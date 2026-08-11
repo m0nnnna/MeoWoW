@@ -48,11 +48,14 @@ its movement keys to the protocol so the camera and the character move together.
   format-evolution comparison.
 - `WOW_DATA` supplies `--data` to `wow-cli` and gates the integration tests.
 - Test realm: **`wow1.nekos.farm`** (auth 3724, world 8085), realm `NekoCore`
-  at `108.174.48.199:8085`, realm id 1. Accounts `TESTER` and `ACCOUNT33`
-  exist. **Passwords are deliberately not recorded here** — this file is
-  committed. Ask the user, and pass the password via `WOW_PASSWORD` rather than
-  an argument. A wrong password and a missing account are hard to tell apart,
-  so guessing wastes real time.
+  at `108.174.48.199:8085`, realm id 1. Accounts `TESTER`, `ACCOUNT33` and
+  `ACCOUNT34` exist. **Passwords are deliberately not recorded here** — this
+  file is committed. Ask the user, and pass the password via `WOW_PASSWORD`
+  rather than an argument. A wrong password and a missing account are hard to
+  tell apart, so guessing wastes real time.
+- Two accounts exist so that **two clients can be online at once**, which is the
+  only way to test anything about one player observing another — relayed
+  movement, entity replication. A single account cannot prove any of it.
 - `ACCOUNT33` has two characters, `Testwolf` (human warrior) and `Testdruid`
   (night elf druid), created to give `SMSG_CHAR_ENUM` real data to parse. An
   account with no characters exercises none of that packet's field offsets.
