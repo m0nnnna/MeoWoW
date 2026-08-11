@@ -19,10 +19,14 @@ the 3.3.5a data files you already own, exactly as
   installation in the client's load order, including delete markers, so
   patches correctly shadow *and remove* base content.
 
+- **DBC tables** — the client's database files, with typed schemas for `Map`,
+  `AreaTable`, `Spell`, `CreatureDisplayInfo`, and `CreatureModelData`, plus
+  column-type inference for transcribing the ones that have no schema yet.
+
 Verified against a stock build 12340 install: 203,949 paths, of which 198,827
 read and decompress cleanly (21.4 GiB) and 5,121 are correctly masked by patch
 tombstones. The one remaining unresolved path is a stale entry in Blizzard's
-own listfile.
+own listfile. All 245 DBC tables present in the install parse.
 
 ```console
 $ wow-cli --data "D:/Games/World of Warcraft 3.3.5a/Data" info
@@ -35,6 +39,9 @@ $ wow-cli --data ... which 'DBFilesClient\Map.dbc'
 DBFilesClient\Map.dbc
   -> .../enUS/patch-enUS-3.MPQ
      43226 bytes (7746 packed), compressed
+
+$ wow-cli dbc rows Map --limit 1
+MapRow { id: 0, directory: "Azeroth", instance_type: 0, name: "Eastern Kingdoms", ... }
 ```
 
 ## Getting started

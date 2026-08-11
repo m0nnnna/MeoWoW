@@ -52,6 +52,38 @@ enum Command {
         /// Only check files matching this substring.
         filter: Option<String>,
     },
+    /// Inspect client database tables.
+    #[command(subcommand)]
+    Dbc(DbcCommand),
+}
+
+#[derive(Subcommand)]
+enum DbcCommand {
+    /// List every DBC in the archives with its shape.
+    List {
+        /// Case-insensitive substring to match.
+        filter: Option<String>,
+    },
+    /// Show a table's header and inferred column types.
+    ///
+    /// Column types are not stored in the file, so this guesses them from the
+    /// data. Use it to transcribe a table that has no schema yet.
+    Info { table: String },
+    /// Dump rows using inferred column types.
+    Dump {
+        table: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Dump rows through a transcribed schema.
+    Rows {
+        /// One of: Map, AreaTable, CreatureDisplayInfo, CreatureModelData, Spell.
+        table: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Check every transcribed schema against the files in this install.
+    Check,
 }
 
 fn main() -> Result<()> {
@@ -77,6 +109,7 @@ fn main() -> Result<()> {
         Command::Extract { name, out } => extract(&mut chain, &name, out),
         Command::Which { name } => which(&chain, &name),
         Command::Verify { limit, filter } => verify(&mut chain, limit, filter.as_deref()),
+        Command::Dbc(cmd) => dbc_cmd(&mut chain, cmd),
     }
 }
 
@@ -175,6 +208,219 @@ fn which(chain: &Chain, name: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Accepts `Map`, `Map.dbc`, or a full archive path.
+fn dbc_path(table: &str) -> String {
+    if table.contains('\\') || table.contains('/') {
+        table.to_string()
+    } else if table.to_lowercase().ends_with(".dbc") {
+        format!(r"DBFilesClient\{table}")
+    } else {
+        format!(r"DBFilesClient\{table}.dbc")
+    }
+}
+
+fn dbc_cmd(chain: &mut Chain, cmd: DbcCommand) -> Result<()> {
+    match cmd {
+        DbcCommand::List { filter } => dbc_list(chain, filter.as_deref()),
+        DbcCommand::Info { table } => dbc_info(chain, &table),
+        DbcCommand::Dump { table, limit } => dbc_dump(chain, &table, limit),
+        DbcCommand::Rows { table, limit } => dbc_rows(chain, &table, limit),
+        DbcCommand::Check => dbc_check(chain),
+    }
+}
+
+fn dbc_list(chain: &mut Chain, filter: Option<&str>) -> Result<()> {
+    let needle = filter.map(str::to_lowercase);
+    let names: Vec<String> = chain
+        .list()?
+        .into_iter()
+        .filter(|n| {
+            let lower = n.to_lowercase();
+            lower.starts_with("dbfilesclient\\")
+                && lower.ends_with(".dbc")
+                && needle.as_ref().is_none_or(|f| lower.contains(f.as_str()))
+        })
+        .collect();
+
+    println!("{:<40} {:>8} {:>7} {:>7}", "table", "records", "fields", "strings");
+    let (mut ok, mut bad) = (0, 0);
+    for name in &names {
+        let short = name.rsplit('\\').next().unwrap_or(name);
+        match chain.read(name).map_err(anyhow::Error::from).and_then(|b| {
+            dbc::Dbc::parse(&b).map_err(anyhow::Error::from)
+        }) {
+            Ok(t) => {
+                ok += 1;
+                // Byte-packed tables cannot be read with word accessors, so
+                // flag them rather than letting a schema quietly misread one.
+                let note = if t.is_uniform() {
+                    String::new()
+                } else {
+                    format!("  byte-packed ({} bytes/record)", t.record_size())
+                };
+                println!(
+                    "{short:<40} {:>8} {:>7} {:>7}{note}",
+                    t.len(),
+                    t.fields(),
+                    t.string_block().len()
+                );
+            }
+            Err(e) => {
+                bad += 1;
+                println!("{short:<40} {:>8} {e}", "-");
+            }
+        }
+    }
+    println!("\n{ok} tables parsed, {bad} failed");
+    Ok(())
+}
+
+fn load_dbc(chain: &mut Chain, table: &str) -> Result<(String, dbc::Dbc)> {
+    let path = dbc_path(table);
+    let bytes = chain
+        .read(&path)
+        .with_context(|| format!("reading {path}"))?;
+    let parsed = dbc::Dbc::parse(&bytes).with_context(|| format!("parsing {path}"))?;
+    Ok((path, parsed))
+}
+
+fn dbc_info(chain: &mut Chain, table: &str) -> Result<()> {
+    let (path, t) = load_dbc(chain, table)?;
+    println!("{path}");
+    println!(
+        "  {} records x {} fields ({} bytes/record), {} bytes of strings\n",
+        t.len(),
+        t.fields(),
+        t.record_size(),
+        t.string_block().len()
+    );
+
+    println!("inferred columns (types are guessed -- verify before trusting):");
+    println!("  {:>5}  {:<8} {:>12} {:>12} {:>7}", "field", "type", "min", "max", "zeros");
+    for c in dbc::infer::infer(&t) {
+        use dbc::infer::ColumnKind as K;
+        // Locale padding is noise; collapse it into the localized column.
+        if c.kind == K::LocalePad {
+            continue;
+        }
+        let (min, max) = match c.kind {
+            K::Float => (
+                format!("{:.3}", f32::from_bits(c.min)),
+                format!("{:.3}", f32::from_bits(c.max)),
+            ),
+            _ => (c.min.to_string(), c.max.to_string()),
+        };
+        let note = if c.kind == K::Localized { "  (spans 17 fields)" } else { "" };
+        println!(
+            "  {:>5}  {:<8} {min:>12} {max:>12} {:>7}{note}",
+            c.index,
+            c.kind.as_str(),
+            c.zeros
+        );
+    }
+    Ok(())
+}
+
+fn dbc_dump(chain: &mut Chain, table: &str, limit: usize) -> Result<()> {
+    let (path, t) = load_dbc(chain, table)?;
+    let columns = dbc::infer::infer(&t);
+    println!("{path} -- {} records\n", t.len());
+
+    for (i, row) in t.rows().take(limit).enumerate() {
+        let mut parts: Vec<String> = Vec::new();
+        for c in &columns {
+            use dbc::infer::ColumnKind as K;
+            let v = row.raw(c.index);
+            match c.kind {
+                K::LocalePad | K::LocaleMask | K::Empty => continue,
+                K::Float => parts.push(format!("{}={:.3}", c.index, f32::from_bits(v))),
+                K::String => parts.push(format!("{}={:?}", c.index, t.string_at(v))),
+                K::Localized => parts.push(format!("{}={:?}", c.index, t.string_at(v))),
+                K::Bool => parts.push(format!("{}={}", c.index, v != 0)),
+                K::Int => parts.push(format!("{}={v}", c.index)),
+            }
+        }
+        println!("[{i}] {}", parts.join("  "));
+    }
+    if t.len() > limit {
+        println!("\n... {} more (raise --limit)", t.len() - limit);
+    }
+    Ok(())
+}
+
+fn dbc_rows(chain: &mut Chain, table: &str, limit: usize) -> Result<()> {
+    use dbc::schema::*;
+
+    macro_rules! dispatch {
+        ($($name:ident),* $(,)?) => {
+            match table.to_lowercase().as_str() {
+                $(
+                    t if t == stringify!($name).to_lowercase() => {
+                        let bytes = chain.read($name::PATH)?;
+                        let parsed = $name::parse(&bytes)?;
+                        println!("{} -- {} rows\n", $name::PATH, parsed.len());
+                        for (i, row) in parsed.iter().take(limit).enumerate() {
+                            println!("[{i}] {row:?}");
+                        }
+                        if parsed.len() > limit {
+                            println!("\n... {} more (raise --limit)", parsed.len() - limit);
+                        }
+                        return Ok(());
+                    }
+                )*
+                other => anyhow::bail!(
+                    "no schema for {other:?}; known: {}. Use `dbc dump` for an \
+                     untranscribed table.",
+                    [$(stringify!($name)),*].join(", ")
+                ),
+            }
+        };
+    }
+
+    dispatch!(Map, AreaTable, CreatureDisplayInfo, CreatureModelData, Spell)
+}
+
+fn dbc_check(chain: &mut Chain) -> Result<()> {
+    use dbc::schema::*;
+
+    macro_rules! check {
+        ($($name:ident),* $(,)?) => {{
+            let mut failures = 0;
+            $(
+                let label = $name::NAME;
+                match chain.read($name::PATH) {
+                    Ok(bytes) => match $name::parse(&bytes) {
+                        Ok(t) => println!(
+                            "  ok    {label:<22} {:>7} rows x {} fields",
+                            t.len(),
+                            $name::FIELDS
+                        ),
+                        Err(e) => {
+                            failures += 1;
+                            println!("  FAIL  {label:<22} {e}");
+                        }
+                    },
+                    Err(e) => {
+                        failures += 1;
+                        println!("  FAIL  {label:<22} {e}");
+                    }
+                }
+            )*
+            failures
+        }};
+    }
+
+    println!("checking transcribed schemas against this install:");
+    let failures = check!(Map, AreaTable, CreatureDisplayInfo, CreatureModelData, Spell);
+    println!();
+    if failures == 0 {
+        println!("all schemas match");
+        Ok(())
+    } else {
+        anyhow::bail!("{failures} schema(s) do not match this build")
+    }
 }
 
 fn verify(chain: &mut Chain, limit: Option<usize>, filter: Option<&str>) -> Result<()> {

@@ -15,7 +15,7 @@ best possible test harness for everything that follows.
 | # | Milestone | Ends with |
 |---|-----------|-----------|
 | 1.1 | **MPQ archives** ✅ | `wow-cli info` / `ls` / `extract` over the real patch chain |
-| 1.2 | **DBC tables** | Typed access to `Map`, `AreaTable`, `Spell`, `CreatureDisplayInfo`; `wow-cli dbc dump` |
+| 1.2 | **DBC tables** ✅ | Typed `Map`, `AreaTable`, `Spell`, `CreatureDisplayInfo`, `CreatureModelData`; `wow-cli dbc list/info/dump/rows/check` |
 | 1.3 | **BLP textures** | Decode DXT1/3/5, palettized, uncompressed → PNG export |
 | 1.4 | **M2 models** | Geometry, submeshes, texture units, bone hierarchy; `.skin` LOD parsing |
 | 1.5 | **WMO objects** | Root + group files, portals, materials, doodad sets |

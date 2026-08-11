@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 mpq = { path = "../../crates/mpq" }
+dbc = { path = "../../crates/dbc" }
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
