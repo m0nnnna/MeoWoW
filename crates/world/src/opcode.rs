@@ -18,6 +18,17 @@ pub enum ClientOpcode {
     Ping = 0x01DC,
     AuthSession = 0x01ED,
     TimeSyncResp = 0x0391,
+
+    // Movement. These are `MSG_` rather than `CMSG_`: the same opcode travels
+    // in both directions, the client reporting its own movement and the server
+    // relaying someone else's. Only the framing differs -- inbound packets are
+    // about a guid that is not ours.
+    MoveStartForward = 0x00B5,
+    MoveStartBackward = 0x00B6,
+    MoveStop = 0x00B7,
+    MoveJump = 0x00BB,
+    MoveSetFacing = 0x00DA,
+    MoveHeartbeat = 0x00EE,
 }
 
 /// The server-to-client opcodes this client reacts to.
@@ -46,6 +57,13 @@ pub mod server {
     pub const MOTD: u16 = 0x033D;
     pub const ACCOUNT_DATA_TIMES: u16 = 0x0209;
     pub const LOGIN_SETTIMESPEED: u16 = 0x0042;
+    /// A creature following a server-computed path. The most common packet in
+    /// a populated zone by a wide margin.
+    pub const MONSTER_MOVE: u16 = 0x00DD;
+    /// Relayed movement from another mover, sharing the client opcodes.
+    pub const MOVE_START_FORWARD: u16 = 0x00B5;
+    pub const MOVE_STOP: u16 = 0x00B7;
+    pub const MOVE_HEARTBEAT: u16 = 0x00EE;
 }
 
 /// A human-readable name for an incoming opcode, for logs and dumps.
@@ -72,6 +90,10 @@ pub fn describe(opcode: u16) -> String {
         server::MOTD => "SMSG_MOTD",
         server::ACCOUNT_DATA_TIMES => "SMSG_ACCOUNT_DATA_TIMES",
         server::LOGIN_SETTIMESPEED => "SMSG_LOGIN_SETTIMESPEED",
+        server::MONSTER_MOVE => "SMSG_MONSTER_MOVE",
+        server::MOVE_START_FORWARD => "MSG_MOVE_START_FORWARD",
+        server::MOVE_STOP => "MSG_MOVE_STOP",
+        server::MOVE_HEARTBEAT => "MSG_MOVE_HEARTBEAT",
         other => return format!("opcode {other:#06x}"),
     };
     name.to_string()

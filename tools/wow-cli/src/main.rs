@@ -120,6 +120,16 @@ enum Command {
         /// decompressed, for offline analysis.
         #[arg(long)]
         dump_failed: Option<PathBuf>,
+        /// After entering, walk this many units forward.
+        ///
+        /// Verify it by running the command again without `--enter`: the
+        /// character list reports the position the *server* has stored.
+        #[arg(long)]
+        walk: Option<f32>,
+        /// Heading to walk along, in degrees. Defaults to the way the
+        /// character is already facing.
+        #[arg(long)]
+        heading: Option<f32>,
         /// After entering, hold the connection open this many seconds,
         /// answering keepalives. Proves the session survives rather than being
         /// dropped a minute in.
@@ -280,12 +290,16 @@ fn main() -> Result<()> {
             delete,
             enter,
             dump_failed,
+            walk,
+            heading,
             stay,
             port,
             timeout,
         } => {
             return world_login(WorldRequest {
                 dump_failed: dump_failed.as_deref(),
+                walk: *walk,
+                heading: *heading,
                 stay: *stay,
                 host,
                 port: *port,
@@ -383,6 +397,8 @@ struct WorldRequest<'a> {
     delete: Option<&'a str>,
     enter: Option<&'a str>,
     dump_failed: Option<&'a std::path::Path>,
+    walk: Option<f32>,
+    heading: Option<f32>,
     stay: u64,
     locale: &'a str,
     timeout: u64,
@@ -406,6 +422,8 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         delete,
         enter,
         dump_failed,
+        walk,
+        heading,
         stay,
         locale,
         timeout,
@@ -525,6 +543,64 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         let rest = connection.drain(std::time::Duration::from_millis(1500), 512)?;
         report_object_updates(&rest, character.guid, dump_failed)?;
 
+        if let Some(distance) = walk {
+            let from = world::Position {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                orientation: position.orientation,
+            };
+            let heading = heading.map(f32::to_radians).unwrap_or(from.orientation);
+            // The default run speed for a character on foot. Walking faster
+            // than this is what a server's movement checks exist to catch.
+            const RUN_SPEED: f32 = 7.0;
+
+            println!(
+                "\nwalking {distance:.0} units on heading {:.2} rad",
+                heading
+            );
+            let (arrived, seen) =
+                connection.walk(character.guid, from, heading, distance, RUN_SPEED)?;
+            println!(
+                "  client is now at {:.1}, {:.1}, {:.1}",
+                arrived.x, arrived.y, arrived.z
+            );
+
+            let mut counts: std::collections::BTreeMap<u16, (usize, Vec<u8>)> = Default::default();
+            for packet in &seen {
+                let entry = counts.entry(packet.opcode).or_default();
+                entry.0 += 1;
+                entry.1 = packet.body.clone();
+            }
+            println!("  server sent {} packets while walking:", seen.len());
+            for (opcode, (count, body)) in &counts {
+                // Short bodies are printed in full: an unrecognised opcode that
+                // arrives once per packet sent is worth identifying, and one
+                // byte of payload is usually enough to guess what it means.
+                let preview: String = body
+                    .iter()
+                    .take(8)
+                    .map(|b| format!("{b:02x} "))
+                    .collect();
+                println!(
+                    "    {:<32} x{count:<4} {} bytes [{}]",
+                    world::opcode::describe(*opcode),
+                    body.len(),
+                    preview.trim_end()
+                );
+            }
+            // Movement is never acknowledged, so the only honest confirmation
+            // is to ask the server again later. Re-entering is the quick way;
+            // the character list also works but only once the previous
+            // session's logout-save has landed, which takes tens of seconds.
+            // Checking it immediately reads the save *before* last and looks
+            // exactly like movement having been ignored.
+            println!(
+                "  nothing acknowledges movement. Re-enter to see the position\n  \
+                 the server holds, or re-read the character list after ~30s."
+            );
+        }
+
         if stay > 0 {
             hold_connection(&mut connection, std::time::Duration::from_secs(stay))?;
         }
@@ -550,10 +626,36 @@ fn hold_connection(
     let mut pings = 0usize;
     let mut last_ping = std::time::Instant::now();
 
+    let mut movers: std::collections::BTreeSet<u64> = Default::default();
     while std::time::Instant::now() < until {
-        packets += connection
-            .drain(std::time::Duration::from_millis(500), 256)?
-            .len();
+        let batch = connection.drain(std::time::Duration::from_millis(500), 256)?;
+        packets += batch.len();
+        // Relayed movement shares its opcodes with the client's own, so a
+        // packet arriving under one means someone *else* moved.
+        for packet in &batch {
+            let relayed = matches!(
+                packet.opcode,
+                world::opcode::server::MOVE_START_FORWARD
+                    | world::opcode::server::MOVE_STOP
+                    | world::opcode::server::MOVE_HEARTBEAT
+            );
+            if relayed {
+                match world::protocol::parse_movement(&packet.body) {
+                    Ok((mover, info)) => {
+                        if movers.insert(mover) {
+                            println!(
+                                "  {} moved: guid {mover:#x} at {:.1}, {:.1}, {:.1}",
+                                world::opcode::describe(packet.opcode),
+                                info.position.x,
+                                info.position.y,
+                                info.position.z
+                            );
+                        }
+                    }
+                    Err(e) => println!("  undecodable relayed movement: {e}"),
+                }
+            }
+        }
         if last_ping.elapsed() >= PING_EVERY {
             let sent = std::time::Instant::now();
             connection.ping(0)?;
@@ -563,7 +665,11 @@ fn hold_connection(
         }
     }
 
-    println!("  still connected: {packets} packets seen, {pings} keepalives answered");
+    println!(
+        "  still connected: {packets} packets seen, {pings} keepalives answered, \
+         {} other mover(s) reported",
+        movers.len()
+    );
     Ok(())
 }
 

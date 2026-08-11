@@ -605,6 +605,31 @@ pub fn time_sync_resp(counter: u32, ticks: u32) -> Vec<u8> {
     body
 }
 
+/// Builds a movement packet body: the mover's guid, then its state.
+///
+/// The leading packed guid is easy to leave out, because the client is
+/// obviously talking about itself. 3.3.5a added it so that a player controlling
+/// something else -- a vehicle, a mind-controlled creature -- can say *which*
+/// thing moved. Omitting it does not fail cleanly: the server reads the first
+/// bytes of the movement flags as a guid and everything after shifts.
+pub fn movement(mover: u64, info: &crate::movement::MovementInfo) -> Vec<u8> {
+    let mut body = Vec::with_capacity(40);
+    crate::update::write_packed_guid(mover, &mut body);
+    info.write(&mut body);
+    body
+}
+
+/// Reads a movement packet relayed from another mover.
+pub fn parse_movement(
+    body: &[u8],
+) -> Result<(u64, crate::movement::MovementInfo), Error> {
+    let mut reader = Reader::new(body, "MSG_MOVE_*");
+    let mover = crate::update::read_packed_guid(&mut reader)?;
+    let info = crate::movement::MovementInfo::read(&mut reader)?;
+    reader.finish()?;
+    Ok((mover, info))
+}
+
 /// Equipment slots reported per character.
 ///
 /// Nineteen worn slots -- head through tabard, including both weapons and the
@@ -988,6 +1013,59 @@ mod tests {
         }
         assert_eq!(describe_response(0x14), "client build rejected");
         assert_eq!(describe_response(0x1D), "account already online");
+    }
+
+    /// A movement packet must survive its own parser, guid included.
+    ///
+    /// The leading packed guid is the part worth pinning. It is easy to omit --
+    /// the client is obviously talking about itself -- and omitting it does not
+    /// fail cleanly: the server reads the first bytes of the movement flags as
+    /// a guid and every field after shifts, producing a valid-looking move to
+    /// somewhere else entirely.
+    #[test]
+    fn a_movement_packet_round_trips_with_its_mover() {
+        use crate::movement::MovementInfo;
+        use crate::update::Position;
+
+        let info = MovementInfo {
+            flags: crate::update::movement_flags::FORWARD,
+            time: 12_345,
+            position: Position {
+                x: -8949.95,
+                y: -132.49,
+                z: 83.53,
+                orientation: 3.14,
+            },
+            ..MovementInfo::default()
+        };
+
+        let body = movement(0x32, &info);
+        let (mover, parsed) = parse_movement(&body).unwrap();
+        assert_eq!(mover, 0x32);
+        assert_eq!(parsed, info);
+
+        // And the guid really is on the wire ahead of the state: dropping it
+        // must not still parse, or the test proves nothing.
+        assert!(
+            parse_movement(&body[1..]).is_err(),
+            "the packet parsed without its guid, so the guid is not load-bearing"
+        );
+    }
+
+    /// A large guid packs to more than one byte, so the offset of everything
+    /// after it moves. Both ends must agree about that.
+    #[test]
+    fn a_wide_mover_guid_shifts_the_body() {
+        use crate::movement::MovementInfo;
+
+        let info = MovementInfo::standing(Default::default(), 7);
+        let narrow = movement(0x32, &info);
+        let wide = movement(0xF130_0000_3370_0BA9, &info);
+        assert!(wide.len() > narrow.len());
+
+        let (mover, parsed) = parse_movement(&wide).unwrap();
+        assert_eq!(mover, 0xF130_0000_3370_0BA9);
+        assert_eq!(parsed, info);
     }
 
     #[test]

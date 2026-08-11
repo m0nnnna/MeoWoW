@@ -116,6 +116,10 @@ pub mod update_flags {
 /// Only the ones that affect the *layout* are named. The rest describe motion
 /// the client would act on but does not need in order to find the packet's end.
 pub mod movement_flags {
+    /// Running or walking forwards. Set while moving, cleared on stop.
+    pub const FORWARD: u32 = 0x0000_0001;
+    pub const BACKWARD: u32 = 0x0000_0002;
+    pub const WALKING: u32 = 0x0000_0100;
     pub const ON_TRANSPORT: u32 = 0x0000_0200;
     pub const FALLING: u32 = 0x0000_1000;
     pub const SWIMMING: u32 = 0x0020_0000;
@@ -154,6 +158,9 @@ pub struct Movement {
     /// Walk, run, run-back, swim, swim-back, flight, flight-back, turn, pitch.
     pub speeds: Option<[f32; 9]>,
     pub target: Option<u64>,
+    /// The full movement state, when this object carries one. Retained because
+    /// the client's own movement packets echo the same structure back.
+    pub info: Option<crate::movement::MovementInfo>,
 }
 
 impl Movement {
@@ -306,44 +313,14 @@ fn read_fields(reader: &mut Reader<'_>) -> Result<Fields, Error> {
     Ok(Fields { values })
 }
 
-fn read_movement_info(reader: &mut Reader<'_>) -> Result<(u32, Position), Error> {
-    let flags = reader.u32()?;
-    let flags2 = reader.u16()?;
-    let _time = reader.u32()?;
-    let position = Position {
-        x: reader.f32()?,
-        y: reader.f32()?,
-        z: reader.f32()?,
-        orientation: reader.f32()?,
-    };
-
-    if flags & movement_flags::ON_TRANSPORT != 0 {
-        let _transport = read_packed_guid(reader)?;
-        reader.skip(16)?; // position and orientation on the transport
-        let _transport_time = reader.u32()?;
-        let _seat = reader.u8()?;
-        if flags2 & MOVEMENT_FLAG2_INTERPOLATED_MOVEMENT != 0 {
-            let _interpolated = reader.u32()?;
-        }
-    }
-
-    // Pitch is present when the thing can be pointing up or down: in water, in
-    // the air, or explicitly allowed to.
-    if flags & (movement_flags::SWIMMING | movement_flags::FLYING) != 0
-        || flags2 & MOVEMENT_FLAG2_ALWAYS_ALLOW_PITCHING != 0
-    {
-        let _pitch = reader.f32()?;
-    }
-
-    let _fall_time = reader.u32()?;
-    if flags & movement_flags::FALLING != 0 {
-        reader.skip(16)?; // jump velocity, sin and cos of the angle, speed
-    }
-    if flags & movement_flags::SPLINE_ELEVATION != 0 {
-        let _elevation = reader.f32()?;
-    }
-
-    Ok((flags, position))
+/// Reads the movement state inside a create block.
+///
+/// Delegates to [`crate::movement::MovementInfo`] rather than reading the
+/// fields here. The client sends this same structure back when it moves, and
+/// two independent copies of a conditional layout would be free to drift --
+/// with the outgoing half having no parse error to announce the drift.
+fn read_movement_info(reader: &mut Reader<'_>) -> Result<crate::movement::MovementInfo, Error> {
+    crate::movement::MovementInfo::read(reader)
 }
 
 /// Reads the spline block appended when something is following a path.
@@ -381,9 +358,10 @@ fn read_movement(reader: &mut Reader<'_>) -> Result<Movement, Error> {
     };
 
     if flags & update_flags::LIVING != 0 {
-        let (movement_flags, position) = read_movement_info(reader)?;
-        movement.movement_flags = movement_flags;
-        movement.position = Some(position);
+        let info = read_movement_info(reader)?;
+        movement.movement_flags = info.flags;
+        movement.position = Some(info.position);
+        movement.info = Some(info);
 
         let mut speeds = [0f32; 9];
         for speed in speeds.iter_mut() {
@@ -391,7 +369,7 @@ fn read_movement(reader: &mut Reader<'_>) -> Result<Movement, Error> {
         }
         movement.speeds = Some(speeds);
 
-        if movement_flags & movement_flags::SPLINE_ENABLED != 0 {
+        if info.flags & movement_flags::SPLINE_ENABLED != 0 {
             skip_spline(reader)?;
         }
     } else if flags & update_flags::POSITION != 0 {

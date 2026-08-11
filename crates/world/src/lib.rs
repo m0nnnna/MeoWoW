@@ -10,12 +10,14 @@
 
 pub mod client;
 pub mod crypt;
+pub mod movement;
 pub mod opcode;
 pub mod protocol;
 pub mod update;
 
 pub use client::{Connection, DEFAULT_PORT};
 pub use crypt::HeaderCrypt;
+pub use movement::MovementInfo;
 pub use opcode::ClientOpcode;
 pub use protocol::{
     Appearance, AuthResponse, Character, Equipment, WorldPosition, EQUIPMENT_SLOTS,

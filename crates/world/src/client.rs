@@ -289,6 +289,100 @@ impl Connection {
         Ok(())
     }
 
+    /// Sends one movement packet for a mover we control.
+    pub fn send_movement(
+        &mut self,
+        opcode: ClientOpcode,
+        mover: u64,
+        info: &crate::movement::MovementInfo,
+    ) -> Result<(), Error> {
+        self.send(opcode, &protocol::movement(mover, info))
+    }
+
+    /// Walks a character in a straight line and reports where it ended up.
+    ///
+    /// Movement is a *stream*, not a request: start, a heartbeat every so
+    /// often, then stop. Sending only the endpoints is the obvious shortcut and
+    /// the wrong one -- the server integrates position against elapsed time to
+    /// decide whether a move was possible, and a single jump across the whole
+    /// distance is exactly the shape of a speed hack.
+    ///
+    /// Nothing acknowledges any of this. A rejected move produces no error;
+    /// the server simply keeps its own idea of where the character is. The only
+    /// honest confirmation is to ask again later -- see the CLI, which
+    /// reconnects and reads the position back from a fresh character list.
+    pub fn walk(
+        &mut self,
+        mover: u64,
+        from: crate::update::Position,
+        heading: f32,
+        distance: f32,
+        speed: f32,
+    ) -> Result<(crate::update::Position, Vec<Packet>), Error> {
+        use crate::movement::MovementInfo;
+        use crate::update::movement_flags;
+
+        // A tenth of a second between heartbeats, which is roughly what a real
+        // client sends while moving.
+        const STEP: Duration = Duration::from_millis(100);
+
+        let steps = ((distance / speed) / STEP.as_secs_f32()).ceil().max(1.0) as u32;
+        let (dx, dy) = (heading.cos(), heading.sin());
+
+        let mut at = crate::update::Position {
+            orientation: heading,
+            ..from
+        };
+        let start = MovementInfo {
+            flags: movement_flags::FORWARD,
+            time: self.tick(),
+            position: at,
+            ..MovementInfo::default()
+        };
+        self.send_movement(ClientOpcode::MoveStartForward, mover, &start)?;
+
+        // Kept and returned rather than discarded: movement is unacknowledged,
+        // so what the server volunteers during it is the only evidence
+        // available about whether it was accepted.
+        let mut seen = Vec::new();
+
+        for step in 1..=steps {
+            std::thread::sleep(STEP);
+            let travelled = (distance * step as f32 / steps as f32).min(distance);
+            at.x = from.x + dx * travelled;
+            at.y = from.y + dy * travelled;
+
+            let beat = MovementInfo {
+                flags: movement_flags::FORWARD,
+                time: self.tick(),
+                position: at,
+                ..MovementInfo::default()
+            };
+            self.send_movement(ClientOpcode::MoveHeartbeat, mover, &beat)?;
+
+            // Drain whatever arrived so the socket does not back up and the
+            // time-sync answers keep flowing.
+            seen.extend(self.drain(Duration::from_millis(1), 64)?);
+        }
+
+        // Stopping matters: a character left in the FORWARD state keeps moving
+        // in the server's simulation after the client goes quiet.
+        let stop = MovementInfo {
+            flags: 0,
+            time: self.tick(),
+            position: at,
+            ..MovementInfo::default()
+        };
+        self.send_movement(ClientOpcode::MoveStop, mover, &stop)?;
+        seen.extend(self.drain(Duration::from_millis(300), 128)?);
+        Ok((at, seen))
+    }
+
+    /// Milliseconds since the connection opened, as the movement clock.
+    fn tick(&self) -> u32 {
+        self.started.elapsed().as_millis() as u32
+    }
+
     /// Reads packets until the server stops sending for `quiet_for`.
     ///
     /// Entering the world produces a burst rather than a reply, and nothing in

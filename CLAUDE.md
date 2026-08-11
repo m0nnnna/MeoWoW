@@ -12,7 +12,7 @@ streams. Phase 3 has started.
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation), WMO, ADT/WDT — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
-| Protocol | **3.1 logon, 3.2 world handshake, 3.3 enter world done**, all confirmed against a live realm; 3.4 movement is next |
+| Protocol | **3.1 logon, 3.2 handshake, 3.3 enter world done**; 3.4 movement half done — we move and it persists, being *seen* move needs a second account. All confirmed against a live realm |
 | Game + UI | Not started. The largest remaining chunk. |
 
 Roughly 50% of the way to something a person could test by playing. See
@@ -21,8 +21,9 @@ Roughly 50% of the way to something a person could test by playing. See
 **The two halves have met.** `wow-viewer --realm-host <host> --user <account>
 --character <name>` logs in, enters the world, and streams the map the server
 chose around the position it reported, with the creatures it reported standing
-in it. What is missing now is agency: the camera stands where the character is
-but cannot move it, which is 3.4.
+in it. The character can also be walked (`wow-cli world --enter X --walk 20`),
+but the viewer cannot drive that yet — the obvious next visible step is wiring
+its movement keys to the protocol so the camera and the character move together.
 
 ## Orientation
 
@@ -90,6 +91,17 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   are precisely specified and fail loudly. Every hour actually lost went to
   ordinary struct layout, where a wrong guess parses perfectly. Budget for the
   boring parts.
+- **Check that your check is current.** The first walk was declared a failure
+  because the character list still showed the old position — but the character
+  list reports the last *saved* position, which lands tens of seconds after a
+  disconnect, while `SMSG_LOGIN_VERIFY_WORLD` reports the live one. The movement
+  had worked all along. When a change appears not to have taken, confirm the
+  thing being read is the thing being written.
+- **Writing a format is riskier than reading it.** A bad read fails loudly at a
+  known offset; a bad write is accepted as some other valid message and shows up
+  as wrong behaviour far away. Where a structure travels both ways, define it
+  once and round-trip it — two copies of a conditional layout can drift, and the
+  outgoing copy has nothing to announce the drift.
 - **Not every failure is a bug.** The world connection dropping after three
   keepalives was the server enforcing a *minimum* ping interval — pinging too
   eagerly is punished harder than not pinging. It surfaced as an unexpected end

@@ -274,9 +274,102 @@ reads 54 and 55. The guid appears twice — once in the block header, once as
 field 0 — written by different server code, and they agree. None of that is
 checkable against the parser itself.
 
+# Movement
+
+`MSG_MOVE_*` — `MSG_`, not `CMSG_`, because the same opcode travels in both
+directions: the client reporting its own movement and the server relaying
+someone else's.
+
+This is the first thing the client **sends** whose layout it also has to get
+right, and that changes the failure mode completely. Everything before it was
+read-only, where a wrong guess produced a parse error at a known offset. A
+malformed movement packet produces no error at all — the server reads it as some
+*other* valid movement, and the first sign is a character standing somewhere
+unexpected.
+
+So `MovementInfo` is defined once in `movement.rs` and both directions go
+through it. Object updates read it; the client's own movement writes it. A field
+that is wrong is then wrong symmetrically, which a round trip catches; two
+copies could drift, and the outgoing copy has nothing to announce the drift.
+
+The write side emits its optional parts from the **flags**, never from whether
+the corresponding field is populated. The reader on the other side has only the
+flags to go on, so a writer consulting anything else can produce a packet
+nothing can parse back.
+
+## The mover guid
+
+Each packet begins with a packed guid saying *which* thing moved, before the
+movement state. It is easy to leave out — the client is obviously talking about
+itself — but WotLK added it so a player controlling a vehicle or a
+mind-controlled creature can say so. Omitting it does not fail cleanly: the
+server reads the first bytes of the movement flags as a guid and everything
+after shifts.
+
+## Movement is a stream, not a request
+
+Start, a heartbeat roughly every 100 ms, then stop. Sending only the endpoints
+is the obvious shortcut and the wrong one: the server integrates position
+against elapsed time, and one jump across the whole distance is the exact shape
+of a speed hack. Stopping matters too — a character left in the `FORWARD` state
+keeps moving in the server's simulation after the client goes quiet.
+
+## Nothing acknowledges movement
+
+There is no reply. A rejected move produces no error; the server simply keeps
+its own idea of where the character is. Confirmation has to be obtained by
+asking again later, and there are two ways, which disagree:
+
+- **`SMSG_LOGIN_VERIFY_WORLD` on re-entry** reports the live position
+  immediately.
+- **The character list** reports the position last written to the database,
+  which happens when the previous session's logout-save lands — tens of seconds
+  after an abrupt disconnect.
+
+Checking the character list immediately reads the save *before* last and looks
+exactly like movement having been ignored. That cost a debugging detour here:
+the first walk was declared a failure on the strength of a character list that
+was simply not caught up yet. Waiting 35 seconds showed the correct position.
+
+## Verified against a live realm
+
+Four legs of 20 units on headings 0°, 90°, 180° and 270°, each run re-entering
+the world before walking:
+
+```text
+leg   0:  in world at -9000.0, -122.5  ->  -8980.0, -122.5
+leg  90:  in world at -8980.0, -122.5  ->  -8980.0, -102.5
+leg 180:  in world at -8980.0, -102.5  ->  -9000.0, -102.5
+leg 270:  in world at -9000.0, -102.5  ->  -9000.0, -122.5
+```
+
+Every leg's starting position, read from the server, is the previous leg's
+endpoint, and the square closes on the point it started from. The facing carries
+over too. Chaining the legs is what makes this evidence: any single move could be
+a coincidence of a stale read, but four in sequence returning exactly to the
+origin could not.
+
+## Open questions
+
+An unidentified opcode **0x029D** arrives exactly once per movement packet sent,
+with a one-byte body of `00`. The 1:1 correspondence and the payload are
+consistent with a stand-state update being pushed on every movement packet, but
+that is inference from two observations, not something confirmed, so it is not
+named in `opcode.rs`.
+
+Back-to-back sessions on one account are occasionally refused while the previous
+one is still logging out. It is transient and retrying works.
+
 ## Not implemented yet
 
 PIN and authenticator second factors (the client refuses rather than guessing).
-On the world side: movement, and interpreting the update fields beyond the
-handful named in `update.rs`. Spline paths are parsed exactly but discarded,
-because nothing consumes them until movement prediction exists.
+On the world side: interpreting the update fields beyond the handful named in
+`update.rs`. Spline paths are parsed exactly but discarded, because nothing
+consumes them until movement prediction exists.
+
+**Being seen moving by another client is not yet proven.** It needs a second
+account logged in at the same time, and only one is available here. The inbound
+half is written and wired up — a relayed `MSG_MOVE_*` is decoded and its mover
+reported — but with nobody else online it has never received a real packet. What
+*is* proven is that the server accepts our movement and persists it, which is
+the half that had to be right first.
