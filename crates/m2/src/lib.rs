@@ -13,9 +13,13 @@
 //! the triangles that reference it are in separate `.skin` files, one per level
 //! of detail. See [`skin`].
 
+pub mod anim;
 pub mod skin;
 
+pub use anim::{Interpolation, Keyframe, Keyframes, Pose, Sequence, Track};
 pub use skin::Skin;
+
+use glam::{Mat4, Quat, Vec3};
 
 use std::fmt;
 
@@ -187,6 +191,46 @@ pub struct Bone {
     pub submesh_id: u16,
     /// Point the bone rotates about, in model space.
     pub pivot: [f32; 3],
+}
+
+/// A bone together with its animation tracks.
+pub struct AnimatedBone {
+    pub bone: Bone,
+    pub translation: Track<Vec3>,
+    pub rotation: Track<Quat>,
+    pub scale: Track<Vec3>,
+}
+
+impl AnimatedBone {
+    /// Whether this bone moves at all.
+    pub fn is_animated(&self) -> bool {
+        self.translation.is_animated()
+            || self.rotation.is_animated()
+            || self.scale.is_animated()
+    }
+}
+
+/// Orders bones so every parent is posed before its children.
+///
+/// M2 files normally store parents first, but that is a convention rather than
+/// a guarantee, and a single out-of-order bone would silently drop its parent's
+/// transform. Sorting by chain depth costs nothing at these sizes.
+fn bone_order(bones: &[AnimatedBone]) -> Vec<usize> {
+    let depth = |mut index: usize| {
+        let mut depth = 0usize;
+        // Bounded by the bone count; cycles are reported by `validate`.
+        while let Ok(parent) = usize::try_from(bones[index].bone.parent) {
+            if parent >= bones.len() || depth > bones.len() {
+                break;
+            }
+            index = parent;
+            depth += 1;
+        }
+        depth
+    };
+    let mut order: Vec<usize> = (0..bones.len()).collect();
+    order.sort_by_key(|&i| depth(i));
+    order
 }
 
 /// A parsed model.
@@ -412,6 +456,221 @@ impl Model {
                 }
             })
             .collect()
+    }
+
+    /// Reads an `M2Track` at an absolute offset.
+    ///
+    /// A track's timestamps and values are *arrays of arrays*: the outer array
+    /// has one entry per sequence, and each entry is itself a
+    /// `(count, offset)` pair. Reading the outer array as the keyframes
+    /// directly is the obvious mistake, and yields plausible-looking garbage.
+    fn read_track<T: anim::Keyframe>(
+        &self,
+        base: usize,
+        external: &std::collections::BTreeMap<usize, Vec<u8>>,
+        inline: &[bool],
+    ) -> anim::Track<T> {
+        let h = |o: usize| {
+            self.data
+                .get(o..o + 2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .unwrap_or(0)
+        };
+        let array_at = |o: usize| Array {
+            count: self.u32_at(o),
+            offset: self.u32_at(o + 4),
+        };
+
+        let global = h(base + 2);
+        let times_outer = array_at(base + 4);
+        let values_outer = array_at(base + 12);
+
+        // The two outer arrays are parallel; a mismatch means we are misreading
+        // the layout, so take the shorter and let validation notice.
+        let count = times_outer.count.min(values_outer.count) as usize;
+        let mut sequences = Vec::with_capacity(count);
+        for i in 0..count {
+            // A sequence that is neither inline nor externally supplied has no
+            // data here at all: its offsets address a file we were not given,
+            // and reading them from the .m2 yields whatever happens to sit
+            // there. Empty is the honest answer, and lets alias resolution or
+            // the bind pose take over.
+            if !inline.get(i).copied().unwrap_or(true) && !external.contains_key(&i) {
+                sequences.push(anim::Keyframes {
+                    times: Vec::new(),
+                    values: Vec::new(),
+                });
+                continue;
+            }
+
+            let t = array_at(times_outer.offset as usize + i * 8);
+            let v = array_at(values_outer.offset as usize + i * 8);
+
+            // The outer array lives in the .m2, but for a sequence whose data
+            // moved to an external file the inner offsets address *that* file.
+            let source: &[u8] = external.get(&i).map(Vec::as_slice).unwrap_or(&self.data);
+            let word = |at: usize| {
+                source
+                    .get(at..at + 4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .unwrap_or(0)
+            };
+
+            let times: Vec<u32> = (0..t.count as usize)
+                .map(|k| word(t.offset as usize + k * 4))
+                .collect();
+            let values: Vec<T> = (0..v.count as usize)
+                .filter_map(|k| {
+                    let at = v.offset as usize + k * T::SIZE;
+                    source.get(at..at + T::SIZE).map(T::read)
+                })
+                .collect();
+
+            sequences.push(anim::Keyframes { times, values });
+        }
+
+        anim::Track {
+            interpolation: anim::Interpolation::from_raw(h(base)),
+            // 0xFFFF means "no global sequence".
+            global_sequence: (global != u16::MAX).then_some(global),
+            sequences,
+        }
+    }
+
+    /// The model's animations.
+    pub fn sequences(&self) -> Vec<Sequence> {
+        self.slice("sequences", self.header.sequences, Sequence::SIZE)
+            .map(|raw| raw.chunks_exact(Sequence::SIZE).map(Sequence::read).collect())
+            .unwrap_or_default()
+    }
+
+    /// Bones with their animation tracks decoded.
+    ///
+    /// Separate from [`Model::bones`] because decoding every track is far more
+    /// work than reading the hierarchy, and most callers only want the latter.
+    pub fn animated_bones(&self) -> Vec<AnimatedBone> {
+        self.animated_bones_with(&Default::default())
+    }
+
+    /// Bones with tracks decoded, using externally loaded `.anim` data for the
+    /// sequences that need it.
+    ///
+    /// Keyed by sequence index. Sequences without [`Sequence::is_inline`] have
+    /// no usable data in the `.m2`; see [`anim::external_anim_path`].
+    pub fn animated_bones_with(
+        &self,
+        external: &std::collections::BTreeMap<usize, Vec<u8>>,
+    ) -> Vec<AnimatedBone> {
+        let Ok(raw) = self.slice("bones", self.header.bones, BONE_SIZE) else {
+            return Vec::new();
+        };
+        let base = self.header.bones.offset as usize;
+        let inline: Vec<bool> = self.sequences().iter().map(|s| s.is_inline()).collect();
+
+        let mut bones: Vec<AnimatedBone> = self
+            .bones()
+            .into_iter()
+            .enumerate()
+            .map(|(i, bone)| {
+                let at = base + i * BONE_SIZE;
+                debug_assert!(raw.len() >= (i + 1) * BONE_SIZE);
+                AnimatedBone {
+                    bone,
+                    // Three 20-byte tracks between the header fields and pivot.
+                    translation: self.read_track(at + 16, external, &inline),
+                    rotation: self.read_track(at + 36, external, &inline),
+                    scale: self.read_track(at + 56, external, &inline),
+                }
+            })
+            .collect();
+
+        self.resolve_aliases(&mut bones);
+        bones
+    }
+
+    /// Points alias sequences at the keyframes they borrow.
+    ///
+    /// A bare `0x40` sequence has neither inline data nor an external file; it
+    /// names another entry through `alias_next`. Left unresolved it samples to
+    /// nothing and the model snaps to bind pose.
+    fn resolve_aliases(&self, bones: &mut [AnimatedBone]) {
+        let sequences = self.sequences();
+
+        // Follow the chain to the first entry that is not itself an alias,
+        // bounded so a malformed cycle cannot hang the loader.
+        let target = |start: usize| -> Option<usize> {
+            let mut i = start;
+            for _ in 0..8 {
+                let s = sequences.get(i)?;
+                if !s.is_alias() {
+                    return Some(i);
+                }
+                let next = s.alias_next as usize;
+                if next == i || next >= sequences.len() {
+                    return None;
+                }
+                i = next;
+            }
+            None
+        };
+
+        let redirects: Vec<(usize, usize)> = (0..sequences.len())
+            .filter(|&i| sequences[i].is_alias())
+            .filter_map(|i| target(i).filter(|&t| t != i).map(|t| (i, t)))
+            .collect();
+
+        for bone in bones {
+            for &(from, to) in &redirects {
+                // Only fill genuinely empty slots: an alias may also be inline
+                // (`0x60`) and carry perfectly good keys of its own.
+                macro_rules! fill {
+                    ($track:expr) => {
+                        if let (Some(true), Some(source)) = (
+                            $track.sequences.get(from).map(|k| k.values.is_empty()),
+                            $track.sequences.get(to).cloned(),
+                        ) {
+                            if !source.values.is_empty() {
+                                $track.sequences[from] = source;
+                            }
+                        }
+                    };
+                }
+                fill!(bone.translation);
+                fill!(bone.rotation);
+                fill!(bone.scale);
+            }
+        }
+    }
+
+    /// Computes model-space matrices for every bone at a point in time.
+    ///
+    /// `time_ms` is relative to the start of the sequence; callers wrap it to
+    /// the sequence's duration.
+    pub fn pose(&self, bones: &[AnimatedBone], sequence: usize, time_ms: u32) -> Pose {
+        Self::pose_bones(bones, sequence, time_ms)
+    }
+
+    /// Poses a skeleton without needing the model it came from.
+    pub fn pose_bones(bones: &[AnimatedBone], sequence: usize, time_ms: u32) -> Pose {
+        let mut out = vec![Mat4::IDENTITY; bones.len()];
+        for &i in &bone_order(bones) {
+            let b = &bones[i];
+            let translation = b.translation.sample(sequence, time_ms).unwrap_or(Vec3::ZERO);
+            let rotation = b.rotation.sample(sequence, time_ms).unwrap_or(Quat::IDENTITY);
+            let scale = b.scale.sample(sequence, time_ms).unwrap_or(Vec3::ONE);
+
+            let local = anim::local_transform(
+                Vec3::from(b.bone.pivot),
+                translation,
+                rotation,
+                scale,
+            );
+            out[i] = match usize::try_from(b.bone.parent) {
+                Ok(parent) if parent < bones.len() => out[parent] * local,
+                _ => local,
+            };
+        }
+        out
     }
 
     fn u16_table(&self, what: &'static str, array: Array) -> Vec<u16> {

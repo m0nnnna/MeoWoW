@@ -259,6 +259,23 @@ dbc_table! {
 }
 
 dbc_table! {
+    /// Names for animation ids. An M2 sequence stores only the numeric id, so
+    /// this is the only way to know that sequence 0 is `Stand`.
+    AnimationData, AnimationDataRow,
+    path = r"DBFilesClient\AnimationData.dbc", fields = 8, {
+        0 id: u32,
+        /// Not localized: these are internal names like `Stand` or `Attack1H`.
+        1 name: str,
+        2 weapon_flags: u32,
+        3 body_flags: u32,
+        4 flags: u32,
+        /// Animation to play instead when this one is unavailable.
+        5 fallback: u32,
+        6 behaviour_id: u32,
+    }
+}
+
+dbc_table! {
     /// Spell definitions. 234 columns, of which this names the few a client
     /// needs before it implements combat.
     Spell, SpellRow, path = r"DBFilesClient\Spell.dbc", fields = 234, {
@@ -314,7 +331,14 @@ macro_rules! impl_table_info {
     };
 }
 
-impl_table_info!(Map, AreaTable, CreatureDisplayInfo, CreatureModelData, Spell);
+impl_table_info!(
+    Map,
+    AreaTable,
+    CreatureDisplayInfo,
+    CreatureModelData,
+    AnimationData,
+    Spell
+);
 
 /// Marker so the unused-import lint does not fire on the re-exports the macro
 /// relies on.

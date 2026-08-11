@@ -15,14 +15,17 @@ use crate::Gpu;
 /// the scale of a single model.
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// Vertex layout handed to the GPU. Bone weights are omitted until animation
-/// needs them.
+/// Vertex layout handed to the GPU.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct MeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    /// Indices into the model's bone list, addressed directly.
+    pub bone_indices: [u8; 4],
+    /// Influences summing to 255; all zero means the vertex is not skinned.
+    pub bone_weights: [u8; 4],
 }
 
 #[repr(C)]
@@ -87,11 +90,16 @@ struct Camera {
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(1) @binding(1) var samp: sampler;
+// Storage rather than uniform: bone counts are per-model and reach 315, which
+// a fixed-size uniform array would have to over-allocate for.
+@group(2) @binding(0) var<storage, read> bones: array<mat4x4<f32>>;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
+    @location(3) bone_indices: vec4<u32>,
+    @location(4) bone_weights: vec4<f32>,
 };
 
 struct VsOut {
@@ -103,8 +111,38 @@ struct VsOut {
 @vertex
 fn vs(in: VsIn) -> VsOut {
     var out: VsOut;
-    out.clip = camera.view_proj * vec4<f32>(in.position, 1.0);
-    out.normal = in.normal;
+
+    let w = in.bone_weights;
+    let total = w.x + w.y + w.z + w.w;
+
+    var position = vec4<f32>(in.position, 1.0);
+    var normal = in.normal;
+
+    // Unweighted vertices exist -- rigid props parented to a single bone leave
+    // the weights blank -- so they pass through untransformed.
+    if (total > 0.001) {
+        let p = vec4<f32>(in.position, 1.0);
+        let n = vec4<f32>(in.normal, 0.0);
+        var skinned = vec4<f32>(0.0);
+        var skinned_n = vec3<f32>(0.0);
+
+        skinned = skinned + (bones[in.bone_indices.x] * p) * w.x;
+        skinned = skinned + (bones[in.bone_indices.y] * p) * w.y;
+        skinned = skinned + (bones[in.bone_indices.z] * p) * w.z;
+        skinned = skinned + (bones[in.bone_indices.w] * p) * w.w;
+
+        skinned_n = skinned_n + (bones[in.bone_indices.x] * n).xyz * w.x;
+        skinned_n = skinned_n + (bones[in.bone_indices.y] * n).xyz * w.y;
+        skinned_n = skinned_n + (bones[in.bone_indices.z] * n).xyz * w.z;
+        skinned_n = skinned_n + (bones[in.bone_indices.w] * n).xyz * w.w;
+
+        // Weights are quantised to 255ths and do not always sum to exactly 1.
+        position = skinned / total;
+        normal = skinned_n;
+    }
+
+    out.clip = camera.view_proj * position;
+    out.normal = normal;
     out.uv = in.uv;
     return out;
 }
@@ -175,7 +213,15 @@ pub struct MeshRenderer {
     pub camera_buffer: wgpu::Buffer,
     camera_bind: wgpu::BindGroup,
     material_layout: wgpu::BindGroupLayout,
+    bone_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+}
+
+/// Bone matrices for one model, plus the binding that exposes them.
+pub struct BoneBuffer {
+    pub buffer: wgpu::Buffer,
+    pub bind_group: wgpu::BindGroup,
+    pub count: usize,
 }
 
 impl MeshRenderer {
@@ -247,11 +293,31 @@ impl MeshRenderer {
             }],
         });
 
+        let bone_layout =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("bones"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+
         let layout = gpu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("mesh"),
-                bind_group_layouts: &[Some(&camera_layout), Some(&material_layout)],
+                bind_group_layouts: &[
+                    Some(&camera_layout),
+                    Some(&material_layout),
+                    Some(&bone_layout),
+                ],
                 immediate_size: 0,
             });
 
@@ -263,7 +329,43 @@ impl MeshRenderer {
             camera_buffer,
             camera_bind,
             material_layout,
+            bone_layout,
             sampler: crate::texture::default_sampler(gpu),
+        }
+    }
+
+    /// Allocates a bone palette. Always at least one matrix, because a storage
+    /// binding cannot be empty even when a model has no skeleton.
+    pub fn create_bones(&self, gpu: &Gpu, count: usize) -> BoneBuffer {
+        let count = count.max(1);
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bones"),
+            size: (count * std::mem::size_of::<[[f32; 4]; 4]>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bones"),
+            layout: &self.bone_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        BoneBuffer {
+            buffer,
+            bind_group,
+            count,
+        }
+    }
+
+    /// Uploads a pose. Extra matrices beyond the buffer's capacity are dropped
+    /// rather than overflowing it.
+    pub fn update_bones(&self, gpu: &Gpu, bones: &BoneBuffer, pose: &[[[f32; 4]; 4]]) {
+        let n = pose.len().min(bones.count);
+        if n > 0 {
+            gpu.queue
+                .write_buffer(&bones.buffer, 0, bytemuck::cast_slice(&pose[..n]));
         }
     }
 
@@ -367,7 +469,10 @@ fn build_pipeline(
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x3,
                         1 => Float32x3,
-                        2 => Float32x2
+                        2 => Float32x2,
+                        3 => Uint8x4,
+                        // Unorm so 255 arrives as 1.0 without a shader divide.
+                        4 => Unorm8x4
                     ],
                 })],
             },

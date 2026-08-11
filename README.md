@@ -29,6 +29,8 @@ the 3.3.5a data files you already own, exactly as
 - **M2 models** — header, vertex pool, bone hierarchy, materials, and the
   `.skin` files holding the actual triangles, plus the DBC walk that turns a
   creature display id into a model on disk.
+- **Animation** — keyframe tracks, the external `.anim` files most sequences
+  actually live in, alias resolution, and GPU skinning.
 
 Verified against a stock build 12340 install: 203,949 paths, of which 198,827
 read and decompress cleanly (21.4 GiB) and 5,121 are correctly masked by patch
@@ -59,7 +61,7 @@ MapRow { id: 0, directory: "Azeroth", instance_type: 0, name: "Eastern Kingdoms"
 GPU path is checked without a display:
 
 ```console
-cargo run -p wow-viewer -- --creature 1216            # a gnoll, skins and all
+cargo run -p wow-viewer -- --creature 1216            # a gnoll, skinned and animated
 cargo run -p wow-viewer -- --model 'World\...\HumanGuardTower.m2'
 cargo run -p wow-viewer -- --texture 'Interface\Icons\Spell_Fire_Fireball02.blp'
 cargo run -p wow-viewer -- --screenshot frame.png --creature 1216 --yaw 0

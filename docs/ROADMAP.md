@@ -31,7 +31,7 @@ where.
 |---|-----------|-----------|
 | 2.1 | **Window + wgpu device** ✅ | `apps/viewer`: textures on screen, egui overlay, headless `--screenshot` |
 | 2.2 | **Static M2 rendering** ✅ | Textured creatures and doodads, orbit camera, depth-sorted batches |
-| 2.3 | **M2 animation** | Bone transforms, keyframe interpolation, animation picker |
+| 2.3 | **M2 animation** ✅ | Keyframe tracks, external `.anim` files, GPU skinning, animation picker |
 | 2.4 | **WMO rendering** | Walk inside a building with correct lighting groups |
 | 2.5 | **Terrain rendering** | One ADT tile, correct texture blending |
 | 2.6 | **World streaming** | Free-fly across Azeroth, tiles loading and evicting |

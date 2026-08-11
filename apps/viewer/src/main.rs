@@ -20,7 +20,7 @@ use model::{LoadedModel, Variations};
 use mpq::Chain;
 use render::camera::Orbit;
 use render::capture::Offscreen;
-use render::mesh::{DepthBuffer, MeshRenderer};
+use render::mesh::{BoneBuffer, DepthBuffer, MeshRenderer};
 use render::{texture::upload_blp, Blitter, Gpu, UploadedTexture};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -68,6 +68,14 @@ struct Args {
     /// Camera pitch in degrees.
     #[arg(long)]
     pitch: Option<f32>,
+
+    /// Animation index to play. Omit for the bind pose.
+    #[arg(long)]
+    anim: Option<usize>,
+
+    /// Time within the animation, in milliseconds.
+    #[arg(long, default_value_t = 0)]
+    anim_time: u32,
 
     #[arg(long, default_value_t = 1280)]
     width: u32,
@@ -150,6 +158,7 @@ fn draw_scene(
     blitter: &Blitter,
     meshes: &MeshRenderer,
     material_binds: &[wgpu::BindGroup],
+    bones: Option<&BoneBuffer>,
 ) {
     match scene {
         Scene::Texture(tex) => {
@@ -189,6 +198,9 @@ fn draw_scene(
             });
 
             pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
+            if let Some(bones) = bones {
+                pass.set_bind_group(2, &bones.bind_group, &[]);
+            }
             pass.set_vertex_buffer(0, m.mesh.vertices.slice(..));
             pass.set_index_buffer(m.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
 
@@ -208,6 +220,34 @@ fn draw_scene(
             }
         }
     }
+}
+
+/// Evaluates a pose and uploads it, returning the matrices for reuse.
+///
+/// The bind pose is all-identity rather than a special case: an M2's vertices
+/// are already stored in bind pose, so identity matrices reproduce exactly what
+/// the unskinned renderer drew.
+fn upload_pose(
+    gpu: &Gpu,
+    meshes: &MeshRenderer,
+    bones: &BoneBuffer,
+    m: &LoadedModel,
+    anim: Option<usize>,
+    time_ms: u32,
+) {
+    let pose: Vec<[[f32; 4]; 4]> = match anim {
+        Some(seq) if seq < m.sequences.len() => {
+            // Wrap into the sequence so a caller can pass a free-running clock.
+            let duration = m.sequences[seq].duration_ms.max(1);
+            let t = time_ms % duration;
+            m2::Model::pose_bones(&m.bones, seq, t)
+                .iter()
+                .map(|mat| mat.to_cols_array_2d())
+                .collect()
+        }
+        _ => vec![glam::Mat4::IDENTITY.to_cols_array_2d(); m.bones.len().max(1)],
+    };
+    meshes.update_bones(gpu, bones, &pose);
 }
 
 fn material_bind_groups(
@@ -283,8 +323,12 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
 
     let scene = build_scene(&gpu, chain, args)?;
     let camera = initial_camera(&scene, args);
+    let mut bones = None;
     if let Scene::Model(m) = &scene {
         meshes.prepare(&gpu, m.draws.iter().map(|d| d.state));
+        let buffer = meshes.create_bones(&gpu, m.bones.len());
+        upload_pose(&gpu, &meshes, &buffer, m, args.anim, args.anim_time);
+        bones = Some(buffer);
     }
     let binds = material_bind_groups(&gpu, &meshes, &scene);
 
@@ -304,6 +348,7 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
         &blitter,
         &meshes,
         &binds,
+        bones.as_ref(),
     );
     gpu.queue.submit([encoder.finish()]);
 
@@ -341,6 +386,7 @@ struct Renderer {
     blitter: Blitter,
     meshes: MeshRenderer,
     material_binds: Vec<wgpu::BindGroup>,
+    bones: Option<BoneBuffer>,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
@@ -358,6 +404,12 @@ struct App {
     error: Option<String>,
     last_frame: Instant,
     frame_ms: f32,
+    /// Selected sequence, or `None` for the bind pose.
+    anim: Option<usize>,
+    /// Elapsed time within the current sequence.
+    anim_time_ms: u32,
+    playing: bool,
+    speed: f32,
 }
 
 impl App {
@@ -373,6 +425,10 @@ impl App {
             error: None,
             last_frame: Instant::now(),
             frame_ms: 0.0,
+            anim: None,
+            anim_time_ms: 0,
+            playing: true,
+            speed: 1.0,
         }
     }
 }
@@ -452,6 +508,15 @@ impl ApplicationHandler for App {
                 meshes.prepare(&gpu, m.draws.iter().map(|d| d.state));
             }
         }
+        let mut bones = None;
+        if let Some(Scene::Model(m)) = &scene {
+            bones = Some(meshes.create_bones(&gpu, m.bones.len()));
+            // Default to the first sequence that actually has keyframes, so
+            // the model is moving on arrival rather than standing in bind pose.
+            self.anim = self.args.anim.or_else(|| {
+                (!m.sequences.is_empty()).then_some(0)
+            });
+        }
         let material_binds = scene
             .as_ref()
             .map(|s| material_bind_groups(&gpu, &meshes, s))
@@ -465,6 +530,7 @@ impl ApplicationHandler for App {
             blitter,
             meshes,
             material_binds,
+            bones,
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -542,9 +608,20 @@ impl App {
         let ui_output = self.build_ui(window);
         let camera = self.camera;
 
+        // Advance the clock before posing, from real elapsed time so playback
+        // speed is independent of frame rate.
+        if self.playing {
+            let step = (self.frame_ms * self.speed).max(0.0) as u32;
+            self.anim_time_ms = self.anim_time_ms.wrapping_add(step);
+        }
+        let (anim, anim_time) = (self.anim, self.anim_time_ms);
+
         let Some(r) = self.renderer.as_mut() else {
             return;
         };
+        if let (Some(Scene::Model(m)), Some(bones)) = (&r.scene, &r.bones) {
+            upload_pose(&r.gpu, &r.meshes, bones, m, anim, anim_time);
+        }
 
         use wgpu::CurrentSurfaceTexture as Acquired;
         let frame = match r.surface.get_current_texture() {
@@ -590,6 +667,7 @@ impl App {
                 &r.blitter,
                 &r.meshes,
                 &r.material_binds,
+                r.bones.as_ref(),
             );
         }
 
@@ -651,6 +729,33 @@ impl App {
         let (error, frame_ms) = (self.error.clone(), self.frame_ms);
         let camera = self.camera;
 
+        // Snapshot what the picker needs, so the UI closure does not borrow the
+        // renderer while it mutates animation state.
+        let animations: Vec<(usize, String, u32)> = match &r.scene {
+            Some(Scene::Model(m)) => m
+                .sequences
+                .iter()
+                .enumerate()
+                .map(|(i, seq)| {
+                    (
+                        i,
+                        m.sequence_names
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("#{i}")),
+                        seq.duration_ms,
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let animated_bones = match &r.scene {
+            Some(Scene::Model(m)) => m.bones.iter().filter(|b| b.is_animated()).count(),
+            _ => 0,
+        };
+        let (mut anim, mut playing, mut speed, mut anim_time) =
+            (self.anim, self.playing, self.speed, self.anim_time_ms);
+
         let output = ctx.run_ui(input, |ctx| {
             egui::Window::new("open-wow")
                 .default_width(430.0)
@@ -668,6 +773,41 @@ impl App {
                     if let Some(e) = &error {
                         ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
                     }
+                    if !animations.is_empty() {
+                        ui.separator();
+                        ui.label(format!(
+                            "{} animations, {animated_bones} animated bones",
+                            animations.len()
+                        ));
+                        ui.horizontal(|ui| {
+                            if ui.button(if playing { "pause" } else { "play" }).clicked() {
+                                playing = !playing;
+                            }
+                            if ui.button("restart").clicked() {
+                                anim_time = 0;
+                            }
+                            ui.add(egui::Slider::new(&mut speed, 0.0..=2.0).text("speed"));
+                        });
+                        let current = anim
+                            .and_then(|i| animations.get(i))
+                            .map(|(_, n, d)| format!("{n} ({d} ms)"))
+                            .unwrap_or_else(|| "bind pose".into());
+                        ui.label(format!("playing: {current}  t={anim_time} ms"));
+
+                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                            if ui.selectable_label(anim.is_none(), "bind pose").clicked() {
+                                anim = None;
+                            }
+                            for (i, name, duration) in &animations {
+                                let label = format!("{i:>3}  {name}  {duration} ms");
+                                if ui.selectable_label(anim == Some(*i), label).clicked() {
+                                    anim = Some(*i);
+                                    anim_time = 0;
+                                }
+                            }
+                        });
+                    }
+
                     ui.separator();
                     ui.label(format!(
                         "camera: yaw {:.0}\u{b0}  pitch {:.0}\u{b0}  distance {:.2}",
@@ -678,6 +818,13 @@ impl App {
                     ui.weak("drag to orbit, scroll to zoom");
                 });
         });
+
+        // Selecting a different animation restarts it; otherwise keep the
+        // clock the UI may have reset.
+        self.anim_time_ms = if anim != self.anim { 0 } else { anim_time };
+        self.anim = anim;
+        self.playing = playing;
+        self.speed = speed;
 
         if let Some(r) = self.renderer.as_mut() {
             r.egui_state

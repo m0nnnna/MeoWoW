@@ -81,6 +81,12 @@ enum M2Command {
     },
     /// Resolve a creature display id to its model, the way the renderer will.
     Creature { display_id: u32 },
+    /// List a model's animations and how much of the skeleton each moves.
+    Anims {
+        path: String,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -125,7 +131,8 @@ enum DbcCommand {
     },
     /// Dump rows through a transcribed schema.
     Rows {
-        /// One of: Map, AreaTable, CreatureDisplayInfo, CreatureModelData, Spell.
+        /// One of: Map, AreaTable, CreatureDisplayInfo, CreatureModelData,
+        /// AnimationData, Spell.
         table: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -168,7 +175,113 @@ fn m2_cmd(chain: &mut Chain, cmd: M2Command) -> Result<()> {
         M2Command::Info { path, lod } => m2_info(chain, &path, lod),
         M2Command::Survey { filter, limit } => m2_survey(chain, filter.as_deref(), limit),
         M2Command::Creature { display_id } => m2_creature(chain, display_id),
+        M2Command::Anims { path, limit } => m2_anims(chain, &path, limit),
     }
+}
+
+fn m2_anims(chain: &mut Chain, path: &str, limit: usize) -> Result<()> {
+    let path = m2::model_path(path);
+    let model = m2::Model::parse(&chain.read(&path)?)?;
+    let sequences = model.sequences();
+
+    // Most sequences keep their keyframes in sibling .anim files.
+    let mut external = std::collections::BTreeMap::new();
+    let mut missing = 0usize;
+    for (i, seq) in sequences.iter().enumerate() {
+        if seq.is_inline() {
+            continue;
+        }
+        match chain.read(&m2::anim::external_anim_path(&path, seq)) {
+            Ok(bytes) => {
+                external.insert(i, bytes);
+            }
+            Err(_) => missing += 1,
+        }
+    }
+    let bones = model.animated_bones_with(&external);
+
+    // Animation ids are numbers in the model; the names live in a DBC.
+    let names = dbc::schema::AnimationData::parse(
+        &chain.read(dbc::schema::AnimationData::PATH)?,
+    )
+    .ok();
+    let name_of = |id: u16| -> String {
+        names
+            .as_ref()
+            .and_then(|t| t.iter().find(|r| r.id() == id as u32))
+            .map(|r| r.name().to_string())
+            .unwrap_or_else(|| format!("#{id}"))
+    };
+
+    let animated = bones.iter().filter(|b| b.is_animated()).count();
+    println!("{path}");
+    println!(
+        "  {} bones ({animated} animated), {} sequences",
+        bones.len(),
+        sequences.len()
+    );
+    println!(
+        "  {} external .anim files loaded, {missing} without one (aliases or absent)",
+        external.len()
+    );
+
+    println!(
+        "\n  {:>3} {:<22} {:>8} {:>5} {:>8} {:>7}  flags",
+        "idx", "name", "duration", "var", "keyed", "speed"
+    );
+    for (i, seq) in sequences.iter().enumerate().take(limit) {
+        // How many bones actually have keys for this sequence, which is what
+        // separates a real animation from an alias or an empty slot.
+        let keyed = bones
+            .iter()
+            .filter(|b| {
+                b.rotation.sample(i, 0).is_some()
+                    || b.translation.sample(i, 0).is_some()
+                    || b.scale.sample(i, 0).is_some()
+            })
+            .count();
+        let mut flags = Vec::new();
+        if seq.is_inline() {
+            flags.push("inline");
+        } else {
+            flags.push("external");
+        }
+        if seq.is_alias() {
+            flags.push("alias");
+        }
+        println!(
+            "  {i:>3} {:<22} {:>7}ms {:>5} {:>8} {:>7.2}  {}",
+            name_of(seq.id),
+            seq.duration_ms,
+            seq.variation,
+            keyed,
+            seq.move_speed,
+            flags.join(" ")
+        );
+    }
+    if sequences.len() > limit {
+        println!("  ... {} more", sequences.len() - limit);
+    }
+
+    // Bone indices in a vertex must address the model's bone list directly; if
+    // they were submesh-relative, this maximum would be far below the count.
+    let max_bone = model
+        .vertices()
+        .iter()
+        .flat_map(|v| {
+            v.bone_indices
+                .iter()
+                .zip(v.bone_weights)
+                .filter(|(_, w)| *w > 0)
+                .map(|(&i, _)| i as usize)
+        })
+        .max()
+        .unwrap_or(0);
+    println!(
+        "\n  highest vertex bone index: {max_bone} of {} bones",
+        bones.len()
+    );
+    Ok(())
 }
 
 fn m2_info(chain: &mut Chain, path: &str, lod: u32) -> Result<()> {
@@ -855,7 +968,7 @@ fn dbc_rows(chain: &mut Chain, table: &str, limit: usize) -> Result<()> {
         };
     }
 
-    dispatch!(Map, AreaTable, CreatureDisplayInfo, CreatureModelData, Spell)
+    dispatch!(Map, AreaTable, CreatureDisplayInfo, CreatureModelData, AnimationData, Spell)
 }
 
 fn dbc_check(chain: &mut Chain) -> Result<()> {
@@ -889,7 +1002,14 @@ fn dbc_check(chain: &mut Chain) -> Result<()> {
     }
 
     println!("checking transcribed schemas against this install:");
-    let failures = check!(Map, AreaTable, CreatureDisplayInfo, CreatureModelData, Spell);
+    let failures = check!(
+        Map,
+        AreaTable,
+        CreatureDisplayInfo,
+        CreatureModelData,
+        AnimationData,
+        Spell
+    );
     println!();
     if failures == 0 {
         println!("all schemas match");

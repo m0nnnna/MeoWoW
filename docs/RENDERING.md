@@ -139,3 +139,26 @@ directory comes from the **model's** path, never from the DBC:
 Unresolved slots fall back to a 1x1 white texture so the geometry still renders
 as shaded shape rather than failing to draw, and the overlay lists what was
 missing.
+
+## Skinning
+
+Bone matrices go to the GPU in a **storage** buffer rather than a uniform: bone
+counts are per-model and reach 315, which a fixed-size uniform array would have
+to over-allocate for. The palette is allocated per model and rewritten each
+frame from a freshly evaluated pose.
+
+Vertices carry `Uint8x4` bone indices and `Unorm8x4` weights, so 255 arrives in
+the shader as `1.0` with no divide. Indices address the model's bone list
+directly.
+
+Two details the shader has to handle:
+
+- **Weights do not always sum to exactly 1.** They are quantised to 255ths, so
+  the blended position is divided by the actual total.
+- **Unweighted vertices exist.** Rigid props parented to a single bone leave the
+  weights blank; those pass through untransformed rather than collapsing to the
+  origin.
+
+The bind pose is not a special case — it is all-identity matrices, which
+reproduces exactly what the unskinned renderer drew, so the two paths cannot
+drift apart.

@@ -26,6 +26,12 @@ pub struct LoadedModel {
     pub mesh: GpuMesh,
     pub draws: Vec<Draw>,
     pub textures: Vec<UploadedTexture>,
+    /// Skeleton with animation tracks, kept so poses can be evaluated per
+    /// frame rather than baked at load.
+    pub bones: Vec<m2::AnimatedBone>,
+    pub sequences: Vec<m2::Sequence>,
+    /// Human-readable name per sequence, from `AnimationData.dbc`.
+    pub sequence_names: Vec<String>,
     pub min: Vec3,
     pub max: Vec3,
     pub path: String,
@@ -159,6 +165,8 @@ pub fn load(
             position: v.position,
             normal: v.normal,
             uv: v.uv[0],
+            bone_indices: v.bone_indices,
+            bone_weights: v.bone_weights,
         })
         .collect();
 
@@ -266,10 +274,18 @@ pub fn load(
     };
 
     let triangle_count = indices.len() / 3;
+    let sequences = model.sequences();
+    let external = load_external_anims(chain, &path, &sequences);
+    let bones = model.animated_bones_with(&external);
+    let sequence_names = sequence_names(chain, &sequences);
+
     Ok(LoadedModel {
         mesh: GpuMesh::upload(gpu, &vertices, &indices),
         draws,
         textures,
+        bones,
+        sequences,
+        sequence_names,
         min,
         max,
         path,
@@ -277,6 +293,55 @@ pub fn load(
         triangle_count,
         missing_textures,
     })
+}
+
+/// Loads the `.anim` files holding keyframes that are not inline in the `.m2`.
+///
+/// A sequence without `is_inline` has no usable data in the model; its offsets
+/// address the external file. Missing files are skipped rather than fatal --
+/// aliases legitimately have none, and the loader falls back to bind pose.
+fn load_external_anims(
+    chain: &mut Chain,
+    model_path: &str,
+    sequences: &[m2::Sequence],
+) -> std::collections::BTreeMap<usize, Vec<u8>> {
+    sequences
+        .iter()
+        .enumerate()
+        .filter(|(_, seq)| !seq.is_inline())
+        .filter_map(|(i, seq)| {
+            let path = m2::anim::external_anim_path(model_path, seq);
+            chain.read(&path).ok().map(|bytes| (i, bytes))
+        })
+        .collect()
+}
+
+/// Resolves each sequence's numeric animation id to a name.
+///
+/// Names are per-id, and models routinely ship several variations of the same
+/// animation, so the variation index is appended to keep entries distinct in a
+/// picker.
+fn sequence_names(chain: &mut Chain, sequences: &[m2::Sequence]) -> Vec<String> {
+    let table = chain
+        .read(dbc::schema::AnimationData::PATH)
+        .ok()
+        .and_then(|b| dbc::schema::AnimationData::parse(&b).ok());
+
+    sequences
+        .iter()
+        .map(|seq| {
+            let name = table
+                .as_ref()
+                .and_then(|t| t.iter().find(|r| r.id() == seq.id as u32))
+                .map(|r| r.name().to_string())
+                .unwrap_or_else(|| format!("#{}", seq.id));
+            if seq.variation == 0 {
+                name
+            } else {
+                format!("{name} ({})", seq.variation)
+            }
+        })
+        .collect()
 }
 
 /// Looks up the model and skins for a creature display id.

@@ -6,7 +6,8 @@
 
 use render::capture::Offscreen;
 use render::mesh::{
-    BlendMode, CameraUniform, DepthBuffer, GpuMesh, MeshRenderer, MeshVertex, RenderState,
+    BlendMode, BoneBuffer, CameraUniform, DepthBuffer, GpuMesh, MeshRenderer, MeshVertex,
+    RenderState,
 };
 use render::Gpu;
 
@@ -74,26 +75,28 @@ fn solid(gpu: &Gpu, rgba: [u8; 4]) -> wgpu::TextureView {
 ///
 /// Winding is clockwise to match the front face the pipelines expect, and
 /// normals point at the light so shading is a no-op and the output colour is
-/// the texture's.
+/// the texture's. `weights` of zero selects the unskinned path.
+fn quad_weighted(z: f32, bone: u8, weight: u8) -> [MeshVertex; 3] {
+    let vertex = |x: f32, y: f32| MeshVertex {
+        position: [x, y, z],
+        normal: [0.0, 0.0, 1.0],
+        uv: [0.0, 0.0],
+        bone_indices: [bone, 0, 0, 0],
+        bone_weights: [weight, 0, 0, 0],
+    };
+    [vertex(-1.0, -1.0), vertex(-1.0, 3.0), vertex(3.0, -1.0)]
+}
+
 fn quad(z: f32) -> [MeshVertex; 3] {
-    let n = [0.0, 0.0, 1.0];
-    [
-        MeshVertex {
-            position: [-1.0, -1.0, z],
-            normal: n,
-            uv: [0.0, 0.0],
-        },
-        MeshVertex {
-            position: [-1.0, 3.0, z],
-            normal: n,
-            uv: [0.0, 0.0],
-        },
-        MeshVertex {
-            position: [3.0, -1.0, z],
-            normal: n,
-            uv: [0.0, 0.0],
-        },
-    ]
+    quad_weighted(z, 0, 0)
+}
+
+/// A bone palette holding a single transform.
+fn bones_with(gpu: &Gpu, meshes: &MeshRenderer, matrices: &[glam::Mat4]) -> BoneBuffer {
+    let buffer = meshes.create_bones(gpu, matrices.len().max(1));
+    let raw: Vec<[[f32; 4]; 4]> = matrices.iter().map(|m| m.to_cols_array_2d()).collect();
+    meshes.update_bones(gpu, &buffer, &raw);
+    buffer
 }
 
 /// An identity camera, so vertex positions are clip coordinates directly and
@@ -126,6 +129,7 @@ fn render_pair(gpu: &Gpu, first_z: f32, second_z: f32) -> [u8; 4] {
     };
     meshes.prepare(gpu, [state]);
     meshes.update_camera(gpu, &identity_camera());
+    let bones = bones_with(gpu, &meshes, &[glam::Mat4::IDENTITY]);
 
     let first = GpuMesh::upload(gpu, &quad(first_z), &[0, 1, 2]);
     let second = GpuMesh::upload(gpu, &quad(second_z), &[0, 1, 2]);
@@ -161,6 +165,7 @@ fn render_pair(gpu: &Gpu, first_z: f32, second_z: f32) -> [u8; 4] {
         });
         pass.set_pipeline(meshes.get(state).expect("pipeline"));
         pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
+        pass.set_bind_group(2, &bones.bind_group, &[]);
 
         pass.set_bind_group(1, &red, &[]);
         pass.set_vertex_buffer(0, first.vertices.slice(..));
@@ -252,4 +257,90 @@ fn all_blend_modes_build() {
         }
     }
     assert_eq!(meshes.pipeline_count(), 8);
+}
+
+/// Skinning must actually move geometry, and an unweighted vertex must not be
+/// moved at all.
+///
+/// The bone translates far along +X. A weighted triangle is pushed off screen
+/// and disappears; an identical unweighted one stays put. Testing both
+/// directions is what distinguishes working skinning from a shader that
+/// silently ignores the bone matrix.
+#[test]
+fn skinning_moves_weighted_vertices_only() {
+    let gpu = require_gpu!();
+    let (w, h) = (32u32, 32u32);
+
+    let render = |weight: u8| -> [u8; 4] {
+        let target = Offscreen::new(&gpu, w, h, FORMAT);
+        let depth = DepthBuffer::new(&gpu, w, h);
+        let mut meshes = MeshRenderer::new(&gpu, FORMAT);
+        let state = RenderState {
+            blend: BlendMode::Opaque,
+            two_sided: true,
+            depth_write: true,
+        };
+        meshes.prepare(&gpu, [state]);
+        meshes.update_camera(&gpu, &identity_camera());
+
+        // Bone 0 shoves everything well outside the clip volume.
+        let bones = bones_with(
+            &gpu,
+            &meshes,
+            &[glam::Mat4::from_translation(glam::Vec3::new(10.0, 0.0, 0.0))],
+        );
+        let mesh = GpuMesh::upload(&gpu, &quad_weighted(0.5, 0, weight), &[0, 1, 2]);
+        let red = meshes.material_bind_group(&gpu, &solid(&gpu, [255, 0, 0, 255]));
+
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                multiview_mask: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(meshes.get(state).expect("pipeline"));
+            pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
+            pass.set_bind_group(1, &red, &[]);
+            pass.set_bind_group(2, &bones.bind_group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..3, 0, 0..1);
+        }
+        gpu.queue.submit([encoder.finish()]);
+        let pixels = target.read_rgba(&gpu).expect("readback");
+        centre_pixel(&pixels, w, h)
+    };
+
+    let unweighted = render(0);
+    assert!(
+        unweighted[0] > 200,
+        "an unweighted vertex must ignore the bone, got {unweighted:?}"
+    );
+
+    let weighted = render(255);
+    assert!(
+        weighted[0] < 40,
+        "a fully weighted vertex must follow the bone off screen, got {weighted:?}"
+    );
 }
