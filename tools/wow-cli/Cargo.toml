@@ -17,3 +17,4 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 m2 = { version = "0.0.1", path = "../../crates/m2" }
+wmo = { version = "0.0.1", path = "../../crates/wmo" }

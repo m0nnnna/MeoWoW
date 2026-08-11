@@ -61,6 +61,26 @@ enum Command {
     /// Inspect models.
     #[command(subcommand)]
     M2(M2Command),
+    /// Inspect world objects: buildings, dungeons, bridges.
+    #[command(subcommand)]
+    Wmo(WmoCommand),
+}
+
+#[derive(Subcommand)]
+enum WmoCommand {
+    /// Show a root file and its groups.
+    Info {
+        /// Archive path of the root `.wmo`, not a `_000` group file.
+        path: String,
+        #[arg(long, default_value_t = 12)]
+        limit: usize,
+    },
+    /// Parse every root and group in the archives, validating the arrays.
+    Survey {
+        filter: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -167,7 +187,204 @@ fn main() -> Result<()> {
         Command::Dbc(cmd) => dbc_cmd(&mut chain, cmd),
         Command::Blp(cmd) => blp_cmd(&mut chain, cmd),
         Command::M2(cmd) => m2_cmd(&mut chain, cmd),
+        Command::Wmo(cmd) => wmo_cmd(&mut chain, cmd),
     }
+}
+
+fn wmo_cmd(chain: &mut Chain, cmd: WmoCommand) -> Result<()> {
+    match cmd {
+        WmoCommand::Info { path, limit } => wmo_info(chain, &path, limit),
+        WmoCommand::Survey { filter, limit } => wmo_survey(chain, filter.as_deref(), limit),
+    }
+}
+
+fn wmo_info(chain: &mut Chain, path: &str, limit: usize) -> Result<()> {
+    if wmo::is_group_path(path) {
+        anyhow::bail!("{path} is a group file; pass the root .wmo instead");
+    }
+    let bytes = chain.read(path)?;
+    let root = wmo::Root::parse(&bytes)?;
+    // Group names live in the root, so groups need it passed in.
+    let names = wmo::Chunks::find(&bytes, b"MOGN").unwrap_or(&[]).to_vec();
+    let h = root.header;
+
+    println!("{path}");
+    println!(
+        "  {} groups, {} materials, {} textures, {} portals, {} lights",
+        h.group_count,
+        root.materials.len(),
+        root.textures().len(),
+        h.portal_count,
+        h.light_count
+    );
+    println!(
+        "  bounds [{:.1} {:.1} {:.1}] .. [{:.1} {:.1} {:.1}]",
+        h.bounding_box.0[0],
+        h.bounding_box.0[1],
+        h.bounding_box.0[2],
+        h.bounding_box.1[0],
+        h.bounding_box.1[1],
+        h.bounding_box.1[2]
+    );
+    println!(
+        "  ambient {:?}, flags {:#x}, wmo id {}",
+        h.ambient_color, h.flags, h.wmo_id
+    );
+
+    if !root.doodad_sets.is_empty() {
+        println!("\n  doodad sets:");
+        for set in &root.doodad_sets {
+            let name = if set.name.is_empty() { "<unnamed>" } else { &set.name };
+            println!("    {name:<24} {} doodads", set.count);
+        }
+    }
+
+    println!("\n  textures:");
+    for texture in root.textures().iter().take(limit) {
+        println!("    {texture}");
+    }
+
+    println!("\n  groups:");
+    let (mut verts, mut tris, mut collision, mut failures) = (0usize, 0usize, 0usize, 0usize);
+    for i in 0..h.group_count as usize {
+        let gpath = wmo::group_path(path, i);
+        let Ok(gbytes) = chain.read(&gpath) else {
+            println!("    {i:>3}: {gpath} MISSING");
+            failures += 1;
+            continue;
+        };
+        let group = match wmo::Group::parse(&gbytes, &names) {
+            Ok(g) => g,
+            Err(e) => {
+                println!("    {i:>3}: {e}");
+                failures += 1;
+                continue;
+            }
+        };
+        verts += group.vertices.len();
+        tris += group.triangle_count();
+        let hidden = group
+            .triangle_materials
+            .iter()
+            .filter(|t| t.is_collision_only())
+            .count();
+        collision += hidden;
+
+        if i < limit {
+            let name = if group.name.is_empty() { "<unnamed>" } else { &group.name };
+            let hidden_note = if hidden > 0 {
+                format!("{hidden} collision-only")
+            } else {
+                String::new()
+            };
+            println!(
+                "    {i:>3}: {name:<26} {:>6} verts {:>6} tris {:>3} batches  {}{}{hidden_note}",
+                group.vertices.len(),
+                group.triangle_count(),
+                group.batches.len(),
+                if group.is_interior() { "interior " } else { "exterior " },
+                if group.has_vertex_colors() { "vcolors " } else { "" },
+            );
+        }
+        if let Err(e) = group.validate() {
+            println!("         INVALID: {e}");
+            failures += 1;
+        }
+    }
+    if h.group_count as usize > limit {
+        println!("    ... {} more", h.group_count as usize - limit);
+    }
+    println!(
+        "\n  total: {verts} vertices, {tris} triangles, {collision} collision-only, \
+         {failures} problems"
+    );
+    Ok(())
+}
+
+fn wmo_survey(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let needle = filter.map(str::to_lowercase);
+    // Group files sit beside their roots and parse as WMOs; treating each as a
+    // building would count every wall as its own object.
+    let roots: Vec<String> = chain
+        .list()?
+        .into_iter()
+        .filter(|n| {
+            let l = n.to_lowercase();
+            l.ends_with(".wmo")
+                && !wmo::is_group_path(&l)
+                && needle.as_ref().is_none_or(|f| l.contains(f.as_str()))
+        })
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+
+    let mut failures: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let (mut ok, mut groups, mut verts, mut tris) = (0usize, 0usize, 0u64, 0u64);
+    let (mut doodads, mut unresolved, mut biggest) = (0u64, 0usize, 0usize);
+
+    for (i, name) in roots.iter().enumerate() {
+        let Ok(bytes) = chain.read(name) else {
+            unresolved += 1;
+            continue;
+        };
+        let root = match wmo::Root::parse(&bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                let key = e.to_string();
+                let key = key.split(" (").next().unwrap_or(&key).to_string();
+                failures.entry(key).or_insert((0, name.clone())).0 += 1;
+                continue;
+            }
+        };
+        ok += 1;
+        doodads += root.doodads.len() as u64;
+        let names = wmo::Chunks::find(&bytes, b"MOGN").unwrap_or(&[]).to_vec();
+
+        for gi in 0..root.header.group_count as usize {
+            let gpath = wmo::group_path(name, gi);
+            let Ok(gbytes) = chain.read(&gpath) else {
+                failures
+                    .entry("group file missing".into())
+                    .or_insert((0, gpath.clone()))
+                    .0 += 1;
+                continue;
+            };
+            match wmo::Group::parse(&gbytes, &names) {
+                Ok(group) => {
+                    groups += 1;
+                    verts += group.vertices.len() as u64;
+                    tris += group.triangle_count() as u64;
+                    biggest = biggest.max(group.vertices.len());
+                    if let Err(e) = group.validate() {
+                        let key = format!("group invalid: {}", first_clause(&e));
+                        failures.entry(key).or_insert((0, gpath.clone())).0 += 1;
+                    }
+                }
+                Err(e) => {
+                    let key = format!("group parse: {}", first_clause(&e.to_string()));
+                    failures.entry(key).or_insert((0, gpath.clone())).0 += 1;
+                }
+            }
+        }
+        if i % 500 == 499 {
+            tracing::info!("{}/{} objects", i + 1, roots.len());
+        }
+    }
+
+    println!("\n{ok}/{} root objects parsed, {groups} groups", roots.len());
+    println!("  {verts} vertices, {tris} triangles, {doodads} doodad placements");
+    println!("  largest group: {biggest} vertices");
+    println!("  {unresolved} listed roots did not resolve (tombstoned or stale)");
+    if failures.is_empty() {
+        println!("\nno failures");
+    } else {
+        println!("\nfailures:");
+        for (kind, (count, example)) in &failures {
+            println!("  {count:>7}  {kind}\n           e.g. {example}");
+        }
+    }
+    Ok(())
 }
 
 fn m2_cmd(chain: &mut Chain, cmd: M2Command) -> Result<()> {

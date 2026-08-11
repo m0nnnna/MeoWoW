@@ -72,12 +72,34 @@ impl BlendMode {
     }
 }
 
+/// Which face of a triangle is the front.
+///
+/// M2 and WMO disagree: M2 winds clockwise, WMO counter-clockwise. Using one
+/// convention for both culls exactly the surfaces you want to see -- a WMO roof
+/// vanishes and you look straight through it at the interior ceiling, which
+/// reads as a hole rather than as a culling bug.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Winding {
+    Clockwise,
+    CounterClockwise,
+}
+
+impl Winding {
+    fn to_wgpu(self) -> wgpu::FrontFace {
+        match self {
+            Self::Clockwise => wgpu::FrontFace::Cw,
+            Self::CounterClockwise => wgpu::FrontFace::Ccw,
+        }
+    }
+}
+
 /// Everything about a batch that selects a pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RenderState {
     pub blend: BlendMode,
     pub two_sided: bool,
     pub depth_write: bool,
+    pub winding: Winding,
 }
 
 const SHADER: &str = r#"
@@ -487,8 +509,7 @@ fn build_pipeline(
                 })],
             }),
             primitive: wgpu::PrimitiveState {
-                // M2 triangles wind clockwise when viewed from the front.
-                front_face: wgpu::FrontFace::Cw,
+                front_face: state.winding.to_wgpu(),
                 cull_mode: if state.two_sided {
                     None
                 } else {
@@ -550,6 +571,15 @@ impl DepthBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn winding_maps_to_front_face() {
+        assert_eq!(Winding::Clockwise.to_wgpu(), wgpu::FrontFace::Cw);
+        assert_eq!(
+            Winding::CounterClockwise.to_wgpu(),
+            wgpu::FrontFace::Ccw
+        );
+    }
 
     #[test]
     fn maps_m2_blend_values() {

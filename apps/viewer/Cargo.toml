@@ -26,3 +26,4 @@ tracing-subscriber.workspace = true
 m2 = { version = "0.0.1", path = "../../crates/m2" }
 dbc = { version = "0.0.1", path = "../../crates/dbc" }
 glam.workspace = true
+wmo = { version = "0.0.1", path = "../../crates/wmo" }

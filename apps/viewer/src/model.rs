@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use glam::Vec3;
 use mpq::Chain;
-use render::mesh::{BlendMode, GpuMesh, MeshVertex, RenderState};
+use render::mesh::{BlendMode, GpuMesh, MeshVertex, RenderState, Winding};
 use render::{texture::upload_blp, Gpu, UploadedTexture};
 
 /// One draw call: a slice of the index buffer with the state to draw it.
@@ -84,7 +84,7 @@ fn variation_path(model_path: &str, name: &str) -> String {
 
 /// A 1x1 white texture, so a model with unresolved slots still renders as
 /// shaded geometry instead of failing to draw.
-fn placeholder(gpu: &Gpu) -> UploadedTexture {
+pub fn placeholder(gpu: &Gpu) -> UploadedTexture {
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("placeholder"),
         size: wgpu::Extent3d {
@@ -239,6 +239,7 @@ pub fn load(
                 // Transparent geometry must not occlude what is behind it, and
                 // the format says so per material as well.
                 depth_write: !blend.is_transparent() && !material.depth_write_disabled(),
+                winding: Winding::Clockwise,
             },
             texture,
             submesh_id: submesh.id,

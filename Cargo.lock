@@ -3665,6 +3665,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "wmo"
+version = "0.0.1"
+dependencies = [
+ "mpq",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "wow-cli"
 version = "0.0.1"
 dependencies = [
@@ -3677,6 +3686,7 @@ dependencies = [
  "png 0.17.16",
  "tracing",
  "tracing-subscriber",
+ "wmo",
 ]
 
 [[package]]
@@ -3700,6 +3710,7 @@ dependencies = [
  "tracing-subscriber",
  "wgpu",
  "winit",
+ "wmo",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@
 //! in CI.
 
 mod model;
+mod world_object;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,6 +54,14 @@ struct Args {
     #[arg(long)]
     creature: Option<u32>,
 
+    /// Archive path of a world object's root `.wmo`.
+    #[arg(long)]
+    wmo: Option<String>,
+
+    /// Draw only this WMO group, for isolating geometry.
+    #[arg(long)]
+    wmo_group: Option<usize>,
+
     /// Level of detail, 0 being the most detailed.
     #[arg(long, default_value_t = 0)]
     lod: u32,
@@ -88,6 +97,35 @@ struct Args {
 enum Scene {
     Texture(Box<UploadedTexture>),
     Model(Box<LoadedModel>),
+    WorldObject(Box<world_object::LoadedWmo>),
+}
+
+impl Scene {
+    /// Geometry shared by the model and world-object paths, so both draw
+    /// through the same code.
+    fn geometry(&self) -> Option<(&render::mesh::GpuMesh, &[model::Draw])> {
+        match self {
+            Scene::Model(m) => Some((&m.mesh, &m.draws)),
+            Scene::WorldObject(w) => Some((&w.mesh, &w.draws)),
+            Scene::Texture(_) => None,
+        }
+    }
+
+    fn textures(&self) -> &[UploadedTexture] {
+        match self {
+            Scene::Model(m) => &m.textures,
+            Scene::WorldObject(w) => &w.textures,
+            Scene::Texture(_) => &[],
+        }
+    }
+
+    fn bounds(&self) -> Option<(glam::Vec3, glam::Vec3)> {
+        match self {
+            Scene::Model(m) => Some((m.min, m.max)),
+            Scene::WorldObject(w) => Some((w.min, w.max)),
+            Scene::Texture(_) => None,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -125,15 +163,19 @@ fn build_scene(gpu: &Gpu, chain: &mut Chain, args: &Args) -> Result<Scene> {
         let loaded = model::load(gpu, chain, path, &Variations::default(), args.lod)?;
         return Ok(Scene::Model(Box::new(loaded)));
     }
+    if let Some(path) = &args.wmo {
+        let loaded = world_object::load(gpu, chain, path, args.wmo_group)?;
+        return Ok(Scene::WorldObject(Box::new(loaded)));
+    }
     let path = args.texture.as_deref().unwrap_or(DEFAULT_TEXTURE);
     let parsed = blp::Blp::parse(&chain.read(path)?)?;
     Ok(Scene::Texture(Box::new(upload_blp(gpu, &parsed, path))))
 }
 
 fn initial_camera(scene: &Scene, args: &Args) -> Orbit {
-    let mut camera = match scene {
-        Scene::Model(m) => Orbit::frame(m.min, m.max),
-        Scene::Texture(_) => Orbit::default(),
+    let mut camera = match scene.bounds() {
+        Some((min, max)) => Orbit::frame(min, max),
+        None => Orbit::default(),
     };
     if let Some(yaw) = args.yaw {
         camera.yaw = yaw.to_radians();
@@ -160,11 +202,13 @@ fn draw_scene(
     material_binds: &[wgpu::BindGroup],
     bones: Option<&BoneBuffer>,
 ) {
-    match scene {
-        Scene::Texture(tex) => {
-            blitter.draw(gpu, encoder, color, size, &tex.view, (tex.width, tex.height));
+    match scene.geometry() {
+        None => {
+            if let Scene::Texture(tex) = scene {
+                blitter.draw(gpu, encoder, color, size, &tex.view, (tex.width, tex.height));
+            }
         }
-        Scene::Model(m) => {
+        Some((mesh, draw_list)) => {
             let aspect = size.0 as f32 / size.1.max(1) as f32;
             meshes.update_camera(gpu, &camera.uniform(aspect));
 
@@ -201,10 +245,10 @@ fn draw_scene(
             if let Some(bones) = bones {
                 pass.set_bind_group(2, &bones.bind_group, &[]);
             }
-            pass.set_vertex_buffer(0, m.mesh.vertices.slice(..));
-            pass.set_index_buffer(m.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
 
-            for draw in &m.draws {
+            for draw in draw_list {
                 let (Some(pipeline), Some(binds)) =
                     (meshes.get(draw.state), material_binds.get(draw.texture))
                 else {
@@ -255,14 +299,11 @@ fn material_bind_groups(
     meshes: &MeshRenderer,
     scene: &Scene,
 ) -> Vec<wgpu::BindGroup> {
-    match scene {
-        Scene::Model(m) => m
-            .textures
-            .iter()
-            .map(|t| meshes.material_bind_group(gpu, &t.view))
-            .collect(),
-        Scene::Texture(_) => Vec::new(),
-    }
+    scene
+        .textures()
+        .iter()
+        .map(|t| meshes.material_bind_group(gpu, &t.view))
+        .collect()
 }
 
 fn describe(scene: &Scene) -> String {
@@ -306,6 +347,30 @@ fn describe(scene: &Scene) -> String {
             }
             s
         }
+        Scene::WorldObject(w) => {
+            let mut s = format!(
+                "{}\n{} vertices, {} triangles\n{} groups, {} draw calls, {} textures",
+                w.path,
+                w.vertex_count,
+                w.triangle_count,
+                w.group_count,
+                w.draws.len(),
+                w.textures.len()
+            );
+            if w.collision_triangles > 0 {
+                s.push_str(&format!(
+                    "\n{} collision-only triangles (not drawn)",
+                    w.collision_triangles
+                ));
+            }
+            if !w.doodad_sets.is_empty() {
+                s.push_str(&format!("\ndoodad sets: {}", w.doodad_sets.join(", ")));
+            }
+            if !w.missing_textures.is_empty() {
+                s.push_str(&format!("\nunresolved: {}", w.missing_textures.join(", ")));
+            }
+            s
+        }
     }
 }
 
@@ -323,11 +388,20 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
 
     let scene = build_scene(&gpu, chain, args)?;
     let camera = initial_camera(&scene, args);
+    // Any scene with geometry needs its pipelines built and a bone palette
+    // bound -- rigid world objects included, where the palette is identity.
     let mut bones = None;
-    if let Scene::Model(m) = &scene {
-        meshes.prepare(&gpu, m.draws.iter().map(|d| d.state));
-        let buffer = meshes.create_bones(&gpu, m.bones.len());
-        upload_pose(&gpu, &meshes, &buffer, m, args.anim, args.anim_time);
+    if let Some((_, draws)) = scene.geometry() {
+        meshes.prepare(&gpu, draws.iter().map(|d| d.state));
+        let bone_count = match &scene {
+            Scene::Model(m) => m.bones.len(),
+            _ => 1,
+        };
+        let buffer = meshes.create_bones(&gpu, bone_count);
+        match &scene {
+            Scene::Model(m) => upload_pose(&gpu, &meshes, &buffer, m, args.anim, args.anim_time),
+            _ => meshes.update_bones(&gpu, &buffer, &[glam::Mat4::IDENTITY.to_cols_array_2d()]),
+        }
         bones = Some(buffer);
     }
     let binds = material_bind_groups(&gpu, &meshes, &scene);
@@ -504,18 +578,25 @@ impl ApplicationHandler for App {
         };
         if let Some(scene) = &scene {
             self.camera = initial_camera(scene, &self.args);
-            if let Scene::Model(m) = scene {
-                meshes.prepare(&gpu, m.draws.iter().map(|d| d.state));
-            }
         }
         let mut bones = None;
-        if let Some(Scene::Model(m)) = &scene {
-            bones = Some(meshes.create_bones(&gpu, m.bones.len()));
-            // Default to the first sequence that actually has keyframes, so
-            // the model is moving on arrival rather than standing in bind pose.
-            self.anim = self.args.anim.or_else(|| {
-                (!m.sequences.is_empty()).then_some(0)
-            });
+        if let Some(scene) = &scene {
+            if let Some((_, draws)) = scene.geometry() {
+                meshes.prepare(&gpu, draws.iter().map(|d| d.state));
+                let bone_count = match scene {
+                    Scene::Model(m) => m.bones.len(),
+                    _ => 1,
+                };
+                let buffer = meshes.create_bones(&gpu, bone_count);
+                // Rigid geometry still needs a bound palette; identity leaves
+                // it untouched.
+                meshes.update_bones(&gpu, &buffer, &[glam::Mat4::IDENTITY.to_cols_array_2d()]);
+                bones = Some(buffer);
+            }
+            if let Scene::Model(m) = scene {
+                // Start on a real animation rather than the bind pose.
+                self.anim = self.args.anim.or_else(|| (!m.sequences.is_empty()).then_some(0));
+            }
         }
         let material_binds = scene
             .as_ref()

@@ -8,9 +8,9 @@ the 3.3.5a data files you already own, exactly as
 [OpenMW](https://openmw.org/) does for Morrowind. It talks to existing
 3.3.5a-compatible servers.
 
-> **Status: early.** Reads a real installation's archives, tables, textures and
-> models, and renders animated creatures. No world, no networking yet. See
-> [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status: early.** Reads a real installation's archives, tables, textures,
+> models and world objects, and renders animated creatures and buildings. No
+> terrain, no networking yet. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What works today
 
@@ -32,13 +32,16 @@ the 3.3.5a data files you already own, exactly as
   creature display id into a model on disk.
 - **Animation** — keyframe tracks, the external `.anim` files most sequences
   actually live in, alias resolution, and GPU skinning.
+- **WMO objects** — buildings and dungeon interiors: root plus group files,
+  materials, render batches, collision separation, and doodad sets.
 
 Verified against a stock build 12340 install: 203,949 paths, of which 198,827
 read and decompress cleanly (21.4 GiB) and 5,121 are correctly masked by patch
 tombstones. The one remaining unresolved path is a stale entry in Blizzard's
 own listfile. All 245 DBC tables present in the install parse, as do all
-107,927 readable textures and all 22,779 models with their 24,626 skins
-(9.9M vertices, 15.9M triangles).
+107,927 readable textures, all 22,779 models with their 24,626 skins
+(9.9M vertices, 15.9M triangles), and all 1,985 world objects with their 9,346
+groups (29.4M vertices, 31.6M triangles).
 
 ```console
 $ wow-cli --data "D:/Games/World of Warcraft 3.3.5a/Data" info
@@ -63,6 +66,7 @@ GPU path is checked without a display:
 
 ```console
 cargo run -p wow-viewer -- --creature 1216            # a gnoll, skinned and animated
+cargo run -p wow-viewer -- --wmo 'World\wmo\Azeroth\Buildings\Human_Farm\Farm.wmo'
 cargo run -p wow-viewer -- --model 'World\...\HumanGuardTower.m2'
 cargo run -p wow-viewer -- --texture 'Interface\Icons\Spell_Fire_Fireball02.blp'
 cargo run -p wow-viewer -- --screenshot frame.png --creature 1216 --yaw 0

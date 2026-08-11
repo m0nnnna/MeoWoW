@@ -7,7 +7,7 @@
 use render::capture::Offscreen;
 use render::mesh::{
     BlendMode, BoneBuffer, CameraUniform, DepthBuffer, GpuMesh, MeshRenderer, MeshVertex,
-    RenderState,
+    RenderState, Winding,
 };
 use render::Gpu;
 
@@ -126,6 +126,7 @@ fn render_pair(gpu: &Gpu, first_z: f32, second_z: f32) -> [u8; 4] {
         blend: BlendMode::Opaque,
         two_sided: true,
         depth_write: true,
+        winding: Winding::Clockwise,
     };
     meshes.prepare(gpu, [state]);
     meshes.update_camera(gpu, &identity_camera());
@@ -216,6 +217,7 @@ fn pipelines_are_cached_per_state() {
         blend: BlendMode::Opaque,
         two_sided: false,
         depth_write: true,
+        winding: Winding::Clockwise,
     };
     let b = RenderState {
         two_sided: true,
@@ -225,6 +227,7 @@ fn pipelines_are_cached_per_state() {
         blend: BlendMode::Additive,
         two_sided: true,
         depth_write: false,
+        winding: Winding::Clockwise,
     };
 
     meshes.prepare(&gpu, [a, b, c, a, b]);
@@ -251,6 +254,7 @@ fn all_blend_modes_build() {
                 blend,
                 two_sided,
                 depth_write: !blend.is_transparent(),
+                winding: Winding::Clockwise,
             };
             meshes.prepare(&gpu, [state]);
             assert!(meshes.get(state).is_some(), "{blend:?} two_sided={two_sided}");
@@ -279,6 +283,7 @@ fn skinning_moves_weighted_vertices_only() {
             blend: BlendMode::Opaque,
             two_sided: true,
             depth_write: true,
+            winding: Winding::Clockwise,
         };
         meshes.prepare(&gpu, [state]);
         meshes.update_camera(&gpu, &identity_camera());
