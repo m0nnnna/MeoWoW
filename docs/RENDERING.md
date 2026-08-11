@@ -162,3 +162,38 @@ Two details the shader has to handle:
 The bind pose is not a special case — it is all-identity matrices, which
 reproduces exactly what the unskinned renderer drew, so the two paths cannot
 drift apart.
+
+## Per-object transforms
+
+Placements are **instance attributes**, not a uniform: a `mat4` occupying vertex
+locations 5 to 8 with `step_mode: Instance`. One buffer holds every transform in
+a scene and each draw selects its range, so nothing is rebound between objects
+and identical models collapse into a single instanced draw — a tile with 785
+doodads loads 83 meshes.
+
+Normals are transformed by the same matrix without an inverse-transpose, which
+is correct only because placements are rigid with uniform scale. If non-uniform
+scaling ever appears, that shortcut has to go.
+
+A vertex buffer cannot be empty, so `InstanceBuffer::upload` substitutes a
+single identity entry rather than allowing a zero-length buffer, and
+single-asset scenes bind an identity instance so they take the same path.
+
+## Placement coordinates
+
+ADT placements are stored with the axes permuted relative to terrain vertices:
+the stored middle component is height, and the other two run *inwards* from the
+grid corner, so converting is `32 * TILE_SIZE - v`. Getting it wrong puts every
+object somewhere plausible but entirely elsewhere.
+
+Rotations are Euler degrees in the game's internal Y-up space, and yaw is offset
+by 90 degrees because the stored angle is measured from a different axis than
+the model's forward.
+
+## Framing a tile
+
+Frame on the **tile**, not on everything it references. A tile at the edge of a
+city lists that city's WMO in full: Northshire pulls in all of Stormwind, whose
+bounding box is over a thousand units across, and framing that shrinks the tile
+to a speck beside a distant cluster of buildings. That looked like a placement
+bug for a while and was simply correct geography.

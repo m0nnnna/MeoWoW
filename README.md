@@ -71,7 +71,7 @@ GPU path is checked without a display:
 
 ```console
 cargo run -p wow-viewer -- --creature 1216            # a gnoll, skinned and animated
-cargo run -p wow-viewer -- --map Azeroth --tile 32,48   # Northshire terrain
+cargo run -p wow-viewer -- --map Azeroth --tile 32,48 --world  # Northshire, populated
 cargo run -p wow-viewer -- --wmo 'World\wmo\Azeroth\Buildings\Human_Farm\Farm.wmo'
 cargo run -p wow-viewer -- --model 'World\...\HumanGuardTower.m2'
 cargo run -p wow-viewer -- --texture 'Interface\Icons\Spell_Fire_Fireball02.blp'

@@ -28,6 +28,32 @@ pub struct MeshVertex {
     pub bone_weights: [u8; 4],
 }
 
+/// A per-object transform, supplied as instance data.
+///
+/// Instance attributes rather than a uniform, so a scene can hold thousands of
+/// placements in one buffer and a draw selects its own by index -- no rebinding
+/// between objects, and identical models can later share a draw call.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct Instance {
+    pub model: [[f32; 4]; 4],
+}
+
+impl Instance {
+    pub fn from_cols_array_2d(model: [[f32; 4]; 4]) -> Self {
+        Self { model }
+    }
+
+    pub const IDENTITY: Self = Self {
+        model: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+    };
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct CameraUniform {
@@ -122,6 +148,11 @@ struct VsIn {
     @location(2) uv: vec2<f32>,
     @location(3) bone_indices: vec4<u32>,
     @location(4) bone_weights: vec4<f32>,
+    // Per-instance model matrix, one column per location.
+    @location(5) model_0: vec4<f32>,
+    @location(6) model_1: vec4<f32>,
+    @location(7) model_2: vec4<f32>,
+    @location(8) model_3: vec4<f32>,
 };
 
 struct VsOut {
@@ -163,8 +194,11 @@ fn vs(in: VsIn) -> VsOut {
         normal = skinned_n;
     }
 
-    out.clip = camera.view_proj * position;
-    out.normal = normal;
+    let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
+    out.clip = camera.view_proj * model * position;
+    // Placements are rigid with uniform scale, so the model matrix rotates
+    // normals correctly without a separate inverse-transpose.
+    out.normal = (model * vec4<f32>(normal, 0.0)).xyz;
     out.uv = in.uv;
     return out;
 }
@@ -485,18 +519,30 @@ fn build_pipeline(
                 module: shader,
                 entry_point: Some("vs"),
                 compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<MeshVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x3,
-                        1 => Float32x3,
-                        2 => Float32x2,
-                        3 => Uint8x4,
-                        // Unorm so 255 arrives as 1.0 without a shader divide.
-                        4 => Unorm8x4
-                    ],
-                })],
+                buffers: &[
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<MeshVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x3,
+                            1 => Float32x3,
+                            2 => Float32x2,
+                            3 => Uint8x4,
+                            // Unorm so 255 arrives as 1.0 without a shader divide.
+                            4 => Unorm8x4
+                        ],
+                    }),
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Instance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![
+                            5 => Float32x4,
+                            6 => Float32x4,
+                            7 => Float32x4,
+                            8 => Float32x4
+                        ],
+                    }),
+                ],
             },
             fragment: Some(wgpu::FragmentState {
                 module: shader,
@@ -528,6 +574,36 @@ fn build_pipeline(
             multiview_mask: None,
             cache: None,
         })
+}
+
+/// Per-object transforms for a whole scene.
+pub struct InstanceBuffer {
+    pub buffer: wgpu::Buffer,
+    pub len: usize,
+}
+
+impl InstanceBuffer {
+    pub fn upload(gpu: &Gpu, instances: &[Instance]) -> Self {
+        use wgpu::util::DeviceExt;
+        // A vertex buffer cannot be empty, so an empty scene still gets one
+        // identity entry.
+        let fallback = [Instance::IDENTITY];
+        let data = if instances.is_empty() {
+            &fallback[..]
+        } else {
+            instances
+        };
+        Self {
+            buffer: gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("instances"),
+                    contents: bytemuck::cast_slice(data),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+            len: data.len(),
+        }
+    }
 }
 
 /// A depth attachment matching the colour target's size.

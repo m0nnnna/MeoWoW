@@ -9,6 +9,7 @@
 //! in CI.
 
 mod model;
+mod scene;
 mod terrain;
 mod world_object;
 
@@ -71,6 +72,14 @@ struct Args {
     #[arg(long, default_value = "32,48")]
     tile: String,
 
+    /// Load the tile's buildings and doodads too, not just its terrain.
+    #[arg(long)]
+    world: bool,
+
+    /// Cap on doodad placements, since a dense tile has hundreds.
+    #[arg(long, default_value_t = 4000)]
+    max_doodads: usize,
+
     /// Level of detail, 0 being the most detailed.
     #[arg(long, default_value_t = 0)]
     lod: u32,
@@ -108,6 +117,7 @@ enum Scene {
     Model(Box<LoadedModel>),
     WorldObject(Box<world_object::LoadedWmo>),
     Terrain(Box<terrain::LoadedTerrain>),
+    World(Box<scene::WorldScene>),
 }
 
 impl Scene {
@@ -118,7 +128,7 @@ impl Scene {
             Scene::Model(m) => Some((&m.mesh, &m.draws)),
             Scene::WorldObject(w) => Some((&w.mesh, &w.draws)),
             Scene::Terrain(t) => Some((&t.mesh, &t.draws)),
-            Scene::Texture(_) => None,
+            Scene::Texture(_) | Scene::World(_) => None,
         }
     }
 
@@ -127,7 +137,7 @@ impl Scene {
             Scene::Model(m) => &m.textures,
             Scene::WorldObject(w) => &w.textures,
             Scene::Terrain(t) => &t.textures,
-            Scene::Texture(_) => &[],
+            Scene::Texture(_) | Scene::World(_) => &[],
         }
     }
 
@@ -136,6 +146,7 @@ impl Scene {
             Scene::Model(m) => Some((m.min, m.max)),
             Scene::WorldObject(w) => Some((w.min, w.max)),
             Scene::Terrain(t) => Some((t.min, t.max)),
+            Scene::World(w) => Some((w.min, w.max)),
             Scene::Texture(_) => None,
         }
     }
@@ -181,8 +192,12 @@ fn build_scene(gpu: &Gpu, chain: &mut Chain, args: &Args) -> Result<Scene> {
         return Ok(Scene::WorldObject(Box::new(loaded)));
     }
     if let Some(map) = &args.map {
-        let (x, y) = parse_tile(&args.tile)?;
-        let loaded = terrain::load(gpu, chain, map, x, y)?;
+        let tile = parse_tile(&args.tile)?;
+        if args.world {
+            let loaded = scene::load(gpu, chain, map, tile, args.max_doodads)?;
+            return Ok(Scene::World(Box::new(loaded)));
+        }
+        let loaded = terrain::load(gpu, chain, map, tile.0, tile.1)?;
         return Ok(Scene::Terrain(Box::new(loaded)));
     }
     let path = args.texture.as_deref().unwrap_or(DEFAULT_TEXTURE);
@@ -227,7 +242,74 @@ fn draw_scene(
     meshes: &MeshRenderer,
     material_binds: &[wgpu::BindGroup],
     bones: Option<&BoneBuffer>,
+    world_binds: &[Vec<wgpu::BindGroup>],
+    identity: &render::mesh::InstanceBuffer,
 ) {
+    // A world holds many meshes, so it cannot go through the single-mesh path.
+    if let Scene::World(world) = scene {
+        {
+            let aspect = size.0 as f32 / size.1.max(1) as f32;
+            meshes.update_camera(gpu, &camera.uniform(aspect));
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("world"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.42,
+                            g: 0.55,
+                            b: 0.70,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                multiview_mask: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
+            if let Some(bones) = bones {
+                pass.set_bind_group(2, &bones.bind_group, &[]);
+            }
+            pass.set_vertex_buffer(1, world.instances.buffer.slice(..));
+
+            for (item, binds) in world.items.iter().zip(world_binds) {
+                pass.set_vertex_buffer(0, item.mesh.vertices.slice(..));
+                pass.set_index_buffer(item.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                let instances =
+                    item.instance_start..item.instance_start + item.instance_count;
+                for draw in &item.draws {
+                    let (Some(pipeline), Some(bind)) =
+                        (meshes.get(draw.state), binds.get(draw.texture))
+                    else {
+                        continue;
+                    };
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(1, bind, &[]);
+                    pass.draw_indexed(
+                        draw.first_index..draw.first_index + draw.index_count,
+                        0,
+                        instances.clone(),
+                    );
+                }
+            }
+        }
+        return;
+    }
+
     match scene.geometry() {
         None => {
             if let Scene::Texture(tex) = scene {
@@ -272,6 +354,8 @@ fn draw_scene(
                 pass.set_bind_group(2, &bones.bind_group, &[]);
             }
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            // Single-asset scenes draw at the origin.
+            pass.set_vertex_buffer(1, identity.buffer.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
 
             for draw in draw_list {
@@ -318,6 +402,42 @@ fn upload_pose(
         _ => vec![glam::Mat4::IDENTITY.to_cols_array_2d(); m.bones.len().max(1)],
     };
     meshes.update_bones(gpu, bones, &pose);
+}
+
+/// One bind-group list per scene item, since each carries its own textures.
+fn world_bind_groups(
+    gpu: &Gpu,
+    meshes: &MeshRenderer,
+    scene: &Scene,
+) -> Vec<Vec<wgpu::BindGroup>> {
+    match scene {
+        Scene::World(w) => w
+            .items
+            .iter()
+            .map(|item| {
+                item.textures
+                    .iter()
+                    .map(|t| meshes.material_bind_group(gpu, &t.view))
+                    .collect()
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every render state a scene needs, including multi-mesh worlds.
+fn scene_states(scene: &Scene) -> Vec<render::mesh::RenderState> {
+    match scene {
+        Scene::World(w) => w
+            .items
+            .iter()
+            .flat_map(|i| i.draws.iter().map(|d| d.state))
+            .collect(),
+        other => other
+            .geometry()
+            .map(|(_, draws)| draws.iter().map(|d| d.state).collect())
+            .unwrap_or_default(),
+    }
 }
 
 fn material_bind_groups(
@@ -370,6 +490,25 @@ fn describe(scene: &Scene) -> String {
                     "\nunresolved: {}",
                     m.missing_textures.join(", ")
                 ));
+            }
+            s
+        }
+        Scene::World(w) => {
+            let mut s = format!(
+                "{}
+{} terrain triangles
+{} buildings and {} doodads from {} unique models
+                 {} draw calls",
+                w.label,
+                w.terrain_triangles,
+                w.object_instances,
+                w.doodad_instances,
+                w.unique_models,
+                w.draw_calls
+            );
+            if !w.skipped.is_empty() {
+                s.push_str(&format!("
+{} models could not load", w.skipped.len()));
             }
             s
         }
@@ -437,21 +576,20 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     let camera = initial_camera(&scene, args);
     // Any scene with geometry needs its pipelines built and a bone palette
     // bound -- rigid world objects included, where the palette is identity.
-    let mut bones = None;
-    if let Some((_, draws)) = scene.geometry() {
-        meshes.prepare(&gpu, draws.iter().map(|d| d.state));
-        let bone_count = match &scene {
-            Scene::Model(m) => m.bones.len(),
-            _ => 1,
-        };
-        let buffer = meshes.create_bones(&gpu, bone_count);
-        match &scene {
-            Scene::Model(m) => upload_pose(&gpu, &meshes, &buffer, m, args.anim, args.anim_time),
-            _ => meshes.update_bones(&gpu, &buffer, &[glam::Mat4::IDENTITY.to_cols_array_2d()]),
-        }
-        bones = Some(buffer);
+    meshes.prepare(&gpu, scene_states(&scene));
+    let bone_count = match &scene {
+        Scene::Model(m) => m.bones.len(),
+        _ => 1,
+    };
+    let bone_buffer = meshes.create_bones(&gpu, bone_count);
+    match &scene {
+        Scene::Model(m) => upload_pose(&gpu, &meshes, &bone_buffer, m, args.anim, args.anim_time),
+        _ => meshes.update_bones(&gpu, &bone_buffer, &[glam::Mat4::IDENTITY.to_cols_array_2d()]),
     }
+    let bones = Some(bone_buffer);
     let binds = material_bind_groups(&gpu, &meshes, &scene);
+    let world_binds = world_bind_groups(&gpu, &meshes, &scene);
+    let identity = render::mesh::InstanceBuffer::upload(&gpu, &[render::mesh::Instance::IDENTITY]);
 
     let mut encoder = gpu
         .device
@@ -470,6 +608,8 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
         &meshes,
         &binds,
         bones.as_ref(),
+        &world_binds,
+        &identity,
     );
     gpu.queue.submit([encoder.finish()]);
 
@@ -507,6 +647,8 @@ struct Renderer {
     blitter: Blitter,
     meshes: MeshRenderer,
     material_binds: Vec<wgpu::BindGroup>,
+    world_binds: Vec<Vec<wgpu::BindGroup>>,
+    identity: render::mesh::InstanceBuffer,
     bones: Option<BoneBuffer>,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -628,23 +770,28 @@ impl ApplicationHandler for App {
         }
         let mut bones = None;
         if let Some(scene) = &scene {
-            if let Some((_, draws)) = scene.geometry() {
-                meshes.prepare(&gpu, draws.iter().map(|d| d.state));
-                let bone_count = match scene {
-                    Scene::Model(m) => m.bones.len(),
-                    _ => 1,
-                };
-                let buffer = meshes.create_bones(&gpu, bone_count);
-                // Rigid geometry still needs a bound palette; identity leaves
-                // it untouched.
-                meshes.update_bones(&gpu, &buffer, &[glam::Mat4::IDENTITY.to_cols_array_2d()]);
-                bones = Some(buffer);
-            }
+            meshes.prepare(&gpu, scene_states(scene));
+            let bone_count = match scene {
+                Scene::Model(m) => m.bones.len(),
+                _ => 1,
+            };
+            let buffer = meshes.create_bones(&gpu, bone_count);
+            // Rigid geometry still needs a bound palette; identity leaves it
+            // untouched.
+            meshes.update_bones(&gpu, &buffer, &[glam::Mat4::IDENTITY.to_cols_array_2d()]);
+            bones = Some(buffer);
+
             if let Scene::Model(m) = scene {
                 // Start on a real animation rather than the bind pose.
                 self.anim = self.args.anim.or_else(|| (!m.sequences.is_empty()).then_some(0));
             }
         }
+        let world_binds = scene
+            .as_ref()
+            .map(|s| world_bind_groups(&gpu, &meshes, s))
+            .unwrap_or_default();
+        let identity =
+            render::mesh::InstanceBuffer::upload(&gpu, &[render::mesh::Instance::IDENTITY]);
         let material_binds = scene
             .as_ref()
             .map(|s| material_bind_groups(&gpu, &meshes, s))
@@ -658,6 +805,8 @@ impl ApplicationHandler for App {
             blitter,
             meshes,
             material_binds,
+            world_binds,
+            identity,
             bones,
             egui_ctx,
             egui_state,
@@ -796,6 +945,8 @@ impl App {
                 &r.meshes,
                 &r.material_binds,
                 r.bones.as_ref(),
+                &r.world_binds,
+                &r.identity,
             );
         }
 

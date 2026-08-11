@@ -6,8 +6,8 @@
 
 use render::capture::Offscreen;
 use render::mesh::{
-    BlendMode, BoneBuffer, CameraUniform, DepthBuffer, GpuMesh, MeshRenderer, MeshVertex,
-    RenderState, Winding,
+    BlendMode, BoneBuffer, CameraUniform, DepthBuffer, GpuMesh, Instance, InstanceBuffer,
+    MeshRenderer, MeshVertex, RenderState, Winding,
 };
 use render::Gpu;
 
@@ -131,6 +131,9 @@ fn render_pair(gpu: &Gpu, first_z: f32, second_z: f32) -> [u8; 4] {
     meshes.prepare(gpu, [state]);
     meshes.update_camera(gpu, &identity_camera());
     let bones = bones_with(gpu, &meshes, &[glam::Mat4::IDENTITY]);
+    // Geometry is authored in clip space here, so the instance transform is
+    // identity.
+    let instances = InstanceBuffer::upload(gpu, &[Instance::IDENTITY]);
 
     let first = GpuMesh::upload(gpu, &quad(first_z), &[0, 1, 2]);
     let second = GpuMesh::upload(gpu, &quad(second_z), &[0, 1, 2]);
@@ -167,6 +170,7 @@ fn render_pair(gpu: &Gpu, first_z: f32, second_z: f32) -> [u8; 4] {
         pass.set_pipeline(meshes.get(state).expect("pipeline"));
         pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
         pass.set_bind_group(2, &bones.bind_group, &[]);
+        pass.set_vertex_buffer(1, instances.buffer.slice(..));
 
         pass.set_bind_group(1, &red, &[]);
         pass.set_vertex_buffer(0, first.vertices.slice(..));
@@ -295,6 +299,7 @@ fn skinning_moves_weighted_vertices_only() {
             &[glam::Mat4::from_translation(glam::Vec3::new(10.0, 0.0, 0.0))],
         );
         let mesh = GpuMesh::upload(&gpu, &quad_weighted(0.5, 0, weight), &[0, 1, 2]);
+        let instances = InstanceBuffer::upload(&gpu, &[Instance::IDENTITY]);
         let red = meshes.material_bind_group(&gpu, &solid(&gpu, [255, 0, 0, 255]));
 
         let mut encoder = gpu
@@ -329,6 +334,7 @@ fn skinning_moves_weighted_vertices_only() {
             pass.set_bind_group(1, &red, &[]);
             pass.set_bind_group(2, &bones.bind_group, &[]);
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_vertex_buffer(1, instances.buffer.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..3, 0, 0..1);
         }
