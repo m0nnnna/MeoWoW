@@ -47,3 +47,19 @@ target-dir = "C:/Users/you/.cargo-targets/open-wow-client"
 
 This is also substantially faster than writing gigabytes of intermediate
 artifacts over SMB.
+
+## Windows will not run a test binary named like an installer
+
+Windows applies an installer-detection heuristic to executable *filenames*: a
+binary whose name contains `install`, `setup`, `update`, or `patch` triggers a
+UAC elevation prompt. Cargo names a test binary after its source file, so
+`tests/real_install.rs` produces `real_install-<hash>.exe` and the test run
+dies with:
+
+```
+The requested operation requires elevation. (os error 740)
+```
+
+Name integration tests around the data they use, not the installation —
+`tests/real_data.rs`. This is worth remembering given how much of this project
+deals with patches and installs.

@@ -138,20 +138,41 @@ fn extract(chain: &mut Chain, name: &str, out: Option<PathBuf>) -> Result<()> {
 }
 
 fn which(chain: &Chain, name: &str) -> Result<()> {
+    println!("{name}");
     match chain.source_of(name) {
         Some(path) => {
-            println!("{name}\n  -> {}", path.display());
+            println!("  -> {}", path.display());
             if let Some(e) = chain.stat(name) {
                 println!(
-                    "     {} bytes ({} packed){}{}",
+                    "     {} bytes ({} packed), flags {:#010x}{}{}",
                     e.size,
                     e.packed_size,
+                    e.flags,
                     if e.compressed { ", compressed" } else { "" },
                     if e.encrypted { ", encrypted" } else { "" },
                 );
             }
         }
-        None => println!("{name}\n  -> not present in any archive"),
+        None => println!("  -> does not resolve"),
+    }
+
+    // The full chain matters when a patch deletes something the base still
+    // holds: the winning answer alone does not explain why.
+    let trace = chain.trace(name);
+    if !trace.is_empty() {
+        println!("\n  chain (highest priority first):");
+        for (path, state) in trace {
+            let file = path.file_name().unwrap_or_default().to_string_lossy();
+            match state {
+                mpq::State::Present { size, flags } => {
+                    println!("    {file:<30} present  {size:>9} bytes  flags {flags:#010x}")
+                }
+                mpq::State::Deleted { size, flags } => {
+                    println!("    {file:<30} DELETED  {size:>9} bytes  flags {flags:#010x}")
+                }
+                mpq::State::Absent => {}
+            }
+        }
     }
     Ok(())
 }

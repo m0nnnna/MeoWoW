@@ -74,6 +74,18 @@ struct HashEntry {
     block_index: u32,
 }
 
+/// What one archive says about a path, as distinct from what the chain
+/// concludes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Lookup {
+    Present(BlockEntry, u16),
+    /// A tombstone: the patch that introduced it removes the file, and lower
+    /// archives in the chain must not be consulted.
+    Deleted,
+    /// No entry at all.
+    Absent,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct BlockEntry {
     offset: u64,
@@ -92,6 +104,17 @@ pub struct Entry {
     pub compressed: bool,
     pub encrypted: bool,
     pub locale: u16,
+    /// Raw block flags, for diagnostics.
+    pub flags: u32,
+}
+
+/// One archive's verdict on a path, for diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Present { size: u32, flags: u32 },
+    /// A tombstone left by a patch.
+    Deleted { size: u32, flags: u32 },
+    Absent,
 }
 
 /// A single opened `.MPQ` file.
@@ -184,10 +207,28 @@ impl Archive {
     }
 
     fn block_of(&self, name: &str) -> Option<(BlockEntry, u16)> {
-        let hash = self.find(name)?;
-        let block = *self.block_table.get(hash.block_index as usize)?;
-        (block.flags & flags::EXISTS != 0 && block.flags & flags::DELETE_MARKER == 0)
-            .then_some((block, hash.locale))
+        match self.lookup(name) {
+            Lookup::Present(block, locale) => Some((block, locale)),
+            Lookup::Deleted | Lookup::Absent => None,
+        }
+    }
+
+    /// Distinguishes "this archive has no opinion about the path" from "this
+    /// archive deletes it", which a patch chain must treat differently.
+    pub(crate) fn lookup(&self, name: &str) -> Lookup {
+        let Some(hash) = self.find(name) else {
+            return Lookup::Absent;
+        };
+        let Some(&block) = self.block_table.get(hash.block_index as usize) else {
+            return Lookup::Absent;
+        };
+        if block.flags & flags::DELETE_MARKER != 0 {
+            Lookup::Deleted
+        } else if block.flags & flags::EXISTS != 0 {
+            Lookup::Present(block, hash.locale)
+        } else {
+            Lookup::Absent
+        }
     }
 
     pub fn contains(&self, name: &str) -> bool {
@@ -202,7 +243,30 @@ impl Archive {
             compressed: block.flags & (flags::COMPRESS | flags::IMPLODE) != 0,
             encrypted: block.flags & flags::ENCRYPTED != 0,
             locale,
+            flags: block.flags,
         })
+    }
+
+    /// This archive's verdict on `name`, ignoring any chain it sits in.
+    pub fn state(&self, name: &str) -> State {
+        match self.lookup(name) {
+            Lookup::Present(b, _) => State::Present {
+                size: b.size,
+                flags: b.flags,
+            },
+            Lookup::Deleted => {
+                // Re-read the block purely to report its recorded size, which
+                // is the evidence that a tombstone carries no payload.
+                let b = self
+                    .find(name)
+                    .and_then(|h| self.block_table.get(h.block_index as usize));
+                State::Deleted {
+                    size: b.map_or(0, |b| b.size),
+                    flags: b.map_or(0, |b| b.flags),
+                }
+            }
+            Lookup::Absent => State::Absent,
+        }
     }
 
     /// Reads and fully decodes a member.

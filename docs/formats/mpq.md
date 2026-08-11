@@ -83,9 +83,40 @@ Filesystem case is not consistent even within one install — a stock directory
 holds both `patch-3.MPQ` and `Patch-U.mpq` — so archive files are resolved
 case-insensitively.
 
+### Delete markers
+
+A patch can *remove* a file, and it does so by adding an entry with
+`DELETE_MARKER` (`0x02000000`), zero size, and no compression flags —
+`Creature\KodobeastPack\KodoBeastPack.m2` carries flags `0x82000000` in
+`patch.MPQ` while the real 206,800-byte model still sits in `common-2.MPQ`
+below it.
+
+**A tombstone must stop the chain search, not be skipped.** Treating it as
+"this archive doesn't have the file" falls through to the stale copy
+underneath and resurrects content the real client never loads. On a stock
+install this is 5,121 files — 2.5% of everything — so the failure is quiet
+rather than obvious.
+
+The rule: walk from highest priority down, and the first archive with *any*
+entry decides, whether that entry is a file or a tombstone.
+
 ## Verification
 
 `wow-cli verify` reads and decompresses every listed file. On a stock install
-that is ~204k files and ~16 GiB, and it is the cheapest way to catch a parser
-regression: a systematic error shows up as one large bucket in the failure
-summary rather than as scattered noise.
+that is 203,949 paths and 21.4 GiB decompressed, and it is the cheapest way to
+catch a parser regression: a systematic error shows up as one large bucket in
+the failure summary rather than as scattered noise. It is also how the delete
+marker bug above was found — the failure count moved by 5,121 in a single
+change.
+
+Expected result on a stock 12340 install: **198,827 files read, 5,122 not
+resolving.** Of those, 5,121 are correctly-masked tombstones and exactly one
+— `Sound\Creature\PathaleonTheCalculator\TEMPEST_Pathal_Charm02.wav` — is a
+stale listfile entry with no backing hash entry anywhere. Every sibling in that
+directory reads fine, so it is Blizzard's bookkeeping error, not ours.
+
+`Chain::list` therefore returns names the archives *claim*, not names that
+resolve. Filtering it would make `verify` tautological.
+
+`wow-cli which <path>` prints the whole chain with per-archive flags, which is
+the tool for answering "why did I get this version of this file".

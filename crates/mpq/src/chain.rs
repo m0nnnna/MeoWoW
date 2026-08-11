@@ -71,24 +71,37 @@ impl Chain {
         Ok(chain)
     }
 
-    /// Highest-priority archive containing `name`.
-    fn owner(&mut self, name: &str) -> Option<&mut Archive> {
-        let idx = self
-            .archives
+    /// Index of the archive that wins for `name`, or `None` if the chain
+    /// resolves it to nothing.
+    ///
+    /// The first archive with an opinion decides. That includes a delete
+    /// marker: a patch that removes a file must mask the copy still sitting in
+    /// the base archive below it, so the search stops rather than falling
+    /// through.
+    fn resolve(&self, name: &str) -> Option<usize> {
+        self.archives
             .iter()
-            .rposition(|archive| archive.contains(name))?;
+            .enumerate()
+            .rev()
+            .find_map(|(i, archive)| match archive.lookup(name) {
+                crate::Lookup::Present(..) => Some(Some(i)),
+                crate::Lookup::Deleted => Some(None),
+                crate::Lookup::Absent => None,
+            })
+            .flatten()
+    }
+
+    fn owner(&mut self, name: &str) -> Option<&mut Archive> {
+        let idx = self.resolve(name)?;
         self.archives.get_mut(idx)
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.archives.iter().any(|a| a.contains(name))
+        self.resolve(name).is_some()
     }
 
     pub fn stat(&self, name: &str) -> Option<Entry> {
-        self.archives
-            .iter()
-            .rev()
-            .find_map(|archive| archive.stat(name))
+        self.archives[self.resolve(name)?].stat(name)
     }
 
     /// Reads a file, resolving it against the load order.
@@ -100,18 +113,30 @@ impl Chain {
 
     /// Reports which archive would win for `name`.
     pub fn source_of(&self, name: &str) -> Option<&Path> {
-        self.archives
-            .iter()
-            .rev()
-            .find(|a| a.contains(name))
-            .map(|a| a.path())
+        Some(self.archives[self.resolve(name)?].path())
     }
 
     pub fn archives(&self) -> impl Iterator<Item = &Archive> {
         self.archives.iter()
     }
 
+    /// Every archive's verdict on `name`, highest priority first, skipping
+    /// archives with no entry. Diagnostic only.
+    pub fn trace(&self, name: &str) -> Vec<(&Path, crate::State)> {
+        self.archives
+            .iter()
+            .rev()
+            .map(|a| (a.path(), a.state(name)))
+            .filter(|(_, s)| *s != crate::State::Absent)
+            .collect()
+    }
+
     /// Union of every archive's `(listfile)`, deduplicated.
+    ///
+    /// These are names the archives *claim*, not names guaranteed to resolve.
+    /// Stock installs ship listfile entries with no backing hash entry, and
+    /// deleted files stay listed. Reconciling the two is `wow-cli verify`'s
+    /// job, so this deliberately does not filter.
     pub fn list(&mut self) -> Result<Vec<String>, Error> {
         let mut all = Vec::new();
         for archive in &mut self.archives {

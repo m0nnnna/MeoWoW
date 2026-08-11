@@ -16,8 +16,13 @@ the 3.3.5a data files you already own, exactly as
 - **MPQ archives** — format versions 0 and 1, zlib and bzip2 sectors,
   encrypted files, single-unit and sectored storage, sparse decoding.
 - **Patch chains** — resolves a path across all 17 archives of a stock
-  installation in the client's load order, so patches correctly shadow base
-  content.
+  installation in the client's load order, including delete markers, so
+  patches correctly shadow *and remove* base content.
+
+Verified against a stock build 12340 install: 203,949 paths, of which 198,827
+read and decompress cleanly (21.4 GiB) and 5,121 are correctly masked by patch
+tombstones. The one remaining unresolved path is a stale entry in Blizzard's
+own listfile.
 
 ```console
 $ wow-cli --data "D:/Games/World of Warcraft 3.3.5a/Data" info
