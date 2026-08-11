@@ -349,6 +349,27 @@ over too. Chaining the legs is what makes this evidence: any single move could b
 a coincidence of a stale read, but four in sequence returning exactly to the
 origin could not.
 
+## Turning on the spot
+
+Orientation normally reaches the server as a side effect of the position in a
+movement packet, so a character that turns without walking keeps its old facing
+for everyone else. `MSG_MOVE_SET_FACING` (0x00DA) reports it on its own;
+confirmed by turning to 90° and 270° and reading the value back on re-entry.
+
+## A packet sent just before disconnecting can be lost
+
+Worth its own note, because it produces a false negative that looks exactly like
+a wrong opcode. The first `MSG_MOVE_SET_FACING` test sent one packet and exited
+immediately; the facing did not change, and the obvious reading was that 0x00DA
+was wrong. It was not — the server had not processed the packet by the time the
+socket closed. Holding the connection open for half a second afterwards makes it
+take, every time.
+
+Walking never showed this because a walk takes seconds and its last heartbeat is
+long since processed. Anything that sends a single packet and leaves needs to
+wait, and the CLI's `--face` now drains briefly before returning for exactly
+this reason.
+
 ## Open questions
 
 An unidentified opcode **0x029D** arrives exactly once per movement packet sent,

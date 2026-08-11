@@ -105,6 +105,11 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   disconnect, while `SMSG_LOGIN_VERIFY_WORLD` reports the live one. The movement
   had worked all along. When a change appears not to have taken, confirm the
   thing being read is the thing being written.
+- **Give the other end time to act before concluding it ignored you.** A single
+  packet sent immediately before disconnecting is often never processed, and the
+  result is indistinguishable from having sent the wrong thing. A facing opcode
+  was briefly written off as wrong on exactly this evidence; half a second of
+  waiting made it work every time.
 - **Writing a format is riskier than reading it.** A bad read fails loudly at a
   known offset; a bad write is accepted as some other valid message and shows up
   as wrong behaviour far away. Where a structure travels both ways, define it

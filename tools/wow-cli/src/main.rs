@@ -130,6 +130,9 @@ enum Command {
         /// character is already facing.
         #[arg(long)]
         heading: Option<f32>,
+        /// Turn on the spot to this heading, in degrees, without walking.
+        #[arg(long)]
+        face: Option<f32>,
         /// After entering, hold the connection open this many seconds,
         /// answering keepalives. Proves the session survives rather than being
         /// dropped a minute in.
@@ -292,6 +295,7 @@ fn main() -> Result<()> {
             dump_failed,
             walk,
             heading,
+            face,
             stay,
             port,
             timeout,
@@ -300,6 +304,7 @@ fn main() -> Result<()> {
                 dump_failed: dump_failed.as_deref(),
                 walk: *walk,
                 heading: *heading,
+                face: *face,
                 stay: *stay,
                 host,
                 port: *port,
@@ -399,6 +404,7 @@ struct WorldRequest<'a> {
     dump_failed: Option<&'a std::path::Path>,
     walk: Option<f32>,
     heading: Option<f32>,
+    face: Option<f32>,
     stay: u64,
     locale: &'a str,
     timeout: u64,
@@ -424,6 +430,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         dump_failed,
         walk,
         heading,
+        face,
         stay,
         locale,
         timeout,
@@ -542,6 +549,25 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         // Nothing marks the end of the login burst, so read until it stops.
         let rest = connection.drain(std::time::Duration::from_millis(1500), 512)?;
         report_object_updates(&rest, character.guid, dump_failed)?;
+
+        if let Some(degrees) = face {
+            let at = world::Position {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                orientation: position.orientation,
+            };
+            let heading = degrees.to_radians();
+            connection.set_facing(character.guid, at, heading)?;
+            // Stay on the line briefly. A packet sent and immediately followed
+            // by a disconnect can be lost: the server has not processed it by
+            // the time the socket closes, and the result is indistinguishable
+            // from the packet having been malformed. This one cost a wrong
+            // conclusion about the opcode before the pause was added.
+            connection.drain(std::time::Duration::from_millis(500), 64)?;
+            println!("\nturned to face {heading:.2} rad ({degrees:.0} deg)");
+            println!("  re-enter to confirm the server kept it");
+        }
 
         if let Some(distance) = walk {
             let from = world::Position {

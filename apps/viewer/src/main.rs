@@ -1708,6 +1708,24 @@ impl App {
                 }
                 self.last_heartbeat = Instant::now();
             }
+        } else if turn != 0.0 && self.last_heartbeat.elapsed() >= LIVE_HEARTBEAT_EVERY {
+            // Turning on the spot. Without this the server never learns the new
+            // facing until the next time we translate, so anyone watching sees
+            // the character pointing the wrong way -- invisible from here,
+            // because our own camera follows the local orientation regardless.
+            let info = MovementInfo {
+                flags: 0,
+                time: live.connection.tick(),
+                position,
+                ..MovementInfo::default()
+            };
+            if let Err(e) =
+                live.connection
+                    .send_movement(ClientOpcode::MoveSetFacing, live.guid, &info)
+            {
+                tracing::warn!("sending facing failed: {e:#}");
+            }
+            self.last_heartbeat = Instant::now();
         }
 
         // Same offset as the initial placement in `live_camera`, recomputed
@@ -1736,7 +1754,9 @@ impl App {
             tracing::warn!("draining the live connection failed: {e:#}");
         }
         if self.last_ping.elapsed() >= ::world::client::PING_INTERVAL {
-            if let Err(e) = live.connection.ping(0) {
+            // Fire and forget: waiting for the pong would block the render
+            // thread for a round trip. The drain above collects it.
+            if let Err(e) = live.connection.send_ping(0) {
                 tracing::warn!("keepalive ping failed: {e:#}");
             }
             self.last_ping = Instant::now();

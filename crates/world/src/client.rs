@@ -378,6 +378,28 @@ impl Connection {
         Ok((at, seen))
     }
 
+    /// Turns on the spot, without translating.
+    ///
+    /// Needed because orientation only reaches the server as a side effect of
+    /// the position in a movement packet: a character that turns and does not
+    /// walk would otherwise keep its old facing for everyone else.
+    pub fn set_facing(
+        &mut self,
+        mover: u64,
+        at: crate::update::Position,
+        heading: f32,
+    ) -> Result<(), Error> {
+        let info = crate::movement::MovementInfo {
+            time: self.tick(),
+            position: crate::update::Position {
+                orientation: heading,
+                ..at
+            },
+            ..crate::movement::MovementInfo::default()
+        };
+        self.send_movement(ClientOpcode::MoveSetFacing, mover, &info)
+    }
+
     /// Milliseconds since the connection opened, as the movement clock.
     pub fn tick(&self) -> u32 {
         self.started.elapsed().as_millis() as u32
@@ -435,7 +457,28 @@ impl Connection {
         outcome.map(|()| collected)
     }
 
+    /// Sends a keepalive without waiting for the echo.
+    ///
+    /// The right call from anything with a frame to render. [`Connection::ping`]
+    /// blocks until the pong arrives -- a round trip on a real realm, some tens
+    /// of milliseconds, and up to the read timeout if the server stalls -- which
+    /// is several dropped frames every time it fires. The pong is picked up by
+    /// the next [`Connection::drain`] and discarded, which is all the caller
+    /// wanted from it anyway.
+    ///
+    /// Call no more often than [`PING_INTERVAL`]; the server treats a faster
+    /// rate as abuse and disconnects.
+    pub fn send_ping(&mut self, latency: u32) -> Result<(), Error> {
+        self.ping_sequence = self.ping_sequence.wrapping_add(1);
+        let sequence = self.ping_sequence;
+        self.send(ClientOpcode::Ping, &protocol::ping(sequence, latency))
+    }
+
     /// Sends a keepalive and waits for its echo.
+    ///
+    /// Blocks for a round trip, so prefer [`Connection::send_ping`] anywhere
+    /// responsiveness matters. Useful when the round-trip time is itself the
+    /// thing being measured.
     ///
     /// Call no more often than [`PING_INTERVAL`]; the server treats a faster
     /// rate as abuse and disconnects.
