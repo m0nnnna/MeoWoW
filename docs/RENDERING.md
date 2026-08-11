@@ -163,6 +163,29 @@ The bind pose is not a special case — it is all-identity matrices, which
 reproduces exactly what the unskinned renderer drew, so the two paths cannot
 drift apart.
 
+### The palette must be as long as the longest skeleton
+
+A shared palette — one buffer for a whole scene of different models, as the
+world paths use — has to be sized for the largest skeleton in it, not for one
+matrix.
+
+This is worth its own heading because of *how it fails*. A vertex whose bone
+index runs past the end of the palette does not produce an error or a warning:
+the storage read returns zero, the skinned position collapses to the origin, and
+the model **silently disappears**. Nothing in the frame says a model was
+skipped, because it was not skipped — it was drawn, at zero size.
+
+It cost a debugging session. Server-placed creatures were invisible while the
+map's own doodads rendered perfectly, and the two look nothing alike from the
+outside: the obvious conclusion was that the entities had never been placed. In
+fact a tree indexes bone 0 — in range in a one-element palette — and a character
+model indexes sixty. The scene was drawing all of them, and the humanoids were
+collapsed to a point.
+
+The rule: when models are drawn in the bind pose, allocate `BIND_POSE_BONES`
+matrices and fill *all* of them with identity. Uploading a single matrix leaves
+the rest of the buffer zeroed, which is the same failure.
+
 ## Per-object transforms
 
 Placements are **instance attributes**, not a uniform: a `mat4` occupying vertex
@@ -289,3 +312,50 @@ account for.
 zero-sized buffer cannot be sliced and slicing is unconditional at draw time.
 Loaders still reject degenerate geometry outright; the padding exists so the
 failure is a missing model rather than a panic inside a render pass.
+
+## Standing in a live world
+
+`--realm-host` logs in, enters the world as `--character`, and streams the map
+the *server* chose around the position it reported. This is where the renderer
+and the protocol finally meet:
+
+```console
+$ wow-viewer --realm-host <host> --user <account> --character Testwolf --radius 1
+Testwolf on Eastern Kingdoms (map 0, Azeroth)
+at -8950.0, -132.5, 83.5 facing 0.00 rad
+tile 32,48
+91 objects reported
+```
+
+Three things join up, and only one of them needed new code:
+
+- **The position needs no conversion.** A network position is already in the
+  space the renderer streams tiles in. That is *not* true of the coordinates in
+  the data files — ADT placements are stored measured inwards from the grid
+  corner with the axes permuted, which is why `placement_position` exists — so
+  the natural assumption is that the network needs a conversion too. It does
+  not, and applying one lands the camera on a tile that does not exist. Both
+  halves of that are pinned by tests in `live.rs`.
+- **The map comes from `Map.dbc`.** The server sends a numeric map id; the
+  renderer needs a directory name. One lookup.
+- **Entities are ordinary instanced draws.** A creature is a display id, which
+  `CreatureDisplayInfo` turns into a model and its skins — the same path
+  `--creature` already used.
+
+Entity models are cached by **display id, not by path**: a display id supplies
+skins on top of a model path, so two ids sharing a path are different-looking
+creatures, and keying by path gives the second one the first one's hide.
+
+### What still looks wrong
+
+Humanoid NPCs render white. Character models composite their skin at runtime
+from `CharSections.dbc` — body, face, hair and equipment baked into one texture
+— and that compositor does not exist yet. Creature models are unaffected,
+because their skins are named outright in `CreatureDisplayInfo`; a critter next
+to a white night elf is the same code path working correctly on both.
+
+Facing uses the same quarter-turn offset as the doodad path, on the reasoning
+that the offset is a property of where an M2's forward axis points rather than
+of where the angle came from. Position is what these screenshots really assert;
+facing is inferred from that consistency and has not been checked against a
+reference client.

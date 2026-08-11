@@ -8,6 +8,7 @@
 //! opening a window, which keeps the render path checkable from a terminal and
 //! in CI.
 
+mod live;
 mod model;
 mod scene;
 mod terrain;
@@ -125,6 +126,35 @@ struct Args {
 
     #[arg(long, default_value_t = 720)]
     height: u32,
+
+    /// Log in to this logon server and stand where the character is standing.
+    ///
+    /// Implies `--stream`, and picks the map from the server rather than
+    /// `--map`: the point is that the world decides where you are.
+    #[arg(long)]
+    realm_host: Option<String>,
+
+    #[arg(long, default_value_t = auth::client::DEFAULT_PORT)]
+    realm_port: u16,
+
+    #[arg(long)]
+    user: Option<String>,
+
+    /// Prefer `WOW_PASSWORD` so it stays out of shell history.
+    #[arg(long, env = "WOW_PASSWORD", hide_env_values = true)]
+    password: Option<String>,
+
+    /// Realm to enter. Defaults to the first one offered.
+    #[arg(long)]
+    realm: Option<String>,
+
+    /// Character to enter the world as.
+    #[arg(long)]
+    character: Option<String>,
+
+    /// Draw the creatures and players the server reported around us.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    entities: bool,
 }
 
 /// What the viewer is currently showing.
@@ -197,7 +227,77 @@ fn main() -> Result<()> {
 }
 
 /// Resolves the command line into something to draw.
+///
+/// The second return value is present only when the world was entered over the
+/// network; it says where the character is standing and what is around it.
+/// Kept beside the scene rather than inside it because it describes how the
+/// scene was chosen, not what is in it.
 fn build_scene(
+    gpu: &Gpu,
+    terrain_renderer: &TerrainRenderer,
+    meshes: &mut MeshRenderer,
+    chain: &mut Chain,
+    args: &Args,
+) -> Result<(Scene, Option<live::LiveWorld>)> {
+    if args.realm_host.is_some() {
+        return build_live_scene(gpu, meshes, chain, args);
+    }
+    build_offline_scene(gpu, terrain_renderer, chain, args).map(|scene| (scene, None))
+}
+
+/// Logs in and builds a streaming world around wherever the character is.
+fn build_live_scene(
+    gpu: &Gpu,
+    meshes: &mut MeshRenderer,
+    chain: &mut Chain,
+    args: &Args,
+) -> Result<(Scene, Option<live::LiveWorld>)> {
+    let host = args.realm_host.as_deref().expect("checked by the caller");
+    let login = live::Login {
+        host,
+        port: args.realm_port,
+        user: args.user.as_deref().context("--realm-host needs --user")?,
+        password: args
+            .password
+            .as_deref()
+            .context("--realm-host needs --password or WOW_PASSWORD")?,
+        realm: args.realm.as_deref(),
+        character: args
+            .character
+            .as_deref()
+            .context("--realm-host needs --character")?,
+        locale: &args.locale,
+    };
+
+    let live = live::connect(chain, &login)?;
+    let mut world = world::World::new(
+        chain,
+        &live.map_directory,
+        args.radius as i32,
+        args.max_doodads,
+    )?;
+
+    if args.entities {
+        let placements: Vec<world::EntityPlacement> = live
+            .entities
+            .iter()
+            .map(|entity| world::EntityPlacement {
+                display_id: entity.display_id,
+                position: entity.position,
+                orientation: entity.orientation,
+                scale: entity.scale,
+            })
+            .collect();
+        let undrawable = world.set_entities(gpu, meshes, chain, &placements);
+        if undrawable > 0 {
+            tracing::warn!("{undrawable} object(s) had no loadable model");
+        }
+    }
+
+    Ok((Scene::Streaming(Box::new(world)), Some(live)))
+}
+
+fn build_offline_scene(
     gpu: &Gpu,
     terrain_renderer: &TerrainRenderer,
     chain: &mut Chain,
@@ -240,6 +340,24 @@ fn build_scene(
     let path = args.texture.as_deref().unwrap_or(DEFAULT_TEXTURE);
     let parsed = blp::Blp::parse(&chain.read(path)?)?;
     Ok(Scene::Texture(Box::new(upload_blp(gpu, &parsed, path))))
+}
+
+/// Bone palette size for scenes drawn in the bind pose.
+///
+/// Sized for the largest skeleton rather than for one matrix, and the
+/// difference is not cosmetic. A vertex whose bone index runs past the end of
+/// the palette does not fail loudly: the storage read returns zero, the skinned
+/// position collapses to the origin, and the model **silently disappears**.
+///
+/// That is precisely how it was found. Doodads kept rendering while every
+/// creature vanished, because a tree indexes bone 0 and a character model
+/// indexes sixty. The scene looked like the entities had never been placed at
+/// all, which sent the search to the protocol rather than to the palette.
+const BIND_POSE_BONES: usize = 512;
+
+/// A palette of identity matrices, leaving every model in its bind pose.
+fn bind_pose(count: usize) -> Vec<[[f32; 4]; 4]> {
+    vec![glam::Mat4::IDENTITY.to_cols_array_2d(); count]
 }
 
 /// Which movement keys are currently held.
@@ -319,6 +437,36 @@ fn initial_camera(scene: &Scene, args: &Args) -> Camera {
     } else {
         Camera::Orbit(orbit)
     }
+}
+
+/// Puts the camera where the character is standing.
+///
+/// Behind and above the character's own position rather than exactly on it: at
+/// eye height inside the body the view is filled by the inside of the player's
+/// own mesh, and nothing looks like it worked.
+fn live_camera(live: &live::LiveWorld, args: &Args) -> Camera {
+    const BEHIND: f32 = 9.0;
+    const ABOVE: f32 = 4.0;
+
+    let yaw = args
+        .yaw
+        .map(f32::to_radians)
+        .unwrap_or(live.orientation);
+    let mut fly = Fly {
+        position: live.position
+            - glam::Vec3::new(yaw.cos(), yaw.sin(), 0.0) * BEHIND
+            + glam::Vec3::Z * ABOVE,
+        yaw,
+        pitch: -0.15,
+        // Walking pace rather than the flying speed a survey wants: the point
+        // here is to stand somewhere, not to cross a continent.
+        speed: 30.0,
+        ..Default::default()
+    };
+    if let Some(pitch) = args.pitch {
+        fly.pitch = pitch.to_radians();
+    }
+    Camera::Fly(fly)
 }
 
 /// Places the camera over a streaming world's starting tile.
@@ -667,8 +815,10 @@ fn draw_streaming(
     if let Some(bones) = bones {
         pass.set_bind_group(2, &bones.bind_group, &[]);
     }
-    for tile in world.tiles() {
-        for group in &tile.groups {
+    // The map's own geometry and the server's objects draw identically; only
+    // where the transforms came from differs.
+    for group in world.tiles().flat_map(|t| t.groups.iter()).chain(world.entities()) {
+        {
             pass.set_vertex_buffer(0, group.model.mesh.vertices.slice(..));
             pass.set_vertex_buffer(1, group.instances.buffer.slice(..));
             pass.set_index_buffer(
@@ -703,6 +853,74 @@ fn material_bind_groups(
         .iter()
         .map(|t| meshes.material_bind_group(gpu, &t.view))
         .collect()
+}
+
+/// Describes a connected world above whatever the scene itself reports.
+///
+/// Worth its own block rather than a line: when the camera is somewhere
+/// unexpected the first question is always whether the *server* put it there or
+/// the renderer did, and that is answerable only if the position the protocol
+/// reported is on screen next to the tile the renderer chose.
+fn describe_live(live: &live::LiveWorld) -> String {
+    let tile = world::tile_at(live.position);
+    let mut text = format!(
+        "{} on {} (map {}, {})\nat {:.1}, {:.1}, {:.1} facing {:.2} rad\n\
+         tile {},{}\n{} objects reported",
+        live.character,
+        live.map_name,
+        live.map_id,
+        live.map_directory,
+        live.position.x,
+        live.position.y,
+        live.position.z,
+        live.orientation,
+        tile.0,
+        tile.1,
+        live.entities.len(),
+    );
+
+    let mut by_kind: std::collections::BTreeMap<&str, usize> = Default::default();
+    for entity in &live.entities {
+        *by_kind.entry(entity.kind.name()).or_default() += 1;
+    }
+    if !by_kind.is_empty() {
+        let parts: Vec<String> = by_kind
+            .iter()
+            .map(|(kind, count)| format!("{count} {kind}"))
+            .collect();
+        text.push_str(&format!("\n  {}", parts.join(", ")));
+    }
+
+    // The nearest thing is what the camera is most likely pointed at, so it is
+    // the one worth naming when checking that positions landed correctly.
+    if let Some(nearest) = live
+        .entities
+        .iter()
+        .min_by(|a, b| {
+            let (a, b) = (
+                a.position.distance_squared(live.position),
+                b.position.distance_squared(live.position),
+            );
+            a.total_cmp(&b)
+        })
+    {
+        text.push_str(&format!(
+            "\nnearest {} guid {:#x} display {}{} at {:.0} units",
+            nearest.kind.name(),
+            nearest.guid,
+            nearest.display_id,
+            nearest
+                .level
+                .map(|l| format!(" level {l}"))
+                .unwrap_or_default(),
+            nearest.position.distance(live.position),
+        ));
+    }
+
+    for note in &live.skipped {
+        text.push_str(&format!("\n{note}"));
+    }
+    text
 }
 
 fn describe(scene: &Scene) -> String {
@@ -770,12 +988,13 @@ fn describe(scene: &Scene) -> String {
             let s = w.stats;
             format!(
                 "streaming\n{} tiles resident, {} queued, {} failed\n\
-                 {} models cached, {} instances\n{} draw calls",
+                 {} models cached, {} instances ({} server-placed)\n{} draw calls",
                 s.tiles_resident,
                 s.tiles_pending,
                 s.tiles_failed,
                 s.models_cached,
                 s.instances,
+                s.entities,
                 s.draw_calls
             )
         }
@@ -840,9 +1059,10 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     let mut meshes = MeshRenderer::new(&gpu, format);
     let terrain_renderer = TerrainRenderer::new(&gpu, format, meshes.camera_layout());
 
-    let mut scene = build_scene(&gpu, &terrain_renderer, chain, args)?;
-    let camera = match &scene {
-        Scene::Streaming(w) => streaming_camera(w, chain, args)?,
+    let (mut scene, live) = build_scene(&gpu, &terrain_renderer, &mut meshes, chain, args)?;
+    let camera = match (&scene, &live) {
+        (_, Some(live)) => live_camera(live, args),
+        (Scene::Streaming(w), None) => streaming_camera(w, chain, args)?,
         _ => initial_camera(&scene, args),
     };
     if let Scene::Streaming(world) = &mut scene {
@@ -864,12 +1084,12 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     meshes.prepare(&gpu, scene_states(&scene));
     let bone_count = match &scene {
         Scene::Model(m) => m.bones.len(),
-        _ => 1,
+        _ => BIND_POSE_BONES,
     };
     let bone_buffer = meshes.create_bones(&gpu, bone_count);
     match &scene {
         Scene::Model(m) => upload_pose(&gpu, &meshes, &bone_buffer, m, args.anim, args.anim_time),
-        _ => meshes.update_bones(&gpu, &bone_buffer, &[glam::Mat4::IDENTITY.to_cols_array_2d()]),
+        _ => meshes.update_bones(&gpu, &bone_buffer, &bind_pose(bone_count)),
     }
     let bones = Some(bone_buffer);
     let binds = material_bind_groups(&gpu, &meshes, &scene);
@@ -901,6 +1121,9 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
 
     let rgba = target.read_rgba(&gpu)?;
     write_png(out, &rgba, target.width, target.height)?;
+    if let Some(live) = &live {
+        println!("{}", describe_live(live));
+    }
     println!(
         "{}\nrendered {}x{} -> {}",
         describe(&scene),
@@ -961,6 +1184,8 @@ struct App {
     anim_time_ms: u32,
     playing: bool,
     speed: f32,
+    /// Present when the world was entered over the network.
+    live: Option<live::LiveWorld>,
 }
 
 impl App {
@@ -981,6 +1206,7 @@ impl App {
             anim_time_ms: 0,
             playing: true,
             speed: 1.0,
+            live: None,
         }
     }
 }
@@ -1047,8 +1273,17 @@ impl ApplicationHandler for App {
         let terrain_renderer = TerrainRenderer::new(&gpu, format, meshes.camera_layout());
         let depth = DepthBuffer::new(&gpu, config.width, config.height);
 
-        let scene = match build_scene(&gpu, &terrain_renderer, &mut self.chain, &self.args) {
-            Ok(scene) => Some(scene),
+        let scene = match build_scene(
+            &gpu,
+            &terrain_renderer,
+            &mut meshes,
+            &mut self.chain,
+            &self.args,
+        ) {
+            Ok((scene, live)) => {
+                self.live = live;
+                Some(scene)
+            }
             Err(e) => {
                 self.error = Some(format!("{e:#}"));
                 tracing::error!("{e:#}");
@@ -1056,9 +1291,12 @@ impl ApplicationHandler for App {
             }
         };
         if let Some(scene) = &scene {
-            self.camera = match scene {
-                Scene::Streaming(w) => streaming_camera(w, &mut self.chain, &self.args)
-                    .unwrap_or_else(|_| initial_camera(scene, &self.args)),
+            self.camera = match (scene, &self.live) {
+                (_, Some(live)) => live_camera(live, &self.args),
+                (Scene::Streaming(w), None) => {
+                    streaming_camera(w, &mut self.chain, &self.args)
+                        .unwrap_or_else(|_| initial_camera(scene, &self.args))
+                }
                 _ => initial_camera(scene, &self.args),
             };
         }
@@ -1067,12 +1305,12 @@ impl ApplicationHandler for App {
             meshes.prepare(&gpu, scene_states(scene));
             let bone_count = match scene {
                 Scene::Model(m) => m.bones.len(),
-                _ => 1,
+                _ => BIND_POSE_BONES,
             };
             let buffer = meshes.create_bones(&gpu, bone_count);
-            // Rigid geometry still needs a bound palette; identity leaves it
-            // untouched.
-            meshes.update_bones(&gpu, &buffer, &[glam::Mat4::IDENTITY.to_cols_array_2d()]);
+            // Every model here is drawn in its bind pose, but the palette must
+            // still cover the largest skeleton -- see BIND_POSE_BONES.
+            meshes.update_bones(&gpu, &buffer, &bind_pose(bone_count));
             bones = Some(buffer);
 
             if let Scene::Model(m) = scene {
@@ -1343,7 +1581,10 @@ impl App {
         let gpu_line = r.gpu.describe();
         let bc = r.gpu.supports_bc();
         let pipelines = r.meshes.pipeline_count();
-        let summary = r.scene.as_ref().map(describe);
+        let summary = r.scene.as_ref().map(|scene| match &self.live {
+            Some(live) => format!("{}\n\n{}", describe_live(live), describe(scene)),
+            None => describe(scene),
+        });
         let (error, frame_ms) = (self.error.clone(), self.frame_ms);
         let camera = self.camera;
 

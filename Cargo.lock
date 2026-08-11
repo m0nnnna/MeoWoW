@@ -3905,6 +3905,7 @@ version = "0.0.1"
 dependencies = [
  "adt",
  "anyhow",
+ "auth",
  "blp",
  "clap",
  "dbc",
@@ -3922,6 +3923,7 @@ dependencies = [
  "wgpu",
  "winit",
  "wmo",
+ "world",
 ]
 
 [[package]]

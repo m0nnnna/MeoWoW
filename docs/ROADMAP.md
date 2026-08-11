@@ -82,6 +82,20 @@ dropping after three keepalives was the server enforcing a *minimum* ping
 interval, not a parser losing its place. Rate limits and anti-abuse rules are
 part of the protocol, and they fail in ways that mimic corruption.
 
+### The renderer and the protocol have joined
+
+Not a numbered milestone — it needed no new format work and no new protocol
+work — but it is the point the project stops being two halves.
+`wow-viewer --realm-host <host> --character <name>` logs in, enters the world,
+and streams the map the server chose around the position it reported, with the
+creatures it reported standing in it.
+
+It was cheap, which is the interesting part: a `Map.dbc` lookup for the map id,
+a reuse of the existing `--creature` model path for display ids, and no
+coordinate conversion at all. The single bug was in the renderer and not the
+join — a shared bone palette sized for one matrix, which silently collapsed
+every skinned model to the origin. See `docs/RENDERING.md`.
+
 ## Phase 4 — Game
 
 Chat, inventory, spellcasting, combat, loot, quests — sequenced by whatever is

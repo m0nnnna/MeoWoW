@@ -65,6 +65,17 @@ pub struct Stats {
     pub instances: usize,
     pub draw_calls: usize,
     pub tiles_failed: usize,
+    /// Server-placed objects currently drawn.
+    pub entities: usize,
+}
+
+/// One server-placed object waiting to be turned into an instance.
+pub struct EntityPlacement {
+    pub display_id: u32,
+    pub position: Vec3,
+    /// Heading in radians, as the server reports it.
+    pub orientation: f32,
+    pub scale: f32,
 }
 
 pub struct World {
@@ -75,6 +86,16 @@ pub struct World {
     /// `None` marks a model that failed to load, so it is not retried on every
     /// tile that places it.
     cache: HashMap<String, Option<Rc<CachedModel>>>,
+    /// Entity models are cached separately, by display id rather than by path.
+    ///
+    /// Not merely convenient: a creature display id supplies *skins* on top of
+    /// its model path, so two display ids sharing one path are different-looking
+    /// creatures. Keying by path would give the second one the first one's hide.
+    entity_cache: HashMap<u32, Option<Rc<CachedModel>>>,
+    /// Objects the server placed, as opposed to the ones the map files did.
+    /// Owned by the world rather than a tile: they move, and they do not belong
+    /// to the tile they happen to be standing on.
+    entities: Vec<Group>,
     tiles: HashMap<(i32, i32), Tile>,
     pending: VecDeque<(i32, i32)>,
     queued: HashSet<(i32, i32)>,
@@ -111,6 +132,8 @@ impl World {
             radius: radius.max(0),
             max_doodads,
             cache: HashMap::new(),
+            entity_cache: HashMap::new(),
+            entities: Vec::new(),
             tiles: HashMap::new(),
             pending: VecDeque::new(),
             queued: HashSet::new(),
@@ -206,12 +229,14 @@ impl World {
     }
 
     fn refresh_stats(&mut self) {
+        let entities: usize = self.entities.iter().map(|g| g.count as usize).sum();
         let instances: usize = self
             .tiles
             .values()
             .flat_map(|t| t.groups.iter())
             .map(|g| g.count as usize)
-            .sum();
+            .sum::<usize>()
+            + entities;
         let draw_calls: usize = self
             .tiles
             .values()
@@ -219,14 +244,21 @@ impl World {
                 t.terrain.chunks.len()
                     + t.groups.iter().map(|g| g.model.draws.len()).sum::<usize>()
             })
-            .sum();
+            .sum::<usize>()
+            + self
+                .entities
+                .iter()
+                .map(|g| g.model.draws.len())
+                .sum::<usize>();
         self.stats = Stats {
             tiles_resident: self.tiles.len(),
             tiles_pending: self.pending.len(),
-            models_cached: self.cache.values().filter(|m| m.is_some()).count(),
+            models_cached: self.cache.values().filter(|m| m.is_some()).count()
+                + self.entity_cache.values().filter(|m| m.is_some()).count(),
             instances,
             draw_calls,
             tiles_failed: self.failed.len(),
+            entities,
         };
     }
 
@@ -350,6 +382,103 @@ impl World {
 
     pub fn tiles(&self) -> impl Iterator<Item = &Tile> {
         self.tiles.values()
+    }
+
+    /// Objects placed by the server, drawn alongside the map's own geometry.
+    pub fn entities(&self) -> &[Group] {
+        &self.entities
+    }
+
+    /// Replaces the server-placed objects.
+    ///
+    /// Returns how many could not be drawn, which is worth surfacing: a world
+    /// missing half its creatures because their models failed to load looks
+    /// exactly like a world where the protocol never reported them.
+    pub fn set_entities(
+        &mut self,
+        gpu: &Gpu,
+        meshes: &mut MeshRenderer,
+        chain: &mut Chain,
+        placements: &[EntityPlacement],
+    ) -> usize {
+        use std::f32::consts::FRAC_PI_2;
+
+        let mut grouped: HashMap<u32, Vec<Mat4>> = HashMap::new();
+        for placement in placements {
+            grouped
+                .entry(placement.display_id)
+                .or_default()
+                .push(Mat4::from_scale_rotation_translation(
+                    Vec3::splat(placement.scale),
+                    // The quarter-turn matches the doodad path, which is known
+                    // to orient these same models correctly: the offset is a
+                    // property of where an M2's forward axis points, not of
+                    // where the angle came from. Position is what this milestone
+                    // is really asserting; facing is inferred from that
+                    // consistency rather than checked against a reference.
+                    glam::Quat::from_rotation_z(placement.orientation - FRAC_PI_2),
+                    placement.position,
+                ));
+        }
+
+        let mut built = Vec::new();
+        let mut undrawable = 0;
+        for (display_id, transforms) in grouped {
+            let Some(model) = self.entity_model(gpu, meshes, chain, display_id) else {
+                undrawable += transforms.len();
+                continue;
+            };
+            meshes.prepare(gpu, model.draws.iter().map(|d| d.state));
+            let raw: Vec<Instance> = transforms
+                .iter()
+                .map(|t| Instance::from_cols_array_2d(t.to_cols_array_2d()))
+                .collect();
+            built.push(Group {
+                model,
+                instances: InstanceBuffer::upload(gpu, &raw),
+                count: raw.len() as u32,
+            });
+        }
+
+        self.entities = built;
+        self.refresh_stats();
+        undrawable
+    }
+
+    /// Loads a creature model by display id, with the skins that id selects.
+    fn entity_model(
+        &mut self,
+        gpu: &Gpu,
+        meshes: &MeshRenderer,
+        chain: &mut Chain,
+        display_id: u32,
+    ) -> Option<Rc<CachedModel>> {
+        if let Some(cached) = self.entity_cache.get(&display_id) {
+            return cached.clone();
+        }
+
+        let entry = crate::model::creature(chain, display_id)
+            .and_then(|(path, variations)| {
+                crate::model::load(gpu, chain, &path, &variations, 0)
+            })
+            .map(|loaded| {
+                let binds = loaded
+                    .textures
+                    .iter()
+                    .map(|t| meshes.material_bind_group(gpu, &t.view))
+                    .collect();
+                Rc::new(CachedModel {
+                    mesh: loaded.mesh,
+                    draws: loaded.draws,
+                    binds,
+                    textures: loaded.textures,
+                })
+            })
+            .map_err(|e| tracing::debug!("display id {display_id}: {e}"))
+            .ok();
+
+        self.entity_cache.insert(display_id, entry.clone());
+        entry
     }
 }
 

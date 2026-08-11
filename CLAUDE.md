@@ -15,14 +15,14 @@ streams. Phase 3 has started.
 | Protocol | **3.1 logon, 3.2 world handshake, 3.3 enter world done**, all confirmed against a live realm; 3.4 movement is next |
 | Game + UI | Not started. The largest remaining chunk. |
 
-Roughly 45% of the way to something a person could test by playing. See
+Roughly 50% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
 
-The two halves still have not met in code. The client can log in, enter the
-world and parse everything around it — position, creatures, game objects — and
-it can render terrain and models at those same coordinates, but nothing yet
-feeds one into the other. Joining them is the obvious next visible win and does
-not depend on 3.4.
+**The two halves have met.** `wow-viewer --realm-host <host> --user <account>
+--character <name>` logs in, enters the world, and streams the map the server
+chose around the position it reported, with the creatures it reported standing
+in it. What is missing now is agency: the camera stands where the character is
+but cannot move it, which is 3.4.
 
 ## Orientation
 
@@ -101,6 +101,13 @@ Worth reading before debugging anything, because the same shapes keep recurring.
 - **When geometry is missing rather than wrong, suspect culling before data.**
   WMO winds counter-clockwise, M2 and terrain clockwise. Guessing from a
   neighbouring format culled a roof and looked like a hole in the mesh.
+- **Geometry drawn at zero size looks exactly like geometry never drawn.** A
+  bone index past the end of the palette reads zero on the GPU, collapsing the
+  model to the origin with no error anywhere. Creatures were invisible while
+  doodads rendered, and the obvious reading — that the entities were never
+  placed — sent the search to the protocol instead of the renderer. When
+  something is missing, confirm whether it was *submitted* before asking whether
+  it was produced.
 - **An odd-looking render is often the camera.** A gnoll looked scrambled and a
   building looked misplaced; both were framing, not geometry. Render canonical
   angles before doubting the parser.

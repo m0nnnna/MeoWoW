@@ -28,3 +28,6 @@ dbc = { version = "0.0.1", path = "../../crates/dbc" }
 glam.workspace = true
 wmo = { version = "0.0.1", path = "../../crates/wmo" }
 adt = { version = "0.0.1", path = "../../crates/adt" }
+# The viewer can stand in a live world, not only in one read off disk.
+auth = { version = "0.0.1", path = "../../crates/auth" }
+world = { version = "0.0.1", path = "../../crates/world" }
