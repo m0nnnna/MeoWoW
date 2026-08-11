@@ -8,8 +8,9 @@ the 3.3.5a data files you already own, exactly as
 [OpenMW](https://openmw.org/) does for Morrowind. It talks to existing
 3.3.5a-compatible servers.
 
-> **Status: very early.** The archive layer reads real game data. Nothing
-> renders yet. See [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status: early.** Reads a real installation's archives, tables, textures and
+> models, and renders animated creatures. No world, no networking yet. See
+> [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What works today
 
