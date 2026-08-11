@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "tools/*"]
+members = ["crates/*", "tools/*", "apps/*"]
 
 [workspace.package]
 version = "0.0.1"
@@ -20,6 +20,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 png = "0.17"
+# Graphics stack. egui-wgpu pins a wgpu major, so these three move together --
+# see docs/BUILDING.md before bumping any of them independently.
+wgpu = "30"
+winit = "0.30"
+egui = "0.36"
+egui-wgpu = "0.36"
+egui-winit = "0.36"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.33"
 
 [profile.dev]
 # Format parsing on multi-GB archives is unusable in a fully unoptimized build,

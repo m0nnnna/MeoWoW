@@ -1,0 +1,25 @@
+[package]
+name = "wow-viewer"
+description = "Windowed asset viewer for WoW 3.3.5a client data."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mpq = { path = "../../crates/mpq" }
+blp = { path = "../../crates/blp" }
+render = { path = "../../crates/render" }
+
+wgpu.workspace = true
+winit.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+pollster.workspace = true
+png.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

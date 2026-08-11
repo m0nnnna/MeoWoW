@@ -48,6 +48,20 @@ $ wow-cli dbc rows Map --limit 1
 MapRow { id: 0, directory: "Azeroth", instance_type: 0, name: "Eastern Kingdoms", ... }
 ```
 
+## Viewer
+
+`apps/viewer` puts assets on screen. It also renders headless, which is how the
+GPU path is checked without a display:
+
+```console
+cargo run -p wow-viewer -- --texture 'Interface\Icons\Spell_Fire_Fireball02.blp'
+cargo run -p wow-viewer -- --screenshot frame.png --texture '<path>'
+```
+
+DXT textures are handed to the GPU as `Bc1/2/3` blocks with no CPU decode; the
+overlay reports which path each texture took and why. See
+[docs/RENDERING.md](docs/RENDERING.md).
+
 ## Getting started
 
 You need a 3.3.5a installation (verify `Wow.exe` reports file version

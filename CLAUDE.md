@@ -5,9 +5,13 @@ Client only — no server, no bundled assets.
 
 ## Orientation
 
-- `crates/` — libraries, one per concern (`mpq`, and later `dbc`, `blp`, `m2`, …)
+- `crates/` — libraries, one per concern (`mpq`, `dbc`, `blp`, `render`, …)
 - `tools/wow-cli` — inspection CLI; every format gets a dump command here
   *before* it is wired into the renderer
+- `apps/viewer` — windowed asset viewer; `--screenshot` renders one frame
+  headless to a PNG, which is how render output is verified without a display
+- `docs/RENDERING.md` — GPU layering, the compressed-upload path, and the
+  dependency pinning that the graphics stack requires
 - `docs/ROADMAP.md` — milestone ladder and why it is ordered that way
 - `docs/REUSE-POLICY.md` — what we implement vs. depend on; read before adding
   any dependency
@@ -36,6 +40,19 @@ Client only — no server, no bundled assets.
 4. **`wow-cli verify` is the regression net** for the data layer — it reads all
    ~204k files, and systematic parser errors surface as one large bucket in the
    failure summary.
+
+## Traps already hit
+
+- **Never rewrite a file with a script that can throw mid-write.** A Python
+  `write_text` containing a character the console codec could not encode
+  truncated `docs/ROADMAP.md` to zero bytes. Prefer the editing tools; if a
+  script must write, write UTF-8 explicitly and to a temporary file first.
+- `wgpu`/`egui`/`egui-wgpu`/`egui-winit` versions are coupled, and the
+  `windows` crate needs a pin to build the DX12 backend at all — see
+  `docs/RENDERING.md` before touching any of them.
+- Windows refuses to execute a test binary whose filename looks like an
+  installer, so integration tests are `tests/real_data.rs`, never
+  `real_install.rs`.
 
 ## Conventions
 
