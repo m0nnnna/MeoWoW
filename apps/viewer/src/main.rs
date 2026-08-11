@@ -11,6 +11,7 @@
 mod model;
 mod scene;
 mod terrain;
+mod world;
 mod world_object;
 
 use std::path::PathBuf;
@@ -78,6 +79,11 @@ struct Args {
     #[arg(long)]
     world: bool,
 
+    /// Stream tiles in and out as the camera moves, instead of loading a fixed
+    /// block once.
+    #[arg(long)]
+    stream: bool,
+
     /// Radius in tiles around the chosen one: 0 is a single tile, 1 a 3x3.
     #[arg(long, default_value_t = 0)]
     radius: usize,
@@ -128,6 +134,8 @@ enum Scene {
     WorldObject(Box<world_object::LoadedWmo>),
     Terrain(Box<terrain::LoadedTerrain>),
     World(Box<scene::WorldScene>),
+    /// A streaming world; its contents change as the camera moves.
+    Streaming(Box<world::World>),
 }
 
 impl Scene {
@@ -137,7 +145,8 @@ impl Scene {
         match self {
             Scene::Model(m) => Some((&m.mesh, &m.draws)),
             Scene::WorldObject(w) => Some((&w.mesh, &w.draws)),
-            Scene::Texture(_) | Scene::World(_) | Scene::Terrain(_) => None,
+            Scene::Texture(_) | Scene::World(_) | Scene::Terrain(_)
+            | Scene::Streaming(_) => None,
         }
     }
 
@@ -145,7 +154,8 @@ impl Scene {
         match self {
             Scene::Model(m) => &m.textures,
             Scene::WorldObject(w) => &w.textures,
-            Scene::Texture(_) | Scene::World(_) | Scene::Terrain(_) => &[],
+            Scene::Texture(_) | Scene::World(_) | Scene::Terrain(_)
+            | Scene::Streaming(_) => &[],
         }
     }
 
@@ -155,7 +165,9 @@ impl Scene {
             Scene::WorldObject(w) => Some((w.min, w.max)),
             Scene::Terrain(t) => Some((t.min, t.max)),
             Scene::World(w) => Some((w.min, w.max)),
-            Scene::Texture(_) => None,
+            // A streaming world has no fixed extent; the camera is placed
+            // explicitly instead of framed.
+            Scene::Texture(_) | Scene::Streaming(_) => None,
         }
     }
 }
@@ -206,6 +218,10 @@ fn build_scene(
     }
     if let Some(map) = &args.map {
         let tile = parse_tile(&args.tile)?;
+        if args.stream {
+            let world = world::World::new(chain, map, args.radius as i32, args.max_doodads)?;
+            return Ok(Scene::Streaming(Box::new(world)));
+        }
         if args.world {
             let loaded = scene::load(
                 gpu,
@@ -305,6 +321,24 @@ fn initial_camera(scene: &Scene, args: &Args) -> Camera {
     }
 }
 
+/// Places the camera over a streaming world's starting tile.
+fn streaming_camera(world: &world::World, chain: &mut Chain, args: &Args) -> Result<Camera> {
+    let tile = parse_tile(&args.tile)?;
+    let mut fly = Fly {
+        position: world.spawn_above(chain, (tile.0 as i32, tile.1 as i32)),
+        pitch: -0.45,
+        speed: 120.0,
+        ..Default::default()
+    };
+    if let Some(yaw) = args.yaw {
+        fly.yaw = yaw.to_radians();
+    }
+    if let Some(pitch) = args.pitch {
+        fly.pitch = pitch.to_radians();
+    }
+    Ok(Camera::Fly(fly))
+}
+
 /// Records one frame. Shared by the windowed and headless paths so the two
 /// cannot drift apart.
 #[allow(clippy::too_many_arguments)]
@@ -331,6 +365,22 @@ fn draw_scene(
         Scene::World(w) => &w.terrain,
         _ => &[],
     };
+
+    if let Scene::Streaming(world) = scene {
+        draw_streaming(
+            gpu,
+            encoder,
+            color,
+            depth,
+            size,
+            world,
+            camera,
+            meshes,
+            terrain_renderer,
+            bones,
+        );
+        return;
+    }
     // A world holds many meshes, so it cannot go through the single-mesh path.
     if !terrain_parts.is_empty() || matches!(scene, Scene::World(_)) {
         {
@@ -551,6 +601,98 @@ fn scene_states(scene: &Scene) -> Vec<render::mesh::RenderState> {
     }
 }
 
+/// Draws a streaming world: terrain first, then the instanced objects on it.
+#[allow(clippy::too_many_arguments)]
+fn draw_streaming(
+    gpu: &Gpu,
+    encoder: &mut wgpu::CommandEncoder,
+    color: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+    size: (u32, u32),
+    world: &world::World,
+    camera: &Camera,
+    meshes: &MeshRenderer,
+    terrain_renderer: &TerrainRenderer,
+    bones: Option<&BoneBuffer>,
+) {
+    let aspect = size.0 as f32 / size.1.max(1) as f32;
+    meshes.update_camera(gpu, &camera.uniform(aspect));
+
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("streaming world"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: color,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.42,
+                    g: 0.55,
+                    b: 0.70,
+                    a: 1.0,
+                }),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Clear(1.0),
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        multiview_mask: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+    });
+
+    pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
+    pass.set_pipeline(terrain_renderer.pipeline());
+    for tile in world.tiles() {
+        pass.set_vertex_buffer(0, tile.terrain.mesh.vertices.slice(..));
+        pass.set_index_buffer(tile.terrain.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        for chunk in &tile.terrain.chunks {
+            pass.set_bind_group(1, &chunk.bind_group, &[]);
+            pass.draw_indexed(
+                chunk.first_index..chunk.first_index + chunk.index_count,
+                0,
+                0..1,
+            );
+        }
+    }
+
+    // Placed geometry is rigid, but the mesh pipeline always expects a bone
+    // palette; identity leaves it untouched.
+    if let Some(bones) = bones {
+        pass.set_bind_group(2, &bones.bind_group, &[]);
+    }
+    for tile in world.tiles() {
+        for group in &tile.groups {
+            pass.set_vertex_buffer(0, group.model.mesh.vertices.slice(..));
+            pass.set_vertex_buffer(1, group.instances.buffer.slice(..));
+            pass.set_index_buffer(
+                group.model.mesh.indices.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            for draw in &group.model.draws {
+                let (Some(pipeline), Some(bind)) =
+                    (meshes.get(draw.state), group.model.binds.get(draw.texture))
+                else {
+                    continue;
+                };
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(1, bind, &[]);
+                pass.draw_indexed(
+                    draw.first_index..draw.first_index + draw.index_count,
+                    0,
+                    0..group.count,
+                );
+            }
+        }
+    }
+}
+
 fn material_bind_groups(
     gpu: &Gpu,
     meshes: &MeshRenderer,
@@ -624,6 +766,19 @@ fn describe(scene: &Scene) -> String {
             }
             s
         }
+        Scene::Streaming(w) => {
+            let s = w.stats;
+            format!(
+                "streaming\n{} tiles resident, {} queued, {} failed\n\
+                 {} models cached, {} instances\n{} draw calls",
+                s.tiles_resident,
+                s.tiles_pending,
+                s.tiles_failed,
+                s.models_cached,
+                s.instances,
+                s.draw_calls
+            )
+        }
         Scene::Terrain(t) => {
             let mut s = format!(
                 "{}\n{} vertices, {} triangles\n{} chunks, {} draw calls, {} textures\n\
@@ -685,8 +840,25 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     let mut meshes = MeshRenderer::new(&gpu, format);
     let terrain_renderer = TerrainRenderer::new(&gpu, format, meshes.camera_layout());
 
-    let scene = build_scene(&gpu, &terrain_renderer, chain, args)?;
-    let camera = initial_camera(&scene, args);
+    let mut scene = build_scene(&gpu, &terrain_renderer, chain, args)?;
+    let camera = match &scene {
+        Scene::Streaming(w) => streaming_camera(w, chain, args)?,
+        _ => initial_camera(&scene, args),
+    };
+    if let Scene::Streaming(world) = &mut scene {
+        // Headless renders one frame, so fill the resident set up front rather
+        // than a couple of tiles at a time.
+        let eye = match camera {
+            Camera::Fly(f) => f.position,
+            Camera::Orbit(o) => o.eye(),
+        };
+        for _ in 0..64 {
+            world.update(&gpu, &mut meshes, &terrain_renderer, chain, eye);
+            if world.stats.tiles_pending == 0 {
+                break;
+            }
+        }
+    }
     // Any scene with geometry needs its pipelines built and a bone palette
     // bound -- rigid world objects included, where the palette is identity.
     meshes.prepare(&gpu, scene_states(&scene));
@@ -884,7 +1056,11 @@ impl ApplicationHandler for App {
             }
         };
         if let Some(scene) = &scene {
-            self.camera = initial_camera(scene, &self.args);
+            self.camera = match scene {
+                Scene::Streaming(w) => streaming_camera(w, &mut self.chain, &self.args)
+                    .unwrap_or_else(|_| initial_camera(scene, &self.args)),
+                _ => initial_camera(scene, &self.args),
+            };
         }
         let mut bones = None;
         if let Some(scene) = &scene {
@@ -1042,6 +1218,22 @@ impl App {
         let Some(r) = self.renderer.as_mut() else {
             return;
         };
+
+        // Stream before drawing, so newly admitted tiles appear this frame.
+        if let Some(Scene::Streaming(world)) = r.scene.as_mut() {
+            let eye = match camera {
+                Camera::Fly(f) => f.position,
+                Camera::Orbit(o) => o.eye(),
+            };
+            world.update(
+                &r.gpu,
+                &mut r.meshes,
+                &r.terrain_renderer,
+                &mut self.chain,
+                eye,
+            );
+        }
+
         if let (Some(Scene::Model(m)), Some(bones)) = (&r.scene, &r.bones) {
             upload_pose(&r.gpu, &r.meshes, bones, m, anim, anim_time);
         }

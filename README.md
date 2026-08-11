@@ -8,10 +8,9 @@ the 3.3.5a data files you already own, exactly as
 [OpenMW](https://openmw.org/) does for Morrowind. It talks to existing
 3.3.5a-compatible servers.
 
-> **Status: early.** Reads a real installation's archives, tables, textures,
-> models, world objects and terrain, and renders animated creatures, buildings
-> and landscape. No world streaming, no networking yet. See
-> [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status: the world renders.** Reads a real installation's data and streams
+> Azeroth as you fly across it -- terrain, buildings, doodads, animated
+> creatures. No networking or UI yet. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What works today
 
@@ -71,7 +70,8 @@ GPU path is checked without a display:
 
 ```console
 cargo run -p wow-viewer -- --creature 1216            # a gnoll, skinned and animated
-cargo run -p wow-viewer -- --map Azeroth --tile 32,48 --world  # Northshire, populated
+cargo run -p wow-viewer -- --map Azeroth --tile 31,48 --stream --radius 2  # fly over Stormwind
+cargo run -p wow-viewer -- --map Azeroth --tile 32,48 --world  # one tile, populated
 cargo run -p wow-viewer -- --wmo 'World\wmo\Azeroth\Buildings\Human_Farm\Farm.wmo'
 cargo run -p wow-viewer -- --model 'World\...\HumanGuardTower.m2'
 cargo run -p wow-viewer -- --texture 'Interface\Icons\Spell_Fire_Fireball02.blp'

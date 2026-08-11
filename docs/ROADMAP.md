@@ -34,11 +34,16 @@ where.
 | 2.3 | **M2 animation** ✅ | Keyframe tracks, external `.anim` files, GPU skinning, animation picker |
 | 2.4 | **WMO rendering** ✅ | Buildings on screen, per-group isolation; portals and interior lighting still to come |
 | 2.5 | **Terrain rendering** ✅ | Four-layer alpha blending on its own pipeline, correct tileset scale |
-| 2.6 | **World streaming** ◑ | Free-fly camera and blocks of tiles with placements; loading and eviction as the camera moves still to do |
+| 2.6 | **World streaming** ✅ | Fly across a continent; tiles load and evict around the camera, models cached across them |
 
-Milestone 2.6 is the first point where the project feels real. It is also the
-natural place to stop and harden, because everything after it depends on the
-world being trustworthy.
+Phase 2 is complete: you can fly across Azeroth with terrain, buildings and
+doodads streaming in around you.
+
+What is deliberately still missing from the renderer, in rough order of how much
+it matters: liquid (`MH2O`, so Stormwind's harbour is a dry basin), WMO portal
+culling and interior lighting, frustum culling, and shadows. None of these block
+Phase 3, and all are easier to judge once there is a character standing in the
+world.
 
 ## Phase 3 — Protocol
 

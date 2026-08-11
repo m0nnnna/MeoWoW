@@ -238,8 +238,33 @@ pub struct GpuMesh {
 }
 
 impl GpuMesh {
+    /// Uploads geometry.
+    ///
+    /// Empty input still allocates a one-element buffer: a zero-sized buffer
+    /// cannot be sliced, and slicing is unconditional at draw time. Callers
+    /// should reject degenerate meshes rather than rely on this, but a panic
+    /// deep in the render pass is a poor way to find out.
     pub fn upload(gpu: &Gpu, vertices: &[MeshVertex], indices: &[u32]) -> Self {
         use wgpu::util::DeviceExt;
+        let blank_vertex = [MeshVertex {
+            position: [0.0; 3],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0; 2],
+            bone_indices: [0; 4],
+            bone_weights: [0; 4],
+        }];
+        let vertices = if vertices.is_empty() {
+            &blank_vertex[..]
+        } else {
+            vertices
+        };
+        let blank_index = [0u32];
+        let index_count = indices.len() as u32;
+        let indices = if indices.is_empty() {
+            &blank_index[..]
+        } else {
+            indices
+        };
         Self {
             vertices: gpu
                 .device
@@ -255,7 +280,7 @@ impl GpuMesh {
                     contents: bytemuck::cast_slice(indices),
                     usage: wgpu::BufferUsages::INDEX,
                 }),
-            index_count: indices.len() as u32,
+            index_count,
         }
     }
 }

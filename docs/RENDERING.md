@@ -250,3 +250,42 @@ putting a gamma curve on it would bias every blend.
 
 Landscape draws before the objects standing on it. It is opaque and fills most
 of the frame, so drawing it first rejects the most fragments.
+
+## Streaming
+
+`--stream --radius n` keeps the `(2n+1)²` tiles around the camera resident,
+loading and evicting as it moves. Three things make that work at world scale.
+
+**Models are cached across tiles.** Elwynn's trees stand on every tile; loading
+them per tile multiplies memory by the number resident. Failures are cached too,
+so a broken path is not retried by every tile that places it.
+
+**Each placement is owned by exactly one tile** — the tile its *position* falls
+on. An object straddling a border is listed by every tile it touches, so without
+a single owner it is drawn once per listing and only partly removed when one
+neighbour is evicted.
+
+**Loading is budgeted.** Reading and uploading a tile is slow enough to show as
+a stall, so only two are admitted per frame and the rest queue nearest-first, so
+the view fills outwards.
+
+Eviction keeps a one-tile margin beyond the load radius. Without it a camera
+sitting on a boundary reloads the same tiles every time it drifts a metre.
+
+Stormwind at radius 2 is 25 tiles, 374 cached models, 11,490 instances and
+13,183 draw calls.
+
+### Tile coordinates
+
+`tile_at` inverts the grid, and the axes are **swapped as well as inverted**: a
+tile's origin is `(32 - tile_y) * TILE_SIZE` on x and `(32 - tile_x) * TILE_SIZE`
+on y. A tile owns everything *below* its origin on both axes, so a point exactly
+on the origin belongs to the neighbour — which is what a boundary test has to
+account for.
+
+### Empty buffers
+
+`GpuMesh::upload` substitutes a one-element buffer for empty input, because a
+zero-sized buffer cannot be sliced and slicing is unconditional at draw time.
+Loaders still reject degenerate geometry outright; the padding exists so the
+failure is a missing model rather than a panic inside a render pass.

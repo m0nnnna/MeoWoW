@@ -267,6 +267,10 @@ pub fn load(
             (min.min(p), max.max(p))
         },
     );
+    if vertices.is_empty() || indices.is_empty() {
+        anyhow::bail!("{path} produced no drawable geometry");
+    }
+
     let (min, max) = if vertices.is_empty() {
         let (a, b) = model.bounding_box();
         (Vec3::from(a), Vec3::from(b))

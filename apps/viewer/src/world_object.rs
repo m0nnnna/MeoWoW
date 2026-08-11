@@ -168,8 +168,11 @@ pub fn load(
         }
     }
 
-    if vertices.is_empty() {
-        anyhow::bail!("{path} produced no geometry from {} groups", root.header.group_count);
+    if vertices.is_empty() || indices.is_empty() {
+        anyhow::bail!(
+            "{path} produced no drawable geometry from {} groups",
+            root.header.group_count
+        );
     }
 
     // Opaque first so the depth buffer is populated before anything blends.
