@@ -1,0 +1,14 @@
+[package]
+name = "mpq"
+description = "Reader for Blizzard MPQ archives (format versions 0 and 1), as used by WoW 3.3.5a."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+flate2.workspace = true
+bzip2-rs.workspace = true

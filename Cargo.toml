@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "tools/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/floofywolf/open-wow-client"
+
+[workspace.dependencies]
+# Generic plumbing only. Every WoW-specific format is implemented in-tree
+# from public documentation -- see docs/REUSE-POLICY.md.
+thiserror = "2"
+anyhow = "1"
+flate2 = "1"
+bzip2-rs = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.dev]
+# Format parsing on multi-GB archives is unusable in a fully unoptimized build,
+# but we still want fast incremental compiles of our own code.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

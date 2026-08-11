@@ -1,0 +1,15 @@
+[package]
+name = "wow-cli"
+description = "Inspection tool for WoW 3.3.5a client data."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mpq = { path = "../../crates/mpq" }
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

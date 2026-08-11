@@ -1,0 +1,18 @@
+/target
+/out
+*.pdb
+.vscode/
+.idea/
+
+# Never commit game assets -- the client requires the user's own installation.
+*.MPQ
+*.mpq
+*.dbc
+*.blp
+*.m2
+*.wmo
+*.adt
+*.wdt
+
+# Machine-local build config (target-dir redirect); see docs/BUILDING.md
+/.cargo/config.toml
