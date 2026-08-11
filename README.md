@@ -22,11 +22,15 @@ the 3.3.5a data files you already own, exactly as
 - **DBC tables** — the client's database files, with typed schemas for `Map`,
   `AreaTable`, `Spell`, `CreatureDisplayInfo`, and `CreatureModelData`, plus
   column-type inference for transcribing the ones that have no schema yet.
+- **BLP textures** — DXT1/3/5, palettized at every alpha depth, and raw BGRA,
+  with PNG export. Compressed blocks are also exposed unmodified, so the
+  renderer can hand them to the GPU without a CPU decode.
 
 Verified against a stock build 12340 install: 203,949 paths, of which 198,827
 read and decompress cleanly (21.4 GiB) and 5,121 are correctly masked by patch
 tombstones. The one remaining unresolved path is a stale entry in Blizzard's
-own listfile. All 245 DBC tables present in the install parse.
+own listfile. All 245 DBC tables present in the install parse, as do all
+107,927 readable textures.
 
 ```console
 $ wow-cli --data "D:/Games/World of Warcraft 3.3.5a/Data" info

@@ -55,6 +55,31 @@ enum Command {
     /// Inspect client database tables.
     #[command(subcommand)]
     Dbc(DbcCommand),
+    /// Inspect and export textures.
+    #[command(subcommand)]
+    Blp(BlpCommand),
+}
+
+#[derive(Subcommand)]
+enum BlpCommand {
+    /// Show a texture's encoding and mip chain.
+    Info { path: String },
+    /// Export a mip level to PNG.
+    Export {
+        path: String,
+        #[arg(long, default_value_t = 0)]
+        level: usize,
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+    /// Parse every texture in the archives and tally what the format space
+    /// actually looks like.
+    Survey {
+        /// Only survey paths matching this substring.
+        filter: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -110,7 +135,157 @@ fn main() -> Result<()> {
         Command::Which { name } => which(&chain, &name),
         Command::Verify { limit, filter } => verify(&mut chain, limit, filter.as_deref()),
         Command::Dbc(cmd) => dbc_cmd(&mut chain, cmd),
+        Command::Blp(cmd) => blp_cmd(&mut chain, cmd),
     }
+}
+
+fn blp_cmd(chain: &mut Chain, cmd: BlpCommand) -> Result<()> {
+    match cmd {
+        BlpCommand::Info { path } => blp_info(chain, &path),
+        BlpCommand::Export { path, level, out } => blp_export(chain, &path, level, out),
+        BlpCommand::Survey { filter, limit } => blp_survey(chain, filter.as_deref(), limit),
+    }
+}
+
+fn blp_info(chain: &mut Chain, path: &str) -> Result<()> {
+    let bytes = chain.read(path)?;
+    let tex = blp::Blp::parse(&bytes)?;
+    println!("{path}");
+    let usable = tex.usable_mip_count();
+    println!(
+        "  {}x{}  {}  alpha depth {}  {} mip levels ({usable} usable)  ({} bytes on disk)",
+        tex.width(),
+        tex.height(),
+        tex.encoding().name(),
+        tex.alpha_depth(),
+        tex.mip_count(),
+        bytes.len()
+    );
+    for level in 0..tex.mip_count() {
+        let (w, h) = tex.level_size(level);
+        let stored = match tex.level(level) {
+            Some(blp::Level::Dxt { blocks, .. }) => blocks.len(),
+            Some(blp::Level::Bgra(b)) => b.len(),
+            Some(blp::Level::Palettized { indices, alpha, .. }) => indices.len() + alpha.len(),
+            None => 0,
+        };
+        // Levels past the usable prefix are filler, not image data.
+        let note = if level >= usable {
+            format!("  padding (expected {})", tex.expected_level_bytes(level))
+        } else {
+            String::new()
+        };
+        println!("    {level:>2}: {w:>5}x{h:<5} {stored:>9} bytes{note}");
+    }
+    Ok(())
+}
+
+fn blp_export(chain: &mut Chain, path: &str, level: usize, out: Option<PathBuf>) -> Result<()> {
+    let bytes = chain.read(path)?;
+    let tex = blp::Blp::parse(&bytes)?;
+    let rgba = tex
+        .decode_rgba(level)
+        .with_context(|| format!("no mip level {level} (texture has {})", tex.mip_count()))?;
+    let (w, h) = tex.level_size(level);
+
+    let out = out.unwrap_or_else(|| {
+        let stem = path
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or("texture")
+            .trim_end_matches(".blp")
+            .trim_end_matches(".BLP");
+        PathBuf::from(format!("{stem}.png"))
+    });
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file = std::fs::File::create(&out)?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header()?.write_image_data(&rgba)?;
+
+    println!(
+        "wrote {}x{} ({}) to {}",
+        w,
+        h,
+        tex.encoding().name(),
+        out.display()
+    );
+    Ok(())
+}
+
+fn blp_survey(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let needle = filter.map(str::to_lowercase);
+    let names: Vec<String> = chain
+        .list()?
+        .into_iter()
+        .filter(|n| {
+            let l = n.to_lowercase();
+            l.ends_with(".blp") && needle.as_ref().is_none_or(|f| l.contains(f.as_str()))
+        })
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+
+    // An example per encoding makes the survey self-documenting: every row can
+    // be reproduced with `blp export`.
+    let mut kinds: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let mut failures: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let (mut ok, mut no_mips, mut widest) = (0usize, 0usize, 0u32);
+
+    for (i, name) in names.iter().enumerate() {
+        let Ok(bytes) = chain.read(name) else {
+            continue; // tombstoned or stale listfile entry
+        };
+        match blp::Blp::parse(&bytes) {
+            Ok(tex) => {
+                ok += 1;
+                widest = widest.max(tex.width());
+                if tex.mip_count() <= 1 {
+                    no_mips += 1;
+                }
+                kinds
+                    .entry(format!(
+                        "{:<11} alpha_depth={}",
+                        tex.encoding().name(),
+                        tex.alpha_depth()
+                    ))
+                    .or_insert_with(|| (0, name.clone()))
+                    .0 += 1;
+            }
+            Err(e) => {
+                let key = e.to_string();
+                // Collapse the variable parts so one systematic gap is one row.
+                let key = key.split(" (").next().unwrap_or(&key).to_string();
+                let entry = failures.entry(key).or_insert((0, name.clone()));
+                entry.0 += 1;
+            }
+        }
+        if i % 20000 == 19999 {
+            tracing::info!("{}/{} surveyed", i + 1, names.len());
+        }
+    }
+
+    println!("\n{ok}/{} textures parsed\n", names.len());
+    println!("encodings in use:");
+    for (kind, (count, example)) in &kinds {
+        println!("  {count:>7}  {kind}\n           e.g. {example}");
+    }
+    println!("\nwidest texture: {widest}px; {no_mips} have a single mip level");
+
+    if failures.is_empty() {
+        println!("\nno failures");
+    } else {
+        println!("\nfailures:");
+        for (kind, (count, example)) in &failures {
+            println!("  {count:>7}  {kind}\n           e.g. {example}");
+        }
+    }
+    Ok(())
 }
 
 fn info(chain: &mut Chain) -> Result<()> {

@@ -10,6 +10,8 @@ repository.workspace = true
 [dependencies]
 mpq = { path = "../../crates/mpq" }
 dbc = { path = "../../crates/dbc" }
+blp = { path = "../../crates/blp" }
+png.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
