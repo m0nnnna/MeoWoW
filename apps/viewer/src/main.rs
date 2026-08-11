@@ -21,12 +21,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use model::{LoadedModel, Variations};
 use mpq::Chain;
-use render::camera::Orbit;
+use render::camera::{Camera, Fly, Orbit};
 use render::capture::Offscreen;
 use render::mesh::{BoneBuffer, DepthBuffer, MeshRenderer};
 use render::{texture::upload_blp, Blitter, Gpu, UploadedTexture};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
@@ -76,6 +77,10 @@ struct Args {
     #[arg(long)]
     world: bool,
 
+    /// Radius in tiles around the chosen one: 0 is a single tile, 1 a 3x3.
+    #[arg(long, default_value_t = 0)]
+    radius: usize,
+
     /// Cap on doodad placements, since a dense tile has hundreds.
     #[arg(long, default_value_t = 4000)]
     max_doodads: usize,
@@ -95,6 +100,10 @@ struct Args {
     /// Camera pitch in degrees.
     #[arg(long)]
     pitch: Option<f32>,
+
+    /// Orbit the scene instead of flying through it. Worlds default to flying.
+    #[arg(long)]
+    orbit: bool,
 
     /// Animation index to play. Omit for the bind pose.
     #[arg(long)]
@@ -194,7 +203,7 @@ fn build_scene(gpu: &Gpu, chain: &mut Chain, args: &Args) -> Result<Scene> {
     if let Some(map) = &args.map {
         let tile = parse_tile(&args.tile)?;
         if args.world {
-            let loaded = scene::load(gpu, chain, map, tile, args.max_doodads)?;
+            let loaded = scene::load(gpu, chain, map, tile, args.radius, args.max_doodads)?;
             return Ok(Scene::World(Box::new(loaded)));
         }
         let loaded = terrain::load(gpu, chain, map, tile.0, tile.1)?;
@@ -205,6 +214,49 @@ fn build_scene(gpu: &Gpu, chain: &mut Chain, args: &Args) -> Result<Scene> {
     Ok(Scene::Texture(Box::new(upload_blp(gpu, &parsed, path))))
 }
 
+/// Which movement keys are currently held.
+#[derive(Default, Clone, Copy)]
+struct KeyState {
+    forward: bool,
+    back: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    fast: bool,
+}
+
+impl KeyState {
+    fn set(&mut self, code: KeyCode, pressed: bool) -> bool {
+        let slot = match code {
+            KeyCode::KeyW | KeyCode::ArrowUp => &mut self.forward,
+            KeyCode::KeyS | KeyCode::ArrowDown => &mut self.back,
+            KeyCode::KeyA | KeyCode::ArrowLeft => &mut self.left,
+            KeyCode::KeyD | KeyCode::ArrowRight => &mut self.right,
+            KeyCode::Space | KeyCode::KeyE => &mut self.up,
+            KeyCode::KeyQ | KeyCode::ControlLeft => &mut self.down,
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => &mut self.fast,
+            _ => return false,
+        };
+        *slot = pressed;
+        true
+    }
+
+    /// Movement in camera-local axes: x right, y forward, z world up.
+    fn direction(&self) -> glam::Vec3 {
+        let axis = |positive, negative| match (positive, negative) {
+            (true, false) => 1.0,
+            (false, true) => -1.0,
+            _ => 0.0,
+        };
+        glam::Vec3::new(
+            axis(self.right, self.left),
+            axis(self.forward, self.back),
+            axis(self.up, self.down),
+        )
+    }
+}
+
 /// Parses an `x,y` tile coordinate.
 fn parse_tile(spec: &str) -> Result<(usize, usize)> {
     let (x, y) = spec
@@ -213,18 +265,32 @@ fn parse_tile(spec: &str) -> Result<(usize, usize)> {
     Ok((x.trim().parse()?, y.trim().parse()?))
 }
 
-fn initial_camera(scene: &Scene, args: &Args) -> Orbit {
-    let mut camera = match scene.bounds() {
+/// Picks a camera for the scene.
+///
+/// Worlds fly by default and single assets orbit: orbiting a nine-tile block
+/// means circling something two kilometres wide, which is useless for looking
+/// at anything in it.
+fn initial_camera(scene: &Scene, args: &Args) -> Camera {
+    let mut orbit = match scene.bounds() {
         Some((min, max)) => Orbit::frame(min, max),
         None => Orbit::default(),
     };
+    // Apply the requested bearing to the orbit first, then convert. That way
+    // `--yaw`/`--pitch` mean the same thing in both modes: a direction to view
+    // the scene *from*, not a direction to stare in from wherever we happen to
+    // be standing.
     if let Some(yaw) = args.yaw {
-        camera.yaw = yaw.to_radians();
+        orbit.yaw = yaw.to_radians();
     }
     if let Some(pitch) = args.pitch {
-        camera.pitch = pitch.to_radians();
+        orbit.pitch = pitch.to_radians();
     }
-    camera
+
+    if matches!(scene, Scene::World(_)) && !args.orbit {
+        Camera::Fly(Fly::from_orbit(&orbit))
+    } else {
+        Camera::Orbit(orbit)
+    }
 }
 
 /// Records one frame. Shared by the windowed and headless paths so the two
@@ -237,7 +303,7 @@ fn draw_scene(
     depth: &wgpu::TextureView,
     size: (u32, u32),
     scene: &Scene,
-    camera: &Orbit,
+    camera: &Camera,
     blitter: &Blitter,
     meshes: &MeshRenderer,
     material_binds: &[wgpu::BindGroup],
@@ -496,10 +562,11 @@ fn describe(scene: &Scene) -> String {
         Scene::World(w) => {
             let mut s = format!(
                 "{}
-{} terrain triangles
-{} buildings and {} doodads from {} unique models
-                 {} draw calls",
+{} tiles, {} terrain triangles
+{} buildings and {} doodads from {} unique                  models
+{} draw calls",
                 w.label,
+                w.tiles_loaded,
                 w.terrain_triangles,
                 w.object_instances,
                 w.doodad_instances,
@@ -661,10 +728,11 @@ struct App {
     chain: Chain,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    camera: Orbit,
+    camera: Camera,
     dragging: bool,
     last_cursor: Option<(f64, f64)>,
     error: Option<String>,
+    keys: KeyState,
     last_frame: Instant,
     frame_ms: f32,
     /// Selected sequence, or `None` for the bind pose.
@@ -682,7 +750,8 @@ impl App {
             chain,
             window: None,
             renderer: None,
-            camera: Orbit::default(),
+            camera: Camera::Orbit(Orbit::default()),
+            keys: KeyState::default(),
             dragging: false,
             last_cursor: None,
             error: None,
@@ -845,6 +914,12 @@ impl ApplicationHandler for App {
                     self.last_cursor = None;
                 }
             }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    let pressed = event.state == ElementState::Pressed;
+                    self.keys.set(code, pressed);
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let now = (position.x, position.y);
                 if self.dragging {
@@ -852,10 +927,16 @@ impl ApplicationHandler for App {
                         // Roughly half a turn across the window, which reads as
                         // direct manipulation rather than a flick.
                         const SPEED: f32 = 0.008;
-                        self.camera.orbit(
+                        let (dx, dy) = (
                             -(now.0 - prev.0) as f32 * SPEED,
                             (now.1 - prev.1) as f32 * SPEED,
                         );
+                        match &mut self.camera {
+                            Camera::Orbit(c) => c.orbit(dx, dy),
+                            // Dragging turns the view, so the world follows the
+                            // cursor rather than moving against it.
+                            Camera::Fly(c) => c.look(dx, -dy),
+                        }
                     }
                 }
                 self.last_cursor = Some(now);
@@ -865,7 +946,13 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
                 };
-                self.camera.zoom(0.88f32.powf(notches));
+                match &mut self.camera {
+                    Camera::Orbit(c) => c.zoom(0.88f32.powf(notches)),
+                    // Flying has no zoom; the wheel trims travel speed instead.
+                    Camera::Fly(c) => {
+                        c.speed = (c.speed * 1.15f32.powf(notches)).clamp(1.0, 5000.0)
+                    }
+                }
             }
             WindowEvent::RedrawRequested => {
                 self.redraw(&window);
@@ -884,6 +971,15 @@ impl App {
 
         let ui_output = self.build_ui(window);
         let camera = self.camera;
+
+        // Movement integrates real elapsed time, so travel speed does not
+        // depend on frame rate.
+        if let Camera::Fly(fly) = &mut self.camera {
+            let direction = self.keys.direction();
+            if direction != glam::Vec3::ZERO {
+                fly.travel(direction, self.frame_ms / 1000.0, self.keys.fast);
+            }
+        }
 
         // Advance the clock before posing, from real elapsed time so playback
         // speed is independent of frame rate.
@@ -1088,13 +1184,14 @@ impl App {
                     }
 
                     ui.separator();
-                    ui.label(format!(
-                        "camera: yaw {:.0}\u{b0}  pitch {:.0}\u{b0}  distance {:.2}",
-                        camera.yaw.to_degrees(),
-                        camera.pitch.to_degrees(),
-                        camera.distance
-                    ));
-                    ui.weak("drag to orbit, scroll to zoom");
+                    ui.label(camera.describe());
+                    ui.weak(match camera {
+                        Camera::Orbit(_) => "drag to orbit, scroll to zoom",
+                        Camera::Fly(_) => {
+                            "drag to look, WASD to move, space/Q for height, \
+                             shift to sprint, scroll for speed"
+                        }
+                    });
                 });
         });
 

@@ -7,7 +7,7 @@
 //! Placements are grouped by model path, so a forest of five hundred identical
 //! trees loads one mesh and draws it with five hundred instances.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use glam::{Mat4, Quat, Vec3};
@@ -33,6 +33,7 @@ pub struct WorldScene {
     pub min: Vec3,
     pub max: Vec3,
     pub label: String,
+    pub tiles_loaded: usize,
     pub terrain_triangles: usize,
     pub object_instances: usize,
     pub doodad_instances: usize,
@@ -75,61 +76,106 @@ fn transform(raw_position: [f32; 3], rotation: [f32; 3], scale: f32) -> Mat4 {
     )
 }
 
-/// Loads a tile and everything placed on it.
+/// Loads a square block of tiles and everything placed on them.
+///
+/// `radius` 0 is a single tile, 1 is the 3x3 around it, and so on. Tiles that
+/// do not exist are skipped rather than failing: coastlines are ragged, and a
+/// block near one is mostly ocean.
 pub fn load(
     gpu: &Gpu,
     chain: &mut Chain,
     map: &str,
-    tile: (usize, usize),
+    centre: (usize, usize),
+    radius: usize,
     max_doodads: usize,
 ) -> Result<WorldScene> {
-    let terrain = crate::terrain::load(gpu, chain, map, tile.0, tile.1)?;
     let wdt = adt::Wdt::parse(&chain.read(&adt::wdt_path(map))?)?;
-    let parsed = adt::Adt::parse(
-        &chain.read(&adt::tile_path(map, tile.0, tile.1))?,
-        wdt.big_alpha(),
-    )?;
 
     let mut instances: Vec<Instance> = Vec::new();
     let mut items: Vec<Placed> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
-    // Framing follows the *tile*, not everything it references. A tile at the
-    // edge of a city lists the whole city's WMO -- Northshire pulls in all of
-    // Stormwind -- and framing that would shrink the tile to a speck.
-    let (min, max) = (terrain.min, terrain.max);
+    let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     let (mut object_min, mut object_max) = (min, max);
+    let mut terrain_triangles = 0usize;
+    let mut tiles_loaded = 0usize;
 
-    // Terrain is already in world space, so it draws at identity.
-    let terrain_triangles = terrain.triangle_count;
-    items.push(Placed {
-        mesh: terrain.mesh,
-        draws: terrain.draws,
-        textures: terrain.textures,
-        instance_start: instances.len() as u32,
-        instance_count: 1,
-    });
-    instances.push(Instance::IDENTITY);
-
-    // Group placements by model so one mesh serves every copy of it.
+    // Placements are deduplicated by unique id: an object straddling a tile
+    // border is listed by *every* tile it touches, so loading a block without
+    // this draws the same building several times over itself.
     let mut object_groups: HashMap<String, Vec<Mat4>> = HashMap::new();
-    for placement in &parsed.objects {
-        object_groups
-            .entry(placement.path.to_string())
-            .or_default()
-            .push(transform(placement.position, placement.rotation, 1.0));
+    let mut doodad_groups: HashMap<String, Vec<Mat4>> = HashMap::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut doodad_budget = max_doodads;
+
+    let low = |v: usize| v.saturating_sub(radius);
+    for y in low(centre.1)..=(centre.1 + radius).min(adt::TILES_PER_MAP - 1) {
+        for x in low(centre.0)..=(centre.0 + radius).min(adt::TILES_PER_MAP - 1) {
+            if !wdt.has_tile(x, y) {
+                continue;
+            }
+            let terrain = match crate::terrain::load(gpu, chain, map, x, y) {
+                Ok(t) => t,
+                Err(e) => {
+                    skipped.push(format!("terrain {x},{y}: {e}"));
+                    continue;
+                }
+            };
+            tiles_loaded += 1;
+            terrain_triangles += terrain.triangle_count;
+            min = min.min(terrain.min);
+            max = max.max(terrain.max);
+
+            // Terrain is already in world space, so it draws at identity.
+            items.push(Placed {
+                mesh: terrain.mesh,
+                draws: terrain.draws,
+                textures: terrain.textures,
+                instance_start: instances.len() as u32,
+                instance_count: 1,
+            });
+            instances.push(Instance::IDENTITY);
+
+            let Ok(bytes) = chain.read(&adt::tile_path(map, x, y)) else {
+                continue;
+            };
+            let Ok(parsed) = adt::Adt::parse(&bytes, wdt.big_alpha()) else {
+                continue;
+            };
+
+            for placement in &parsed.objects {
+                if !seen.insert(placement.unique_id) {
+                    continue;
+                }
+                object_groups
+                    .entry(placement.path.to_string())
+                    .or_default()
+                    .push(transform(placement.position, placement.rotation, 1.0));
+            }
+            for placement in &parsed.doodads {
+                if doodad_budget == 0 {
+                    break;
+                }
+                if !seen.insert(placement.unique_id) {
+                    continue;
+                }
+                doodad_budget -= 1;
+                doodad_groups
+                    .entry(placement.path.to_string())
+                    .or_default()
+                    .push(transform(
+                        placement.position,
+                        placement.rotation,
+                        placement.scale,
+                    ));
+            }
+        }
     }
 
-    let mut doodad_groups: HashMap<String, Vec<Mat4>> = HashMap::new();
-    for placement in parsed.doodads.iter().take(max_doodads) {
-        doodad_groups
-            .entry(placement.path.to_string())
-            .or_default()
-            .push(transform(
-                placement.position,
-                placement.rotation,
-                placement.scale,
-            ));
+    if tiles_loaded == 0 {
+        anyhow::bail!("no tiles exist around {},{} in {map}", centre.0, centre.1);
     }
+    object_min = object_min.min(min);
+    object_max = object_max.max(max);
 
     let (mut object_instances, mut doodad_instances) = (0usize, 0usize);
 
@@ -158,7 +204,7 @@ pub fn load(
     let mut ordered: Vec<(String, Vec<Mat4>)> = doodad_groups.into_iter().collect();
     ordered.sort_by(|a, b| a.0.cmp(&b.0));
     for (path, transforms) in ordered {
-        // Doodads have no skeleton pose here; they draw in bind pose.
+        // Doodads draw in bind pose; nothing here animates yet.
         match crate::model::load(gpu, chain, &path, &crate::model::Variations::default(), 0) {
             Ok(loaded) => {
                 doodad_instances += transforms.len();
@@ -179,13 +225,20 @@ pub fn load(
     }
 
     let draw_calls = items.iter().map(|i| i.draws.len()).sum();
-    let unique_models = items.len().saturating_sub(1);
+    let unique_models = items.len().saturating_sub(tiles_loaded);
     Ok(WorldScene {
         instances: InstanceBuffer::upload(gpu, &instances),
         items,
         min,
         max,
-        label: format!("{map} tile {},{}", tile.0, tile.1),
+        label: format!(
+            "{map} {}x{} tiles around {},{}",
+            radius * 2 + 1,
+            radius * 2 + 1,
+            centre.0,
+            centre.1
+        ),
+        tiles_loaded,
         terrain_triangles,
         object_instances,
         doodad_instances,

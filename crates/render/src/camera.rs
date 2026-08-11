@@ -181,3 +181,235 @@ mod tests {
         assert!(camera.distance >= 0.05);
     }
 }
+
+/// A free-flying camera, for moving through a world rather than around an
+/// object.
+///
+/// Shares the orbit camera's conventions: `+Z` up, and the same projection so
+/// switching between them does not change what the scene looks like.
+#[derive(Clone, Copy, Debug)]
+pub struct Fly {
+    pub position: Vec3,
+    /// Heading, measured the same way as [`Orbit::yaw`].
+    pub yaw: f32,
+    pub pitch: f32,
+    pub fov_y: f32,
+    pub near: f32,
+    pub far: f32,
+    /// Units per second at normal speed.
+    pub speed: f32,
+}
+
+impl Default for Fly {
+    fn default() -> Self {
+        Self {
+            position: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: -0.2,
+            fov_y: 65f32.to_radians(),
+            near: 0.5,
+            // A continent tile is 533 units across, so the far plane has to
+            // clear several of them to be useful.
+            far: 12_000.0,
+            speed: 60.0,
+        }
+    }
+}
+
+impl Fly {
+    /// Places the camera to look at a bounding box from outside it, matching
+    /// what the orbit camera would have shown.
+    pub fn looking_at(min: Vec3, max: Vec3) -> Self {
+        Self::from_orbit(&Orbit::frame(min, max))
+    }
+
+    /// Converts an orbit camera into a free one aimed the same way.
+    ///
+    /// Keeping the two convertible means a bearing means the same thing in
+    /// either mode, so a screenshot angle is reproducible whichever is active.
+    pub fn from_orbit(orbit: &Orbit) -> Self {
+        let eye = orbit.eye();
+        let to_target = orbit.target - eye;
+        let mut camera = Self {
+            position: eye,
+            far: (orbit.far * 4.0).max(12_000.0),
+            // Scale movement to the scene: crossing it should take seconds,
+            // not minutes.
+            speed: (to_target.length() * 0.35).clamp(5.0, 400.0),
+            ..Default::default()
+        };
+        camera.yaw = to_target.y.atan2(to_target.x);
+        camera.pitch = to_target.z.atan2(to_target.truncate().length());
+        camera
+    }
+
+    pub fn forward(&self) -> Vec3 {
+        let (sp, cp) = self.pitch.sin_cos();
+        let (sy, cy) = self.yaw.sin_cos();
+        Vec3::new(cp * cy, cp * sy, sp)
+    }
+
+    /// Right-hand side of the view, always level with the horizon so strafing
+    /// never rolls the camera.
+    pub fn right(&self) -> Vec3 {
+        self.forward().cross(Vec3::Z).normalize_or_zero()
+    }
+
+    pub fn look(&mut self, delta_yaw: f32, delta_pitch: f32) {
+        self.yaw += delta_yaw;
+        const LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.02;
+        self.pitch = (self.pitch + delta_pitch).clamp(-LIMIT, LIMIT);
+    }
+
+    /// Moves by a direction expressed in camera-local axes: `x` right, `y`
+    /// forward, `z` world-up.
+    ///
+    /// Vertical movement uses world up rather than the camera's, so looking
+    /// down while ascending still goes up.
+    pub fn travel(&mut self, local: Vec3, seconds: f32, fast: bool) {
+        let multiplier = if fast { 6.0 } else { 1.0 };
+        let step = self.speed * multiplier * seconds;
+        self.position +=
+            (self.right() * local.x + self.forward() * local.y + Vec3::Z * local.z) * step;
+    }
+
+    pub fn view_proj(&self, aspect: f32) -> glam::Mat4 {
+        let view = glam::camera::rh::view::look_to_mat4(self.position, self.forward(), Vec3::Z);
+        let proj = glam::camera::rh::proj::directx::perspective(
+            self.fov_y,
+            aspect.max(0.001),
+            self.near,
+            self.far,
+        );
+        proj * view
+    }
+
+    pub fn uniform(&self, aspect: f32) -> CameraUniform {
+        // Key light behind the viewer, so surfaces face-on are brightest.
+        let light = -self.forward() + Vec3::new(0.0, 0.0, 0.8);
+        CameraUniform {
+            view_proj: self.view_proj(aspect).to_cols_array_2d(),
+            eye: [self.position.x, self.position.y, self.position.z, 1.0],
+            light: [light.x, light.y, light.z, 0.0],
+        }
+    }
+}
+
+/// Either camera, so the renderer does not care which is in use.
+#[derive(Clone, Copy, Debug)]
+pub enum Camera {
+    Orbit(Orbit),
+    Fly(Fly),
+}
+
+impl Camera {
+    pub fn uniform(&self, aspect: f32) -> CameraUniform {
+        match self {
+            Self::Orbit(c) => c.uniform(aspect),
+            Self::Fly(c) => c.uniform(aspect),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Orbit(c) => format!(
+                "orbit: yaw {:.0}\u{b0} pitch {:.0}\u{b0} distance {:.1}",
+                c.yaw.to_degrees(),
+                c.pitch.to_degrees(),
+                c.distance
+            ),
+            Self::Fly(c) => format!(
+                "fly: [{:.0} {:.0} {:.0}] yaw {:.0}\u{b0} pitch {:.0}\u{b0} {:.0} u/s",
+                c.position.x,
+                c.position.y,
+                c.position.z,
+                c.yaw.to_degrees(),
+                c.pitch.to_degrees(),
+                c.speed
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod fly_tests {
+    use super::*;
+
+    #[test]
+    fn forward_is_level_at_zero_pitch() {
+        let camera = Fly {
+            pitch: 0.0,
+            yaw: 0.0,
+            ..Default::default()
+        };
+        assert!((camera.forward() - Vec3::X).length() < 1e-5);
+    }
+
+    /// Strafing must never introduce roll, however far the camera is pitched.
+    #[test]
+    fn right_stays_level_when_looking_down() {
+        for pitch in [-1.4, -0.5, 0.0, 0.5, 1.4f32] {
+            let camera = Fly {
+                pitch,
+                ..Default::default()
+            };
+            assert!(
+                camera.right().z.abs() < 1e-5,
+                "pitch {pitch} tilted the right vector"
+            );
+        }
+    }
+
+    /// Vertical travel follows world up, not the view direction, so ascending
+    /// while looking down still gains height.
+    #[test]
+    fn vertical_travel_ignores_pitch() {
+        let mut camera = Fly {
+            pitch: -1.2,
+            speed: 10.0,
+            ..Default::default()
+        };
+        let before = camera.position;
+        camera.travel(Vec3::Z, 1.0, false);
+        assert!(camera.position.z > before.z + 9.0);
+        assert!((camera.position.x - before.x).abs() < 1e-4);
+    }
+
+    #[test]
+    fn fast_travel_is_a_multiple_of_normal() {
+        let step = |fast| {
+            let mut camera = Fly {
+                speed: 10.0,
+                yaw: 0.0,
+                pitch: 0.0,
+                ..Default::default()
+            };
+            camera.travel(Vec3::Y, 1.0, fast);
+            camera.position.x
+        };
+        assert!((step(false) - 10.0).abs() < 1e-4);
+        assert!(step(true) > step(false) * 5.0);
+    }
+
+    #[test]
+    fn pitch_cannot_reach_the_pole() {
+        let mut camera = Fly::default();
+        camera.look(0.0, 100.0);
+        assert!(camera.pitch < std::f32::consts::FRAC_PI_2);
+    }
+
+    /// Framing a box must put the camera outside it and looking at it.
+    #[test]
+    fn looking_at_a_box_points_towards_it() {
+        let (min, max) = (Vec3::new(-100.0, -100.0, 0.0), Vec3::new(100.0, 100.0, 50.0));
+        let camera = Fly::looking_at(min, max);
+        let centre = (min + max) * 0.5;
+
+        let to_centre = (centre - camera.position).normalize();
+        assert!(
+            camera.forward().dot(to_centre) > 0.99,
+            "camera is not aimed at the box"
+        );
+        assert!(camera.speed > 0.0 && camera.far > (centre - camera.position).length());
+    }
+}

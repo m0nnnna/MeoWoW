@@ -11,7 +11,7 @@ pub mod mesh;
 pub mod texture;
 
 pub use blit::Blitter;
-pub use camera::Orbit;
+pub use camera::{Camera, Fly, Orbit};
 pub use mesh::{GpuMesh, MeshRenderer, MeshVertex};
 pub use texture::UploadedTexture;
 

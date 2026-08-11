@@ -197,3 +197,29 @@ city lists that city's WMO in full: Northshire pulls in all of Stormwind, whose
 bounding box is over a thousand units across, and framing that shrinks the tile
 to a speck beside a distant cluster of buildings. That looked like a placement
 bug for a while and was simply correct geography.
+
+## Cameras
+
+Two, sharing conventions so a bearing means the same thing in either: `Orbit`
+circles a target, `Fly` moves freely. Worlds fly by default — orbiting a
+nine-tile block means circling something two kilometres wide, which is useless
+for looking at anything inside it.
+
+`Fly::from_orbit` converts between them, and the viewer applies `--yaw`/`--pitch`
+to an orbit camera *before* converting. Overriding a fly camera's angles after
+positioning it leaves the camera in place staring at empty sky, which is exactly
+the screenshot it produced the first time.
+
+Strafing uses a right vector re-levelled against world up, so looking down and
+strafing never rolls the view, and vertical movement follows world up rather
+than the view direction.
+
+## Loading a block of tiles
+
+`--radius n` loads the `(2n+1)²` tiles around one, skipping any the WDT does not
+declare — coastlines are ragged and a block near one is mostly ocean.
+
+**Placements must be deduplicated by `unique_id`.** An object straddling a tile
+border is listed by *every* tile it touches, so a nine-tile block without
+deduplication draws the same building several times over itself. Northshire's
+3x3 block yields 27 buildings and 4,933 doodads from 192 unique models.
