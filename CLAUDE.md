@@ -12,15 +12,17 @@ streams. Phase 3 has started.
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation), WMO, ADT/WDT — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
-| Protocol | **3.1 logon/SRP6 and 3.2 world handshake done**, both confirmed against a live realm; 3.3 enter world is next |
+| Protocol | **3.1 logon, 3.2 world handshake, 3.3 enter world done**, all confirmed against a live realm; 3.4 movement is next |
 | Game + UI | Not started. The largest remaining chunk. |
 
-Roughly 40% of the way to something a person could test by playing. See
+Roughly 45% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
 
-The two halves have not met yet: the renderer draws a world nobody is standing
-in, and the protocol reaches a character list that opens onto nothing. 3.3 is
-where they join.
+The two halves still have not met in code. The client can log in, enter the
+world and parse everything around it — position, creatures, game objects — and
+it can render terrain and models at those same coordinates, but nothing yet
+feeds one into the other. Joining them is the obvious next visible win and does
+not depend on 3.4.
 
 ## Orientation
 
@@ -77,11 +79,22 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   vectors, SRP6 rotation keys are unit quaternions, terrain chunks must meet at
   their edges. Each of those caught a real bug that size checks missed.
 - **Assert the parse consumed the whole record.** The corollary to the above,
-  and cheaper than any of it. Three separate world-protocol bugs — a packet
-  sixteen bytes longer than expected, three missing equipment slots, a field of
-  the wrong width — were invisible field by field and obvious the moment a
-  cursor reported leftovers. Parse through a cursor and make running out of
-  input *and* having input left over both errors.
+  and cheaper than any of it. Four separate world-protocol bugs — a packet
+  sixteen bytes longer than expected, three missing equipment slots, a
+  result-code enum off by one, a position block read as nine floats instead of
+  eight — were invisible field by field and obvious the moment a cursor reported
+  leftovers. Parse through a cursor and make running out of input *and* having
+  input left over both errors.
+- **The hard-looking part is rarely the expensive one.** SRP6, the RC4 header
+  cipher and the update-field bit-packing all worked close to first time: they
+  are precisely specified and fail loudly. Every hour actually lost went to
+  ordinary struct layout, where a wrong guess parses perfectly. Budget for the
+  boring parts.
+- **Not every failure is a bug.** The world connection dropping after three
+  keepalives was the server enforcing a *minimum* ping interval — pinging too
+  eagerly is punished harder than not pinging. It surfaced as an unexpected end
+  of stream, which is indistinguishable from a desynchronised cipher. Before
+  suspecting corruption, ask whether a rate limit or anti-abuse rule was tripped.
 - **Compare against something derived independently.** The SRP6 tests carry a
   server written from the protocol, not from the client. Agreement between two
   separate derivations is evidence; a thing checked against itself is not.

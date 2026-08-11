@@ -34,6 +34,19 @@ use crate::protocol::{self, AuthResponse, Character};
 /// Port a 3.3.5a world server listens on, absent a realm list saying otherwise.
 pub const DEFAULT_PORT: u16 = 8085;
 
+/// How often to send a keepalive.
+///
+/// This is a *lower* bound dressed as an interval, and getting it wrong in the
+/// obvious direction is punished. The stock server counts any ping arriving
+/// less than about 27 seconds after the previous one as "overspeed" and
+/// disconnects after a couple of them, so a client that pings eagerly to be
+/// safe is dropped faster than one that does not ping at all.
+///
+/// Confirmed the hard way: at five-second pings the live realm closed the
+/// connection after the third, which surfaced as an unexpected end of stream
+/// and looked exactly like a desynchronised header cipher.
+pub const PING_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("could not reach the world server at {address}: {source}")]
@@ -56,6 +69,8 @@ pub enum Error {
     Unexpected { expected: &'static str, got: u16 },
     #[error("gave up waiting for {0} after {1} intervening packets")]
     NoReply(&'static str, usize),
+    #[error("the server refused to log this character in (code {code:#04x})")]
+    LoginFailed { code: u8 },
     #[error("still queued at position {0} after waiting")]
     StillQueued(u32),
     #[error("the realm address {0:?} is not a host:port pair")]
@@ -64,11 +79,12 @@ pub enum Error {
 
 /// How many unrelated packets to skip while waiting for an expected one.
 ///
-/// The server volunteers a handful after login -- addon verdicts, the cache
-/// version, tutorial flags -- and more on other realm configurations. A bound
-/// keeps a confused stream from looping forever without being so tight that a
-/// chatty but healthy server trips it.
-const MAX_SKIPPED: usize = 64;
+/// The session handshake only volunteers a handful -- addon verdicts, the cache
+/// version, tutorial flags -- but entering the world sends a burst of several
+/// dozen: action bars, spell lists, faction standings, the motd. The bound
+/// exists to stop a stream that has lost its place from looping forever, so it
+/// has to sit well above the largest healthy burst rather than snugly above it.
+const MAX_SKIPPED: usize = 512;
 
 /// A live, authenticated world connection.
 pub struct Connection {
@@ -78,6 +94,10 @@ pub struct Connection {
     crypt: Option<HeaderCrypt>,
     /// Reported by `SMSG_AUTH_RESPONSE`; 2 is Wrath.
     pub expansion: u8,
+    /// Origin for the tick counts sent back in time-sync responses. The server
+    /// only checks that they advance sensibly, so any fixed origin will do.
+    started: std::time::Instant,
+    ping_sequence: u32,
 }
 
 /// Written by hand rather than derived: the cipher holds key-derived state,
@@ -114,6 +134,8 @@ impl Connection {
             stream: connect(address, timeout)?,
             crypt: None,
             expansion: 0,
+            started: std::time::Instant::now(),
+            ping_sequence: 0,
         };
         connection.handshake(account, realm_id, session_key)?;
         Ok(connection)
@@ -200,6 +222,21 @@ impl Connection {
         Ok(protocol::parse_result_code(&packet.body, "SMSG_CHAR_DELETE")?)
     }
 
+    /// Enters the world as one character.
+    ///
+    /// The reply is not a single packet but a burst of them -- action bars,
+    /// spell lists, faction standings, the motd -- with the position buried in
+    /// the middle. Everything not asked for is skipped, except the housekeeping
+    /// the server requires an answer to; see [`Connection::housekeep`].
+    pub fn enter_world(&mut self, guid: u64) -> Result<protocol::WorldPosition, Error> {
+        self.send(ClientOpcode::PlayerLogin, &protocol::player_login(guid))?;
+        let packet = self.expect(
+            opcode::server::LOGIN_VERIFY_WORLD,
+            "SMSG_LOGIN_VERIFY_WORLD",
+        )?;
+        Ok(protocol::parse_login_verify_world(&packet.body)?)
+    }
+
     /// Reads until the wanted opcode arrives, discarding what the server
     /// volunteers along the way.
     ///
@@ -207,21 +244,119 @@ impl Connection {
     /// socket even when it is not wanted, or the next header is read from the
     /// middle of it.
     pub fn expect(&mut self, opcode: u16, name: &'static str) -> Result<Packet, Error> {
-        for skipped in 0..MAX_SKIPPED {
+        for _ in 0..MAX_SKIPPED {
             let packet = self.receive()?;
             if packet.opcode == opcode {
                 return Ok(packet);
             }
-            tracing::debug!(
-                "skipping {} ({} bytes) while waiting for {name}",
-                crate::opcode::describe(packet.opcode),
-                packet.body.len()
-            );
-            if skipped + 1 == MAX_SKIPPED {
-                return Err(Error::NoReply(name, MAX_SKIPPED));
-            }
+            self.housekeep(&packet)?;
         }
         Err(Error::NoReply(name, MAX_SKIPPED))
+    }
+
+    /// Answers the packets the server requires a reply to, whatever else is
+    /// being waited for.
+    ///
+    /// Time sync is not optional: a server that stops hearing responses drops
+    /// the session, and because the drop arrives as a plain connection close it
+    /// is indistinguishable from a parser that lost its place in the stream.
+    /// Handling it here rather than in a caller means no wait loop can forget.
+    ///
+    /// A login refusal is turned into an error rather than skipped -- it is the
+    /// answer to the request, just not the hoped-for one, and skipping it would
+    /// leave the caller waiting for a packet that is never coming.
+    fn housekeep(&mut self, packet: &Packet) -> Result<(), Error> {
+        match packet.opcode {
+            opcode::server::TIME_SYNC_REQ => {
+                let counter = protocol::parse_time_sync_req(&packet.body)?;
+                let ticks = self.started.elapsed().as_millis() as u32;
+                self.send(
+                    ClientOpcode::TimeSyncResp,
+                    &protocol::time_sync_resp(counter, ticks),
+                )?;
+                tracing::debug!("answered time sync {counter} with {ticks} ms");
+            }
+            opcode::server::CHARACTER_LOGIN_FAILED => {
+                let code = protocol::parse_result_code(&packet.body, "SMSG_CHARACTER_LOGIN_FAILED")?;
+                return Err(Error::LoginFailed { code });
+            }
+            other => tracing::debug!(
+                "skipping {} ({} bytes)",
+                crate::opcode::describe(other),
+                packet.body.len()
+            ),
+        }
+        Ok(())
+    }
+
+    /// Reads packets until the server stops sending for `quiet_for`.
+    ///
+    /// Entering the world produces a burst rather than a reply, and nothing in
+    /// it marks the end -- the only signal that the initial state is complete
+    /// is the stream going quiet. So the read timeout is temporarily shortened
+    /// and a timeout is treated as success rather than as an error.
+    ///
+    /// Housekeeping still runs on everything collected, because a burst can be
+    /// long enough to contain a time-sync request.
+    pub fn drain(&mut self, quiet_for: Duration, limit: usize) -> Result<Vec<Packet>, Error> {
+        let restore = self.stream.read_timeout().ok().flatten();
+        self.stream
+            .set_read_timeout(Some(quiet_for))
+            .map_err(|source| Error::Io {
+                what: "shortening the read timeout",
+                source,
+            })?;
+
+        let mut collected = Vec::new();
+        let outcome = loop {
+            if collected.len() >= limit {
+                break Ok(());
+            }
+            match self.receive() {
+                Ok(packet) => {
+                    if let Err(error) = self.housekeep(&packet) {
+                        break Err(error);
+                    }
+                    collected.push(packet);
+                }
+                // A quiet stream is the expected end of a burst, not a fault.
+                Err(Error::Io { source, .. })
+                    if matches!(
+                        source.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break Ok(())
+                }
+                Err(error) => break Err(error),
+            }
+        };
+
+        self.stream
+            .set_read_timeout(restore)
+            .map_err(|source| Error::Io {
+                what: "restoring the read timeout",
+                source,
+            })?;
+        outcome.map(|()| collected)
+    }
+
+    /// Sends a keepalive and waits for its echo.
+    ///
+    /// Call no more often than [`PING_INTERVAL`]; the server treats a faster
+    /// rate as abuse and disconnects.
+    pub fn ping(&mut self, latency: u32) -> Result<(), Error> {
+        self.ping_sequence = self.ping_sequence.wrapping_add(1);
+        let sequence = self.ping_sequence;
+        self.send(ClientOpcode::Ping, &protocol::ping(sequence, latency))?;
+        let packet = self.expect(opcode::server::PONG, "SMSG_PONG")?;
+        let echoed = protocol::parse_pong(&packet.body)?;
+        if echoed != sequence {
+            // Not fatal, but it means the stream is not where it is believed to
+            // be, which is worth knowing before something subtler goes wrong.
+            tracing::warn!("pong echoed {echoed}, expected {sequence}");
+        }
+        Ok(())
     }
 
     /// Sends one packet, encrypting the header if the cipher is running.
@@ -485,13 +620,33 @@ mod tests {
         write_server_packet(&mut stream, Some(&mut crypt), 0x02EF, &0u32.to_le_bytes());
         write_server_packet(&mut stream, Some(&mut crypt), 0x04AB, &3u32.to_le_bytes());
         write_server_packet(&mut stream, Some(&mut crypt), 0x00FD, &[0u8; 32]);
+        // A clock-sync poll in the middle of the burst. The client must answer
+        // this unprompted, while it is waiting for something else entirely.
+        write_server_packet(&mut stream, Some(&mut crypt), 0x0390, &99u32.to_le_bytes());
 
-        // --- character list
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).expect("enum header");
-        crypt.from_client.apply_keystream(&mut header);
-        let opcode = u32::from_le_bytes(header[2..6].try_into().unwrap());
-        assert_eq!(opcode, 0x0037, "expected CMSG_CHAR_ENUM");
+        // --- character list request
+        //
+        // Ordering here is not the obvious one and the test originally got it
+        // wrong. The client sends CMSG_CHAR_ENUM *before* it has read the burst
+        // above, so its time-sync answer necessarily arrives second -- it
+        // cannot answer a packet it has not read yet. So accept either order
+        // rather than demanding the tidy one.
+        let mut answered_time_sync = false;
+        loop {
+            let (opcode, body) = read_client_packet(&mut stream, &mut crypt);
+            match opcode {
+                0x0391 => {
+                    assert_eq!(
+                        u32::from_le_bytes(body[0..4].try_into().unwrap()),
+                        99,
+                        "the time-sync counter must be echoed"
+                    );
+                    answered_time_sync = true;
+                }
+                0x0037 => break,
+                other => panic!("unexpected client opcode {other:#06x}"),
+            }
+        }
 
         let mut body = vec![characters];
         for index in 0..characters {
@@ -519,6 +674,26 @@ mod tests {
             }
         }
         write_server_packet(&mut stream, Some(&mut crypt), 0x003B, &body);
+
+        // The answer is still in flight if it has not arrived yet; the client
+        // sends it while draining toward the reply just written.
+        if !answered_time_sync {
+            let (opcode, body) = read_client_packet(&mut stream, &mut crypt);
+            assert_eq!(opcode, 0x0391, "client never answered the time sync");
+            assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 99);
+        }
+    }
+
+    /// Reads one client packet, decrypting its header.
+    fn read_client_packet(stream: &mut TcpStream, crypt: &mut ServerCrypt) -> (u32, Vec<u8>) {
+        let mut header = [0u8; 6];
+        stream.read_exact(&mut header).expect("client header");
+        crypt.from_client.apply_keystream(&mut header);
+        let size = u16::from_be_bytes([header[0], header[1]]) as usize;
+        let opcode = u32::from_le_bytes(header[2..6].try_into().unwrap());
+        let mut body = vec![0u8; size - 4];
+        stream.read_exact(&mut body).expect("client body");
+        (opcode, body)
     }
 
     fn write_server_packet(

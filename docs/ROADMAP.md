@@ -54,7 +54,7 @@ Target is a stock TrinityCore or MaNGOS 3.3.5a server.
 |---|-----------|-----------|
 | 3.1 | **Auth server** ✅ | SRP6 login, realm list, stage-aware refusals; `wow-cli auth <host>` |
 | 3.2 | **World handshake** ✅ | RC4 header crypt, `SMSG_AUTH_CHALLENGE` → character list; `wow-cli world <host>` |
-| 3.3 | **Enter world** | Login to a character, receive the initial object update |
+| 3.3 | **Enter world** ✅ | Login to a character, parse the initial object update; `wow-cli world --enter <name>` |
 | 3.4 | **Movement** | Move, and be seen moving by another client |
 | 3.5 | **Entity replication** | Other players and creatures visible and animating |
 
@@ -62,12 +62,25 @@ Target is a stock TrinityCore or MaNGOS 3.3.5a server.
 was indeed unforgiving — but not in the way budgeted for. The cipher itself
 worked on the first attempt against a live server. What failed three times was
 ordinary packet layout: a challenge sixteen bytes longer than expected, three
-missing equipment slots, and a result-code enum offset by one. See
-`docs/PROTOCOL.md`; the lesson is that a cursor which asserts it consumed the
-whole packet catches all three, and no amount of per-field checking does.
+missing equipment slots, and a result-code enum offset by one.
 
-The remaining unforgiving half — object-update-field packing — is 3.3's problem,
-and that budget still stands.
+3.3 went the same way. The object-update-field packing — the other half that was
+budgeted as unforgiving — took one bug: a position block read as nine floats
+instead of eight. Everything else parsed first time.
+
+The pattern across both milestones is worth stating, because it should change
+how the remaining protocol work is approached. **The hard-looking parts were not
+the expensive ones.** Cryptography and bit-packing are precisely specified and
+either work or fail loudly. What cost the time every single time was ordinary
+struct layout, where a wrong guess parses perfectly and returns nonsense. The
+cheap defence — parse through a cursor, assert the packet was consumed exactly —
+caught all four bugs, and no amount of per-field validation would have caught
+any of them. See `docs/PROTOCOL.md`.
+
+The other lesson is that some failures are not bugs at all: the connection
+dropping after three keepalives was the server enforcing a *minimum* ping
+interval, not a parser losing its place. Rate limits and anti-abuse rules are
+part of the protocol, and they fail in ways that mimic corruption.
 
 ## Phase 4 — Game
 

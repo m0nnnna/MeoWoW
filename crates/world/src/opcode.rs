@@ -14,8 +14,10 @@ pub enum ClientOpcode {
     CharCreate = 0x0036,
     CharEnum = 0x0037,
     CharDelete = 0x0038,
+    PlayerLogin = 0x003D,
     Ping = 0x01DC,
     AuthSession = 0x01ED,
+    TimeSyncResp = 0x0391,
 }
 
 /// The server-to-client opcodes this client reacts to.
@@ -32,6 +34,18 @@ pub mod server {
     pub const LOGIN_VERIFY_WORLD: u16 = 0x0236;
     pub const CHAR_CREATE: u16 = 0x003A;
     pub const CHAR_DELETE: u16 = 0x003C;
+    /// Login refused after the character was chosen, unlike the auth-stage
+    /// refusals; carries its own reason code.
+    pub const CHARACTER_LOGIN_FAILED: u16 = 0x0041;
+    pub const UPDATE_OBJECT: u16 = 0x00A9;
+    pub const DESTROY_OBJECT: u16 = 0x00AA;
+    /// The same payload as [`UPDATE_OBJECT`], zlib-deflated behind a length.
+    pub const COMPRESSED_UPDATE_OBJECT: u16 = 0x01F6;
+    /// The server asks periodically; ignoring it eventually drops the session.
+    pub const TIME_SYNC_REQ: u16 = 0x0390;
+    pub const MOTD: u16 = 0x033D;
+    pub const ACCOUNT_DATA_TIMES: u16 = 0x0209;
+    pub const LOGIN_SETTIMESPEED: u16 = 0x0042;
 }
 
 /// A human-readable name for an incoming opcode, for logs and dumps.
@@ -50,6 +64,14 @@ pub fn describe(opcode: u16) -> String {
         server::LOGIN_VERIFY_WORLD => "SMSG_LOGIN_VERIFY_WORLD",
         server::CHAR_CREATE => "SMSG_CHAR_CREATE",
         server::CHAR_DELETE => "SMSG_CHAR_DELETE",
+        server::CHARACTER_LOGIN_FAILED => "SMSG_CHARACTER_LOGIN_FAILED",
+        server::UPDATE_OBJECT => "SMSG_UPDATE_OBJECT",
+        server::DESTROY_OBJECT => "SMSG_DESTROY_OBJECT",
+        server::COMPRESSED_UPDATE_OBJECT => "SMSG_COMPRESSED_UPDATE_OBJECT",
+        server::TIME_SYNC_REQ => "SMSG_TIME_SYNC_REQ",
+        server::MOTD => "SMSG_MOTD",
+        server::ACCOUNT_DATA_TIMES => "SMSG_ACCOUNT_DATA_TIMES",
+        server::LOGIN_SETTIMESPEED => "SMSG_LOGIN_SETTIMESPEED",
         other => return format!("opcode {other:#06x}"),
     };
     name.to_string()

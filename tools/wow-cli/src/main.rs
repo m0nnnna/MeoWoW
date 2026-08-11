@@ -113,6 +113,18 @@ enum Command {
         /// Delete the named character before listing.
         #[arg(long)]
         delete: Option<String>,
+        /// Enter the world as this character and report where it landed.
+        #[arg(long)]
+        enter: Option<String>,
+        /// Write object-update payloads that failed to parse here, already
+        /// decompressed, for offline analysis.
+        #[arg(long)]
+        dump_failed: Option<PathBuf>,
+        /// After entering, hold the connection open this many seconds,
+        /// answering keepalives. Proves the session survives rather than being
+        /// dropped a minute in.
+        #[arg(long, default_value_t = 0)]
+        stay: u64,
         #[arg(long, default_value_t = auth::client::DEFAULT_PORT)]
         port: u16,
         #[arg(long, default_value_t = 8)]
@@ -266,10 +278,15 @@ fn main() -> Result<()> {
             race,
             class,
             delete,
+            enter,
+            dump_failed,
+            stay,
             port,
             timeout,
         } => {
             return world_login(WorldRequest {
+                dump_failed: dump_failed.as_deref(),
+                stay: *stay,
                 host,
                 port: *port,
                 user,
@@ -279,6 +296,7 @@ fn main() -> Result<()> {
                 race: *race,
                 class: *class,
                 delete: delete.as_deref(),
+                enter: enter.as_deref(),
                 locale: &cli.locale,
                 timeout: *timeout,
             })
@@ -363,6 +381,9 @@ struct WorldRequest<'a> {
     race: u8,
     class: u8,
     delete: Option<&'a str>,
+    enter: Option<&'a str>,
+    dump_failed: Option<&'a std::path::Path>,
+    stay: u64,
     locale: &'a str,
     timeout: u64,
 }
@@ -383,6 +404,9 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         race,
         class,
         delete,
+        enter,
+        dump_failed,
+        stay,
         locale,
         timeout,
     } = request;
@@ -474,6 +498,202 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
             },
         );
     }
+
+    if let Some(name) = enter {
+        let character = characters
+            .iter()
+            .find(|character| character.name.eq_ignore_ascii_case(name))
+            .with_context(|| format!("no character named {name:?} on this realm"))?;
+
+        println!("\nentering the world as {:?}", character.name);
+        let position = connection.enter_world(character.guid)?;
+        println!(
+            "  in world on map {} at {:.1}, {:.1}, {:.1} facing {:.2} rad",
+            position.map, position.x, position.y, position.z, position.orientation
+        );
+        // The character list already said where this character was. Agreement
+        // between two packets that derive it separately is worth checking:
+        // it is the cheapest confirmation that neither parse drifted.
+        let drift = (position.x - character.position[0]).abs()
+            + (position.y - character.position[1]).abs()
+            + (position.z - character.position[2]).abs();
+        if drift > 0.1 {
+            println!("  note: differs from the character list position by {drift:.2}");
+        }
+
+        // Nothing marks the end of the login burst, so read until it stops.
+        let rest = connection.drain(std::time::Duration::from_millis(1500), 512)?;
+        report_object_updates(&rest, character.guid, dump_failed)?;
+
+        if stay > 0 {
+            hold_connection(&mut connection, std::time::Duration::from_secs(stay))?;
+        }
+    }
+    Ok(())
+}
+
+/// Stays in the world, answering keepalives, and reports what kept arriving.
+///
+/// The point is not the packet count but that the connection survives: a client
+/// that stops pinging is dropped, and the drop arrives as a plain close that
+/// looks exactly like a parser losing its place in the stream.
+fn hold_connection(
+    connection: &mut world::Connection,
+    duration: std::time::Duration,
+) -> Result<()> {
+    // Not tunable: pinging faster gets the session killed. See PING_INTERVAL.
+    const PING_EVERY: std::time::Duration = world::client::PING_INTERVAL;
+
+    println!("\nholding the connection for {}s", duration.as_secs());
+    let until = std::time::Instant::now() + duration;
+    let mut packets = 0usize;
+    let mut pings = 0usize;
+    let mut last_ping = std::time::Instant::now();
+
+    while std::time::Instant::now() < until {
+        packets += connection
+            .drain(std::time::Duration::from_millis(500), 256)?
+            .len();
+        if last_ping.elapsed() >= PING_EVERY {
+            let sent = std::time::Instant::now();
+            connection.ping(0)?;
+            pings += 1;
+            println!("  pong after {} ms", sent.elapsed().as_millis());
+            last_ping = std::time::Instant::now();
+        }
+    }
+
+    println!("  still connected: {packets} packets seen, {pings} keepalives answered");
+    Ok(())
+}
+
+/// Parses every object update in a burst and reports what the world looks like.
+///
+/// Failures are counted rather than fatal, and the first is printed in full.
+/// One malformed packet says something specific about one code path; aborting
+/// on it would hide how many of the rest were fine, which is the number that
+/// says whether a layout is wrong in general or only in a rare branch.
+fn report_object_updates(
+    packets: &[world::client::Packet],
+    own_guid: u64,
+    dump_failed: Option<&std::path::Path>,
+) -> Result<()> {
+    use world::update::{self, Block};
+
+    let mut blocks = Vec::new();
+    let mut parsed = 0usize;
+    let mut failures = Vec::new();
+
+    for packet in packets {
+        let (result, payload) = match packet.opcode {
+            world::opcode::server::UPDATE_OBJECT => (
+                update::parse_update_object(&packet.body),
+                Ok(packet.body.clone()),
+            ),
+            world::opcode::server::COMPRESSED_UPDATE_OBJECT => (
+                update::parse_compressed_update_object(&packet.body),
+                update::decompress_update_object(&packet.body),
+            ),
+            _ => continue,
+        };
+        match result {
+            Ok(mut found) => {
+                parsed += 1;
+                blocks.append(&mut found);
+            }
+            Err(error) => failures.push((packet.opcode, error, payload)),
+        }
+    }
+
+    println!("\nobject updates: {parsed} parsed, {} failed", failures.len());
+    for (index, (opcode, error, payload)) in failures.iter().enumerate() {
+        println!("  {}: {error}", world::opcode::describe(*opcode));
+        if let Some(directory) = dump_failed {
+            let Ok(payload) = payload else { continue };
+            std::fs::create_dir_all(directory)?;
+            let path = directory.join(format!("failed-{index}.bin"));
+            std::fs::write(&path, payload)
+                .with_context(|| format!("writing {}", path.display()))?;
+            println!("    wrote {} bytes to {}", payload.len(), path.display());
+        }
+    }
+    if blocks.is_empty() {
+        return Ok(());
+    }
+
+    let mut by_type: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut created = 0usize;
+    let mut removed = 0usize;
+    for block in &blocks {
+        match block {
+            Block::Create { object_type, .. } => {
+                created += 1;
+                *by_type.entry(object_type.name()).or_default() += 1;
+            }
+            Block::OutOfRange { guids } => removed += guids.len(),
+            _ => {}
+        }
+    }
+    println!(
+        "  {} blocks: {created} created, {removed} left view",
+        blocks.len()
+    );
+    for (name, count) in &by_type {
+        println!("    {name:<16} x{count}");
+    }
+
+    // The strongest check available: find our own player object and compare it
+    // against what the character list already said. Two packets built by
+    // different server code agreeing is real evidence; a parse checked against
+    // itself is not.
+    let own = blocks.iter().find_map(|block| match block {
+        Block::Create {
+            guid,
+            fields,
+            movement,
+            object_type,
+            ..
+        } if *guid == own_guid && *object_type == world::ObjectType::Player => {
+            Some((fields, movement))
+        }
+        _ => None,
+    });
+    let Some((fields, movement)) = own else {
+        println!("  own player object not found in the burst");
+        return Ok(());
+    };
+
+    println!("  own player object (guid {own_guid:#x}):");
+    if let Some(position) = movement.position {
+        println!(
+            "    at {:.1}, {:.1}, {:.1}   self={} living={}",
+            position.x,
+            position.y,
+            position.z,
+            movement.is_self(),
+            movement.is_living()
+        );
+    }
+    for (label, index) in [
+        ("level", update::fields::UNIT_LEVEL),
+        ("health", update::fields::UNIT_HEALTH),
+        ("max health", update::fields::UNIT_MAX_HEALTH),
+        ("faction", update::fields::UNIT_FACTION),
+        ("display id", update::fields::UNIT_DISPLAY_ID),
+    ] {
+        if let Some(value) = fields.get(index) {
+            println!("    {label:<12} {value}");
+        }
+    }
+    if let Some(guid) = fields.get_u64(update::fields::OBJECT_GUID) {
+        // The guid appears twice: in the block header and again as a field.
+        // They must agree, and they are written by different code paths.
+        println!(
+            "    guid field   {guid:#x} {}",
+            if guid == own_guid { "(matches)" } else { "(MISMATCH)" }
+        );
+    }
+    println!("    {} fields set", fields.len());
     Ok(())
 }
 

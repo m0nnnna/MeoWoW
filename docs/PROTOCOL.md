@@ -186,9 +186,97 @@ characters proves the handshake but exercises none of the character list's
 field offsets, and the slot-count error above is exactly what that blind spot
 hides.
 
+# Entering the world
+
+`CMSG_PLAYER_LOGIN` carries only a guid. The reply is not a packet but a burst
+of fifty-odd: action bars, spell lists, faction standings, the motd, and the
+object updates that describe everything in view. Nothing marks its end, so the
+only signal that the initial state is complete is the stream going quiet.
+
+## Object updates
+
+`SMSG_UPDATE_OBJECT` is the packet the whole game world arrives through. It is
+the least forgiving thing in the protocol, for one structural reason:
+
+**Nothing in it is length-prefixed and every part is conditional on a flag read
+a moment earlier.** A movement block's size depends on its movement flags; a
+values block's size depends on a bitmask; the block count sits at the front.
+There is no way to skip a part that is not understood, because finding where it
+ends *is* the act of understanding it. One misread bit and the rest of the
+packet is garbage — not detectably so, just quietly wrong.
+
+Three sub-formats carry most of the difficulty:
+
+- **Packed guids.** A mask byte says which of eight bytes are non-zero; only
+  those follow. Byte *positions* must be preserved, not compacted.
+- **Update masks.** A count, that many 32-bit words of bitmask, then one value
+  per set bit in ascending index order. Sparse by nature — a player has over a
+  thousand fields and a typical update sets a handful.
+- **Movement blocks.** Nested conditionals. Swimming or flying inserts a pitch
+  float that nothing else announces; falling adds four more; a spline appends a
+  variable-length path.
+
+`SMSG_COMPRESSED_UPDATE_OBJECT` is the same payload behind zlib, with the
+*uncompressed* length in front — the same convention as the addon manifest.
+
+## What the real server corrected, again
+
+One packet in forty-nine failed to parse, reporting an impossible update type.
+The cause was four bytes: the `UPDATEFLAG_POSITION` layout writes the position
+twice, absolute then transport-relative, but the orientation **once**, between
+the second copy and a trailing corpse-facing float. Eight floats, not nine.
+Reading it as two complete four-float positions overran by one field and
+desynchronised the remainder of the packet.
+
+Same shape as every previous protocol bug here: every individual field parsed,
+and only the cursor's end-of-packet assertion noticed.
+
+## The keepalive interval is not a free choice
+
+`CMSG_PING` every thirty seconds. Pinging *faster* is punished: the stock server
+counts any ping under about 27 seconds after the previous one as "overspeed" and
+disconnects after a couple of them. A client that pings eagerly to be safe is
+dropped sooner than one that never pings at all.
+
+Found the hard way. At five-second pings the realm closed the connection after
+the third, and it surfaced as an unexpected end of stream — indistinguishable
+from a desynchronised header cipher, which is exactly where the debugging went
+first.
+
+`SMSG_TIME_SYNC_REQ` must also be answered, and answered from wherever the
+client happens to be in its read loop, so it is handled centrally rather than by
+whichever call site is waiting. Note the ordering this produces: the client
+sends `CMSG_CHAR_ENUM` before it has *read* the burst containing the time-sync
+request, so its answer necessarily arrives second. It cannot answer a packet it
+has not read yet.
+
+## Verified end to end
+
+```console
+$ wow-cli world wow1.nekos.farm --user account33 --enter Testwolf --stay 100
+  in world on map 0 at -8950.0, -132.5, 83.5 facing 0.00 rad
+
+object updates: 50 parsed, 0 failed
+  135 blocks: 130 created, 4 left view
+    game object x36   item x7   player x1   unit x86
+  own player object (guid 0x32):
+    level 1   health 60/60   faction 1   display id 49
+    guid field 0x32 (matches)
+    118 fields set
+
+holding the connection for 100s
+  still connected: 510 packets seen, 3 keepalives answered
+```
+
+The checks that matter are the independent ones. Health 60 and display id 49
+are what a level 1 human warrior has; the night elf druid on the other character
+reads 54 and 55. The guid appears twice — once in the block header, once as
+field 0 — written by different server code, and they agree. None of that is
+checkable against the parser itself.
+
 ## Not implemented yet
 
 PIN and authenticator second factors (the client refuses rather than guessing).
-On the world side: entering the world, the object update fields, and movement.
-`CMSG_PING` is defined but not yet sent, so a long-idle connection will be
-dropped by the server.
+On the world side: movement, and interpreting the update fields beyond the
+handful named in `update.rs`. Spline paths are parsed exactly but discarded,
+because nothing consumes them until movement prediction exists.

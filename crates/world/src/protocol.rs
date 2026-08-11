@@ -72,8 +72,14 @@ pub enum Error {
     Refused(String),
     #[error("string field {what} is not terminated")]
     UnterminatedString { what: &'static str },
-    #[error("could not compress the addon block: {0}")]
+    #[error("compression failed: {0}")]
     Compress(#[from] std::io::Error),
+    #[error("compressed payload declared {declared} bytes but expanded to {got}")]
+    CompressedLength { declared: usize, got: usize },
+    #[error("unknown object update type {got}")]
+    UnknownUpdateType { got: u8 },
+    #[error("unknown object type {got}")]
+    UnknownObjectType { got: u8 },
 }
 
 /// A bounds-checked cursor over a packet body.
@@ -530,6 +536,73 @@ pub fn describe_char_result(code: u8) -> &'static str {
         0x48 => "deletion failed",
         _ => "an unrecognised outcome",
     }
+}
+
+/// Asks to enter the world as one character.
+pub fn player_login(guid: u64) -> Vec<u8> {
+    guid.to_le_bytes().to_vec()
+}
+
+/// Where the server says the character actually is.
+///
+/// This is the first thing that ties the protocol to the renderer: the map and
+/// position here are the same coordinate space the ADT terrain is built in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorldPosition {
+    pub map: u32,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub orientation: f32,
+}
+
+pub fn parse_login_verify_world(body: &[u8]) -> Result<WorldPosition, Error> {
+    let mut reader = Reader::new(body, "SMSG_LOGIN_VERIFY_WORLD");
+    let position = WorldPosition {
+        map: reader.u32()?,
+        x: reader.f32()?,
+        y: reader.f32()?,
+        z: reader.f32()?,
+        orientation: reader.f32()?,
+    };
+    reader.finish()?;
+    Ok(position)
+}
+
+/// The keepalive. `latency` is the client's own estimate, in milliseconds.
+///
+/// Not optional on a long-lived connection: a server that stops hearing pings
+/// drops the session, and the drop looks exactly like a parser bug that ate the
+/// stream.
+pub fn ping(sequence: u32, latency: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&sequence.to_le_bytes());
+    body.extend_from_slice(&latency.to_le_bytes());
+    body
+}
+
+pub fn parse_pong(body: &[u8]) -> Result<u32, Error> {
+    let mut reader = Reader::new(body, "SMSG_PONG");
+    let sequence = reader.u32()?;
+    reader.finish()?;
+    Ok(sequence)
+}
+
+/// The server's clock-sync poll, which must be answered to stay connected.
+pub fn parse_time_sync_req(body: &[u8]) -> Result<u32, Error> {
+    let mut reader = Reader::new(body, "SMSG_TIME_SYNC_REQ");
+    let counter = reader.u32()?;
+    reader.finish()?;
+    Ok(counter)
+}
+
+/// Answers a clock-sync poll. `ticks` is the client's uptime in milliseconds;
+/// the server only checks that it advances sensibly.
+pub fn time_sync_resp(counter: u32, ticks: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&counter.to_le_bytes());
+    body.extend_from_slice(&ticks.to_le_bytes());
+    body
 }
 
 /// Equipment slots reported per character.
