@@ -52,7 +52,7 @@ Target is a stock TrinityCore or MaNGOS 3.3.5a server.
 
 | # | Milestone | Ends with |
 |---|-----------|-----------|
-| 3.1 | **Auth server** | SRP6 login, realm list printed by `wow-cli` |
+| 3.1 | **Auth server** ✅ | SRP6 login, realm list, stage-aware refusals; `wow-cli auth <host>` |
 | 3.2 | **World handshake** | RC4 header crypt, `SMSG_AUTH_CHALLENGE` → character list |
 | 3.3 | **Enter world** | Login to a character, receive the initial object update |
 | 3.4 | **Movement** | Move, and be seen moving by another client |

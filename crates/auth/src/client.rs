@@ -182,7 +182,7 @@ mod tests {
     /// A logon server good enough to authenticate against, written from the
     /// protocol rather than from the client, so a passing exchange is evidence
     /// the wire format is right.
-    fn serve_once(listener: TcpListener, username: String, password: String, refuse: bool) {
+    fn serve_once(listener: TcpListener, username: String, password: String, mode: Refuse) {
         let (mut stream, _) = listener.accept().expect("accept");
         let mut buffer = vec![0u8; 4096];
 
@@ -201,8 +201,8 @@ mod tests {
         let mut b_le = b_public.to_bytes_le();
         b_le.resize(KEY_LEN, 0);
 
-        if refuse {
-            // Unknown account.
+        if mode == Refuse::AtChallenge {
+            // Unknown account: refused before any password is seen.
             stream.write_all(&[0x00, 0x00, 0x04]).expect("write");
             return;
         }
@@ -249,6 +249,13 @@ mod tests {
         ]);
         assert_eq!(client_m1, expected_m1, "client proof did not verify");
 
+        if mode == Refuse::AtProof {
+            // Same code as a missing account, but reached only once the salt
+            // has been handed out -- so it can only mean a bad proof.
+            stream.write_all(&[0x01, 0x04, 0x00, 0x00]).expect("write");
+            return;
+        }
+
         let m2 = sha1_of(&[&a_pub, &client_m1, &key]);
         let mut reply = vec![0x01u8, 0x00];
         reply.extend_from_slice(&m2);
@@ -282,18 +289,25 @@ mod tests {
         stream.write_all(&reply).expect("write realm list");
     }
 
-    fn spawn_server(username: &str, password: &str, refuse: bool) -> u16 {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Refuse {
+        Never,
+        AtChallenge,
+        AtProof,
+    }
+
+    fn spawn_server(username: &str, password: &str, mode: Refuse) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
         let (u, p) = (username.to_string(), password.to_string());
-        std::thread::spawn(move || serve_once(listener, u, p, refuse));
+        std::thread::spawn(move || serve_once(listener, u, p, mode));
         port
     }
 
     /// The whole exchange over a real socket: challenge, proof, realm list.
     #[test]
     fn logs_in_against_a_server() {
-        let port = spawn_server("tester", "hunter2", false);
+        let port = spawn_server("tester", "hunter2", Refuse::Never);
         let result = login(
             "127.0.0.1",
             port,
@@ -311,23 +325,20 @@ mod tests {
         assert!(result.session_key.iter().any(|&b| b != 0));
     }
 
-    /// A refusal surfaces as a clear error rather than a parse failure.
+    /// The server sends the same refusal code for a missing account and a bad
+    /// password. The stage is what separates them, and reporting one message
+    /// for both makes a wrong password look like a missing account.
     #[test]
-    fn a_refused_account_reports_why() {
-        let port = spawn_server("tester", "hunter2", true);
-        let err = login(
-            "127.0.0.1",
-            port,
-            "tester",
-            "hunter2",
-            "enUS",
-            Duration::from_secs(5),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("unknown account"),
-            "got: {err}"
-        );
+    fn refusals_are_reported_by_stage() {
+        let port = spawn_server("tester", "hunter2", Refuse::AtChallenge);
+        let err = login("127.0.0.1", port, "tester", "hunter2", "enUS", Duration::from_secs(5))
+            .unwrap_err();
+        assert!(matches!(err, Error::NoSuchAccount), "got: {err}");
+
+        let port = spawn_server("tester", "hunter2", Refuse::AtProof);
+        let err = login("127.0.0.1", port, "tester", "hunter2", "enUS", Duration::from_secs(5))
+            .unwrap_err();
+        assert!(matches!(err, Error::WrongPassword), "got: {err}");
     }
 
     /// An unreachable host fails quickly and says so, rather than hanging.
