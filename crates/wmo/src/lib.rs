@@ -43,92 +43,10 @@ pub enum Error {
     },
 }
 
-/// A four-character chunk identifier, stored un-reversed.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Magic(pub [u8; 4]);
-
-impl Magic {
-    pub const fn new(s: &[u8; 4]) -> Self {
-        Self(*s)
-    }
-
-    pub fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.0).unwrap_or("????")
-    }
-}
-
-impl std::fmt::Debug for Magic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl std::fmt::Display for Magic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-/// Walks a chunked file.
-///
-/// Stops cleanly at the first truncated chunk rather than panicking; a
-/// half-written file yields the chunks that are intact.
-pub struct Chunks<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Chunks<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    /// Returns the payload of the first chunk with this magic.
-    pub fn find(data: &'a [u8], magic: &[u8; 4]) -> Option<&'a [u8]> {
-        Chunks::new(data)
-            .find(|(m, _)| m.0 == *magic)
-            .map(|(_, payload)| payload)
-    }
-}
-
-impl<'a> Iterator for Chunks<'a> {
-    type Item = (Magic, &'a [u8]);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let header = self.data.get(self.pos..self.pos + 8)?;
-        // Stored little-endian, which reads as the identifier backwards.
-        let magic = Magic([header[3], header[2], header[1], header[0]]);
-        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-
-        let start = self.pos + 8;
-        let payload = self.data.get(start..start + size)?;
-        self.pos = start + size;
-        Some((magic, payload))
-    }
-}
-
-pub(crate) fn u32_at(b: &[u8], o: usize) -> u32 {
-    b.get(o..o + 4)
-        .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
-        .unwrap_or(0)
-}
-
-pub(crate) fn f32_at(b: &[u8], o: usize) -> f32 {
-    f32::from_bits(u32_at(b, o))
-}
-
-pub(crate) fn vec3_at(b: &[u8], o: usize) -> [f32; 3] {
-    [f32_at(b, o), f32_at(b, o + 4), f32_at(b, o + 8)]
-}
-
-/// Reads a NUL-terminated string starting at `offset` in a string block.
-pub(crate) fn string_at(block: &[u8], offset: usize) -> &str {
-    let Some(tail) = block.get(offset..) else {
-        return "";
-    };
-    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-    std::str::from_utf8(&tail[..end]).unwrap_or("")
-}
+// The chunked container itself is shared with ADT; see `crates/chunk`. These
+// re-exports keep `wmo::Chunks` working for callers.
+pub use chunk::{Chunks, Magic};
+pub(crate) use chunk::{f32_at, string_at, u32_at, vec3_at};
 
 /// Confirms a file is a WMO of the expected version.
 pub(crate) fn check_version(data: &[u8]) -> Result<(), Error> {

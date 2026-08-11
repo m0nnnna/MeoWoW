@@ -34,6 +34,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "adt"
+version = "0.0.1"
+dependencies = [
+ "chunk",
+ "m2",
+ "mpq",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -386,6 +397,10 @@ name = "cfg_aliases"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
+
+[[package]]
+name = "chunk"
+version = "0.0.1"
 
 [[package]]
 name = "clap"
@@ -3668,6 +3683,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 name = "wmo"
 version = "0.0.1"
 dependencies = [
+ "chunk",
  "mpq",
  "thiserror 2.0.20",
  "tracing",
@@ -3677,6 +3693,7 @@ dependencies = [
 name = "wow-cli"
 version = "0.0.1"
 dependencies = [
+ "adt",
  "anyhow",
  "blp",
  "clap",
@@ -3693,6 +3710,7 @@ dependencies = [
 name = "wow-viewer"
 version = "0.0.1"
 dependencies = [
+ "adt",
  "anyhow",
  "blp",
  "clap",

@@ -64,6 +64,30 @@ enum Command {
     /// Inspect world objects: buildings, dungeons, bridges.
     #[command(subcommand)]
     Wmo(WmoCommand),
+    /// Inspect terrain.
+    #[command(subcommand)]
+    Adt(AdtCommand),
+}
+
+#[derive(Subcommand)]
+enum AdtCommand {
+    /// Summarize a map: which tiles exist and how alpha is stored.
+    Map { map: String },
+    /// Show one terrain tile.
+    Tile {
+        map: String,
+        x: usize,
+        y: usize,
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+    },
+    /// Parse every tile of a map, checking that chunks meet at their edges.
+    Survey {
+        /// Map directory name, e.g. `Azeroth`. Omit to sweep every map.
+        map: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -188,7 +212,187 @@ fn main() -> Result<()> {
         Command::Blp(cmd) => blp_cmd(&mut chain, cmd),
         Command::M2(cmd) => m2_cmd(&mut chain, cmd),
         Command::Wmo(cmd) => wmo_cmd(&mut chain, cmd),
+        Command::Adt(cmd) => adt_cmd(&mut chain, cmd),
     }
+}
+
+fn adt_cmd(chain: &mut Chain, cmd: AdtCommand) -> Result<()> {
+    match cmd {
+        AdtCommand::Map { map } => adt_map(chain, &map),
+        AdtCommand::Tile { map, x, y, limit } => adt_tile(chain, &map, x, y, limit),
+        AdtCommand::Survey { map, limit } => adt_survey(chain, map.as_deref(), limit),
+    }
+}
+
+/// Loads a map's WDT, which is where the alpha-map storage flag lives.
+fn load_wdt(chain: &mut Chain, map: &str) -> Result<adt::Wdt> {
+    let path = adt::wdt_path(map);
+    let bytes = chain.read(&path).with_context(|| format!("reading {path}"))?;
+    adt::Wdt::parse(&bytes).with_context(|| format!("parsing {path}"))
+}
+
+fn adt_map(chain: &mut Chain, map: &str) -> Result<()> {
+    let wdt = load_wdt(chain, map)?;
+    println!("{}", adt::wdt_path(map));
+    println!(
+        "  flags {:#x}, {} of {} tiles present, alpha maps are {}-bit",
+        wdt.flags,
+        wdt.tile_count(),
+        adt::TILES_PER_MAP * adt::TILES_PER_MAP,
+        if wdt.big_alpha() { 8 } else { 4 }
+    );
+
+    // A coarse picture of which part of the grid the map occupies.
+    let tiles = wdt.tiles();
+    if let (Some(min_x), Some(max_x)) = (
+        tiles.iter().map(|t| t.0).min(),
+        tiles.iter().map(|t| t.0).max(),
+    ) {
+        let min_y = tiles.iter().map(|t| t.1).min().unwrap_or(0);
+        let max_y = tiles.iter().map(|t| t.1).max().unwrap_or(0);
+        println!("  occupied region: x {min_x}..={max_x}, y {min_y}..={max_y}");
+        println!("  first tiles: {:?}", &tiles[..tiles.len().min(6)]);
+    }
+    Ok(())
+}
+
+fn adt_tile(chain: &mut Chain, map: &str, x: usize, y: usize, limit: usize) -> Result<()> {
+    let wdt = load_wdt(chain, map)?;
+    let path = adt::tile_path(map, x, y);
+    let bytes = chain.read(&path).with_context(|| format!("reading {path}"))?;
+    let tile = adt::Adt::parse(&bytes, wdt.big_alpha())?;
+
+    println!("{path}");
+    println!(
+        "  {} textures, {} doodad models, {} object models",
+        tile.textures.len(),
+        tile.doodad_models.len(),
+        tile.object_models.len()
+    );
+    println!(
+        "  {} doodad placements, {} world object placements",
+        tile.doodads.len(),
+        tile.objects.len()
+    );
+
+    let heights: Vec<f32> = tile
+        .chunks
+        .iter()
+        .flat_map(|c| c.heights.iter().map(move |h| h + c.position[2]))
+        .collect();
+    let low = heights.iter().copied().fold(f32::MAX, f32::min);
+    let high = heights.iter().copied().fold(f32::MIN, f32::max);
+    println!("  elevation {low:.1} to {high:.1}");
+    match tile.validate() {
+        Ok(()) => println!("  chunk edges meet"),
+        Err(e) => println!("  SEAM: {e}"),
+    }
+
+    println!("\n  textures:");
+    for texture in tile.textures.iter().take(limit) {
+        println!("    {texture}");
+    }
+
+    println!("\n  chunks (first {limit}):");
+    for c in tile.chunks.iter().take(limit) {
+        println!(
+            "    {:>2},{:<2} area {:>5} {} layers, {} alpha maps, {} doodads, {} objects{}",
+            c.index.0,
+            c.index.1,
+            c.area_id,
+            c.layers.len(),
+            c.alpha_maps.len(),
+            c.doodad_refs.len(),
+            c.object_refs.len(),
+            if c.holes != 0 { format!(" holes {:#06x}", c.holes) } else { String::new() },
+        );
+    }
+
+    if !tile.objects.is_empty() {
+        println!("\n  world objects placed here:");
+        for o in tile.objects.iter().take(limit) {
+            println!(
+                "    {} at [{:.0} {:.0} {:.0}] set {}",
+                o.path, o.position[0], o.position[1], o.position[2], o.doodad_set
+            );
+        }
+    }
+    Ok(())
+}
+
+fn adt_survey(chain: &mut Chain, map: Option<&str>, limit: Option<usize>) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    // Maps are named by their directory, which is what Map.dbc records.
+    let maps: Vec<String> = match map {
+        Some(m) => vec![m.to_string()],
+        None => {
+            let table = dbc::schema::Map::parse(&chain.read(dbc::schema::Map::PATH)?)?;
+            let mut names: Vec<String> = table
+                .iter()
+                .map(|m| m.directory().to_string())
+                .filter(|d| !d.is_empty())
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            names
+        }
+    };
+
+    let mut failures: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let (mut tiles_ok, mut tiles_missing, mut maps_ok) = (0usize, 0usize, 0usize);
+    let (mut doodads, mut objects, mut budget) = (0u64, 0u64, limit.unwrap_or(usize::MAX));
+
+    for name in &maps {
+        let wdt = match load_wdt(chain, name) {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+        maps_ok += 1;
+        for (x, y) in wdt.tiles() {
+            if budget == 0 {
+                break;
+            }
+            let path = adt::tile_path(name, x, y);
+            let Ok(bytes) = chain.read(&path) else {
+                tiles_missing += 1;
+                continue;
+            };
+            budget -= 1;
+            match adt::Adt::parse(&bytes, wdt.big_alpha()) {
+                Ok(tile) => {
+                    tiles_ok += 1;
+                    doodads += tile.doodads.len() as u64;
+                    objects += tile.objects.len() as u64;
+                    if let Err(e) = tile.validate() {
+                        let key = format!("edges: {}", first_clause(&e));
+                        failures.entry(key).or_insert((0, path.clone())).0 += 1;
+                    }
+                }
+                Err(e) => {
+                    let key = e.to_string();
+                    let key = key.split(" (").next().unwrap_or(&key).to_string();
+                    failures.entry(key).or_insert((0, path.clone())).0 += 1;
+                }
+            }
+        }
+        if budget == 0 {
+            break;
+        }
+        tracing::info!("{name}: done");
+    }
+
+    println!("\n{maps_ok} maps, {tiles_ok} tiles parsed, {tiles_missing} declared but absent");
+    println!("  {doodads} doodad placements, {objects} world object placements");
+    if failures.is_empty() {
+        println!("\nno failures");
+    } else {
+        println!("\nfailures:");
+        for (kind, (count, example)) in &failures {
+            println!("  {count:>7}  {kind}\n           e.g. {example}");
+        }
+    }
+    Ok(())
 }
 
 fn wmo_cmd(chain: &mut Chain, cmd: WmoCommand) -> Result<()> {

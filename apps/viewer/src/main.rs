@@ -9,6 +9,7 @@
 //! in CI.
 
 mod model;
+mod terrain;
 mod world_object;
 
 use std::path::PathBuf;
@@ -62,6 +63,14 @@ struct Args {
     #[arg(long)]
     wmo_group: Option<usize>,
 
+    /// Map directory to load terrain from, e.g. `Azeroth`.
+    #[arg(long)]
+    map: Option<String>,
+
+    /// Terrain tile coordinates within the map, as `x,y`.
+    #[arg(long, default_value = "32,48")]
+    tile: String,
+
     /// Level of detail, 0 being the most detailed.
     #[arg(long, default_value_t = 0)]
     lod: u32,
@@ -98,6 +107,7 @@ enum Scene {
     Texture(Box<UploadedTexture>),
     Model(Box<LoadedModel>),
     WorldObject(Box<world_object::LoadedWmo>),
+    Terrain(Box<terrain::LoadedTerrain>),
 }
 
 impl Scene {
@@ -107,6 +117,7 @@ impl Scene {
         match self {
             Scene::Model(m) => Some((&m.mesh, &m.draws)),
             Scene::WorldObject(w) => Some((&w.mesh, &w.draws)),
+            Scene::Terrain(t) => Some((&t.mesh, &t.draws)),
             Scene::Texture(_) => None,
         }
     }
@@ -115,6 +126,7 @@ impl Scene {
         match self {
             Scene::Model(m) => &m.textures,
             Scene::WorldObject(w) => &w.textures,
+            Scene::Terrain(t) => &t.textures,
             Scene::Texture(_) => &[],
         }
     }
@@ -123,6 +135,7 @@ impl Scene {
         match self {
             Scene::Model(m) => Some((m.min, m.max)),
             Scene::WorldObject(w) => Some((w.min, w.max)),
+            Scene::Terrain(t) => Some((t.min, t.max)),
             Scene::Texture(_) => None,
         }
     }
@@ -167,9 +180,22 @@ fn build_scene(gpu: &Gpu, chain: &mut Chain, args: &Args) -> Result<Scene> {
         let loaded = world_object::load(gpu, chain, path, args.wmo_group)?;
         return Ok(Scene::WorldObject(Box::new(loaded)));
     }
+    if let Some(map) = &args.map {
+        let (x, y) = parse_tile(&args.tile)?;
+        let loaded = terrain::load(gpu, chain, map, x, y)?;
+        return Ok(Scene::Terrain(Box::new(loaded)));
+    }
     let path = args.texture.as_deref().unwrap_or(DEFAULT_TEXTURE);
     let parsed = blp::Blp::parse(&chain.read(path)?)?;
     Ok(Scene::Texture(Box::new(upload_blp(gpu, &parsed, path))))
+}
+
+/// Parses an `x,y` tile coordinate.
+fn parse_tile(spec: &str) -> Result<(usize, usize)> {
+    let (x, y) = spec
+        .split_once(',')
+        .with_context(|| format!("expected `x,y`, got {spec:?}"))?;
+    Ok((x.trim().parse()?, y.trim().parse()?))
 }
 
 fn initial_camera(scene: &Scene, args: &Args) -> Orbit {
@@ -344,6 +370,27 @@ fn describe(scene: &Scene) -> String {
                     "\nunresolved: {}",
                     m.missing_textures.join(", ")
                 ));
+            }
+            s
+        }
+        Scene::Terrain(t) => {
+            let mut s = format!(
+                "{}\n{} vertices, {} triangles\n{} chunks, {} draw calls, {} textures\n\
+                 {} doodad and {} world object placements",
+                t.path,
+                t.vertex_count,
+                t.triangle_count,
+                t.chunk_count,
+                t.draws.len(),
+                t.textures.len(),
+                t.doodad_placements,
+                t.object_placements
+            );
+            if t.holes > 0 {
+                s.push_str(&format!("\n{} terrain holes", t.holes));
+            }
+            if !t.missing_textures.is_empty() {
+                s.push_str(&format!("\nunresolved: {}", t.missing_textures.join(", ")));
             }
             s
         }

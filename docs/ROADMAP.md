@@ -19,7 +19,7 @@ best possible test harness for everything that follows.
 | 1.3 | **BLP textures** ✅ | DXT1/3/5, palettized, BGRA; `wow-cli blp info/export/survey` |
 | 1.4 | **M2 models** ✅ | Geometry, submeshes, texture units, bone hierarchy, `.skin` LODs; `wow-cli m2 info/survey/creature` |
 | 1.5 | **WMO objects** ✅ | Root + group files, materials, batches, doodad sets; `wow-cli wmo info/survey` |
-| 1.6 | **ADT terrain** | Height maps, alpha layers, texture assignment, doodad/WMO placement |
+| 1.6 | **ADT terrain** ✅ | WDT tile maps, height fields, alpha layers, placements; `wow-cli adt map/tile/survey` |
 
 DBC comes before textures because nearly everything else is indexed by it — you
 cannot place a model in the world without the tables that say which model goes
@@ -33,7 +33,7 @@ where.
 | 2.2 | **Static M2 rendering** ✅ | Textured creatures and doodads, orbit camera, depth-sorted batches |
 | 2.3 | **M2 animation** ✅ | Keyframe tracks, external `.anim` files, GPU skinning, animation picker |
 | 2.4 | **WMO rendering** ✅ | Buildings on screen, per-group isolation; portals and interior lighting still to come |
-| 2.5 | **Terrain rendering** | One ADT tile, correct texture blending |
+| 2.5 | **Terrain rendering** ◑ | Tiles render with their base layer; multi-layer alpha blending still to do |
 | 2.6 | **World streaming** | Free-fly across Azeroth, tiles loading and evicting |
 
 Milestone 2.6 is the first point where the project feels real. It is also the
