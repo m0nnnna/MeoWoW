@@ -267,6 +267,7 @@ pub struct MeshRenderer {
     target_format: wgpu::TextureFormat,
     pipelines: HashMap<RenderState, wgpu::RenderPipeline>,
     pub camera_buffer: wgpu::Buffer,
+    camera_layout: wgpu::BindGroupLayout,
     camera_bind: wgpu::BindGroup,
     material_layout: wgpu::BindGroupLayout,
     bone_layout: wgpu::BindGroupLayout,
@@ -383,6 +384,7 @@ impl MeshRenderer {
             target_format,
             pipelines: HashMap::new(),
             camera_buffer,
+            camera_layout,
             camera_bind,
             material_layout,
             bone_layout,
@@ -427,6 +429,12 @@ impl MeshRenderer {
 
     pub fn camera_bind_group(&self) -> &wgpu::BindGroup {
         &self.camera_bind
+    }
+
+    /// The camera binding's layout, so other pipelines can share group 0 and
+    /// the same uniform.
+    pub fn camera_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.camera_layout
     }
 
     pub fn update_camera(&self, gpu: &Gpu, camera: &CameraUniform) {

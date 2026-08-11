@@ -33,8 +33,8 @@ where.
 | 2.2 | **Static M2 rendering** ✅ | Textured creatures and doodads, orbit camera, depth-sorted batches |
 | 2.3 | **M2 animation** ✅ | Keyframe tracks, external `.anim` files, GPU skinning, animation picker |
 | 2.4 | **WMO rendering** ✅ | Buildings on screen, per-group isolation; portals and interior lighting still to come |
-| 2.5 | **Terrain rendering** ◑ | Tiles render with their base layer; multi-layer alpha blending still to do |
-| 2.6 | **World streaming** ◑ | A tile renders with its buildings and doodads placed; free-fly and tile eviction still to do |
+| 2.5 | **Terrain rendering** ✅ | Four-layer alpha blending on its own pipeline, correct tileset scale |
+| 2.6 | **World streaming** ◑ | Free-fly camera and blocks of tiles with placements; loading and eviction as the camera moves still to do |
 
 Milestone 2.6 is the first point where the project feels real. It is also the
 natural place to stop and harden, because everything after it depends on the

@@ -24,6 +24,7 @@ use mpq::Chain;
 use render::camera::{Camera, Fly, Orbit};
 use render::capture::Offscreen;
 use render::mesh::{BoneBuffer, DepthBuffer, MeshRenderer};
+use render::TerrainRenderer;
 use render::{texture::upload_blp, Blitter, Gpu, UploadedTexture};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -136,8 +137,7 @@ impl Scene {
         match self {
             Scene::Model(m) => Some((&m.mesh, &m.draws)),
             Scene::WorldObject(w) => Some((&w.mesh, &w.draws)),
-            Scene::Terrain(t) => Some((&t.mesh, &t.draws)),
-            Scene::Texture(_) | Scene::World(_) => None,
+            Scene::Texture(_) | Scene::World(_) | Scene::Terrain(_) => None,
         }
     }
 
@@ -145,8 +145,7 @@ impl Scene {
         match self {
             Scene::Model(m) => &m.textures,
             Scene::WorldObject(w) => &w.textures,
-            Scene::Terrain(t) => &t.textures,
-            Scene::Texture(_) | Scene::World(_) => &[],
+            Scene::Texture(_) | Scene::World(_) | Scene::Terrain(_) => &[],
         }
     }
 
@@ -186,7 +185,12 @@ fn main() -> Result<()> {
 }
 
 /// Resolves the command line into something to draw.
-fn build_scene(gpu: &Gpu, chain: &mut Chain, args: &Args) -> Result<Scene> {
+fn build_scene(
+    gpu: &Gpu,
+    terrain_renderer: &TerrainRenderer,
+    chain: &mut Chain,
+    args: &Args,
+) -> Result<Scene> {
     if let Some(display_id) = args.creature {
         let (path, variations) = model::creature(chain, display_id)?;
         let loaded = model::load(gpu, chain, &path, &variations, args.lod)?;
@@ -203,10 +207,18 @@ fn build_scene(gpu: &Gpu, chain: &mut Chain, args: &Args) -> Result<Scene> {
     if let Some(map) = &args.map {
         let tile = parse_tile(&args.tile)?;
         if args.world {
-            let loaded = scene::load(gpu, chain, map, tile, args.radius, args.max_doodads)?;
+            let loaded = scene::load(
+                gpu,
+                terrain_renderer,
+                chain,
+                map,
+                tile,
+                args.radius,
+                args.max_doodads,
+            )?;
             return Ok(Scene::World(Box::new(loaded)));
         }
-        let loaded = terrain::load(gpu, chain, map, tile.0, tile.1)?;
+        let loaded = terrain::load(gpu, terrain_renderer, chain, map, tile.0, tile.1)?;
         return Ok(Scene::Terrain(Box::new(loaded)));
     }
     let path = args.texture.as_deref().unwrap_or(DEFAULT_TEXTURE);
@@ -306,16 +318,29 @@ fn draw_scene(
     camera: &Camera,
     blitter: &Blitter,
     meshes: &MeshRenderer,
+    terrain_renderer: &TerrainRenderer,
     material_binds: &[wgpu::BindGroup],
     bones: Option<&BoneBuffer>,
     world_binds: &[Vec<wgpu::BindGroup>],
     identity: &render::mesh::InstanceBuffer,
 ) {
+    // Terrain has its own pipeline, so both the tile and world scenes route
+    // their landscape through here.
+    let terrain_parts: &[terrain::LoadedTerrain] = match scene {
+        Scene::Terrain(t) => std::slice::from_ref(t.as_ref()),
+        Scene::World(w) => &w.terrain,
+        _ => &[],
+    };
     // A world holds many meshes, so it cannot go through the single-mesh path.
-    if let Scene::World(world) = scene {
+    if !terrain_parts.is_empty() || matches!(scene, Scene::World(_)) {
         {
             let aspect = size.0 as f32 / size.1.max(1) as f32;
             meshes.update_camera(gpu, &camera.uniform(aspect));
+            let empty: Vec<scene::Placed> = Vec::new();
+            let (items, instances) = match scene {
+                Scene::World(w) => (&w.items, Some(&w.instances)),
+                _ => (&empty, None),
+            };
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("world"),
@@ -346,13 +371,33 @@ fn draw_scene(
                 occlusion_query_set: None,
             });
 
+            // Landscape first: it is opaque and fills most of the frame, so
+            // drawing it before the objects standing on it rejects the most
+            // fragments.
+            pass.set_pipeline(terrain_renderer.pipeline());
+            pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
+            for part in terrain_parts {
+                pass.set_vertex_buffer(0, part.mesh.vertices.slice(..));
+                pass.set_index_buffer(part.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                for chunk in &part.chunks {
+                    pass.set_bind_group(1, &chunk.bind_group, &[]);
+                    pass.draw_indexed(
+                        chunk.first_index..chunk.first_index + chunk.index_count,
+                        0,
+                        0..1,
+                    );
+                }
+            }
+
             pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
             if let Some(bones) = bones {
                 pass.set_bind_group(2, &bones.bind_group, &[]);
             }
-            pass.set_vertex_buffer(1, world.instances.buffer.slice(..));
+            if let Some(instances) = instances {
+                pass.set_vertex_buffer(1, instances.buffer.slice(..));
+            }
 
-            for (item, binds) in world.items.iter().zip(world_binds) {
+            for (item, binds) in items.iter().zip(world_binds) {
                 pass.set_vertex_buffer(0, item.mesh.vertices.slice(..));
                 pass.set_index_buffer(item.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 let instances =
@@ -587,7 +632,7 @@ fn describe(scene: &Scene) -> String {
                 t.vertex_count,
                 t.triangle_count,
                 t.chunk_count,
-                t.draws.len(),
+                t.chunks.len(),
                 t.textures.len(),
                 t.doodad_placements,
                 t.object_placements
@@ -638,8 +683,9 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     let depth = DepthBuffer::new(&gpu, args.width, args.height);
     let blitter = Blitter::new(&gpu, format);
     let mut meshes = MeshRenderer::new(&gpu, format);
+    let terrain_renderer = TerrainRenderer::new(&gpu, format, meshes.camera_layout());
 
-    let scene = build_scene(&gpu, chain, args)?;
+    let scene = build_scene(&gpu, &terrain_renderer, chain, args)?;
     let camera = initial_camera(&scene, args);
     // Any scene with geometry needs its pipelines built and a bone palette
     // bound -- rigid world objects included, where the palette is identity.
@@ -673,6 +719,7 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
         &camera,
         &blitter,
         &meshes,
+        &terrain_renderer,
         &binds,
         bones.as_ref(),
         &world_binds,
@@ -713,6 +760,7 @@ struct Renderer {
     depth: DepthBuffer,
     blitter: Blitter,
     meshes: MeshRenderer,
+    terrain_renderer: TerrainRenderer,
     material_binds: Vec<wgpu::BindGroup>,
     world_binds: Vec<Vec<wgpu::BindGroup>>,
     identity: render::mesh::InstanceBuffer,
@@ -824,9 +872,10 @@ impl ApplicationHandler for App {
 
         let blitter = Blitter::new(&gpu, format);
         let mut meshes = MeshRenderer::new(&gpu, format);
+        let terrain_renderer = TerrainRenderer::new(&gpu, format, meshes.camera_layout());
         let depth = DepthBuffer::new(&gpu, config.width, config.height);
 
-        let scene = match build_scene(&gpu, &mut self.chain, &self.args) {
+        let scene = match build_scene(&gpu, &terrain_renderer, &mut self.chain, &self.args) {
             Ok(scene) => Some(scene),
             Err(e) => {
                 self.error = Some(format!("{e:#}"));
@@ -873,6 +922,7 @@ impl ApplicationHandler for App {
             depth,
             blitter,
             meshes,
+            terrain_renderer,
             material_binds,
             world_binds,
             identity,
@@ -1039,6 +1089,7 @@ impl App {
                 &camera,
                 &r.blitter,
                 &r.meshes,
+                &r.terrain_renderer,
                 &r.material_binds,
                 r.bones.as_ref(),
                 &r.world_binds,

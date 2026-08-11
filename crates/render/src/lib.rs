@@ -8,11 +8,13 @@ pub mod blit;
 pub mod camera;
 pub mod capture;
 pub mod mesh;
+pub mod terrain;
 pub mod texture;
 
 pub use blit::Blitter;
 pub use camera::{Camera, Fly, Orbit};
 pub use mesh::{GpuMesh, MeshRenderer, MeshVertex};
+pub use terrain::TerrainRenderer;
 pub use texture::UploadedTexture;
 
 #[derive(Debug, thiserror::Error)]

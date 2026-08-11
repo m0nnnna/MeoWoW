@@ -91,7 +91,5 @@ no failures
 
 ## Not implemented yet
 
-Alpha-blended layer compositing — the renderer currently draws each chunk with
-its base layer only, so terrain shows the dominant texture without the blends
-between them. Liquid (`MH2O`), shadow maps (`MCSH`), vertex colours (`MCCV`) and
-flight bounds are parsed past but not interpreted.
+Liquid (`MH2O`), shadow maps (`MCSH`), vertex colours (`MCCV`) and flight bounds
+are parsed past but not interpreted.

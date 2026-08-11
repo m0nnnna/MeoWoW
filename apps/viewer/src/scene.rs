@@ -28,6 +28,8 @@ pub struct Placed {
 }
 
 pub struct WorldScene {
+    /// One entry per tile; terrain has its own pipeline.
+    pub terrain: Vec<crate::terrain::LoadedTerrain>,
     pub items: Vec<Placed>,
     pub instances: InstanceBuffer,
     pub min: Vec3,
@@ -83,6 +85,7 @@ fn transform(raw_position: [f32; 3], rotation: [f32; 3], scale: f32) -> Mat4 {
 /// block near one is mostly ocean.
 pub fn load(
     gpu: &Gpu,
+    terrain_renderer: &render::TerrainRenderer,
     chain: &mut Chain,
     map: &str,
     centre: (usize, usize),
@@ -92,6 +95,7 @@ pub fn load(
     let wdt = adt::Wdt::parse(&chain.read(&adt::wdt_path(map))?)?;
 
     let mut instances: Vec<Instance> = Vec::new();
+    let mut terrain_parts: Vec<crate::terrain::LoadedTerrain> = Vec::new();
     let mut items: Vec<Placed> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
@@ -113,7 +117,7 @@ pub fn load(
             if !wdt.has_tile(x, y) {
                 continue;
             }
-            let terrain = match crate::terrain::load(gpu, chain, map, x, y) {
+            let terrain = match crate::terrain::load(gpu, terrain_renderer, chain, map, x, y) {
                 Ok(t) => t,
                 Err(e) => {
                     skipped.push(format!("terrain {x},{y}: {e}"));
@@ -125,15 +129,8 @@ pub fn load(
             min = min.min(terrain.min);
             max = max.max(terrain.max);
 
-            // Terrain is already in world space, so it draws at identity.
-            items.push(Placed {
-                mesh: terrain.mesh,
-                draws: terrain.draws,
-                textures: terrain.textures,
-                instance_start: instances.len() as u32,
-                instance_count: 1,
-            });
-            instances.push(Instance::IDENTITY);
+            // Terrain is already in world space and uses its own pipeline.
+            terrain_parts.push(terrain);
 
             let Ok(bytes) = chain.read(&adt::tile_path(map, x, y)) else {
                 continue;
@@ -224,10 +221,12 @@ pub fn load(
         }
     }
 
-    let draw_calls = items.iter().map(|i| i.draws.len()).sum();
-    let unique_models = items.len().saturating_sub(tiles_loaded);
+    let draw_calls: usize = items.iter().map(|i| i.draws.len()).sum::<usize>()
+        + terrain_parts.iter().map(|t| t.chunks.len()).sum::<usize>();
+    let unique_models = items.len();
     Ok(WorldScene {
         instances: InstanceBuffer::upload(gpu, &instances),
+        terrain: terrain_parts,
         items,
         min,
         max,

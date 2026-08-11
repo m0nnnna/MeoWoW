@@ -223,3 +223,30 @@ declare — coastlines are ragged and a block near one is mostly ocean.
 border is listed by *every* tile it touches, so a nine-tile block without
 deduplication draws the same building several times over itself. Northshire's
 3x3 block yields 27 buildings and 4,933 doodads from 192 unique models.
+
+## Terrain has its own pipeline
+
+Every other surface samples one texture. A terrain chunk samples **four** and
+mixes them with a per-chunk alpha map, which cannot be expressed through the
+single-texture material binding the mesh pipeline uses — so terrain gets its own
+pipeline, sharing the camera bind group so both see the same view.
+
+Layers 1 to 3 pack into the red, green and blue channels of one RGBA texture per
+chunk. Layer 0 is the base and needs no coverage of its own; chunks with fewer
+layers leave the unused channels at zero, so those layers contribute nothing and
+the padding texture bound to their slots never shows.
+
+Two details the shader depends on:
+
+- **Tileset art repeats eight times across a chunk.** UVs are stored in chunk
+  space (0 to 1) and multiplied by eight for the tileset; sampling the tileset
+  at chunk coordinates instead stretches a single copy over the whole chunk,
+  which is what the first terrain renders did.
+- **The blend map must clamp, not repeat.** It spans exactly one chunk, so
+  wrapping stitches a seam along two edges of every one of them.
+
+The blend texture is `Rgba8Unorm`, not sRGB: it is coverage, not colour, and
+putting a gamma curve on it would bias every blend.
+
+Landscape draws before the objects standing on it. It is opaque and fills most
+of the frame, so drawing it first rejects the most fragments.

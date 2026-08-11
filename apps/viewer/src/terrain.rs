@@ -6,20 +6,28 @@
 //! texture -- enough to prove the geometry, which is the part that is easy to
 //! get subtly wrong.
 
-use std::collections::HashMap;
-
 use anyhow::{Context, Result};
 use glam::Vec3;
 use mpq::Chain;
-use render::mesh::{BlendMode, GpuMesh, MeshVertex, RenderState, Winding};
+use render::mesh::{GpuMesh, MeshVertex};
+use render::terrain::{pack_blend_map, TerrainRenderer, MAX_LAYERS};
 use render::{texture::upload_blp, Gpu, UploadedTexture};
 
-use crate::model::Draw;
+/// One chunk's slice of the tile mesh, with its layers already bound.
+pub struct ChunkDraw {
+    pub first_index: u32,
+    pub index_count: u32,
+    pub bind_group: wgpu::BindGroup,
+}
 
 pub struct LoadedTerrain {
     pub mesh: GpuMesh,
-    pub draws: Vec<Draw>,
+    pub chunks: Vec<ChunkDraw>,
+    /// Kept alive because the chunk bind groups reference their views.
     pub textures: Vec<UploadedTexture>,
+    /// Likewise: dropping these would invalidate the bindings.
+    #[allow(dead_code)]
+    pub blend_maps: Vec<wgpu::Texture>,
     pub min: Vec3,
     pub max: Vec3,
     pub path: String,
@@ -65,7 +73,14 @@ fn emit_chunk_indices(base: u32, chunk: &adt::Chunk, indices: &mut Vec<u32>) {
     }
 }
 
-pub fn load(gpu: &Gpu, chain: &mut Chain, map: &str, x: usize, y: usize) -> Result<LoadedTerrain> {
+pub fn load(
+    gpu: &Gpu,
+    renderer: &TerrainRenderer,
+    chain: &mut Chain,
+    map: &str,
+    x: usize,
+    y: usize,
+) -> Result<LoadedTerrain> {
     let wdt_path = adt::wdt_path(map);
     let wdt = adt::Wdt::parse(&chain.read(&wdt_path)?)
         .with_context(|| format!("parsing {wdt_path}"))?;
@@ -80,9 +95,7 @@ pub fn load(gpu: &Gpu, chain: &mut Chain, map: &str, x: usize, y: usize) -> Resu
     // Textures are shared across chunks, so upload each one once.
     let mut textures: Vec<UploadedTexture> = Vec::new();
     let mut missing_textures = Vec::new();
-    let mut by_path: HashMap<String, usize> = HashMap::new();
     for name in &tile.textures {
-        let slot = textures.len();
         let uploaded = chain
             .read(name)
             .ok()
@@ -95,31 +108,30 @@ pub fn load(gpu: &Gpu, chain: &mut Chain, map: &str, x: usize, y: usize) -> Resu
                 textures.push(crate::model::placeholder(gpu));
             }
         }
-        by_path.insert(name.clone(), slot);
     }
-    if textures.is_empty() {
-        textures.push(crate::model::placeholder(gpu));
-    }
+    // A bind group cannot leave a slot empty, so chunks with fewer than four
+    // layers pad with this. Its blend channel is zero, so it never shows.
+    let blank = crate::model::placeholder(gpu);
 
     let mut vertices: Vec<MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
-    let mut draws: Vec<Draw> = Vec::new();
+    let mut chunk_draws: Vec<ChunkDraw> = Vec::new();
+    let mut blend_maps: Vec<wgpu::Texture> = Vec::new();
     let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     let mut holes = 0usize;
 
-    for (ci, chunk) in tile.chunks.iter().enumerate() {
+    for chunk in tile.chunks.iter() {
         let base = vertices.len() as u32;
         for i in 0..chunk.heights.len() {
             let p = Vec3::from(chunk.vertex_position(i));
             min = min.min(p);
             max = max.max(p);
 
-            // Normals are signed bytes with the axes in the game's order.
             let n = chunk.normals.get(i).copied().unwrap_or([0, 0, 127]);
             let normal = Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32) / 127.0;
 
-            // Terrain UVs repeat eight times across a chunk, matching how the
-            // tileset textures are authored.
+            // Chunk-local coordinates, 0 to 1. The shader multiplies up for the
+            // tileset and uses these directly for the blend map.
             let (row, col, inner) = adt::lattice_coords(i);
             let column_offset = if inner { 0.5 } else { 0.0 };
             let u = (col as f32 + column_offset) / 8.0;
@@ -142,30 +154,27 @@ pub fn load(gpu: &Gpu, chain: &mut Chain, map: &str, x: usize, y: usize) -> Resu
         }
         holes += (0..16).filter(|i| chunk.has_hole(i % 4, i / 4)).count();
 
-        // Layer 0 is the chunk's base texture and is always fully opaque.
-        let texture = chunk
-            .layers
-            .first()
-            .and_then(|l| tile.textures.get(l.texture_id as usize))
-            .and_then(|name| by_path.get(name).copied())
-            .unwrap_or(0);
+        let blend = upload_blend_map(gpu, chunk);
+        let views: Vec<&wgpu::TextureView> = (0..MAX_LAYERS)
+            .map(|layer| {
+                chunk
+                    .layers
+                    .get(layer)
+                    .and_then(|l| textures.get(l.texture_id as usize))
+                    .map(|t| &t.view)
+                    .unwrap_or(&blank.view)
+            })
+            .collect();
+        let layers: [&wgpu::TextureView; MAX_LAYERS] =
+            [views[0], views[1], views[2], views[3]];
 
-        draws.push(Draw {
+        let blend_view = blend.create_view(&wgpu::TextureViewDescriptor::default());
+        chunk_draws.push(ChunkDraw {
             first_index: start,
             index_count: count,
-            state: RenderState {
-                blend: BlendMode::Opaque,
-                two_sided: false,
-                depth_write: true,
-                // Terrain winds clockwise like M2, *not* like WMO. Guessing
-                // from the neighbouring format culls almost every triangle and
-                // leaves a handful of slivers rather than an empty screen,
-                // which reads as broken geometry instead of a culling bug.
-                winding: Winding::Clockwise,
-            },
-            texture,
-            submesh_id: ci as u16,
+            bind_group: renderer.bind_chunk(gpu, &layers, &blend_view),
         });
+        blend_maps.push(blend);
     }
 
     if vertices.is_empty() {
@@ -173,10 +182,12 @@ pub fn load(gpu: &Gpu, chain: &mut Chain, map: &str, x: usize, y: usize) -> Resu
     }
 
     let triangle_count = indices.len() / 3;
+    textures.push(blank);
     Ok(LoadedTerrain {
         mesh: GpuMesh::upload(gpu, &vertices, &indices),
-        draws,
+        chunks: chunk_draws,
         textures,
+        blend_maps,
         min,
         max,
         path,
@@ -188,6 +199,48 @@ pub fn load(gpu: &Gpu, chain: &mut Chain, map: &str, x: usize, y: usize) -> Resu
         object_placements: tile.objects.len(),
         missing_textures,
     })
+}
+
+/// Uploads a chunk's packed alpha maps as a single RGBA texture.
+fn upload_blend_map(gpu: &Gpu, chunk: &adt::Chunk) -> wgpu::Texture {
+    let size = adt::ALPHA_SIZE as u32;
+    let packed = pack_blend_map(&chunk.alpha_maps, adt::ALPHA_SIZE);
+
+    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("blend map"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        // Coverage, not colour: no sRGB curve.
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &packed,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(size * 4),
+            rows_per_image: Some(size),
+        },
+        wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+    );
+    texture
 }
 
 #[cfg(test)]
