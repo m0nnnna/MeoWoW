@@ -1,0 +1,19 @@
+[package]
+name = "auth"
+description = "SRP6 authentication and realm listing for the WoW 3.3.5a logon server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+num-bigint = "0.4"
+rand = "0.9"
+sha1 = "0.10"
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+num-bigint = "0.4"
+sha1 = "0.10"

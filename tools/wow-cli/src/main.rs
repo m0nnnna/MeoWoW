@@ -67,6 +67,22 @@ enum Command {
     /// Inspect terrain.
     #[command(subcommand)]
     Adt(AdtCommand),
+    /// Log in to a realm's logon server and list its realms.
+    ///
+    /// Needs no game files, only an account on the server.
+    Auth {
+        /// Logon server hostname.
+        host: String,
+        #[arg(long, short)]
+        user: String,
+        /// Password. Prefer `WOW_PASSWORD` so it stays out of shell history.
+        #[arg(long, short, env = "WOW_PASSWORD", hide_env_values = true)]
+        password: String,
+        #[arg(long, default_value_t = auth::client::DEFAULT_PORT)]
+        port: u16,
+        #[arg(long, default_value_t = 8)]
+        timeout: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -195,6 +211,19 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Logging in touches no game files, so it must not demand a data directory.
+    if let Command::Auth {
+        host,
+        user,
+        password,
+        port,
+        timeout,
+    } = &cli.command
+    {
+        return auth_login(host, *port, user, password, &cli.locale, *timeout);
+    }
+
     let data = cli
         .data
         .context("no data directory: pass --data or set WOW_DATA")?;
@@ -213,7 +242,53 @@ fn main() -> Result<()> {
         Command::M2(cmd) => m2_cmd(&mut chain, cmd),
         Command::Wmo(cmd) => wmo_cmd(&mut chain, cmd),
         Command::Adt(cmd) => adt_cmd(&mut chain, cmd),
+        // Handled before the archives are opened.
+        Command::Auth { .. } => unreachable!(),
     }
+}
+
+fn auth_login(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    locale: &str,
+    timeout: u64,
+) -> Result<()> {
+    println!("connecting to {host}:{port} as {user}");
+    let session = auth::login(
+        host,
+        port,
+        user,
+        password,
+        locale,
+        std::time::Duration::from_secs(timeout),
+    )?;
+
+    // The key itself is a secret; showing its length and a fingerprint is
+    // enough to confirm it was negotiated.
+    println!(
+        "\nauthenticated. session key is {} bytes, fingerprint {:02x}{:02x}..{:02x}{:02x}",
+        session.session_key.len(),
+        session.session_key[0],
+        session.session_key[1],
+        session.session_key[38],
+        session.session_key[39],
+    );
+
+    println!("\n{} realm(s):", session.realms.len());
+    for realm in &session.realms {
+        println!(
+            "  {:<28} {:<24} {:>3} characters, population {:.2}{}{}",
+            realm.name,
+            realm.address,
+            realm.characters,
+            realm.population,
+            if realm.locked { ", locked" } else { "" },
+            if realm.is_offline() { ", offline" } else { "" },
+        );
+    }
+    Ok(())
 }
 
 fn adt_cmd(chain: &mut Chain, cmd: AdtCommand) -> Result<()> {
