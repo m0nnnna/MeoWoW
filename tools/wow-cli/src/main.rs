@@ -58,6 +58,29 @@ enum Command {
     /// Inspect and export textures.
     #[command(subcommand)]
     Blp(BlpCommand),
+    /// Inspect models.
+    #[command(subcommand)]
+    M2(M2Command),
+}
+
+#[derive(Subcommand)]
+enum M2Command {
+    /// Show a model's header, textures, materials, and skin geometry.
+    Info {
+        /// Archive path; `.mdx` is rewritten to `.m2` automatically.
+        path: String,
+        /// Level of detail to describe.
+        #[arg(long, default_value_t = 0)]
+        lod: u32,
+    },
+    /// Parse every model and its skins, validating the index tables.
+    Survey {
+        filter: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Resolve a creature display id to its model, the way the renderer will.
+    Creature { display_id: u32 },
 }
 
 #[derive(Subcommand)]
@@ -136,7 +159,285 @@ fn main() -> Result<()> {
         Command::Verify { limit, filter } => verify(&mut chain, limit, filter.as_deref()),
         Command::Dbc(cmd) => dbc_cmd(&mut chain, cmd),
         Command::Blp(cmd) => blp_cmd(&mut chain, cmd),
+        Command::M2(cmd) => m2_cmd(&mut chain, cmd),
     }
+}
+
+fn m2_cmd(chain: &mut Chain, cmd: M2Command) -> Result<()> {
+    match cmd {
+        M2Command::Info { path, lod } => m2_info(chain, &path, lod),
+        M2Command::Survey { filter, limit } => m2_survey(chain, filter.as_deref(), limit),
+        M2Command::Creature { display_id } => m2_creature(chain, display_id),
+    }
+}
+
+fn m2_info(chain: &mut Chain, path: &str, lod: u32) -> Result<()> {
+    let path = m2::model_path(path);
+    let model = m2::Model::parse(&chain.read(&path)?)?;
+
+    let (min, max) = model.bounding_box();
+    println!("{path}");
+    println!("  internal name: {:?}", model.name());
+    println!(
+        "  version {}, flags {:#x}, {} skin profile(s)",
+        model.version(),
+        model.global_flags(),
+        model.skin_count()
+    );
+    println!(
+        "  {} vertices, {} bones, {} textures, {} materials, {} sequences",
+        model.vertex_count(),
+        model.bones().len(),
+        model.textures().len(),
+        model.materials().len(),
+        model.sequence_count()
+    );
+    println!(
+        "  bounds [{:.2} {:.2} {:.2}] .. [{:.2} {:.2} {:.2}], radius {:.2}",
+        min[0],
+        min[1],
+        min[2],
+        max[0],
+        max[1],
+        max[2],
+        model.bounding_sphere_radius()
+    );
+
+    println!("\n  textures:");
+    for (i, t) in model.textures().iter().enumerate() {
+        let what = if t.is_hardcoded() {
+            t.filename.clone()
+        } else {
+            format!("<supplied at runtime, type {}>", t.kind)
+        };
+        println!("    {i:>2}: flags {:#06x}  {what}", t.flags);
+    }
+
+    println!("\n  materials:");
+    for (i, m) in model.materials().iter().enumerate() {
+        let mut notes = Vec::new();
+        if m.unlit() {
+            notes.push("unlit");
+        }
+        if m.two_sided() {
+            notes.push("two-sided");
+        }
+        if m.depth_write_disabled() {
+            notes.push("no depth write");
+        }
+        println!(
+            "    {i:>2}: blend {}, flags {:#06x} {}",
+            m.blend,
+            m.flags,
+            notes.join(" ")
+        );
+    }
+
+    let roots = model.bones().iter().filter(|b| b.parent < 0).count();
+    println!("\n  skeleton: {} bones, {roots} root(s)", model.bones().len());
+
+    let skin_path = m2::skin_path(&path, lod);
+    match chain.read(&skin_path) {
+        Ok(bytes) => {
+            let skin = m2::Skin::parse(&bytes)?;
+            println!("\n  {skin_path}");
+            println!(
+                "    {} local vertices, {} indices ({} triangles), {} submeshes, {} batches",
+                skin.vertex_map().len(),
+                skin.triangles().len(),
+                skin.triangles().len() / 3,
+                skin.submeshes().len(),
+                skin.batches().len()
+            );
+            match skin.validate(model.vertex_count()) {
+                Ok(()) => println!("    index tables valid"),
+                Err(e) => println!("    INVALID: {e}"),
+            }
+
+            let combos = model.texture_combos();
+            let textures = model.textures();
+            println!("\n    batches:");
+            for (i, b) in skin.batches().iter().enumerate().take(24) {
+                let sub = skin.submeshes().get(b.submesh_index as usize);
+                // A batch names its texture indirectly, through the combo
+                // table; this is the lookup the renderer performs per draw.
+                let tex = combos
+                    .get(b.texture_combo_index as usize)
+                    .and_then(|&t| textures.get(t as usize))
+                    .map(|t| {
+                        if t.is_hardcoded() {
+                            t.filename.clone()
+                        } else {
+                            format!("<runtime type {}>", t.kind)
+                        }
+                    })
+                    .unwrap_or_else(|| "<none>".into());
+                println!(
+                    "      {i:>2}: submesh {:>3} (id {:>5}, {:>5} tris)  material {:>2}  {tex}",
+                    b.submesh_index,
+                    sub.map_or(0, |s| s.id),
+                    sub.map_or(0, |s| s.triangle_count()),
+                    b.material_index,
+                );
+            }
+            if skin.batches().len() > 24 {
+                println!("      ... {} more", skin.batches().len() - 24);
+            }
+        }
+        Err(e) => println!("\n  {skin_path}: {e}"),
+    }
+    Ok(())
+}
+
+fn m2_survey(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let needle = filter.map(str::to_lowercase);
+    let names: Vec<String> = chain
+        .list()?
+        .into_iter()
+        .filter(|n| {
+            let l = n.to_lowercase();
+            l.ends_with(".m2") && needle.as_ref().is_none_or(|f| l.contains(f.as_str()))
+        })
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+
+    let mut failures: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let (mut models, mut skins, mut verts, mut tris) = (0usize, 0usize, 0u64, 0u64);
+    let (mut no_skin, mut max_verts, mut max_bones) = (0usize, 0usize, 0usize);
+    let mut unresolved = 0usize;
+
+    for (i, name) in names.iter().enumerate() {
+        // Listed but absent: tombstoned by a patch, or a stale listfile entry.
+        let Ok(bytes) = chain.read(name) else {
+            unresolved += 1;
+            continue;
+        };
+        let model = match m2::Model::parse(&bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                let key = e.to_string();
+                let key = key.split(" (").next().unwrap_or(&key).to_string();
+                failures.entry(key).or_insert((0, name.clone())).0 += 1;
+                continue;
+            }
+        };
+        models += 1;
+        for issue in model.validate() {
+            let key = format!("model: {}", first_clause(&issue));
+            failures.entry(key).or_insert((0, name.clone())).0 += 1;
+        }
+        verts += model.vertex_count() as u64;
+        max_verts = max_verts.max(model.vertex_count());
+        max_bones = max_bones.max(model.bones().len());
+
+        let mut found_any = false;
+        for lod in 0..model.skin_count().min(4) {
+            let path = m2::skin_path(name, lod);
+            let Ok(sb) = chain.read(&path) else { continue };
+            match m2::Skin::parse(&sb) {
+                Ok(skin) => {
+                    found_any = true;
+                    skins += 1;
+                    tris += (skin.triangles().len() / 3) as u64;
+                    if let Err(e) = skin.validate(model.vertex_count()) {
+                        let key = format!("skin index table invalid: {}", first_clause(&e));
+                        failures.entry(key).or_insert((0, path.clone())).0 += 1;
+                    }
+                }
+                Err(e) => {
+                    let key = format!("skin parse: {}", first_clause(&e.to_string()));
+                    failures.entry(key).or_insert((0, path.clone())).0 += 1;
+                }
+            }
+        }
+        if !found_any {
+            no_skin += 1;
+        }
+        if i % 2000 == 1999 {
+            tracing::info!("{}/{} models", i + 1, names.len());
+        }
+    }
+
+    println!("\n{models}/{} models parsed, {skins} skins", names.len());
+    println!("  {verts} vertices, {tris} triangles across all levels of detail");
+    println!("  largest model: {max_verts} vertices, {max_bones} bones");
+    println!("  {no_skin} models had no readable skin");
+    println!("  {unresolved} listed paths did not resolve (tombstoned or stale)");
+    if failures.is_empty() {
+        println!("\nno failures");
+    } else {
+        println!("\nfailures:");
+        for (kind, (count, example)) in &failures {
+            println!("  {count:>7}  {kind}\n           e.g. {example}");
+        }
+    }
+    Ok(())
+}
+
+/// Trims a message to its first clause so similar errors group together.
+fn first_clause(msg: &str) -> String {
+    msg.split(&[',', ':'][..]).next().unwrap_or(msg).to_string()
+}
+
+fn m2_creature(chain: &mut Chain, display_id: u32) -> Result<()> {
+    use dbc::schema::{CreatureDisplayInfo, CreatureModelData};
+
+    let display = CreatureDisplayInfo::parse(&chain.read(CreatureDisplayInfo::PATH)?)?;
+    let models = CreatureModelData::parse(&chain.read(CreatureModelData::PATH)?)?;
+
+    let row = display
+        .iter()
+        .find(|d| d.id() == display_id)
+        .with_context(|| format!("no CreatureDisplayInfo row {display_id}"))?;
+    let model_row = models
+        .iter()
+        .find(|m| m.id() == row.model_id())
+        .with_context(|| format!("no CreatureModelData row {}", row.model_id()))?;
+
+    let dbc_path = model_row.model_name().to_string();
+    let path = m2::model_path(&dbc_path);
+    println!("display {display_id} -> model {} -> {dbc_path}", row.model_id());
+    println!("  resolved: {path}");
+    println!("  scale {:.2}, collision {:.2} wide x {:.2} high",
+        model_row.model_scale(),
+        model_row.collision_width(),
+        model_row.collision_height());
+
+    // Skins named by the DBC replace the model's runtime texture slots.
+    let variations: Vec<&str> = [
+        row.texture_variation_0(),
+        row.texture_variation_1(),
+        row.texture_variation_2(),
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect();
+    if !variations.is_empty() {
+        println!("  texture variations: {}", variations.join(", "));
+    }
+
+    match chain.read(&path) {
+        Ok(bytes) => {
+            let model = m2::Model::parse(&bytes)?;
+            println!(
+                "  loaded: {} vertices, {} bones, {} textures",
+                model.vertex_count(),
+                model.bones().len(),
+                model.textures().len()
+            );
+            // Runtime slots are where the DBC variations get substituted; the
+            // directory comes from the model, the name from the DBC.
+            for (i, t) in model.textures().iter().enumerate() {
+                if !t.is_hardcoded() {
+                    println!("    slot {i}: runtime type {} <- DBC variation", t.kind);
+                }
+            }
+        }
+        Err(e) => println!("  NOT FOUND: {e}"),
+    }
+    Ok(())
 }
 
 fn blp_cmd(chain: &mut Chain, cmd: BlpCommand) -> Result<()> {

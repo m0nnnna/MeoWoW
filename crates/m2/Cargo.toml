@@ -1,0 +1,16 @@
+[package]
+name = "m2"
+description = "Reader for Blizzard's M2 model format and its .skin companions, as used by WoW 3.3.5a."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+dbc = { path = "../dbc" }
+mpq = { path = "../mpq" }

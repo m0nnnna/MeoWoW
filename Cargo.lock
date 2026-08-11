@@ -1368,6 +1368,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "m2"
+version = "0.0.1"
+dependencies = [
+ "dbc",
+ "mpq",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3654,6 +3664,7 @@ dependencies = [
  "blp",
  "clap",
  "dbc",
+ "m2",
  "mpq",
  "png 0.17.16",
  "tracing",

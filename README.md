@@ -26,11 +26,16 @@ the 3.3.5a data files you already own, exactly as
   with PNG export. Compressed blocks are also exposed unmodified, so the
   renderer can hand them to the GPU without a CPU decode.
 
+- **M2 models** — header, vertex pool, bone hierarchy, materials, and the
+  `.skin` files holding the actual triangles, plus the DBC walk that turns a
+  creature display id into a model on disk.
+
 Verified against a stock build 12340 install: 203,949 paths, of which 198,827
 read and decompress cleanly (21.4 GiB) and 5,121 are correctly masked by patch
 tombstones. The one remaining unresolved path is a stale entry in Blizzard's
 own listfile. All 245 DBC tables present in the install parse, as do all
-107,927 readable textures.
+107,927 readable textures and all 22,779 models with their 24,626 skins
+(9.9M vertices, 15.9M triangles).
 
 ```console
 $ wow-cli --data "D:/Games/World of Warcraft 3.3.5a/Data" info
