@@ -17,7 +17,7 @@ mod world_object;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -359,6 +359,31 @@ const BIND_POSE_BONES: usize = 512;
 fn bind_pose(count: usize) -> Vec<[[f32; 4]; 4]> {
     vec![glam::Mat4::IDENTITY.to_cols_array_2d(); count]
 }
+
+/// Which direction, if any, is currently being reported to the world server.
+///
+/// Tracked separately from the held keys so a transition -- key pressed,
+/// released, or swapped -- can be told apart from "still moving the same way",
+/// which is what decides whether a `MoveStart*`/`MoveStop` is due or just
+/// another heartbeat.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiveMove {
+    Forward,
+    Backward,
+}
+
+/// A tenth of a second between heartbeats, matching `Connection::walk`'s
+/// cadence -- roughly what a real client sends while moving.
+const LIVE_HEARTBEAT_EVERY: Duration = Duration::from_millis(100);
+
+/// Units per second on foot. Not tunable from the command line: it is a
+/// property of the character, not the viewer.
+const LIVE_WALK_SPEED: f32 = 7.0;
+
+/// Radians per second turned by the A/D keys. Not verified against a
+/// reference client -- see the facing note in `docs/RENDERING.md` -- but close
+/// enough that the character does not spin wildly or crawl.
+const LIVE_TURN_RATE: f32 = std::f32::consts::PI;
 
 /// Which movement keys are currently held.
 #[derive(Default, Clone, Copy)]
@@ -1186,6 +1211,11 @@ struct App {
     speed: f32,
     /// Present when the world was entered over the network.
     live: Option<live::LiveWorld>,
+    /// The direction currently reported to the server, if any -- `None` means
+    /// the last packet sent was a `MoveStop`, or nothing has moved yet.
+    live_move: Option<LiveMove>,
+    last_heartbeat: Instant,
+    last_ping: Instant,
 }
 
 impl App {
@@ -1207,6 +1237,9 @@ impl App {
             playing: true,
             speed: 1.0,
             live: None,
+            live_move: None,
+            last_heartbeat: Instant::now(),
+            last_ping: Instant::now(),
         }
     }
 }
@@ -1281,6 +1314,13 @@ impl ApplicationHandler for App {
             &self.args,
         ) {
             Ok((scene, live)) => {
+                if live.is_some() {
+                    // Start the movement and keepalive clocks from the moment
+                    // the connection is actually ready to drive, not from
+                    // whenever the window happened to be created.
+                    self.last_heartbeat = Instant::now();
+                    self.last_ping = Instant::now();
+                }
                 self.live = live;
                 Some(scene)
             }
@@ -1437,8 +1477,12 @@ impl App {
         let camera = self.camera;
 
         // Movement integrates real elapsed time, so travel speed does not
-        // depend on frame rate.
-        if let Camera::Fly(fly) = &mut self.camera {
+        // depend on frame rate. A live world is driven by the character's
+        // walk, not a free-flying camera -- see `drive_live_movement`.
+        if self.live.is_some() {
+            self.drive_live_movement();
+            self.pump_live_connection();
+        } else if let Camera::Fly(fly) = &mut self.camera {
             let direction = self.keys.direction();
             if direction != glam::Vec3::ZERO {
                 fly.travel(direction, self.frame_ms / 1000.0, self.keys.fast);
@@ -1569,6 +1613,134 @@ impl App {
 
         r.gpu.queue.submit([encoder.finish()]);
         r.gpu.queue.present(frame);
+    }
+
+    /// Turns and walks the live character from held keys, sending whatever the
+    /// movement stream requires, and keeps the camera behind it.
+    ///
+    /// Terrain height, jumping and collision are out of scope here: Z is
+    /// whatever the server last reported, so walking across sloped ground
+    /// leaves the character floating or sinking. That is expected, not a bug
+    /// -- see the movement section of `docs/PROTOCOL.md`.
+    fn drive_live_movement(&mut self) {
+        use ::world::update::movement_flags;
+        use ::world::{ClientOpcode, MovementInfo, Position};
+
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let dt = (self.frame_ms / 1000.0).max(0.0);
+
+        // Turning is purely local: nothing here reports it to the server
+        // unless a translation is also in flight, since the position sent
+        // with every Start/Heartbeat carries the current orientation anyway.
+        let turn = match (self.keys.left, self.keys.right) {
+            (true, false) => LIVE_TURN_RATE,
+            (false, true) => -LIVE_TURN_RATE,
+            _ => 0.0,
+        };
+        if turn != 0.0 {
+            live.orientation =
+                (live.orientation + turn * dt).rem_euclid(std::f32::consts::TAU);
+        }
+
+        let desired = if self.keys.forward {
+            Some(LiveMove::Forward)
+        } else if self.keys.back {
+            Some(LiveMove::Backward)
+        } else {
+            None
+        };
+
+        if let Some(heading) = desired {
+            let (dx, dy) = (live.orientation.cos(), live.orientation.sin());
+            let sign = if heading == LiveMove::Forward { 1.0 } else { -1.0 };
+            live.position.x += dx * LIVE_WALK_SPEED * sign * dt;
+            live.position.y += dy * LIVE_WALK_SPEED * sign * dt;
+        }
+
+        let position = Position {
+            x: live.position.x,
+            y: live.position.y,
+            z: live.position.z,
+            orientation: live.orientation,
+        };
+
+        if desired != self.live_move {
+            let (opcode, flags) = match desired {
+                Some(LiveMove::Forward) => (ClientOpcode::MoveStartForward, movement_flags::FORWARD),
+                Some(LiveMove::Backward) => {
+                    (ClientOpcode::MoveStartBackward, movement_flags::BACKWARD)
+                }
+                // Left in the FORWARD/BACKWARD state, the character keeps
+                // moving in the server's own simulation after we go quiet.
+                None => (ClientOpcode::MoveStop, 0),
+            };
+            let info = MovementInfo {
+                flags,
+                time: live.connection.tick(),
+                position,
+                ..MovementInfo::default()
+            };
+            if let Err(e) = live.connection.send_movement(opcode, live.guid, &info) {
+                tracing::warn!("sending movement failed: {e:#}");
+            }
+            self.live_move = desired;
+            self.last_heartbeat = Instant::now();
+        } else if let Some(heading) = desired {
+            if self.last_heartbeat.elapsed() >= LIVE_HEARTBEAT_EVERY {
+                let flags = if heading == LiveMove::Forward {
+                    movement_flags::FORWARD
+                } else {
+                    movement_flags::BACKWARD
+                };
+                let info = MovementInfo {
+                    flags,
+                    time: live.connection.tick(),
+                    position,
+                    ..MovementInfo::default()
+                };
+                if let Err(e) =
+                    live.connection
+                        .send_movement(ClientOpcode::MoveHeartbeat, live.guid, &info)
+                {
+                    tracing::warn!("sending heartbeat failed: {e:#}");
+                }
+                self.last_heartbeat = Instant::now();
+            }
+        }
+
+        // Same offset as the initial placement in `live_camera`, recomputed
+        // every frame so the camera tracks the character instead of flying
+        // free. Pitch is left alone so a mouse drag can still look up or down.
+        if let Camera::Fly(fly) = &mut self.camera {
+            const BEHIND: f32 = 9.0;
+            const ABOVE: f32 = 4.0;
+            let yaw = live.orientation;
+            fly.position = live.position
+                - glam::Vec3::new(yaw.cos(), yaw.sin(), 0.0) * BEHIND
+                + glam::Vec3::Z * ABOVE;
+            fly.yaw = yaw;
+        }
+    }
+
+    /// Keeps a live connection alive: drains relayed traffic so time-sync
+    /// requests keep getting answered, and pings no faster than
+    /// `world::client::PING_INTERVAL` -- pinging faster is punished harder
+    /// than not pinging at all.
+    fn pump_live_connection(&mut self) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.drain(Duration::from_millis(1), 64) {
+            tracing::warn!("draining the live connection failed: {e:#}");
+        }
+        if self.last_ping.elapsed() >= ::world::client::PING_INTERVAL {
+            if let Err(e) = live.connection.ping(0) {
+                tracing::warn!("keepalive ping failed: {e:#}");
+            }
+            self.last_ping = Instant::now();
+        }
     }
 
     fn build_ui(&mut self, window: &Arc<Window>) -> egui::FullOutput {

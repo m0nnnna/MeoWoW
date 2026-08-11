@@ -18,12 +18,17 @@ streams. Phase 3 has started.
 Roughly 50% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
 
-**The two halves have met.** `wow-viewer --realm-host <host> --user <account>
---character <name>` logs in, enters the world, and streams the map the server
-chose around the position it reported, with the creatures it reported standing
-in it. The character can also be walked (`wow-cli world --enter X --walk 20`),
-but the viewer cannot drive that yet — the obvious next visible step is wiring
-its movement keys to the protocol so the camera and the character move together.
+**The two halves have met, and the viewer drives movement.** `wow-viewer
+--realm-host <host> --user <account> --character <name>` logs in, enters the
+world, and streams the map the server chose around the position it reported,
+with the creatures it reported standing in it. Holding W/S walks the character
+forward or backward and A/D turns it, each sent as a real `MSG_MOVE_*` stream
+(`MoveStartForward`/`MoveHeartbeat`/`MoveStop`), and the camera follows behind
+rather than flying freely. Verified against the live realm the same way the
+CLI's `--walk` is: the position the server reports on re-entry moved, and
+differs from the stale character-list position exactly as documented above.
+`wow-cli world --enter X --walk 20` remains the CLI-driven equivalent, useful
+when no window is available.
 
 ## Orientation
 

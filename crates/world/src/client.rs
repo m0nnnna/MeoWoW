@@ -379,7 +379,7 @@ impl Connection {
     }
 
     /// Milliseconds since the connection opened, as the movement clock.
-    fn tick(&self) -> u32 {
+    pub fn tick(&self) -> u32 {
         self.started.elapsed().as_millis() as u32
     }
 

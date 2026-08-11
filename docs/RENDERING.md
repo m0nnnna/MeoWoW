@@ -346,6 +346,28 @@ Entity models are cached by **display id, not by path**: a display id supplies
 skins on top of a model path, so two ids sharing a path are different-looking
 creatures, and keying by path gives the second one the first one's hide.
 
+### Driving movement
+
+Once logged in, the viewer keeps the `world::Connection` alive in `App` rather
+than dropping it after login, and drives it from the render loop on held
+W/S/A/D: W/S send the `MSG_MOVE_*` stream (`MoveStartForward`/`MoveStop` or
+`MoveStartBackward`/`MoveStop`, with a heartbeat roughly every 100 ms while
+moving), A/D turn the character locally. The camera is recomputed from the
+character's position and orientation every frame instead of flying freely, so
+it tracks behind rather than needing to be steered separately.
+
+No background thread reads the socket: the connection is pumped once per frame
+with a 1 ms `drain`, which is what keeps `SMSG_TIME_SYNC_REQ` answered, plus an
+explicit keepalive no faster than `PING_INTERVAL`. Doing this on the render
+thread is deliberate, not a shortcut -- RC4 header state cannot be shared or
+rewound, so exactly one place may ever read the socket, and packets here are
+small and infrequent enough that a frame stall from a blocking read is not a
+real cost.
+
+Z is left exactly as the server last reported it and never re-derived from
+terrain: walking across sloped ground floats or sinks the character, which is
+expected until height-following exists.
+
 ### What still looks wrong
 
 Humanoid NPCs render white. Character models composite their skin at runtime

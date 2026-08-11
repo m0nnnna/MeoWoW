@@ -34,6 +34,9 @@ pub struct Entity {
 /// Where the player is and what can be seen from there.
 pub struct LiveWorld {
     pub character: String,
+    /// The character's own guid, needed as the mover in every movement packet
+    /// this client sends.
+    pub guid: u64,
     pub map_id: u32,
     /// Folder under `World\Maps`, which is what the streaming renderer needs.
     pub map_directory: String,
@@ -44,6 +47,11 @@ pub struct LiveWorld {
     /// Objects seen but not drawable, and why. Reported rather than hidden:
     /// silently drawing a subset of the world looks like a rendering bug.
     pub skipped: Vec<String>,
+    /// Kept alive rather than dropped at the end of [`connect`]: the viewer
+    /// walks the character over this same connection, and RC4 header state
+    /// cannot be shared or rewound, so a fresh connection could not pick up
+    /// where this one left off.
+    pub connection: world::Connection,
 }
 
 /// What to connect to.
@@ -122,6 +130,7 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
     let (map_directory, map_name) = map_directory(chain, landed.map)?;
     Ok(LiveWorld {
         character: character.name.clone(),
+        guid: character.guid,
         map_id: landed.map,
         map_directory,
         map_name,
@@ -130,6 +139,7 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
         orientation: landed.orientation,
         entities,
         skipped,
+        connection,
     })
 }
 
