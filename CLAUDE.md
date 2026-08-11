@@ -12,16 +12,20 @@ streams. Phase 3 has started.
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation), WMO, ADT/WDT — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
-| Protocol | **3.1 logon/SRP6 done** (needs real credentials to finish proving); 3.2 world handshake is next |
+| Protocol | **3.1 logon/SRP6 and 3.2 world handshake done**, both confirmed against a live realm; 3.3 enter world is next |
 | Game + UI | Not started. The largest remaining chunk. |
 
-Roughly 35% of the way to something a person could test by playing. See
+Roughly 40% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
+
+The two halves have not met yet: the renderer draws a world nobody is standing
+in, and the protocol reaches a character list that opens onto nothing. 3.3 is
+where they join.
 
 ## Orientation
 
 - `crates/` — one library per concern: `chunk` (shared chunked container),
-  `mpq`, `dbc`, `blp`, `m2`, `wmo`, `adt`, `render`, `auth`
+  `mpq`, `dbc`, `blp`, `m2`, `wmo`, `adt`, `render`, `auth`, `world`
 - `tools/wow-cli` — inspection CLI. **Every format gets a dump command here
   before it is wired into the renderer**, and a `survey` command that parses the
   whole archive set. Those surveys have caught every systematic parser bug so
@@ -40,9 +44,15 @@ Roughly 35% of the way to something a person could test by playing. See
   enUS, 17 archives, 203,949 paths). 1.12.1 and 2.4.3 are also on disk for
   format-evolution comparison.
 - `WOW_DATA` supplies `--data` to `wow-cli` and gates the integration tests.
-- Test realm: **`wow1.nekos.farm`** (auth 3724, world 8085). An account named
-  `TESTER` exists; its password is not recorded here. Ask the user rather than
-  guessing — a wrong password and a missing account are hard to tell apart.
+- Test realm: **`wow1.nekos.farm`** (auth 3724, world 8085), realm `NekoCore`
+  at `108.174.48.199:8085`, realm id 1. Accounts `TESTER` and `ACCOUNT33`
+  exist. **Passwords are deliberately not recorded here** — this file is
+  committed. Ask the user, and pass the password via `WOW_PASSWORD` rather than
+  an argument. A wrong password and a missing account are hard to tell apart,
+  so guessing wastes real time.
+- `ACCOUNT33` has two characters, `Testwolf` (human warrior) and `Testdruid`
+  (night elf druid), created to give `SMSG_CHAR_ENUM` real data to parse. An
+  account with no characters exercises none of that packet's field offsets.
 
 ## Rules that matter
 
@@ -66,6 +76,12 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   properties the data must have, not just that it decoded: M2 normals are unit
   vectors, SRP6 rotation keys are unit quaternions, terrain chunks must meet at
   their edges. Each of those caught a real bug that size checks missed.
+- **Assert the parse consumed the whole record.** The corollary to the above,
+  and cheaper than any of it. Three separate world-protocol bugs — a packet
+  sixteen bytes longer than expected, three missing equipment slots, a field of
+  the wrong width — were invisible field by field and obvious the moment a
+  cursor reported leftovers. Parse through a cursor and make running out of
+  input *and* having input left over both errors.
 - **Compare against something derived independently.** The SRP6 tests carry a
   server written from the protocol, not from the client. Agreement between two
   separate derivations is evidence; a thing checked against itself is not.

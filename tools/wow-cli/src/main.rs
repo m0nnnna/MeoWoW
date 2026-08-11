@@ -83,6 +83,41 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         timeout: u64,
     },
+    /// Log in, connect to a realm's world server, and list its characters.
+    ///
+    /// Runs the whole chain: SRP6 against the logon server, then the world
+    /// handshake and its RC4 header cipher. Needs no game files.
+    World {
+        /// Logon server hostname. The world server's address comes from the
+        /// realm list, not from here.
+        host: String,
+        #[arg(long, short)]
+        user: String,
+        /// Password. Prefer `WOW_PASSWORD` so it stays out of shell history.
+        #[arg(long, short, env = "WOW_PASSWORD", hide_env_values = true)]
+        password: String,
+        /// Realm to enter, by name. Defaults to the only realm offered.
+        #[arg(long, short)]
+        realm: Option<String>,
+        /// Create a character with this name before listing.
+        ///
+        /// Exists to give the character-list parser real data to read: an
+        /// empty list exercises none of its field offsets.
+        #[arg(long)]
+        create: Option<String>,
+        /// Race and class for `--create`; defaults to a human warrior.
+        #[arg(long, default_value_t = 1)]
+        race: u8,
+        #[arg(long, default_value_t = 1)]
+        class: u8,
+        /// Delete the named character before listing.
+        #[arg(long)]
+        delete: Option<String>,
+        #[arg(long, default_value_t = auth::client::DEFAULT_PORT)]
+        port: u16,
+        #[arg(long, default_value_t = 8)]
+        timeout: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -212,16 +247,43 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Logging in touches no game files, so it must not demand a data directory.
-    if let Command::Auth {
-        host,
-        user,
-        password,
-        port,
-        timeout,
-    } = &cli.command
-    {
-        return auth_login(host, *port, user, password, &cli.locale, *timeout);
+    // The network commands touch no game files, so they must not demand a data
+    // directory.
+    match &cli.command {
+        Command::Auth {
+            host,
+            user,
+            password,
+            port,
+            timeout,
+        } => return auth_login(host, *port, user, password, &cli.locale, *timeout),
+        Command::World {
+            host,
+            user,
+            password,
+            realm,
+            create,
+            race,
+            class,
+            delete,
+            port,
+            timeout,
+        } => {
+            return world_login(WorldRequest {
+                host,
+                port: *port,
+                user,
+                password,
+                realm: realm.as_deref(),
+                create: create.as_deref(),
+                race: *race,
+                class: *class,
+                delete: delete.as_deref(),
+                locale: &cli.locale,
+                timeout: *timeout,
+            })
+        }
+        _ => {}
     }
 
     let data = cli
@@ -243,7 +305,7 @@ fn main() -> Result<()> {
         Command::Wmo(cmd) => wmo_cmd(&mut chain, cmd),
         Command::Adt(cmd) => adt_cmd(&mut chain, cmd),
         // Handled before the archives are opened.
-        Command::Auth { .. } => unreachable!(),
+        Command::Auth { .. } | Command::World { .. } => unreachable!(),
     }
 }
 
@@ -289,6 +351,155 @@ fn auth_login(
         );
     }
     Ok(())
+}
+
+struct WorldRequest<'a> {
+    host: &'a str,
+    port: u16,
+    user: &'a str,
+    password: &'a str,
+    realm: Option<&'a str>,
+    create: Option<&'a str>,
+    race: u8,
+    class: u8,
+    delete: Option<&'a str>,
+    locale: &'a str,
+    timeout: u64,
+}
+
+/// Logs in and walks all the way through to the character list.
+///
+/// The two halves are deliberately one command: the session key only exists
+/// inside a single logon, so there is nothing sensible to hand a separate
+/// "connect to the world server" command short of caching a secret to disk.
+fn world_login(request: WorldRequest<'_>) -> Result<()> {
+    let WorldRequest {
+        host,
+        port,
+        user,
+        password,
+        realm: realm_name,
+        create,
+        race,
+        class,
+        delete,
+        locale,
+        timeout,
+    } = request;
+    let timeout = std::time::Duration::from_secs(timeout);
+
+    println!("logging in to {host}:{port} as {user}");
+    let session = auth::login(host, port, user, password, locale, timeout)?;
+
+    let realm = pick_realm(&session.realms, realm_name)?;
+    println!("realm {:?} at {} (id {})", realm.name, realm.address, realm.id);
+    if realm.is_offline() {
+        // Worth saying out loud: the handshake will simply fail to connect, and
+        // that looks like a client bug rather than a realm that is down.
+        println!("  note: the realm list marks this realm offline");
+    }
+
+    let (world_host, world_port) = world::client::split_realm_address(&realm.address)?;
+    println!("connecting to the world server at {world_host}:{world_port}");
+
+    let mut connection = world::Connection::open(
+        &format!("{world_host}:{world_port}"),
+        user,
+        realm.id as u32,
+        &session.session_key,
+        timeout,
+    )?;
+    println!(
+        "session accepted, header cipher running (expansion {})",
+        connection.expansion
+    );
+
+    if let Some(name) = delete {
+        let guid = connection
+            .characters()?
+            .into_iter()
+            .find(|character| character.name.eq_ignore_ascii_case(name))
+            .with_context(|| format!("no character named {name:?} to delete"))?
+            .guid;
+        let code = connection.delete_character(guid)?;
+        println!(
+            "delete {name:?}: {} ({code:#04x})",
+            world::protocol::describe_char_result(code)
+        );
+    }
+
+    if let Some(name) = create {
+        let look = world::Appearance {
+            race,
+            class,
+            ..world::Appearance::human_warrior()
+        };
+        let code = connection.create_character(name, &look)?;
+        println!(
+            "create {name:?} ({} {}): {} ({code:#04x})",
+            world::race_name(race),
+            world::class_name(class),
+            world::protocol::describe_char_result(code)
+        );
+    }
+
+    let characters = connection.characters()?;
+    if characters.is_empty() {
+        println!("\nno characters on this realm");
+        return Ok(());
+    }
+
+    println!("\n{} character(s):", characters.len());
+    for character in &characters {
+        // Race and class are padded as one field: separately, a long race name
+        // pushes every following column out of line.
+        let kind = format!(
+            "{} {}",
+            world::race_name(character.race),
+            world::class_name(character.class)
+        );
+        println!(
+            "  {:<14} level {:<3} {kind:<24} map {:<4} at {:.1}, {:.1}, {:.1}{}{}",
+            character.name,
+            character.level,
+            character.map,
+            character.position[0],
+            character.position[1],
+            character.position[2],
+            if character.is_ghost() { ", ghost" } else { "" },
+            if character.needs_rename() {
+                ", must be renamed"
+            } else {
+                ""
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Chooses which realm to enter.
+///
+/// With one realm the choice is obvious; with several, guessing would silently
+/// send the player somewhere they did not ask for, so an ambiguous case lists
+/// the options and stops.
+fn pick_realm<'a>(realms: &'a [auth::Realm], wanted: Option<&str>) -> Result<&'a auth::Realm> {
+    if let Some(wanted) = wanted {
+        return realms
+            .iter()
+            .find(|realm| realm.name.eq_ignore_ascii_case(wanted))
+            .with_context(|| {
+                let names: Vec<&str> = realms.iter().map(|realm| realm.name.as_str()).collect();
+                format!("no realm named {wanted:?}; this account sees {names:?}")
+            });
+    }
+    match realms {
+        [] => anyhow::bail!("the logon server offered no realms"),
+        [only] => Ok(only),
+        many => {
+            let names: Vec<&str> = many.iter().map(|realm| realm.name.as_str()).collect();
+            anyhow::bail!("{} realms available: {names:?}; pass --realm", many.len())
+        }
+    }
 }
 
 fn adt_cmd(chain: &mut Chain, cmd: AdtCommand) -> Result<()> {

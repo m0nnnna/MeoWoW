@@ -1,0 +1,25 @@
+[package]
+name = "world"
+description = "The 3.3.5a world server protocol: RC4 header crypt, session handshake, character list."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The session key comes from the logon stage; sharing the constant keeps the
+# two halves of the protocol from drifting apart.
+auth = { path = "../auth" }
+flate2.workspace = true
+hmac = "0.12"
+rand = "0.9"
+rc4 = "0.1"
+sha1 = "0.10"
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hmac = "0.12"
+rc4 = "0.1"
+sha1 = "0.10"

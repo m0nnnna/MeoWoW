@@ -53,14 +53,21 @@ Target is a stock TrinityCore or MaNGOS 3.3.5a server.
 | # | Milestone | Ends with |
 |---|-----------|-----------|
 | 3.1 | **Auth server** ✅ | SRP6 login, realm list, stage-aware refusals; `wow-cli auth <host>` |
-| 3.2 | **World handshake** | RC4 header crypt, `SMSG_AUTH_CHALLENGE` → character list |
+| 3.2 | **World handshake** ✅ | RC4 header crypt, `SMSG_AUTH_CHALLENGE` → character list; `wow-cli world <host>` |
 | 3.3 | **Enter world** | Login to a character, receive the initial object update |
 | 3.4 | **Movement** | Move, and be seen moving by another client |
 | 3.5 | **Entity replication** | Other players and creatures visible and animating |
 
-3.2 is the single hardest protocol step: the header cipher and the
-object-update-field packing are both unforgiving, and a one-bit error produces
-a desync with no useful error message. Budget accordingly.
+3.2 was expected to be the single hardest protocol step, and the header cipher
+was indeed unforgiving — but not in the way budgeted for. The cipher itself
+worked on the first attempt against a live server. What failed three times was
+ordinary packet layout: a challenge sixteen bytes longer than expected, three
+missing equipment slots, and a result-code enum offset by one. See
+`docs/PROTOCOL.md`; the lesson is that a cursor which asserts it consumed the
+whole packet catches all three, and no amount of per-field checking does.
+
+The remaining unforgiving half — object-update-field packing — is 3.3's problem,
+and that budget still stands.
 
 ## Phase 4 — Game
 
