@@ -1,0 +1,466 @@
+//! Drawing M2 geometry.
+//!
+//! One pipeline per distinct render state, built on demand and cached. M2
+//! materials vary along three axes that a pipeline cannot switch at draw time
+//! -- blending, face culling, and whether alpha is tested -- so the combination
+//! is the cache key.
+
+use std::collections::HashMap;
+
+use bytemuck::{Pod, Zeroable};
+
+use crate::Gpu;
+
+/// Depth format used everywhere. Reversed-Z is not worth the complication at
+/// the scale of a single model.
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Vertex layout handed to the GPU. Bone weights are omitted until animation
+/// needs them.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct MeshVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct CameraUniform {
+    pub view_proj: [[f32; 4]; 4],
+    pub eye: [f32; 4],
+    /// Direction *towards* the light, plus an unused w.
+    pub light: [f32; 4],
+}
+
+/// How a batch's material maps onto fixed-function state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BlendMode {
+    /// Fully opaque.
+    Opaque,
+    /// Binary transparency via `discard`; still writes depth, so it can be
+    /// drawn with the opaque pass.
+    AlphaKey,
+    /// Standard source-alpha blending.
+    Blend,
+    /// Additive, for glows and effects.
+    Additive,
+}
+
+impl BlendMode {
+    /// Maps an M2 material's blend field.
+    ///
+    /// The values beyond 3 are variations on modulation that all read
+    /// acceptably as alpha blending until the shader models them properly.
+    pub fn from_m2(blend: u16) -> Self {
+        match blend {
+            0 => Self::Opaque,
+            1 => Self::AlphaKey,
+            3 => Self::Additive,
+            _ => Self::Blend,
+        }
+    }
+
+    /// Whether the batch belongs in the transparent pass, which must be drawn
+    /// after everything opaque and back to front.
+    pub fn is_transparent(self) -> bool {
+        matches!(self, Self::Blend | Self::Additive)
+    }
+}
+
+/// Everything about a batch that selects a pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RenderState {
+    pub blend: BlendMode,
+    pub two_sided: bool,
+    pub depth_write: bool,
+}
+
+const SHADER: &str = r#"
+struct Camera {
+    view_proj: mat4x4<f32>,
+    eye: vec4<f32>,
+    light: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(1) @binding(0) var tex: texture_2d<f32>;
+@group(1) @binding(1) var samp: sampler;
+
+struct VsIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+};
+
+struct VsOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+};
+
+@vertex
+fn vs(in: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip = camera.view_proj * vec4<f32>(in.position, 1.0);
+    out.normal = in.normal;
+    out.uv = in.uv;
+    return out;
+}
+
+// Placeholder lighting: a single directional term plus ambient, enough to read
+// shape. Real lighting comes from the light DBCs much later.
+fn shade(normal: vec3<f32>, uv: vec2<f32>) -> vec4<f32> {
+    let n = normalize(normal);
+    let ndl = max(dot(n, normalize(camera.light.xyz)), 0.0);
+    let lit = 0.38 + 0.62 * ndl;
+    let texel = textureSample(tex, samp, uv);
+    return vec4<f32>(texel.rgb * lit, texel.a);
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    return shade(in.normal, in.uv);
+}
+
+// Cutout materials: reject rather than blend, so the batch can still write
+// depth and be drawn in the opaque pass.
+@fragment
+fn fs_alpha_key(in: VsOut) -> @location(0) vec4<f32> {
+    let c = shade(in.normal, in.uv);
+    if (c.a < 0.5) {
+        discard;
+    }
+    return vec4<f32>(c.rgb, 1.0);
+}
+"#;
+
+/// Geometry resident on the GPU.
+pub struct GpuMesh {
+    pub vertices: wgpu::Buffer,
+    pub indices: wgpu::Buffer,
+    pub index_count: u32,
+}
+
+impl GpuMesh {
+    pub fn upload(gpu: &Gpu, vertices: &[MeshVertex], indices: &[u32]) -> Self {
+        use wgpu::util::DeviceExt;
+        Self {
+            vertices: gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("mesh vertices"),
+                    contents: bytemuck::cast_slice(vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+            indices: gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("mesh indices"),
+                    contents: bytemuck::cast_slice(indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+            index_count: indices.len() as u32,
+        }
+    }
+}
+
+/// Cached pipelines plus the camera binding they share.
+pub struct MeshRenderer {
+    shader: wgpu::ShaderModule,
+    layout: wgpu::PipelineLayout,
+    target_format: wgpu::TextureFormat,
+    pipelines: HashMap<RenderState, wgpu::RenderPipeline>,
+    pub camera_buffer: wgpu::Buffer,
+    camera_bind: wgpu::BindGroup,
+    material_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+impl MeshRenderer {
+    pub fn new(gpu: &Gpu, target_format: wgpu::TextureFormat) -> Self {
+        let shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("mesh"),
+                source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            });
+
+        let camera_layout =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("camera"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+
+        let material_layout =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("material"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float {
+                                    filterable: true,
+                                },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(
+                                wgpu::SamplerBindingType::Filtering,
+                            ),
+                            count: None,
+                        },
+                    ],
+                });
+
+        let camera_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("camera"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let camera_bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera"),
+            layout: &camera_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+
+        let layout = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mesh"),
+                bind_group_layouts: &[Some(&camera_layout), Some(&material_layout)],
+                immediate_size: 0,
+            });
+
+        Self {
+            shader,
+            layout,
+            target_format,
+            pipelines: HashMap::new(),
+            camera_buffer,
+            camera_bind,
+            material_layout,
+            sampler: crate::texture::default_sampler(gpu),
+        }
+    }
+
+    pub fn camera_bind_group(&self) -> &wgpu::BindGroup {
+        &self.camera_bind
+    }
+
+    pub fn update_camera(&self, gpu: &Gpu, camera: &CameraUniform) {
+        gpu.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+    }
+
+    /// Binds one texture for drawing.
+    pub fn material_bind_group(&self, gpu: &Gpu, view: &wgpu::TextureView) -> wgpu::BindGroup {
+        gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("material"),
+            layout: &self.material_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        })
+    }
+
+    /// Returns the pipeline for a state, building it the first time it is
+    /// asked for.
+    pub fn pipeline(&mut self, gpu: &Gpu, state: RenderState) -> &wgpu::RenderPipeline {
+        self.pipelines
+            .entry(state)
+            .or_insert_with(|| build_pipeline(gpu, &self.shader, &self.layout, self.target_format, state))
+    }
+
+    /// Builds every pipeline a draw list will need.
+    ///
+    /// Called before recording, because [`MeshRenderer::pipeline`] needs `&mut
+    /// self` and a render pass already holds the encoder. Pre-warming lets the
+    /// pass look pipelines up immutably.
+    pub fn prepare(&mut self, gpu: &Gpu, states: impl IntoIterator<Item = RenderState>) {
+        for state in states {
+            self.pipeline(gpu, state);
+        }
+    }
+
+    /// Looks up a pipeline built by [`MeshRenderer::prepare`].
+    pub fn get(&self, state: RenderState) -> Option<&wgpu::RenderPipeline> {
+        self.pipelines.get(&state)
+    }
+
+    pub fn pipeline_count(&self) -> usize {
+        self.pipelines.len()
+    }
+}
+
+fn build_pipeline(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    state: RenderState,
+) -> wgpu::RenderPipeline {
+    let blend = match state.blend {
+        BlendMode::Opaque | BlendMode::AlphaKey => None,
+        BlendMode::Blend => Some(wgpu::BlendState::ALPHA_BLENDING),
+        BlendMode::Additive => Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
+    };
+
+    let entry = if state.blend == BlendMode::AlphaKey {
+        "fs_alpha_key"
+    } else {
+        "fs"
+    };
+
+    gpu.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mesh"),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<MeshVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x3,
+                        1 => Float32x3,
+                        2 => Float32x2
+                    ],
+                })],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                // M2 triangles wind clockwise when viewed from the front.
+                front_face: wgpu::FrontFace::Cw,
+                cull_mode: if state.two_sided {
+                    None
+                } else {
+                    Some(wgpu::Face::Back)
+                },
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(state.depth_write),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+}
+
+/// A depth attachment matching the colour target's size.
+pub struct DepthBuffer {
+    pub view: wgpu::TextureView,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl DepthBuffer {
+    pub fn new(gpu: &Gpu, width: u32, height: u32) -> Self {
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        Self {
+            view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            width,
+            height,
+        }
+    }
+
+    /// Recreates the buffer if the target has changed size.
+    pub fn resize(&mut self, gpu: &Gpu, width: u32, height: u32) {
+        if self.width != width || self.height != height {
+            *self = Self::new(gpu, width, height);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_m2_blend_values() {
+        assert_eq!(BlendMode::from_m2(0), BlendMode::Opaque);
+        assert_eq!(BlendMode::from_m2(1), BlendMode::AlphaKey);
+        assert_eq!(BlendMode::from_m2(2), BlendMode::Blend);
+        assert_eq!(BlendMode::from_m2(3), BlendMode::Additive);
+    }
+
+    /// Alpha-keyed geometry is opaque as far as sorting is concerned: it
+    /// discards rather than blends, so it can write depth in the first pass.
+    #[test]
+    fn alpha_key_is_not_transparent() {
+        assert!(!BlendMode::AlphaKey.is_transparent());
+        assert!(!BlendMode::Opaque.is_transparent());
+        assert!(BlendMode::Blend.is_transparent());
+        assert!(BlendMode::Additive.is_transparent());
+    }
+}

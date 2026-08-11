@@ -59,13 +59,15 @@ MapRow { id: 0, directory: "Azeroth", instance_type: 0, name: "Eastern Kingdoms"
 GPU path is checked without a display:
 
 ```console
+cargo run -p wow-viewer -- --creature 1216            # a gnoll, skins and all
+cargo run -p wow-viewer -- --model 'World\...\HumanGuardTower.m2'
 cargo run -p wow-viewer -- --texture 'Interface\Icons\Spell_Fire_Fireball02.blp'
-cargo run -p wow-viewer -- --screenshot frame.png --texture '<path>'
+cargo run -p wow-viewer -- --screenshot frame.png --creature 1216 --yaw 0
 ```
 
-DXT textures are handed to the GPU as `Bc1/2/3` blocks with no CPU decode; the
-overlay reports which path each texture took and why. See
-[docs/RENDERING.md](docs/RENDERING.md).
+Drag to orbit, scroll to zoom. DXT textures are handed to the GPU as `Bc1/2/3`
+blocks with no CPU decode, and the overlay reports which path each texture took
+and why. See [docs/RENDERING.md](docs/RENDERING.md).
 
 ## Getting started
 

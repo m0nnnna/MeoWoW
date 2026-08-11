@@ -1,13 +1,14 @@
 //! Windowed asset viewer.
 //!
-//! The first milestone with pixels. It exists to prove three things are wired
-//! together in one process: the archive layer finds a file, the BLP layer
-//! decodes it, and the GPU displays it -- specifically via the compressed
-//! upload path, which until now was only a design claim.
+//! Shows a texture or a model from a WoW 3.3.5a installation. It exists to
+//! prove the layers work together in one process: the archive layer finds a
+//! file, the format crates decode it, and the GPU draws it.
 //!
-//! It can also run headless (`--screenshot`), rendering one frame to a PNG
-//! without opening a window. That keeps the render path checkable from a
-//! terminal and in CI.
+//! It also runs headless (`--screenshot`), rendering one frame to a PNG without
+//! opening a window, which keeps the render path checkable from a terminal and
+//! in CI.
+
+mod model;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,15 +16,19 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use model::{LoadedModel, Variations};
 use mpq::Chain;
-use render::{capture::Offscreen, texture::upload_blp, Blitter, Gpu, UploadedTexture};
+use render::camera::Orbit;
+use render::capture::Offscreen;
+use render::mesh::{DepthBuffer, MeshRenderer};
+use render::{texture::upload_blp, Blitter, Gpu, UploadedTexture};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
-/// Shown on startup so the window is never empty, and a reliable presence in
-/// every locale of a stock install.
+/// Shown when nothing else is asked for: present in every locale of a stock
+/// install, so the window is never empty.
 const DEFAULT_TEXTURE: &str = r"Interface\Icons\Spell_Fire_Fireball02.blp";
 
 #[derive(Parser, Clone)]
@@ -36,19 +41,45 @@ struct Args {
     #[arg(long, default_value = "enUS")]
     locale: String,
 
-    /// Archive path of the texture to show.
-    #[arg(long, default_value = DEFAULT_TEXTURE)]
-    texture: String,
+    /// Archive path of a texture to show.
+    #[arg(long)]
+    texture: Option<String>,
+
+    /// Archive path of a model to show. `.mdx` is rewritten to `.m2`.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Creature display id; supplies both the model and its skins.
+    #[arg(long)]
+    creature: Option<u32>,
+
+    /// Level of detail, 0 being the most detailed.
+    #[arg(long, default_value_t = 0)]
+    lod: u32,
 
     /// Render one frame to this PNG and exit, without opening a window.
     #[arg(long)]
     screenshot: Option<PathBuf>,
+
+    /// Camera yaw in degrees, for reproducible screenshots.
+    #[arg(long)]
+    yaw: Option<f32>,
+
+    /// Camera pitch in degrees.
+    #[arg(long)]
+    pitch: Option<f32>,
 
     #[arg(long, default_value_t = 1280)]
     width: u32,
 
     #[arg(long, default_value_t = 720)]
     height: u32,
+}
+
+/// What the viewer is currently showing.
+enum Scene {
+    Texture(Box<UploadedTexture>),
+    Model(Box<LoadedModel>),
 }
 
 fn main() -> Result<()> {
@@ -68,30 +99,174 @@ fn main() -> Result<()> {
         return screenshot(&args, &mut chain, &path);
     }
 
-    let paths = blp_paths(&mut chain);
-    tracing::info!("{} textures available", paths.len());
-
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(args, chain, paths);
+    let mut app = App::new(args, chain);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
-fn blp_paths(chain: &mut Chain) -> Vec<String> {
-    chain
-        .list()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|n| n.to_lowercase().ends_with(".blp"))
-        .collect()
+/// Resolves the command line into something to draw.
+fn build_scene(gpu: &Gpu, chain: &mut Chain, args: &Args) -> Result<Scene> {
+    if let Some(display_id) = args.creature {
+        let (path, variations) = model::creature(chain, display_id)?;
+        let loaded = model::load(gpu, chain, &path, &variations, args.lod)?;
+        return Ok(Scene::Model(Box::new(loaded)));
+    }
+    if let Some(path) = &args.model {
+        let loaded = model::load(gpu, chain, path, &Variations::default(), args.lod)?;
+        return Ok(Scene::Model(Box::new(loaded)));
+    }
+    let path = args.texture.as_deref().unwrap_or(DEFAULT_TEXTURE);
+    let parsed = blp::Blp::parse(&chain.read(path)?)?;
+    Ok(Scene::Texture(Box::new(upload_blp(gpu, &parsed, path))))
 }
 
-/// Loads and uploads one texture, reporting what happened for the overlay.
-fn load_texture(gpu: &Gpu, chain: &mut Chain, path: &str) -> Result<UploadedTexture> {
-    let bytes = chain.read(path)?;
-    let parsed = blp::Blp::parse(&bytes)?;
-    Ok(upload_blp(gpu, &parsed, path))
+fn initial_camera(scene: &Scene, args: &Args) -> Orbit {
+    let mut camera = match scene {
+        Scene::Model(m) => Orbit::frame(m.min, m.max),
+        Scene::Texture(_) => Orbit::default(),
+    };
+    if let Some(yaw) = args.yaw {
+        camera.yaw = yaw.to_radians();
+    }
+    if let Some(pitch) = args.pitch {
+        camera.pitch = pitch.to_radians();
+    }
+    camera
+}
+
+/// Records one frame. Shared by the windowed and headless paths so the two
+/// cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+fn draw_scene(
+    gpu: &Gpu,
+    encoder: &mut wgpu::CommandEncoder,
+    color: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+    size: (u32, u32),
+    scene: &Scene,
+    camera: &Orbit,
+    blitter: &Blitter,
+    meshes: &MeshRenderer,
+    material_binds: &[wgpu::BindGroup],
+) {
+    match scene {
+        Scene::Texture(tex) => {
+            blitter.draw(gpu, encoder, color, size, &tex.view, (tex.width, tex.height));
+        }
+        Scene::Model(m) => {
+            let aspect = size.0 as f32 / size.1.max(1) as f32;
+            meshes.update_camera(gpu, &camera.uniform(aspect));
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("model"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05,
+                            g: 0.06,
+                            b: 0.08,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                multiview_mask: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
+            pass.set_vertex_buffer(0, m.mesh.vertices.slice(..));
+            pass.set_index_buffer(m.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+
+            for draw in &m.draws {
+                let (Some(pipeline), Some(binds)) =
+                    (meshes.get(draw.state), material_binds.get(draw.texture))
+                else {
+                    continue;
+                };
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(1, binds, &[]);
+                pass.draw_indexed(
+                    draw.first_index..draw.first_index + draw.index_count,
+                    0,
+                    0..1,
+                );
+            }
+        }
+    }
+}
+
+fn material_bind_groups(
+    gpu: &Gpu,
+    meshes: &MeshRenderer,
+    scene: &Scene,
+) -> Vec<wgpu::BindGroup> {
+    match scene {
+        Scene::Model(m) => m
+            .textures
+            .iter()
+            .map(|t| meshes.material_bind_group(gpu, &t.view))
+            .collect(),
+        Scene::Texture(_) => Vec::new(),
+    }
+}
+
+fn describe(scene: &Scene) -> String {
+    match scene {
+        Scene::Texture(t) => format!(
+            "{}x{} {:?}, {} mips, {}",
+            t.width,
+            t.height,
+            t.format,
+            t.mip_levels,
+            match t.fallback_reason {
+                None => "uploaded compressed".to_string(),
+                Some(r) => format!("CPU-decoded ({r})"),
+            }
+        ),
+        Scene::Model(m) => {
+            let mut s = format!(
+                "{}\n{} vertices, {} triangles\n{} draw calls, {} textures",
+                m.path,
+                m.vertex_count,
+                m.triangle_count,
+                m.draws.len(),
+                m.textures.len()
+            );
+            // Submesh ids identify geosets -- hair, armour, facial features --
+            // which is what character customisation will switch on later.
+            let mut ids: Vec<u16> = m.draws.iter().map(|d| d.submesh_id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let shown: Vec<String> = ids.iter().take(12).map(u16::to_string).collect();
+            s.push_str(&format!(
+                "\ngeosets: {}{}",
+                shown.join(" "),
+                if ids.len() > 12 { " ..." } else { "" }
+            ));
+            if !m.missing_textures.is_empty() {
+                s.push_str(&format!(
+                    "\nunresolved: {}",
+                    m.missing_textures.join(", ")
+                ));
+            }
+            s
+        }
+    }
 }
 
 // ---------------------------------------------------------------- headless
@@ -102,38 +277,41 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let target = Offscreen::new(&gpu, args.width, args.height, format);
+    let depth = DepthBuffer::new(&gpu, args.width, args.height);
     let blitter = Blitter::new(&gpu, format);
-    let texture = load_texture(&gpu, chain, &args.texture)?;
+    let mut meshes = MeshRenderer::new(&gpu, format);
+
+    let scene = build_scene(&gpu, chain, args)?;
+    let camera = initial_camera(&scene, args);
+    if let Scene::Model(m) = &scene {
+        meshes.prepare(&gpu, m.draws.iter().map(|d| d.state));
+    }
+    let binds = material_bind_groups(&gpu, &meshes, &scene);
 
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("screenshot"),
         });
-    blitter.draw(
+    draw_scene(
         &gpu,
         &mut encoder,
         &target.view,
+        &depth.view,
         (target.width, target.height),
-        &texture.view,
-        (texture.width, texture.height),
+        &scene,
+        &camera,
+        &blitter,
+        &meshes,
+        &binds,
     );
     gpu.queue.submit([encoder.finish()]);
 
     let rgba = target.read_rgba(&gpu)?;
     write_png(out, &rgba, target.width, target.height)?;
-
     println!(
-        "{}\n  {}x{} {:?}, {} mip levels, {}\n  rendered {}x{} -> {}",
-        args.texture,
-        texture.width,
-        texture.height,
-        texture.format,
-        texture.mip_levels,
-        match texture.fallback_reason {
-            None => "uploaded compressed".to_string(),
-            Some(r) => format!("CPU-decoded ({r})"),
-        },
+        "{}\nrendered {}x{} -> {}",
+        describe(&scene),
         target.width,
         target.height,
         out.display()
@@ -159,72 +337,42 @@ struct Renderer {
     gpu: Gpu,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    depth: DepthBuffer,
     blitter: Blitter,
+    meshes: MeshRenderer,
+    material_binds: Vec<wgpu::BindGroup>,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
-    texture: Option<UploadedTexture>,
+    scene: Option<Scene>,
 }
 
 struct App {
     args: Args,
     chain: Chain,
-    paths: Vec<String>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    /// Current texture path, and any error from loading it.
-    current: String,
+    camera: Orbit,
+    dragging: bool,
+    last_cursor: Option<(f64, f64)>,
     error: Option<String>,
-    filter: String,
-    matches: Vec<String>,
     last_frame: Instant,
     frame_ms: f32,
 }
 
 impl App {
-    fn new(args: Args, chain: Chain, paths: Vec<String>) -> Self {
-        let current = args.texture.clone();
-        let mut app = Self {
+    fn new(args: Args, chain: Chain) -> Self {
+        Self {
             args,
             chain,
-            paths,
             window: None,
             renderer: None,
-            current,
+            camera: Orbit::default(),
+            dragging: false,
+            last_cursor: None,
             error: None,
-            filter: "icons\\spell_fire".into(),
-            matches: Vec::new(),
             last_frame: Instant::now(),
             frame_ms: 0.0,
-        };
-        app.refilter();
-        app
-    }
-
-    /// Recomputes the picker list. Done on edit rather than per frame -- the
-    /// candidate set is over 100k paths.
-    fn refilter(&mut self) {
-        let needle = self.filter.to_lowercase();
-        self.matches = self
-            .paths
-            .iter()
-            .filter(|p| p.to_lowercase().contains(&needle))
-            .take(200)
-            .cloned()
-            .collect();
-    }
-
-    fn select(&mut self, path: String) {
-        let Some(r) = self.renderer.as_mut() else {
-            return;
-        };
-        match load_texture(&r.gpu, &mut self.chain, &path) {
-            Ok(tex) => {
-                r.texture = Some(tex);
-                self.current = path;
-                self.error = None;
-            }
-            Err(e) => self.error = Some(format!("{path}: {e}")),
         }
     }
 }
@@ -249,7 +397,7 @@ impl ApplicationHandler for App {
             .expect("create surface");
 
         let caps = surface.get_capabilities(&gpu.adapter);
-        // Prefer an sRGB target so the sRGB textures land on screen correctly.
+        // Prefer an sRGB target so sRGB textures land on screen correctly.
         let format = caps
             .formats
             .iter()
@@ -287,20 +435,42 @@ impl ApplicationHandler for App {
         );
 
         let blitter = Blitter::new(&gpu, format);
+        let mut meshes = MeshRenderer::new(&gpu, format);
+        let depth = DepthBuffer::new(&gpu, config.width, config.height);
+
+        let scene = match build_scene(&gpu, &mut self.chain, &self.args) {
+            Ok(scene) => Some(scene),
+            Err(e) => {
+                self.error = Some(format!("{e:#}"));
+                tracing::error!("{e:#}");
+                None
+            }
+        };
+        if let Some(scene) = &scene {
+            self.camera = initial_camera(scene, &self.args);
+            if let Scene::Model(m) = scene {
+                meshes.prepare(&gpu, m.draws.iter().map(|d| d.state));
+            }
+        }
+        let material_binds = scene
+            .as_ref()
+            .map(|s| material_bind_groups(&gpu, &meshes, s))
+            .unwrap_or_default();
+
         self.renderer = Some(Renderer {
             gpu,
             surface,
             config,
+            depth,
             blitter,
+            meshes,
+            material_binds,
             egui_ctx,
             egui_state,
             egui_renderer,
-            texture: None,
+            scene,
         });
         self.window = Some(window);
-
-        let initial = self.current.clone();
-        self.select(initial);
     }
 
     fn window_event(
@@ -312,8 +482,6 @@ impl ApplicationHandler for App {
         let (Some(window), Some(r)) = (self.window.clone(), self.renderer.as_mut()) else {
             return;
         };
-
-        // egui gets first refusal on input so the picker is usable.
         if r.egui_state.on_window_event(&window, &event).consumed {
             window.request_redraw();
             return;
@@ -325,7 +493,36 @@ impl ApplicationHandler for App {
                 r.config.width = size.width.max(1);
                 r.config.height = size.height.max(1);
                 r.surface.configure(&r.gpu.device, &r.config);
+                r.depth.resize(&r.gpu, r.config.width, r.config.height);
                 window.request_redraw();
+            }
+            WindowEvent::MouseInput { state, button, .. } if button == MouseButton::Left => {
+                self.dragging = state == ElementState::Pressed;
+                if !self.dragging {
+                    self.last_cursor = None;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let now = (position.x, position.y);
+                if self.dragging {
+                    if let Some(prev) = self.last_cursor {
+                        // Roughly half a turn across the window, which reads as
+                        // direct manipulation rather than a flick.
+                        const SPEED: f32 = 0.008;
+                        self.camera.orbit(
+                            -(now.0 - prev.0) as f32 * SPEED,
+                            (now.1 - prev.1) as f32 * SPEED,
+                        );
+                    }
+                }
+                self.last_cursor = Some(now);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let notches = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
+                };
+                self.camera.zoom(0.88f32.powf(notches));
             }
             WindowEvent::RedrawRequested => {
                 self.redraw(&window);
@@ -342,21 +539,18 @@ impl App {
         self.frame_ms = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
         self.last_frame = now;
 
-        // Build the UI first: it needs &mut self, and the renderer borrow below
-        // would otherwise conflict.
-        let (ui_output, chosen) = self.build_ui(window);
-        if let Some(path) = chosen {
-            self.select(path);
-        }
+        let ui_output = self.build_ui(window);
+        let camera = self.camera;
 
         let Some(r) = self.renderer.as_mut() else {
             return;
         };
+
         use wgpu::CurrentSurfaceTexture as Acquired;
         let frame = match r.surface.get_current_texture() {
             Acquired::Success(frame) => frame,
-            // Suboptimal still yields a usable frame; reconfiguring next time
-            // restores the fast path without dropping this one.
+            // Suboptimal still yields a usable frame; reconfiguring restores
+            // the fast path next time without dropping this one.
             Acquired::Suboptimal(frame) => {
                 r.surface.configure(&r.gpu.device, &r.config);
                 frame
@@ -366,7 +560,6 @@ impl App {
                 r.surface.configure(&r.gpu.device, &r.config);
                 return;
             }
-            // Nothing to draw into, or nothing worth drawing.
             Acquired::Timeout | Acquired::Occluded => return,
             Acquired::Validation => {
                 tracing::error!("surface validation error while acquiring a frame");
@@ -384,19 +577,22 @@ impl App {
                 label: Some("frame"),
             });
 
-        let target_size = (r.config.width, r.config.height);
-        if let Some(tex) = &r.texture {
-            r.blitter.draw(
+        let size = (r.config.width, r.config.height);
+        if let Some(scene) = &r.scene {
+            draw_scene(
                 &r.gpu,
                 &mut encoder,
                 &view,
-                target_size,
-                &tex.view,
-                (tex.width, tex.height),
+                &r.depth.view,
+                size,
+                scene,
+                &camera,
+                &r.blitter,
+                &r.meshes,
+                &r.material_binds,
             );
         }
 
-        // egui on top of the blit.
         let clipped = r
             .egui_ctx
             .tessellate(ui_output.shapes, ui_output.pixels_per_point);
@@ -408,16 +604,11 @@ impl App {
             }
         }
         let desc = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [r.config.width, r.config.height],
+            size_in_pixels: [size.0, size.1],
             pixels_per_point: ui_output.pixels_per_point,
         };
-        r.egui_renderer.update_buffers(
-            &r.gpu.device,
-            &r.gpu.queue,
-            &mut encoder,
-            &clipped,
-            &desc,
-        );
+        r.egui_renderer
+            .update_buffers(&r.gpu.device, &r.gpu.queue, &mut encoder, &clipped, &desc);
         {
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("egui"),
@@ -446,37 +637,19 @@ impl App {
         r.gpu.queue.present(frame);
     }
 
-    /// Runs one egui frame, returning its output and any newly picked texture.
-    fn build_ui(&mut self, window: &Arc<Window>) -> (egui::FullOutput, Option<String>) {
+    fn build_ui(&mut self, window: &Arc<Window>) -> egui::FullOutput {
         let Some(r) = self.renderer.as_mut() else {
-            return (egui::FullOutput::default(), None);
+            return egui::FullOutput::default();
         };
         let input = r.egui_state.take_egui_input(window);
         let ctx = r.egui_ctx.clone();
 
         let gpu_line = r.gpu.describe();
         let bc = r.gpu.supports_bc();
-        let tex_info = r.texture.as_ref().map(|t| {
-            (
-                t.width,
-                t.height,
-                format!("{:?}", t.format),
-                t.mip_levels,
-                t.compressed,
-                t.fallback_reason,
-                t.bytes_uploaded,
-            )
-        });
-
-        let mut chosen = None;
-        let mut filter = self.filter.clone();
-        let matches = self.matches.clone();
-        let (current, error, frame_ms, total) = (
-            self.current.clone(),
-            self.error.clone(),
-            self.frame_ms,
-            self.paths.len(),
-        );
+        let pipelines = r.meshes.pipeline_count();
+        let summary = r.scene.as_ref().map(describe);
+        let (error, frame_ms) = (self.error.clone(), self.frame_ms);
+        let camera = self.camera;
 
         let output = ctx.run_ui(input, |ctx| {
             egui::Window::new("open-wow")
@@ -484,64 +657,32 @@ impl App {
                 .show(ctx, |ui| {
                     ui.label(egui::RichText::new(&gpu_line).strong());
                     ui.label(format!(
-                        "BC texture compression: {}",
-                        if bc { "yes" } else { "no (CPU decode)" }
+                        "BC compression: {} | {frame_ms:.1} ms/frame | {pipelines} pipelines",
+                        if bc { "yes" } else { "no" }
                     ));
-                    ui.label(format!("{frame_ms:.1} ms/frame"));
                     ui.separator();
-
-                    ui.label(egui::RichText::new(&current).monospace());
-                    match &tex_info {
-                        Some((w, h, fmt, mips, compressed, reason, bytes)) => {
-                            ui.label(format!("{w}x{h}, {mips} mip levels"));
-                            ui.label(format!("GPU format: {fmt}"));
-                            ui.label(if *compressed {
-                                format!("uploaded compressed, {} KiB", bytes / 1024)
-                            } else {
-                                format!(
-                                    "CPU-decoded ({}), {} KiB",
-                                    reason.unwrap_or("?"),
-                                    bytes / 1024
-                                )
-                            });
-                        }
-                        None => {
-                            ui.label("no texture loaded");
-                        }
-                    }
+                    match &summary {
+                        Some(s) => ui.label(egui::RichText::new(s).monospace()),
+                        None => ui.label("nothing loaded"),
+                    };
                     if let Some(e) = &error {
                         ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
                     }
-
                     ui.separator();
-                    ui.label(format!("{total} textures in the archives"));
-                    ui.horizontal(|ui| {
-                        ui.label("filter:");
-                        ui.text_edit_singleline(&mut filter);
-                    });
-                    egui::ScrollArea::vertical()
-                        .max_height(260.0)
-                        .show(ui, |ui| {
-                            for path in &matches {
-                                if ui.selectable_label(*path == current, path).clicked() {
-                                    chosen = Some(path.clone());
-                                }
-                            }
-                            if matches.len() == 200 {
-                                ui.weak("... narrow the filter to see more");
-                            }
-                        });
+                    ui.label(format!(
+                        "camera: yaw {:.0}\u{b0}  pitch {:.0}\u{b0}  distance {:.2}",
+                        camera.yaw.to_degrees(),
+                        camera.pitch.to_degrees(),
+                        camera.distance
+                    ));
+                    ui.weak("drag to orbit, scroll to zoom");
                 });
         });
 
-        if filter != self.filter {
-            self.filter = filter;
-            self.refilter();
-        }
         if let Some(r) = self.renderer.as_mut() {
             r.egui_state
                 .handle_platform_output(window, output.platform_output.clone());
         }
-        (output, chosen)
+        output
     }
 }

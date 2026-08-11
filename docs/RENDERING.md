@@ -84,3 +84,58 @@ cargo update -p windows@<old> --precise 0.62.0
 ```
 
 This is an upstream packaging problem, not something wrong with the project.
+
+## Drawing models
+
+`MeshRenderer` caches one pipeline per distinct render state. M2 materials vary
+along three axes a pipeline cannot switch at draw time — blending, face
+culling, and whether alpha is tested — so the combination is the cache key,
+and pipelines are built on first use. A stock creature needs one or two; the
+full set is eight.
+
+Pipelines must be built *before* recording, because building takes `&mut self`
+while a render pass holds the encoder. `prepare()` pre-warms them so the pass
+can look them up immutably.
+
+Batches are sorted opaque-first so the depth buffer is populated before
+anything blends against it. Within a group the authored batch order is kept:
+M2 orders its batches deliberately.
+
+**Alpha-keyed materials are not transparent for sorting purposes.** They
+`discard` rather than blend, so they still write depth and belong in the opaque
+pass. Treating them as transparent produces sorting artefacts on hair and
+foliage for no reason.
+
+### Coordinate system
+
+WoW is **Z-up, right-handed**, with `+X` forward — the direction a model faces.
+The orbit camera uses `Vec3::Z` as up; the usual `+Y`-up assumption lays every
+model on its side, which is easy to mistake for a broken vertex layout.
+
+Projection must match wgpu's NDC: **Z in 0..1 with Y up**, the DirectX/Metal
+convention. In glam 0.33 that is `camera::rh::proj::directx::perspective`. The
+`vulkan` module is also Z 0..1 but Y *down* and would flip the image; `opengl`
+uses Z -1..1 and would clip wrongly.
+
+### Framing
+
+`Orbit::frame` fits a bounding sphere rather than the box, because the camera
+orbits and the box's silhouette changes as it does.
+
+The bounds come from the vertices actually drawn, **not** from the M2 header's
+bounding box. The header box is a culling volume that also covers animation
+extents: for `GnollMelee` it is nearly twice the diagonal of the static pose,
+which leaves the model small and off-centre in frame.
+
+### Textures a model does not name
+
+Most M2 texture slots have `kind != 0`, meaning the client supplies them.
+Creature skins are types 11 to 13, filled from
+`CreatureDisplayInfo.texture_variation_*`. The variation is a bare name and the
+directory comes from the **model's** path, never from the DBC:
+`ShadowHideGnollFighterSkin` in `Creature\GnollMelee\GnollMelee.m2` resolves to
+`Creature\GnollMelee\ShadowHideGnollFighterSkin.blp`.
+
+Unresolved slots fall back to a 1x1 white texture so the geometry still renders
+as shaded shape rather than failing to draw, and the overlay lists what was
+missing.

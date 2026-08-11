@@ -917,6 +917,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.33.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360bd2cd76e0cd9032d42cf2922155cecea2685b0cfa4630c3246df030bcfd6"
+
+[[package]]
 name = "glifo"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2210,6 +2216,7 @@ version = "0.0.1"
 dependencies = [
  "blp",
  "bytemuck",
+ "glam",
  "mpq",
  "pollster",
  "thiserror 2.0.20",
@@ -3678,9 +3685,12 @@ dependencies = [
  "anyhow",
  "blp",
  "clap",
+ "dbc",
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "glam",
+ "m2",
  "mpq",
  "png 0.17.16",
  "pollster",

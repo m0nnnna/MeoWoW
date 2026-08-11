@@ -5,10 +5,14 @@
 //! screenshot rendering and GPU tests possible in CI.
 
 pub mod blit;
+pub mod camera;
 pub mod capture;
+pub mod mesh;
 pub mod texture;
 
 pub use blit::Blitter;
+pub use camera::Orbit;
+pub use mesh::{GpuMesh, MeshRenderer, MeshVertex};
 pub use texture::UploadedTexture;
 
 #[derive(Debug, thiserror::Error)]
