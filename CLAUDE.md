@@ -12,24 +12,31 @@ streams. Phase 3 has started.
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation), WMO, ADT/WDT — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
-| Protocol | **3.1–3.4 done**, all confirmed against a live realm including one client watching another move. 3.5 replication: the viewer now draws it too — creatures and other players appear where the server currently says they are — but they jump rather than walk, since animation and path interpolation are still deferred |
+| Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated creatures and players slide along their actual path, turn to face it, and play the model's own walk/stand cycles |
 | Game + UI | Not started. The largest remaining chunk. |
 
 Roughly 50% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
 
-**The two halves have met, the viewer drives movement, and it draws what the
-protocol replicates.** `wow-viewer --realm-host <host> --user <account>
+**The two halves have met, the viewer drives movement, and it draws the
+replicated world moving.** `wow-viewer --realm-host <host> --user <account>
 --character <name>` logs in, enters the world, and streams the map the server
 chose around the position it reported. Holding W/S walks the character forward
 or backward and A/D turns it, each sent as a real `MSG_MOVE_*` stream
 (`MoveStartForward`/`MoveHeartbeat`/`MoveStop`), and the camera follows behind
 rather than flying freely. `LiveWorld` keeps a `world::WorldState` alongside
 the connection and folds every drained packet into it, so creatures and other
-players move on screen instead of standing wherever they were at login —
-verified with two clients, one walking while the other, running the real
-viewer, drew it happen. `wow-cli world --enter X --walk 20` remains the
-CLI-driven equivalent, useful when no window is available.
+players slide along their actual path instead of jumping between snapshots or
+standing wherever they were at login — turning to face the way they're moving,
+playing the model's own walk cycle in motion and its stand cycle at rest, all
+re-evaluated every frame. Verified with two clients, one walking while the
+other, running the real viewer, drew it happen; four real bugs in that
+drawing path (an animation that never went idle, a whole species animating
+because one instance of it moved, entities facing a constant wrong direction,
+motion that stuttered once animation ran faster than position updates) were
+only found by watching it live — see `docs/ROADMAP.md`'s 3.5 section.
+`wow-cli world --enter X --walk 20` remains the CLI-driven equivalent, useful
+when no window is available.
 
 ## Orientation
 

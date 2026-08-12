@@ -286,6 +286,7 @@ fn build_live_scene(
                     position: entity.position,
                     orientation: entity.orientation,
                     scale: entity.scale,
+                    moving: entity.moving,
                 })
                 .collect();
         let undrawable = world.set_entities(gpu, meshes, chain, &placements);
@@ -384,16 +385,6 @@ const LIVE_WALK_SPEED: f32 = 7.0;
 /// reference client -- see the facing note in `docs/RENDERING.md` -- but close
 /// enough that the character does not spin wildly or crawl.
 const LIVE_TURN_RATE: f32 = std::f32::consts::PI;
-
-/// How often the replicated world's instance buffers are rebuilt for drawing.
-///
-/// A timer, not a rebuild-on-`WorldState::stats()`-change: in a populated zone
-/// stats change on almost every packet -- the docs' own replication test saw
-/// hundreds of monster moves in a couple of minutes -- so gating on "did the
-/// count change" would rebuild about as often as no gate at all. A fixed
-/// interval is what actually bounds the cost, and a few times a second is
-/// plenty for creatures that are not being animated or interpolated anyway.
-const LIVE_ENTITY_REBUILD_EVERY: Duration = Duration::from_millis(200);
 
 /// Which movement keys are currently held.
 #[derive(Default, Clone, Copy)]
@@ -845,15 +836,20 @@ fn draw_streaming(
         }
     }
 
-    // Placed geometry is rigid, but the mesh pipeline always expects a bone
-    // palette; identity leaves it untouched.
-    if let Some(bones) = bones {
-        pass.set_bind_group(2, &bones.bind_group, &[]);
-    }
     // The map's own geometry and the server's objects draw identically; only
-    // where the transforms came from differs.
+    // where the transforms came from, and which bone buffer they bind,
+    // differs. Everything is rigid except a replicated entity group with an
+    // animation to play -- see `world::Group::animation` -- so bind group 2
+    // is chosen fresh per group instead of once for the whole pass.
     for group in world.tiles().flat_map(|t| t.groups.iter()).chain(world.entities()) {
         {
+            let group_bones = group
+                .animation
+                .and_then(|key| world.entity_bone_buffer(key))
+                .or(bones);
+            if let Some(group_bones) = group_bones {
+                pass.set_bind_group(2, &group_bones.bind_group, &[]);
+            }
             pass.set_vertex_buffer(0, group.model.mesh.vertices.slice(..));
             pass.set_vertex_buffer(1, group.instances.buffer.slice(..));
             pass.set_index_buffer(
@@ -1239,9 +1235,9 @@ struct App {
     live_move: Option<LiveMove>,
     last_heartbeat: Instant,
     last_ping: Instant,
-    last_entity_rebuild: Instant,
-    /// The `undrawable` count last logged, so the rebuild timer warns once
-    /// per change instead of every tick for the rest of the session.
+    /// The `undrawable` count last logged, so entity rebuilding (which now
+    /// runs every frame) warns once per change instead of every frame for the
+    /// rest of the session.
     last_undrawable_warned: usize,
 }
 
@@ -1267,7 +1263,6 @@ impl App {
             live_move: None,
             last_heartbeat: Instant::now(),
             last_ping: Instant::now(),
-            last_entity_rebuild: Instant::now(),
             last_undrawable_warned: 0,
         }
     }
@@ -1344,12 +1339,11 @@ impl ApplicationHandler for App {
         ) {
             Ok((scene, live)) => {
                 if live.is_some() {
-                    // Start the movement, keepalive and rebuild clocks from
-                    // the moment the connection is actually ready to drive,
-                    // not from whenever the window happened to be created.
+                    // Start the movement and keepalive clocks from the moment
+                    // the connection is actually ready to drive, not from
+                    // whenever the window happened to be created.
                     self.last_heartbeat = Instant::now();
                     self.last_ping = Instant::now();
-                    self.last_entity_rebuild = Instant::now();
                     self.last_undrawable_warned = 0;
                 }
                 self.live = live;
@@ -1545,42 +1539,47 @@ impl App {
                 &mut self.chain,
                 eye,
             );
+            // Every frame, not throttled: see `World::update_animations` for
+            // why animation and instance-position rebuilding run on different
+            // clocks.
+            world.update_animations(&r.gpu, &r.meshes);
 
-            // Rebuilding every instance buffer every frame is wasteful, so
-            // this is throttled by a timer rather than running unconditionally
-            // -- see `LIVE_ENTITY_REBUILD_EVERY` for why a timer was chosen
-            // over gating on `WorldState::stats()` changing.
+            // Also every frame, despite rebuilding every instance buffer.
+            // This was originally throttled (see git history for
+            // `LIVE_ENTITY_REBUILD_EVERY`) on the reasoning that rebuilding
+            // is wasteful -- true, but untested against what it actually
+            // costs at the entity counts this project deals with (tens to
+            // one or two hundred). What the throttle actually did, watched
+            // live, was decouple position from the now-every-frame animation:
+            // legs mid-stride while the body itself only advanced ten times a
+            // second reads as a stutter, not as a frame-rate problem. If a
+            // much larger population ever makes this measurably expensive,
+            // that is the moment to reintroduce a budget -- ideally one that
+            // updates existing instances' transforms in place rather than
+            // reallocating every buffer, rather than reaching for the same
+            // timer again.
             if self.args.entities {
                 if let Some(live) = &self.live {
-                    if self.last_entity_rebuild.elapsed() >= LIVE_ENTITY_REBUILD_EVERY {
-                        let placements: Vec<crate::world::EntityPlacement> =
-                            live::drawable_entities(&live.state, live.guid)
-                                .iter()
-                                .map(|entity| crate::world::EntityPlacement {
-                                    display_id: entity.display_id,
-                                    position: entity.position,
-                                    orientation: entity.orientation,
-                                    scale: entity.scale,
-                                })
-                                .collect();
-                        let undrawable = world.set_entities(
-                            &r.gpu,
-                            &mut r.meshes,
-                            &mut self.chain,
-                            &placements,
-                        );
-                        // Warn on change, not on every rebuild: this timer
-                        // fires several times a second for the life of the
-                        // session, and a zone with one unloadable model would
-                        // otherwise log about it forever.
-                        if undrawable > 0 && undrawable != self.last_undrawable_warned {
-                            tracing::warn!(
-                                "{undrawable} replicated object(s) had no loadable model"
-                            );
-                        }
-                        self.last_undrawable_warned = undrawable;
-                        self.last_entity_rebuild = Instant::now();
+                    let placements: Vec<crate::world::EntityPlacement> =
+                        live::drawable_entities(&live.state, live.guid)
+                            .iter()
+                            .map(|entity| crate::world::EntityPlacement {
+                                display_id: entity.display_id,
+                                position: entity.position,
+                                orientation: entity.orientation,
+                                scale: entity.scale,
+                                moving: entity.moving,
+                            })
+                            .collect();
+                    let undrawable =
+                        world.set_entities(&r.gpu, &mut r.meshes, &mut self.chain, &placements);
+                    // Warn on change, not on every rebuild: this now runs
+                    // every frame, and a zone with one unloadable model would
+                    // otherwise log about it forever.
+                    if undrawable > 0 && undrawable != self.last_undrawable_warned {
+                        tracing::warn!("{undrawable} replicated object(s) had no loadable model");
                     }
+                    self.last_undrawable_warned = undrawable;
                 }
             }
         }

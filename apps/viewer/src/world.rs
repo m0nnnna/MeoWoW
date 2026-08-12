@@ -16,10 +16,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::time::Instant;
 
 use glam::{Mat4, Vec3};
 use mpq::Chain;
-use render::mesh::{Instance, InstanceBuffer, MeshRenderer};
+use render::mesh::{BoneBuffer, Instance, InstanceBuffer, MeshRenderer};
 use render::{Gpu, TerrainRenderer, UploadedTexture};
 
 use crate::model::Draw;
@@ -40,6 +41,12 @@ pub struct CachedModel {
     pub mesh: render::mesh::GpuMesh,
     pub draws: Vec<Draw>,
     pub binds: Vec<wgpu::BindGroup>,
+    /// Populated whenever the loader has them (every M2, not a WMO), even
+    /// though only replicated entities currently animate. Doodads and
+    /// buildings are always drawn in the bind pose regardless, so carrying
+    /// this costs them nothing and keeps one loader path instead of two.
+    pub bones: Vec<m2::AnimatedBone>,
+    pub sequences: Vec<m2::Sequence>,
     /// Held because the bind groups reference their views.
     #[allow(dead_code)]
     textures: Vec<UploadedTexture>,
@@ -50,6 +57,17 @@ pub struct Group {
     pub model: Rc<CachedModel>,
     pub instances: InstanceBuffer,
     pub count: u32,
+    /// Set only for a replicated-entity group: display id plus whether this
+    /// is the group's moving bucket (walk cycle) or standing bucket (stand
+    /// cycle), used to look up its own animated bone buffer instead of
+    /// drawing with the scene's shared bind pose. The bucket has to be part
+    /// of the key, not just the display id -- a species with both moving and
+    /// standing instances needs two different poses live at once, and a
+    /// display-id-only key would have the later of the two overwrite the
+    /// other's buffer every rebuild. `None` for every tile-owned group
+    /// (doodads and buildings never animate) and when the model has no
+    /// matching sequence to play.
+    pub animation: Option<(u32, bool)>,
 }
 
 pub struct Tile {
@@ -76,6 +94,10 @@ pub struct EntityPlacement {
     /// Heading in radians, as the server reports it.
     pub orientation: f32,
     pub scale: f32,
+    /// Whether a monster move is in flight for this specific instance. Drives
+    /// whether its display id's group is drawn with a walk cycle -- see
+    /// `Group::animated_display_id`.
+    pub moving: bool,
 }
 
 pub struct World {
@@ -96,6 +118,17 @@ pub struct World {
     /// Owned by the world rather than a tile: they move, and they do not belong
     /// to the tile they happen to be standing on.
     entities: Vec<Group>,
+    /// Animated bone buffers for replicated-entity groups, keyed by
+    /// `Group::animation` and reused across rebuilds rather than reallocated:
+    /// `update_bones` rewrites a buffer's contents in place, so the GPU
+    /// buffer and its bind group only need to be created once per
+    /// (display id, moving) pair, not once per rebuild tick.
+    entity_bones: HashMap<(u32, bool), BoneBuffer>,
+    /// Origin for the animation clock. The server does not say which frame of
+    /// a walk cycle a creature is on -- nothing does, since 3.3.5a leaves that
+    /// entirely to the client -- so any fixed origin that advances is enough
+    /// to loop a sequence convincingly.
+    started: Instant,
     tiles: HashMap<(i32, i32), Tile>,
     pending: VecDeque<(i32, i32)>,
     queued: HashSet<(i32, i32)>,
@@ -134,6 +167,8 @@ impl World {
             cache: HashMap::new(),
             entity_cache: HashMap::new(),
             entities: Vec::new(),
+            entity_bones: HashMap::new(),
+            started: Instant::now(),
             tiles: HashMap::new(),
             pending: VecDeque::new(),
             queued: HashSet::new(),
@@ -329,6 +364,7 @@ impl World {
                 model,
                 instances: InstanceBuffer::upload(gpu, &raw),
                 count: raw.len() as u32,
+                animation: None,
             });
         }
 
@@ -352,16 +388,17 @@ impl World {
 
         let lower = path.to_lowercase();
         let built = if lower.ends_with(".wmo") {
+            // No skeleton to speak of, so nothing to animate.
             crate::world_object::load(gpu, chain, path, None)
-                .map(|w| (w.mesh, w.draws, w.textures))
+                .map(|w| (w.mesh, w.draws, w.textures, Vec::new(), Vec::new()))
                 .ok()
         } else {
             crate::model::load(gpu, chain, path, &crate::model::Variations::default(), 0)
-                .map(|m| (m.mesh, m.draws, m.textures))
+                .map(|m| (m.mesh, m.draws, m.textures, m.bones, m.sequences))
                 .ok()
         };
 
-        let entry = built.map(|(mesh, draws, textures)| {
+        let entry = built.map(|(mesh, draws, textures, bones, sequences)| {
             let binds = textures
                 .iter()
                 .map(|t| meshes.material_bind_group(gpu, &t.view))
@@ -370,6 +407,8 @@ impl World {
                 mesh,
                 draws,
                 binds,
+                bones,
+                sequences,
                 textures,
             })
         });
@@ -394,6 +433,16 @@ impl World {
     /// Returns how many could not be drawn, which is worth surfacing: a world
     /// missing half its creatures because their models failed to load looks
     /// exactly like a world where the protocol never reported them.
+    ///
+    /// A display id splits into up to two groups -- moving and standing --
+    /// rather than one, because several instances routinely share a display
+    /// id (a zone's wolves, say) and animating or not animating *all* of them
+    /// together is wrong either way: seen live, it read as "every creature
+    /// plays a walk cycle forever," because in a populated zone there is
+    /// almost always at least one instance of a given species moving at any
+    /// moment. The split costs nothing extra worth avoiding: the model is
+    /// already cached by display id in `entity_cache`, so the second lookup
+    /// for the same display id is a clone of the same `Rc`, not a reload.
     pub fn set_entities(
         &mut self,
         gpu: &Gpu,
@@ -401,29 +450,38 @@ impl World {
         chain: &mut Chain,
         placements: &[EntityPlacement],
     ) -> usize {
-        use std::f32::consts::FRAC_PI_2;
-
-        let mut grouped: HashMap<u32, Vec<Mat4>> = HashMap::new();
+        let mut grouped: HashMap<(u32, bool), Vec<Mat4>> = HashMap::new();
         for placement in placements {
             grouped
-                .entry(placement.display_id)
+                .entry((placement.display_id, placement.moving))
                 .or_default()
                 .push(Mat4::from_scale_rotation_translation(
                     Vec3::splat(placement.scale),
-                    // The quarter-turn matches the doodad path, which is known
-                    // to orient these same models correctly: the offset is a
-                    // property of where an M2's forward axis points, not of
-                    // where the angle came from. Position is what this milestone
-                    // is really asserting; facing is inferred from that
-                    // consistency rather than checked against a reference.
-                    glam::Quat::from_rotation_z(placement.orientation - FRAC_PI_2),
+                    // No quarter-turn here, unlike the doodad path: that
+                    // offset corrects for ADT placement rotations being
+                    // measured from a different axis than an M2's forward
+                    // (see `docs/RENDERING.md`, "Placement coordinates"), a
+                    // fact about *that* data source, not about M2 models in
+                    // general. Network orientation is a different value with
+                    // a different, already-consistent convention: direction
+                    // of travel is `(orientation.cos(), orientation.sin())`
+                    // everywhere else in this codebase (`Connection::walk`,
+                    // `drive_live_movement`, `interpolated_position`), and an
+                    // M2's forward is +X, so rotating by the raw angle already
+                    // points +X at that direction with nothing to correct.
+                    // The quarter-turn was carried over from the doodad
+                    // formula without being re-derived for this different
+                    // input, and facing was never checked against a live
+                    // reference to catch it -- see the same doc section.
+                    glam::Quat::from_rotation_z(placement.orientation),
                     placement.position,
                 ));
         }
 
         let mut built = Vec::new();
         let mut undrawable = 0;
-        for (display_id, transforms) in grouped {
+        let mut wanted_bones: HashSet<(u32, bool)> = HashSet::new();
+        for ((display_id, moving), transforms) in grouped {
             let Some(model) = self.entity_model(gpu, meshes, chain, display_id) else {
                 undrawable += transforms.len();
                 continue;
@@ -433,16 +491,74 @@ impl World {
                 .iter()
                 .map(|t| Instance::from_cols_array_2d(t.to_cols_array_2d()))
                 .collect();
+
+            // Walking while moving, standing while not -- not every model has
+            // both, or either. Only the buffer is created here; `update_animations`
+            // writes the pose every frame rather than only on this rebuild, so
+            // neither cycle visibly stutters at the rebuild rate.
+            let sequence_id = if moving { WALK_ANIMATION_ID } else { STAND_ANIMATION_ID };
+            let has_sequence = model.sequences.iter().any(|s| s.id == sequence_id);
+            let animation = has_sequence.then(|| {
+                self.entity_bones
+                    .entry((display_id, moving))
+                    .or_insert_with(|| meshes.create_bones(gpu, model.bones.len().max(1)));
+                (display_id, moving)
+            });
+            if let Some(key) = animation {
+                wanted_bones.insert(key);
+            }
+
             built.push(Group {
                 model,
                 instances: InstanceBuffer::upload(gpu, &raw),
                 count: raw.len() as u32,
+                animation,
             });
         }
+        // Drop bone buffers for creatures that changed bucket or left view,
+        // rather than growing this cache for the life of the session.
+        self.entity_bones.retain(|key, _| wanted_bones.contains(key));
 
         self.entities = built;
         self.refresh_stats();
         undrawable
+    }
+
+    /// Re-evaluates every currently-animated group's pose against the clock.
+    ///
+    /// Deliberately not folded into `set_entities` and not gated by the same
+    /// rebuild that repositions entities: rewriting a bone buffer's contents
+    /// is one `write_buffer` per animated model, cheap enough to do every
+    /// frame. Tying animation to the coarser rebuild made a walk cycle
+    /// visibly stutter -- noticed by actually watching it live, not
+    /// predicted -- since it only ever advanced a few times a second instead
+    /// of once per frame.
+    pub fn update_animations(&self, gpu: &Gpu, meshes: &MeshRenderer) {
+        for group in &self.entities {
+            let Some((display_id, moving)) = group.animation else {
+                continue;
+            };
+            let sequence_id = if moving { WALK_ANIMATION_ID } else { STAND_ANIMATION_ID };
+            let (Some(sequence), Some(bones)) = (
+                group.model.sequences.iter().position(|s| s.id == sequence_id),
+                self.entity_bones.get(&(display_id, moving)),
+            ) else {
+                continue;
+            };
+            let duration = group.model.sequences[sequence].duration_ms.max(1);
+            let time_ms = (self.started.elapsed().as_millis() as u32) % duration;
+            let pose: Vec<[[f32; 4]; 4]> = m2::Model::pose_bones(&group.model.bones, sequence, time_ms)
+                .iter()
+                .map(|m| m.to_cols_array_2d())
+                .collect();
+            meshes.update_bones(gpu, bones, &pose);
+        }
+    }
+
+    /// The animated bone buffer for a `Group::animation` key, if `set_entities`
+    /// gave it one this rebuild.
+    pub fn entity_bone_buffer(&self, key: (u32, bool)) -> Option<&BoneBuffer> {
+        self.entity_bones.get(&key)
     }
 
     /// Loads a creature model by display id, with the skins that id selects.
@@ -471,6 +587,8 @@ impl World {
                     mesh: loaded.mesh,
                     draws: loaded.draws,
                     binds,
+                    bones: loaded.bones,
+                    sequences: loaded.sequences,
                     textures: loaded.textures,
                 })
             })
@@ -481,6 +599,13 @@ impl World {
         entry
     }
 }
+
+/// `AnimationData.dbc` rows for the walk and stand cycles -- public spec
+/// (documented on wowdev.wiki as part of the client's own animation-id
+/// table), not derived from any server implementation. Every 3.3.5a model's
+/// sequences use the same ids for the same actions.
+const WALK_ANIMATION_ID: u16 = 4;
+const STAND_ANIMATION_ID: u16 = 0;
 
 #[cfg(test)]
 mod tests {

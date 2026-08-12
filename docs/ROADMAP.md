@@ -56,7 +56,7 @@ Target is a stock TrinityCore or MaNGOS 3.3.5a server.
 | 3.2 | **World handshake** ✅ | RC4 header crypt, `SMSG_AUTH_CHALLENGE` → character list; `wow-cli world <host>` |
 | 3.3 | **Enter world** ✅ | Login to a character, parse the initial object update; `wow-cli world --enter <name>` |
 | 3.4 | **Movement** ✅ | Move, and be seen moving by a second client; `wow-cli world --enter <name> --walk <n>`, or W/S/A/D in the viewer |
-| 3.5 | **Entity replication** ◐ | Live world state, and the viewer draws it: creatures and other players appear where the server currently says they are, updating a few times a second as `WorldState` changes. What is left is *animating* — no skeletal animation and no interpolation along a move's path, so a replicated entity jumps between positions rather than walking between them |
+| 3.5 | **Entity replication** ✅ | Live world state, and the viewer draws it: creatures and other players walk and turn to face the way they're actually moving, interpolated along each `SMSG_MONSTER_MOVE` path and animated with the model's own walk/stand cycles, updated every frame |
 
 3.2 was expected to be the single hardest protocol step, and the header cipher
 was indeed unforgiving — but not in the way budgeted for. The cipher itself
@@ -132,13 +132,51 @@ timer rather than once at login. Verified with the same two-client rig used to
 close 3.4 — one client walked while the other, running the actual `wow-viewer`
 binary, drew it moving.
 
-It stays at ◐ because the milestone says *visible and animating*, and only the
-first half is done. What a replicated entity does today is jump between
-positions a few times a second, not walk between them: there is no skeletal
-animation, and no interpolation along a `SMSG_MONSTER_MOVE`'s path over its
-stated duration. Both are deliberately deferred — getting entities into the
-right *place* was the task, and the milestone can wait for the walk cycle
-without inflating it into a general movement-prediction system.
+### 3.5 closes: interpolation, animation, and four bugs only live testing found
+
+Getting a replicated entity from "jumps between positions" to "visibly and
+animating" needed two pieces: `Entity::interpolated_position` lerps between a
+monster move's `position` and `destination` over `move_duration`, keyed off
+when the move was received (`move_started`); `World::update_animations` plays
+the model's own walk or stand sequence, chosen by `AnimationData.dbc` id and
+sampled every frame from a free-running clock.
+
+None of the four bugs below showed up in a headless run or in `cargo test` —
+a healthy live session never sends malformed input, and a screenshot cannot
+show whether something *moves* smoothly. All four were found by literally
+watching the window while a second client walked:
+
+- **A creature that had ever moved never stopped "moving."** `destination`
+  stays set to a move's endpoint until a fresher update replaces it, which for
+  a creature at rest might be a long time — so gating the walk animation on
+  `destination.is_some()` played it forever, with no idle state, for anything
+  that had made even one move. `Entity::is_moving` checks whether the move's
+  *duration* has actually elapsed instead.
+- **A whole species animated if any one instance of it was moving.** Grouping
+  and animating by display id alone means a zone with several wolves — almost
+  always at least one of them wandering — showed every wolf, including the
+  standing ones, playing the walk cycle continuously. Splitting each display
+  id into a moving bucket and a standing bucket, each with its own instance
+  buffer and its own bone buffer, fixed it; the model is already cached by
+  display id, so drawing two buckets of one species costs a second cache hit,
+  not a second load.
+- **Entities faced one direction regardless of which way they walked.** The
+  entity placement formula carried the doodad path's quarter-turn offset,
+  which corrects for ADT rotations being measured from a different axis than
+  an M2's forward — a fact about *that* data source. Network orientation
+  already uses this codebase's own `(cos θ, sin θ)` convention directly
+  against an M2's own +X-forward axis, so it needs no correction at all.
+  `docs/RENDERING.md` had flagged entity facing as never checked against a
+  reference client; it hadn't been, and the copied offset was wrong.
+- **Motion looked stuttery, not merely coarse.** Position was rebuilt on a
+  100ms timer while animation, once decoupled from it, ran every frame: legs
+  mid-stride over a body that only advanced ten times a second reads as
+  jankiness, not as a frame-rate problem. The timer existed to bound a
+  rebuild cost that had never actually been measured against this project's
+  entity counts (tens to a couple hundred); once removed, `set_entities` runs
+  every frame too, and the stutter was gone. If a much larger population ever
+  makes that measurably expensive, the fix is an in-place transform update,
+  not the same timer again.
 
 This milestone also changed what "careful" means. Every earlier parser was
 memoryless, so a mistake produced one wrong answer and vanished. Replicated

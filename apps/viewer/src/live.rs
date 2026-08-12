@@ -24,11 +24,18 @@ pub struct Entity {
     pub guid: u64,
     /// `CreatureDisplayInfo` id, which is what selects a model and its skins.
     pub display_id: u32,
+    /// Interpolated along a monster move's path if one is in flight -- see
+    /// `world::state::Entity::interpolated_position` -- not the raw
+    /// last-reported position, which only ever holds a path's start.
     pub position: Vec3,
     pub orientation: f32,
     pub scale: f32,
     pub kind: world::ObjectType,
     pub level: Option<u32>,
+    /// Whether a monster move is currently in flight for this entity, which
+    /// is what the renderer uses to decide whether to animate a walk cycle
+    /// rather than draw the bind pose.
+    pub moving: bool,
 }
 
 /// Where the player is and what can be seen from there.
@@ -174,6 +181,7 @@ pub fn replicate(state: &mut world::WorldState, packets: &[world::client::Packet
 pub fn drawable_entities(state: &world::WorldState, own_guid: u64) -> Vec<Entity> {
     use world::update;
 
+    let now = std::time::Instant::now();
     let mut entities = Vec::new();
     for entity in state.iter() {
         // The player's own body is where the camera is; drawing it would
@@ -181,7 +189,10 @@ pub fn drawable_entities(state: &world::WorldState, own_guid: u64) -> Vec<Entity
         if entity.guid == own_guid {
             continue;
         }
-        let Some(position) = entity.position else {
+        // Interpolated, not the raw last-reported position: a monster move
+        // only ever reports a path's start and end, and drawing the start for
+        // the whole duration is exactly the jump this exists to remove.
+        let Some(position) = entity.interpolated_position(now) else {
             continue;
         };
         // Only units and players carry a display id. Game objects are
@@ -207,6 +218,7 @@ pub fn drawable_entities(state: &world::WorldState, own_guid: u64) -> Vec<Entity
                 .unwrap_or(1.0),
             kind: entity.object_type,
             level: entity.level(),
+            moving: entity.is_moving(now),
         });
     }
     entities

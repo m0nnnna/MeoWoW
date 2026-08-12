@@ -374,8 +374,8 @@ expected until height-following exists.
 
 ### Drawing the replicated world
 
-`LiveWorld` now carries a `world::WorldState` alongside the connection instead
-of the one-shot `Vec<Entity>` the login burst used to produce. Every batch
+`LiveWorld` carries a `world::WorldState` alongside the connection instead of
+the one-shot `Vec<Entity>` the login burst used to produce. Every batch
 `pump_live_connection` drains is folded into it with `WorldState::replicate`:
 object updates, relayed movement, monster moves and destroys all have to be
 handled in the same place, because a caller that folded only object updates
@@ -392,29 +392,66 @@ cares about; `wow-cli` calls the same method for the fuller `Replication`
 report it prints.
 
 `live::drawable_entities` turns that state into what the renderer needs --
-guid, display id, position, orientation, scale, excluding the character's own
-body -- read fresh from `state` each time it is called rather than cached,
-since the state changes on every fold.
+guid, display id, an interpolated position and facing, scale, whether a move
+is currently in flight, excluding the character's own body -- read fresh from
+`state` each time it is called rather than cached, since the state changes on
+every fold.
 
-**Rebuilding is throttled by a timer, not by whether `WorldState::stats()`
-changed.** `LIVE_ENTITY_REBUILD_EVERY` gates the instance-buffer rebuild to a
-few times a second. Stats looked like the more precise trigger -- only rebuild
-when something actually happened -- but in a populated zone something happens
-on nearly every packet: the protocol doc's own two-client session saw hundreds
-of monster moves in a couple of minutes. Gating on that would rebuild about as
-often as no gate at all, which defeats the point. A fixed interval is what
-actually bounds the cost, and creatures that are not being animated or
-interpolated do not need updating faster than that anyway.
+**Position is interpolated, not snapped.** `SMSG_MONSTER_MOVE` only ever
+reports a path's start, its end, and how long the whole thing takes.
+`Entity::interpolated_position` lerps between them against wall-clock elapsed
+time since the move was received (`move_started`), clamped to the endpoints,
+with facing derived from the direction of travel rather than either endpoint's
+orientation -- the wire never reports one. `Entity::is_moving` answers a
+related but distinct question, whether that move's *duration* has actually
+elapsed: `destination` alone stays set to the last move's endpoint long after
+it arrives, so checking only that reported a creature "moving" forever after
+its first move ever, with no idle state.
 
-**A replicated entity jumps rather than walks.** With no interpolation along a
-monster move's path and no skeletal animation driven by movement, an entity's
-on-screen position simply teleports to wherever the rebuild timer last read
-from `WorldState`. This is expected, not a bug -- see the deferred half of
-milestone 3.5 in `docs/ROADMAP.md`.
+**Both are re-evaluated every frame, not on a timer.** An earlier version
+throttled the whole rebuild -- repositioning *and* animating -- to a few times
+a second, reasoning that rebuilding every instance buffer every frame was too
+costly to justify. That cost was never actually measured against this
+project's entity counts (tens to a couple hundred), and what the throttle
+produced, watched live, was a stutter: legs mid-stride from a walk cycle
+sampled every frame, over a body that only advanced ten times a second. If a
+much larger population ever makes `set_entities` measurably expensive, the fix
+is updating existing instances' transforms in place rather than reallocating
+every buffer -- not reintroducing the same timer.
+
+**Animation is per-(display id, moving) bucket, not per display id.** Several
+instances routinely share one display id -- a zone's wolves, say -- and in a
+populated zone at least one of a given species is almost always moving.
+Animating or not animating a whole display id together is wrong either way:
+gate on "any instance moving" and every standing wolf plays the walk cycle
+forever; gate on "all instances moving" and a genuinely moving one stands
+rigid. `set_entities` splits each display id into up to two groups -- a moving
+bucket playing the model's walk sequence, a standing bucket playing its stand
+sequence -- each with its own instance buffer and its own bone buffer, keyed
+by `(display id, moving)`. The split is nearly free: the model itself is still
+cached by display id alone in `entity_cache`, so drawing a second bucket for
+one species is a clone of the same `Rc`, not a second load. Sequence ids (4 for
+walk, 0 for stand) come from `AnimationData.dbc`'s public row layout, the same
+convention for every 3.3.5a model.
+
+**Facing needed no offset at all.** The entity placement formula originally
+carried the doodad path's quarter-turn correction, which exists because ADT
+placement rotations are measured from a different axis than an M2's forward
+(see "Placement coordinates" above) -- a fact about *that* data source.
+Network orientation already matches this codebase's own convention directly:
+direction of travel is `(orientation.cos(), orientation.sin())` everywhere
+movement is computed, against an M2's own +X-forward axis, so rotating
+entities by the raw angle already points them the right way. The offset was
+carried over from the doodad formula without being re-derived for a different
+input, and stayed wrong for as long as it did because -- as this section used
+to say -- facing had never been checked against a reference client.
 
 Verified with the same two-client rig that closed 3.4: one client walked while
 the other -- running the real `wow-viewer` binary rather than a test harness --
-drew the replicated character moving.
+drew the replicated character sliding, turning to face its direction of
+travel, playing its walk cycle while moving and its stand cycle at rest, all
+at full frame rate. None of the four bugs above showed up in a headless run or
+in `cargo test` -- only in watching the window while a second client moved.
 
 ### What still looks wrong
 

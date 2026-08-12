@@ -36,6 +36,13 @@ pub struct Entity {
     pub movement: Option<MovementInfo>,
     /// Where a `SMSG_MONSTER_MOVE` says this creature is heading, if anywhere.
     pub destination: Option<Position>,
+    /// How long the move to `destination` takes, in milliseconds. `None`
+    /// exactly when `destination` is `None`.
+    pub move_duration: Option<u32>,
+    /// When this client received the move that set `destination`. Paired
+    /// with `move_duration` to interpolate between `position` and
+    /// `destination` -- see [`Entity::interpolated_position`].
+    pub move_started: Option<std::time::Instant>,
     /// How many updates of any kind have touched this object.
     pub updates: usize,
 }
@@ -55,6 +62,72 @@ impl Entity {
 
     pub fn is_player(&self) -> bool {
         self.object_type == ObjectType::Player
+    }
+
+    /// Clears any monster-move path in flight.
+    ///
+    /// Called whenever a fresher, authoritative position arrives -- a relayed
+    /// `MSG_MOVE_*`, an object update's own movement block, or a re-create.
+    /// Any of those supersedes a path predicted from an older
+    /// `SMSG_MONSTER_MOVE`; leaving the old destination in place would have
+    /// the entity interpolate toward a point the server has already moved it
+    /// away from.
+    fn clear_predicted_move(&mut self) {
+        self.destination = None;
+        self.move_duration = None;
+        self.move_started = None;
+    }
+
+    /// Where this entity actually is right now, interpolated along a monster
+    /// move's path if one is in flight, clamped to the endpoints.
+    ///
+    /// The wire only ever reports a path's start, its end, and how long the
+    /// whole thing takes -- nothing between arrives from the server, which is
+    /// why `position` alone (the path's start) makes a replicated creature
+    /// jump instead of walk. `now` is supplied by the caller rather than read
+    /// from the clock here, so the interpolation math is exercised by a fixed
+    /// input rather than a hopefully-fast-enough sleep in tests.
+    ///
+    /// Facing is derived from the direction of travel, not from either
+    /// endpoint's orientation: `SMSG_MONSTER_MOVE` never reports one, and
+    /// both `from` and `to` decode with orientation fixed at zero.
+    pub fn interpolated_position(&self, now: std::time::Instant) -> Option<Position> {
+        let (Some(start), Some(end), Some(duration), Some(started)) = (
+            self.position,
+            self.destination,
+            self.move_duration,
+            self.move_started,
+        ) else {
+            return self.position;
+        };
+        if duration == 0 {
+            return Some(end);
+        }
+        let elapsed = now.saturating_duration_since(started).as_millis() as f32;
+        let t = (elapsed / duration as f32).clamp(0.0, 1.0);
+        Some(Position {
+            x: start.x + (end.x - start.x) * t,
+            y: start.y + (end.y - start.y) * t,
+            z: start.z + (end.z - start.z) * t,
+            orientation: (end.y - start.y).atan2(end.x - start.x),
+        })
+    }
+
+    /// Whether a monster move is still in flight at `now`, as opposed to
+    /// having already arrived.
+    ///
+    /// `destination.is_some()` alone cannot answer this: it stays set to the
+    /// last move's endpoint until a fresher update arrives, which for a
+    /// creature that has stopped moving may be a long time -- checking only
+    /// that would report a creature "moving" forever after its last move
+    /// rather than for that move's actual duration, which is exactly the
+    /// "every creature plays its walk cycle standing still" bug this method
+    /// exists to let a caller avoid.
+    pub fn is_moving(&self, now: std::time::Instant) -> bool {
+        let (Some(duration), Some(started)) = (self.move_duration, self.move_started) else {
+            return false;
+        };
+        now.saturating_duration_since(started).as_millis() < duration as u128
     }
 }
 
@@ -169,6 +242,7 @@ impl WorldState {
             existing.fields.merge(fields);
             if movement.position.is_some() {
                 existing.position = movement.position;
+                existing.clear_predicted_move();
             }
             if movement.info.is_some() {
                 existing.movement = movement.info;
@@ -186,6 +260,8 @@ impl WorldState {
                 fields: fields.clone(),
                 movement: movement.info,
                 destination: None,
+                move_duration: None,
+                move_started: None,
                 updates: 1,
             },
         );
@@ -219,6 +295,7 @@ impl WorldState {
         entity.updates += 1;
         if position.is_some() {
             entity.position = position;
+            entity.clear_predicted_move();
         }
         if info.is_some() {
             entity.movement = info;
@@ -235,7 +312,11 @@ impl WorldState {
     /// The creature is placed at the path's *start*, not its end: the packet
     /// describes movement about to happen over `duration` milliseconds, and
     /// teleporting it to the destination on arrival of the packet would make
-    /// every creature in the zone jump.
+    /// every creature in the zone jump. `move_duration` and `move_started`
+    /// carry enough to interpolate between the two -- see
+    /// [`Entity::interpolated_position`] -- rather than only ever showing the
+    /// start. A stop (`move_.to` is `None`) clears them the same way a fresher
+    /// authoritative position does.
     pub fn apply_monster_move(&mut self, move_: &MonsterMove) {
         let Some(entity) = self.entities.get_mut(&move_.guid) else {
             self.stats.orphaned += 1;
@@ -245,6 +326,8 @@ impl WorldState {
         entity.updates += 1;
         entity.position = Some(move_.from);
         entity.destination = move_.to;
+        entity.move_duration = move_.to.map(|_| move_.duration);
+        entity.move_started = move_.to.map(|_| std::time::Instant::now());
     }
 
     pub fn remove(&mut self, guid: u64) -> bool {
@@ -667,5 +750,159 @@ mod tests {
 
         assert!(world.get(7).is_none(), "the valid destroy did not apply");
         assert!(world.get(8).is_some(), "the valid create did not apply");
+    }
+
+    /// The whole point of interpolation: read partway through a move, the
+    /// entity should be partway along the path, not still at its start or
+    /// already at its end.
+    ///
+    /// `now` is derived from the entity's own `move_started` rather than a
+    /// freshly captured `Instant::now()`, so the test is not racing the
+    /// `Instant::now()` call inside `apply_monster_move` -- a few
+    /// microseconds either side of that race would silently change which
+    /// instant is earlier and make this test flaky for a reason that has
+    /// nothing to do with the interpolation math being tested.
+    #[test]
+    fn interpolated_position_lerps_between_endpoints_and_faces_the_direction_of_travel() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(at(100.0, 0.0)),
+            duration: 4000,
+            stopped: false,
+        });
+
+        let entity = world.get(7).unwrap();
+        let started = entity.move_started.expect("a move with a destination must record when it started");
+
+        let halfway = entity
+            .interpolated_position(started + std::time::Duration::from_millis(2000))
+            .unwrap();
+        assert!(
+            (halfway.x - 50.0).abs() < 0.01,
+            "halfway through a 4s move along x should be near x=50, got {}",
+            halfway.x
+        );
+        assert_eq!(halfway.y, 0.0);
+        assert_eq!(
+            halfway.orientation, 0.0,
+            "travelling straight along +x should face angle 0"
+        );
+    }
+
+    /// Before a move starts and after it should have finished, the position
+    /// must clamp to the endpoints rather than extrapolate past them or sit
+    /// at zero progress forever.
+    #[test]
+    fn interpolated_position_clamps_at_both_ends() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(at(100.0, 0.0)),
+            duration: 4000,
+            stopped: false,
+        });
+
+        let entity = world.get(7).unwrap();
+        let started = entity.move_started.unwrap();
+
+        let before = entity
+            .interpolated_position(started - std::time::Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(before.x, 0.0, "must not run backwards past the start");
+
+        let after = entity
+            .interpolated_position(started + std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(after.x, 100.0, "must clamp at the destination, not overshoot");
+    }
+
+    /// An authoritative position -- here, relayed movement, but the same
+    /// applies to an object update's own movement block or a re-create --
+    /// must cancel a monster-move path in flight. Otherwise the entity
+    /// interpolates back toward a destination the server has already
+    /// contradicted, fighting the newer, truer position every frame.
+    #[test]
+    fn an_authoritative_position_clears_a_predicted_move() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(at(100.0, 0.0)),
+            duration: 4000,
+            stopped: false,
+        });
+        assert!(world.get(7).unwrap().destination.is_some());
+
+        let info = MovementInfo::standing(at(3.0, 4.0), 1);
+        world.apply_relayed_movement(7, &info);
+
+        let entity = world.get(7).unwrap();
+        assert!(
+            entity.destination.is_none(),
+            "the predicted path must not survive a fresher authoritative position"
+        );
+        assert!(entity.move_duration.is_none());
+        assert!(entity.move_started.is_none());
+        assert_eq!(
+            entity.interpolated_position(std::time::Instant::now()),
+            Some(at(3.0, 4.0)),
+            "with no path in flight, the position must be exactly what was reported"
+        );
+    }
+
+    /// The bug `is_moving` exists to prevent: `destination` alone stays set
+    /// long after a move has actually arrived, so a caller checking
+    /// `destination.is_some()` to decide whether to play a walk animation
+    /// would keep a creature walking in place forever after its one and only
+    /// move -- observed live as "every creature plays its walk cycle
+    /// standing still, and nothing ever goes idle."
+    #[test]
+    fn is_moving_is_true_only_for_the_moves_actual_duration() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(at(100.0, 0.0)),
+            duration: 4000,
+            stopped: false,
+        });
+
+        let entity = world.get(7).unwrap();
+        let started = entity.move_started.unwrap();
+
+        assert!(
+            entity.is_moving(started + std::time::Duration::from_millis(2000)),
+            "halfway through a 4s move, the creature is still moving"
+        );
+        assert!(
+            !entity.is_moving(started + std::time::Duration::from_secs(30)),
+            "long after the move should have arrived, it must not still read as moving, \
+             even though destination is still set to the old target"
+        );
+        assert!(entity.destination.is_some(), "the premise: destination outlives the move");
+    }
+
+    /// A stop (`to: None`) must read as not moving, the same as a move that
+    /// has simply finished.
+    #[test]
+    fn a_stopped_creature_is_not_moving() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: None,
+            duration: 0,
+            stopped: true,
+        });
+
+        assert!(!world.get(7).unwrap().is_moving(std::time::Instant::now()));
     }
 }
