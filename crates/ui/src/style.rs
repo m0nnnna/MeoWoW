@@ -240,6 +240,23 @@ pub struct Style {
     /// because the marker follows a creature rather than sitting at an anchor
     /// -- see [`crate::frames::marker`].
     pub show_target_marker: bool,
+
+    /// Font size of a floating damage number at spawn, before scale.
+    pub combat_text_size: f32,
+    /// How far a number travels upward over its lifetime, in points at
+    /// scale 1.0. Fading is derived from the same age, not a separate value:
+    /// one number rising and dimming together reads as one animation rather
+    /// than two that happen to overlap.
+    pub combat_text_rise: f32,
+    /// How long a number takes to rise and fade completely. A `Style` field
+    /// rather than a constant for the same reason `chat_scrollback` is: it
+    /// governs behaviour a user might want to retune, not just a colour.
+    pub combat_text_lifetime_ms: u64,
+    pub combat_text_damage: Color,
+    /// A critical hit's number, drawn larger as well as in this colour --
+    /// see [`crate::frames::combat_text::draw`].
+    pub combat_text_critical: Color,
+    pub combat_text_miss: Color,
 }
 
 impl Default for Style {
@@ -305,6 +322,13 @@ impl Default for Style {
             target_marker: Color::rgb(240, 225, 130),
             target_marker_width: 2.0,
             show_target_marker: true,
+
+            combat_text_size: 20.0,
+            combat_text_rise: 40.0,
+            combat_text_lifetime_ms: 1200,
+            combat_text_damage: Color::rgb(255, 226, 120),
+            combat_text_critical: Color::rgb(255, 110, 40),
+            combat_text_miss: Color::rgb(200, 202, 214),
         }
     }
 }
@@ -352,6 +376,9 @@ impl Style {
         self.chat_width = self.chat_width.clamp(120.0, 2000.0);
         self.chat_height = self.chat_height.clamp(40.0, 1200.0);
         self.chat_scrollback = self.chat_scrollback.clamp(10, 10_000);
+        self.combat_text_size = self.combat_text_size.clamp(6.0, 72.0);
+        self.combat_text_rise = self.combat_text_rise.clamp(0.0, 400.0);
+        self.combat_text_lifetime_ms = self.combat_text_lifetime_ms.clamp(100, 10_000);
         before != *self
     }
 }

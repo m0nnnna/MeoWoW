@@ -267,6 +267,25 @@ pub fn marker_rect(
     ))
 }
 
+/// Where a floating combat-text number starts, in screen space.
+///
+/// `marker_rect`'s same trick applied to a single point instead of a box: a
+/// damage number is spawned from one fixed world position (the victim's
+/// position when the swing landed, not tracked to the unit afterwards -- a
+/// killing blow's number must still finish rising even after the corpse it
+/// came from is gone) and re-projected fresh every frame as the camera moves.
+/// `None` behind the camera, the same reasoning `marker_rect` gives: a
+/// perspective divide would fold the point back into view and the number
+/// would jump across the screen following nothing.
+pub fn combat_text_anchor(
+    camera: &render::camera::Camera,
+    viewport: (f32, f32),
+    position: Vec3,
+) -> Option<egui::Pos2> {
+    let (x, y) = camera.project(position, viewport)?;
+    Some(egui::pos2(x, y))
+}
+
 /// What a ray selects, if anything.
 ///
 /// Nearest hit wins, so a creature standing in front of another takes the
@@ -442,6 +461,26 @@ mod tests {
         };
         let state = ::world::WorldState::new();
         assert_eq!(chat_entry(&message, &state).who.as_deref(), Some("Young Wolf"));
+    }
+
+    fn camera() -> render::camera::Camera {
+        render::camera::Camera::Fly(render::camera::Fly {
+            position: Vec3::new(-10.0, 4.0, 3.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            ..render::camera::Fly::default()
+        })
+    }
+
+    /// A point in front of the camera lands on screen; the same point pushed
+    /// behind it must not, or a killing blow's number would flash into view
+    /// mirrored the instant the camera looked away.
+    #[test]
+    fn combat_text_anchor_follows_marker_rects_own_rule_about_the_camera() {
+        let camera = camera();
+        const VIEWPORT: (f32, f32) = (1600.0, 900.0);
+        assert!(combat_text_anchor(&camera, VIEWPORT, Vec3::new(20.0, 4.0, 3.0)).is_some());
+        assert!(combat_text_anchor(&camera, VIEWPORT, Vec3::new(-40.0, 4.0, 3.0)).is_none());
     }
 
     /// The interface draws zeroes for fields that have not arrived, rather

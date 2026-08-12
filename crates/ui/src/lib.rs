@@ -35,6 +35,7 @@ use std::path::PathBuf;
 pub use edit::{EditAction, EditState};
 pub use element::{Anchor, Element};
 pub use frames::chat::{ChatEntry, ChatKind};
+pub use frames::combat_text::{CombatTextKind, FloatingText};
 pub use frames::{CastBarView, UnitView};
 pub use layout::{default_path, ElementId, Profile};
 pub use style::{Color, PowerType, Style};
@@ -64,6 +65,9 @@ pub struct HudData<'a> {
     /// against -- see [`frames::marker`]. `None` when nothing is selected or
     /// the selection is behind the camera.
     pub target_marker: Option<egui::Rect>,
+    /// Damage numbers in flight, world-anchored like the target marker rather
+    /// than placed by an [`Element`] -- see [`frames::combat_text`].
+    pub combat_text: &'a [frames::combat_text::FloatingText],
     /// The chat scrollback, oldest first. Owned and capped by the caller: this
     /// crate must not accumulate an unbounded log nobody drains.
     pub chat: &'a [frames::chat::ChatEntry],
@@ -233,6 +237,18 @@ impl Hud {
                 egui::Id::new("hud-target-marker"),
             ));
             frames::marker::draw(&painter, rect, &style);
+        }
+
+        // Also drawn straight onto a layer and never added to `occupied`, for
+        // the same reason as the target marker above: a damage number sits
+        // over a creature, and claiming that rectangle for the interface
+        // would make the creature underneath unclickable while it faded.
+        if !data.combat_text.is_empty() {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("hud-combat-text"),
+            ));
+            frames::combat_text::draw(&painter, data.combat_text, &style);
         }
 
         for id in ElementId::ALL {
@@ -724,6 +740,66 @@ mod tests {
         assert!(
             cooldown_shapes > ready_shapes,
             "the cooldown sweep painted no extra shape: {cooldown_shapes} vs {ready_shapes}"
+        );
+    }
+
+    /// A damage number is drawn straight onto a layer like the target marker,
+    /// not through an `Element` -- so this checks the same
+    /// layout-arithmetic-versus-the-screen gap `a_cooldown_darkens_the_slot`
+    /// watches for, applied to `Hud::show`'s other screen-space path: giving
+    /// it an entry has to paint something, not merely compute one.
+    #[test]
+    fn combat_text_paints_something() {
+        let entries = vec![frames::combat_text::FloatingText {
+            pos: egui::pos2(400.0, 400.0),
+            text: "6".into(),
+            kind: frames::combat_text::CombatTextKind::Damage,
+            age: 0.0,
+        }];
+        let mut hud = Hud::default();
+        let rects = painted(
+            &mut hud,
+            &HudData {
+                combat_text: &entries,
+                ..Default::default()
+            },
+        );
+        assert!(!rects.is_empty(), "a damage number painted nothing");
+    }
+
+    /// The number has to rise, not just fade: an older entry's painted shape
+    /// must sit higher on screen (a smaller `top()`) than the same entry
+    /// fresh, or the animation the style's `combat_text_rise` promises never
+    /// actually reaches the screen.
+    #[test]
+    fn an_aged_combat_number_rises() {
+        fn top_of(age: f32) -> f32 {
+            let entries = vec![frames::combat_text::FloatingText {
+                pos: egui::pos2(400.0, 400.0),
+                text: "6".into(),
+                kind: frames::combat_text::CombatTextKind::Damage,
+                age,
+            }];
+            let mut hud = Hud::default();
+            let rects = painted(
+                &mut hud,
+                &HudData {
+                    combat_text: &entries,
+                    ..Default::default()
+                },
+            );
+            rects
+                .iter()
+                .map(|r| r.top())
+                .fold(f32::MAX, f32::min)
+        }
+
+        let fresh = top_of(0.0);
+        let aged = top_of(0.6);
+        assert!(fresh < f32::MAX, "a fresh number painted nothing to measure");
+        assert!(
+            aged < fresh,
+            "an older number must sit higher on screen: {aged} vs {fresh}"
         );
     }
 

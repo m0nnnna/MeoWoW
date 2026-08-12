@@ -311,8 +311,14 @@ pub fn drawable_entities(state: &world::WorldState, own_guid: u64) -> Vec<Entity
     let now = std::time::Instant::now();
     let mut entities = Vec::new();
     for entity in state.iter() {
-        // The player's own body is where the camera is; drawing it would
-        // fill the view from inside the mesh.
+        // The player's own body is deliberately not built here. Not because
+        // it should not be drawn -- it should, and [`own_entity`] does it --
+        // but because *this* function reads replicated state, and replicated
+        // state is wrong about where we are. The server never relays our own
+        // movement back to us, so this entity's position is still wherever the
+        // character logged in, however far it has since walked. Drawing from
+        // it would leave the body standing at the login spot while the camera
+        // walked away.
         if entity.guid == own_guid {
             continue;
         }
@@ -349,6 +355,56 @@ pub fn drawable_entities(state: &world::WorldState, own_guid: u64) -> Vec<Entity
         });
     }
     entities
+}
+
+/// The player's own body, drawn from where this client believes it is.
+///
+/// Split from [`drawable_entities`] because the two have different sources of
+/// truth, and mixing them is the bug this exists to avoid. Everything about
+/// *what the body looks like* -- its model, its size -- comes from replicated
+/// state, which is authoritative for appearance and never changes. Everything
+/// about *where it is* comes from the caller's own movement simulation, which
+/// is the only thing that knows: the server does not echo our movement back,
+/// so the replicated position is frozen at login.
+///
+/// `moving` likewise comes from the keys being held rather than from
+/// `Entity::is_moving`, which reads the same replicated movement that never
+/// arrives for us. Without it the character would slide across the ground in
+/// its standing pose -- the exact bug 3.5 hit for *other* players, arriving
+/// here by a different route.
+pub fn own_entity(
+    state: &world::WorldState,
+    own_guid: u64,
+    position: Vec3,
+    orientation: f32,
+    moving: bool,
+) -> Option<Entity> {
+    use world::update;
+
+    let entity = state.get(own_guid)?;
+    let display_id = entity.display_id().filter(|id| *id != 0)?;
+    // Worth a line: a body that is not drawn and a body drawn somewhere
+    // unexpected look identical from the outside, and this says which.
+    tracing::debug!(
+        "own body: display {display_id} at {:.1}, {:.1}, {:.1} facing {orientation:.2}",
+        position.x,
+        position.y,
+        position.z
+    );
+    Some(Entity {
+        guid: own_guid,
+        display_id,
+        position,
+        orientation,
+        scale: entity
+            .fields
+            .get_f32(update::fields::OBJECT_SCALE)
+            .filter(|s| *s > 0.0)
+            .unwrap_or(1.0),
+        kind: entity.object_type,
+        level: entity.level(),
+        moving,
+    })
 }
 
 /// Resolves a map id to the folder its terrain lives in.

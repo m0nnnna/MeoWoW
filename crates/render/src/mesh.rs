@@ -419,14 +419,35 @@ impl MeshRenderer {
 
     /// Allocates a bone palette. Always at least one matrix, because a storage
     /// binding cannot be empty even when a model has no skeleton.
+    /// Creates a bone palette, filled with identities rather than left zeroed.
+    ///
+    /// **The initialisation is the point, not a nicety.** A new wgpu buffer is
+    /// zeroed, and a zero matrix multiplies every vertex to the origin -- so a
+    /// palette that is created and never posed collapses its whole model to a
+    /// point, silently, with nothing anywhere reporting an error. This project
+    /// has already lost time to exactly that shape once, when a palette sized
+    /// for one matrix made every skinned model invisible and the search went
+    /// to the protocol instead of the renderer.
+    ///
+    /// It cost time again here: `--screenshot` places replicated entities but
+    /// never calls `World::update_animations`, which is the only thing that
+    /// writes a pose, so *every* creature and player in a headless render
+    /// collapsed to the world origin. Nobody noticed because 3.5 was verified
+    /// by watching a window, where the frame loop does pose them. Identity
+    /// here turns that failure from "nothing is drawn" into "the bind pose is
+    /// drawn" -- still wrong, but wrong in a way somebody can see.
     pub fn create_bones(&self, gpu: &Gpu, count: usize) -> BoneBuffer {
+        use wgpu::util::DeviceExt;
         let count = count.max(1);
-        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bones"),
-            size: (count * std::mem::size_of::<[[f32; 4]; 4]>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let identity = glam::Mat4::IDENTITY.to_cols_array_2d();
+        let contents: Vec<[[f32; 4]; 4]> = vec![identity; count];
+        let buffer = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bones"),
+                contents: bytemuck::cast_slice(&contents),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bones"),
             layout: &self.bone_layout,

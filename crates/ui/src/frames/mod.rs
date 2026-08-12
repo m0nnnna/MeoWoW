@@ -16,6 +16,7 @@
 pub mod action_bar;
 pub mod cast_bar;
 pub mod chat;
+pub mod combat_text;
 pub mod marker;
 pub mod unit;
 

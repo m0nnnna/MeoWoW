@@ -283,7 +283,18 @@ Worth reading before debugging anything, because the same shapes keep recurring.
 - **When geometry is missing rather than wrong, suspect culling before data.**
   WMO winds counter-clockwise, M2 and terrain clockwise. Guessing from a
   neighbouring format culled a roof and looked like a hole in the mesh.
-- **Geometry drawn at zero size looks exactly like geometry never drawn.** A
+- **Geometry drawn at zero size looks exactly like geometry never drawn.**
+  This one recurred, in a second place, years of commits later. A bone palette
+  is a fresh GPU buffer, and a fresh GPU buffer is zeroed, and a zero matrix
+  multiplies every vertex to the origin -- so a palette created and never posed
+  collapses its model to a point in total silence. `--screenshot` placed every
+  replicated creature and never called `update_animations`, so a headless
+  render of a zone with ninety-five creatures in it came back as empty grass,
+  and had done since the feature was written. Nobody noticed because 3.5 was
+  verified by watching a *window*, where the frame loop does pose them. The
+  buffer now initialises to identity, so the same mistake draws a bind pose --
+  visibly wrong instead of invisibly absent. **Anything that must be written
+  before it is read should start as something you can see.** A
   bone index past the end of the palette reads zero on the GPU, collapsing the
   model to the origin with no error anywhere. Creatures were invisible while
   doodads rendered, and the obvious reading — that the entities were never

@@ -282,7 +282,7 @@ fn build_live_scene(
 
     if args.entities {
         let placements: Vec<world::EntityPlacement> =
-            live::drawable_entities(&live.state, live.guid)
+            drawable_with_own(&live, false)
                 .iter()
                 .map(|entity| world::EntityPlacement {
                     display_id: entity.display_id,
@@ -296,6 +296,13 @@ fn build_live_scene(
         if undrawable > 0 {
             tracing::warn!("{undrawable} object(s) had no loadable model");
         }
+        // Pose them once, here, because this path renders a single frame and
+        // never reaches the loop that does it every frame. Without this every
+        // skinned entity draws against a bone palette nothing has written --
+        // and a headless screenshot of a populated zone came back with no
+        // creatures in it at all, which is how this was found. See
+        // `MeshRenderer::create_bones`.
+        world.update_animations(gpu, meshes);
     }
 
     Ok((Scene::Streaming(Box::new(world)), Some(live)))
@@ -1276,6 +1283,9 @@ struct App {
     /// frame means a name that turns up late fixes the lines already on
     /// screen.
     chat: Vec<Line>,
+    /// Damage numbers currently rising and fading, oldest first. Pruned every
+    /// frame once a number's age passes `1.0` -- see [`PendingCombatText`].
+    combat_text: Vec<PendingCombatText>,
     /// The line being typed, or `None` when not typing. While this is `Some`,
     /// keys are text rather than movement.
     composing: Option<String>,
@@ -1316,6 +1326,31 @@ fn action_slot(code: KeyCode) -> Option<usize> {
     })
 }
 
+/// Everything worth drawing, the player's own body included.
+///
+/// One function because four places need this list and they must agree: the
+/// initial placement, the per-frame rebuild, and the click test all have to
+/// see the same world, or a click lands on something that is not where it
+/// looks. That is the same rule the action bar's slot geometry follows, and
+/// the picking ray already follows by unprojecting the matrix the scene was
+/// drawn with.
+///
+/// `moving` is the caller's own movement state rather than anything read back
+/// from the server -- see [`live::own_entity`].
+fn drawable_with_own(live: &live::LiveWorld, moving: bool) -> Vec<live::Entity> {
+    let mut entities = live::drawable_entities(&live.state, live.guid);
+    if let Some(own) = live::own_entity(
+        &live.state,
+        live.guid,
+        live.position,
+        live.orientation,
+        moving,
+    ) {
+        entities.push(own);
+    }
+    entities
+}
+
 /// One entry in the scrollback, before it is turned into text.
 ///
 /// The alternative -- rendering to a string at the moment of arrival -- is
@@ -1325,6 +1360,23 @@ fn action_slot(code: KeyCode) -> Option<usize> {
 enum Line {
     Chat(::world::ChatMessage),
     Swing(::world::combat::MeleeSwing),
+}
+
+/// A damage number in flight, from the swing that spawned it to fully faded.
+///
+/// The world position is captured once, at the swing, and never re-read from
+/// the entity afterwards -- see `hud::combat_text_anchor` for why: a killing
+/// blow's number has to keep rising even after the corpse it came from is
+/// destroyed and gone from replicated state. `extra_amount` plays no part in
+/// `text` or `kind`: it is deliberately unnamed in `world::combat` because no
+/// capture has confirmed what it means, and a number this client cannot
+/// explain has no business on screen at all, let alone under a guessed label
+/// like "blocked".
+struct PendingCombatText {
+    world_pos: glam::Vec3,
+    text: String,
+    kind: ui::CombatTextKind,
+    spawned: Instant,
 }
 
 /// A line this client generated itself, shaped like one off the wire.
@@ -1375,6 +1427,7 @@ impl App {
             press_at: None,
             camera_yaw_offset: 0.0,
             chat: Vec::new(),
+            combat_text: Vec::new(),
             composing: None,
             spells: spells::Spellbook::default(),
             bars_seeded: false,
@@ -1755,8 +1808,9 @@ impl App {
             // timer again.
             if self.args.entities {
                 if let Some(live) = &self.live {
+                    let moving = self.live_move.is_some();
                     let placements: Vec<crate::world::EntityPlacement> =
-                        live::drawable_entities(&live.state, live.guid)
+                        drawable_with_own(live, moving)
                             .iter()
                             .map(|entity| crate::world::EntityPlacement {
                                 display_id: entity.display_id,
@@ -2204,7 +2258,7 @@ impl App {
         // Rebuilt rather than cached: the same interpolated positions the
         // renderer drew this frame, so a click hits where the creature looks
         // like it is rather than where it last reported being.
-        let entities = live::drawable_entities(&live.state, live.guid);
+        let entities = drawable_with_own(live, self.live_move.is_some());
         let picked = hud::pick(&ray, &entities, &|display_id| world.entity_bounds(display_id));
 
         self.set_target(picked);
@@ -2275,6 +2329,31 @@ impl App {
                         "combat: {}",
                         hud::combat_entry(swing, live.guid, &live.state).rendered()
                     );
+                    // Spawned above whoever was hit, missed and all -- a whiff
+                    // wants a number just as much as a landed swing, or the
+                    // fight looks like it stalled every time an attack fails
+                    // to connect. Silently skipped if the victim's position
+                    // has not replicated yet; the swing is still logged and
+                    // still in the scrollback either way.
+                    if let Some(pos) = live
+                        .state
+                        .get(swing.victim)
+                        .and_then(|entity| entity.interpolated_position(Instant::now()))
+                    {
+                        let (text, kind) = if swing.missed() {
+                            ("Miss".to_string(), ui::CombatTextKind::Miss)
+                        } else if swing.critical() {
+                            (swing.damage.to_string(), ui::CombatTextKind::Critical)
+                        } else {
+                            (swing.damage.to_string(), ui::CombatTextKind::Damage)
+                        };
+                        self.combat_text.push(PendingCombatText {
+                            world_pos: glam::Vec3::new(pos.x, pos.y, pos.z),
+                            text,
+                            kind,
+                            spawned: Instant::now(),
+                        });
+                    }
                     self.chat.push(Line::Swing(swing.clone()));
                 }
                 for message in &report.chat {
@@ -2397,10 +2476,18 @@ impl App {
             Some(hud::unit_view(entity, hud::unit_name(&live.state, entity)))
         });
 
-        // Where to bracket the selection, in egui's points rather than in
-        // physical pixels: the aspect ratio is the same either way, so
-        // projecting through the point-sized viewport lands in the coordinates
-        // egui paints in without a second conversion to get wrong.
+        // In egui's points rather than physical pixels, for both the marker
+        // below and the combat text after it: the aspect ratio is the same
+        // either way, so projecting through the point-sized viewport lands in
+        // the coordinates egui paints in without a second conversion to get
+        // wrong.
+        let points = ctx.pixels_per_point().max(0.01);
+        let viewport = (
+            r.config.width as f32 / points,
+            r.config.height as f32 / points,
+        );
+
+        // Where to bracket the selection.
         let target_marker = self.target.and_then(|guid| {
             let Some(Scene::Streaming(world)) = r.scene.as_ref() else {
                 return None;
@@ -2413,18 +2500,39 @@ impl App {
                 .get_f32(::world::update::fields::OBJECT_SCALE)
                 .filter(|s| *s > 0.0)
                 .unwrap_or(1.0);
-            let points = ctx.pixels_per_point().max(0.01);
             hud::marker_rect(
                 &self.camera,
-                (
-                    r.config.width as f32 / points,
-                    r.config.height as f32 / points,
-                ),
+                viewport,
                 glam::Vec3::new(at.x, at.y, at.z),
                 scale,
                 world.entity_bounds(display_id),
             )
         });
+
+        // Every number still rising, oldest first. Pruned here rather than in
+        // `pump_live_connection`, which runs on the network's schedule, not
+        // the render clock -- an age has to be measured against the frame
+        // that draws it, and a swing that never gets drawn (the window is
+        // occluded, say) should not be able to dodge its own expiry.
+        let lifetime = Duration::from_millis(self.hud.profile.style.combat_text_lifetime_ms);
+        let now = Instant::now();
+        self.combat_text
+            .retain(|entry| now.saturating_duration_since(entry.spawned) < lifetime);
+        let combat_text: Vec<ui::FloatingText> = self
+            .combat_text
+            .iter()
+            .filter_map(|entry| {
+                let pos = hud::combat_text_anchor(&self.camera, viewport, entry.world_pos)?;
+                let age = now.saturating_duration_since(entry.spawned).as_secs_f32()
+                    / lifetime.as_secs_f32().max(f32::EPSILON);
+                Some(ui::FloatingText {
+                    pos,
+                    text: entry.text.clone(),
+                    kind: entry.kind,
+                    age,
+                })
+            })
+            .collect();
 
         // Rendered fresh every frame from the messages that arrived, so names
         // that resolve after a line was received still reach it.
@@ -2497,6 +2605,7 @@ impl App {
                     player: player.as_ref(),
                     target: target.as_ref(),
                     target_marker,
+                    combat_text: &combat_text,
                     chat: &chat,
                     composing: composing.as_deref(),
                     bars: &bars,

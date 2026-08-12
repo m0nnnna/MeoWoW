@@ -531,6 +531,51 @@ Measure the thing, not the thing next to it.
 (recognised by name, not parsed). See "4.3 finished: cast bars" below for how
 that changed.
 
+## The player is on screen
+
+`wow-viewer --realm-host ... --entities true` now draws the character's own
+body, in third person, with the world's creatures around it.
+
+Two separate bugs, and the second was much bigger than the first.
+
+**The body was excluded on purpose, by a comment that had gone stale.**
+`drawable_entities` skipped the player's own guid because "the player's own
+body is where the camera is; drawing it would fill the view from inside the
+mesh" -- true when the camera flew freely, and untrue since the camera started
+following nine units behind. The body is now built by `live::own_entity`,
+which is deliberately *not* part of `drawable_entities`: the two have
+different sources of truth. What the body looks like comes from replicated
+state, which is authoritative and never changes. Where it *is* comes from the
+viewer's own movement simulation, because the server never echoes our own
+movement back -- the replicated position is frozen at login, and drawing from
+it would leave the character standing at the login spot while the camera
+walked away. The same trap had already cost a wrong diagnosis in `wow-cli`,
+where an attack command measured its approach from that frozen position.
+
+**And then: every replicated creature had been invisible in every headless
+render since the feature was written.** Not the player -- all of them. A bone
+palette is a fresh GPU buffer, a fresh GPU buffer is zeroed, and a zero matrix
+multiplies every vertex to the origin. `--screenshot` places entities and then
+renders a single frame; the only thing that ever writes a pose is
+`World::update_animations`, which is called from the windowed frame loop and
+nowhere else. So ninety-five creatures collapsed to the world origin, silently,
+and a screenshot of Northshire came back as empty grass.
+
+This is `CLAUDE.md`'s own "geometry drawn at zero size looks exactly like
+geometry never drawn", recurring in a second place. It survived because 3.5 was
+verified by *watching a window*, where the loop does pose them -- the one
+observation that could not have caught it. Fixed twice over: the screenshot
+path poses before it renders, and `create_bones` now fills the palette with
+identities, so the same mistake made anywhere else draws a bind pose instead of
+nothing. Anything that must be written before it is read should start as
+something a person can see.
+
+**The character is untextured**, and that is the honest current state rather
+than a bug: a player's skin, hair and face come from `CharSections.dbc`, and
+display id 49's `CreatureDisplayInfo` texture columns are empty because players
+do not get their appearance that way. Every hairstyle geoset draws at once for
+the same reason. Both are appearance, not placement, and both are next.
+
 ## 4.4: melee combat
 
 `wow-cli world --enter Testwolf --attack --stay 40 --capture <file>` walks a
@@ -661,6 +706,40 @@ release flow, and telling the two swing-refusal opcodes apart -- no experiment
 has separated them, because neither carries a payload and both conditions were
 violated at once. Combat has also not been *watched* in the viewer yet: it is
 verified headlessly and through the CLI.
+
+### 4.4 continued: floating combat text
+
+Every swing in `Replication::swings` now spawns a number above whoever it hit
+-- a landed hit, a critical (larger, its own colour), or `Miss`, rising and
+fading over `Style::combat_text_lifetime_ms`. Drawn the way the target marker
+is, not through an `Element`: a number belongs to a swing, not to a fixed spot
+on screen, so `apps/viewer/src/hud.rs`'s `combat_text_anchor` re-projects one
+fixed world point every frame exactly the way `marker_rect` re-projects the
+selection box, and for the same reason -- a world position measured once
+and a screen position recomputed as the camera moves cannot drift apart the
+way two independently-tracked ones could.
+
+The position is captured **at the swing**, from the victim's replicated
+position, and never re-read afterwards. A killing blow's number has to keep
+rising after the corpse it came from can no longer answer
+`interpolated_position` -- tracking the entity live would make the last
+number of every fight disappear early, which is exactly the swing worth
+seeing land.
+
+**`MeleeSwing::extra_amount` names nothing here either.** The number drawn is
+always `swing.damage` or the literal text `Miss`; `extra_amount` is not
+substituted into the label, the colour, or the count of numbers spawned. The
+same reasoning as `describe_cast_failure` and the field's own doc comment in
+`crates/world/src/combat.rs`: four captures are not a confirmation, and a
+combat log -- or a floating number -- that guesses "blocked" would misexplain
+a fight to whoever is reading the screen, not just whoever is reading the log.
+
+Verified headlessly, the same way the rest of 4.4 has been: `crates/ui`'s
+`combat_text_paints_something` and `an_aged_combat_number_rises` pin that an
+entry actually reaches the screen and that age moves it upward, and
+`apps/viewer/src/hud.rs`'s `combat_text_anchor_follows_marker_rects_own_rule_about_the_camera`
+pins the same behind-the-camera refusal `marker_rect` already has. Not yet
+watched live -- see the paragraph above.
 
 ### 4.3 continued: tooltips, a cooldown sweep, and a width that was never 16
 
