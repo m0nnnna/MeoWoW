@@ -476,8 +476,41 @@ result into a shared buffer addressed by instance index, which is real
 architecture work, not a quick follow-up. Deferring it is still the right
 call; this paragraph exists so that call is on record rather than assumed.
 
-**Facing needs half a turn, and both places that set it were wrong about
-which way a model faces.**
+**Facing: M2 needs no offset, WMO needs a half turn -- and the reason this
+took three attempts is that a *culling* bug was wearing a rotation bug's
+clothes.**
+
+M2 geometry was being drawn with clockwise winding, which culls every
+front-facing triangle. That does not produce a missing model. It produces one
+you can see *into*: what survives is the interior of the far surface, which
+has a silhouette, a texture and a size, and reads at a glance as a model
+facing away from you. So a correctly-oriented character looked reversed, a
+static render at a server-confirmed heading appeared to show its back where
+its face belonged, and a half turn was added to entities to "fix" it. The
+rotation was the innocent one.
+
+Separating them took a live A/B: with the winding corrected to
+counter-clockwise, a key that toggles a half turn on entity facing settles it
+in seconds -- everything walks forwards at zero offset and backwards at half
+a turn. `OWC_NO_CULL=1` is kept as the diagnostic that found the winding, by
+making the see-through fronts disappear.
+
+The settled values, and what each rests on:
+
+| what | offset | evidence |
+|---|---|---|
+| entities (players, creatures) | none | live A/B with the winding fixed |
+| doodads (M2) | none | fence runs measured from positions; same format as entities |
+| world objects (WMO) | +180 | a real client screenshot: the abbey's portal faces the path, between lamp pillars whose positions no rotation can move |
+
+**This section previously said the opposite of all of it** -- that M2 winds
+clockwise, and that facing needed no offset because an M2 faces +X and the
+doodad quarter-turn was a mistake to carry over. The +X part was right by
+accident and for the wrong reason. Everything else was written from reasoning
+about the formats rather than from looking at a render, which is exactly the
+failure the rest of this document warns about.
+
+Superseded, kept for the shape of the mistake:
 
 This section used to claim entity facing needed no offset, on the grounds that
 an M2's forward is +X. It is not: **an M2's local forward is -X**, and until

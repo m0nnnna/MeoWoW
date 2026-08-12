@@ -60,35 +60,33 @@ pub fn placement_position(raw: [f32; 3]) -> Vec3 {
 
 /// Builds the rotation for a **doodad** placement -- an M2 on the terrain.
 ///
-/// Half a turn, for the same reason creatures need one: an M2's local forward
-/// is -X, so a model placed at a stored yaw points exactly backwards without
-/// it. See `world::set_entities`, which learned this from the player's own
-/// body once there was one to look at.
+/// No offset: an M2's forward is +X, so a stored yaw is already a world yaw.
 ///
-/// **The offset used to be a quarter turn, and that was wrong in a way no
-/// building could reveal.** `-90` shipped, `+90` replaced it, and both are 90
-/// degrees off: they put every fence in Elwynn *across* its own line instead
-/// of along it. Neither could be seen by looking at a church, because a
-/// quarter turn on a symmetric-ish building still shows you a wall.
+/// This shipped as `-90`, was changed to `+90`, then to `+180`, and every one
+/// of those was wrong. `-90` and `+90` are a quarter turn out and lay every
+/// fence in Elwynn across its own line; `+180` was derived from a belief that
+/// an M2 faces -X, which turned out to be an artefact of inside-out culling
+/// rather than a fact about models.
 ///
-/// What measured it: a fence is a *run*, several copies laid end to end, and
-/// the run's direction comes from the placements' own positions with no
-/// rotation involved at all. Across three runs at different angles,
-/// `direction - yaw` is one constant and `direction + yaw` is not -- so the
-/// yaw is not mirrored, and the constant is zero modulo a half turn. The half
-/// turn itself is the -X forward above. See
+/// What holds it down now is a measurement that does not care about any of
+/// that: a fence is a *run*, and the run's direction comes from the
+/// placements' own positions with no rotation involved at all. Across three
+/// runs at different angles, `direction - yaw` is one constant and
+/// `direction + yaw` is not -- so the yaw is not mirrored, and the offset is
+/// zero modulo a half turn. The half turn is then settled by entities, which
+/// are the same file format and demonstrably need none. See
 /// [`tests::a_fence_run_lies_along_its_stored_yaw`].
 pub fn placement_rotation(rotation: [f32; 3]) -> Quat {
-    Quat::from_rotation_z((rotation[1] + 180.0).to_radians())
+    Quat::from_rotation_z(rotation[1].to_radians())
         * Quat::from_rotation_y((-rotation[0]).to_radians())
         * Quat::from_rotation_x(rotation[2].to_radians())
 }
 
 /// Builds the rotation for a **world object** placement -- a WMO.
 ///
-/// Identical to [`placement_rotation`], and kept as its own name because the
-/// two were briefly *not* identical and the reason that was wrong is worth
-/// keeping.
+/// A half turn, where a doodad takes none. The two really do differ: WMO and
+/// M2 are different formats, authored to different forward axes, and only the
+/// M2 one matches the network's heading convention.
 ///
 /// Northshire Abbey appeared to want a quarter turn where the fences wanted a
 /// half one, on the evidence that a quarter turn showed its portal from the
@@ -105,7 +103,9 @@ pub fn placement_rotation(rotation: [f32; 3]) -> Quat {
 /// The general shape of the mistake: a movable thing was checked against
 /// another movable thing. The fix was to find something nailed down.
 pub fn object_rotation(rotation: [f32; 3]) -> Quat {
-    placement_rotation(rotation)
+    Quat::from_rotation_z((rotation[1] + 180.0).to_radians())
+        * Quat::from_rotation_y((-rotation[0]).to_radians())
+        * Quat::from_rotation_x(rotation[2].to_radians())
 }
 
 fn transform(raw_position: [f32; 3], rotation: [f32; 3], scale: f32) -> Mat4 {
@@ -423,13 +423,12 @@ mod tests {
     /// undone by accident.
     #[test]
     fn yaw_rotates_about_the_vertical_axis() {
-        // A doodad takes a half turn, so a stored yaw of 90 puts +X onto -Y.
+        // A doodad takes no offset, so a stored yaw of 90 puts +X onto +Y.
         let a = placement_rotation([0.0, 90.0, 0.0]) * Vec3::X;
-        assert!((a + Vec3::Y).length() < 1e-5, "got {a:?}");
+        assert!((a - Vec3::Y).length() < 1e-5, "got {a:?}");
 
-        // A world object takes the same half turn. They were briefly given
-        // different offsets on the strength of one building looking right
-        // from one angle; see `object_rotation`.
+        // A world object takes a half turn on top, which is what puts the
+        // abbey's door on the side the path arrives from.
         let b = object_rotation([0.0, 90.0, 0.0]) * Vec3::X;
         assert!((b + Vec3::Y).length() < 1e-4, "got {b:?}");
     }

@@ -1291,6 +1291,22 @@ struct App {
     /// Damage numbers currently rising and fading, oldest first. Pruned every
     /// frame once a number's age passes `1.0` -- see [`PendingCombatText`].
     combat_text: Vec<PendingCombatText>,
+    /// Debug: add a half turn to every entity's facing, toggled with F2.
+    ///
+    /// Here because two observations disagree and a live A/B settles it in
+    /// seconds where reasoning has already been wrong twice. A static render
+    /// of the player at a server-confirmed heading says the current facing is
+    /// right; watching anything actually *walk* says it is backwards. Rather
+    /// than flip a constant on a guess for the third time, this lets the
+    /// person at the window compare them directly.
+    entity_flip: bool,
+    /// Debug: draw M2 geometry with the opposite winding, toggled with F3.
+    ///
+    /// "The front of the pillars is missing and I can see inside them" is
+    /// culling, not geometry -- and a model rendered inside-out can also read
+    /// as one facing the wrong way, which is very likely why the two
+    /// observations above disagree.
+    flip_winding: bool,
     /// The line being typed, or `None` when not typing. While this is `Some`,
     /// keys are text rather than movement.
     composing: Option<String>,
@@ -1433,6 +1449,8 @@ impl App {
             camera_yaw_offset: 0.0,
             chat: Vec::new(),
             combat_text: Vec::new(),
+            entity_flip: false,
+            flip_winding: false,
             composing: None,
             spells: spells::Spellbook::default(),
             bars_seeded: false,
@@ -1669,6 +1687,22 @@ impl ApplicationHandler for App {
                         }
                         match code {
                             KeyCode::F1 => self.hud.toggle_edit(),
+                            KeyCode::F2 => {
+                                self.entity_flip = !self.entity_flip;
+                                let state = if self.entity_flip { "flipped" } else { "as shipped" };
+                                self.chat.push(Line::Chat(local_notice(format!(
+                                    "entity facing: {state}"
+                                ))));
+                                tracing::info!("entity facing {state}");
+                            }
+                            KeyCode::F3 => {
+                                self.flip_winding = !self.flip_winding;
+                                let state = if self.flip_winding { "reversed" } else { "as shipped" };
+                                self.chat.push(Line::Chat(local_notice(format!(
+                                    "model winding: {state}"
+                                ))));
+                                tracing::info!("model winding {state}");
+                            }
                             // Only offer a chat line when there is somewhere
                             // to send it.
                             KeyCode::Enter | KeyCode::NumpadEnter if self.live.is_some() => {
@@ -1814,13 +1848,15 @@ impl App {
             if self.args.entities {
                 if let Some(live) = &self.live {
                     let moving = self.live_move.is_some();
+                    // F2. See `App::entity_flip`.
+                    let flip = if self.entity_flip { std::f32::consts::PI } else { 0.0 };
                     let placements: Vec<crate::world::EntityPlacement> =
                         drawable_with_own(live, moving)
                             .iter()
                             .map(|entity| crate::world::EntityPlacement {
                                 display_id: entity.display_id,
                                 position: entity.position,
-                                orientation: entity.orientation,
+                                orientation: entity.orientation + flip,
                                 scale: entity.scale,
                                 moving: entity.moving,
                                 look: (entity.guid == live.guid)

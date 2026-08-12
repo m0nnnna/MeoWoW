@@ -289,11 +289,30 @@ pub fn load_dressed(
             index_count: resolved.len() as u32,
             state: RenderState {
                 blend,
-                two_sided: material.two_sided(),
+                // `OWC_NO_CULL=1` draws every triangle regardless of which
+                // way it faces. Kept as a diagnostic: it is how the winding
+                // below was identified, by making "the front of the pillar is
+                // missing and I can see inside it" disappear -- which proved
+                // the geometry was there all along and only the facing test
+                // was rejecting it.
+                two_sided: material.two_sided()
+                    || std::env::var_os("OWC_NO_CULL").is_some(),
                 // Transparent geometry must not occlude what is behind it, and
                 // the format says so per material as well.
                 depth_write: !blend.is_transparent() && !material.depth_write_disabled(),
-                winding: Winding::Clockwise,
+                // **Counter-clockwise, despite what the rest of this
+                // project long assumed.** `docs/RENDERING.md` said M2 winds
+                // clockwise and WMO counter-clockwise; for M2 that was wrong,
+                // and it culled every front-facing triangle. The symptom is
+                // not a missing model -- it is a model you can see *into*,
+                // because what survives culling is the far side's interior.
+                //
+                // It hid for as long as it did because an inside-out model
+                // still has a silhouette, a texture and a size, and reads at
+                // a glance as a model facing away from you. That is almost
+                // certainly why entity facing looked wrong at the same time:
+                // two bugs producing one symptom.
+                winding: Winding::CounterClockwise,
             },
             texture,
             submesh_id: submesh.id,

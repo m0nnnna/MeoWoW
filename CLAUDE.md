@@ -280,6 +280,16 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   through another, so the write and read halves are confirmed against each other
   *via a third party* that had to understand both. Reach for that shape whenever
   a format travels in both directions.
+- **Two bugs can share one symptom, and you will fix the innocent one.**
+  M2 geometry drawn with the wrong winding culls front faces, which does not
+  look like missing geometry -- it looks like a model *facing away from you*,
+  because what survives is the interior of its far surface. On that reading a
+  half turn was added to entity facing, then the same wrong reasoning was
+  propagated to doodads. Neither rotation was ever wrong. What separated them
+  was fixing the winding first and then A/B-ing the rotation live, one
+  variable at a time, with the person at the window pressing the key. When a
+  symptom persists across a fix that should have worked, suspect that it has
+  two causes rather than that the fix was too small.
 - **When geometry is missing rather than wrong, suspect culling before data.**
   WMO winds counter-clockwise, M2 and terrain clockwise. Guessing from a
   neighbouring format culled a roof and looked like a hole in the mesh.
