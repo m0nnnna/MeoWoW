@@ -178,6 +178,32 @@ watching the window while a second client walked:
   makes that measurably expensive, the fix is an in-place transform update,
   not the same timer again.
 
+A second look at that facing fix found it was incomplete, and found something
+worse alongside it: a claim in both this fix's own commit and in
+`docs/RENDERING.md` that `SMSG_MONSTER_MOVE` "never reports" a facing was
+false. Three of its five move types carry one — `FACING_ANGLE` as a bare
+angle, `FACING_SPOT` as a point, `FACING_TARGET` as a guid — and the parser
+skipped all three past the bug that made the claim look true: a stopped
+creature has no destination to derive a heading from, so it fell through to
+the raw wire position, whose orientation the parser always hands back as
+zero, and snapped to face east regardless of which way it had been walking.
+`FACING_ANGLE` is now parsed into `MonsterMove::facing` and preferred when
+present; without it, a stop keeps the entity's last known facing rather than
+resetting to the placeholder. `FACING_SPOT` and `FACING_TARGET` remain
+unparsed — the former is a short further step, the latter needs another
+entity's live position, which the packet parser has no access to — but the
+docs no longer claim there is nothing there to fix.
+
+That review also named a real deferral this milestone had made without
+writing down: one bone buffer per `(display id, moving)` bucket means every
+instance sharing a bucket — several wolves walking together, say — animates
+in exact lockstep, identical phase, all at once. The bucket split fixed
+standing creatures playing a walk cycle at all; it did not give each instance
+its own, and per-instance phase would need either a bone buffer per instance
+or CPU-side pose sampling packed by instance index — real architecture work.
+Deferring it is still the right call. See `docs/RENDERING.md` for where that
+call is now on record.
+
 This milestone also changed what "careful" means. Every earlier parser was
 memoryless, so a mistake produced one wrong answer and vanished. Replicated
 state keeps mistakes: a dropped update is permanent and a bad merge erases

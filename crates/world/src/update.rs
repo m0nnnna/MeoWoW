@@ -570,6 +570,15 @@ pub struct MonsterMove {
     /// How long the whole path takes, in milliseconds.
     pub duration: u32,
     pub stopped: bool,
+    /// An explicit facing to arrive at, when the move type provides one.
+    /// `FACING_ANGLE` carries it directly and is parsed; `FACING_SPOT` and
+    /// `FACING_TARGET` also carry one, as a point or a guid to face rather
+    /// than a bare angle, and are still only skipped -- the former is a small
+    /// further step (this parser already has `from` to measure from), the
+    /// latter needs another entity's live position, which is a `WorldState`
+    /// lookup this parser has no access to. Neither `from` nor `to` ever
+    /// carries an orientation of its own; those fields decode fixed at zero.
+    pub facing: Option<f32>,
 }
 
 /// How the creature should be facing when it arrives.
@@ -605,8 +614,11 @@ pub fn parse_monster_move(body: &[u8]) -> Result<MonsterMove, Error> {
     let _spline_id = reader.u32()?;
 
     // A stop ends the packet here. Reading on would consume whatever follows in
-    // the stream, which is the next packet.
+    // the stream, which is the next packet. A stop carries no facing of its
+    // own -- there is nothing left to skip or parse for it, unlike the other
+    // four types.
     let move_type = reader.u8()?;
+    let mut facing = None;
     match move_type {
         monster_move_type::STOP => {
             reader.finish()?;
@@ -616,11 +628,12 @@ pub fn parse_monster_move(body: &[u8]) -> Result<MonsterMove, Error> {
                 to: None,
                 duration: 0,
                 stopped: true,
+                facing: None,
             });
         }
         monster_move_type::FACING_SPOT => reader.skip(12)?,
         monster_move_type::FACING_TARGET => reader.skip(8)?,
-        monster_move_type::FACING_ANGLE => reader.skip(4)?,
+        monster_move_type::FACING_ANGLE => facing = Some(reader.f32()?),
         monster_move_type::NORMAL => {}
         other => return Err(Error::UnknownUpdateType { got: other }),
     }
@@ -678,6 +691,7 @@ pub fn parse_monster_move(body: &[u8]) -> Result<MonsterMove, Error> {
         to,
         duration,
         stopped: false,
+        facing,
     })
 }
 
@@ -1088,5 +1102,75 @@ mod tests {
             parse_compressed_update_object(&body),
             Err(Error::CompressedLength { .. })
         ));
+    }
+
+    fn monster_move_body(move_type: u8, extra: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        write_packed_guid(7, &mut body);
+        body.push(0); // the unacted-on flag byte
+        for value in [1.0f32, 2.0, 3.0] {
+            body.extend_from_slice(&value.to_le_bytes()); // from
+        }
+        body.extend_from_slice(&0u32.to_le_bytes()); // spline id
+        body.push(move_type);
+        body.extend_from_slice(extra);
+        body
+    }
+
+    /// `FACING_ANGLE` is the one move type carrying a facing this parser can
+    /// use directly (`FACING_SPOT` and `FACING_TARGET` need more than this
+    /// parser alone has -- see `MonsterMove::facing`), so its float has to
+    /// land in `facing`, not be silently skipped.
+    #[test]
+    fn facing_angle_is_parsed_into_facing() {
+        let mut extra = 1.25f32.to_le_bytes().to_vec(); // the facing itself
+        extra.extend_from_slice(&0u32.to_le_bytes()); // spline flags: none set
+        extra.extend_from_slice(&4000u32.to_le_bytes()); // duration
+        extra.extend_from_slice(&1u32.to_le_bytes()); // one path point
+        for value in [10.0f32, 20.0, 30.0] {
+            extra.extend_from_slice(&value.to_le_bytes()); // destination
+        }
+        let body = monster_move_body(monster_move_type::FACING_ANGLE, &extra);
+
+        let parsed = parse_monster_move(&body).unwrap();
+        assert_eq!(parsed.facing, Some(1.25));
+        assert_eq!(
+            parsed.from,
+            Position { x: 1.0, y: 2.0, z: 3.0, orientation: 0.0 }
+        );
+        assert_eq!(
+            parsed.to,
+            Some(Position { x: 10.0, y: 20.0, z: 30.0, orientation: 0.0 })
+        );
+        assert_eq!(parsed.duration, 4000);
+    }
+
+    /// A stop carries no further fields at all, so it must not be mistaken
+    /// for a move that happens to report no facing.
+    #[test]
+    fn a_stop_carries_no_facing() {
+        let body = monster_move_body(monster_move_type::STOP, &[]);
+
+        let parsed = parse_monster_move(&body).unwrap();
+        assert!(parsed.stopped);
+        assert!(parsed.to.is_none());
+        assert_eq!(parsed.facing, None);
+    }
+
+    /// A plain move -- no facing hint of any kind -- must also come back
+    /// `None` rather than some other type's field bleeding through.
+    #[test]
+    fn a_normal_move_has_no_facing() {
+        let mut extra = 0u32.to_le_bytes().to_vec(); // spline flags: none set
+        extra.extend_from_slice(&2500u32.to_le_bytes()); // duration
+        extra.extend_from_slice(&1u32.to_le_bytes()); // one path point
+        for value in [5.0f32, 6.0, 7.0] {
+            extra.extend_from_slice(&value.to_le_bytes());
+        }
+        let body = monster_move_body(monster_move_type::NORMAL, &extra);
+
+        let parsed = parse_monster_move(&body).unwrap();
+        assert_eq!(parsed.facing, None);
+        assert_eq!(parsed.duration, 2500);
     }
 }

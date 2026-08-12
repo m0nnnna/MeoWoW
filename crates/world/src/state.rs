@@ -88,9 +88,14 @@ impl Entity {
     /// from the clock here, so the interpolation math is exercised by a fixed
     /// input rather than a hopefully-fast-enough sleep in tests.
     ///
-    /// Facing is derived from the direction of travel, not from either
-    /// endpoint's orientation: `SMSG_MONSTER_MOVE` never reports one, and
-    /// both `from` and `to` decode with orientation fixed at zero.
+    /// While a path is in flight, facing is derived from the direction of
+    /// travel rather than either endpoint's own orientation: `from` and `to`
+    /// both decode with orientation fixed at zero, the wire never having
+    /// reported a *starting* facing. An *arrival* facing is a separate thing
+    /// the wire can report (`MonsterMove::facing`, from `FACING_ANGLE`); that
+    /// is applied once the entity is next given a resting position -- see
+    /// [`WorldState::apply_monster_move`] -- not by this method, which only
+    /// ever computes a heading from movement already in progress.
     pub fn interpolated_position(&self, now: std::time::Instant) -> Option<Position> {
         let (Some(start), Some(end), Some(duration), Some(started)) = (
             self.position,
@@ -317,6 +322,16 @@ impl WorldState {
     /// [`Entity::interpolated_position`] -- rather than only ever showing the
     /// start. A stop (`move_.to` is `None`) clears them the same way a fresher
     /// authoritative position does.
+    ///
+    /// `move_.from.orientation` is not usable as this position's facing --
+    /// the wire never reports a *starting* orientation, so the parser always
+    /// hands back zero there, and using it verbatim would turn every stop
+    /// into "snap to face east." What the wire *can* supply is an explicit
+    /// arrival facing (`move_.facing`, currently only from `FACING_ANGLE`),
+    /// preferred when present; failing that, whatever the entity was already
+    /// facing a moment ago -- mid-interpolation if a path was in flight, its
+    /// last resting facing otherwise -- which is a far better guess than a
+    /// constant that has nothing to do with this creature.
     pub fn apply_monster_move(&mut self, move_: &MonsterMove) {
         let Some(entity) = self.entities.get_mut(&move_.guid) else {
             self.stats.orphaned += 1;
@@ -324,7 +339,17 @@ impl WorldState {
         };
         self.stats.movement_updates += 1;
         entity.updates += 1;
-        entity.position = Some(move_.from);
+
+        let orientation = move_.facing.unwrap_or_else(|| {
+            entity
+                .interpolated_position(std::time::Instant::now())
+                .map(|p| p.orientation)
+                .unwrap_or(0.0)
+        });
+        entity.position = Some(Position {
+            orientation,
+            ..move_.from
+        });
         entity.destination = move_.to;
         entity.move_duration = move_.to.map(|_| move_.duration);
         entity.move_started = move_.to.map(|_| std::time::Instant::now());
@@ -668,6 +693,7 @@ mod tests {
             to: Some(at(50.0, 50.0)),
             duration: 5000,
             stopped: false,
+            facing: None,
         });
 
         let entity = world.get(7).unwrap();
@@ -772,6 +798,7 @@ mod tests {
             to: Some(at(100.0, 0.0)),
             duration: 4000,
             stopped: false,
+            facing: None,
         });
 
         let entity = world.get(7).unwrap();
@@ -805,6 +832,7 @@ mod tests {
             to: Some(at(100.0, 0.0)),
             duration: 4000,
             stopped: false,
+            facing: None,
         });
 
         let entity = world.get(7).unwrap();
@@ -836,6 +864,7 @@ mod tests {
             to: Some(at(100.0, 0.0)),
             duration: 4000,
             stopped: false,
+            facing: None,
         });
         assert!(world.get(7).unwrap().destination.is_some());
 
@@ -872,6 +901,7 @@ mod tests {
             to: Some(at(100.0, 0.0)),
             duration: 4000,
             stopped: false,
+            facing: None,
         });
 
         let entity = world.get(7).unwrap();
@@ -901,6 +931,7 @@ mod tests {
             to: None,
             duration: 0,
             stopped: true,
+            facing: None,
         });
 
         assert!(!world.get(7).unwrap().is_moving(std::time::Instant::now()));

@@ -402,11 +402,24 @@ reports a path's start, its end, and how long the whole thing takes.
 `Entity::interpolated_position` lerps between them against wall-clock elapsed
 time since the move was received (`move_started`), clamped to the endpoints,
 with facing derived from the direction of travel rather than either endpoint's
-orientation -- the wire never reports one. `Entity::is_moving` answers a
-related but distinct question, whether that move's *duration* has actually
-elapsed: `destination` alone stays set to the last move's endpoint long after
-it arrives, so checking only that reported a creature "moving" forever after
-its first move ever, with no idle state.
+own orientation -- `from` and `to` both decode fixed at zero, since the wire
+never reports a *starting* facing. An *arrival* facing is a different thing
+the wire genuinely can supply: three of the five move types carry one, and
+`FACING_ANGLE`'s is now parsed into `MonsterMove::facing` rather than
+discarded (`FACING_SPOT` and `FACING_TARGET` also carry one, as a point or a
+guid to face rather than a bare angle, and remain unparsed -- the former is a
+small further step from here, the latter needs another entity's live
+position, a `WorldState` lookup the packet parser has no access to). Preferred
+over a computed guess when present, and applied in `apply_monster_move` rather
+than in `interpolated_position` itself, because it describes an arrival, not
+motion in progress. Without a hint of either kind, a stop falls back to
+whatever the entity was already facing a moment before -- not to the parser's
+placeholder zero, which briefly turned every stop into "snap to face east"
+regardless of which way the creature had been walking. `Entity::is_moving`
+answers a related but distinct question, whether that move's *duration* has
+actually elapsed: `destination` alone stays set to the last move's endpoint
+long after it arrives, so checking only that reported a creature "moving"
+forever after its first move ever, with no idle state.
 
 **Both are re-evaluated every frame, not on a timer.** An earlier version
 throttled the whole rebuild -- repositioning *and* animating -- to a few times
@@ -433,6 +446,21 @@ cached by display id alone in `entity_cache`, so drawing a second bucket for
 one species is a clone of the same `Rc`, not a second load. Sequence ids (4 for
 walk, 0 for stand) come from `AnimationData.dbc`'s public row layout, the same
 convention for every 3.3.5a model.
+
+**A deferral the bucket split does not fix: every instance in one bucket
+shares one pose.** One bone buffer per `(display id, moving)` key means one
+`update_animations` call writes one pose for every instance drawn from it, so
+five wolves walking together animate in exact lockstep -- identical frame,
+identical phase, all at once. The bucket split fixed the worse version of
+this (a standing wolf playing the walk cycle at all); it did not fix the
+residual, and unlike the other tradeoffs on this page, it was not written
+down anywhere until now. Giving each instance its own phase would mean either
+a bone buffer per instance -- most of the population of a zone, each with its
+own storage buffer and bind group, for a handful of bones' worth of
+difference -- or sampling `pose_bones` per instance on the CPU and packing the
+result into a shared buffer addressed by instance index, which is real
+architecture work, not a quick follow-up. Deferring it is still the right
+call; this paragraph exists so that call is on record rather than assumed.
 
 **Facing needed no offset at all.** The entity placement formula originally
 carried the doodad path's quarter-turn correction, which exists because ADT
