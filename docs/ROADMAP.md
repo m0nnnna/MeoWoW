@@ -187,22 +187,40 @@ skipped all three past the bug that made the claim look true: a stopped
 creature has no destination to derive a heading from, so it fell through to
 the raw wire position, whose orientation the parser always hands back as
 zero, and snapped to face east regardless of which way it had been walking.
-`FACING_ANGLE` is now parsed into `MonsterMove::facing` and preferred when
-present; without it, a stop keeps the entity's last known facing rather than
-resetting to the placeholder. `FACING_SPOT` and `FACING_TARGET` remain
-unparsed — the former is a short further step, the latter needs another
-entity's live position, which the packet parser has no access to — but the
-docs no longer claim there is nothing there to fix.
+`FACING_ANGLE` was parsed into a new `MonsterMove::facing` field in response.
+`FACING_SPOT` and `FACING_TARGET` remain unparsed — the former is a short
+further step, the latter needs another entity's live position, which the
+packet parser has no access to.
 
-That review also named a real deferral this milestone had made without
-writing down: one bone buffer per `(display id, moving)` bucket means every
-instance sharing a bucket — several wolves walking together, say — animates
-in exact lockstep, identical phase, all at once. The bucket split fixed
-standing creatures playing a walk cycle at all; it did not give each instance
-its own, and per-instance phase would need either a bone buffer per instance
-or CPU-side pose sampling packed by instance index — real architecture work.
-Deferring it is still the right call. See `docs/RENDERING.md` for where that
-call is now on record.
+A third look found that parsing it was not the same as using it: the value
+reached `Entity` but not the screen. `apply_monster_move` stored it into
+`entity.position.orientation`, and `interpolated_position` never reads that
+field while a path is in flight — it computes a fresh heading from direction
+of travel unconditionally, at every `t` including `t == 1.0`, and the field
+that held the parsed angle was really only consulted after a *later* update
+overwrote it with something else. `destination` living well past its move's
+actual duration (the exact fact `is_moving` exists to work around) meant
+that "later update" might not arrive for a long time, so the parsed value
+was live in memory and dead in practice — asserted only by the tests that
+checked the parse boundary itself, not by anything that checked an entity
+ended up facing it. Facing now has two regimes computed in one place,
+`interpolated_position` itself: direction of travel while `t < 1.0`, and a
+new `Entity::arrival_facing` — set from `MonsterMove::facing`, consulted only
+once `t >= 1.0` — otherwise. That same fix closed a second, smaller gap in
+the same function: a duration of exactly zero used to return the destination
+verbatim, endpoint orientation and all, bypassing both the direction-of-travel
+computation and the arrival-facing fallback in the one branch that skipped
+both.
+
+That second review also named a real deferral this milestone had made
+without writing down: one bone buffer per `(display id, moving)` bucket means
+every instance sharing a bucket — several wolves walking together, say —
+animates in exact lockstep, identical phase, all at once. The bucket split
+fixed standing creatures playing a walk cycle at all; it did not give each
+instance its own, and per-instance phase would need either a bone buffer per
+instance or CPU-side pose sampling packed by instance index — real
+architecture work. Deferring it is still the right call. See
+`docs/RENDERING.md` for where that call is now on record.
 
 This milestone also changed what "careful" means. Every earlier parser was
 memoryless, so a mistake produced one wrong answer and vanished. Replicated

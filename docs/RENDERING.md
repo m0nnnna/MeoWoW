@@ -400,26 +400,36 @@ every fold.
 **Position is interpolated, not snapped.** `SMSG_MONSTER_MOVE` only ever
 reports a path's start, its end, and how long the whole thing takes.
 `Entity::interpolated_position` lerps between them against wall-clock elapsed
-time since the move was received (`move_started`), clamped to the endpoints,
-with facing derived from the direction of travel rather than either endpoint's
-own orientation -- `from` and `to` both decode fixed at zero, since the wire
-never reports a *starting* facing. An *arrival* facing is a different thing
-the wire genuinely can supply: three of the five move types carry one, and
-`FACING_ANGLE`'s is now parsed into `MonsterMove::facing` rather than
-discarded (`FACING_SPOT` and `FACING_TARGET` also carry one, as a point or a
-guid to face rather than a bare angle, and remain unparsed -- the former is a
-small further step from here, the latter needs another entity's live
-position, a `WorldState` lookup the packet parser has no access to). Preferred
-over a computed guess when present, and applied in `apply_monster_move` rather
-than in `interpolated_position` itself, because it describes an arrival, not
-motion in progress. Without a hint of either kind, a stop falls back to
-whatever the entity was already facing a moment before -- not to the parser's
-placeholder zero, which briefly turned every stop into "snap to face east"
-regardless of which way the creature had been walking. `Entity::is_moving`
-answers a related but distinct question, whether that move's *duration* has
-actually elapsed: `destination` alone stays set to the last move's endpoint
-long after it arrives, so checking only that reported a creature "moving"
-forever after its first move ever, with no idle state.
+time since the move was received (`move_started`), clamped to the endpoints.
+
+Facing has two regimes, and both are computed inside `interpolated_position`
+itself -- nowhere else, so nothing can bypass either one. While `t < 1.0`
+(still travelling), it is the direction of travel: `from` and `to` never
+carry their own orientation, both decoding fixed at zero, since the wire does
+not report a *starting* facing. Once `t >= 1.0` (arrived -- which a
+zero-duration move reaches immediately, not through some separate early
+return that would skip this logic entirely), `Entity::arrival_facing` takes
+over if the wire supplied one for this move, falling back to the same
+direction-of-travel computation otherwise. An *arrival* facing is a
+different thing the wire genuinely can supply: three of the five move types
+carry one, and `FACING_ANGLE`'s is parsed into `MonsterMove::facing` rather
+than discarded (`FACING_SPOT` and `FACING_TARGET` also carry one, as a point
+or a guid to face rather than a bare angle, and remain unparsed -- the former
+is a small further step from here, the latter needs another entity's live
+position, a `WorldState` lookup the packet parser has no access to).
+
+Storing the arrival hint anywhere *read* only during motion in progress does
+not work -- it would simply never be seen, since a path in flight is always
+interpolated by direction of travel regardless. It has to live as a value
+consulted specifically once `t` crosses 1.0, which is what `arrival_facing`
+is for. Without either kind of hint, a stop falls back to whatever the
+entity was already facing a moment before -- not to the parser's placeholder
+zero, which briefly turned every stop into "snap to face east" regardless of
+which way the creature had been walking. `Entity::is_moving` answers a
+related but distinct question, whether that move's *duration* has actually
+elapsed: `destination` alone stays set to the last move's endpoint long after
+it arrives, so checking only that reported a creature "moving" forever after
+its first move ever, with no idle state.
 
 **Both are re-evaluated every frame, not on a timer.** An earlier version
 throttled the whole rebuild -- repositioning *and* animating -- to a few times

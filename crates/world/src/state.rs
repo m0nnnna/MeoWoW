@@ -43,6 +43,13 @@ pub struct Entity {
     /// with `move_duration` to interpolate between `position` and
     /// `destination` -- see [`Entity::interpolated_position`].
     pub move_started: Option<std::time::Instant>,
+    /// An explicit facing to arrive at, from the current move
+    /// (`MonsterMove::facing`), consulted only once that move has fully
+    /// arrived. Storing it anywhere read *during* the move does not work: an
+    /// active `SMSG_MONSTER_MOVE` is interpolated by direction of travel
+    /// regardless, so a value read mid-flight is simply never seen. This has
+    /// to live as its own field, checked only when `t >= 1.0`.
+    pub arrival_facing: Option<f32>,
     /// How many updates of any kind have touched this object.
     pub updates: usize,
 }
@@ -76,6 +83,7 @@ impl Entity {
         self.destination = None;
         self.move_duration = None;
         self.move_started = None;
+        self.arrival_facing = None;
     }
 
     /// Where this entity actually is right now, interpolated along a monster
@@ -88,14 +96,15 @@ impl Entity {
     /// from the clock here, so the interpolation math is exercised by a fixed
     /// input rather than a hopefully-fast-enough sleep in tests.
     ///
-    /// While a path is in flight, facing is derived from the direction of
-    /// travel rather than either endpoint's own orientation: `from` and `to`
-    /// both decode with orientation fixed at zero, the wire never having
-    /// reported a *starting* facing. An *arrival* facing is a separate thing
-    /// the wire can report (`MonsterMove::facing`, from `FACING_ANGLE`); that
-    /// is applied once the entity is next given a resting position -- see
-    /// [`WorldState::apply_monster_move`] -- not by this method, which only
-    /// ever computes a heading from movement already in progress.
+    /// Facing has two regimes, computed here and nowhere else so neither can
+    /// be bypassed: while still travelling (`t < 1.0`), it is the direction
+    /// of travel -- `from`/`to` never carry their own orientation, the wire
+    /// not reporting a *starting* facing. Once arrived (`t >= 1.0`, which a
+    /// zero-duration move reaches immediately), `arrival_facing` takes over
+    /// if the wire supplied one, falling back to the same direction-of-travel
+    /// computation otherwise -- never to either endpoint's own hardcoded-zero
+    /// orientation, which a duration of exactly zero would otherwise expose
+    /// by returning `end` verbatim.
     pub fn interpolated_position(&self, now: std::time::Instant) -> Option<Position> {
         let (Some(start), Some(end), Some(duration), Some(started)) = (
             self.position,
@@ -105,16 +114,26 @@ impl Entity {
         ) else {
             return self.position;
         };
-        if duration == 0 {
-            return Some(end);
-        }
-        let elapsed = now.saturating_duration_since(started).as_millis() as f32;
-        let t = (elapsed / duration as f32).clamp(0.0, 1.0);
+
+        let t = if duration == 0 {
+            1.0
+        } else {
+            let elapsed = now.saturating_duration_since(started).as_millis() as f32;
+            (elapsed / duration as f32).clamp(0.0, 1.0)
+        };
+
+        let direction_of_travel = || (end.y - start.y).atan2(end.x - start.x);
+        let orientation = if t >= 1.0 {
+            self.arrival_facing.unwrap_or_else(direction_of_travel)
+        } else {
+            direction_of_travel()
+        };
+
         Some(Position {
             x: start.x + (end.x - start.x) * t,
             y: start.y + (end.y - start.y) * t,
             z: start.z + (end.z - start.z) * t,
-            orientation: (end.y - start.y).atan2(end.x - start.x),
+            orientation,
         })
     }
 
@@ -267,6 +286,7 @@ impl WorldState {
                 destination: None,
                 move_duration: None,
                 move_started: None,
+                arrival_facing: None,
                 updates: 1,
             },
         );
@@ -317,21 +337,24 @@ impl WorldState {
     /// The creature is placed at the path's *start*, not its end: the packet
     /// describes movement about to happen over `duration` milliseconds, and
     /// teleporting it to the destination on arrival of the packet would make
-    /// every creature in the zone jump. `move_duration` and `move_started`
-    /// carry enough to interpolate between the two -- see
-    /// [`Entity::interpolated_position`] -- rather than only ever showing the
-    /// start. A stop (`move_.to` is `None`) clears them the same way a fresher
-    /// authoritative position does.
+    /// every creature in the zone jump. `move_duration`, `move_started` and
+    /// `arrival_facing` carry enough to interpolate between the two and to
+    /// face the right way once there -- see [`Entity::interpolated_position`]
+    /// -- rather than only ever showing the start. A stop (`move_.to` is
+    /// `None`) clears all three the same way a fresher authoritative position
+    /// does.
     ///
-    /// `move_.from.orientation` is not usable as this position's facing --
-    /// the wire never reports a *starting* orientation, so the parser always
-    /// hands back zero there, and using it verbatim would turn every stop
-    /// into "snap to face east." What the wire *can* supply is an explicit
-    /// arrival facing (`move_.facing`, currently only from `FACING_ANGLE`),
-    /// preferred when present; failing that, whatever the entity was already
-    /// facing a moment ago -- mid-interpolation if a path was in flight, its
-    /// last resting facing otherwise -- which is a far better guess than a
-    /// constant that has nothing to do with this creature.
+    /// `entity.position.orientation` is set here too, but only for the
+    /// *next* time `destination` goes back to `None` and `interpolated_position`
+    /// falls through to it verbatim -- while this move is in flight the value
+    /// set below is never read, since `interpolated_position` computes facing
+    /// dynamically from `arrival_facing` and the direction of travel, not
+    /// from this field. `move_.from.orientation` itself is never usable
+    /// directly: the wire never reports a *starting* orientation, so the
+    /// parser always hands back zero there, and using it verbatim would turn
+    /// every stop into "snap to face east." The best available guess is
+    /// whatever the entity was already facing a moment ago -- mid-interpolation
+    /// if a path was in flight, its last resting facing otherwise.
     pub fn apply_monster_move(&mut self, move_: &MonsterMove) {
         let Some(entity) = self.entities.get_mut(&move_.guid) else {
             self.stats.orphaned += 1;
@@ -353,6 +376,7 @@ impl WorldState {
         entity.destination = move_.to;
         entity.move_duration = move_.to.map(|_| move_.duration);
         entity.move_started = move_.to.map(|_| std::time::Instant::now());
+        entity.arrival_facing = move_.facing;
     }
 
     pub fn remove(&mut self, guid: u64) -> bool {
@@ -849,6 +873,102 @@ mod tests {
         assert_eq!(after.x, 100.0, "must clamp at the destination, not overshoot");
     }
 
+    /// The gap a review of the first version of this code found: `facing`
+    /// was parsed and stored, but nothing ever read it back, because
+    /// `interpolated_position` computed direction of travel unconditionally
+    /// -- at every `t`, including `t == 1.0`. An entity that had "arrived"
+    /// kept reporting the heading it walked in on forever, and the wire's
+    /// own arrival hint was silently discarded after being parsed.
+    #[test]
+    fn arrival_facing_takes_over_once_the_move_completes_but_not_before() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(at(100.0, 0.0)), // due "east": direction of travel is 0 rad
+            duration: 4000,
+            stopped: false,
+            facing: Some(2.5), // deliberately unrelated to the direction of travel
+        });
+
+        let entity = world.get(7).unwrap();
+        let started = entity.move_started.unwrap();
+
+        let mid = entity
+            .interpolated_position(started + std::time::Duration::from_millis(2000))
+            .unwrap();
+        assert_eq!(
+            mid.orientation, 0.0,
+            "still en route: direction of travel, not the arrival hint"
+        );
+
+        let arrived = entity
+            .interpolated_position(started + std::time::Duration::from_millis(4000))
+            .unwrap();
+        assert_eq!(
+            arrived.orientation, 2.5,
+            "arrived: the wire's arrival facing must actually take effect"
+        );
+
+        let long_after = entity
+            .interpolated_position(started + std::time::Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(long_after.orientation, 2.5, "and stay in effect, not just at the instant of arrival");
+    }
+
+    /// A duration of exactly zero reaches `t >= 1.0` immediately, so it has
+    /// to go through the same arrival-facing logic as any other completed
+    /// move -- not a separate early return that hands back the endpoint's
+    /// own orientation, which the wire always reports as zero regardless of
+    /// which way the creature actually ended up facing.
+    #[test]
+    fn a_zero_duration_move_prefers_the_arrival_facing_over_the_endpoint_default() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 5.0)), &[])]);
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 5.0),
+            to: Some(at(0.0, 5.0)),
+            duration: 0,
+            stopped: false,
+            facing: Some(1.1),
+        });
+
+        let entity = world.get(7).unwrap();
+        let position = entity
+            .interpolated_position(std::time::Instant::now())
+            .unwrap();
+        assert_eq!(position.orientation, 1.1);
+    }
+
+    /// And without a hint, a zero-duration move still must not fall back to
+    /// the endpoint's hardcoded-zero orientation -- direction of travel is
+    /// the same fallback a normal move gets.
+    #[test]
+    fn a_zero_duration_move_without_a_hint_faces_the_destination() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(at(0.0, 100.0)), // due "north"
+            duration: 0,
+            stopped: false,
+            facing: None,
+        });
+
+        let entity = world.get(7).unwrap();
+        let position = entity
+            .interpolated_position(std::time::Instant::now())
+            .unwrap();
+        assert!(
+            (position.orientation - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "got {}",
+            position.orientation
+        );
+    }
+
     /// An authoritative position -- here, relayed movement, but the same
     /// applies to an object update's own movement block or a re-create --
     /// must cancel a monster-move path in flight. Otherwise the entity
@@ -864,9 +984,10 @@ mod tests {
             to: Some(at(100.0, 0.0)),
             duration: 4000,
             stopped: false,
-            facing: None,
+            facing: Some(2.5),
         });
         assert!(world.get(7).unwrap().destination.is_some());
+        assert!(world.get(7).unwrap().arrival_facing.is_some());
 
         let info = MovementInfo::standing(at(3.0, 4.0), 1);
         world.apply_relayed_movement(7, &info);
@@ -878,6 +999,10 @@ mod tests {
         );
         assert!(entity.move_duration.is_none());
         assert!(entity.move_started.is_none());
+        assert!(
+            entity.arrival_facing.is_none(),
+            "a stale arrival hint must not survive a fresher authoritative position either"
+        );
         assert_eq!(
             entity.interpolated_position(std::time::Instant::now()),
             Some(at(3.0, 4.0)),
