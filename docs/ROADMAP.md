@@ -611,11 +611,54 @@ rather than the bug. `UnitView::is_dead` therefore requires a known maximum,
 and the live run confirms it reads correctly: `Kobold Vermin  unit  2  0/55`
 against three neighbours at full health.
 
-**Not done:** spell damage (`SMSG_SPELLNONMELEEDAMAGELOG`), threat -- opcode
-`0x0483` is captured and looks like it (a victim, a count, then guid/value
-pairs climbing 720 then 1040) but is not parsed -- the corpse and release
-flow, and telling the two swing-refusal opcodes apart, which no experiment has
-yet separated because neither carries a payload and both conditions were
+### 4.4 continued: threat, power, and a packet that was seen and thrown away
+
+Three more of the fight's opcodes now parse, two of them decided by data that
+was already on disk.
+
+**`SMSG_POWER_UPDATE` (`0x0480`) was confirmed from outside itself.** Read as
+`{packed guid, u8 power type, u32 value}`, all thirty in one fight named this
+client and carried power type `1`, and the last read **500** -- and `--units`,
+whose numbers come from the entirely separate object-update path, reported that
+character at `500/1000` rage at the end of the same run. Two parsers with no
+code in common agreeing on a number neither could have taken from the other is
+the strongest check this project has, and it is why the value is folded into
+the entity's own field set through the new `Fields::set` rather than kept
+beside it. One store means the two paths cannot drift.
+
+**`SMSG_THREAT_UPDATE` (`0x0483`) had to be confirmed structurally**, because
+nothing outside the packet knows what a threat number should be. Across a
+fight every one named the kobold as the list's owner, carried exactly one entry
+naming this client, climbed monotonically from 1360 to 4240, and consumed its
+body exactly. A layout wrong about where the count sat would not produce a
+clean tail on every packet, let alone a rising series.
+
+**And the one worth the most: a 46-byte swing.** `SMSG_ATTACKERSTATEUPDATE`
+turned up four bytes longer than every packet seen so far, and the cursor
+discipline caught it as `4 trailing bytes left unread` rather than reading a
+wrong field. Then it was lost -- `hold_connection` printed the refusal's
+*length* and discarded its body, so the single packet that could answer the
+question was seen and thrown away. This is the same shape of mistake as the
+viewer counting decode failures without their bodies, one tool over, and it was
+fixed the same way. Printing refused bodies caught four more in three fights.
+
+All four carry `hit_info = 0x2002`, and all 35 shorter packets have that bit
+clear -- a perfect correlation across 39 swings, which is enough to gate the
+extra `u32` on the bit rather than on how many bytes happen to remain. What the
+number *means* is not settled: it read `2` on two swings that dealt no damage
+and `1` on two that dealt 5 and 4, which is consistent with an amount blocked
+and with several other things. So the flag is named `CARRIES_EXTRA_AMOUNT`, for
+what it does to the layout, and the field stays a number.
+
+The test rig also stopped being a coin flip. A creature wanders while the
+approach walk runs, so a swing sent at where it *was* is refused for range and
+nothing happens -- which reads as the command being broken rather than the
+target having moved two yards. `--attack` now re-swings until swings actually
+come back, and says so when they do not.
+
+**Not done:** spell damage (`SMSG_SPELLNONMELEEDAMAGELOG`), the corpse and
+release flow, and telling the two swing-refusal opcodes apart -- no experiment
+has separated them, because neither carries a payload and both conditions were
 violated at once. Combat has also not been *watched* in the viewer yet: it is
 verified headlessly and through the CLI.
 

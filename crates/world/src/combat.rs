@@ -34,6 +34,21 @@ pub mod hit_info {
     /// damage of the ones without it -- 12 and 8 against a spread of 4 to 6 --
     /// which is what makes this reading a measurement rather than a guess.
     pub const CRITICAL: u32 = 0x0000_0200;
+    /// The packet carries one more `u32` after its usual tail.
+    ///
+    /// **Named for what it does to the layout, not for what it means**, and
+    /// the difference matters. What is established is a perfect correlation
+    /// across 39 captured swings: all 35 packets of 42 bytes have this bit
+    /// clear, and all 4 packets of 46 bytes have it set. That is a structural
+    /// fact and this parser depends on it.
+    ///
+    /// What the extra number *is* remains open. It read `2` on two swings
+    /// that dealt no damage at all and `1` on two that dealt 5 and 4, which
+    /// is consistent with an amount blocked -- a swing blocked in full deals
+    /// nothing -- but "consistent with" is not "confirmed", and a wrong name
+    /// on a combat log misexplains a fight to whoever reads it next. See
+    /// [`MeleeSwing::extra_amount`].
+    pub const CARRIES_EXTRA_AMOUNT: u32 = 0x0000_2000;
 }
 
 /// One damage component of a swing: physical, or a school of magic.
@@ -91,6 +106,17 @@ pub struct MeleeSwing {
     /// the packet -- rather than for what they might be.
     pub trailing: u32,
     pub trailing_byte: u8,
+    /// Present exactly when [`hit_info::CARRIES_EXTRA_AMOUNT`] is set, which
+    /// is what makes this packet 46 bytes rather than 42.
+    ///
+    /// Deliberately not named `blocked`. Four captures carry it: `2` on two
+    /// swings that dealt no damage, `1` on two that dealt 5 and 4. A block
+    /// absorbing a whole swing would explain that, and so would two or three
+    /// other things, and the cost of guessing is a combat log that confidently
+    /// says the wrong word. Left as a number until an observation pins it --
+    /// the same rule `describe_cast_failure` and `SpellCooldown::second`
+    /// already live by.
+    pub extra_amount: Option<u32>,
 }
 
 impl MeleeSwing {
@@ -140,6 +166,13 @@ pub fn parse_melee_swing(body: &[u8]) -> Result<MeleeSwing, Error> {
     let victim_state = r.u32()?;
     let trailing = r.u32()?;
     let trailing_byte = r.u8()?;
+    // Gated on the bit rather than on how many bytes happen to be left: a
+    // parser that read "one more u32 if any remain" would silently absorb a
+    // field of any other shape that turned up here, which is exactly how a
+    // wrong layout stops announcing itself.
+    let extra_amount = (hit_info & hit_info::CARRIES_EXTRA_AMOUNT != 0)
+        .then(|| r.u32())
+        .transpose()?;
     r.finish()?;
 
     Ok(MeleeSwing {
@@ -152,6 +185,7 @@ pub fn parse_melee_swing(body: &[u8]) -> Result<MeleeSwing, Error> {
         victim_state,
         trailing,
         trailing_byte,
+        extra_amount,
     })
 }
 
@@ -201,6 +235,40 @@ pub fn parse_attack_stop(body: &[u8]) -> Result<AttackStop, Error> {
         victim,
         trailing,
     })
+}
+
+/// One unit's threat list, from `SMSG_THREAT_UPDATE`.
+///
+/// The guid is the unit whose list it is -- the *victim* -- and the entries
+/// are everyone on it. Confirmed structurally rather than by a single number,
+/// because there is nothing outside the packet to check a threat figure
+/// against: across a whole fight every one of these named the kobold as the
+/// owner, carried exactly one entry naming this client, climbed monotonically
+/// from 1360 to 4240 as the fight went on, and consumed its body exactly.
+/// A layout that was wrong about where the count sat would not have produced a
+/// clean tail on every packet, let alone a rising series.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreatUpdate {
+    /// Whose list this is.
+    pub victim: u64,
+    /// Who is on it, and by how much. Ordered as the packet sent them.
+    pub entries: Vec<(u64, u32)>,
+}
+
+pub fn parse_threat_update(body: &[u8]) -> Result<ThreatUpdate, Error> {
+    let mut r = Reader::new(body, "SMSG_THREAT_UPDATE");
+    let victim = read_packed_guid(&mut r)?;
+    let count = r.u32()?;
+    // A count is a length taken off the wire, and this one has only ever been
+    // seen as 1. Reserving on it would let a corrupt packet ask for gigabytes
+    // before the reader ran out of input and said so.
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        let who = read_packed_guid(&mut r)?;
+        entries.push((who, r.u32()?));
+    }
+    r.finish()?;
+    Ok(ThreatUpdate { victim, entries })
 }
 
 /// One swing as a line of combat log.
@@ -362,6 +430,69 @@ mod tests {
         body.push(0);
         assert!(parse_melee_swing(&body).is_err());
         assert!(parse_melee_swing(&HIT[..HIT.len() - 1]).is_err());
+    }
+
+    /// The 46-byte shape, verbatim from a later capture: a kobold swinging
+    /// for nothing at all, with the extra field reading 2.
+    ///
+    /// This packet is the reason the parser gates on the bit rather than on
+    /// bytes remaining. It was seen once, printed only as "4 trailing bytes
+    /// left unread", and lost -- the tool counted the refusal without keeping
+    /// the body. Printing refused bodies caught four more in three fights.
+    #[test]
+    fn the_longer_swing_shape_is_gated_on_its_flag() {
+        let body = [
+            0x02, 0x20, 0x00, 0x00, 0xcb, 0xdd, 0x0b, 0x06, 0x30, 0xf1, 0x01, 0x32, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(body.len(), 46);
+        let swing = parse_melee_swing(&body).expect("the 46-byte shape must parse");
+        assert_eq!(swing.hit_info, 0x2002);
+        assert_eq!(swing.victim, ME);
+        assert_eq!(swing.damage, 0, "this swing dealt nothing");
+        assert_eq!(swing.extra_amount, Some(2));
+
+        // And the correlation the parser depends on: with the bit cleared the
+        // same trailing bytes must be refused rather than absorbed, or a
+        // shape of some other length would be read as this one.
+        let mut without = body;
+        without[1] = 0x00;
+        assert!(
+            parse_melee_swing(&without).is_err(),
+            "the extra field was read without its flag"
+        );
+    }
+
+    /// And the 42-byte shape must not grow one.
+    #[test]
+    fn the_usual_swing_shape_has_no_extra_field() {
+        assert_eq!(parse_melee_swing(HIT).unwrap().extra_amount, None);
+    }
+
+    /// Verbatim from the capture. The kobold's list, with this client the
+    /// only thing on it.
+    #[test]
+    fn a_threat_update_matches_a_captured_live_packet() {
+        let body = [
+            0xcb, 0xdd, 0x0b, 0x06, 0x30, 0xf1, 0x01, 0x00, 0x00, 0x00, 0x01, 0x32, 0x50, 0x05,
+            0x00, 0x00,
+        ];
+        let threat = parse_threat_update(&body).expect("the captured packet must parse");
+        assert_eq!(threat.victim, 0xf130_0000_0600_0bdd);
+        assert_eq!(threat.entries, vec![(ME, 1360)]);
+    }
+
+    /// The count is read from the wire, so a packet claiming more entries than
+    /// it carries must run out of input rather than be trusted.
+    #[test]
+    fn a_threat_update_that_overclaims_its_count_fails() {
+        let body = [
+            0xcb, 0xdd, 0x0b, 0x06, 0x30, 0xf1, 0xff, 0xff, 0xff, 0xff, 0x01, 0x32, 0x50, 0x05,
+            0x00, 0x00,
+        ];
+        assert!(parse_threat_update(&body).is_err());
     }
 
     fn named(guid: u64) -> String {

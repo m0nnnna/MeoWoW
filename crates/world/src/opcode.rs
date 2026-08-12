@@ -124,6 +124,13 @@ pub mod server {
     /// condition without the other. Named for what they are.
     pub const ATTACK_SWING_REFUSED_A: u16 = 0x0145;
     pub const ATTACK_SWING_REFUSED_B: u16 = 0x0146;
+    /// One unit's power changing without a whole object update behind it.
+    /// Confirmed by its last captured value agreeing with what the
+    /// object-update path independently reported -- see
+    /// [`crate::update::PowerUpdate`].
+    pub const POWER_UPDATE: u16 = 0x0480;
+    /// Who is on a unit's threat list. See [`crate::combat::ThreatUpdate`].
+    pub const THREAT_UPDATE: u16 = 0x0483;
 
     /// The same body as [`MESSAGECHAT`], sent for a GM's lines.
     pub const GM_MESSAGECHAT: u16 = 0x03B3;
@@ -170,6 +177,8 @@ pub fn describe(opcode: u16) -> String {
         server::ATTACKER_STATE_UPDATE => "SMSG_ATTACKERSTATEUPDATE",
         server::ATTACK_SWING_REFUSED_A => "SMSG_ATTACKSWING_REFUSED(0x0145)",
         server::ATTACK_SWING_REFUSED_B => "SMSG_ATTACKSWING_REFUSED(0x0146)",
+        server::POWER_UPDATE => "SMSG_POWER_UPDATE",
+        server::THREAT_UPDATE => "SMSG_THREAT_UPDATE",
         server::GM_MESSAGECHAT => "SMSG_GM_MESSAGECHAT",
         other => return format!("opcode {other:#06x}"),
     };

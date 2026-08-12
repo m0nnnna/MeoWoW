@@ -156,6 +156,14 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   intact — a visible `$s1` says "not implemented", a fabricated `47` says
   nothing and is believed. Same rule as `describe_cast_failure` naming one
   status code, one layer up.
+- **Print the body, not the length, of anything you refuse.** A parser that
+  declines an unconfirmed shape is only useful if the shape survives the
+  refusal. `SMSG_ATTACKERSTATEUPDATE` arrived four bytes longer than any packet
+  seen before, the cursor caught it as trailing bytes -- and the tool logged
+  the *length* and dropped the bytes, so the one packet that could have
+  answered the question was seen and lost. Two separate tools here had the same
+  hole. If a parser's own doc comment says "a capture would settle this", then
+  something has to be keeping captures.
 - **A reply you cannot get is not the same as a reply you did not earn.**
   `CMSG_ATTACKSWING` could not be read off a capture -- nothing acknowledges an
   opcode, and an outgoing number that is wrong gets read as some *other* valid

@@ -828,10 +828,30 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
                     connection.set_selection(guid)?;
                     connection.attack_swing(guid)?;
                     println!("swinging at {guid:#x}");
-                    println!(
-                        "  nothing acknowledges the swing itself. What proves the opcode is\n  \
-                         whether combat packets start arriving that were not before."
-                    );
+
+                    // And check it actually started, rather than assuming.
+                    // A creature keeps wandering while the approach walk runs,
+                    // so a swing sent at where it was is refused for range and
+                    // nothing happens -- which reads as the whole command
+                    // being broken rather than as the target having moved two
+                    // yards. Confirmed by watching for swings, not by hoping.
+                    let mut started = false;
+                    for _ in 0..3 {
+                        let batch = connection.drain(std::time::Duration::from_millis(1200), 128)?;
+                        let report = state.replicate(&batch, None);
+                        print_events(&report, &state, character.guid);
+                        if !report.swings.is_empty() {
+                            started = true;
+                            break;
+                        }
+                        connection.attack_swing(guid)?;
+                    }
+                    if !started {
+                        println!(
+                            "  no swings came back. The target has probably moved out of \
+                             reach again -- rerun, or watch the census under --stay."
+                        );
+                    }
                 }
                 None => println!("\nnothing replicated to attack"),
             }
@@ -1106,6 +1126,22 @@ fn print_events(report: &world::Replication, state: &world::WorldState, own_guid
         println!(
             "  {}",
             world::combat::describe_swing(swing, own_guid, |guid| combat_name(state, guid))
+        );
+    }
+    // Threat is returned rather than stored -- nothing in the interface reads
+    // a threat table yet -- so printing it here is the only thing keeping the
+    // parse honest. A category nobody consumes is a category nobody notices
+    // has stopped working.
+    for threat in &report.threat {
+        let entries: Vec<String> = threat
+            .entries
+            .iter()
+            .map(|(who, value)| format!("{} {value}", combat_name(state, *who)))
+            .collect();
+        println!(
+            "  threat on {}: {}",
+            combat_name(state, threat.victim),
+            entries.join(", ")
         );
     }
 }
@@ -1390,10 +1426,19 @@ fn hold_connection(
         swings += report.swings.len();
         totals.attacks_started += report.attacks_started;
         totals.attacks_stopped += report.attacks_stopped;
-        for (opcode, error, _) in &report.failures {
+        totals.power_updates += report.power_updates;
+        for (opcode, error, body) in &report.failures {
             // Printed rather than counted: a packet that will not decode here
             // is a layout error in something the replicated world depends on.
             println!("  undecodable {}: {error}", world::opcode::describe(*opcode));
+            // With its bytes. Several parsers here deliberately refuse shapes
+            // nobody has captured and say a capture is what would settle
+            // them -- and the first refusal of a 46-byte swing printed only
+            // its length, so the one packet that could have resolved the
+            // question was seen and thrown away.
+            if let Ok(body) = body {
+                println!("    {} bytes: {}", body.len(), hex_preview(body, 64));
+            }
         }
         totals.failures.extend(report.failures);
 
@@ -1437,10 +1482,11 @@ fn hold_connection(
     );
     if swings > 0 || totals.attacks_started > 0 {
         println!(
-            "  combat: {swings} swings, {} attacks started, {} stopped, {} still swinging",
+            "  combat: {swings} swings, {} attacks started, {} stopped,              {} still swinging, {} power updates",
             totals.attacks_started,
             totals.attacks_stopped,
-            state.attacking.len()
+            state.attacking.len(),
+            totals.power_updates
         );
     }
     println!(

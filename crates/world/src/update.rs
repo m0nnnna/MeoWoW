@@ -217,6 +217,21 @@ impl Fields {
         self.values.iter().copied()
     }
 
+    /// Writes one field, keeping the set sorted.
+    ///
+    /// Exists for the packets that change a single field without carrying a
+    /// whole update block -- `SMSG_POWER_UPDATE` is the first. Going through
+    /// the same field table as an object update matters: a rage bar fed from
+    /// somewhere else would be a second source of truth for a value the
+    /// update blocks also carry, and the two would disagree the moment one
+    /// path missed a packet.
+    pub fn set(&mut self, index: u16, value: u32) {
+        match self.values.binary_search_by_key(&index, |(at, _)| *at) {
+            Ok(found) => self.values[found].1 = value,
+            Err(insert) => self.values.insert(insert, (index, value)),
+        }
+    }
+
     /// Folds a later update into this set, overwriting fields it names.
     ///
     /// This is what makes a `Values` block meaningful. Such a block carries
@@ -294,6 +309,56 @@ impl Block {
 ///
 /// A mask byte says which of the eight bytes are non-zero, and only those
 /// follow. Guids are mostly small numbers in a 64-bit space, so this typically
+/// One unit's power changing, from `SMSG_POWER_UPDATE`.
+///
+/// Not strictly a combat packet -- power regenerates out of combat too -- but
+/// it was found in a combat capture, because that is when a warrior's rage
+/// moves. Thirty of them arrived during one fight.
+///
+/// **Confirmed against something outside the packet.** Read as
+/// `{packed guid, u8 power type, u32 value}`, all thirty named this client's
+/// own guid, all carried power type `1`, and the last one read **500** -- and
+/// `wow-cli world --units`, which gets its numbers from the entirely separate
+/// object-update path, reported that character at `500/1000` rage at the end
+/// of the same run. Two parsers with no code in common agreeing on a number
+/// neither could have taken from the other is the strongest check available
+/// here, and it is the reason [`Fields::set`] exists rather than this feeding
+/// a bar of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerUpdate {
+    pub guid: u64,
+    /// Indexes the seven consecutive power fields from [`fields::UNIT_POWER1`],
+    /// the same way [`fields::UNIT_BYTES_0`]'s fourth byte does. `1` is rage.
+    pub power_type: u8,
+    pub value: u32,
+}
+
+impl PowerUpdate {
+    /// Which update field this writes, or `None` for a power index past the
+    /// end of the array.
+    ///
+    /// Bounds-checked rather than trusted: a power type of 200 would otherwise
+    /// write over whatever field happens to sit 200 slots past the powers, and
+    /// that is a corruption with no error attached to it.
+    pub fn field(&self) -> Option<u16> {
+        (u16::from(self.power_type) < fields::POWER_COUNT)
+            .then(|| fields::UNIT_POWER1 + u16::from(self.power_type))
+    }
+}
+
+pub fn parse_power_update(body: &[u8]) -> Result<PowerUpdate, Error> {
+    let mut r = Reader::new(body, "SMSG_POWER_UPDATE");
+    let guid = read_packed_guid(&mut r)?;
+    let power_type = r.u8()?;
+    let value = r.u32()?;
+    r.finish()?;
+    Ok(PowerUpdate {
+        guid,
+        power_type,
+        value,
+    })
+}
+
 /// saves five or six bytes per reference -- and object updates are nothing but
 /// guid references.
 pub fn read_packed_guid(reader: &mut Reader<'_>) -> Result<u64, Error> {

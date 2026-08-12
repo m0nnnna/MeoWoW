@@ -93,6 +93,8 @@ pub enum Error {
          until one carries a different number -- see `combat::MeleeSwing`"
     )]
     UnconfirmedSwingDamageBlocks { count: u8 },
+    #[error("SMSG_POWER_UPDATE: power type {got} is past the end of the power array")]
+    UnknownPowerType { got: u8 },
 }
 
 /// A bounds-checked cursor over a packet body.

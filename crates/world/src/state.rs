@@ -348,6 +348,12 @@ pub struct Replication {
     /// health arrives separately, as an ordinary field update, and is already
     /// folded into the entity by the time this is read.
     pub swings: Vec<crate::combat::MeleeSwing>,
+    /// `SMSG_POWER_UPDATE`s folded into an entity's fields this batch.
+    pub power_updates: usize,
+    /// Threat lists that arrived this batch. Returned rather than stored: no
+    /// part of the interface reads a threat table yet, and keeping one would
+    /// be state with a lifetime to manage and no consumer to justify it.
+    pub threat: Vec<crate::combat::ThreatUpdate>,
     /// `SMSG_ATTACKSTART`s folded into [`WorldState::attacking`] this batch.
     pub attacks_started: usize,
     /// `SMSG_ATTACKSTOP`s that cleared an entry from
@@ -865,6 +871,48 @@ impl WorldState {
                 crate::opcode::server::ATTACKER_STATE_UPDATE => {
                     match crate::combat::parse_melee_swing(&packet.body) {
                         Ok(swing) => report.swings.push(swing),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // A single field changing, without a whole update block. Folded
+                // into the entity's own field set rather than kept beside it,
+                // so a rage bar has one source of truth: the object-update
+                // path carries this value too, and two stores of it would
+                // disagree the moment either missed a packet.
+                crate::opcode::server::POWER_UPDATE => {
+                    match crate::update::parse_power_update(&packet.body) {
+                        Ok(power) => match (self.entities.get_mut(&power.guid), power.field()) {
+                            (Some(entity), Some(field)) => {
+                                entity.fields.set(field, power.value);
+                                report.power_updates += 1;
+                            }
+                            // A power for something not in view is not an
+                            // error, it is an update about a unit this client
+                            // never saw created -- counted like any other
+                            // orphan so a rising number is visible.
+                            (None, _) => self.stats.orphaned += 1,
+                            (Some(_), None) => report.failures.push((
+                                packet.opcode,
+                                crate::protocol::Error::UnknownPowerType {
+                                    got: power.power_type,
+                                },
+                                Ok(packet.body.clone()),
+                            )),
+                        },
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::THREAT_UPDATE => {
+                    match crate::combat::parse_threat_update(&packet.body) {
+                        Ok(threat) => report.threat.push(threat),
                         Err(error) => report.failures.push((
                             packet.opcode,
                             error,
@@ -1489,6 +1537,76 @@ mod tests {
         assert_eq!(report.swings.len(), 1, "the swing never reached the caller");
         assert_eq!(report.swings[0].damage, 4);
         assert_eq!(report.swings[0].attacker, 0x32);
+    }
+
+    /// A power update has to reach the *entity's own field set*, not a store
+    /// beside it: the object-update path carries this value too, and two
+    /// copies disagree the moment either misses a packet.
+    #[test]
+    fn a_power_update_lands_in_the_entity_that_owns_it() {
+        use crate::client::Packet;
+
+        const ME: u64 = 0x32;
+        let mut world = WorldState::new();
+        // A player with rage already known, so there is something to overwrite
+        // and the test cannot pass by merely inserting.
+        let mut fields = crate::update::Fields::default();
+        fields.set(crate::update::fields::UNIT_POWER1 + 1, 100);
+        // Race, class, gender, power type -- one per byte, in that order. A
+        // unit frame reads its power *through* this byte, so an entity
+        // without it reports no power at all however many power fields it
+        // has: human warrior, rage.
+        fields.set(crate::update::fields::UNIT_BYTES_0, 1 | (1 << 8) | (1 << 24));
+        world.create(
+            ME,
+            crate::update::ObjectType::Player,
+            &crate::update::Movement::default(),
+            &fields,
+        );
+
+        // Verbatim from the capture: rage reaching 500, the value `--units`
+        // independently reported at the end of that run.
+        let body = [0x01, 0x32, 0x01, 0xf4, 0x01, 0x00, 0x00];
+        let report = world.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::POWER_UPDATE,
+                body: body.to_vec(),
+            }],
+            None,
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.power_updates, 1);
+        assert_eq!(
+            world.get(ME).and_then(|e| e.power()),
+            Some(500),
+            "the update did not reach the field a unit frame reads"
+        );
+    }
+
+    /// A power index past the end of the array must be refused, not written:
+    /// it would otherwise overwrite whatever field sits that far past the
+    /// powers, which is corruption with no error attached.
+    #[test]
+    fn a_power_type_past_the_array_is_refused() {
+        use crate::client::Packet;
+
+        let mut world = WorldState::new();
+        world.create(
+            0x32,
+            crate::update::ObjectType::Player,
+            &crate::update::Movement::default(),
+            &crate::update::Fields::default(),
+        );
+        let body = [0x01, 0x32, 200, 0x01, 0x00, 0x00, 0x00];
+        let report = world.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::POWER_UPDATE,
+                body: body.to_vec(),
+            }],
+            None,
+        );
+        assert_eq!(report.power_updates, 0);
+        assert_eq!(report.failures.len(), 1, "a bad power type was written anyway");
     }
 
     /// Attack start and stop have to balance, or the client believes a fight
