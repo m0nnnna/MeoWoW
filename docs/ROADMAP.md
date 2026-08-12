@@ -668,6 +668,29 @@ it against is not verified by looking at it**, however carefully. Drawing the
 player supplied the missing reference, which is why a rendering feature found
 a protocol-adjacent bug that four milestones of watching had not.
 
+### Every building was back to front too
+
+Reported from playing: "the church isn't facing the right direction". Correct,
+and it is the same fact as the creatures.
+
+`scene::placement_rotation` offset a placement's yaw by `-90` degrees where it
+should be `+90` -- 180 degrees out, arriving by the same wrong assumption that
+an M2 faces +X. So the abbey, the stable, the mine entrances and every fence in
+Elwynn were mirrored, and had been for as long as buildings have rendered.
+
+**Northshire Abbey is a compass, and that is the whole reason this got fixed.**
+Rendered from the starting lawn at `-90`, it is a blank wall of stained glass
+with no way in -- the apse. At `+90` it is the entrance, with its steps and its
+portico, which is what a player standing there sees. A tree hides this
+perfectly. A fence hides it. A wolf hides it. A door does not.
+
+That is two separate 180-degree errors found in one session, both from the same
+root, and both invisible until something asymmetric with a known orientation
+was put in front of the camera. The rendering doc now says so where the
+convention is defined, and the old paragraph claiming "facing needed no offset
+at all" is gone -- it was confidently wrong, and it had been verified by
+watching a window, which is exactly the observation that could not disprove it.
+
 ## 4.4: melee combat
 
 `wow-cli world --enter Testwolf --attack --stay 40 --capture <file>` walks a

@@ -209,6 +209,10 @@ the stored middle component is height, and the other two run *inwards* from the
 grid corner, so converting is `32 * TILE_SIZE - v`. Getting it wrong puts every
 object somewhere plausible but entirely elsewhere.
 
+The *rotation* has its own trap, and this one shipped wrong: the stored yaw is
+offset by 90 degrees, and the sign of that offset was inverted, mirroring every
+building in the world. See "Facing needs half a turn" below.
+
 Rotations are Euler degrees in the game's internal Y-up space, and yaw is offset
 by 90 degrees because the stored angle is measured from a different axis than
 the model's forward.
@@ -472,17 +476,37 @@ result into a shared buffer addressed by instance index, which is real
 architecture work, not a quick follow-up. Deferring it is still the right
 call; this paragraph exists so that call is on record rather than assumed.
 
-**Facing needed no offset at all.** The entity placement formula originally
-carried the doodad path's quarter-turn correction, which exists because ADT
-placement rotations are measured from a different axis than an M2's forward
-(see "Placement coordinates" above) -- a fact about *that* data source.
-Network orientation already matches this codebase's own convention directly:
-direction of travel is `(orientation.cos(), orientation.sin())` everywhere
-movement is computed, against an M2's own +X-forward axis, so rotating
-entities by the raw angle already points them the right way. The offset was
-carried over from the doodad formula without being re-derived for a different
-input, and stayed wrong for as long as it did because -- as this section used
-to say -- facing had never been checked against a reference client.
+**Facing needs half a turn, and both places that set it were wrong about
+which way a model faces.**
+
+This section used to claim entity facing needed no offset, on the grounds that
+an M2's forward is +X. It is not: **an M2's local forward is -X**, and until
+that was measured, every creature in the world was turned exactly backwards
+and every doodad and building was mirrored with it.
+
+Two separate paths carry the same fact, and both are now corrected:
+
+- **Entities** (`world::set_entities`) rotate by `orientation + PI`.
+- **ADT placements** (`scene::placement_rotation`) offset yaw by `+90`, not
+  `-90`. That is the same 180 degrees, arriving through the doodad formula's
+  own quarter-turn.
+
+Neither could be checked for as long as it went unchecked, and the reason is
+worth stating because it is not carelessness. Creature headings come from the
+server with nothing to compare them against, and a wolf, a tree or a fence
+gives no clue which end is the front. The two references that finally settled
+it are both asymmetric and both external to the renderer:
+
+- The **player's own character**, once it was drawn: turn it to a heading the
+  server confirms (`wow-cli world --face 0`), put the camera at the matching
+  yaw so it stands directly behind, and whether you see a face or a back is
+  not a matter of opinion.
+- **Northshire Abbey**, once the camera was pointed at it: at `-90` it renders
+  a blank wall of stained glass with no way in, and at `+90` it renders the
+  entrance, its steps and its portico. A building with a door is a compass.
+
+The general form, which is in `CLAUDE.md` as well: a value with nothing to
+compare it against is not verified by looking at it, however carefully.
 
 Verified with the same two-client rig that closed 3.4: one client walked while
 the other -- running the real `wow-viewer` binary rather than a test harness --

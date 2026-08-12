@@ -61,11 +61,25 @@ pub fn placement_position(raw: [f32; 3]) -> Vec3 {
 /// Builds the rotation for a placement.
 ///
 /// Rotations are Euler degrees in the game's internal Y-up space. Yaw carries
-/// almost all of the meaning -- doodads are rarely tilted -- and it is offset by
-/// 90 degrees because the stored angle is measured from a different axis than
-/// the model's forward.
+/// almost all of the meaning -- doodads are rarely tilted -- and it is offset
+/// by 90 degrees because the stored angle is measured from a different axis
+/// than the model's forward.
+///
+/// **The sign of that offset was wrong, and it put every building in the world
+/// back to front.** It read `-90` on the assumption that an M2 faces +X; the
+/// model faces -X, the same fact that had every creature turned around (see
+/// `world::set_entities`). A symmetric doodad hides this perfectly and a tree
+/// hides it completely, which is why it survived: nothing in a forest looks
+/// wrong when the forest is mirrored.
+///
+/// Northshire Abbey is what settled it. From the starting lawn, `-90` renders
+/// a blank wall of stained glass with no way in -- the apse, the far end of
+/// the building -- while `+90` renders the entrance, its steps and its
+/// portico, which is what a player standing there actually sees. A building
+/// with a door is an asymmetric reference, and it is the first one this
+/// renderer was pointed at.
 pub fn placement_rotation(rotation: [f32; 3]) -> Quat {
-    Quat::from_rotation_z((rotation[1] - 90.0).to_radians())
+    Quat::from_rotation_z((rotation[1] + 90.0).to_radians())
         * Quat::from_rotation_y((-rotation[0]).to_radians())
         * Quat::from_rotation_x(rotation[2].to_radians())
 }
@@ -333,13 +347,23 @@ mod tests {
         assert!((turned - Vec3::Z).length() < 1e-5, "yaw tilted the model");
     }
 
+    /// Pins the yaw offset, including its sign.
+    ///
+    /// The sign is the whole point: this test previously asserted the opposite
+    /// one and passed, because both are internally consistent and nothing here
+    /// knows which way a building faces. What decided it was a render of
+    /// Northshire Abbey showing its door rather than its back wall -- see
+    /// [`placement_rotation`]. These numbers exist so that result cannot be
+    /// undone by accident.
     #[test]
     fn yaw_rotates_about_the_vertical_axis() {
+        // A stored yaw of 90 degrees plus the 90 degree offset is half a turn.
         let a = placement_rotation([0.0, 90.0, 0.0]) * Vec3::X;
-        // 90 degrees of yaw, minus the 90 degree offset, is no rotation.
-        assert!((a - Vec3::X).length() < 1e-5, "got {a:?}");
+        assert!((a + Vec3::X).length() < 1e-5, "got {a:?}");
 
+        // And a further 90 degrees is another quarter turn, in the direction
+        // that makes the abbey face its own lawn.
         let b = placement_rotation([0.0, 180.0, 0.0]) * Vec3::X;
-        assert!((b - Vec3::Y).length() < 1e-4, "got {b:?}");
+        assert!((b + Vec3::Y).length() < 1e-4, "got {b:?}");
     }
 }
