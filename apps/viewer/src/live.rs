@@ -183,7 +183,8 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
     };
     let look = crate::character::resolve(chain, appearance);
     tracing::info!(
-        "character look: body {:?}, hair {:?}, geosets {:?}",
+        "character look: skin {:?}, body {:?}, hair {:?}, geosets {:?}",
+        look.skin,
         look.body,
         look.hair,
         look.geosets

@@ -625,6 +625,49 @@ turning them into one skin needs a texture blit this client does not do yet.
 The base skin is used alone until it does. Hair renders geometrically but
 untextured for the same class of reason.
 
+### The skin is composed, and every entity was facing backwards
+
+The character's face, beard and underwear are now blended into its skin, and
+the render found a bug that had been in the tree since 3.5.
+
+**The composition regions were derived, not transcribed.** 3.3.5a ships no
+`CharComponentTextureSections` table -- the layout lives inside the real
+client -- so the regions are the classic 256-unit character layout doubled to
+this build's 512x512 base skin. What makes that a measurement is that the
+overlay files are *exactly* the sizes it predicts, three times over: face
+upper 256x64, face lower 256x128, pelvis 256x128. A wrong layout would have to
+be wrong by zero pixels in three independent places. Facial hair ships at half
+resolution and is stretched over the same face regions, and is the one layer
+with real alpha -- a beard blended as an opaque rectangle would be a box on
+the chin.
+
+**Then the screenshot showed the character's face, and the camera is behind
+it.**
+
+Entity headings were being applied raw, under a comment asserting that "an
+M2's forward is +X" -- a comment which also admitted, in the same breath, that
+facing had never been checked against a live reference. It could not have
+been. The only entity whose heading this client *knows* is the player's own,
+and until this milestone the player's body was not drawn. Creature headings
+come from the server and there is nothing to check them against; a wolf's
+silhouette does not advertise which end is the head at nine yards.
+
+So **every creature has been facing backwards since 3.5**, and the milestone
+that introduced facing was verified by watching exactly the thing that could
+not show it.
+
+What settled it, with two constants chosen independently: `wow-cli world
+--face 0` turned the character to heading zero and the server confirmed
+`facing 0.00 rad`; a screenshot with the camera at yaw zero -- which puts it
+directly behind a character facing +X -- then showed the model's face. With a
+half turn applied it shows its back. The server picked one number, the camera
+picked the other, and they agree that an M2's forward is -X.
+
+The lesson is not "check facing". It is that **a value with nothing to compare
+it against is not verified by looking at it**, however carefully. Drawing the
+player supplied the missing reference, which is why a rendering feature found
+a protocol-adjacent bug that four milestones of watching had not.
+
 ## 4.4: melee combat
 
 `wow-cli world --enter Testwolf --attack --stay 40 --capture <file>` walks a

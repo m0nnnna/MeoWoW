@@ -498,23 +498,33 @@ impl World {
                 .or_default()
                 .push(Mat4::from_scale_rotation_translation(
                     Vec3::splat(placement.scale),
-                    // No quarter-turn here, unlike the doodad path: that
-                    // offset corrects for ADT placement rotations being
-                    // measured from a different axis than an M2's forward
-                    // (see `docs/RENDERING.md`, "Placement coordinates"), a
-                    // fact about *that* data source, not about M2 models in
-                    // general. Network orientation is a different value with
-                    // a different, already-consistent convention: direction
-                    // of travel is `(orientation.cos(), orientation.sin())`
-                    // everywhere else in this codebase (`Connection::walk`,
-                    // `drive_live_movement`, `interpolated_position`), and an
-                    // M2's forward is +X, so rotating by the raw angle already
-                    // points +X at that direction with nothing to correct.
-                    // The quarter-turn was carried over from the doodad
-                    // formula without being re-derived for this different
-                    // input, and facing was never checked against a live
-                    // reference to catch it -- see the same doc section.
-                    glam::Quat::from_rotation_z(placement.orientation),
+                    // Half a turn, and it is measured rather than assumed.
+                    //
+                    // This is *not* the doodad path's quarter-turn, which
+                    // corrects for ADT placements being measured from a
+                    // different axis (see `docs/RENDERING.md`). It is a
+                    // separate fact about M2 character and creature models:
+                    // their local forward is -X, so rotating by the raw
+                    // network heading points them exactly backwards.
+                    //
+                    // The comment that used to sit here asserted the opposite
+                    // -- "an M2's forward is +X" -- and admitted in the same
+                    // breath that facing had never been checked against a
+                    // live reference. It could not be, because the one entity
+                    // whose heading this client *knows* is the player's own,
+                    // and the player's body was not drawn. Every creature has
+                    // therefore been facing backwards since 3.5, which a
+                    // wolf's silhouette hides rather well.
+                    //
+                    // What settled it: `wow-cli world --face 0` turned the
+                    // character to heading zero and the server confirmed it,
+                    // then a screenshot with the camera at yaw zero -- which
+                    // puts it directly behind a character facing +X -- showed
+                    // the model's face. With this half turn it shows its back.
+                    // Two independently chosen constants, one from the server
+                    // and one from the camera, agreeing on which way is
+                    // forward.
+                    glam::Quat::from_rotation_z(placement.orientation + std::f32::consts::PI),
                     placement.position,
                 ));
         }

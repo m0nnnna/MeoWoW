@@ -216,10 +216,27 @@ pub fn load_dressed(
             })
         };
 
-        let uploaded = file.as_ref().and_then(|f| {
-            let bytes = chain.read(f).ok()?;
-            let parsed = blp::Blp::parse(&bytes).ok()?;
-            Some(upload_blp(gpu, &parsed, f))
+        // A character's body texture is composed in memory from several
+        // layers and has no file behind it, so it is uploaded from pixels
+        // before any path is considered.
+        let composed = look
+            .filter(|_| def.kind == 1)
+            .and_then(|look| look.skin.as_ref())
+            .map(|skin| {
+                render::texture::upload_rgba(
+                    gpu,
+                    skin.width,
+                    skin.height,
+                    &skin.rgba,
+                    "character skin",
+                )
+            });
+        let uploaded = composed.or_else(|| {
+            file.as_ref().and_then(|f| {
+                let bytes = chain.read(f).ok()?;
+                let parsed = blp::Blp::parse(&bytes).ok()?;
+                Some(upload_blp(gpu, &parsed, f))
+            })
         });
 
         match uploaded {

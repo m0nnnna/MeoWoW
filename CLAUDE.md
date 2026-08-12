@@ -14,7 +14,7 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
 | Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated creatures and players slide along their actual path, turn to face it, and play the model's own walk/stand cycles |
 | Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, `F1` to rearrange, saved to `ui.toml` |
-| Game | **4.3 done**: spellbook, three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. Spell damage, threat and the corpse flow remain. Inventory and quests follow |
+| Game | **4.3 done**: spellbook, three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. Spell damage, threat and the corpse flow remain. Inventory and quests follow |
 
 Roughly 57% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
@@ -301,6 +301,17 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   placed — sent the search to the protocol instead of the renderer. When
   something is missing, confirm whether it was *submitted* before asking whether
   it was produced.
+- **A value with nothing to compare it against is not verified by looking at
+  it.** Entity facing was applied raw for four milestones under a comment
+  claiming an M2's forward is +X, and every creature in the world was turned
+  exactly backwards the whole time. Watching it live could not catch it: the
+  only heading this client *knows* is the player's own, and the player's body
+  was not drawn, while a creature's heading comes from the server with nothing
+  to check it against. It fell out the moment the player appeared on screen --
+  turn the character to a heading the server confirms, put the camera at the
+  matching yaw, and whether you see a face or a back is no longer a matter of
+  opinion. Before trusting a value because it "looks right", ask what it is
+  being compared *to*.
 - **Some rules can only be found by looking.** Geoset selection -- which of a
   character model's seventeen haircuts and six beards to draw -- took four
   attempts, and each wrong one was a *reasonable* reading of the same table.

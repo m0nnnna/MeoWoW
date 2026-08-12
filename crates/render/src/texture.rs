@@ -149,6 +149,49 @@ fn upload_compressed(
     }
 }
 
+/// Uploads pixels that never came from a BLP.
+///
+/// A player's skin is *composed* -- a base body texture with a face, facial
+/// hair and underwear blended into fixed regions of it -- so by the time it
+/// reaches the GPU there is no file behind it to hand [`upload_blp`]. One mip
+/// level only: building a chain for a texture assembled this frame would cost
+/// more than it saves for the handful of characters on screen.
+pub fn upload_rgba(gpu: &Gpu, width: u32, height: u32, rgba: &[u8], label: &str) -> UploadedTexture {
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let texture = create(gpu, label, width, height, format, 1);
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    UploadedTexture {
+        view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        texture,
+        width,
+        height,
+        format,
+        mip_levels: 1,
+        compressed: false,
+        fallback_reason: None,
+        bytes_uploaded: rgba.len(),
+    }
+}
+
 fn upload_decoded(
     gpu: &Gpu,
     tex: &Blp,

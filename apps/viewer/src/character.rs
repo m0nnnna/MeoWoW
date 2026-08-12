@@ -55,10 +55,29 @@ impl Appearance {
     }
 }
 
+/// A skin composed from its layers, ready to upload.
+#[derive(Clone, PartialEq)]
+pub struct Skin {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl std::fmt::Debug for Skin {
+    /// Without this a `Look` prints a megabyte of pixels into the log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Skin({}x{})", self.width, self.height)
+    }
+}
+
 /// Everything the model loader needs to dress one character.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Look {
-    /// The body texture, already a full archive path.
+    /// The composed body texture: base skin with the face, facial hair and
+    /// underwear blended into it. `None` without a game installation.
+    pub skin: Option<Skin>,
+    /// The base body texture's path, kept for logs and for the case where
+    /// composition could not run.
     pub body: Option<String>,
     /// The hair texture.
     pub hair: Option<String>,
@@ -131,8 +150,9 @@ pub fn resolve(chain: &mut Chain, look: Appearance) -> Look {
         .ok()
         .and_then(|bytes| CharSections::parse(&bytes).ok());
 
-    let (mut body, mut hair) = (None, None);
+    let (mut body, mut hair, mut skin) = (None, None, None);
     if let Some(sections) = &sections {
+        skin = compose(chain, sections, look);
         // Section type 0 is the base skin, indexed by skin colour. The face,
         // facial hair and underwear are separate *layers* meant to be composed
         // onto this one; composing them needs a texture blit this client does
@@ -198,10 +218,170 @@ pub fn resolve(chain: &mut Chain, look: Appearance) -> Look {
     }
 
     Look {
+        skin,
         body,
         hair,
         geosets,
     }
+}
+
+
+/// Where each layer goes on the composed skin, in the base texture's own
+/// pixels.
+///
+/// **Derived from the textures, not transcribed.** 3.3.5a has no
+/// `CharComponentTextureSections` table -- the layout lives in the client --
+/// so the regions below are the classic 256-unit character layout doubled to
+/// the 512x512 base skin this build ships. What makes that a measurement
+/// rather than a guess is that the overlay textures are *exactly* the sizes it
+/// predicts, in three independent places:
+///
+/// | layer | region says | the file is |
+/// |---|---|---|
+/// | face upper | 256x64 | 256x64 |
+/// | face lower | 256x128 | 256x128 |
+/// | pelvis | 256x128 | 256x128 |
+///
+/// Three exact agreements between a layout and files that know nothing about
+/// it is the same kind of evidence as two parsers arriving at the same rage
+/// value. A wrong layout would have to be wrong by zero pixels three times.
+mod region {
+    /// `(x, y, width, height)` on a 512x512 base skin.
+    pub type Rect = (u32, u32, u32, u32);
+    pub const FACE_UPPER: Rect = (0, 320, 256, 64);
+    pub const FACE_LOWER: Rect = (0, 384, 256, 128);
+    /// Underwear sits on the upper legs.
+    pub const PELVIS: Rect = (256, 192, 256, 128);
+}
+
+/// Reads a texture and expands it to RGBA.
+fn layer(chain: &mut Chain, path: &str) -> Option<(u32, u32, Vec<u8>)> {
+    let bytes = chain.read(path).ok()?;
+    let image = blp::Blp::parse(&bytes).ok()?;
+    let rgba = image.decode_rgba(0)?;
+    Some((image.width(), image.height(), rgba))
+}
+
+/// Blends one layer into a region of the skin.
+///
+/// Nearest-neighbour where the layer and the region disagree on size, which
+/// happens for facial hair: it ships at half the face's resolution and is
+/// meant to be stretched over it. Alpha is honoured rather than assumed --
+/// the skin and face layers are opaque and simply overwrite, but facial hair
+/// carries an 8-bit alpha and a beard drawn as an opaque rectangle would be a
+/// box on the chin.
+fn blend(skin: &mut Skin, rect: region::Rect, layer: (u32, u32, Vec<u8>)) {
+    let (rx, ry, rw, rh) = rect;
+    let (lw, lh, pixels) = layer;
+    if lw == 0 || lh == 0 {
+        return;
+    }
+    for y in 0..rh {
+        let sy = ry + y;
+        if sy >= skin.height {
+            break;
+        }
+        // Sampled from the layer by proportion, so a half-size layer stretches
+        // to fill its region instead of covering a quarter of it.
+        let ly = (y * lh / rh).min(lh - 1);
+        for x in 0..rw {
+            let sx = rx + x;
+            if sx >= skin.width {
+                break;
+            }
+            let lx = (x * lw / rw).min(lw - 1);
+            let src = ((ly * lw + lx) * 4) as usize;
+            let dst = ((sy * skin.width + sx) * 4) as usize;
+            let (Some(s), Some(d)) = (pixels.get(src..src + 4), skin.rgba.get(dst..dst + 4)) else {
+                continue;
+            };
+            let alpha = s[3] as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let blended = [
+                ((s[0] as u32 * alpha + d[0] as u32 * (255 - alpha)) / 255) as u8,
+                ((s[1] as u32 * alpha + d[1] as u32 * (255 - alpha)) / 255) as u8,
+                ((s[2] as u32 * alpha + d[2] as u32 * (255 - alpha)) / 255) as u8,
+                255,
+            ];
+            skin.rgba[dst..dst + 4].copy_from_slice(&blended);
+        }
+    }
+}
+
+/// Builds one character's skin out of its layers.
+///
+/// The base body first, then the face, then facial hair over the face, then
+/// underwear. Order matters and is the order a person would paint them: a
+/// beard belongs on top of the chin it grows from, not under it.
+fn compose(chain: &mut Chain, sections: &CharSections, look: Appearance) -> Option<Skin> {
+    let base = find(sections, look.race, look.gender, 0, 0, look.skin)?;
+    let (width, height, rgba) = layer(chain, &base)?;
+    let mut skin = Skin {
+        width,
+        height,
+        rgba,
+    };
+
+    // The face is two halves in the first two texture columns of one row.
+    if let Some(row) = row_for(sections, look.race, look.gender, 1, look.face, look.skin) {
+        if let Some(l) = layer(chain, row.0.as_str()) {
+            blend(&mut skin, region::FACE_LOWER, l);
+        }
+        if let Some(l) = layer(chain, row.1.as_str()) {
+            blend(&mut skin, region::FACE_UPPER, l);
+        }
+    }
+
+    // Facial hair, over the face rather than under it. Indexed by hair colour,
+    // not skin colour -- a beard matches the hair on the head.
+    if let Some(row) = row_for(
+        sections,
+        look.race,
+        look.gender,
+        2,
+        look.facial_hair,
+        look.hair_colour,
+    ) {
+        if let Some(l) = layer(chain, row.0.as_str()) {
+            blend(&mut skin, region::FACE_LOWER, l);
+        }
+        if let Some(l) = layer(chain, row.1.as_str()) {
+            blend(&mut skin, region::FACE_UPPER, l);
+        }
+    }
+
+    // Underwear. Not modesty for its own sake: the base skin has no smallclothes
+    // painted on, so without this the character is nude.
+    if let Some(row) = row_for(sections, look.race, look.gender, 4, 0, look.skin) {
+        if let Some(l) = layer(chain, row.0.as_str()) {
+            blend(&mut skin, region::PELVIS, l);
+        }
+    }
+
+    Some(skin)
+}
+
+/// A section row's first two texture columns.
+fn row_for(
+    sections: &CharSections,
+    race: u8,
+    gender: u8,
+    section_type: u32,
+    variation: u8,
+    colour: u8,
+) -> Option<(String, String)> {
+    sections
+        .iter()
+        .find(|row| {
+            row.race() == u32::from(race)
+                && row.gender() == u32::from(gender)
+                && row.section_type() == section_type
+                && row.variation() == u32::from(variation)
+                && row.colour() == u32::from(colour)
+        })
+        .map(|row| (row.texture_0().to_string(), row.texture_1().to_string()))
 }
 
 /// One `CharSections` row's first texture, if it exists.
