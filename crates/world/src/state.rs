@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 
+use crate::client::Packet;
 use crate::movement::MovementInfo;
 use crate::update::{Block, Fields, MonsterMove, ObjectType, Position};
 
@@ -72,6 +73,22 @@ pub struct Stats {
     /// Updates naming a guid never created. Each one is a change applied to
     /// nothing, and a rising count means create blocks are being lost.
     pub orphaned: usize,
+}
+
+/// What one batch of packets did to a [`WorldState`].
+///
+/// Returned by [`WorldState::replicate`] rather than folded silently, because
+/// a caller checking that replication is actually working needs to see it:
+/// zero failures across hundreds of applied changes is the evidence, not an
+/// assumption.
+#[derive(Debug, Default)]
+pub struct Replication {
+    pub object_updates: usize,
+    pub monster_moves: usize,
+    pub relayed_moves: usize,
+    pub destroys: usize,
+    /// Packets that would not decode, with their payload for offline analysis.
+    pub failures: Vec<(u16, crate::protocol::Error, Result<Vec<u8>, crate::protocol::Error>)>,
 }
 
 #[derive(Debug, Default)]
@@ -237,6 +254,115 @@ impl WorldState {
         } else {
             false
         }
+    }
+
+    /// Folds every packet that carries world state from one drained batch.
+    ///
+    /// One place rather than one per caller, because replication only works
+    /// if *all* of the inputs are applied: object updates create and change
+    /// things, relayed movement moves other players, monster moves move
+    /// creatures, and destroys remove them. Living here rather than being
+    /// reimplemented per caller is not just deduplication -- two independent
+    /// opcode dispatch tables over the same state machine drift apart
+    /// silently: a new opcode wired into one and not the other freezes
+    /// whatever it should have moved, in exactly the "looked plausible and
+    /// was quietly frozen" way this method exists to prevent, just one level
+    /// up. A packet that fails to decode costs only itself and is counted in
+    /// [`Replication::failures`] rather than treated as fatal or dropped
+    /// silently -- a removal that fails to decode is a permanent ghost if
+    /// nothing counts it, no less than a create block that goes missing.
+    ///
+    /// `blocks_out`, when given, collects every block from a successfully
+    /// parsed object update in addition to folding it into `self` -- for
+    /// callers that want to report create/out-of-range detail beyond what
+    /// state itself tracks (`wow-cli` does). Callers that do not care pass
+    /// `None` and pay nothing for the fields they ignore.
+    pub fn replicate(
+        &mut self,
+        packets: &[Packet],
+        mut blocks_out: Option<&mut Vec<Block>>,
+    ) -> Replication {
+        use crate::update;
+
+        let mut report = Replication::default();
+
+        for packet in packets {
+            match packet.opcode {
+                crate::opcode::server::UPDATE_OBJECT
+                | crate::opcode::server::COMPRESSED_UPDATE_OBJECT => {
+                    let compressed =
+                        packet.opcode == crate::opcode::server::COMPRESSED_UPDATE_OBJECT;
+                    let parsed = if compressed {
+                        update::parse_compressed_update_object(&packet.body)
+                    } else {
+                        update::parse_update_object(&packet.body)
+                    };
+                    match parsed {
+                        Ok(blocks) => {
+                            report.object_updates += 1;
+                            self.apply(&blocks);
+                            if let Some(out) = blocks_out.as_deref_mut() {
+                                out.extend(blocks);
+                            }
+                        }
+                        Err(error) => {
+                            let payload = if compressed {
+                                update::decompress_update_object(&packet.body)
+                            } else {
+                                Ok(packet.body.clone())
+                            };
+                            report.failures.push((packet.opcode, error, payload));
+                        }
+                    }
+                }
+                crate::opcode::server::MONSTER_MOVE => {
+                    match update::parse_monster_move(&packet.body) {
+                        Ok(moved) => {
+                            report.monster_moves += 1;
+                            self.apply_monster_move(&moved);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::MOVE_START_FORWARD
+                | crate::opcode::server::MOVE_STOP
+                | crate::opcode::server::MOVE_HEARTBEAT => {
+                    match crate::protocol::parse_movement(&packet.body) {
+                        Ok((mover, info)) => {
+                            report.relayed_moves += 1;
+                            self.apply_relayed_movement(mover, &info);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::DESTROY_OBJECT => {
+                    let mut reader =
+                        crate::protocol::Reader::new(&packet.body, "SMSG_DESTROY_OBJECT");
+                    match update::read_packed_guid(&mut reader) {
+                        Ok(guid) => {
+                            report.destroys += 1;
+                            self.remove(guid);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        report
     }
 }
 

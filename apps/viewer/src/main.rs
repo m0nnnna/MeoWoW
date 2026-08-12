@@ -1240,6 +1240,9 @@ struct App {
     last_heartbeat: Instant,
     last_ping: Instant,
     last_entity_rebuild: Instant,
+    /// The `undrawable` count last logged, so the rebuild timer warns once
+    /// per change instead of every tick for the rest of the session.
+    last_undrawable_warned: usize,
 }
 
 impl App {
@@ -1265,6 +1268,7 @@ impl App {
             last_heartbeat: Instant::now(),
             last_ping: Instant::now(),
             last_entity_rebuild: Instant::now(),
+            last_undrawable_warned: 0,
         }
     }
 }
@@ -1346,6 +1350,7 @@ impl ApplicationHandler for App {
                     self.last_heartbeat = Instant::now();
                     self.last_ping = Instant::now();
                     self.last_entity_rebuild = Instant::now();
+                    self.last_undrawable_warned = 0;
                 }
                 self.live = live;
                 Some(scene)
@@ -1564,11 +1569,16 @@ impl App {
                             &mut self.chain,
                             &placements,
                         );
-                        if undrawable > 0 {
+                        // Warn on change, not on every rebuild: this timer
+                        // fires several times a second for the life of the
+                        // session, and a zone with one unloadable model would
+                        // otherwise log about it forever.
+                        if undrawable > 0 && undrawable != self.last_undrawable_warned {
                             tracing::warn!(
                                 "{undrawable} replicated object(s) had no loadable model"
                             );
                         }
+                        self.last_undrawable_warned = undrawable;
                         self.last_entity_rebuild = Instant::now();
                     }
                 }

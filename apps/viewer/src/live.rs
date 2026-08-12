@@ -152,55 +152,15 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
 
 /// Folds a batch of drained packets into replicated world state.
 ///
-/// Mirrors `replicate` in `tools/wow-cli/src/main.rs`: object updates create
-/// and change things, relayed movement moves other players, monster moves
-/// move creatures, and destroys remove them. All four have to be handled in
-/// one place -- a caller that folded only object updates would build a world
-/// that looked plausible and was quietly frozen everywhere else. Returns how
-/// many packets failed to decode; a packet that fails costs only itself, so it
-/// is counted and skipped rather than aborting the batch.
+/// A thin wrapper over `WorldState::replicate`, which is the single place
+/// this opcode dispatch lives -- it used to be duplicated here and in
+/// `tools/wow-cli`, and two independent tables over the same state machine
+/// drift silently: a new opcode wired into one and not the other freezes
+/// whatever it should have moved, unnoticed. The viewer only wants a failure
+/// count, so that is all this returns; `wow-cli` wants the fuller
+/// `world::Replication` and calls the method directly.
 pub fn replicate(state: &mut world::WorldState, packets: &[world::client::Packet]) -> usize {
-    use world::update;
-
-    let mut failed = 0usize;
-    for packet in packets {
-        match packet.opcode {
-            world::opcode::server::UPDATE_OBJECT | world::opcode::server::COMPRESSED_UPDATE_OBJECT => {
-                let compressed = packet.opcode == world::opcode::server::COMPRESSED_UPDATE_OBJECT;
-                let parsed = if compressed {
-                    update::parse_compressed_update_object(&packet.body)
-                } else {
-                    update::parse_update_object(&packet.body)
-                };
-                match parsed {
-                    Ok(blocks) => state.apply(&blocks),
-                    Err(_) => failed += 1,
-                }
-            }
-            world::opcode::server::MONSTER_MOVE => {
-                match update::parse_monster_move(&packet.body) {
-                    Ok(moved) => state.apply_monster_move(&moved),
-                    Err(_) => failed += 1,
-                }
-            }
-            world::opcode::server::MOVE_START_FORWARD
-            | world::opcode::server::MOVE_STOP
-            | world::opcode::server::MOVE_HEARTBEAT => {
-                match world::protocol::parse_movement(&packet.body) {
-                    Ok((mover, info)) => state.apply_relayed_movement(mover, &info),
-                    Err(_) => failed += 1,
-                }
-            }
-            world::opcode::server::DESTROY_OBJECT => {
-                let mut reader = world::protocol::Reader::new(&packet.body, "SMSG_DESTROY_OBJECT");
-                if let Ok(guid) = update::read_packed_guid(&mut reader) {
-                    state.remove(guid);
-                }
-            }
-            _ => {}
-        }
-    }
-    failed
+    state.replicate(packets, None).failures.len()
 }
 
 /// Turns replicated state into what the renderer and the summary text both

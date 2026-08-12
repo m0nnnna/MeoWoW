@@ -23,7 +23,7 @@ pub use opcode::ClientOpcode;
 pub use protocol::{
     Appearance, AuthResponse, Character, Equipment, WorldPosition, EQUIPMENT_SLOTS,
 };
-pub use state::WorldState;
+pub use state::{Replication, WorldState};
 pub use update::{Block, MonsterMove, ObjectType, Position};
 
 /// Names the playable races by id.

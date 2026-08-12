@@ -658,7 +658,7 @@ fn hold_connection(
     let mut packets = 0usize;
     let mut pings = 0usize;
     let mut last_ping = std::time::Instant::now();
-    let mut totals = Replication::default();
+    let mut totals = world::Replication::default();
 
     /// Where a replicated object was first and last seen, so a journey can be
     /// reported rather than only a final position.
@@ -676,7 +676,7 @@ fn hold_connection(
         let batch = connection.drain(std::time::Duration::from_millis(300), 48)?;
         packets += batch.len();
 
-        let report = replicate(state, &batch, None);
+        let report = state.replicate(&batch, None);
         totals.object_updates += report.object_updates;
         totals.monster_moves += report.monster_moves;
         totals.relayed_moves += report.relayed_moves;
@@ -777,104 +777,6 @@ fn hold_connection(
 /// One malformed packet says something specific about one code path; aborting
 /// on it would hide how many of the rest were fine, which is the number that
 /// says whether a layout is wrong in general or only in a rare branch.
-/// What one batch of packets did to the replicated world.
-#[derive(Default)]
-struct Replication {
-    object_updates: usize,
-    monster_moves: usize,
-    relayed_moves: usize,
-    /// Packets that would not decode, with their payload for offline analysis.
-    failures: Vec<(u16, world::protocol::Error, Result<Vec<u8>, world::protocol::Error>)>,
-}
-
-/// Folds every packet that carries world state into `state`.
-///
-/// One place rather than several, because replication only works if *all* of
-/// the inputs are applied: object updates create and change things, relayed
-/// movement moves other players, and monster moves move creatures. A caller
-/// that handled two of the three would build a world that looked plausible and
-/// was quietly frozen in part.
-fn replicate(
-    state: &mut world::WorldState,
-    packets: &[world::client::Packet],
-    blocks_out: Option<&mut Vec<world::Block>>,
-) -> Replication {
-    use world::update;
-
-    let mut report = Replication::default();
-    let mut collected = Vec::new();
-
-    for packet in packets {
-        match packet.opcode {
-            world::opcode::server::UPDATE_OBJECT
-            | world::opcode::server::COMPRESSED_UPDATE_OBJECT => {
-                let compressed =
-                    packet.opcode == world::opcode::server::COMPRESSED_UPDATE_OBJECT;
-                let parsed = if compressed {
-                    update::parse_compressed_update_object(&packet.body)
-                } else {
-                    update::parse_update_object(&packet.body)
-                };
-                match parsed {
-                    Ok(blocks) => {
-                        report.object_updates += 1;
-                        state.apply(&blocks);
-                        collected.extend(blocks);
-                    }
-                    Err(error) => {
-                        let payload = if compressed {
-                            update::decompress_update_object(&packet.body)
-                        } else {
-                            Ok(packet.body.clone())
-                        };
-                        report.failures.push((packet.opcode, error, payload));
-                    }
-                }
-            }
-            world::opcode::server::MONSTER_MOVE => {
-                match update::parse_monster_move(&packet.body) {
-                    Ok(moved) => {
-                        report.monster_moves += 1;
-                        state.apply_monster_move(&moved);
-                    }
-                    Err(error) => {
-                        report
-                            .failures
-                            .push((packet.opcode, error, Ok(packet.body.clone())))
-                    }
-                }
-            }
-            world::opcode::server::MOVE_START_FORWARD
-            | world::opcode::server::MOVE_STOP
-            | world::opcode::server::MOVE_HEARTBEAT => {
-                match world::protocol::parse_movement(&packet.body) {
-                    Ok((mover, info)) => {
-                        report.relayed_moves += 1;
-                        state.apply_relayed_movement(mover, &info);
-                    }
-                    Err(error) => {
-                        report
-                            .failures
-                            .push((packet.opcode, error, Ok(packet.body.clone())))
-                    }
-                }
-            }
-            world::opcode::server::DESTROY_OBJECT => {
-                let mut reader = world::protocol::Reader::new(&packet.body, "SMSG_DESTROY_OBJECT");
-                if let Ok(guid) = update::read_packed_guid(&mut reader) {
-                    state.remove(guid);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(out) = blocks_out {
-        out.extend(collected);
-    }
-    report
-}
-
 fn report_object_updates(
     packets: &[world::client::Packet],
     own_guid: u64,
@@ -884,7 +786,7 @@ fn report_object_updates(
 
     let mut state = world::WorldState::new();
     let mut blocks = Vec::new();
-    let replication = replicate(&mut state, packets, Some(&mut blocks));
+    let replication = state.replicate(packets, Some(&mut blocks));
     let parsed = replication.object_updates;
     let failures = replication.failures;
 

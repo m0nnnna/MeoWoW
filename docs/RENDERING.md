@@ -376,11 +376,20 @@ expected until height-following exists.
 
 `LiveWorld` now carries a `world::WorldState` alongside the connection instead
 of the one-shot `Vec<Entity>` the login burst used to produce. Every batch
-`pump_live_connection` drains is folded into it with `live::replicate`, which
-mirrors `tools/wow-cli`'s function of the same name: object updates, relayed
-movement, monster moves and destroys all have to be handled in the same place,
-because a caller that folded only object updates would build a world that
-looked plausible and was quietly frozen everywhere else.
+`pump_live_connection` drains is folded into it with `WorldState::replicate`:
+object updates, relayed movement, monster moves and destroys all have to be
+handled in the same place, because a caller that folded only object updates
+would build a world that looked plausible and was quietly frozen everywhere
+else.
+
+That dispatch briefly existed twice -- once here, once in `tools/wow-cli` --
+before moving into `WorldState` itself. Two copies of an opcode table over the
+same state machine is exactly the failure the previous paragraph describes,
+one level up: a new opcode wired into one and not the other freezes whatever
+it should have moved, silently. `live::replicate` is now a two-line wrapper
+that calls `WorldState::replicate` and keeps only the failure count the viewer
+cares about; `wow-cli` calls the same method for the fuller `Replication`
+report it prints.
 
 `live::drawable_entities` turns that state into what the renderer needs --
 guid, display id, position, orientation, scale, excluding the character's own
