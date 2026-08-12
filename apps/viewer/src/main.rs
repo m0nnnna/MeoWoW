@@ -278,16 +278,16 @@ fn build_live_scene(
     )?;
 
     if args.entities {
-        let placements: Vec<world::EntityPlacement> = live
-            .entities
-            .iter()
-            .map(|entity| world::EntityPlacement {
-                display_id: entity.display_id,
-                position: entity.position,
-                orientation: entity.orientation,
-                scale: entity.scale,
-            })
-            .collect();
+        let placements: Vec<world::EntityPlacement> =
+            live::drawable_entities(&live.state, live.guid)
+                .iter()
+                .map(|entity| world::EntityPlacement {
+                    display_id: entity.display_id,
+                    position: entity.position,
+                    orientation: entity.orientation,
+                    scale: entity.scale,
+                })
+                .collect();
         let undrawable = world.set_entities(gpu, meshes, chain, &placements);
         if undrawable > 0 {
             tracing::warn!("{undrawable} object(s) had no loadable model");
@@ -384,6 +384,16 @@ const LIVE_WALK_SPEED: f32 = 7.0;
 /// reference client -- see the facing note in `docs/RENDERING.md` -- but close
 /// enough that the character does not spin wildly or crawl.
 const LIVE_TURN_RATE: f32 = std::f32::consts::PI;
+
+/// How often the replicated world's instance buffers are rebuilt for drawing.
+///
+/// A timer, not a rebuild-on-`WorldState::stats()`-change: in a populated zone
+/// stats change on almost every packet -- the docs' own replication test saw
+/// hundreds of monster moves in a couple of minutes -- so gating on "did the
+/// count change" would rebuild about as often as no gate at all. A fixed
+/// interval is what actually bounds the cost, and a few times a second is
+/// plenty for creatures that are not being animated or interpolated anyway.
+const LIVE_ENTITY_REBUILD_EVERY: Duration = Duration::from_millis(200);
 
 /// Which movement keys are currently held.
 #[derive(Default, Clone, Copy)]
@@ -888,9 +898,10 @@ fn material_bind_groups(
 /// reported is on screen next to the tile the renderer chose.
 fn describe_live(live: &live::LiveWorld) -> String {
     let tile = world::tile_at(live.position);
+    let entities = live::drawable_entities(&live.state, live.guid);
     let mut text = format!(
         "{} on {} (map {}, {})\nat {:.1}, {:.1}, {:.1} facing {:.2} rad\n\
-         tile {},{}\n{} objects reported",
+         tile {},{}\n{} objects drawable",
         live.character,
         live.map_name,
         live.map_id,
@@ -901,11 +912,11 @@ fn describe_live(live: &live::LiveWorld) -> String {
         live.orientation,
         tile.0,
         tile.1,
-        live.entities.len(),
+        entities.len(),
     );
 
     let mut by_kind: std::collections::BTreeMap<&str, usize> = Default::default();
-    for entity in &live.entities {
+    for entity in &entities {
         *by_kind.entry(entity.kind.name()).or_default() += 1;
     }
     if !by_kind.is_empty() {
@@ -918,17 +929,13 @@ fn describe_live(live: &live::LiveWorld) -> String {
 
     // The nearest thing is what the camera is most likely pointed at, so it is
     // the one worth naming when checking that positions landed correctly.
-    if let Some(nearest) = live
-        .entities
-        .iter()
-        .min_by(|a, b| {
-            let (a, b) = (
-                a.position.distance_squared(live.position),
-                b.position.distance_squared(live.position),
-            );
-            a.total_cmp(&b)
-        })
-    {
+    if let Some(nearest) = entities.iter().min_by(|a, b| {
+        let (a, b) = (
+            a.position.distance_squared(live.position),
+            b.position.distance_squared(live.position),
+        );
+        a.total_cmp(&b)
+    }) {
         text.push_str(&format!(
             "\nnearest {} guid {:#x} display {}{} at {:.0} units",
             nearest.kind.name(),
@@ -942,8 +949,24 @@ fn describe_live(live: &live::LiveWorld) -> String {
         ));
     }
 
-    for note in &live.skipped {
-        text.push_str(&format!("\n{note}"));
+    // Replication's own health check: the invariant this project's docs call
+    // out is `created - removed == held`, and orphaned/failed counts should
+    // stay at zero. Showing them here means a replication bug shows up as a
+    // number that does not add up long before the world looks wrong.
+    let stats = live.state.stats();
+    text.push_str(&format!(
+        "\n{} replicated ({} created, {} removed, {} moves, {} orphaned)",
+        live.state.len(),
+        stats.created,
+        stats.removed,
+        stats.movement_updates,
+        stats.orphaned,
+    ));
+    if live.fold_failures > 0 {
+        text.push_str(&format!(
+            "\n{} update packet(s) failed to parse",
+            live.fold_failures
+        ));
     }
     text
 }
@@ -1216,6 +1239,7 @@ struct App {
     live_move: Option<LiveMove>,
     last_heartbeat: Instant,
     last_ping: Instant,
+    last_entity_rebuild: Instant,
 }
 
 impl App {
@@ -1240,6 +1264,7 @@ impl App {
             live_move: None,
             last_heartbeat: Instant::now(),
             last_ping: Instant::now(),
+            last_entity_rebuild: Instant::now(),
         }
     }
 }
@@ -1315,11 +1340,12 @@ impl ApplicationHandler for App {
         ) {
             Ok((scene, live)) => {
                 if live.is_some() {
-                    // Start the movement and keepalive clocks from the moment
-                    // the connection is actually ready to drive, not from
-                    // whenever the window happened to be created.
+                    // Start the movement, keepalive and rebuild clocks from
+                    // the moment the connection is actually ready to drive,
+                    // not from whenever the window happened to be created.
                     self.last_heartbeat = Instant::now();
                     self.last_ping = Instant::now();
+                    self.last_entity_rebuild = Instant::now();
                 }
                 self.live = live;
                 Some(scene)
@@ -1514,6 +1540,39 @@ impl App {
                 &mut self.chain,
                 eye,
             );
+
+            // Rebuilding every instance buffer every frame is wasteful, so
+            // this is throttled by a timer rather than running unconditionally
+            // -- see `LIVE_ENTITY_REBUILD_EVERY` for why a timer was chosen
+            // over gating on `WorldState::stats()` changing.
+            if self.args.entities {
+                if let Some(live) = &self.live {
+                    if self.last_entity_rebuild.elapsed() >= LIVE_ENTITY_REBUILD_EVERY {
+                        let placements: Vec<crate::world::EntityPlacement> =
+                            live::drawable_entities(&live.state, live.guid)
+                                .iter()
+                                .map(|entity| crate::world::EntityPlacement {
+                                    display_id: entity.display_id,
+                                    position: entity.position,
+                                    orientation: entity.orientation,
+                                    scale: entity.scale,
+                                })
+                                .collect();
+                        let undrawable = world.set_entities(
+                            &r.gpu,
+                            &mut r.meshes,
+                            &mut self.chain,
+                            &placements,
+                        );
+                        if undrawable > 0 {
+                            tracing::warn!(
+                                "{undrawable} replicated object(s) had no loadable model"
+                            );
+                        }
+                        self.last_entity_rebuild = Instant::now();
+                    }
+                }
+            }
         }
 
         if let (Some(Scene::Model(m)), Some(bones)) = (&r.scene, &r.bones) {
@@ -1750,8 +1809,13 @@ impl App {
         let Some(live) = self.live.as_mut() else {
             return;
         };
-        if let Err(e) = live.connection.drain(Duration::from_millis(1), 64) {
-            tracing::warn!("draining the live connection failed: {e:#}");
+        match live.connection.drain(Duration::from_millis(1), 64) {
+            // Every batch has to go through all four kinds of change replicate
+            // handles -- object updates, relayed movement, monster moves,
+            // destroys -- or the world ends up quietly frozen wherever the
+            // dropped kind would have moved something.
+            Ok(packets) => live.fold_failures += live::replicate(&mut live.state, &packets),
+            Err(e) => tracing::warn!("draining the live connection failed: {e:#}"),
         }
         if self.last_ping.elapsed() >= ::world::client::PING_INTERVAL {
             // Fire and forget: waiting for the pong would block the render

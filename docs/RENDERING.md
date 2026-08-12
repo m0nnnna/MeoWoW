@@ -360,13 +360,52 @@ No background thread reads the socket: the connection is pumped once per frame
 with a 1 ms `drain`, which is what keeps `SMSG_TIME_SYNC_REQ` answered, plus an
 explicit keepalive no faster than `PING_INTERVAL`. Doing this on the render
 thread is deliberate, not a shortcut -- RC4 header state cannot be shared or
-rewound, so exactly one place may ever read the socket, and packets here are
-small and infrequent enough that a frame stall from a blocking read is not a
-real cost.
+rewound, so exactly one place may ever read the socket.
+
+The keepalive uses `Connection::send_ping`, which fires and returns rather than
+waiting for the pong. `Connection::ping` -- fine in a CLI, where the round trip
+*is* the point -- blocks for one on a render thread: tens of milliseconds on
+the live realm, and up to the full read timeout if the server stalls, every
+`PING_INTERVAL`. The next frame's `drain` collects the echo instead.
 
 Z is left exactly as the server last reported it and never re-derived from
 terrain: walking across sloped ground floats or sinks the character, which is
 expected until height-following exists.
+
+### Drawing the replicated world
+
+`LiveWorld` now carries a `world::WorldState` alongside the connection instead
+of the one-shot `Vec<Entity>` the login burst used to produce. Every batch
+`pump_live_connection` drains is folded into it with `live::replicate`, which
+mirrors `tools/wow-cli`'s function of the same name: object updates, relayed
+movement, monster moves and destroys all have to be handled in the same place,
+because a caller that folded only object updates would build a world that
+looked plausible and was quietly frozen everywhere else.
+
+`live::drawable_entities` turns that state into what the renderer needs --
+guid, display id, position, orientation, scale, excluding the character's own
+body -- read fresh from `state` each time it is called rather than cached,
+since the state changes on every fold.
+
+**Rebuilding is throttled by a timer, not by whether `WorldState::stats()`
+changed.** `LIVE_ENTITY_REBUILD_EVERY` gates the instance-buffer rebuild to a
+few times a second. Stats looked like the more precise trigger -- only rebuild
+when something actually happened -- but in a populated zone something happens
+on nearly every packet: the protocol doc's own two-client session saw hundreds
+of monster moves in a couple of minutes. Gating on that would rebuild about as
+often as no gate at all, which defeats the point. A fixed interval is what
+actually bounds the cost, and creatures that are not being animated or
+interpolated do not need updating faster than that anyway.
+
+**A replicated entity jumps rather than walks.** With no interpolation along a
+monster move's path and no skeletal animation driven by movement, an entity's
+on-screen position simply teleports to wherever the rebuild timer last read
+from `WorldState`. This is expected, not a bug -- see the deferred half of
+milestone 3.5 in `docs/ROADMAP.md`.
+
+Verified with the same two-client rig that closed 3.4: one client walked while
+the other -- running the real `wow-viewer` binary rather than a test harness --
+drew the replicated character moving.
 
 ### What still looks wrong
 

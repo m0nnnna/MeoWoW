@@ -43,10 +43,16 @@ pub struct LiveWorld {
     pub map_name: String,
     pub position: Vec3,
     pub orientation: f32,
-    pub entities: Vec<Entity>,
-    /// Objects seen but not drawable, and why. Reported rather than hidden:
-    /// silently drawing a subset of the world looks like a rendering bug.
-    pub skipped: Vec<String>,
+    /// Everything replicated so far: every object in range, kept live rather
+    /// than a one-time snapshot of who was around at login. `connect` seeds it
+    /// from the login burst; the caller folds every later batch into it too
+    /// (see [`replicate`]), which is what makes creatures and other players
+    /// move on screen instead of standing wherever they were at login forever.
+    pub state: world::WorldState,
+    /// Packets that failed to fold into `state`, summed over the whole
+    /// session rather than per batch -- a per-batch count resets to zero every
+    /// frame and hides a decode that is failing steadily.
+    pub fold_failures: usize,
     /// Kept alive rather than dropped at the end of [`connect`]: the viewer
     /// walks the character over this same connection, and RC4 header state
     /// cannot be shared or rewound, so a fresh connection could not pick up
@@ -125,7 +131,8 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
 
     // Nothing marks the end of the login burst, so read until it goes quiet.
     let burst = connection.drain(std::time::Duration::from_millis(1500), 512)?;
-    let (entities, skipped) = collect_entities(&burst, character.guid);
+    let mut state = world::WorldState::new();
+    let fold_failures = replicate(&mut state, &burst);
 
     let (map_directory, map_name) = map_directory(chain, landed.map)?;
     Ok(LiveWorld {
@@ -137,95 +144,112 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
         // Already in world space -- see the module comment.
         position: Vec3::new(landed.x, landed.y, landed.z),
         orientation: landed.orientation,
-        entities,
-        skipped,
+        state,
+        fold_failures,
         connection,
     })
 }
 
-/// Pulls the drawable objects out of a burst of update packets.
+/// Folds a batch of drained packets into replicated world state.
 ///
-/// A packet that fails to parse costs its own contents and nothing else, so it
-/// is counted and skipped rather than aborting: losing one packet should not
-/// turn into an empty world.
-fn collect_entities(
-    packets: &[world::client::Packet],
-    own_guid: u64,
-) -> (Vec<Entity>, Vec<String>) {
-    use world::update::{self, Block};
+/// Mirrors `replicate` in `tools/wow-cli/src/main.rs`: object updates create
+/// and change things, relayed movement moves other players, monster moves
+/// move creatures, and destroys remove them. All four have to be handled in
+/// one place -- a caller that folded only object updates would build a world
+/// that looked plausible and was quietly frozen everywhere else. Returns how
+/// many packets failed to decode; a packet that fails costs only itself, so it
+/// is counted and skipped rather than aborting the batch.
+pub fn replicate(state: &mut world::WorldState, packets: &[world::client::Packet]) -> usize {
+    use world::update;
 
-    let mut entities = Vec::new();
-    let mut skipped = Vec::new();
     let mut failed = 0usize;
-    let mut without_model = 0usize;
-
     for packet in packets {
-        let blocks = match packet.opcode {
-            world::opcode::server::UPDATE_OBJECT => update::parse_update_object(&packet.body),
-            world::opcode::server::COMPRESSED_UPDATE_OBJECT => {
-                update::parse_compressed_update_object(&packet.body)
+        match packet.opcode {
+            world::opcode::server::UPDATE_OBJECT | world::opcode::server::COMPRESSED_UPDATE_OBJECT => {
+                let compressed = packet.opcode == world::opcode::server::COMPRESSED_UPDATE_OBJECT;
+                let parsed = if compressed {
+                    update::parse_compressed_update_object(&packet.body)
+                } else {
+                    update::parse_update_object(&packet.body)
+                };
+                match parsed {
+                    Ok(blocks) => state.apply(&blocks),
+                    Err(_) => failed += 1,
+                }
             }
-            _ => continue,
-        };
-        let Ok(blocks) = blocks else {
-            failed += 1;
-            continue;
-        };
-
-        for block in blocks {
-            let Block::Create {
-                guid,
-                object_type,
-                movement,
-                fields,
-                ..
-            } = block
-            else {
-                continue;
-            };
-            // The player's own body is where the camera is; drawing it would
-            // fill the view from inside the mesh.
-            if guid == own_guid {
-                continue;
+            world::opcode::server::MONSTER_MOVE => {
+                match update::parse_monster_move(&packet.body) {
+                    Ok(moved) => state.apply_monster_move(&moved),
+                    Err(_) => failed += 1,
+                }
             }
-            let Some(position) = movement.position else {
-                continue;
-            };
-            // Only units and players carry a display id. Game objects are
-            // modelled through a different table and are left for later.
-            let Some(display_id) = fields.get(update::fields::UNIT_DISPLAY_ID) else {
-                without_model += 1;
-                continue;
-            };
-            if display_id == 0 {
-                without_model += 1;
-                continue;
+            world::opcode::server::MOVE_START_FORWARD
+            | world::opcode::server::MOVE_STOP
+            | world::opcode::server::MOVE_HEARTBEAT => {
+                match world::protocol::parse_movement(&packet.body) {
+                    Ok((mover, info)) => state.apply_relayed_movement(mover, &info),
+                    Err(_) => failed += 1,
+                }
             }
-
-            entities.push(Entity {
-                guid,
-                display_id,
-                position: Vec3::new(position.x, position.y, position.z),
-                orientation: position.orientation,
-                // Scale is a float stored in a u32 field. A missing or zero
-                // scale means "normal", not "invisible".
-                scale: fields
-                    .get_f32(update::fields::OBJECT_SCALE)
-                    .filter(|s| *s > 0.0)
-                    .unwrap_or(1.0),
-                kind: object_type,
-                level: fields.get(update::fields::UNIT_LEVEL),
-            });
+            world::opcode::server::DESTROY_OBJECT => {
+                let mut reader = world::protocol::Reader::new(&packet.body, "SMSG_DESTROY_OBJECT");
+                if let Ok(guid) = update::read_packed_guid(&mut reader) {
+                    state.remove(guid);
+                }
+            }
+            _ => {}
         }
     }
+    failed
+}
 
-    if failed > 0 {
-        skipped.push(format!("{failed} update packet(s) failed to parse"));
+/// Turns replicated state into what the renderer and the summary text both
+/// need: drawable objects with a position and a model, excluding the
+/// character's own body.
+///
+/// Read fresh from `state` rather than cached, since state changes every time
+/// a packet is folded in -- see [`replicate`]. Callers that draw from this
+/// (as opposed to describing it in text) are expected to throttle how often
+/// they call it; see the viewer's entity-rebuild timer.
+pub fn drawable_entities(state: &world::WorldState, own_guid: u64) -> Vec<Entity> {
+    use world::update;
+
+    let mut entities = Vec::new();
+    for entity in state.iter() {
+        // The player's own body is where the camera is; drawing it would
+        // fill the view from inside the mesh.
+        if entity.guid == own_guid {
+            continue;
+        }
+        let Some(position) = entity.position else {
+            continue;
+        };
+        // Only units and players carry a display id. Game objects are
+        // modelled through a different table and are left for later.
+        let Some(display_id) = entity.display_id() else {
+            continue;
+        };
+        if display_id == 0 {
+            continue;
+        }
+
+        entities.push(Entity {
+            guid: entity.guid,
+            display_id,
+            position: Vec3::new(position.x, position.y, position.z),
+            orientation: position.orientation,
+            // Scale is a float stored in a u32 field. A missing or zero scale
+            // means "normal", not "invisible".
+            scale: entity
+                .fields
+                .get_f32(update::fields::OBJECT_SCALE)
+                .filter(|s| *s > 0.0)
+                .unwrap_or(1.0),
+            kind: entity.object_type,
+            level: entity.level(),
+        });
     }
-    if without_model > 0 {
-        skipped.push(format!("{without_model} object(s) with no display id"));
-    }
-    (entities, skipped)
+    entities
 }
 
 /// Resolves a map id to the folder its terrain lives in.

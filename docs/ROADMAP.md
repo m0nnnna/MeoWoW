@@ -56,7 +56,7 @@ Target is a stock TrinityCore or MaNGOS 3.3.5a server.
 | 3.2 | **World handshake** ✅ | RC4 header crypt, `SMSG_AUTH_CHALLENGE` → character list; `wow-cli world <host>` |
 | 3.3 | **Enter world** ✅ | Login to a character, parse the initial object update; `wow-cli world --enter <name>` |
 | 3.4 | **Movement** ✅ | Move, and be seen moving by a second client; `wow-cli world --enter <name> --walk <n>`, or W/S/A/D in the viewer |
-| 3.5 | **Entity replication** ◐ | Live world state: creates, field merges, movement, removals, monster paths — verified two-client. Drawing the replicated entities *animating* is renderer work and not done |
+| 3.5 | **Entity replication** ◐ | Live world state, and the viewer draws it: creatures and other players appear where the server currently says they are, updating a few times a second as `WorldState` changes. What is left is *animating* — no skeletal animation and no interpolation along a move's path, so a replicated entity jumps between positions rather than walking between them |
 
 3.2 was expected to be the single hardest protocol step, and the header cipher
 was indeed unforgiving — but not in the way budgeted for. The cipher itself
@@ -115,7 +115,7 @@ against each other through a third party rather than against themselves. This
 project's standing rule is that a thing checked against itself is not evidence;
 this is the strongest form of the opposite available without a reference client.
 
-### 3.5 is protocol-complete; the renderer half is not
+### 3.5: the renderer now draws what the protocol replicates
 
 `crates/world/src/state.rs` maintains a live view of everything in range —
 creates, field merges, movement, removals and creature paths — and the same
@@ -123,10 +123,22 @@ two-client rig verified it: the observer's replicated position for another
 player matched that player's own record exactly, over 376 applied updates with
 none undecodable and none orphaned.
 
-It is at ◐ because the milestone says *visible and animating*, and the viewer
-still draws only the entities from the login burst: a frozen snapshot, not the
-replicated world. That is renderer plumbing on top of a protocol layer that is
-now done, and it is the obvious next task.
+The viewer used to draw only the entities from the login burst — a frozen
+snapshot — because nothing folded later packets into a `WorldState` the
+renderer could read from. It now does: `LiveWorld` keeps a `WorldState`
+alongside the connection, every drained batch is folded into it the same way
+`wow-cli`'s `replicate` does, and the instanced draws are rebuilt from it on a
+timer rather than once at login. Verified with the same two-client rig used to
+close 3.4 — one client walked while the other, running the actual `wow-viewer`
+binary, drew it moving.
+
+It stays at ◐ because the milestone says *visible and animating*, and only the
+first half is done. What a replicated entity does today is jump between
+positions a few times a second, not walk between them: there is no skeletal
+animation, and no interpolation along a `SMSG_MONSTER_MOVE`'s path over its
+stated duration. Both are deliberately deferred — getting entities into the
+right *place* was the task, and the milestone can wait for the walk cycle
+without inflating it into a general movement-prediction system.
 
 This milestone also changed what "careful" means. Every earlier parser was
 memoryless, so a mistake produced one wrong answer and vanished. Replicated

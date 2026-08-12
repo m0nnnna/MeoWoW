@@ -12,23 +12,24 @@ streams. Phase 3 has started.
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation), WMO, ADT/WDT — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
-| Protocol | **3.1–3.4 done**, all confirmed against a live realm including one client watching another move. 3.5 replication is protocol-complete (`world::state`); drawing the replicated world is the remaining renderer half |
+| Protocol | **3.1–3.4 done**, all confirmed against a live realm including one client watching another move. 3.5 replication: the viewer now draws it too — creatures and other players appear where the server currently says they are — but they jump rather than walk, since animation and path interpolation are still deferred |
 | Game + UI | Not started. The largest remaining chunk. |
 
 Roughly 50% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
 
-**The two halves have met, and the viewer drives movement.** `wow-viewer
---realm-host <host> --user <account> --character <name>` logs in, enters the
-world, and streams the map the server chose around the position it reported,
-with the creatures it reported standing in it. Holding W/S walks the character
-forward or backward and A/D turns it, each sent as a real `MSG_MOVE_*` stream
+**The two halves have met, the viewer drives movement, and it draws what the
+protocol replicates.** `wow-viewer --realm-host <host> --user <account>
+--character <name>` logs in, enters the world, and streams the map the server
+chose around the position it reported. Holding W/S walks the character forward
+or backward and A/D turns it, each sent as a real `MSG_MOVE_*` stream
 (`MoveStartForward`/`MoveHeartbeat`/`MoveStop`), and the camera follows behind
-rather than flying freely. Verified against the live realm the same way the
-CLI's `--walk` is: the position the server reports on re-entry moved, and
-differs from the stale character-list position exactly as documented above.
-`wow-cli world --enter X --walk 20` remains the CLI-driven equivalent, useful
-when no window is available.
+rather than flying freely. `LiveWorld` keeps a `world::WorldState` alongside
+the connection and folds every drained packet into it, so creatures and other
+players move on screen instead of standing wherever they were at login —
+verified with two clients, one walking while the other, running the real
+viewer, drew it happen. `wow-cli world --enter X --walk 20` remains the
+CLI-driven equivalent, useful when no window is available.
 
 ## Orientation
 
