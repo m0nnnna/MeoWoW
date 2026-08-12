@@ -371,9 +371,13 @@ mod tests {
     use super::*;
     use crate::update::Movement;
 
-    fn fields(entries: &[(u16, u32)]) -> Fields {
-        // Built through the real parser so the sort order this relies on is
-        // the parser's, not the test's idea of it.
+    /// One raw `SMSG_UPDATE_OBJECT` body: a single create block for a unit,
+    /// with the given guid and fields. Split out from `fields` below so
+    /// `replicate`'s tests can feed the bytes to a `Packet` directly instead
+    /// of only ever going in through `parse_update_object` -- `replicate` is
+    /// exactly the boundary that turns bytes into applied state, and that
+    /// boundary needs bytes to test through, not pre-parsed blocks.
+    fn update_object_body(guid: u64, entries: &[(u16, u32)]) -> Vec<u8> {
         let highest = entries.iter().map(|(at, _)| *at).max().unwrap_or(0);
         let blocks = (highest as usize / 32) + 1;
         let mut mask = vec![0u32; blocks];
@@ -392,10 +396,17 @@ mod tests {
 
         let mut packet = 1u32.to_le_bytes().to_vec();
         packet.push(2); // create
-        crate::update::write_packed_guid(1, &mut packet);
+        crate::update::write_packed_guid(guid, &mut packet);
         packet.push(3); // unit
         packet.extend_from_slice(&0u16.to_le_bytes()); // no update flags
         packet.extend_from_slice(&body);
+        packet
+    }
+
+    fn fields(entries: &[(u16, u32)]) -> Fields {
+        // Built through the real parser so the sort order this relies on is
+        // the parser's, not the test's idea of it.
+        let packet = update_object_body(1, entries);
         match crate::update::parse_update_object(&packet).unwrap().remove(0) {
             Block::Create { fields, .. } => fields,
             other => panic!("wrong block: {other:?}"),
@@ -603,5 +614,58 @@ mod tests {
         assert_eq!(stats.removed, 1, "removing an unknown guid was counted");
         assert_eq!(world.len(), stats.created - stats.removed);
         assert_eq!(world.players().count(), 1);
+    }
+
+    /// `replicate` is the dispatch every other test in this file bypasses --
+    /// they all call `apply`/`apply_monster_move`/`apply_relayed_movement`
+    /// directly, so none of them would notice a bug in the opcode table
+    /// itself. This is what would have caught a `DESTROY_OBJECT` decode
+    /// failure being silently dropped instead of counted: with an
+    /// `if let Ok(...)` in place of the current `match`, `failures.len()`
+    /// here comes back `0` and the assertion fails, even though a healthy
+    /// live-realm run would never exercise this path -- it only sends
+    /// well-formed packets.
+    #[test]
+    fn replicate_applies_good_packets_and_counts_bad_ones() {
+        use crate::client::Packet;
+
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+
+        let mut good_destroy = Vec::new();
+        crate::update::write_packed_guid(7, &mut good_destroy);
+
+        let packets = vec![
+            // A valid create for a second object, so the good path is proven
+            // alongside the bad one rather than merely surviving it.
+            Packet {
+                opcode: crate::opcode::server::UPDATE_OBJECT,
+                body: update_object_body(8, &[(crate::update::fields::UNIT_LEVEL, 5)]),
+            },
+            // Truncated: a mask byte claiming every one of the eight guid
+            // bytes is present, with none of them supplied.
+            Packet {
+                opcode: crate::opcode::server::DESTROY_OBJECT,
+                body: vec![0xFF],
+            },
+            Packet {
+                opcode: crate::opcode::server::DESTROY_OBJECT,
+                body: good_destroy,
+            },
+        ];
+
+        let report = world.replicate(&packets, None);
+
+        assert_eq!(report.object_updates, 1);
+        assert_eq!(report.destroys, 1);
+        assert_eq!(
+            report.failures.len(),
+            1,
+            "the truncated destroy must be counted, not dropped"
+        );
+        assert_eq!(report.failures[0].0, crate::opcode::server::DESTROY_OBJECT);
+
+        assert!(world.get(7).is_none(), "the valid destroy did not apply");
+        assert!(world.get(8).is_some(), "the valid create did not apply");
     }
 }
