@@ -400,6 +400,89 @@ impl Connection {
         self.send_movement(ClientOpcode::MoveSetFacing, mover, &info)
     }
 
+    /// Tells the server what this client has selected.
+    ///
+    /// A bare guid, unpacked -- `CMSG_SET_SELECTION` predates the packed-guid
+    /// encoding used by the update blocks, and writing a packed one here sends
+    /// a shorter packet that the server reads as a truncated selection.
+    ///
+    /// Nothing is expected back. The server answers only by acting differently
+    /// later (a spell that now has a victim, an attack that lands), which is
+    /// worth stating because "no reply" and "the packet was wrong" look
+    /// identical from here.
+    pub fn set_selection(&mut self, guid: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::SetSelection, &guid.to_le_bytes())
+    }
+
+    /// Asks who a guid is. The answer arrives as `SMSG_NAME_QUERY_RESPONSE`,
+    /// or not at all -- see [`crate::names`] for why that has to be tolerated
+    /// rather than waited on.
+    pub fn ask_player_name(&mut self, guid: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::NameQuery, &crate::query::name_query(guid))
+    }
+
+    /// Asks what a creature entry is called.
+    pub fn ask_creature_name(&mut self, entry: u32, guid: u64) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::CreatureQuery,
+            &crate::query::creature_query(entry, guid),
+        )
+    }
+
+    /// Says something.
+    ///
+    /// `language` is not optional in practice: see
+    /// [`crate::chat::language_for_race`]. Sending `LANG_UNIVERSAL` from an
+    /// ordinary account is refused with no reply at all, which looks exactly
+    /// like a malformed packet.
+    ///
+    /// Fire and forget otherwise: what comes back is the server relaying the
+    /// line to everyone in range, this client included, through the ordinary
+    /// packet stream. There is no reply to wait for, and waiting for one would
+    /// block the render thread.
+    pub fn say(
+        &mut self,
+        chat_type: crate::chat::ChatType,
+        language: u32,
+        target: &str,
+        text: &str,
+    ) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::MessageChat,
+            &crate::chat::message_chat(chat_type, language, target, text),
+        )
+    }
+
+    /// Asks to cast a spell, at a target or at yourself.
+    ///
+    /// Nothing acknowledges success -- what follows is the world reacting, or
+    /// `SMSG_CAST_FAILED` saying why not. As with every other send here, that
+    /// means "no reply" has to be given time before it is read as a refusal.
+    pub fn cast_spell(&mut self, spell_id: u32, target: Option<u64>) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::CastSpell,
+            &crate::spell::cast_spell(spell_id, target),
+        )
+    }
+
+    /// Starts auto-attacking a target.
+    ///
+    /// A bare unpacked guid, the same encoding `CMSG_SET_SELECTION` uses --
+    /// both predate the packed form the update blocks use. Nothing
+    /// acknowledges the request directly; what follows is the server driving
+    /// an exchange of swings on its own timer, which is the only way to tell
+    /// this was understood. See [`ClientOpcode::AttackSwing`] for how that
+    /// number was confirmed.
+    pub fn attack_swing(&mut self, target: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::AttackSwing, &target.to_le_bytes())
+    }
+
+    /// Stops auto-attacking. Takes no body -- there is only ever one attack in
+    /// progress, so there is nothing to name.
+    pub fn attack_stop(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::AttackStop, &[])
+    }
+
     /// Milliseconds since the connection opened, as the movement clock.
     pub fn tick(&self) -> u32 {
         self.started.elapsed().as_millis() as u32

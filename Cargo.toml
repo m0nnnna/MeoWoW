@@ -30,6 +30,10 @@ egui-winit = "0.36"
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.33"
+# The interface layout is a file the user is expected to open and edit, which
+# is why it is TOML and not a binary blob -- see docs/UI.md.
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 
 [profile.dev]
 # Format parsing on multi-GB archives is unusable in a fully unoptimized build,

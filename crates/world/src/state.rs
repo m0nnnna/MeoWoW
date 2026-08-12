@@ -67,6 +67,77 @@ impl Entity {
         self.fields.get(crate::update::fields::UNIT_HEALTH)
     }
 
+    pub fn max_health(&self) -> Option<u32> {
+        self.fields.get(crate::update::fields::UNIT_MAX_HEALTH)
+    }
+
+    /// Race, class, gender and power type, in that order.
+    ///
+    /// Four independent values packed into one 32-bit field, which is worth
+    /// naming rather than unpacking at each call site: the byte order is the
+    /// kind of detail that gets transcribed correctly once and then guessed at
+    /// wrongly the second time.
+    pub fn bytes_0(&self) -> Option<[u8; 4]> {
+        self.fields
+            .get(crate::update::fields::UNIT_BYTES_0)
+            .map(u32::to_le_bytes)
+    }
+
+    pub fn race(&self) -> Option<u8> {
+        self.bytes_0().map(|bytes| bytes[0])
+    }
+
+    pub fn class(&self) -> Option<u8> {
+        self.bytes_0().map(|bytes| bytes[1])
+    }
+
+    pub fn gender(&self) -> Option<u8> {
+        self.bytes_0().map(|bytes| bytes[2])
+    }
+
+    /// Which resource this unit spends: mana, rage, energy and so on.
+    pub fn power_type(&self) -> Option<u8> {
+        self.bytes_0().map(|bytes| bytes[3])
+    }
+
+    /// The unit's current power, read from the one field its power type
+    /// selects.
+    ///
+    /// The seven power fields are a parallel array and only one of them means
+    /// anything for a given unit. Reading `UNIT_POWER1` regardless -- the
+    /// obvious shortcut, since it is right for every caster -- reports zero for
+    /// every rogue and warrior in the world, which looks like a replication
+    /// failure rather than the wrong field.
+    pub fn power(&self) -> Option<u32> {
+        self.fields
+            .get(crate::update::fields::UNIT_POWER1 + self.power_index()?)
+    }
+
+    pub fn max_power(&self) -> Option<u32> {
+        self.fields
+            .get(crate::update::fields::UNIT_MAX_POWER1 + self.power_index()?)
+    }
+
+    /// The offset into the power arrays, refusing anything that would read
+    /// past them.
+    ///
+    /// A power type this client has never heard of is a number straight off
+    /// the wire, and adding it to a base index unchecked would read whatever
+    /// field happens to live there -- reporting a unit's level as its mana
+    /// rather than reporting nothing.
+    fn power_index(&self) -> Option<u16> {
+        let index = self.power_type()? as u16;
+        (index < crate::update::fields::POWER_COUNT).then_some(index)
+    }
+
+    /// What this unit has targeted, if anything. Zero means nothing, and is
+    /// reported as `None` rather than as a guid no object will ever have.
+    pub fn target(&self) -> Option<u64> {
+        self.fields
+            .get_u64(crate::update::fields::UNIT_TARGET)
+            .filter(|guid| *guid != 0)
+    }
+
     pub fn is_player(&self) -> bool {
         self.object_type == ObjectType::Player
     }
@@ -155,6 +226,69 @@ impl Entity {
     }
 }
 
+/// A spell mid-cooldown, timed from when this client learned about it rather
+/// than from the server's own clock, which the client never sees.
+#[derive(Debug, Clone, Copy)]
+pub struct Cooldown {
+    started: std::time::Instant,
+    duration_ms: u32,
+}
+
+impl Cooldown {
+    /// `1.0` the instant a cooldown starts, `0.0` once `duration_ms` has
+    /// fully elapsed. `now` is a parameter for the same reason
+    /// `Entity::interpolated_position` takes one: fixed input, not a
+    /// hopefully-fast-enough clock read inside the test.
+    pub fn remaining_fraction(&self, now: std::time::Instant) -> f32 {
+        if self.duration_ms == 0 {
+            return 0.0;
+        }
+        let elapsed = now.saturating_duration_since(self.started).as_millis() as f32;
+        (1.0 - elapsed / self.duration_ms as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// A cast in progress, timed from when this client learned about it rather
+/// than from the server's own clock -- same reasoning as [`Cooldown`].
+///
+/// A finished cast is harmless to leave in place: once `progress_fraction`
+/// reaches `1.0` it reads as finished whether or not `SMSG_SPELL_GO` ever
+/// arrives to say so explicitly, so a caller reading the fraction every frame
+/// never needs the entry removed to draw the right thing. That matters
+/// because [`SpellGo`](crate::spell::SpellGo) is refused for shapes this
+/// parser has not confirmed live (a miss, an unrecognised target) -- see its
+/// own doc comment -- so a `SMSG_SPELL_GO` this client cannot yet read must
+/// not be able to leave a cast bar stuck forever.
+///
+/// **But harmless is not the same as free, and this map is not `Cooldown`.**
+/// `cooldowns` is keyed by spell id and a character knows a few dozen spells,
+/// so never pruning it is bounded by construction. `casts` is keyed by
+/// *caster guid*: every creature that casts anything within visibility range
+/// takes a slot, and the removals that would free them are exactly the ones
+/// this crate declines to parse. So entries are dropped when the caster
+/// leaves the world instead -- see [`WorldState::remove`] -- which is the
+/// event that bounds the map, and which the "reads as finished anyway"
+/// argument above says nothing about.
+#[derive(Debug, Clone, Copy)]
+pub struct Cast {
+    pub spell_id: u32,
+    started: std::time::Instant,
+    pub duration_ms: u32,
+}
+
+impl Cast {
+    /// `0.0` the instant a cast starts, `1.0` once `duration_ms` has fully
+    /// elapsed. `now` is a parameter for the same reason
+    /// `Cooldown::remaining_fraction` takes one.
+    pub fn progress_fraction(&self, now: std::time::Instant) -> f32 {
+        if self.duration_ms == 0 {
+            return 1.0;
+        }
+        let elapsed = now.saturating_duration_since(self.started).as_millis() as f32;
+        (elapsed / self.duration_ms as f32).clamp(0.0, 1.0)
+    }
+}
+
 /// Counters that make replication errors visible before they become wrong
 /// worlds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -184,6 +318,43 @@ pub struct Replication {
     pub monster_moves: usize,
     pub relayed_moves: usize,
     pub destroys: usize,
+    /// Names that arrived this batch, already folded into [`WorldState::names`].
+    pub names: usize,
+    /// Spells in the spellbook, if it arrived this batch.
+    pub spells: usize,
+    /// `SMSG_SPELL_START`s folded into [`WorldState::casts`] this batch.
+    pub casts_started: usize,
+    /// `SMSG_SPELL_GO`s that cleared an entry from [`WorldState::casts`] this
+    /// batch -- an accounting counter, not a count of parsed packets: an
+    /// instant-cast spell's `SMSG_SPELL_GO` arrives with no matching
+    /// `SMSG_SPELL_START` and clears nothing, which is correct and not
+    /// counted here.
+    pub casts_landed: usize,
+    /// Casts the server refused. Returned rather than stored for the same
+    /// reason chat is: they are events, not state.
+    pub cast_failures: Vec<crate::spell::CastFailed>,
+    /// Chat received this batch.
+    ///
+    /// Handed back rather than stored: chat is a stream of events, not state,
+    /// and the one thing a `WorldState` must never do is accumulate an
+    /// unbounded log nobody drains. The caller owns the scrollback.
+    pub chat: Vec<crate::chat::ChatMessage>,
+    /// Melee swings landed or missed this batch, in the order they arrived.
+    ///
+    /// Handed back for the same reason as [`Self::chat`], and carrying the
+    /// same hazard: this crate has now produced three categories a caller
+    /// forgot to consume, and every one of them looked like the server not
+    /// sending anything. A swing is an event -- what it *did* to a unit's
+    /// health arrives separately, as an ordinary field update, and is already
+    /// folded into the entity by the time this is read.
+    pub swings: Vec<crate::combat::MeleeSwing>,
+    /// `SMSG_ATTACKSTART`s folded into [`WorldState::attacking`] this batch.
+    pub attacks_started: usize,
+    /// `SMSG_ATTACKSTOP`s that cleared an entry from
+    /// [`WorldState::attacking`]. An accounting counter like
+    /// [`Self::casts_landed`]: a stop for a fight this client never saw begin
+    /// clears nothing and is not counted.
+    pub attacks_stopped: usize,
     /// Packets that would not decode, with their payload for offline analysis.
     pub failures: Vec<(u16, crate::protocol::Error, Result<Vec<u8>, crate::protocol::Error>)>,
 }
@@ -192,6 +363,38 @@ pub struct Replication {
 pub struct WorldState {
     entities: HashMap<u64, Entity>,
     stats: Stats,
+    /// What this character knows how to cast. Arrives once, in the login
+    /// burst, and is never resent.
+    pub spells: crate::spell::InitialSpells,
+    /// Spells currently on cooldown, keyed by spell id. Seeded from
+    /// `SMSG_INITIAL_SPELLS`'s own cooldown list at login, then kept current
+    /// by `SMSG_SPELL_COOLDOWN` as casts start new ones. A spell that has
+    /// fully come off cooldown is left in place rather than pruned --
+    /// `Cooldown::remaining_fraction` reads `0.0` for it either way, and there
+    /// are at most a few dozen spells, so nothing is gained by removing it.
+    pub cooldowns: HashMap<u32, Cooldown>,
+    /// Casts in progress, keyed by caster guid. `SMSG_SPELL_START` inserts an
+    /// entry; `SMSG_SPELL_GO` removes it. An instant-cast spell goes straight
+    /// to `SMSG_SPELL_GO` with no bar ever worth showing, so removing an
+    /// absent entry for one is a correct no-op, not a missed `SMSG_SPELL_START`.
+    pub casts: HashMap<u64, Cast>,
+    /// Who each unit is currently swinging at, keyed by attacker.
+    /// `SMSG_ATTACKSTART` inserts, `SMSG_ATTACKSTOP` removes.
+    ///
+    /// Keyed by an unbounded thing -- a guid -- so it is cleared when the
+    /// caster leaves the world too, the same as [`Self::casts`]. That is not a
+    /// theoretical tidiness: a creature that dies mid-fight is destroyed
+    /// rather than sending a stop for itself in every case, and the entry
+    /// would otherwise claim forever that a corpse is still attacking.
+    pub attacking: HashMap<u64, u64>,
+    /// What things are called, and the bookkeeping that asks once.
+    ///
+    /// Lives here rather than beside the state because the answers arrive in
+    /// the same packet stream that everything else does, and this crate's one
+    /// standing rule about that stream is that it has exactly one dispatch
+    /// table. A second one drifts, and a new opcode wired into one and not the
+    /// other freezes whatever it should have moved.
+    pub names: crate::names::Names,
 }
 
 impl WorldState {
@@ -221,6 +424,24 @@ impl WorldState {
 
     pub fn players(&self) -> impl Iterator<Item = &Entity> {
         self.entities.values().filter(|e| e.is_player())
+    }
+
+    /// How much of a spell's cooldown remains, `0.0` if it is not on one at
+    /// all.
+    pub fn cooldown_fraction(&self, spell: u32, now: std::time::Instant) -> f32 {
+        self.cooldowns
+            .get(&spell)
+            .map(|cooldown| cooldown.remaining_fraction(now))
+            .unwrap_or(0.0)
+    }
+
+    /// The cast a given caster is in the middle of, if any -- `None` once
+    /// `progress_fraction` would read `1.0`, not only once `SMSG_SPELL_GO`
+    /// clears the entry. See [`Cast`]'s doc comment for why a caller must not
+    /// need the packet to arrive for the bar to stop showing.
+    pub fn active_cast(&self, caster: u64, now: std::time::Instant) -> Option<Cast> {
+        let cast = *self.casts.get(&caster)?;
+        (cast.progress_fraction(now) < 1.0).then_some(cast)
     }
 
     /// Folds one object-update packet's blocks into the world.
@@ -380,6 +601,21 @@ impl WorldState {
     }
 
     pub fn remove(&mut self, guid: u64) -> bool {
+        // A cast belongs to whoever is casting it, so it leaves with them.
+        // This is what bounds `casts`: its own removal path is a
+        // `SMSG_SPELL_GO` that parses, and this crate deliberately refuses
+        // that packet for shapes it has not confirmed, so entries for a
+        // caster who walked out of range would otherwise accumulate for the
+        // whole session. Nothing visible goes wrong without it -- a stale
+        // entry reads as a finished cast -- which is exactly why it would
+        // never have been noticed.
+        self.casts.remove(&guid);
+        // And any fight it was in, from both sides: a creature that dies is
+        // destroyed rather than always sending a stop, so the entry naming it
+        // as an attacker *and* the entries naming it as a victim would both
+        // outlive it.
+        self.attacking.remove(&guid);
+        self.attacking.retain(|_, victim| *victim != guid);
         if self.entities.remove(&guid).is_some() {
             self.stats.removed += 1;
             true
@@ -468,6 +704,204 @@ impl WorldState {
                             report.relayed_moves += 1;
                             self.apply_relayed_movement(mover, &info);
                         }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::NAME_QUERY_RESPONSE => {
+                    match crate::query::parse_name_query_response(&packet.body) {
+                        Ok(answer) => {
+                            report.names += 1;
+                            self.names.apply_player(&answer);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::CREATURE_QUERY_RESPONSE => {
+                    match crate::query::parse_creature_query_response(&packet.body) {
+                        Ok(answer) => {
+                            report.names += 1;
+                            self.names.apply_creature(&answer);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // A GM's line shares the body, so it shares the parser. It is
+                // a separate opcode purely so a client can style it
+                // differently.
+                crate::opcode::server::MESSAGECHAT | crate::opcode::server::GM_MESSAGECHAT => {
+                    match crate::chat::parse_message_chat(&packet.body) {
+                        Ok(message) => report.chat.push(message),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // Arrives unprompted in the login burst and never again, so
+                // the one place that could catch it is this dispatch. A caller
+                // that folds packets anywhere else would miss the spellbook
+                // entirely and see a character who knows nothing.
+                crate::opcode::server::INITIAL_SPELLS => {
+                    match crate::spell::parse_initial_spells(&packet.body) {
+                        Ok(book) => {
+                            report.spells = book.spells.len();
+                            let now = std::time::Instant::now();
+                            // `SpellCooldown::second` is not yet confirmed to
+                            // be a millisecond duration -- see its doc
+                            // comment -- so this seeds nothing visible today
+                            // (`Cooldown::remaining_fraction` reads `0.0` for
+                            // a `0` duration, which is what every observation
+                            // so far has held). Folded in anyway because a
+                            // later, better-understood value here should not
+                            // need a second wiring-up to take effect.
+                            for cooldown in &book.cooldowns {
+                                self.cooldowns.insert(
+                                    cooldown.spell_id,
+                                    Cooldown {
+                                        started: now,
+                                        duration_ms: cooldown.second,
+                                    },
+                                );
+                            }
+                            self.spells = book;
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // Sent once per cast that actually starts a cooldown, unlike
+                // the login burst's cooldown list. Folded in here for the
+                // same reason as `INITIAL_SPELLS`: this dispatch is the one
+                // place that could catch it, and a caller polling anywhere
+                // else would see a spell that never appears to cool down.
+                // Not yet seen live -- see `parse_spell_cooldown`'s doc
+                // comment for what was actually tried.
+                crate::opcode::server::SPELL_COOLDOWN => {
+                    match crate::spell::parse_spell_cooldown(&packet.body) {
+                        Ok((_caster, cooldowns)) => {
+                            let now = std::time::Instant::now();
+                            for cooldown in cooldowns {
+                                self.cooldowns.insert(
+                                    cooldown.spell_id,
+                                    Cooldown {
+                                        started: now,
+                                        duration_ms: cooldown.cooldown_ms,
+                                    },
+                                );
+                            }
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // A cast winding up. Folded in here for the same reason as
+                // every other spell packet: this dispatch is the one place
+                // that could catch it, and a caller polling anywhere else
+                // would never see a cast bar start. Refused by
+                // `parse_spell_start` for any target shape it has not
+                // confirmed live -- see that parser's doc comment -- which
+                // shows up here as an ordinary decode failure, not a panic.
+                crate::opcode::server::SPELL_START => {
+                    match crate::spell::parse_spell_start(&packet.body) {
+                        Ok(start) => {
+                            report.casts_started += 1;
+                            self.casts.insert(
+                                start.caster,
+                                Cast {
+                                    spell_id: start.spell_id,
+                                    started: std::time::Instant::now(),
+                                    duration_ms: start.cast_time_ms,
+                                },
+                            );
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // A cast landing -- clears whatever `SMSG_SPELL_START` put in
+                // `casts` for this caster. An instant-cast spell has no
+                // matching `SMSG_SPELL_START`, so clearing an absent entry is
+                // the correct, silent no-op for it rather than a sign
+                // anything was missed.
+                crate::opcode::server::SPELL_GO => {
+                    match crate::spell::parse_spell_go(&packet.body) {
+                        Ok(go) => {
+                            if self.casts.remove(&go.caster).is_some() {
+                                report.casts_landed += 1;
+                            }
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // Melee. The swing itself is an event and goes back to the
+                // caller; what it did to anybody's health arrives separately
+                // as an ordinary field update and needs nothing here.
+                crate::opcode::server::ATTACKER_STATE_UPDATE => {
+                    match crate::combat::parse_melee_swing(&packet.body) {
+                        Ok(swing) => report.swings.push(swing),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::ATTACK_START => {
+                    match crate::combat::parse_attack_start(&packet.body) {
+                        Ok(start) => {
+                            report.attacks_started += 1;
+                            self.attacking.insert(start.attacker, start.victim);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::ATTACK_STOP => {
+                    match crate::combat::parse_attack_stop(&packet.body) {
+                        Ok(stop) => {
+                            if self.attacking.remove(&stop.attacker).is_some() {
+                                report.attacks_stopped += 1;
+                            }
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::CAST_FAILED => {
+                    match crate::spell::parse_cast_failed(&packet.body) {
+                        Ok(failure) => report.cast_failures.push(failure),
                         Err(error) => report.failures.push((
                             packet.opcode,
                             error,
@@ -802,6 +1236,356 @@ mod tests {
         assert!(world.get(8).is_some(), "the valid create did not apply");
     }
 
+    #[test]
+    fn cooldown_remaining_fraction_counts_down_and_clamps() {
+        let started = std::time::Instant::now();
+        let cooldown = Cooldown {
+            started,
+            duration_ms: 4000,
+        };
+        assert_eq!(cooldown.remaining_fraction(started), 1.0);
+        assert!(
+            (cooldown.remaining_fraction(started + std::time::Duration::from_millis(2000)) - 0.5)
+                .abs()
+                < 0.01
+        );
+        assert_eq!(
+            cooldown.remaining_fraction(started + std::time::Duration::from_secs(10)),
+            0.0,
+            "must clamp at zero rather than go negative"
+        );
+
+        let instant = Cooldown {
+            started,
+            duration_ms: 0,
+        };
+        assert_eq!(
+            instant.remaining_fraction(started),
+            0.0,
+            "a zero-duration cooldown is never actually on cooldown"
+        );
+    }
+
+    /// `SMSG_SPELL_COOLDOWN` is the one place a cooldown started by a cast
+    /// reaches the client, so it has to land through `replicate` like every
+    /// other opcode this crate dispatches.
+    #[test]
+    fn replicate_folds_spell_cooldown_into_the_world() {
+        use crate::client::Packet;
+
+        let mut body = 0x32u64.to_le_bytes().to_vec();
+        body.push(0); // flags
+        body.extend(78u32.to_le_bytes());
+        body.extend(1500u32.to_le_bytes());
+
+        let mut world = WorldState::new();
+        let report = world.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::SPELL_COOLDOWN,
+                body,
+            }],
+            None,
+        );
+
+        assert!(report.failures.is_empty());
+        let now = std::time::Instant::now();
+        assert_eq!(world.cooldown_fraction(78, now), 1.0);
+        assert_eq!(
+            world.cooldown_fraction(9999, now),
+            0.0,
+            "a spell never put on cooldown must read as ready"
+        );
+    }
+
+    /// The login burst's own cooldown list must take effect immediately, not
+    /// only once a fresh `SMSG_SPELL_COOLDOWN` happens to arrive -- a
+    /// character who logs in mid-cooldown should see that on the bar from the
+    /// first frame, once `SpellCooldown::second` is confirmed to actually
+    /// carry a duration. This tests the wiring on that assumption; it does
+    /// not claim the assumption itself is true yet.
+    #[test]
+    fn replicate_seeds_cooldowns_from_the_login_burst() {
+        use crate::client::Packet;
+
+        let mut body = vec![0u8]; // unknown/always-zero leading byte
+        body.extend(0u16.to_le_bytes()); // no known spells
+        body.extend(1u16.to_le_bytes()); // one cooldown
+        body.extend(172u32.to_le_bytes()); // spell id
+        body.extend(6000u32.to_le_bytes()); // second word
+
+        let mut world = WorldState::new();
+        let report = world.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::INITIAL_SPELLS,
+                body,
+            }],
+            None,
+        );
+
+        assert!(report.failures.is_empty());
+        assert_eq!(world.cooldown_fraction(172, std::time::Instant::now()), 1.0);
+    }
+
+    #[test]
+    fn cast_progress_fraction_counts_up_and_clamps() {
+        let started = std::time::Instant::now();
+        let cast = Cast {
+            spell_id: 5185,
+            started,
+            duration_ms: 4000,
+        };
+        assert_eq!(cast.progress_fraction(started), 0.0);
+        assert!(
+            (cast.progress_fraction(started + std::time::Duration::from_millis(2000)) - 0.5)
+                .abs()
+                < 0.01
+        );
+        assert_eq!(
+            cast.progress_fraction(started + std::time::Duration::from_secs(10)),
+            1.0,
+            "must clamp at one rather than run past it"
+        );
+
+        let instant = Cast {
+            spell_id: 6603,
+            started,
+            duration_ms: 0,
+        };
+        assert_eq!(
+            instant.progress_fraction(started),
+            1.0,
+            "a zero-duration cast is already done the instant it starts"
+        );
+    }
+
+    /// `SMSG_SPELL_START` and `SMSG_SPELL_GO`, straight off the pinned live
+    /// capture in `crates/world/src/spell.rs`'s tests -- same cast, same wire
+    /// dump. `replicate` is the one place that can catch either, the same
+    /// reasoning as every other spell packet this crate dispatches.
+    #[test]
+    fn replicate_folds_spell_start_into_a_cast_and_spell_go_clears_it() {
+        use crate::client::Packet;
+
+        let start_body: [u8; 27] = [
+            0x01, 0x33, 0x01, 0x33, 0x00, 0x41, 0x14, 0x00, 0x00, 0x02, 0x08, 0x00, 0x00, 0xdc,
+            0x05, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x33, 0x64, 0x00, 0x00, 0x00,
+        ];
+        let mut world = WorldState::new();
+        let report = world.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::SPELL_START,
+                body: start_body.to_vec(),
+            }],
+            None,
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.casts_started, 1);
+        let now = std::time::Instant::now();
+        let cast = world
+            .active_cast(0x33, now)
+            .expect("the caster's cast must be visible immediately");
+        assert_eq!(cast.spell_id, 5185);
+        assert_eq!(cast.duration_ms, 1500);
+        assert!(cast.progress_fraction(now) < 1.0);
+
+        let go_body: [u8; 37] = [
+            0x01, 0x33, 0x01, 0x33, 0x00, 0x41, 0x14, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x74,
+            0xd4, 0x37, 0x5a, 0x01, 0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x01, 0x33, 0x51, 0x00, 0x00, 0x00,
+        ];
+        let report = world.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::SPELL_GO,
+                body: go_body.to_vec(),
+            }],
+            None,
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.casts_landed, 1);
+        assert!(
+            world.active_cast(0x33, std::time::Instant::now()).is_none(),
+            "SMSG_SPELL_GO must clear the cast it landed"
+        );
+    }
+
+    /// An instant-cast spell goes straight to `SMSG_SPELL_GO` with no
+    /// `SMSG_SPELL_START` before it, so clearing a caster nobody started a
+    /// cast for has to be a silent no-op, not a sign anything was missed.
+    #[test]
+    fn a_spell_go_with_no_matching_start_clears_nothing() {
+        use crate::client::Packet;
+
+        let go_body: [u8; 37] = [
+            0x01, 0x33, 0x01, 0x33, 0x00, 0x41, 0x14, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x74,
+            0xd4, 0x37, 0x5a, 0x01, 0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x01, 0x33, 0x51, 0x00, 0x00, 0x00,
+        ];
+        let mut world = WorldState::new();
+        let report = world.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::SPELL_GO,
+                body: go_body.to_vec(),
+            }],
+            None,
+        );
+        assert!(report.failures.is_empty());
+        assert_eq!(report.casts_landed, 0);
+    }
+
+    /// A cast bar must not stay stuck forever behind a `SMSG_SPELL_GO` this
+    /// parser cannot yet read -- see `Cast`'s doc comment. `active_cast` reads
+    /// `None` once `duration_ms` has fully elapsed even though nothing ever
+    /// removed the entry from `WorldState::casts`.
+    #[test]
+    fn active_cast_expires_on_its_own_without_needing_spell_go() {
+        let mut world = WorldState::new();
+        let started = std::time::Instant::now();
+        world.casts.insert(
+            0x33,
+            Cast {
+                spell_id: 5185,
+                started,
+                duration_ms: 1500,
+            },
+        );
+        assert!(world.active_cast(0x33, started).is_some());
+        assert!(
+            world
+                .active_cast(0x33, started + std::time::Duration::from_millis(2000))
+                .is_none(),
+            "a cast past its own duration must stop showing on its own"
+        );
+    }
+
+    /// A swing has to come back out of `replicate`, from the real bytes.
+    ///
+    /// The single most likely way combat breaks in this crate is not the
+    /// parser: it is `replicate` handing an event back and a caller dropping
+    /// it, which has now happened with chat, with cast failures, and with
+    /// attack starts inside this project's own test tool. A count of swings
+    /// applied would not catch it, because there is nothing to apply -- the
+    /// damage arrives separately as a field update.
+    #[test]
+    fn replicate_hands_back_the_swings_it_parsed() {
+        use crate::client::Packet;
+
+        // Verbatim from the capture -- see `combat::tests`. This client
+        // hitting a Northshire kobold for 4.
+        let hit = [
+            0x02, 0x00, 0x00, 0x00, 0x01, 0x32, 0xcb, 0xde, 0x0b, 0x06, 0x30, 0xf1, 0x04, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+            0x40, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let mut world = WorldState::new();
+        let report = world.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::ATTACKER_STATE_UPDATE,
+                body: hit.to_vec(),
+            }],
+            None,
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.swings.len(), 1, "the swing never reached the caller");
+        assert_eq!(report.swings[0].damage, 4);
+        assert_eq!(report.swings[0].attacker, 0x32);
+    }
+
+    /// Attack start and stop have to balance, or the client believes a fight
+    /// is still going after it ended.
+    #[test]
+    fn a_fight_starts_and_stops() {
+        use crate::client::Packet;
+
+        const ME: u64 = 0x32;
+        const WOLF: u64 = 0xf130_0000_0600_0bde;
+        let start = [
+            0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xde, 0x0b, 0x00, 0x06, 0x00, 0x00,
+            0x30, 0xf1,
+        ];
+        // The same fight ending -- and note this one packs its guids where the
+        // start does not.
+        let stop = [
+            0x01, 0x32, 0xcb, 0xde, 0x0b, 0x06, 0x30, 0xf1, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let mut world = WorldState::new();
+        let report = world.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::ATTACK_START,
+                body: start.to_vec(),
+            }],
+            None,
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.attacks_started, 1);
+        assert_eq!(world.attacking.get(&ME), Some(&WOLF));
+
+        let report = world.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::ATTACK_STOP,
+                body: stop.to_vec(),
+            }],
+            None,
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.attacks_stopped, 1);
+        assert!(world.attacking.is_empty(), "the fight outlived its stop");
+    }
+
+    /// A creature that dies is destroyed rather than always sending a stop, so
+    /// the entries naming it -- on either side of the fight -- have to leave
+    /// with it. Otherwise a corpse goes on being recorded as under attack, or
+    /// as attacking.
+    #[test]
+    fn a_fight_leaves_with_whoever_died() {
+        const ME: u64 = 0x32;
+        const WOLF: u64 = 0xf130_0000_0600_0bde;
+
+        let mut world = WorldState::new();
+        world.attacking.insert(ME, WOLF);
+        world.attacking.insert(WOLF, ME);
+
+        world.remove(WOLF);
+        assert!(
+            world.attacking.is_empty(),
+            "the dead unit is still in a fight: {:?}",
+            world.attacking
+        );
+    }
+
+    /// A caster leaving the world takes its cast with it.
+    ///
+    /// Nothing a player can see depends on this -- a stale entry reads as a
+    /// finished cast and draws nothing, which is precisely why it would never
+    /// have been noticed. It is here because `casts` is keyed by caster guid
+    /// rather than by spell id, so without a removal path tied to an event
+    /// that actually happens it grows for the whole session: the only other
+    /// way an entry leaves is a `SMSG_SPELL_GO` that parses, and this crate
+    /// deliberately refuses that packet for shapes it has not confirmed. The
+    /// books are supposed to balance.
+    #[test]
+    fn a_cast_leaves_with_the_caster() {
+        let mut world = WorldState::new();
+        world.casts.insert(
+            0x33,
+            Cast {
+                spell_id: 5185,
+                started: std::time::Instant::now(),
+                duration_ms: 1500,
+            },
+        );
+
+        // Removing a guid the world never held still has to clear the cast:
+        // an out-of-range block names guids that may have been created before
+        // this client was watching.
+        assert!(!world.remove(0x33), "no entity was ever created for it");
+        assert!(
+            world.casts.is_empty(),
+            "the caster left and its cast stayed behind"
+        );
+    }
+
     /// The whole point of interpolation: read partway through a move, the
     /// entity should be partway along the path, not still at its start or
     /// already at its end.
@@ -1060,5 +1844,104 @@ mod tests {
         });
 
         assert!(!world.get(7).unwrap().is_moving(std::time::Instant::now()));
+    }
+
+    /// Four values in one field, so the byte order is worth pinning: getting
+    /// it wrong reports a night elf rogue as a human warrior and parses
+    /// perfectly either way.
+    #[test]
+    fn bytes_0_unpacks_race_class_gender_and_power() {
+        use crate::update::fields;
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            1,
+            ObjectType::Unit,
+            None,
+            &[(fields::UNIT_BYTES_0, packed_bytes_0(4, 4, 1, 3))],
+        )]);
+        let entity = world.get(1).unwrap();
+        assert_eq!(entity.race(), Some(4));
+        assert_eq!(entity.class(), Some(4));
+        assert_eq!(entity.gender(), Some(1));
+        assert_eq!(entity.power_type(), Some(3));
+    }
+
+    /// The powers are a parallel array indexed by the unit's own type. Reading
+    /// `UNIT_POWER1` regardless is the shortcut that works for every caster
+    /// and reports zero for everyone else.
+    #[test]
+    fn power_comes_from_the_field_the_units_type_selects() {
+        use crate::update::fields;
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            1,
+            ObjectType::Unit,
+            None,
+            &[
+                // A rogue: energy, which is power type 3.
+                (fields::UNIT_BYTES_0, packed_bytes_0(1, 4, 0, 3)),
+                (fields::UNIT_POWER1, 0),
+                (fields::UNIT_POWER1 + 3, 87),
+                (fields::UNIT_MAX_POWER1, 0),
+                (fields::UNIT_MAX_POWER1 + 3, 100),
+            ],
+        )]);
+        let entity = world.get(1).unwrap();
+        assert_eq!(entity.power(), Some(87), "read POWER1 instead of POWER4");
+        assert_eq!(entity.max_power(), Some(100));
+    }
+
+    /// A power type off the wire is an arbitrary number, and adding it to a
+    /// base index unchecked reads whatever field happens to live there.
+    ///
+    /// Type 29 is not hypothetical arithmetic: `UNIT_POWER1 + 29` lands exactly
+    /// on `UNIT_LEVEL`, so an unguarded read would report this unit's level as
+    /// its current mana -- a plausible number, in the right kind of range, and
+    /// wrong.
+    #[test]
+    fn a_power_type_past_the_array_reads_nothing_rather_than_a_neighbour() {
+        use crate::update::fields;
+        assert_eq!(
+            fields::UNIT_POWER1 + 29,
+            fields::UNIT_LEVEL,
+            "the premise of this test: an unguarded index 29 lands on the level"
+        );
+
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            1,
+            ObjectType::Unit,
+            None,
+            &[
+                (fields::UNIT_BYTES_0, packed_bytes_0(1, 1, 0, 29)),
+                (fields::UNIT_LEVEL, 60),
+            ],
+        )]);
+        let entity = world.get(1).unwrap();
+        assert_eq!(entity.power(), None);
+        assert_eq!(entity.max_power(), None);
+        assert_eq!(entity.level(), Some(60), "the field itself is untouched");
+    }
+
+    /// An empty target field is zero, which is not a guid.
+    #[test]
+    fn nothing_targeted_reads_as_no_target() {
+        use crate::update::fields;
+        let mut world = WorldState::new();
+        world.apply(&[
+            create(1, ObjectType::Unit, None, &[(fields::UNIT_TARGET, 0)]),
+            create(
+                2,
+                ObjectType::Unit,
+                None,
+                &[(fields::UNIT_TARGET, 0x1234), (fields::UNIT_TARGET + 1, 0xF13)],
+            ),
+        ]);
+        assert_eq!(world.get(1).unwrap().target(), None);
+        assert_eq!(world.get(2).unwrap().target(), Some(0x0000_0F13_0000_1234));
+    }
+
+    fn packed_bytes_0(race: u8, class: u8, gender: u8, power: u8) -> u32 {
+        u32::from_le_bytes([race, class, gender, power])
     }
 }

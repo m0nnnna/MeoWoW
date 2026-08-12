@@ -18,6 +18,36 @@ pub enum ClientOpcode {
     Ping = 0x01DC,
     AuthSession = 0x01ED,
     TimeSyncResp = 0x0391,
+    /// What this client has selected. The interface could keep a target to
+    /// itself, but the server is the one that decides whether a spell or an
+    /// attack has a legal victim, so it has to be told.
+    SetSelection = 0x013D,
+
+    /// Nothing in an object update carries a name; these are how a client
+    /// learns one. Players are asked for by guid, creatures by entry -- every
+    /// wolf of a kind shares one answer.
+    NameQuery = 0x0050,
+    CreatureQuery = 0x0060,
+    MessageChat = 0x0095,
+    /// Ask to cast. What comes back is either the world reacting or
+    /// `SMSG_CAST_FAILED` explaining why not.
+    CastSpell = 0x012E,
+
+    /// Start and stop auto-attacking. Auto-attack is a *state*, not an action:
+    /// one swing request starts an exchange the server then drives on its own
+    /// timer, which is why there is no per-swing message to send.
+    ///
+    /// **These two numbers are the only unverified constants in this enum, and
+    /// they are verified by reaction rather than by transcription.** Nothing
+    /// acknowledges an opcode as such, so the test is that sending
+    /// `AttackSwing` at a live hostile produces a stream of combat packets
+    /// that was not arriving before, and `AttackStop` ends it. A wrong number
+    /// here is worse than a wrong number in a parser -- an outgoing message
+    /// can be read as some *other* valid request -- so it was sent first at a
+    /// level-one character on a test realm with nothing to lose, and the
+    /// reaction checked before either was trusted.
+    AttackSwing = 0x0141,
+    AttackStop = 0x0142,
 
     // Movement. These are `MSG_` rather than `CMSG_`: the same opcode travels
     // in both directions, the client reporting its own movement and the server
@@ -64,6 +94,39 @@ pub mod server {
     pub const MOVE_START_FORWARD: u16 = 0x00B5;
     pub const MOVE_STOP: u16 = 0x00B7;
     pub const MOVE_HEARTBEAT: u16 = 0x00EE;
+
+    /// Answers to the two name queries. Neither is guaranteed to arrive: the
+    /// server simply does not reply to a guid it has forgotten, which is why
+    /// the name cache has to time requests out rather than wait.
+    pub const NAME_QUERY_RESPONSE: u16 = 0x0051;
+    pub const CREATURE_QUERY_RESPONSE: u16 = 0x0061;
+    pub const MESSAGECHAT: u16 = 0x0096;
+    /// The spellbook, sent unprompted during the login burst. There is no
+    /// query for it: miss the packet and the character appears to know nothing.
+    pub const INITIAL_SPELLS: u16 = 0x012A;
+    pub const CAST_FAILED: u16 = 0x0130;
+    pub const SPELL_START: u16 = 0x0131;
+    pub const SPELL_GO: u16 = 0x0132;
+    pub const SPELL_COOLDOWN: u16 = 0x0134;
+
+    /// Melee. All three arrived in one capture of a level-one warrior fighting
+    /// a wolf, and each is named for what its body turned out to hold rather
+    /// than from a table -- see [`crate::combat`].
+    pub const ATTACK_START: u16 = 0x0143;
+    pub const ATTACK_STOP: u16 = 0x0144;
+    /// One swing landing or missing. The workhorse of combat: fifteen of these
+    /// in a fight that lasted under a minute.
+    pub const ATTACKER_STATE_UPDATE: u16 = 0x014A;
+    /// Two empty-bodied refusals that arrive when a swing cannot happen. Both
+    /// were produced by attacking from out of range while facing away, three
+    /// times each, and *which* is which is not established -- neither carries
+    /// a payload to tell them apart, and no experiment has yet isolated one
+    /// condition without the other. Named for what they are.
+    pub const ATTACK_SWING_REFUSED_A: u16 = 0x0145;
+    pub const ATTACK_SWING_REFUSED_B: u16 = 0x0146;
+
+    /// The same body as [`MESSAGECHAT`], sent for a GM's lines.
+    pub const GM_MESSAGECHAT: u16 = 0x03B3;
 }
 
 /// A human-readable name for an incoming opcode, for logs and dumps.
@@ -94,6 +157,20 @@ pub fn describe(opcode: u16) -> String {
         server::MOVE_START_FORWARD => "MSG_MOVE_START_FORWARD",
         server::MOVE_STOP => "MSG_MOVE_STOP",
         server::MOVE_HEARTBEAT => "MSG_MOVE_HEARTBEAT",
+        server::NAME_QUERY_RESPONSE => "SMSG_NAME_QUERY_RESPONSE",
+        server::CREATURE_QUERY_RESPONSE => "SMSG_CREATURE_QUERY_RESPONSE",
+        server::MESSAGECHAT => "SMSG_MESSAGECHAT",
+        server::INITIAL_SPELLS => "SMSG_INITIAL_SPELLS",
+        server::CAST_FAILED => "SMSG_CAST_FAILED",
+        server::SPELL_START => "SMSG_SPELL_START",
+        server::SPELL_GO => "SMSG_SPELL_GO",
+        server::SPELL_COOLDOWN => "SMSG_SPELL_COOLDOWN",
+        server::ATTACK_START => "SMSG_ATTACKSTART",
+        server::ATTACK_STOP => "SMSG_ATTACKSTOP",
+        server::ATTACKER_STATE_UPDATE => "SMSG_ATTACKERSTATEUPDATE",
+        server::ATTACK_SWING_REFUSED_A => "SMSG_ATTACKSWING_REFUSED(0x0145)",
+        server::ATTACK_SWING_REFUSED_B => "SMSG_ATTACKSWING_REFUSED(0x0146)",
+        server::GM_MESSAGECHAT => "SMSG_GM_MESSAGECHAT",
         other => return format!("opcode {other:#06x}"),
     };
     name.to_string()

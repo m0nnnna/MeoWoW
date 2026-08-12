@@ -138,6 +138,67 @@ enum Command {
         /// dropped a minute in.
         #[arg(long, default_value_t = 0)]
         stay: u64,
+        /// After entering, print what a unit frame would show for this
+        /// character and the nearest N replicated units.
+        ///
+        /// The fields a unit frame reads -- health, power, level, and the
+        /// race/class/gender/power-type byte -- are the ones where a wrong
+        /// guess parses perfectly and returns nonsense, so they get a dump
+        /// command like every other format here.
+        #[arg(long)]
+        units: Option<usize>,
+        /// After entering, select the nearest unit and tell the server.
+        ///
+        /// Nothing is sent back, so this proves only that the packet is not
+        /// rejected -- which is worth proving on its own: a malformed one
+        /// drops the session.
+        #[arg(long)]
+        select: bool,
+        /// Select the nearest unit and swing at it, then hold the line.
+        ///
+        /// Auto-attack is a state rather than an action: one swing request
+        /// starts it, and the server drives the exchange from there. Pair with
+        /// `--stay` to see the exchange, and `--capture` to keep the bytes.
+        #[arg(long)]
+        attack: bool,
+        /// Write every packet received to this file as `opcode length hex`.
+        ///
+        /// The login burst and everything `--stay` collects. Exists because a
+        /// count of an opcode says only that a shape arrived, and writing a
+        /// parser needs the shape itself -- several parsers in `world::spell`
+        /// deliberately refuse layouts nobody has captured, and this is how
+        /// one stops being uncaptured.
+        #[arg(long)]
+        capture: Option<PathBuf>,
+        /// Ask the server what everything replicated is called, and wait for
+        /// the answers.
+        #[arg(long)]
+        names: bool,
+        /// After entering, say this out loud. Received chat is printed by
+        /// `--stay`, so two clients prove the round trip.
+        #[arg(long)]
+        say: Option<String>,
+        /// Yell rather than say. `/say` carries about 25 yards, which two
+        /// characters in the same starting zone can easily exceed; a yell
+        /// crosses the zone.
+        #[arg(long)]
+        yell: bool,
+        /// Print the character's spellbook, as `SMSG_INITIAL_SPELLS` sent it.
+        #[arg(long)]
+        spells: bool,
+        /// Cast this spell id at the nearest unit, or at yourself with
+        /// `--cast-self`.
+        #[arg(long)]
+        cast: Option<u32>,
+        #[arg(long)]
+        cast_self: bool,
+        /// Whisper `--say` to this character instead of speaking aloud.
+        ///
+        /// The only chat with no range at all, which makes it the one that
+        /// tests delivery between two clients without their positions being
+        /// part of the experiment.
+        #[arg(long)]
+        whisper: Option<String>,
         #[arg(long, default_value_t = auth::client::DEFAULT_PORT)]
         port: u16,
         #[arg(long, default_value_t = 8)]
@@ -252,10 +313,16 @@ enum DbcCommand {
     /// Dump rows through a transcribed schema.
     Rows {
         /// One of: Map, AreaTable, CreatureDisplayInfo, CreatureModelData,
-        /// AnimationData, Spell.
+        /// AnimationData, Spell, SpellIcon.
         table: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Show only these ids. Repeatable.
+        ///
+        /// Tables like `Spell` have fifty thousand rows, and the question is
+        /// almost always about a handful of them.
+        #[arg(long)]
+        id: Vec<u32>,
     },
     /// Check every transcribed schema against the files in this install.
     Check,
@@ -297,6 +364,17 @@ fn main() -> Result<()> {
             heading,
             face,
             stay,
+            units,
+            select,
+            attack,
+            capture,
+            names,
+            say,
+            yell,
+            whisper,
+            spells,
+            cast,
+            cast_self,
             port,
             timeout,
         } => {
@@ -306,6 +384,17 @@ fn main() -> Result<()> {
                 heading: *heading,
                 face: *face,
                 stay: *stay,
+                units: *units,
+                select: *select,
+                attack: *attack,
+                capture: capture.as_deref(),
+                names: *names,
+                say: say.as_deref(),
+                yell: *yell,
+                whisper: whisper.as_deref(),
+                spells: *spells,
+                cast: *cast,
+                cast_self: *cast_self,
                 host,
                 port: *port,
                 user,
@@ -406,6 +495,17 @@ struct WorldRequest<'a> {
     heading: Option<f32>,
     face: Option<f32>,
     stay: u64,
+    units: Option<usize>,
+    select: bool,
+    attack: bool,
+    capture: Option<&'a std::path::Path>,
+    names: bool,
+    say: Option<&'a str>,
+    yell: bool,
+    whisper: Option<&'a str>,
+    spells: bool,
+    cast: Option<u32>,
+    cast_self: bool,
     locale: &'a str,
     timeout: u64,
 }
@@ -432,6 +532,17 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         heading,
         face,
         stay,
+        units,
+        select,
+        attack,
+        capture,
+        names,
+        say,
+        yell,
+        whisper,
+        spells,
+        cast,
+        cast_self,
         locale,
         timeout,
     } = request;
@@ -548,6 +659,14 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
 
         // Nothing marks the end of the login burst, so read until it stops.
         let rest = connection.drain(std::time::Duration::from_millis(1500), 512)?;
+        let capture_path = capture;
+        let mut capture = match capture_path {
+            Some(path) => Some(Capture::create(path)?),
+            None => None,
+        };
+        if let Some(capture) = capture.as_mut() {
+            capture.record(&rest)?;
+        }
         let mut state = report_object_updates(&rest, character.guid, dump_failed)?;
 
         if let Some(degrees) = face {
@@ -627,16 +746,585 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
             );
         }
 
+        if select {
+            match nearest_unit(&state, character.guid) {
+                Some((guid, distance)) => {
+                    connection.set_selection(guid)?;
+                    // Nothing acknowledges a selection, so the only signal is
+                    // whether the session survives being given one. A packet
+                    // sent and immediately followed by a disconnect is often
+                    // never processed at all -- the same trap that once got a
+                    // facing opcode written off as wrong.
+                    connection.drain(std::time::Duration::from_millis(500), 64)?;
+                    println!("\nselected {guid:#x}, {distance:.1} units away");
+                    println!("  the session survived it, which is all a selection can prove");
+                }
+                None => println!("\nnothing replicated to select"),
+            }
+        }
+
+        if attack {
+            // Walk into melee range and turn to face the target before
+            // swinging. The first attempt skipped both, and the server
+            // answered with two different empty-bodied refusals, three times
+            // each, and no damage -- a swing is refused for being out of range
+            // and for facing the wrong way, and neither refusal produces the
+            // damage packet this exists to capture.
+            const MELEE_REACH: f32 = 2.5;
+            const RUN_SPEED: f32 = 7.0;
+            // Creatures wander, so one approach is not enough: by the time a
+            // walk finishes, the target has moved. Re-measured and repeated
+            // rather than assumed.
+            const APPROACHES: usize = 4;
+
+            let mut here = world::Position {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                orientation: position.orientation,
+            };
+            let mut chosen = None;
+            for attempt in 0..APPROACHES {
+                let Some((guid, distance)) = nearest_unit_from(&state, character.guid, here) else {
+                    break;
+                };
+                chosen = Some(guid);
+                let Some(there) = state.get(guid).and_then(|e| e.position) else {
+                    break;
+                };
+                let heading = (there.y - here.y).atan2(there.x - here.x);
+                if distance <= MELEE_REACH {
+                    connection.set_facing(character.guid, here, heading)?;
+                    println!("  in reach of {guid:#x} at {distance:.1} units, facing it");
+                    break;
+                }
+                let close = distance - MELEE_REACH;
+                println!(
+                    "  approach {}: closing {close:.1} units on {guid:#x}",
+                    attempt + 1
+                );
+                let (arrived, _) =
+                    connection.walk(character.guid, here, heading, close, RUN_SPEED)?;
+                // Where the *client* now is. The server never relays our own
+                // movement back, so `state` still believes the login position
+                // and measuring the next approach from it would aim at where
+                // we used to be.
+                here = arrived;
+                here.orientation = heading;
+                let batch = connection.drain(std::time::Duration::from_millis(400), 128)?;
+                // Not discarded: a fold hands back the events it will never
+                // store, and dropping them here is what made a later summary
+                // report more attacks stopped than ever started.
+                let report = state.replicate(&batch, None);
+                print_events(&report, &state, character.guid);
+            }
+
+            match chosen {
+                Some(guid) => {
+                    // Selected first: the server decides whether an attack has
+                    // a legal victim, and it decides that about the *selected*
+                    // target. Sending a swing at something never selected is a
+                    // different request than the client ever makes.
+                    connection.set_selection(guid)?;
+                    connection.attack_swing(guid)?;
+                    println!("swinging at {guid:#x}");
+                    println!(
+                        "  nothing acknowledges the swing itself. What proves the opcode is\n  \
+                         whether combat packets start arriving that were not before."
+                    );
+                }
+                None => println!("\nnothing replicated to attack"),
+            }
+        }
+
+        // Before `--stay`, so the names are in hand when chat starts arriving
+        // and a line from another player is attributed rather than numbered.
+        if names {
+            println!("\nresolving names:");
+            resolve_names(&mut connection, &mut state, 2)?;
+        }
+
+        if let Some(text) = say {
+            // The character's own language, not Universal -- see
+            // `chat::language_for_race`. Read from replicated state rather
+            // than from the character list so it comes from the same place the
+            // interface would read it.
+            let language = world::chat::language_for_race(
+                state
+                    .get(character.guid)
+                    .and_then(|entity| entity.race())
+                    .unwrap_or(character.race),
+            );
+            // Whisper wins over yell: it is the only chat with no range at
+            // all, which makes it the one that tests delivery between two
+            // clients without their positions being part of the experiment.
+            let (kind, target) = match (whisper, yell) {
+                (Some(name), _) => (world::ChatType::Whisper, name),
+                (None, true) => (world::ChatType::Yell, ""),
+                (None, false) => (world::ChatType::Say, ""),
+            };
+            connection.say(kind, language, target, text)?;
+            println!(
+                "\n{} {text:?}{} in language {language}",
+                kind.label(),
+                if target.is_empty() {
+                    String::new()
+                } else {
+                    format!(" to {target}")
+                }
+            );
+            // What comes back is the server relaying it to everyone in range,
+            // this client included -- so the echo below is itself the proof
+            // that the send was well formed.
+            let batch = connection.drain(std::time::Duration::from_millis(900), 128)?;
+            // Every opcode that came back, not just the ones that parsed.
+            // "Nothing was echoed" and "the echo arrived and this client could
+            // not read it" are completely different problems, and printing
+            // only the successes makes them look identical -- which cost a
+            // wrong conclusion here before this histogram existed.
+            let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+            for packet in &batch {
+                *seen.entry(packet.opcode).or_default() += 1;
+            }
+            let report = state.replicate(&batch, None);
+            print_events(&report, &state, character.guid);
+            for (opcode, error, body) in &report.failures {
+                println!(
+                    "  undecodable {}: {error}",
+                    world::opcode::describe(*opcode)
+                );
+                if let Ok(body) = body {
+                    println!("    {} bytes: {}", body.len(), hex_preview(body, 48));
+                }
+            }
+            if report.chat.is_empty() {
+                println!("  no chat came back. What did arrive:");
+                for (opcode, count) in &seen {
+                    println!("    {:<32} x{count}", world::opcode::describe(*opcode));
+                }
+            }
+        }
+
+        if spells {
+            report_spells(&state);
+        }
+
+        if let Some(spell_id) = cast {
+            let target = if cast_self {
+                None
+            } else {
+                nearest_unit(&state, character.guid).map(|(guid, _)| guid)
+            };
+            // The server decides whether a spell has a legal victim, so tell
+            // it what is selected before asking it to cast at it.
+            if let Some(guid) = target {
+                connection.set_selection(guid)?;
+            }
+            connection.cast_spell(spell_id, target)?;
+            println!(
+                "
+cast {spell_id} at {}",
+                match target {
+                    Some(guid) => format!("{guid:#x}"),
+                    None => "yourself".into(),
+                }
+            );
+            // Half a second, because a cast that is refused answers quickly
+            // and a cast that is accepted answers with the world changing.
+            let batch = connection.drain(std::time::Duration::from_millis(900), 128)?;
+            let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+            for packet in &batch {
+                *seen.entry(packet.opcode).or_default() += 1;
+            }
+            let report = state.replicate(&batch, None);
+            for failure in &report.cast_failures {
+                println!(
+                    "  refused: {} (spell {})",
+                    world::spell::describe_cast_failure(failure.reason),
+                    failure.spell_id
+                );
+            }
+            for message in &report.chat {
+                println!("  {}", describe_chat(message, &state));
+            }
+            if report.cast_failures.is_empty() {
+                println!("  not refused. What arrived:");
+                for (opcode, count) in &seen {
+                    println!("    {:<32} x{count}", world::opcode::describe(*opcode));
+                }
+            }
+        }
+
         if stay > 0 {
             hold_connection(
                 &mut connection,
                 std::time::Duration::from_secs(stay),
                 &mut state,
                 character.guid,
+                capture.as_mut(),
             )?;
+        }
+
+        if let (Some(capture), Some(path)) = (capture, capture_path) {
+            capture.finish(path)?;
+        }
+
+        if let Some(limit) = units {
+            report_units(&state, character.guid, limit);
         }
     }
     Ok(())
+}
+
+/// Prints the spellbook exactly as it arrived.
+///
+/// Ids only: turning one into a name needs `Spell.dbc`, and this command
+/// deliberately works without a game installation -- the protocol tools are
+/// useful on a machine that has no client data, and requiring `--data` to see
+/// whether a packet parsed would be the wrong trade. `wow-cli dbc rows Spell`
+/// resolves them when the data is there.
+fn report_spells(state: &world::WorldState) {
+    let book = &state.spells;
+    println!(
+        "
+spellbook: {} spell(s), {} cooldown(s)",
+        book.spells.len(),
+        book.cooldowns.len()
+    );
+    if book.spells.is_empty() {
+        println!("  none -- SMSG_INITIAL_SPELLS arrives in the login burst and is never resent,");
+        println!("  so an empty book here means the packet was missed, not that nothing is known");
+        return;
+    }
+    let ids: Vec<String> = book.spells.iter().map(|s| s.id.to_string()).collect();
+    for chunk in ids.chunks(12) {
+        println!("  {}", chunk.join(" "));
+    }
+    for cooldown in &book.cooldowns {
+        // `second` rather than a named field: this list's entry width is
+        // confirmed against a live realm, but what its second word actually
+        // measures is not -- see `SpellCooldown`'s doc comment.
+        println!("  cooldown: spell {}, second word {}", cooldown.spell_id, cooldown.second);
+    }
+}
+
+/// Writes every packet received to a file, for reading a shape offline.
+///
+/// One line per packet: the opcode in hex, its length, then the body. Plain
+/// text on purpose -- the point is to be greppable by opcode and readable by
+/// eye, and a capture that needs its own decoder to inspect would just move
+/// the problem. Nothing here interprets anything, which is what makes it
+/// usable on the packets that have no parser yet.
+struct Capture {
+    file: std::io::BufWriter<std::fs::File>,
+    written: usize,
+}
+
+impl Capture {
+    fn create(path: &std::path::Path) -> Result<Self> {
+        let file = std::fs::File::create(path)
+            .with_context(|| format!("creating capture file {}", path.display()))?;
+        Ok(Self {
+            file: std::io::BufWriter::new(file),
+            written: 0,
+        })
+    }
+
+    fn record(&mut self, packets: &[world::client::Packet]) -> Result<()> {
+        use std::io::Write;
+        for packet in packets {
+            let hex: Vec<String> = packet.body.iter().map(|b| format!("{b:02x}")).collect();
+            writeln!(
+                self.file,
+                "{:#06x} {:<40} {:>5} {}",
+                packet.opcode,
+                world::opcode::describe(packet.opcode),
+                packet.body.len(),
+                hex.join(" ")
+            )?;
+            self.written += 1;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+        self.file.flush()?;
+        println!("\ncaptured {} packets to {}", self.written, path.display());
+        Ok(())
+    }
+}
+
+/// The first `limit` bytes of a body, for eyeballing a layout that would not
+/// parse.
+fn hex_preview(body: &[u8], limit: usize) -> String {
+    let shown: String = body
+        .iter()
+        .take(limit)
+        .map(|b| format!("{b:02x} "))
+        .collect();
+    if body.len() > limit {
+        format!("{}...", shown.trim_end())
+    } else {
+        shown.trim_end().to_string()
+    }
+}
+
+/// What to call a unit in the table: its resolved name, or its guid.
+///
+/// Falling back to the guid rather than to a blank keeps the two states
+/// distinguishable at a glance -- a column of guids means names were never
+/// asked for, a column of names with one guid in it means one query went
+/// unanswered, and those want different investigations.
+fn unit_label(state: &world::WorldState, entity: &world::state::Entity) -> String {
+    let resolved = if entity.is_player() {
+        state.names.player(entity.guid).flatten()
+    } else {
+        entity
+            .fields
+            .get(world::update::fields::OBJECT_ENTRY)
+            .and_then(|entry| state.names.creature(entry).flatten())
+    };
+    match resolved {
+        Some(name) => name.to_string(),
+        None => format!("{:#x}", entity.guid),
+    }
+}
+
+/// Prints everything a fold *returns* rather than stores: chat and swings.
+///
+/// One function because there are now three places that drain packets, and
+/// the standing hazard in this crate is a caller that folds a batch and drops
+/// the events it hands back. The count that made this worth extracting was a
+/// summary reading "0 attacks started, 2 stopped" -- impossible, and caused by
+/// the approach loop folding the starts and discarding the report.
+fn print_events(report: &world::Replication, state: &world::WorldState, own_guid: u64) {
+    for message in &report.chat {
+        println!("  {}", describe_chat(message, state));
+    }
+    for swing in &report.swings {
+        println!(
+            "  {}",
+            world::combat::describe_swing(swing, own_guid, |guid| combat_name(state, guid))
+        );
+    }
+}
+
+/// What to call a guid in a combat line, named as well as the cache allows.
+///
+/// Falls back to the guid rather than to a blank, for the same reason
+/// [`unit_label`] does: a line reading "Unit 0xf13... hits you" still says what
+/// happened, and a line with a hole in it does not.
+fn combat_name(state: &world::WorldState, guid: u64) -> String {
+    match state.get(guid) {
+        Some(entity) => unit_label(state, entity),
+        None => format!("{guid:#x}"),
+    }
+}
+
+/// One line of chat, named as well as the name cache currently allows.
+fn describe_chat(message: &world::ChatMessage, state: &world::WorldState) -> String {
+    let who = speaker(message, state);
+    match message.chat_type {
+        world::ChatType::Channel => format!(
+            "[{}] {who}: {}",
+            message.channel.as_deref().unwrap_or("?"),
+            message.text
+        ),
+        world::ChatType::Emote | world::ChatType::TextEmote | world::ChatType::MonsterEmote => {
+            format!("* {who} {}", message.text)
+        }
+        world::ChatType::System => format!("[system] {}", message.text),
+        other => format!("[{}] {who}: {}", other.label(), message.text),
+    }
+}
+
+/// Who said it: the name carried inline if there was one, then the name cache,
+/// then the guid.
+///
+/// The three-way fallback is the honest picture. A creature names itself in the
+/// packet; a player does not, and is anonymous until a query comes back.
+fn speaker(message: &world::ChatMessage, state: &world::WorldState) -> String {
+    if let Some(name) = &message.sender_name {
+        return name.clone();
+    }
+    if let Some(Some(name)) = state.names.player(message.sender) {
+        return name.to_string();
+    }
+    if message.sender == 0 {
+        return "server".into();
+    }
+    format!("{:#x}", message.sender)
+}
+
+/// Asks for every name the replicated world needs, and waits for the answers.
+///
+/// Two rounds rather than one: the first round's queries are answered while
+/// the second round is being sent, and a single drain routinely returns before
+/// the last few arrive. Anything still missing after that is reported as
+/// missing rather than retried forever -- some guids are simply never
+/// answered, and this is a dump command, not the client.
+fn resolve_names(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    rounds: usize,
+) -> Result<()> {
+    use world::update::fields;
+
+    for _ in 0..rounds {
+        let now = std::time::Instant::now();
+        let mut wanted: Vec<(bool, u64, u32)> = Vec::new();
+        for entity in state.iter() {
+            let entry = entity.fields.get(fields::OBJECT_ENTRY).unwrap_or(0);
+            wanted.push((entity.is_player(), entity.guid, entry));
+        }
+
+        let mut asked = 0usize;
+        for (is_player, guid, entry) in wanted {
+            if is_player {
+                if state.names.claim_player(guid, now) {
+                    connection.ask_player_name(guid)?;
+                    asked += 1;
+                }
+            } else if entry != 0 && state.names.claim_creature(entry, now) {
+                connection.ask_creature_name(entry, guid)?;
+                asked += 1;
+            }
+        }
+        if asked == 0 {
+            break;
+        }
+        println!("  asked for {asked} name(s)");
+
+        // Give the answers time to arrive. A query sent and immediately
+        // followed by a read that gives up is indistinguishable from one the
+        // server ignored -- the same trap that briefly condemned a facing
+        // opcode.
+        let batch = connection.drain(std::time::Duration::from_millis(900), 512)?;
+        let report = state.replicate(&batch, None);
+        for (opcode, error, _) in &report.failures {
+            println!("  undecodable {}: {error}", world::opcode::describe(*opcode));
+        }
+        // Chat arrives on the same stream as everything else, so a drain done
+        // for another reason still collects it -- and dropping it here loses
+        // it for good. That is not hypothetical: a two-client test looked like
+        // chat never being delivered, when the other client's line had landed
+        // in this drain and been discarded. `replicate` has one dispatch table
+        // by design; its *callers* are where a category goes quietly missing.
+        for message in &report.chat {
+            println!("  {}", describe_chat(message, state));
+        }
+    }
+
+    let (known, pending) = state.names.counts();
+    let stats = state.names.stats;
+    println!(
+        "  {known} name(s) resolved, {pending} unanswered ({} queries, {} answers, {} unsolicited)",
+        stats.queries_issued, stats.answers, stats.unsolicited
+    );
+    Ok(())
+}
+
+/// The closest replicated unit to the player, if there is one.
+fn nearest_unit(state: &world::WorldState, own_guid: u64) -> Option<(u64, f32)> {
+    let own = state.get(own_guid)?.position?;
+    nearest_unit_from(state, own_guid, own)
+}
+
+/// The nearest unit to a *given* point rather than to the replicated one.
+///
+/// Needed because the server never relays this client's own movement back to
+/// it: walk twenty units and `state`'s idea of where we are is still the login
+/// position. Measuring from it after a walk reports distances to somewhere we
+/// left, which showed up as an attack command that closed the right number of
+/// units and still arrived out of range.
+fn nearest_unit_from(
+    state: &world::WorldState,
+    own_guid: u64,
+    own: world::Position,
+) -> Option<(u64, f32)> {
+    state
+        .iter()
+        .filter(|entity| entity.guid != own_guid)
+        .filter_map(|entity| {
+            let at = entity.position?;
+            let distance = ((at.x - own.x).powi(2) + (at.y - own.y).powi(2) + (at.z - own.z).powi(2))
+                .sqrt();
+            Some((entity.guid, distance))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+}
+
+/// Prints what a unit frame would show, for the player and its neighbours.
+///
+/// This is the dump command the interface's fields should have had before they
+/// were wired into a renderer -- `CLAUDE.md`'s rule, skipped once and repaid
+/// here. It exists because every value below is one where a wrong field index
+/// parses perfectly: a warrior reported with mana instead of rage, or a level
+/// read out of the power array, looks like data rather than like a bug.
+fn report_units(state: &world::WorldState, own_guid: u64, limit: usize) {
+    println!("\nunit fields, as a unit frame would read them:");
+
+    let mut rows: Vec<(f32, &world::state::Entity)> = Vec::new();
+    if let Some(own) = state.get(own_guid) {
+        rows.push((0.0, own));
+    }
+    let mut others: Vec<(f32, &world::state::Entity)> = nearest_ordered(state, own_guid);
+    others.truncate(limit);
+    rows.append(&mut others);
+
+    println!(
+        "  {:<22} {:<9} {:>5}  {:>13}  {:>13}  {}",
+        "name", "kind", "level", "health", "power", "race/class/gender/power"
+    );
+    for (distance, entity) in rows {
+        let bytes = entity
+            .bytes_0()
+            .map(|b| format!("{} / {} / {} / {}", b[0], b[1], b[2], b[3]))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "  {:<22} {:<9} {:>5}  {:>6}/{:<6}  {:>6}/{:<6}  {bytes}{}",
+            unit_label(state, entity),
+            entity.object_type.name(),
+            entity
+                .level()
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "-".into()),
+            entity.health().unwrap_or(0),
+            entity.max_health().unwrap_or(0),
+            entity.power().unwrap_or(0),
+            entity.max_power().unwrap_or(0),
+            if distance > 0.0 {
+                format!("   {distance:.0}u away")
+            } else {
+                "   (you)".into()
+            },
+        );
+    }
+    println!(
+        "  power type: 0 mana, 1 rage, 2 focus, 3 energy, 6 runic power.\n  \
+         A warrior reading anything but rage means the power array was indexed wrong."
+    );
+}
+
+/// Replicated units other than the player, nearest first.
+fn nearest_ordered(state: &world::WorldState, own_guid: u64) -> Vec<(f32, &world::state::Entity)> {
+    let Some(own) = state.get(own_guid).and_then(|entity| entity.position) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(f32, &world::state::Entity)> = state
+        .iter()
+        .filter(|entity| entity.guid != own_guid)
+        .filter_map(|entity| {
+            let at = entity.position?;
+            let distance = ((at.x - own.x).powi(2) + (at.y - own.y).powi(2) + (at.z - own.z).powi(2))
+                .sqrt();
+            // A distance of exactly zero would read as "(you)" in the table.
+            Some((distance.max(f32::MIN_POSITIVE), entity))
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    rows
 }
 
 /// Stays in the world, answering keepalives, and reports what kept arriving.
@@ -649,6 +1337,7 @@ fn hold_connection(
     duration: std::time::Duration,
     state: &mut world::WorldState,
     own_guid: u64,
+    mut capture: Option<&mut Capture>,
 ) -> Result<()> {
     // Not tunable: pinging faster gets the session killed. See PING_INTERVAL.
     const PING_EVERY: std::time::Duration = world::client::PING_INTERVAL;
@@ -659,6 +1348,7 @@ fn hold_connection(
     let mut pings = 0usize;
     let mut last_ping = std::time::Instant::now();
     let mut totals = world::Replication::default();
+    let mut swings = 0usize;
 
     /// Where a replicated object was first and last seen, so a journey can be
     /// reported rather than only a final position.
@@ -667,6 +1357,10 @@ fn hold_connection(
         last: world::Position,
     }
     let mut tracks: std::collections::BTreeMap<u64, Track> = Default::default();
+    // Every opcode seen, decoded or not. Without this, "the server never sent
+    // it" and "it arrived and we could not read it" are the same observation,
+    // and they want opposite investigations.
+    let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
 
     while std::time::Instant::now() < until {
         // A small batch on purpose. `drain` returns when the stream goes quiet
@@ -675,11 +1369,27 @@ fn hold_connection(
         // sampling below sees a handful of coarse snapshots instead of a path.
         let batch = connection.drain(std::time::Duration::from_millis(300), 48)?;
         packets += batch.len();
+        for packet in &batch {
+            *seen.entry(packet.opcode).or_default() += 1;
+        }
+        if let Some(capture) = capture.as_mut() {
+            capture.record(&batch)?;
+        }
 
         let report = state.replicate(&batch, None);
         totals.object_updates += report.object_updates;
         totals.monster_moves += report.monster_moves;
         totals.relayed_moves += report.relayed_moves;
+        totals.names += report.names;
+        // Printed as it arrives rather than summarised at the end: the whole
+        // point of holding the connection is to see whether the other client's
+        // line comes through, and a count of two would not say what was said.
+        // Printed as it arrives, like chat and for the same reason: a count of
+        // fifteen swings does not say who hit whom for how much.
+        print_events(&report, state, own_guid);
+        swings += report.swings.len();
+        totals.attacks_started += report.attacks_started;
+        totals.attacks_stopped += report.attacks_stopped;
         for (opcode, error, _) in &report.failures {
             // Printed rather than counted: a packet that will not decode here
             // is a layout error in something the replicated world depends on.
@@ -725,6 +1435,14 @@ fn hold_connection(
         totals.relayed_moves,
         totals.failures.len()
     );
+    if swings > 0 || totals.attacks_started > 0 {
+        println!(
+            "  combat: {swings} swings, {} attacks started, {} stopped, {} still swinging",
+            totals.attacks_started,
+            totals.attacks_stopped,
+            state.attacking.len()
+        );
+    }
     println!(
         "  replicated world: {} objects ({} created, {} recreated, {} removed, \
          {} value updates, {} moves, {} orphaned)",
@@ -768,6 +1486,15 @@ fn hold_connection(
     // means monster moves are not being applied.
     let heading_somewhere = state.iter().filter(|e| e.destination.is_some()).count();
     println!("  {heading_somewhere} creature(s) currently following a path");
+
+    // Everything that arrived, decoded or not. A packet this client ignores is
+    // not an error -- the server volunteers plenty -- but when something
+    // expected never shows up, the difference between "never sent" and "sent
+    // and unread" is the whole investigation.
+    println!("  opcodes seen:");
+    for (opcode, count) in &seen {
+        println!("    {:<32} x{count}", world::opcode::describe(*opcode));
+    }
     Ok(())
 }
 
@@ -1936,7 +2663,7 @@ fn dbc_cmd(chain: &mut Chain, cmd: DbcCommand) -> Result<()> {
         DbcCommand::List { filter } => dbc_list(chain, filter.as_deref()),
         DbcCommand::Info { table } => dbc_info(chain, &table),
         DbcCommand::Dump { table, limit } => dbc_dump(chain, &table, limit),
-        DbcCommand::Rows { table, limit } => dbc_rows(chain, &table, limit),
+        DbcCommand::Rows { table, limit, id } => dbc_rows(chain, &table, limit, &id),
         DbcCommand::Check => dbc_check(chain),
     }
 }
@@ -2060,7 +2787,7 @@ fn dbc_dump(chain: &mut Chain, table: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn dbc_rows(chain: &mut Chain, table: &str, limit: usize) -> Result<()> {
+fn dbc_rows(chain: &mut Chain, table: &str, limit: usize, ids: &[u32]) -> Result<()> {
     use dbc::schema::*;
 
     macro_rules! dispatch {
@@ -2071,11 +2798,17 @@ fn dbc_rows(chain: &mut Chain, table: &str, limit: usize) -> Result<()> {
                         let bytes = chain.read($name::PATH)?;
                         let parsed = $name::parse(&bytes)?;
                         println!("{} -- {} rows\n", $name::PATH, parsed.len());
-                        for (i, row) in parsed.iter().take(limit).enumerate() {
+                        // A table with fifty thousand rows is almost never a
+                        // question about the first twenty of them.
+                        let wanted: Vec<_> = parsed
+                            .iter()
+                            .filter(|row| ids.is_empty() || ids.contains(&row.id()))
+                            .collect();
+                        for (i, row) in wanted.iter().take(limit).enumerate() {
                             println!("[{i}] {row:?}");
                         }
-                        if parsed.len() > limit {
-                            println!("\n... {} more (raise --limit)", parsed.len() - limit);
+                        if wanted.len() > limit {
+                            println!("\n... {} more (raise --limit)", wanted.len() - limit);
                         }
                         return Ok(());
                     }
@@ -2089,7 +2822,18 @@ fn dbc_rows(chain: &mut Chain, table: &str, limit: usize) -> Result<()> {
         };
     }
 
-    dispatch!(Map, AreaTable, CreatureDisplayInfo, CreatureModelData, AnimationData, Spell)
+    dispatch!(
+        Map,
+        AreaTable,
+        CreatureDisplayInfo,
+        CreatureModelData,
+        AnimationData,
+        Spell,
+        SpellIcon,
+        SkillLineAbility,
+        SpellDuration,
+        SpellRadius
+    )
 }
 
 fn dbc_check(chain: &mut Chain) -> Result<()> {
@@ -2129,7 +2873,9 @@ fn dbc_check(chain: &mut Chain) -> Result<()> {
         CreatureDisplayInfo,
         CreatureModelData,
         AnimationData,
-        Spell
+        Spell,
+        SpellDuration,
+        SpellRadius
     );
     println!();
     if failures == 0 {

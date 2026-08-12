@@ -4,7 +4,9 @@
 //! `crates/mpq/tests/real_data.rs` for why the file is named this way.
 
 use dbc::infer::{infer, ColumnKind};
-use dbc::schema::{AreaTable, CreatureDisplayInfo, CreatureModelData, Map, Spell};
+use dbc::schema::{
+    AreaTable, CreatureDisplayInfo, CreatureModelData, Map, Spell, SpellDuration, SpellRadius,
+};
 use dbc::Dbc;
 use mpq::Chain;
 
@@ -36,7 +38,63 @@ fn transcribed_schemas_match_build_12340() {
             <$t>::parse(&bytes).unwrap_or_else(|e| panic!("{}: {e}", <$t>::NAME));
         })*};
     }
-    check!(Map, AreaTable, CreatureDisplayInfo, CreatureModelData, Spell);
+    check!(
+        Map,
+        AreaTable,
+        CreatureDisplayInfo,
+        CreatureModelData,
+        Spell,
+        SpellDuration,
+        SpellRadius
+    );
+}
+
+/// The effect columns behind a description's `$s1`-style tokens.
+///
+/// These were located by properties of the whole table rather than
+/// transcribed -- each one's test is recorded on the column in
+/// `dbc::schema::Spell` -- and this pins the result to specific spells, so a
+/// shifted index fails loudly here instead of quoting a wrong number at a
+/// player. The values chosen are ones whose meaning is visible in the
+/// description text sitting next to them.
+#[test]
+fn spell_effect_columns_land_on_the_right_values() {
+    let mut chain = require_data!();
+    let spells = Spell::parse(&chain.read(Spell::PATH).unwrap()).unwrap();
+    let durations = SpellDuration::parse(&chain.read(SpellDuration::PATH).unwrap()).unwrap();
+    let radii = SpellRadius::parse(&chain.read(SpellRadius::PATH).unwrap()).unwrap();
+    let find = |id: u32| spells.iter().find(|s| s.id() == id).expect("spell exists");
+
+    // Heroic Strike rank 1: "increases melee damage by $s1", and the value is
+    // stored one below what the tooltip says.
+    let heroic = find(78);
+    assert_eq!(heroic.name(), "Heroic Strike");
+    assert_eq!(heroic.effect_base_points(), 10, "$s1 reads as 11");
+
+    // Frostbolt rank 1 stores its slow negative: "slowing movement speed by
+    // $s1%" has to print 40, which is the check that the sign is handled and
+    // that the column is the slow rather than the damage.
+    assert_eq!(find(116).effect_base_points(), -41);
+
+    // Battle Shout rank 1 exercises both index tables at once: "within $a1
+    // yards ... Lasts $d" is 30 yards for 2 minutes in this build.
+    let shout = find(6673);
+    let radius = radii
+        .iter()
+        .find(|r| r.id() == shout.effect_radius_index())
+        .expect("radius index names a real row");
+    assert_eq!(radius.radius(), 30.0);
+    let duration = durations
+        .iter()
+        .find(|d| d.id() == shout.duration_index())
+        .expect("duration index names a real row");
+    assert_eq!(duration.duration().min(duration.max_duration()), 120_000);
+
+    // A periodic effect, for the `$t1` column. Rejuvenation ticks every 3
+    // seconds, which its own description quotes as `$t1`.
+    let rejuv = find(774);
+    assert_eq!(rejuv.name(), "Rejuvenation");
+    assert_eq!(rejuv.effect_aura_period(), 3000);
 }
 
 /// Column *indices* are the part a field-count check cannot catch, so these

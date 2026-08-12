@@ -5,18 +5,28 @@ Client only — no server, no bundled assets.
 
 ## Where the project is
 
-Phases 1 and 2 are complete: every data format reads, and the world renders and
-streams. Phase 3 has started.
+Phases 1, 2 and 3 are complete: every data format reads, the world renders and
+streams, and the protocol reaches a live realm. Phase 4 has started.
 
 | | State |
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation), WMO, ADT/WDT — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
 | Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated creatures and players slide along their actual path, turn to face it, and play the model's own walk/stand cycles |
-| Game + UI | Not started. The largest remaining chunk. |
+| Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, `F1` to rearrange, saved to `ui.toml` |
+| Game | **4.3 done**: spellbook, three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. Spell damage, threat and the corpse flow remain. Inventory and quests follow |
 
-Roughly 50% of the way to something a person could test by playing. See
+Roughly 57% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
+
+**The UI question is answered: this client draws its own interface and does not
+run addons.** Reimplementing `FrameXML` faithfully enough for third-party addons
+means reproducing a whole Lua/XML widget system before the first health bar
+appears. Instead the interface *is* the customisation surface: every position,
+size and colour lives in `%APPDATA%\open-wow\ui.toml`, editable by hand or by
+dragging frames in-game. egui is the drawing substrate only — frames are painted
+from explicit geometry, so `scale` multiplies every dimension and the appearance
+is a function of our `Style` alone. See `docs/UI.md`.
 
 **The two halves have met, the viewer drives movement, and it draws the
 replicated world moving.** `wow-viewer --realm-host <host> --user <account>
@@ -38,18 +48,47 @@ only found by watching it live — see `docs/ROADMAP.md`'s 3.5 section.
 `wow-cli world --enter X --walk 20` remains the CLI-driven equivalent, useful
 when no window is available.
 
+On top of that there is now an interface: a player frame and a target frame
+drawn from replicated fields, a left click that casts a ray through the cursor
+and sends `CMSG_SET_SELECTION` for whatever it hits, and `F1` to drag the whole
+layout around and save it. The fields those frames read are confirmed against
+the live realm via `wow-cli world --units` — `Testwolf` reads as a rage user
+with `0/1000`, not the `0/0` mana a mis-indexed power array would give, and a
+second account's player replicates the same way. Watched live too: overlapping
+creatures each select deliberately, a bracket of corner ticks marks the
+selection out in the world, and left-drag swings the camera around the
+character. Two bugs came out of that look and out of nothing else — no
+in-world selection marker at all, and a camera whose yaw was written by a drag
+and overwritten by the follow code a millisecond later.
+
+4.2 added chat and names on top: `Enter` opens a line to type in (and takes the
+keyboard away from movement while it is open), the scrollback colours by kind,
+and frames say `Young Wolf` rather than `Creature 299`. Verified across two
+clients — `Watcher` on `ACCOUNT34` whispered `Testwolf` on `ACCOUNT33` and it
+arrived — plus 50 names resolved from 50 queries with none unanswered. Watched
+live, and for the first time in this phase the look found **nothing**: the
+typed line went out and came back exactly once, typing did not walk the
+character, and a whisper from a player who was never in visibility range
+resolved from a bare guid to their name retroactively. That is not extra care;
+it is that 4.1's live bugs had been converted into headless checks (a paint
+assertion, and received chat logged as well as drawn), and the one bug 4.2 did
+have was caught by reading the viewer's own log rather than by looking at it.
+
 ## Orientation
 
 - `crates/` — one library per concern: `chunk` (shared chunked container),
-  `mpq`, `dbc`, `blp`, `m2`, `wmo`, `adt`, `render`, `auth`, `world`
+  `mpq`, `dbc`, `blp`, `m2`, `wmo`, `adt`, `render`, `auth`, `world`, `ui`
+  (the player's interface; depends on neither `world` nor `render`, so it is
+  testable without a connection or a GPU)
 - `tools/wow-cli` — inspection CLI. **Every format gets a dump command here
   before it is wired into the renderer**, and a `survey` command that parses the
   whole archive set. Those surveys have caught every systematic parser bug so
   far.
 - `apps/viewer` — windowed viewer. `--screenshot` renders one frame headless to
   a PNG, which is how render output is checked without a display.
-- `docs/` — `ROADMAP.md`, `RENDERING.md`, `PROTOCOL.md`, `REUSE-POLICY.md`, and
-  `formats/*.md` recording what each format actually does and where it bit us.
+- `docs/` — `ROADMAP.md`, `RENDERING.md`, `PROTOCOL.md`, `UI.md`,
+  `REUSE-POLICY.md`, and `formats/*.md` recording what each format actually
+  does and where it bit us.
 
 ## Local setup
 
@@ -98,6 +137,35 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   properties the data must have, not just that it decoded: M2 normals are unit
   vectors, SRP6 rotation keys are unit quaternions, terrain chunks must meet at
   their edges. Each of those caught a real bug that size checks missed.
+- **"Could this column mean X" is the wrong question; "is it set *because* of
+  X" is the right one.** Finding which of `Spell.dbc`'s 234 columns holds a
+  duration by asking which one contains a valid `SpellDuration` id gave a
+  99.6% match — on the wrong column. Any column of small integers points
+  somewhere inside a 130-row table, so validity is nearly free and proves
+  nothing. Comparing the spells whose description says `$d` against those that
+  do not immediately separated the real column: non-zero 98.5% of the time
+  versus 39.0%. The same reframing found every other column here, and the one
+  test that came back flat had been asked the sloppy version of its question
+  (every description *mentioning* `$m1`, rather than only those quoting a
+  range, which is when a die is actually needed). A property test is only as
+  good as the population you run it against.
+- **A number nobody can check is worse than a blank.** A wrong field offset
+  eventually fails loudly; a wrong *number* on a tooltip never does. So the
+  description substituter resolves only the tokens whose columns were
+  confirmed against the data and passes everything else through with its `$`
+  intact — a visible `$s1` says "not implemented", a fabricated `47` says
+  nothing and is believed. Same rule as `describe_cast_failure` naming one
+  status code, one layer up.
+- **A reply you cannot get is not the same as a reply you did not earn.**
+  `CMSG_ATTACKSWING` could not be read off a capture -- nothing acknowledges an
+  opcode, and an outgoing number that is wrong gets read as some *other* valid
+  request rather than refused. Sent from out of range and facing the wrong way
+  it produced two empty-bodied refusals and no damage, which looks exactly like
+  a wrong opcode. The proof was not that a reply came, but that the reply
+  *changed when the conditions did*: closing to melee and turning to face
+  turned those same refusals into an attack-start and fifteen swings. When
+  nothing can confirm a send directly, find the input you can vary and check
+  the output varies with it.
 - **State that persists needs accounting, not just parsing.** Every parser here
   is memoryless: a bad packet gives one wrong answer and the next is unaffected.
   Replicated world state is not — a dropped update is permanent, a merge that
@@ -134,11 +202,68 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   as wrong behaviour far away. Where a structure travels both ways, define it
   once and round-trip it — two copies of a conditional layout can drift, and the
   outgoing copy has nothing to announce the drift.
+- **When a send produces no reply at all, inventory what *did* arrive before
+  improving your guess.** Sending chat failed silently three times and looked
+  identical every time: packet out, session alive, nothing back. The causes were
+  a language an ordinary account may not speak, an enum where `0` is `SYSTEM`
+  and `1` is `SAY`, and — twice — our own tooling receiving the reply and
+  discarding it. Each round of guessing at the layout was wasted; the moment
+  `wow-cli world --stay` printed every opcode seen, decoded or not, the answer
+  took one run. "The server never sent it" and "it arrived and we could not read
+  it" are the same observation until something separates them, and they want
+  opposite investigations.
+- **Convert every live-only bug into a check that runs without a window.**
+  3.5 and 4.1 each cost a handful of bugs that no test could have caught. 4.2
+  cost none, and the difference was not care: 4.1's failures had been turned
+  into a headless egui pass asserting a frame painted where the layout put it,
+  and into logging received chat as well as drawing it. 4.2's one real bug —
+  a chat line stamped with a guid before its name resolved — was then found by
+  *reading the viewer's log*, a step earlier than looking. Live testing does not
+  stop mattering; each live bug just stops recurring for free.
+- **A limit that bounds packets does not bound time.** The login burst drained
+  until the stream went quiet *or* 512 packets arrived. Northshire emits a
+  monster move fourteen times a second and is never quiet, so the drain ran
+  until it had its 512 -- **thirty-seven seconds**, before the client drew a
+  single frame. Nothing was wrong with the drain; its contract simply had no
+  clock in it. Any "read until N or until idle" loop against a live stream
+  wants a wall-clock budget too, and the chunk size then sets how far past that
+  budget it can overshoot.
+- **Measure the thing, not the thing next to it.** That same delay presented as
+  the action bar filling half a minute after login, and the confident diagnosis
+  was a slow `Spell.dbc` read blocking the render thread -- with a plausible
+  argument attached (two runs agreed to the second, so it must be a fixed cost
+  rather than network jitter). It was wrong. The DBC load takes 185ms; the
+  spellbook had been sitting at the end of a burst that took 37 seconds to
+  finish collecting. One timing log around the suspected culprit settled in one
+  run what reasoning had got backwards.
+- **Do not transcribe a table you have not verified — especially one that only
+  produces text.** A wrong field offset eventually fails loudly; a wrong *name*
+  for a status code never does. It confidently misexplains what happened and
+  sends the next reader somewhere else. `describe_cast_failure` therefore names
+  exactly one reason, the one actually observed against the realm, and returns
+  the raw number for everything else. The urge to fill in the whole enum from
+  memory is the same urge that produced `CHAT_MSG_SAY = 0x00`.
+- **One dispatch table does not save a caller from ignoring what it produces.**
+  `WorldState::replicate` is deliberately the only place opcodes are dispatched,
+  and that is still right — but chat is *returned* rather than stored, and three
+  separate callers quietly dropped it. A two-client test then showed chat never
+  being delivered when it had arrived and been thrown away. Centralising the
+  producer does not centralise the consumers.
 - **Not every failure is a bug.** The world connection dropping after three
   keepalives was the server enforcing a *minimum* ping interval — pinging too
   eagerly is punished harder than not pinging. It surfaced as an unexpected end
   of stream, which is indistinguishable from a desynchronised cipher. Before
   suspecting corruption, ask whether a rate limit or anti-abuse rule was tripped.
+- **But derive from the *same* source when two things must agree exactly.**
+  The opposite-sounding rule, and both are right about different situations.
+  Independence is evidence when you are checking whether something is
+  *correct*. It is a liability when two things must *stay* consistent: the
+  picking ray is unprojected from the very matrix the scene is drawn with, not
+  rebuilt from the camera's angles, because those two agree only until someone
+  changes the projection — and a ray that is off by a little lands clicks on
+  the creature *beside* the one under the cursor, which reads as the server
+  disagreeing about positions rather than as a stale copy of a matrix. Same
+  reasoning as defining a both-ways structure once and round-tripping it.
 - **Compare against something derived independently.** The SRP6 tests carry a
   server written from the protocol, not from the client. Agreement between two
   separate derivations is evidence; a thing checked against itself is not.

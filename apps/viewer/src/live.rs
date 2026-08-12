@@ -60,6 +60,18 @@ pub struct LiveWorld {
     /// session rather than per batch -- a per-batch count resets to zero every
     /// frame and hides a decode that is failing steadily.
     pub fold_failures: usize,
+    /// Opcodes whose first undecodable body has already been logged.
+    ///
+    /// `WorldState::replicate` goes to the trouble of carrying each failed
+    /// packet's *body* out with the error, and the only reason to do that is
+    /// so somebody can read the shape later. Several parsers in `world::spell`
+    /// deliberately refuse layouts nobody has captured yet and say in their
+    /// own doc comments that a capture is what would settle them -- and a
+    /// counter alone cannot tell "the server never sent it" from "it arrived
+    /// and we could not read it", which this project has already paid for
+    /// once. The first body per opcode is the one that teaches; the rest are
+    /// noise, and a busy zone would produce plenty.
+    reported_failures: std::collections::HashSet<u16>,
     /// Kept alive rather than dropped at the end of [`connect`]: the viewer
     /// walks the character over this same connection, and RC4 header state
     /// cannot be shared or rewound, so a fresh connection could not pick up
@@ -137,12 +149,23 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
     );
 
     // Nothing marks the end of the login burst, so read until it goes quiet.
-    let burst = connection.drain(std::time::Duration::from_millis(1500), 512)?;
+    let burst = read_login_burst(&mut connection)?;
     let mut state = world::WorldState::new();
-    let fold_failures = replicate(&mut state, &burst);
+    // Held rather than counted on the spot: the burst is the widest variety of
+    // packets this client ever sees at once, so it is the likeliest place for
+    // a shape no parser has confirmed to turn up -- and the body is what would
+    // settle it. Logged once `LiveWorld` exists to remember which opcodes have
+    // already been reported.
+    let burst_report = replicate(&mut state, &burst);
+    tracing::info!(
+        "login burst: {} packets, {} objects, {} spells",
+        burst.len(),
+        state.len(),
+        state.spells.spells.len(),
+    );
 
     let (map_directory, map_name) = map_directory(chain, landed.map)?;
-    Ok(LiveWorld {
+    let mut live = LiveWorld {
         character: character.name.clone(),
         guid: character.guid,
         map_id: landed.map,
@@ -152,9 +175,104 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
         position: Vec3::new(landed.x, landed.y, landed.z),
         orientation: landed.orientation,
         state,
-        fold_failures,
+        fold_failures: 0,
+        reported_failures: std::collections::HashSet::new(),
         connection,
-    })
+    };
+    live.note_failures(&burst_report);
+    Ok(live)
+}
+
+/// How long the client will wait for the login burst before showing the world.
+///
+/// A budget rather than a target: whatever has not arrived by now keeps
+/// arriving through the ordinary per-frame pump, which is the same code path
+/// that handles every later packet anyway.
+const BURST_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Reads the initial world state, bounded by the clock.
+///
+/// `Connection::drain` stops when the stream goes quiet *or* when a packet
+/// limit is reached, and nothing bounds how long that takes. In an empty zone
+/// it returns in milliseconds; in Northshire, which emits a monster move
+/// roughly fourteen times a second and is therefore never quiet, it kept going
+/// until it had collected its 512-packet limit -- **thirty-seven seconds**,
+/// during which the client had not drawn a frame.
+///
+/// That looked for a while like a slow `Spell.dbc` read, because the symptom
+/// was the action bar filling half a minute after login. It was not: the
+/// spellbook was in the burst all along, at the end of it, and the DBC load
+/// takes 185ms. The lesson is the ordinary one -- measure the thing rather
+/// than the thing next to it.
+///
+/// So the burst is now bounded by wall clock as well. Anything still in flight
+/// is not lost; it arrives through the pump a frame or two later, and the
+/// interface fills in as it does.
+fn read_login_burst(
+    connection: &mut world::Connection,
+) -> Result<Vec<world::client::Packet>, world::client::Error> {
+    // The budget can only be checked between chunks, so the chunk size sets
+    // how far past it this can overshoot: a chunk does not return until it has
+    // its packets or the stream goes quiet, and at Northshire's fourteen
+    // packets a second a chunk of 64 takes four and a half seconds on its own.
+    // Sixteen keeps the overshoot near a second, which is the real bound here
+    // rather than the budget.
+    const CHUNK: usize = 16;
+
+    let deadline = std::time::Instant::now() + BURST_BUDGET;
+    let mut burst = Vec::new();
+    loop {
+        // A short quiet window so a genuinely idle zone returns immediately.
+        let chunk = connection.drain(std::time::Duration::from_millis(200), CHUNK)?;
+        let went_quiet = chunk.is_empty();
+        burst.extend(chunk);
+        if went_quiet || std::time::Instant::now() >= deadline {
+            return Ok(burst);
+        }
+    }
+}
+
+impl LiveWorld {
+    /// Records a fold's failures: counts them all, and logs the first body
+    /// seen for each opcode.
+    ///
+    /// The body is the whole point. Several parsers in `world::spell` refuse
+    /// layouts nobody has captured -- a `SMSG_SPELL_GO` carrying a miss, a
+    /// cast aimed at a location rather than a unit -- and each says in its own
+    /// doc comment that a capture is what would settle it. Without this the
+    /// packet that would answer the question arrives, increments a counter,
+    /// and is discarded; the next person to look sees a number and no way to
+    /// tell whether the shape ever showed up at all.
+    pub fn note_failures(&mut self, report: &world::state::Replication) {
+        self.fold_failures += report.failures.len();
+        for (opcode, error, body) in &report.failures {
+            if !self.reported_failures.insert(*opcode) {
+                continue;
+            }
+            match body {
+                Ok(bytes) => tracing::warn!(
+                    "undecoded opcode {opcode:#06x} ({} bytes): {error}. First body: {}",
+                    bytes.len(),
+                    hex_preview(bytes, 64)
+                ),
+                Err(e) => tracing::warn!(
+                    "undecoded opcode {opcode:#06x}: {error}; its body was \
+                     unavailable too: {e}"
+                ),
+            }
+        }
+    }
+}
+
+/// The first `limit` bytes of a body, for eyeballing a layout that would not
+/// parse.
+fn hex_preview(body: &[u8], limit: usize) -> String {
+    let shown: Vec<String> = body.iter().take(limit).map(|b| format!("{b:02x}")).collect();
+    if body.len() > limit {
+        format!("{}...", shown.join(" "))
+    } else {
+        shown.join(" ")
+    }
 }
 
 /// Folds a batch of drained packets into replicated world state.
@@ -163,11 +281,20 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
 /// this opcode dispatch lives -- it used to be duplicated here and in
 /// `tools/wow-cli`, and two independent tables over the same state machine
 /// drift silently: a new opcode wired into one and not the other freezes
-/// whatever it should have moved, unnoticed. The viewer only wants a failure
-/// count, so that is all this returns; `wow-cli` wants the fuller
-/// `world::Replication` and calls the method directly.
-pub fn replicate(state: &mut world::WorldState, packets: &[world::client::Packet]) -> usize {
-    state.replicate(packets, None).failures.len()
+/// whatever it should have moved, unnoticed.
+///
+/// The whole `Replication` is handed back, not a summary. This used to return
+/// only a failure count, which was fine until `replicate` grew a category the
+/// caller had to act on: chat is *returned* rather than stored, so a caller
+/// that discards the report discards every line anyone said. That went wrong
+/// in `wow-cli` first -- a two-client test looked like chat never being
+/// delivered, when it had arrived in a drain whose report was thrown away.
+/// One dispatch table does not save a caller from ignoring what it produces.
+pub fn replicate(
+    state: &mut world::WorldState,
+    packets: &[world::client::Packet],
+) -> world::Replication {
+    state.replicate(packets, None)
 }
 
 /// Turns replicated state into what the renderer and the summary text both

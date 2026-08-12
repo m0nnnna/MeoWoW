@@ -461,6 +461,101 @@ quiet zone.** These sessions saw one apiece. The merge path is covered
 thoroughly by unit tests, but it has had very little real traffic through it;
 combat would be the way to exercise it properly.
 
+## Names, and chat
+
+Nothing in an object update carries a name. A player's comes only from
+`SMSG_NAME_QUERY_RESPONSE` and a creature's only from
+`SMSG_CREATURE_QUERY_RESPONSE`, each in answer to a query this client has to
+send. A client that never asks shows a world of anonymous things.
+
+Two facts about those responses are worth stating, because they signal the same
+condition in completely different ways:
+
+- The **name query** flags "no such player" with a separate byte after the
+  packed guid, and the packet then stops.
+- The **creature query** flags it with the *top bit of the entry itself*.
+  Reading that as a plain entry gives a creature numbered two billion whose
+  name is whatever bytes came next.
+
+The creature response is parsed **in full** — every trailing model id, quest
+item and movement id — even though only the name is wanted. Stopping after the
+name would throw away the check that makes the name trustworthy: if the tail
+does not line up, some earlier field was the wrong width, and the name read
+before it is no better than the bytes that were skipped.
+
+Declined names (a Russian-locale feature: five grammatical forms behind a
+trailing flag) are skipped but still **read**, or `finish` reports them as
+leftovers and a correct parse looks like a broken one.
+
+### `SMSG_MESSAGECHAT` changes shape by its own first byte
+
+The most layout-dependent packet this client parses. A creature's line carries
+the speaker's name inline; a player's does not, and the guid is all that is
+sent. A channel line carries the channel; an achievement line carries an id
+*after* the tag, where nothing else has anything. A creature addressing another
+creature names both; a creature addressing a player names only itself.
+
+Every variant is the same handful of leading fields followed by something
+different — the exact shape where a wrong guess parses perfectly. All of them
+run through one cursor ending at `finish`, and reading a variant with the wrong
+shape does not produce a slightly wrong message: it produces one whose text is
+somebody's guid, with the leftover count as the only evidence.
+
+Note also that the chat type goes **out** as a 32-bit value and comes **back**
+as a single byte. Same field, two widths, one direction each.
+
+## Two ways to be ignored, and how long they took to tell apart
+
+Sending chat failed silently three times, and each failure looked identical
+from the client: the packet went out, the session survived, and absolutely
+nothing came back. No error, no notification, no reply. That is the worst
+possible feedback, and it is worth recording what each cause actually was.
+
+1. **`LANG_UNIVERSAL` is not a language you may speak.** It is what a GM
+   command uses. An ordinary account sending it is refused with no reply.
+   Chat has to go out in the character's *own* race language —
+   `chat::language_for_race`. Getting this wrong does not garble the text;
+   that is what happens when someone *hears* a language they lack. It stops
+   the message being accepted at all.
+2. **`CHAT_MSG_SAY` is `0x01`, not `0x00`. `0x00` is `CHAT_MSG_SYSTEM`.**
+   A client claiming to be the server announcing something is not allowed to,
+   so the message is dropped — silently, again. `CLAUDE.md` already recorded a
+   result-code enum off by one as an earlier bug; this is the same mistake in
+   a different table, and it cost more than the first one because the symptom
+   was *nothing* rather than a wrong value.
+3. **The line was received and thrown away by our own tooling.** A two-client
+   test showed chat never arriving, when it had in fact arrived during a drain
+   done for another reason whose report was discarded. `WorldState::replicate`
+   has one dispatch table by design — but one table does not save a *caller*
+   from ignoring a category it produces, and chat is returned rather than
+   stored precisely so it cannot accumulate unbounded.
+
+The lesson that generalises: when a send produces no reply at all, the first
+thing to build is not a better guess at the layout but **an inventory of what
+did arrive**. `wow-cli world --stay` now prints every opcode seen, decoded or
+not, because "the server never sent it" and "it arrived and we could not read
+it" are the same observation until something distinguishes them, and they want
+opposite investigations.
+
+## Verified against a live realm
+
+- `--names` resolved 50 names across 131 replicated objects with 50 queries,
+  50 answers and 0 unanswered. The count is lower than the object count because
+  creatures are keyed by **entry**, not guid — a zone of forty wolves costs one
+  query.
+- `--say` produced `[say] Testwolf: hello from open-wow`, the server's own
+  relay of the line back to its sender, attributed through the name cache.
+- Two clients: `ACCOUNT34`'s `Watcher` whispered `ACCOUNT33`'s `Testwolf`, and
+  the whisper arrived with `SMSG_MESSAGECHAT x1` in the opcode histogram. The
+  structure went out through one client, through the server, and back in
+  through another — the same evidence shape that closed 3.4 and 3.5.
+- A **yell** between the same two characters, ~154 units apart, did *not*
+  arrive, while the sender's own echo did. Chat delivery is range-limited and
+  this realm's yell range is under 154 units, which is worth knowing before
+  concluding a parser is broken: whisper is the only chat with no range, and
+  therefore the only one that tests delivery without positions being part of
+  the experiment.
+
 ## Open questions
 
 An unidentified opcode **0x029D** arrives exactly once per movement packet sent,

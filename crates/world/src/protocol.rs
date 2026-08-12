@@ -80,6 +80,19 @@ pub enum Error {
     UnknownUpdateType { got: u8 },
     #[error("unknown object type {got}")]
     UnknownObjectType { got: u8 },
+    #[error("{what}: target flags {flags:#x} are not a shape this parser has seen live")]
+    UnsupportedSpellTarget { what: &'static str, flags: u32 },
+    #[error(
+        "SMSG_SPELL_GO: {count} miss entries, but no live capture has ever carried one -- \
+         their shape is unconfirmed"
+    )]
+    UnconfirmedSpellMisses { count: u8 },
+    #[error(
+        "SMSG_ATTACKERSTATEUPDATE: {count} damage blocks. Every captured swing carried \
+         exactly one, and the per-block width cannot be separated from the packet's tail \
+         until one carries a different number -- see `combat::MeleeSwing`"
+    )]
+    UnconfirmedSwingDamageBlocks { count: u8 },
 }
 
 /// A bounds-checked cursor over a packet body.

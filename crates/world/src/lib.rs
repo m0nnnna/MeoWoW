@@ -8,22 +8,31 @@
 //! Written from public protocol documentation. Nothing here is derived from a
 //! GPL server implementation -- see `docs/REUSE-POLICY.md`.
 
+pub mod chat;
+pub mod combat;
 pub mod client;
 pub mod crypt;
 pub mod movement;
+pub mod names;
 pub mod opcode;
 pub mod protocol;
+pub mod query;
+pub mod spell;
 pub mod state;
 pub mod update;
 
+pub use chat::{ChatMessage, ChatType};
 pub use client::{Connection, DEFAULT_PORT};
 pub use crypt::HeaderCrypt;
 pub use movement::MovementInfo;
+pub use names::Names;
 pub use opcode::ClientOpcode;
+pub use query::{CreatureInfo, PlayerName};
+pub use spell::{InitialSpells, KnownSpell};
 pub use protocol::{
     Appearance, AuthResponse, Character, Equipment, WorldPosition, EQUIPMENT_SLOTS,
 };
-pub use state::{Replication, WorldState};
+pub use state::{Cast, Replication, WorldState};
 pub use update::{Block, MonsterMove, ObjectType, Position};
 
 /// Names the playable races by id.

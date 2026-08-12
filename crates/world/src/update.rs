@@ -706,13 +706,28 @@ pub mod fields {
     pub const OBJECT_ENTRY: u16 = 0x03;
     pub const OBJECT_SCALE: u16 = 0x04;
 
+    /// Whatever this unit currently has selected. Not the same as *our*
+    /// selection, which the client decides and sends.
+    pub const UNIT_TARGET: u16 = 0x12;
+    /// Race, class, gender and power type, one per byte in that order.
+    pub const UNIT_BYTES_0: u16 = 0x17;
     pub const UNIT_HEALTH: u16 = 0x18;
+    /// The first of seven consecutive power fields, indexed by the unit's own
+    /// power type -- see [`UNIT_BYTES_0`]. Reading this one unconditionally
+    /// reports a rogue's mana, which is always zero.
+    pub const UNIT_POWER1: u16 = 0x19;
     pub const UNIT_MAX_HEALTH: u16 = 0x20;
+    /// The first of seven maximums, parallel to [`UNIT_POWER1`].
+    pub const UNIT_MAX_POWER1: u16 = 0x21;
     pub const UNIT_LEVEL: u16 = 0x36;
     pub const UNIT_FACTION: u16 = 0x37;
     pub const UNIT_FLAGS: u16 = 0x3B;
     pub const UNIT_DISPLAY_ID: u16 = 0x43;
     pub const UNIT_NATIVE_DISPLAY_ID: u16 = 0x44;
+
+    /// How many powers a unit has, and so how far past [`UNIT_POWER1`] a power
+    /// index is allowed to reach.
+    pub const POWER_COUNT: u16 = 7;
 }
 
 #[cfg(test)]

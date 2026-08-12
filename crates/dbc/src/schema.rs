@@ -276,20 +276,139 @@ dbc_table! {
 }
 
 dbc_table! {
+    /// Which spells belong to which skill line, and to whom.
+    ///
+    /// This is how a real client decides what goes in a spellbook. Filtering by
+    /// `Spell.dbc`'s attribute bits instead is guesswork that does not survive
+    /// contact with the data: `Opening`, `Closing` and `Honorless Target` are
+    /// all learnable-looking by attributes and belong in no spellbook, while
+    /// `Heroic Strike` and `Auto Attack` share no single distinguishing bit.
+    /// Membership here is the actual mechanism rather than a correlate of it.
+    SkillLineAbility, SkillLineAbilityRow,
+    path = r"DBFilesClient\SkillLineAbility.dbc", fields = 14, {
+        0 id: u32,
+        1 skill_line: u32,
+        2 spell_id: u32,
+        /// Bitmask; zero means every race.
+        3 race_mask: u32,
+        /// Bitmask over class ids, counting from bit 0 for warrior. Zero means
+        /// every class.
+        4 class_mask: u32,
+    }
+}
+
+dbc_table! {
+    /// Icon paths, which is the only way to get from a spell to its artwork.
+    ///
+    /// `Spell.dbc` stores an icon *id*, not a path, so an action bar needs
+    /// both tables and a BLP loader before it can draw anything recognisable.
+    /// The path has no extension on the wire -- `Interface\Icons\Spell_Fire_
+    /// Fireball02` -- and `.blp` has to be appended.
+    SpellIcon, SpellIconRow, path = r"DBFilesClient\SpellIcon.dbc", fields = 2, {
+        0 id: u32,
+        1 texture: str,
+    }
+}
+
+dbc_table! {
     /// Spell definitions. 234 columns, of which this names the few a client
     /// needs before it implements combat.
+    ///
+    /// The effect columns below carry the numbers a description's `$s1`-style
+    /// tokens stand in for. **Every one of them was located by a property of
+    /// the data rather than transcribed**, because a wrong column index here
+    /// parses perfectly and quotes a confident wrong number at the player --
+    /// the exact failure this project's rules single out. What each test was
+    /// is recorded on the column.
     Spell, SpellRow, path = r"DBFilesClient\Spell.dbc", fields = 234, {
         0   id: u32,
         1   category: u32,
         2   dispel_type: u32,
         3   mechanic: u32,
         4   attributes: u32,
+        /// Row in `SpellDuration`, behind the `$d` token.
+        ///
+        /// Found by asking which column is non-zero *because* a spell has a
+        /// duration: 98.5% of the 8,159 descriptions saying `$d` have this
+        /// set against 39.0% of those that do not, and the durations it
+        /// resolves to are 98.7% whole seconds (10s, 15s, 30s, 8s, 6s...).
+        /// Three other columns point at valid `SpellDuration` ids just as
+        /// often and are pure coincidence -- any column of small integers
+        /// hits somewhere in a 130-row table.
+        40  duration_index: u32,
+        /// Die sides per effect, behind `$M1`: the top of a damage range,
+        /// where [`Self::effect_base_points`] plus one is the bottom.
+        ///
+        /// Found by the property a range must have. An earlier test counted
+        /// descriptions merely *mentioning* `$m1` and got a flat answer,
+        /// because a single quoted value needs no die; restricted to the 88
+        /// that quote both `$m1` and `$M1`, this column exceeds one in 96.6%
+        /// of them against 24.9% of spells quoting a bare `$s1`.
+        74  effect_die_sides: i32,
+        75  effect_die_sides_2: i32,
+        76  effect_die_sides_3: i32,
+        /// Base value per effect, behind `$s1`. **Stored one below what is
+        /// displayed.**
+        ///
+        /// Both facts come from the same test, and neither is transcribed. Of
+        /// the 3,775 descriptions reading `$s1%`, this column plus one is a
+        /// multiple of five for 69.3% -- and without the plus one, for 5.2%.
+        /// Percentages in a game are round numbers; a thirteen-fold split
+        /// settles both which column and which offset. `$s2` and `$s3` then
+        /// pick out 81 and 82 by the same test, at 78% and 80%, which is what
+        /// makes this a three-wide array rather than one lucky column.
+        80  effect_base_points: i32,
+        81  effect_base_points_2: i32,
+        82  effect_base_points_3: i32,
+        /// Row in `SpellRadius` per effect, behind `$a1`.
+        ///
+        /// Non-zero in 96.1% of the 721 descriptions saying `$a1` against
+        /// 16.9% of the rest; `$a2` and `$a3` separate their own columns at
+        /// 100% against 6.4% and 1.6%.
+        92  effect_radius_index: u32,
+        93  effect_radius_index_2: u32,
+        94  effect_radius_index_3: u32,
+        /// Milliseconds between ticks of a periodic effect, behind `$t1`.
+        ///
+        /// Non-zero in 95.6% of the 1,072 descriptions saying `$t1` against
+        /// 5.6% of the rest, and it reads as tick periods and nothing else:
+        /// 3000, 2000, 1000, 5000, 10000.
+        98  effect_aura_period: i32,
+        99  effect_aura_period_2: i32,
+        100 effect_aura_period_3: i32,
         133 spell_icon_id: u32,
         134 active_icon_id: u32,
         136 name: loc,
         153 rank: loc,
         170 description: loc,
         187 tooltip: loc,
+    }
+}
+
+dbc_table! {
+    /// How long an effect lasts, indexed by [`SpellRow::duration_index`].
+    ///
+    /// A handful of rows carry a nonsense [`SpellDurationRow::duration`]
+    /// alongside a sane [`SpellDurationRow::max_duration`] -- id 2 reads
+    /// 300000010ms with a 30s maximum. Real data, not a parse error: the
+    /// field count and record size both check out and the other 127 rows are
+    /// ordinary. Callers wanting a number to show a player should prefer the
+    /// smaller of the two rather than trusting either alone.
+    SpellDuration, SpellDurationRow, path = r"DBFilesClient\SpellDuration.dbc", fields = 4, {
+        0 id: u32,
+        1 duration: i32,
+        2 duration_per_level: i32,
+        3 max_duration: i32,
+    }
+}
+
+dbc_table! {
+    /// Effect radii in yards, indexed by [`SpellRow::effect_radius_index`].
+    SpellRadius, SpellRadiusRow, path = r"DBFilesClient\SpellRadius.dbc", fields = 4, {
+        0 id: u32,
+        1 radius: f32,
+        2 radius_per_level: f32,
+        3 max_radius: f32,
     }
 }
 
@@ -337,7 +456,9 @@ impl_table_info!(
     CreatureDisplayInfo,
     CreatureModelData,
     AnimationData,
-    Spell
+    Spell,
+    SpellIcon,
+    SkillLineAbility
 );
 
 /// Marker so the unused-import lint does not fire on the re-exports the macro

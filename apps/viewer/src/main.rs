@@ -8,9 +8,12 @@
 //! opening a window, which keeps the render path checkable from a terminal and
 //! in CI.
 
+mod hud;
 mod live;
 mod model;
 mod scene;
+mod spells;
+mod spelltext;
 mod terrain;
 mod world;
 mod world_object;
@@ -1239,6 +1242,107 @@ struct App {
     /// runs every frame) warns once per change instead of every frame for the
     /// rest of the session.
     last_undrawable_warned: usize,
+    /// The player's own interface: where every frame sits, what it looks like,
+    /// and whether it is currently being rearranged.
+    hud: ui::Hud,
+    /// What this client has selected, and has told the server it has.
+    target: Option<u64>,
+    /// Where the left button went down, so a click can be told from the drag
+    /// that turns the camera. Both arrive as the same pair of events.
+    press_at: Option<(f64, f64)>,
+    /// How far the camera has been swung around the character by dragging,
+    /// added to the character's own facing rather than replacing it. Only
+    /// meaningful while following a live character.
+    camera_yaw_offset: f32,
+    /// Chat scrollback, oldest first, capped at the style's limit. Owned here
+    /// rather than in `world`: chat is a stream of events, and replicated
+    /// state has no business growing without bound.
+    ///
+    /// Kept as the messages that *arrived*, not as the lines they rendered to.
+    /// A line is rendered fresh every frame, so a speaker whose name query is
+    /// still in flight when the line arrives gains their name the moment it
+    /// answers. Rendering once at arrival stamped the guid in permanently --
+    /// which is what a whisper from someone out of visibility range always
+    /// looks like, since they were never in state to be asked about.
+    ///
+    /// Locally generated notices are stored as `System` messages from guid
+    /// zero, so there is one path to render rather than two.
+    ///
+    /// Combat shares the scrollback so the two interleave in the order they
+    /// happened, and is stored as the *swing* rather than as a finished
+    /// sentence for the same reason chat is stored as the message: names
+    /// resolve asynchronously, and 4.2's one real bug was a line stamped with
+    /// a guid a moment before that guid's name arrived. Rendering both every
+    /// frame means a name that turns up late fixes the lines already on
+    /// screen.
+    chat: Vec<Line>,
+    /// The line being typed, or `None` when not typing. While this is `Some`,
+    /// keys are text rather than movement.
+    composing: Option<String>,
+    /// Spell names and icons, loaded from the archives if there are any.
+    spells: spells::Spellbook,
+    /// Whether the bars have been filled from the spellbook yet. The spellbook
+    /// arrives in the login burst, so this cannot happen at construction.
+    bars_seeded: bool,
+    /// Held modifiers, which choose which bar a number key drives.
+    modifiers: winit::keyboard::ModifiersState,
+}
+
+/// How far the pointer may travel between press and release and still count as
+/// a click rather than as a look.
+const CLICK_SLOP: f64 = 4.0;
+
+/// The action-bar slot a key drives, if any.
+///
+/// The number row in order, `1` through `=`. Matched on the *physical* key
+/// rather than the character it produces, because an action bar is muscle
+/// memory about positions on the keyboard: the key left of Backspace should be
+/// the twelfth slot whatever it prints.
+fn action_slot(code: KeyCode) -> Option<usize> {
+    Some(match code {
+        KeyCode::Digit1 => 0,
+        KeyCode::Digit2 => 1,
+        KeyCode::Digit3 => 2,
+        KeyCode::Digit4 => 3,
+        KeyCode::Digit5 => 4,
+        KeyCode::Digit6 => 5,
+        KeyCode::Digit7 => 6,
+        KeyCode::Digit8 => 7,
+        KeyCode::Digit9 => 8,
+        KeyCode::Digit0 => 9,
+        KeyCode::Minus => 10,
+        KeyCode::Equal => 11,
+        _ => return None,
+    })
+}
+
+/// One entry in the scrollback, before it is turned into text.
+///
+/// The alternative -- rendering to a string at the moment of arrival -- is
+/// what this project already got wrong once: a name that resolves a moment
+/// later cannot reach a sentence that has already been built. Both arms are
+/// rendered fresh every frame instead.
+enum Line {
+    Chat(::world::ChatMessage),
+    Swing(::world::combat::MeleeSwing),
+}
+
+/// A line this client generated itself, shaped like one off the wire.
+///
+/// Sharing the wire type means the scrollback has one thing in it and one way
+/// to render it, rather than an enum whose second arm is easy to forget when
+/// the rendering changes.
+fn local_notice(text: String) -> ::world::ChatMessage {
+    ::world::ChatMessage {
+        chat_type: ::world::ChatType::System,
+        language: 0,
+        sender: 0,
+        sender_name: None,
+        target: 0,
+        channel: None,
+        text,
+        tag: 0,
+    }
 }
 
 impl App {
@@ -1264,6 +1368,17 @@ impl App {
             last_heartbeat: Instant::now(),
             last_ping: Instant::now(),
             last_undrawable_warned: 0,
+            // Read before the window exists, so a layout that fails to parse
+            // is reported at startup rather than at the first frame.
+            hud: ui::Hud::load(),
+            target: None,
+            press_at: None,
+            camera_yaw_offset: 0.0,
+            chat: Vec::new(),
+            composing: None,
+            spells: spells::Spellbook::default(),
+            bars_seeded: false,
+            modifiers: Default::default(),
         }
     }
 }
@@ -1439,13 +1554,79 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } if button == MouseButton::Left => {
                 self.dragging = state == ElementState::Pressed;
-                if !self.dragging {
+                if self.dragging {
+                    self.press_at = self.last_cursor;
+                } else {
+                    // A press and release in the same place is a click; the
+                    // same two events with movement between them is the drag
+                    // that turns the camera. Nothing else distinguishes them,
+                    // so the distance has to be measured.
+                    if let (Some(press), Some(release)) = (self.press_at.take(), self.last_cursor) {
+                        let moved =
+                            ((release.0 - press.0).powi(2) + (release.1 - press.1).powi(2)).sqrt();
+                        if moved <= CLICK_SLOP {
+                            self.click_at(release);
+                        }
+                    }
                     self.last_cursor = None;
                 }
             }
+            WindowEvent::ModifiersChanged(state) => {
+                self.modifiers = state.state();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    let pressed = event.state == ElementState::Pressed;
+                let pressed = event.state == ElementState::Pressed;
+                let code = match event.physical_key {
+                    PhysicalKey::Code(code) => Some(code),
+                    _ => None,
+                };
+
+                // While typing, the keyboard belongs to the chat line. This
+                // returns rather than falling through, so W does not walk the
+                // character across the zone while a message is being written.
+                if self.composing.is_some() {
+                    if pressed {
+                        self.type_into_chat(code, event.text.as_deref());
+                    }
+                    window.request_redraw();
+                    return;
+                }
+
+                if let Some(code) = code {
+                    // Held keys repeat; a toggle must fire once per press.
+                    if pressed && !event.repeat {
+                        // An action key before the movement keys, so a bound
+                        // number is never also a movement binding.
+                        if let Some(slot) = action_slot(code) {
+                            let bar = if self.modifiers.shift_key() {
+                                1
+                            } else if self.modifiers.control_key() {
+                                2
+                            } else {
+                                0
+                            };
+                            self.activate_slot(bar, slot);
+                            window.request_redraw();
+                            return;
+                        }
+                        match code {
+                            KeyCode::F1 => self.hud.toggle_edit(),
+                            // Only offer a chat line when there is somewhere
+                            // to send it.
+                            KeyCode::Enter | KeyCode::NumpadEnter if self.live.is_some() => {
+                                self.composing = Some(String::new());
+                                // Keys held when chat opened would otherwise
+                                // stay held forever: nothing releases them,
+                                // because every later key event is swallowed
+                                // above. Clearing here makes the next movement
+                                // tick send a MoveStop.
+                                self.keys = KeyState::default();
+                                window.request_redraw();
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
                     self.keys.set(code, pressed);
                 }
             }
@@ -1460,11 +1641,22 @@ impl ApplicationHandler for App {
                             -(now.0 - prev.0) as f32 * SPEED,
                             (now.1 - prev.1) as f32 * SPEED,
                         );
+                        // Standing in a live world, the camera's yaw is owned
+                        // by `drive_live_movement`, which rebuilds it from the
+                        // character's facing every frame. Writing yaw here too
+                        // would be overwritten before it was ever drawn, so
+                        // the drag accumulates an offset that function adds.
+                        let following = self.live.is_some();
                         match &mut self.camera {
                             Camera::Orbit(c) => c.orbit(dx, dy),
                             // Dragging turns the view, so the world follows the
                             // cursor rather than moving against it.
+                            Camera::Fly(c) if following => c.look(0.0, -dy),
                             Camera::Fly(c) => c.look(dx, -dy),
+                        }
+                        if following {
+                            self.camera_yaw_offset =
+                                (self.camera_yaw_offset + dx).rem_euclid(std::f32::consts::TAU);
                         }
                     }
                 }
@@ -1507,6 +1699,9 @@ impl App {
         if self.live.is_some() {
             self.drive_live_movement();
             self.pump_live_connection();
+            // After the pump, because the spellbook it needs arrives through
+            // it, and because both want the archive chain.
+            self.load_spell_data();
         } else if let Camera::Fly(fly) = &mut self.camera {
             let direction = self.keys.direction();
             if direction != glam::Vec3::ZERO {
@@ -1799,14 +1994,237 @@ impl App {
         // Same offset as the initial placement in `live_camera`, recomputed
         // every frame so the camera tracks the character instead of flying
         // free. Pitch is left alone so a mouse drag can still look up or down.
+        //
+        // The yaw is *not* simply the character's orientation, though it was
+        // at first, and the difference matters more than it looks. Recomputing
+        // it here every frame is what makes the camera follow -- but a mouse
+        // drag also writes a yaw, and this overwrote it a millisecond later,
+        // so dragging sideways did nothing at all while dragging up and down
+        // worked. That reads as half a broken camera rather than as two things
+        // writing one field. The drag now accumulates into
+        // `camera_yaw_offset`, which is added here instead of competing with
+        // it: the camera swings around the character, and the character keeps
+        // facing wherever it was facing, which is what a left drag does in the
+        // game this is modelled on.
         if let Camera::Fly(fly) = &mut self.camera {
             const BEHIND: f32 = 9.0;
             const ABOVE: f32 = 4.0;
-            let yaw = live.orientation;
+            let yaw = live.orientation + self.camera_yaw_offset;
             fly.position = live.position
                 - glam::Vec3::new(yaw.cos(), yaw.sin(), 0.0) * BEHIND
                 + glam::Vec3::Z * ABOVE;
             fly.yaw = yaw;
+        }
+    }
+
+    /// Handles one keypress while a chat line is being written.
+    ///
+    /// `text` is what the key actually produced, which is the only thing that
+    /// knows about layouts, shift and dead keys -- deriving a character from
+    /// the physical key code instead would type QWERTY on an AZERTY keyboard.
+    fn type_into_chat(&mut self, code: Option<KeyCode>, text: Option<&str>) {
+        match code {
+            Some(KeyCode::Escape) => {
+                self.composing = None;
+                return;
+            }
+            Some(KeyCode::Enter) | Some(KeyCode::NumpadEnter) => {
+                let line = self.composing.take().unwrap_or_default();
+                let line = line.trim();
+                if !line.is_empty() {
+                    self.send_chat(line);
+                }
+                return;
+            }
+            Some(KeyCode::Backspace) => {
+                if let Some(buffer) = self.composing.as_mut() {
+                    buffer.pop();
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        // Control characters arrive here as text too -- Enter as "\r", Escape
+        // as "\u{1b}" -- and appending them would put an unprintable glyph in
+        // the message and send it.
+        let Some(text) = text else { return };
+        if let Some(buffer) = self.composing.as_mut() {
+            for character in text.chars().filter(|c| !c.is_control()) {
+                buffer.push(character);
+            }
+        }
+    }
+
+    /// Sends a line of chat, and says so locally if it cannot be sent.
+    fn send_chat(&mut self, line: &str) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        // The character's own language: a message sent in Universal is
+        // refused with no reply at all, which reads exactly like a malformed
+        // packet. See `world::chat::language_for_race`.
+        let race = live
+            .state
+            .get(live.guid)
+            .and_then(|entity| entity.race())
+            .unwrap_or(1);
+        let language = ::world::chat::language_for_race(race);
+        if let Err(e) = live
+            .connection
+            .say(::world::ChatType::Say, language, "", line)
+        {
+            tracing::warn!("sending chat failed: {e:#}");
+            // Locally, so a failure to speak is visible where speaking
+            // happens rather than only in a log nobody has open.
+            self.chat.push(Line::Chat(local_notice(format!("could not send: {e}"))));
+        }
+        // Nothing is echoed locally on success: the server relays the line
+        // back like any other, and adding it here too would show it twice.
+    }
+
+    /// Casts whatever is in an action slot.
+    ///
+    /// A bound key fires whether or not its bar is visible. Hiding a bar is
+    /// about screen space, not about unbinding it -- and a key that silently
+    /// stopped working because a checkbox was unticked would be a poor
+    /// surprise mid-fight.
+    fn activate_slot(&mut self, bar: usize, slot: usize) {
+        let Some(spell) = self.hud.profile.bars.get(bar, slot) else {
+            return;
+        };
+        let target = self.target;
+        let name = self.spells.name(spell);
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        match live.connection.cast_spell(spell, target) {
+            Ok(()) => tracing::debug!("cast {name} ({spell})"),
+            Err(e) => {
+                tracing::warn!("casting {spell} failed: {e:#}");
+                self.chat.push(Line::Chat(local_notice(format!("could not cast: {e}"))));
+            }
+        }
+    }
+
+    /// Reads names and icons for whatever the character knows, once.
+    ///
+    /// Separate from `pump_live_connection` rather than tucked inside it: that
+    /// function holds the connection mutably for its whole body, and this
+    /// needs the archive chain and the spellbook at the same time.
+    fn load_spell_data(&mut self) {
+        if self.bars_seeded {
+            return;
+        }
+        let known: std::collections::HashSet<u32> = match self.live.as_ref() {
+            Some(live) => live.state.spells.spells.iter().map(|s| s.id).collect(),
+            None => return,
+        };
+        if known.is_empty() {
+            // Logged once a second rather than every frame: an empty spellbook
+            // here means `SMSG_INITIAL_SPELLS` was not folded in, which is a
+            // different problem from one that failed to parse.
+            if self.last_frame.elapsed().as_millis() % 1000 < 20 {
+                tracing::debug!("no spells replicated yet");
+            }
+            return;
+        }
+        self.spells = spells::Spellbook::load(&mut self.chain, &known);
+        self.seed_action_bars();
+    }
+
+    /// Fills the first bar from the character's spellbook, once.
+    ///
+    /// The spellbook arrives in the login burst, so this cannot happen at
+    /// startup; and it only runs when the bars are *entirely* empty, so it
+    /// never overwrites a layout the user arranged. What it placed is logged,
+    /// because the passive filter is the part most likely to be wrong and the
+    /// symptom -- a bar full of weapon skills -- is obvious in one line.
+    fn seed_action_bars(&mut self) {
+        if self.bars_seeded {
+            return;
+        }
+        let Some(live) = self.live.as_ref() else {
+            return;
+        };
+        let known: Vec<u32> = live.state.spells.spells.iter().map(|s| s.id).collect();
+        if known.is_empty() {
+            return;
+        }
+        self.bars_seeded = true;
+
+        if !self.hud.profile.bars.is_empty() {
+            tracing::debug!("action bars already arranged; leaving them alone");
+            return;
+        }
+        // The character's own class: the filter turns on which skill line a
+        // spell belongs to, and every class has its own.
+        let class = live
+            .state
+            .get(live.guid)
+            .and_then(|entity| entity.class())
+            .unwrap_or(1);
+        let castable = self.spells.castable(&known, class);
+        let placed: Vec<String> = castable
+            .iter()
+            .take(ui::frames::action_bar::SLOTS)
+            .enumerate()
+            .map(|(slot, spell)| {
+                self.hud.profile.bars.set(0, slot, Some(*spell));
+                self.spells.name(*spell)
+            })
+            .collect();
+        tracing::info!(
+            "action bar seeded from {} known spells ({} castable): {}",
+            known.len(),
+            castable.len(),
+            placed.join(", ")
+        );
+    }
+
+    /// Selects whatever is under the cursor, and tells the server.
+    fn click_at(&mut self, at: (f64, f64)) {
+        let Some(r) = self.renderer.as_ref() else {
+            return;
+        };
+        // A click on the interface belongs to the interface: clicking a health
+        // bar must not target whatever is standing behind it.
+        if self.hud.captures_pointer(&r.egui_ctx) {
+            return;
+        }
+        let (Some(live), Some(Scene::Streaming(world))) = (self.live.as_ref(), r.scene.as_ref())
+        else {
+            return;
+        };
+
+        let viewport = (r.config.width as f32, r.config.height as f32);
+        let Some(ray) = self.camera.ray_through((at.0 as f32, at.1 as f32), viewport) else {
+            return;
+        };
+        // Rebuilt rather than cached: the same interpolated positions the
+        // renderer drew this frame, so a click hits where the creature looks
+        // like it is rather than where it last reported being.
+        let entities = live::drawable_entities(&live.state, live.guid);
+        let picked = hud::pick(&ray, &entities, &|display_id| world.entity_bounds(display_id));
+
+        self.set_target(picked);
+    }
+
+    /// Changes what is selected, telling the server when it actually changed.
+    ///
+    /// Clicking empty ground clears the selection, which goes out as a guid of
+    /// zero rather than as no packet at all: the server holds the last
+    /// selection it was given until it is told otherwise.
+    fn set_target(&mut self, guid: Option<u64>) {
+        if guid == self.target {
+            return;
+        }
+        self.target = guid;
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.set_selection(guid.unwrap_or(0)) {
+            tracing::warn!("sending the selection failed: {e:#}");
         }
     }
 
@@ -1818,13 +2236,88 @@ impl App {
         let Some(live) = self.live.as_mut() else {
             return;
         };
+        // Senders of chat received this pump who are not in replicated state,
+        // so their names can be asked for below.
+        let mut unknown_speakers: Vec<u64> = Vec::new();
         match live.connection.drain(Duration::from_millis(1), 64) {
-            // Every batch has to go through all four kinds of change replicate
+            // Every batch has to go through all the kinds of change replicate
             // handles -- object updates, relayed movement, monster moves,
-            // destroys -- or the world ends up quietly frozen wherever the
-            // dropped kind would have moved something.
-            Ok(packets) => live.fold_failures += live::replicate(&mut live.state, &packets),
+            // destroys, names, chat -- or the world ends up quietly frozen
+            // wherever the dropped kind would have moved something. The whole
+            // report is used, not just its failure count: chat is *returned*
+            // rather than stored, so ignoring the report loses every line.
+            Ok(packets) => {
+                let report = live::replicate(&mut live.state, &packets);
+                live.note_failures(&report);
+                // Why a cast did not happen, in the one place the player is
+                // looking. This was missed on the first pass -- the failures
+                // were parsed and then dropped on the floor, so pressing a key
+                // did nothing and said nothing, which is the exact silent
+                // failure that made sending chat cost three rounds of
+                // debugging. Third time this crate has produced a category a
+                // caller forgot to consume.
+                for failure in &report.cast_failures {
+                    let text = format!(
+                        "{}: {}",
+                        self.spells.name(failure.spell_id),
+                        ::world::spell::describe_cast_failure(failure.reason)
+                    );
+                    tracing::debug!("cast refused -- {text}");
+                    self.chat.push(Line::Chat(local_notice(text)));
+                }
+                // Fourth category this crate returns rather than stores, and
+                // the fourth chance to drop one on the floor. Logged as well
+                // as drawn, so "did the fight reach the client" is answerable
+                // from a terminal -- the step that found 4.2's only real bug
+                // before anyone looked at a window.
+                for swing in &report.swings {
+                    tracing::debug!(
+                        "combat: {}",
+                        hud::combat_entry(swing, live.guid, &live.state).rendered()
+                    );
+                    self.chat.push(Line::Swing(swing.clone()));
+                }
+                for message in &report.chat {
+                    if message.sender != 0 && message.sender_name.is_none() {
+                        unknown_speakers.push(message.sender);
+                    }
+                    // Logged as well as drawn, so the chat pipeline can be
+                    // checked from a terminal. A window is the only way to see
+                    // whether it *looks* right, but "did the line arrive and
+                    // get attributed" is answerable without one.
+                    tracing::debug!(
+                        "chat: {}",
+                        hud::chat_entry(message, &live.state).rendered()
+                    );
+                    self.chat.push(Line::Chat(message.clone()));
+                }
+            }
             Err(e) => tracing::warn!("draining the live connection failed: {e:#}"),
+        }
+
+        // A scrollback nobody trims is a leak with a user interface.
+        let cap = self.hud.profile.style.chat_scrollback;
+        if self.chat.len() > cap {
+            let excess = self.chat.len() - cap;
+            self.chat.drain(..excess);
+        }
+
+        // Names, a few per frame. The cache refuses to ask twice, so this is
+        // safe to call every frame; the cap is only about not sending a
+        // hundred packets in the frame after login.
+        const NAMES_PER_FRAME: usize = 6;
+        let asking = hud::names_to_ask(&mut live.state, &unknown_speakers, NAMES_PER_FRAME);
+        for request in asking {
+            let sent = match request {
+                hud::NameRequest::Player { guid } => live.connection.ask_player_name(guid),
+                hud::NameRequest::Creature { entry, guid } => {
+                    live.connection.ask_creature_name(entry, guid)
+                }
+            };
+            if let Err(e) = sent {
+                tracing::warn!("asking for a name failed: {e:#}");
+                break;
+            }
         }
         if self.last_ping.elapsed() >= ::world::client::PING_INTERVAL {
             // Fire and forget: waiting for the pong would block the render
@@ -1833,6 +2326,15 @@ impl App {
                 tracing::warn!("keepalive ping failed: {e:#}");
             }
             self.last_ping = Instant::now();
+        }
+
+        // A target that died or walked out of range is gone from replicated
+        // state, and a frame left showing the last numbers it had would be
+        // indistinguishable from one that had stopped updating. Not sent to
+        // the server: it removed the object itself, and cleared its own copy
+        // of this selection when it did.
+        if self.target.is_some_and(|guid| live.state.get(guid).is_none()) {
+            self.target = None;
         }
     }
 
@@ -1880,7 +2382,128 @@ impl App {
         let (mut anim, mut playing, mut speed, mut anim_time) =
             (self.anim, self.playing, self.speed, self.anim_time_ms);
 
+        // The interface draws from plain snapshots, so replicated state is
+        // read out here and nothing inside the closure borrows it. Both are
+        // rebuilt every frame; a held `UnitView` would keep showing whatever
+        // the unit's health was when it was built.
+        let player = self.live.as_ref().and_then(|live| {
+            live.state
+                .get(live.guid)
+                .map(|entity| hud::unit_view(entity, live.character.clone()))
+        });
+        let target = self.target.and_then(|guid| {
+            let live = self.live.as_ref()?;
+            let entity = live.state.get(guid)?;
+            Some(hud::unit_view(entity, hud::unit_name(&live.state, entity)))
+        });
+
+        // Where to bracket the selection, in egui's points rather than in
+        // physical pixels: the aspect ratio is the same either way, so
+        // projecting through the point-sized viewport lands in the coordinates
+        // egui paints in without a second conversion to get wrong.
+        let target_marker = self.target.and_then(|guid| {
+            let Some(Scene::Streaming(world)) = r.scene.as_ref() else {
+                return None;
+            };
+            let entity = self.live.as_ref()?.state.get(guid)?;
+            let at = entity.interpolated_position(std::time::Instant::now())?;
+            let display_id = entity.display_id()?;
+            let scale = entity
+                .fields
+                .get_f32(::world::update::fields::OBJECT_SCALE)
+                .filter(|s| *s > 0.0)
+                .unwrap_or(1.0);
+            let points = ctx.pixels_per_point().max(0.01);
+            hud::marker_rect(
+                &self.camera,
+                (
+                    r.config.width as f32 / points,
+                    r.config.height as f32 / points,
+                ),
+                glam::Vec3::new(at.x, at.y, at.z),
+                scale,
+                world.entity_bounds(display_id),
+            )
+        });
+
+        // Rendered fresh every frame from the messages that arrived, so names
+        // that resolve after a line was received still reach it.
+        let chat: Vec<ui::ChatEntry> = match self.live.as_ref() {
+            Some(live) => self
+                .chat
+                .iter()
+                .map(|line| match line {
+                    Line::Chat(message) => hud::chat_entry(message, &live.state),
+                    Line::Swing(swing) => hud::combat_entry(swing, live.guid, &live.state),
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let composing = self.composing.clone();
+        let now = std::time::Instant::now();
+        // Slot contents, resolved fresh each frame: an icon that failed to
+        // load earlier can succeed later, a rearranged bar takes effect
+        // immediately, and a cooldown sweep needs to be re-measured against
+        // the clock every frame regardless of anything else changing.
+        let mut bars: Vec<Vec<ui::frames::action_bar::SlotView>> = Vec::new();
+        for bar in 0..ui::frames::action_bar::BARS {
+            let mut slots = Vec::with_capacity(ui::frames::action_bar::SLOTS);
+            for slot in 0..ui::frames::action_bar::SLOTS {
+                let spell = self.hud.profile.bars.get(bar, slot).map(|id| {
+                    let icon = self.spells.icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, id);
+                    let cooldown_fraction = self
+                        .live
+                        .as_ref()
+                        .map(|live| live.state.cooldown_fraction(id, now))
+                        .unwrap_or(0.0);
+                    ui::frames::action_bar::SlotSpell {
+                        id,
+                        name: self.spells.name(id),
+                        rank: self.spells.rank(id),
+                        description: self.spells.description(id),
+                        icon,
+                        cooldown_fraction,
+                    }
+                });
+                slots.push(ui::frames::action_bar::SlotView {
+                    binding: ui::frames::action_bar::binding_label(bar, slot),
+                    spell,
+                });
+            }
+            bars.push(slots);
+        }
+
+        // Re-measured every frame against the clock for the same reason the
+        // cooldown sweep is: the bar's fill has to move even though nothing
+        // in replicated state changed between frames.
+        let cast_bar = self.live.as_ref().and_then(|live| {
+            let cast = live.state.active_cast(live.guid, now)?;
+            Some(ui::CastBarView {
+                spell_name: self.spells.name(cast.spell_id),
+                progress: cast.progress_fraction(now),
+                cast_time_ms: cast.duration_ms,
+            })
+        });
+
+        let mut hud_response = ui::HudResponse::default();
+        let interface = &mut self.hud;
+        let editing = interface.edit.active;
+        let layout_status = interface.status.clone();
+
         let output = ctx.run_ui(input, |ctx| {
+            hud_response = interface.show(
+                ctx,
+                &ui::HudData {
+                    player: player.as_ref(),
+                    target: target.as_ref(),
+                    target_marker,
+                    chat: &chat,
+                    composing: composing.as_deref(),
+                    bars: &bars,
+                    cast_bar: cast_bar.as_ref(),
+                },
+            );
+
             egui::Window::new("open-wow")
                 .default_width(430.0)
                 .show(ctx, |ui| {
@@ -1941,6 +2564,14 @@ impl App {
                              shift to sprint, scroll for speed"
                         }
                     });
+                    ui.weak(if editing {
+                        "F1: stop editing the interface"
+                    } else {
+                        "click to target, F1 to rearrange the interface"
+                    });
+                    if let Some(status) = &layout_status {
+                        ui.weak(format!("interface: {status}"));
+                    }
                 });
         });
 
@@ -1950,6 +2581,11 @@ impl App {
         self.anim = anim;
         self.playing = playing;
         self.speed = speed;
+
+        // A clicked slot casts, after the closure has released `self.hud`.
+        if let Some((bar, slot)) = hud_response.activated {
+            self.activate_slot(bar, slot);
+        }
 
         if let Some(r) = self.renderer.as_mut() {
             r.egui_state

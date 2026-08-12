@@ -1,0 +1,19 @@
+[package]
+name = "ui"
+description = "The client's own interface: a retained, user-editable layout drawn with egui."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# egui is the drawing and input substrate only. Every frame in this crate is
+# painted from explicit geometry rather than assembled from egui widgets, so
+# what the interface looks like is this crate's decision and not egui's -- see
+# docs/UI.md.
+egui.workspace = true
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

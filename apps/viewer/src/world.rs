@@ -47,6 +47,11 @@ pub struct CachedModel {
     /// this costs them nothing and keeps one loader path instead of two.
     pub bones: Vec<m2::AnimatedBone>,
     pub sequences: Vec<m2::Sequence>,
+    /// The model's own extent, in its local space. Carried so a replicated
+    /// entity can be clicked on: a click needs a volume to test a ray against,
+    /// and the model already knows how big it is. `None` for a WMO, which is
+    /// never a click target.
+    pub bounds: Option<(Vec3, Vec3)>,
     /// Held because the bind groups reference their views.
     #[allow(dead_code)]
     textures: Vec<UploadedTexture>,
@@ -390,15 +395,24 @@ impl World {
         let built = if lower.ends_with(".wmo") {
             // No skeleton to speak of, so nothing to animate.
             crate::world_object::load(gpu, chain, path, None)
-                .map(|w| (w.mesh, w.draws, w.textures, Vec::new(), Vec::new()))
+                .map(|w| (w.mesh, w.draws, w.textures, Vec::new(), Vec::new(), None))
                 .ok()
         } else {
             crate::model::load(gpu, chain, path, &crate::model::Variations::default(), 0)
-                .map(|m| (m.mesh, m.draws, m.textures, m.bones, m.sequences))
+                .map(|m| {
+                    (
+                        m.mesh,
+                        m.draws,
+                        m.textures,
+                        m.bones,
+                        m.sequences,
+                        Some((m.min, m.max)),
+                    )
+                })
                 .ok()
         };
 
-        let entry = built.map(|(mesh, draws, textures, bones, sequences)| {
+        let entry = built.map(|(mesh, draws, textures, bones, sequences, bounds)| {
             let binds = textures
                 .iter()
                 .map(|t| meshes.material_bind_group(gpu, &t.view))
@@ -409,6 +423,7 @@ impl World {
                 binds,
                 bones,
                 sequences,
+                bounds,
                 textures,
             })
         });
@@ -426,6 +441,15 @@ impl World {
     /// Objects placed by the server, drawn alongside the map's own geometry.
     pub fn entities(&self) -> &[Group] {
         &self.entities
+    }
+
+    /// How big a replicated entity's model is, for hit-testing a click.
+    ///
+    /// Only answers for a model already loaded, which is the right limit: an
+    /// entity whose model has not loaded is not on screen either, and letting
+    /// a click select something invisible would be worse than letting it miss.
+    pub fn entity_bounds(&self, display_id: u32) -> Option<(Vec3, Vec3)> {
+        self.entity_cache.get(&display_id)?.as_ref()?.bounds
     }
 
     /// Replaces the server-placed objects.
@@ -589,6 +613,9 @@ impl World {
                     binds,
                     bones: loaded.bones,
                     sequences: loaded.sequences,
+                    // This is the cache click-to-target reads from, so this is
+                    // the one that has to carry the model's extent.
+                    bounds: Some((loaded.min, loaded.max)),
                     textures: loaded.textures,
                 })
             })

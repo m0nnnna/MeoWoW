@@ -295,6 +295,55 @@ impl Fly {
     }
 }
 
+/// A world-space ray, as produced by [`Camera::ray_through`].
+#[derive(Clone, Copy, Debug)]
+pub struct Ray {
+    pub origin: Vec3,
+    /// Unit length.
+    pub direction: Vec3,
+}
+
+impl Ray {
+    /// How far along the ray it first enters an axis-aligned box, if it does.
+    ///
+    /// The slab test. Axis-aligned rather than oriented because the things
+    /// being picked here are creatures, which rotate only about `Z`: a box
+    /// whose horizontal extent is the model's widest lets that rotation happen
+    /// inside it for free, and being a little generous about what counts as a
+    /// hit is the right error for a target selector to make.
+    ///
+    /// The compact form of this test divides by the direction and lets an
+    /// infinite slope stand in for "parallel to these planes". That is fine
+    /// until the ray also *lies in* one of them, where the infinity meets a
+    /// zero extent and `0 * inf` is `NaN` -- and a `NaN` fails every
+    /// comparison it is in, so the box silently stops being clickable rather
+    /// than erroring. An axis-aligned ray is the ordinary case for a camera
+    /// looking along a world axis, so the parallel case is written out.
+    pub fn hits_box(&self, min: Vec3, max: Vec3) -> Option<f32> {
+        let mut entry = 0.0f32;
+        let mut exit = f32::INFINITY;
+        for axis in 0..3 {
+            let direction = self.direction[axis];
+            let (low, high) = (min[axis], max[axis]);
+            if direction == 0.0 {
+                // Parallel to this pair of planes: the ray is either between
+                // them forever or misses the box outright.
+                if self.origin[axis] < low || self.origin[axis] > high {
+                    return None;
+                }
+                continue;
+            }
+            let first = (low - self.origin[axis]) / direction;
+            let second = (high - self.origin[axis]) / direction;
+            entry = entry.max(first.min(second));
+            exit = exit.min(first.max(second));
+        }
+        // `entry` starts at zero, so a box behind the ray leaves `exit`
+        // negative and is rejected here along with one the slabs never share.
+        (exit >= entry).then_some(entry)
+    }
+}
+
 /// Either camera, so the renderer does not care which is in use.
 #[derive(Clone, Copy, Debug)]
 pub enum Camera {
@@ -308,6 +357,81 @@ impl Camera {
             Self::Orbit(c) => c.uniform(aspect),
             Self::Fly(c) => c.uniform(aspect),
         }
+    }
+
+    pub fn view_proj(&self, aspect: f32) -> Mat4 {
+        match self {
+            Self::Orbit(c) => c.view_proj(aspect),
+            Self::Fly(c) => c.view_proj(aspect),
+        }
+    }
+
+    pub fn eye(&self) -> Vec3 {
+        match self {
+            Self::Orbit(c) => c.eye(),
+            Self::Fly(c) => c.position,
+        }
+    }
+
+    /// Where a world point lands on screen, in the same coordinates
+    /// [`Camera::ray_through`] takes.
+    ///
+    /// `None` when the point is behind the camera, where the perspective
+    /// divide would otherwise fold it back into view -- a target standing
+    /// behind you would be marked in front of you, mirrored.
+    pub fn project(&self, point: Vec3, viewport: (f32, f32)) -> Option<(f32, f32)> {
+        let (width, height) = viewport;
+        if !(width > 0.0 && height > 0.0) {
+            return None;
+        }
+        let clip = self.view_proj(width / height) * point.extend(1.0);
+        if clip.w <= 0.0 {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        Some((
+            (ndc.x + 1.0) * 0.5 * width,
+            (1.0 - ndc.y) * 0.5 * height,
+        ))
+    }
+
+    /// A world-space ray through a point on the screen, given in pixels from
+    /// the top-left.
+    ///
+    /// Unprojected from the same matrix the scene is drawn with rather than
+    /// rebuilt from the camera's angles. The two would agree only as long as
+    /// nobody changed the projection, and a picking ray that disagrees with the
+    /// view by a little is far harder to notice than one that disagrees by a
+    /// lot -- clicks land on the creature next to the one under the cursor.
+    ///
+    /// Returns `None` only if the view-projection cannot be inverted, which a
+    /// degenerate viewport (zero width or height) produces.
+    pub fn ray_through(&self, pixel: (f32, f32), viewport: (f32, f32)) -> Option<Ray> {
+        let (width, height) = viewport;
+        if !(width > 0.0 && height > 0.0) {
+            return None;
+        }
+        let inverse = self.view_proj(width / height).inverse();
+        if !inverse.is_finite() {
+            return None;
+        }
+
+        // Clip space is x right, y *up*, and -- this being the DirectX-style
+        // projection this project uses throughout -- depth from 0 at the near
+        // plane to 1 at the far one, not -1 to 1.
+        let x = 2.0 * pixel.0 / width - 1.0;
+        let y = 1.0 - 2.0 * pixel.1 / height;
+        let unproject = |depth: f32| {
+            let point = inverse * glam::Vec4::new(x, y, depth, 1.0);
+            point.truncate() / point.w
+        };
+
+        let near = unproject(0.0);
+        let direction = (unproject(1.0) - near).normalize_or_zero();
+        (direction != Vec3::ZERO).then_some(Ray {
+            origin: near,
+            direction,
+        })
     }
 
     pub fn describe(&self) -> String {
@@ -411,5 +535,140 @@ mod fly_tests {
             "camera is not aimed at the box"
         );
         assert!(camera.speed > 0.0 && camera.far > (centre - camera.position).length());
+    }
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+
+    const VIEWPORT: (f32, f32) = (1600.0, 900.0);
+
+    fn camera() -> Camera {
+        Camera::Fly(Fly {
+            position: Vec3::new(-10.0, 4.0, 3.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            ..Fly::default()
+        })
+    }
+
+    /// Picking is the projection run backwards, so this runs it forwards
+    /// first: take a point in the world, find the pixel it is drawn at, and
+    /// cast a ray back through that pixel. It has to arrive where it started.
+    ///
+    /// The failure this guards against is not a ray that misses wildly -- that
+    /// is obvious the first time anything is clicked -- but one that is off by
+    /// a consistent little, from a sign or a depth-range convention. That lands
+    /// clicks on the creature beside the one under the cursor, which reads as
+    /// the server disagreeing about positions rather than as a bad ray.
+    #[test]
+    fn a_ray_returns_to_the_point_it_was_projected_from() {
+        let camera = camera();
+        for target in [
+            Vec3::new(20.0, 6.0, 2.0),
+            Vec3::new(40.0, -8.0, 9.0),
+            Vec3::new(12.0, 4.0, 3.0),
+        ] {
+            let pixel = camera.project(target, VIEWPORT).unwrap();
+            let ray = camera.ray_through(pixel, VIEWPORT).unwrap();
+            let tolerance = Vec3::splat(0.05);
+            assert!(
+                ray.hits_box(target - tolerance, target + tolerance).is_some(),
+                "the ray through {pixel:?} missed {target}"
+            );
+        }
+    }
+
+    /// The centre of the screen is where the camera is looking.
+    #[test]
+    fn the_centre_pixel_looks_straight_ahead() {
+        let camera = camera();
+        let ray = camera
+            .ray_through((VIEWPORT.0 / 2.0, VIEWPORT.1 / 2.0), VIEWPORT)
+            .unwrap();
+        let forward = match camera {
+            Camera::Fly(c) => c.forward(),
+            Camera::Orbit(_) => unreachable!(),
+        };
+        assert!(
+            ray.direction.dot(forward) > 0.9999,
+            "{:?} is not {forward}",
+            ray.direction
+        );
+    }
+
+    /// Something behind the viewer is not clickable, however well the ray's
+    /// infinite line happens to pass through it.
+    #[test]
+    fn a_box_behind_the_camera_is_not_hit() {
+        let ray = Ray {
+            origin: Vec3::ZERO,
+            direction: Vec3::X,
+        };
+        assert!(ray
+            .hits_box(Vec3::new(-20.0, -1.0, -1.0), Vec3::new(-10.0, 1.0, 1.0))
+            .is_none());
+        assert_eq!(
+            ray.hits_box(Vec3::new(10.0, -1.0, -1.0), Vec3::new(20.0, 1.0, 1.0)),
+            Some(10.0),
+            "and something in front is hit at its near face"
+        );
+    }
+
+    /// A ray running exactly parallel to a face -- and lying in its plane --
+    /// is the case the compact slab test turns into `NaN`, which fails every
+    /// comparison it touches and quietly makes the box unclickable. A camera
+    /// looking along a world axis produces it routinely.
+    #[test]
+    fn a_ray_lying_in_a_face_still_hits() {
+        let ray = Ray {
+            origin: Vec3::ZERO,
+            direction: Vec3::X,
+        };
+        // Zero thickness in Z, with the ray exactly in that plane.
+        assert_eq!(
+            ray.hits_box(Vec3::new(5.0, -1.0, 0.0), Vec3::new(6.0, 1.0, 0.0)),
+            Some(5.0)
+        );
+        // And parallel but outside still misses.
+        assert!(ray
+            .hits_box(Vec3::new(5.0, -1.0, 3.0), Vec3::new(6.0, 1.0, 4.0))
+            .is_none());
+    }
+
+    /// A ray starting inside a box has already hit it -- the camera standing
+    /// in a creature should not have to leave before it can be clicked.
+    #[test]
+    fn a_ray_starting_inside_hits_at_zero() {
+        let ray = Ray {
+            origin: Vec3::ZERO,
+            direction: Vec3::X,
+        };
+        assert_eq!(
+            ray.hits_box(Vec3::splat(-1.0), Vec3::splat(1.0)),
+            Some(0.0)
+        );
+    }
+
+    /// A zero-sized viewport is what a minimised window reports.
+    #[test]
+    fn a_degenerate_viewport_yields_no_ray() {
+        assert!(camera().ray_through((0.0, 0.0), (0.0, 0.0)).is_none());
+        assert!(camera().ray_through((0.0, 0.0), (800.0, 0.0)).is_none());
+    }
+
+    /// A point behind the camera must not project.
+    ///
+    /// The perspective divide is happy to fold it back into view -- a negative
+    /// `w` flips both axes -- so something standing behind you would be marked
+    /// in front of you, mirrored, and moving the wrong way as you turn. The
+    /// sign has to be checked before the divide, not after.
+    #[test]
+    fn a_point_behind_the_camera_does_not_project() {
+        let camera = camera();
+        // The camera sits at x = -10 looking towards +x.
+        assert!(camera.project(Vec3::new(-40.0, 4.0, 3.0), VIEWPORT).is_none());
+        assert!(camera.project(Vec3::new(20.0, 4.0, 3.0), VIEWPORT).is_some());
     }
 }
