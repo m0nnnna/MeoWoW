@@ -13,6 +13,7 @@ pub mod crypt;
 pub mod movement;
 pub mod opcode;
 pub mod protocol;
+pub mod state;
 pub mod update;
 
 pub use client::{Connection, DEFAULT_PORT};
@@ -22,7 +23,8 @@ pub use opcode::ClientOpcode;
 pub use protocol::{
     Appearance, AuthResponse, Character, Equipment, WorldPosition, EQUIPMENT_SLOTS,
 };
-pub use update::{Block, ObjectType, Position};
+pub use state::WorldState;
+pub use update::{Block, MonsterMove, ObjectType, Position};
 
 /// Names the playable races by id.
 ///

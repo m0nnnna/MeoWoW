@@ -216,6 +216,39 @@ impl Fields {
     pub fn iter(&self) -> impl Iterator<Item = (u16, u32)> + '_ {
         self.values.iter().copied()
     }
+
+    /// Folds a later update into this set, overwriting fields it names.
+    ///
+    /// This is what makes a `Values` block meaningful. Such a block carries
+    /// *only what changed*, so applying it as a replacement rather than a merge
+    /// would silently discard every field the object still has -- a creature
+    /// that took damage would lose its level, faction and model, and the loss
+    /// would look like the create block having been mis-parsed rather than
+    /// thrown away afterwards.
+    pub fn merge(&mut self, newer: &Fields) {
+        if newer.values.is_empty() {
+            return;
+        }
+        // Both sides are sorted by index, so this is a linear merge rather than
+        // a lookup per field.
+        let mut merged = Vec::with_capacity(self.values.len() + newer.values.len());
+        let (mut old, mut new) = (self.values.iter().peekable(), newer.values.iter().peekable());
+        loop {
+            match (old.peek(), new.peek()) {
+                (Some((a, _)), Some((b, _))) if a < b => merged.push(*old.next().unwrap()),
+                (Some((a, _)), Some((b, _))) if a > b => merged.push(*new.next().unwrap()),
+                (Some(_), Some(_)) => {
+                    // Same index: the newer value wins.
+                    old.next();
+                    merged.push(*new.next().unwrap());
+                }
+                (Some(_), None) => merged.push(*old.next().unwrap()),
+                (None, Some(_)) => merged.push(*new.next().unwrap()),
+                (None, None) => break,
+            }
+        }
+        self.values = merged;
+    }
 }
 
 /// One entry in an update packet.
@@ -521,6 +554,131 @@ pub fn decompress_update_object(body: &[u8]) -> Result<Vec<u8>, Error> {
         });
     }
     Ok(plain)
+}
+
+/// A creature being sent along a server-computed path.
+///
+/// By a wide margin the most common packet in a populated zone -- a single
+/// login burst in Northshire carried nearly four hundred of them.
+#[derive(Debug, Clone)]
+pub struct MonsterMove {
+    pub guid: u64,
+    /// Where the path starts, which is where the creature is now.
+    pub from: Position,
+    /// Where it ends. Absent when the packet is a stop rather than a move.
+    pub to: Option<Position>,
+    /// How long the whole path takes, in milliseconds.
+    pub duration: u32,
+    pub stopped: bool,
+}
+
+/// How the creature should be facing when it arrives.
+mod monster_move_type {
+    pub const NORMAL: u8 = 0;
+    pub const STOP: u8 = 1;
+    pub const FACING_SPOT: u8 = 2;
+    pub const FACING_TARGET: u8 = 3;
+    pub const FACING_ANGLE: u8 = 4;
+}
+
+/// Spline flags that add fields to a monster-move packet.
+mod monster_spline_flags {
+    pub const ANIMATION: u32 = 0x0000_0008;
+    pub const PARABOLIC: u32 = 0x0000_0800;
+    pub const CATMULLROM: u32 = 0x0004_0000;
+    pub const CYCLIC: u32 = 0x0008_0000;
+    /// Paths that carry every point rather than packed offsets.
+    pub const FLYING: u32 = 0x0000_0200;
+}
+
+pub fn parse_monster_move(body: &[u8]) -> Result<MonsterMove, Error> {
+    let mut reader = Reader::new(body, "SMSG_MONSTER_MOVE");
+    let guid = read_packed_guid(&mut reader)?;
+    // A flag byte that toggles the forward movement flag; not acted on.
+    let _unknown = reader.u8()?;
+    let from = Position {
+        x: reader.f32()?,
+        y: reader.f32()?,
+        z: reader.f32()?,
+        orientation: 0.0,
+    };
+    let _spline_id = reader.u32()?;
+
+    // A stop ends the packet here. Reading on would consume whatever follows in
+    // the stream, which is the next packet.
+    let move_type = reader.u8()?;
+    match move_type {
+        monster_move_type::STOP => {
+            reader.finish()?;
+            return Ok(MonsterMove {
+                guid,
+                from,
+                to: None,
+                duration: 0,
+                stopped: true,
+            });
+        }
+        monster_move_type::FACING_SPOT => reader.skip(12)?,
+        monster_move_type::FACING_TARGET => reader.skip(8)?,
+        monster_move_type::FACING_ANGLE => reader.skip(4)?,
+        monster_move_type::NORMAL => {}
+        other => return Err(Error::UnknownUpdateType { got: other }),
+    }
+
+    let flags = reader.u32()?;
+    if flags & monster_spline_flags::ANIMATION != 0 {
+        reader.skip(1 + 4)?; // animation id, effect start time
+    }
+    let duration = reader.u32()?;
+    if flags & monster_spline_flags::PARABOLIC != 0 {
+        reader.skip(4 + 4)?; // vertical acceleration, effect start time
+    }
+
+    // The path. Two encodings, and picking the wrong one desynchronises the
+    // rest of the packet rather than merely losing the waypoints.
+    let count = reader.u32()? as usize;
+    let to = if flags & (monster_spline_flags::CATMULLROM | monster_spline_flags::FLYING) != 0 {
+        // Every point in full; the destination is the last of them.
+        let mut last = None;
+        for _ in 0..count {
+            last = Some(Position {
+                x: reader.f32()?,
+                y: reader.f32()?,
+                z: reader.f32()?,
+                orientation: 0.0,
+            });
+        }
+        last
+    } else {
+        // The destination in full, then the *intermediate* points as offsets
+        // from the midpoint, packed three to a word. Only the endpoint is
+        // needed here, but the offsets still have to be consumed.
+        let destination = Position {
+            x: reader.f32()?,
+            y: reader.f32()?,
+            z: reader.f32()?,
+            orientation: 0.0,
+        };
+        if count > 1 {
+            reader.skip((count - 1) * 4)?;
+        }
+        Some(destination)
+    };
+
+    // Cyclic paths repeat and can carry a trailing point this does not model,
+    // so the length check is skipped for them rather than reporting a bug that
+    // is really an unimplemented case.
+    if flags & monster_spline_flags::CYCLIC == 0 {
+        reader.finish()?;
+    }
+
+    Ok(MonsterMove {
+        guid,
+        from,
+        to,
+        duration,
+        stopped: false,
+    })
 }
 
 /// The handful of field indices this client interprets so far.

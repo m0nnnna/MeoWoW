@@ -548,7 +548,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
 
         // Nothing marks the end of the login burst, so read until it stops.
         let rest = connection.drain(std::time::Duration::from_millis(1500), 512)?;
-        report_object_updates(&rest, character.guid, dump_failed)?;
+        let mut state = report_object_updates(&rest, character.guid, dump_failed)?;
 
         if let Some(degrees) = face {
             let at = world::Position {
@@ -628,7 +628,12 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         }
 
         if stay > 0 {
-            hold_connection(&mut connection, std::time::Duration::from_secs(stay))?;
+            hold_connection(
+                &mut connection,
+                std::time::Duration::from_secs(stay),
+                &mut state,
+                character.guid,
+            )?;
         }
     }
     Ok(())
@@ -642,6 +647,8 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
 fn hold_connection(
     connection: &mut world::Connection,
     duration: std::time::Duration,
+    state: &mut world::WorldState,
+    own_guid: u64,
 ) -> Result<()> {
     // Not tunable: pinging faster gets the session killed. See PING_INTERVAL.
     const PING_EVERY: std::time::Duration = world::client::PING_INTERVAL;
@@ -651,58 +658,53 @@ fn hold_connection(
     let mut packets = 0usize;
     let mut pings = 0usize;
     let mut last_ping = std::time::Instant::now();
+    let mut totals = Replication::default();
 
-    /// What has been seen of one other mover's journey.
+    /// Where a replicated object was first and last seen, so a journey can be
+    /// reported rather than only a final position.
     struct Track {
-        packets: usize,
         first: world::Position,
         last: world::Position,
     }
+    let mut tracks: std::collections::BTreeMap<u64, Track> = Default::default();
 
-    let mut movers: std::collections::BTreeMap<u64, Track> = Default::default();
     while std::time::Instant::now() < until {
-        let batch = connection.drain(std::time::Duration::from_millis(500), 256)?;
+        // A small batch on purpose. `drain` returns when the stream goes quiet
+        // *or* the limit is hit, and a populated zone is rarely quiet for
+        // 500 ms -- so a large limit means few, long iterations, and the
+        // sampling below sees a handful of coarse snapshots instead of a path.
+        let batch = connection.drain(std::time::Duration::from_millis(300), 48)?;
         packets += batch.len();
-        // Relayed movement shares its opcodes with the client's own, so a
-        // packet arriving under one means someone *else* moved.
-        for packet in &batch {
-            let relayed = matches!(
-                packet.opcode,
-                world::opcode::server::MOVE_START_FORWARD
-                    | world::opcode::server::MOVE_STOP
-                    | world::opcode::server::MOVE_HEARTBEAT
-            );
-            if !relayed {
+
+        let report = replicate(state, &batch, None);
+        totals.object_updates += report.object_updates;
+        totals.monster_moves += report.monster_moves;
+        totals.relayed_moves += report.relayed_moves;
+        for (opcode, error, _) in &report.failures {
+            // Printed rather than counted: a packet that will not decode here
+            // is a layout error in something the replicated world depends on.
+            println!("  undecodable {}: {error}", world::opcode::describe(*opcode));
+        }
+        totals.failures.extend(report.failures);
+
+        // Sample the replicated positions of everything that is not us, so the
+        // summary can show movement rather than a snapshot.
+        for entity in state.iter() {
+            let Some(position) = entity.position else {
+                continue;
+            };
+            if entity.guid == own_guid {
                 continue;
             }
-            match world::protocol::parse_movement(&packet.body) {
-                Ok((mover, info)) => match movers.entry(mover) {
-                    std::collections::btree_map::Entry::Vacant(slot) => {
-                        println!(
-                            "  {} guid {mover:#x} first seen at {:.1}, {:.1}, {:.1}",
-                            world::opcode::describe(packet.opcode),
-                            info.position.x,
-                            info.position.y,
-                            info.position.z
-                        );
-                        slot.insert(Track {
-                            packets: 1,
-                            first: info.position,
-                            last: info.position,
-                        });
-                    }
-                    std::collections::btree_map::Entry::Occupied(mut slot) => {
-                        let track = slot.get_mut();
-                        track.packets += 1;
-                        track.last = info.position;
-                    }
-                },
-                // Worth printing rather than counting: a relayed packet that
-                // will not decode means the shared movement layout is wrong in
-                // the one direction nothing else exercises.
-                Err(e) => println!("  undecodable relayed movement: {e}"),
-            }
+            tracks
+                .entry(entity.guid)
+                .and_modify(|track| track.last = position)
+                .or_insert(Track {
+                    first: position,
+                    last: position,
+                });
         }
+
         if last_ping.elapsed() >= PING_EVERY {
             let sent = std::time::Instant::now();
             connection.ping(0)?;
@@ -712,20 +714,60 @@ fn hold_connection(
         }
     }
 
+    let stats = state.stats();
     println!(
-        "  still connected: {packets} packets seen, {pings} keepalives answered, \
-         {} other mover(s) reported",
-        movers.len()
+        "  still connected: {packets} packets seen, {pings} keepalives answered"
     );
-    for (guid, track) in &movers {
-        let travelled = ((track.last.x - track.first.x).powi(2)
-            + (track.last.y - track.first.y).powi(2))
-        .sqrt();
-        println!(
-            "    guid {guid:#x}: {} packets, {:.1}, {:.1} -> {:.1}, {:.1} ({travelled:.1} units)",
-            track.packets, track.first.x, track.first.y, track.last.x, track.last.y
-        );
+    println!(
+        "  applied: {} object updates, {} monster moves, {} relayed moves, {} undecodable",
+        totals.object_updates,
+        totals.monster_moves,
+        totals.relayed_moves,
+        totals.failures.len()
+    );
+    println!(
+        "  replicated world: {} objects ({} created, {} recreated, {} removed, \
+         {} value updates, {} moves, {} orphaned)",
+        state.len(),
+        stats.created,
+        stats.recreated,
+        stats.removed,
+        stats.value_updates,
+        stats.movement_updates,
+        stats.orphaned
+    );
+
+    // Other players are the interesting case: their movement arrives by a
+    // different route than creatures' and is what proves replication of a
+    // second client.
+    for entity in state.players() {
+        if entity.guid == own_guid {
+            continue;
+        }
+        let moved = tracks.get(&entity.guid).map(|track| {
+            let distance = ((track.last.x - track.first.x).powi(2)
+                + (track.last.y - track.first.y).powi(2))
+            .sqrt();
+            (track.first, track.last, distance)
+        });
+        match moved {
+            // The update count comes from the entity itself rather than from
+            // the sampling above: polling can only see as many positions as it
+            // takes snapshots, whereas this counts every update actually
+            // applied.
+            Some((first, last, distance)) => println!(
+                "  player {:#x}: {:.1}, {:.1} -> {:.1}, {:.1} ({distance:.1} units over \
+                 {} applied updates)",
+                entity.guid, first.x, first.y, last.x, last.y, entity.updates
+            ),
+            None => println!("  player {:#x}: no position replicated", entity.guid),
+        }
     }
+
+    // Creatures that were given somewhere to be. A zone with none of these
+    // means monster moves are not being applied.
+    let heading_somewhere = state.iter().filter(|e| e.destination.is_some()).count();
+    println!("  {heading_somewhere} creature(s) currently following a path");
     Ok(())
 }
 
@@ -735,37 +777,116 @@ fn hold_connection(
 /// One malformed packet says something specific about one code path; aborting
 /// on it would hide how many of the rest were fine, which is the number that
 /// says whether a layout is wrong in general or only in a rare branch.
+/// What one batch of packets did to the replicated world.
+#[derive(Default)]
+struct Replication {
+    object_updates: usize,
+    monster_moves: usize,
+    relayed_moves: usize,
+    /// Packets that would not decode, with their payload for offline analysis.
+    failures: Vec<(u16, world::protocol::Error, Result<Vec<u8>, world::protocol::Error>)>,
+}
+
+/// Folds every packet that carries world state into `state`.
+///
+/// One place rather than several, because replication only works if *all* of
+/// the inputs are applied: object updates create and change things, relayed
+/// movement moves other players, and monster moves move creatures. A caller
+/// that handled two of the three would build a world that looked plausible and
+/// was quietly frozen in part.
+fn replicate(
+    state: &mut world::WorldState,
+    packets: &[world::client::Packet],
+    blocks_out: Option<&mut Vec<world::Block>>,
+) -> Replication {
+    use world::update;
+
+    let mut report = Replication::default();
+    let mut collected = Vec::new();
+
+    for packet in packets {
+        match packet.opcode {
+            world::opcode::server::UPDATE_OBJECT
+            | world::opcode::server::COMPRESSED_UPDATE_OBJECT => {
+                let compressed =
+                    packet.opcode == world::opcode::server::COMPRESSED_UPDATE_OBJECT;
+                let parsed = if compressed {
+                    update::parse_compressed_update_object(&packet.body)
+                } else {
+                    update::parse_update_object(&packet.body)
+                };
+                match parsed {
+                    Ok(blocks) => {
+                        report.object_updates += 1;
+                        state.apply(&blocks);
+                        collected.extend(blocks);
+                    }
+                    Err(error) => {
+                        let payload = if compressed {
+                            update::decompress_update_object(&packet.body)
+                        } else {
+                            Ok(packet.body.clone())
+                        };
+                        report.failures.push((packet.opcode, error, payload));
+                    }
+                }
+            }
+            world::opcode::server::MONSTER_MOVE => {
+                match update::parse_monster_move(&packet.body) {
+                    Ok(moved) => {
+                        report.monster_moves += 1;
+                        state.apply_monster_move(&moved);
+                    }
+                    Err(error) => {
+                        report
+                            .failures
+                            .push((packet.opcode, error, Ok(packet.body.clone())))
+                    }
+                }
+            }
+            world::opcode::server::MOVE_START_FORWARD
+            | world::opcode::server::MOVE_STOP
+            | world::opcode::server::MOVE_HEARTBEAT => {
+                match world::protocol::parse_movement(&packet.body) {
+                    Ok((mover, info)) => {
+                        report.relayed_moves += 1;
+                        state.apply_relayed_movement(mover, &info);
+                    }
+                    Err(error) => {
+                        report
+                            .failures
+                            .push((packet.opcode, error, Ok(packet.body.clone())))
+                    }
+                }
+            }
+            world::opcode::server::DESTROY_OBJECT => {
+                let mut reader = world::protocol::Reader::new(&packet.body, "SMSG_DESTROY_OBJECT");
+                if let Ok(guid) = update::read_packed_guid(&mut reader) {
+                    state.remove(guid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(out) = blocks_out {
+        out.extend(collected);
+    }
+    report
+}
+
 fn report_object_updates(
     packets: &[world::client::Packet],
     own_guid: u64,
     dump_failed: Option<&std::path::Path>,
-) -> Result<()> {
+) -> Result<world::WorldState> {
     use world::update::{self, Block};
 
+    let mut state = world::WorldState::new();
     let mut blocks = Vec::new();
-    let mut parsed = 0usize;
-    let mut failures = Vec::new();
-
-    for packet in packets {
-        let (result, payload) = match packet.opcode {
-            world::opcode::server::UPDATE_OBJECT => (
-                update::parse_update_object(&packet.body),
-                Ok(packet.body.clone()),
-            ),
-            world::opcode::server::COMPRESSED_UPDATE_OBJECT => (
-                update::parse_compressed_update_object(&packet.body),
-                update::decompress_update_object(&packet.body),
-            ),
-            _ => continue,
-        };
-        match result {
-            Ok(mut found) => {
-                parsed += 1;
-                blocks.append(&mut found);
-            }
-            Err(error) => failures.push((packet.opcode, error, payload)),
-        }
-    }
+    let replication = replicate(&mut state, packets, Some(&mut blocks));
+    let parsed = replication.object_updates;
+    let failures = replication.failures;
 
     println!("\nobject updates: {parsed} parsed, {} failed", failures.len());
     for (index, (opcode, error, payload)) in failures.iter().enumerate() {
@@ -780,7 +901,7 @@ fn report_object_updates(
         }
     }
     if blocks.is_empty() {
-        return Ok(());
+        return Ok(state);
     }
 
     let mut by_type: std::collections::BTreeMap<&str, usize> = Default::default();
@@ -822,7 +943,7 @@ fn report_object_updates(
     });
     let Some((fields, movement)) = own else {
         println!("  own player object not found in the burst");
-        return Ok(());
+        return Ok(state);
     };
 
     println!("  own player object (guid {own_guid:#x}):");
@@ -856,7 +977,16 @@ fn report_object_updates(
         );
     }
     println!("    {} fields set", fields.len());
-    Ok(())
+
+    let stats = state.stats();
+    println!(
+        "  replicated world: {} objects ({} created, {} removed, {} orphaned updates)",
+        state.len(),
+        stats.created,
+        stats.removed,
+        stats.orphaned
+    );
+    Ok(state)
 }
 
 /// Chooses which realm to enter.

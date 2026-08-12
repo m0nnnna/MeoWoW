@@ -397,6 +397,70 @@ self-consistent mistake.
 It also exercises the inbound relay path with real data for the first time. Up
 to this point it was written, wired, and had never received a packet.
 
+# Replication
+
+The server never sends the world; it sends *changes* to it. An object arrives
+once as a create block carrying everything, and after that only what altered: a
+`Values` block with three fields, a movement packet with a position, a guid in
+an out-of-range list. `state.rs` folds that stream into a live view.
+
+This is the first place in the project where a mistake **survives**. Every
+parser before it was memoryless — a bad packet produced a bad answer once, and
+the next packet was unaffected. Here a dropped update is permanent, a merge that
+overwrites instead of merging erases fields nothing will resend, and a missed
+removal leaves a ghost standing where nothing is. None of it errors, and all of
+it compounds.
+
+So the defences are about **accounting** rather than parsing. Every change is
+counted; updates naming an unknown guid are tallied as orphans rather than
+fabricating an entity; re-creations are counted separately from creations. A
+replication bug shows up as a number that does not add up long before it shows
+up as a wrong world. The invariant to watch is `created - removed == objects`.
+
+Two rules that are easy to get backwards:
+
+- **A `Values` block is a merge, not a replacement.** It carries only what
+  changed. Applying it as a replacement leaves a creature that took damage with
+  no level, faction or model, and the loss looks like the *create* block having
+  been mis-parsed rather than discarded afterwards.
+- **A monster move places the creature at the path's start, not its end.** The
+  packet describes travel about to happen over its stated duration. Jumping to
+  the destination on arrival makes every creature in the zone teleport.
+
+## `SMSG_MONSTER_MOVE`
+
+By a wide margin the most common packet in a populated zone — a single login
+burst in Northshire carried nearly four hundred. Two things in it bite:
+
+- **A stop ends the packet early.** Reading past it consumes the next packet.
+- **The path has two encodings.** Catmull-rom and flying paths carry every point
+  in full; everything else carries the destination in full and the intermediate
+  points as offsets from the midpoint, packed three to a word. Picking the wrong
+  one desynchronises the rest of the packet rather than merely losing waypoints.
+
+## Verified against a live realm
+
+Watcher held its connection while Testwolf walked 45 units:
+
+```text
+Testwolf (walking):    -8948.2, -131.7  ->  -8909.3, -109.2
+Watcher  (replicated): player 0x32,
+                       -8948.2, -131.7  ->  -8909.3, -109.2
+                       (45.0 units over 67 applied updates)
+
+applied: 24 object updates, 286 monster moves, 66 relayed moves, 0 undecodable
+world:   97 objects (101 created, 50 recreated, 4 removed, 718 moves, 0 orphaned)
+```
+
+The observer's replicated position for another player matches that player's own
+record exactly. Zero orphaned updates across 376 applied changes means no create
+block was lost and no guid was misread, and `101 - 4 == 97` closes the books.
+
+One caveat worth stating rather than glossing: **`Values` blocks are rare in a
+quiet zone.** These sessions saw one apiece. The merge path is covered
+thoroughly by unit tests, but it has had very little real traffic through it;
+combat would be the way to exercise it properly.
+
 ## Open questions
 
 An unidentified opcode **0x029D** arrives exactly once per movement packet sent,

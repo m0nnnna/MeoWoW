@@ -12,7 +12,7 @@ streams. Phase 3 has started.
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation), WMO, ADT/WDT — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
-| Protocol | **3.1 logon, 3.2 handshake, 3.3 enter world, 3.4 movement done** — all confirmed against a live realm, movement including one client watching another move. 3.5 entity replication is next |
+| Protocol | **3.1–3.4 done**, all confirmed against a live realm including one client watching another move. 3.5 replication is protocol-complete (`world::state`); drawing the replicated world is the remaining renderer half |
 | Game + UI | Not started. The largest remaining chunk. |
 
 Roughly 50% of the way to something a person could test by playing. See
@@ -90,6 +90,14 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   properties the data must have, not just that it decoded: M2 normals are unit
   vectors, SRP6 rotation keys are unit quaternions, terrain chunks must meet at
   their edges. Each of those caught a real bug that size checks missed.
+- **State that persists needs accounting, not just parsing.** Every parser here
+  is memoryless: a bad packet gives one wrong answer and the next is unaffected.
+  Replicated world state is not — a dropped update is permanent, a merge that
+  overwrites erases fields nothing will resend, a missed removal leaves a ghost.
+  None of it errors and all of it compounds. Count every change, tally updates
+  naming unknown objects instead of inventing them, and check the books balance
+  (`created - removed == held`). Those counters catch replication bugs long
+  before the world looks wrong, and none of them assert anything about layout.
 - **Assert the parse consumed the whole record.** The corollary to the above,
   and cheaper than any of it. Four separate world-protocol bugs — a packet
   sixteen bytes longer than expected, three missing equipment slots, a
