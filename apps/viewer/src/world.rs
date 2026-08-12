@@ -103,6 +103,16 @@ pub struct EntityPlacement {
     /// whether its display id's group is drawn with a walk cycle -- see
     /// `Group::animated_display_id`.
     pub moving: bool,
+    /// How this instance is dressed, for a player character.
+    ///
+    /// `None` for everything else, which is nearly everything: a creature's
+    /// appearance is already in its display id. A player's is not -- display
+    /// 49 is every human male alive -- so the look travels with the placement
+    /// and takes part in the cache key. Without that, the second human male in
+    /// view wears the first one's skin.
+    pub look: Option<std::rc::Rc<crate::character::Look>>,
+    /// Distinguishes one look from another for caching. Zero means undressed.
+    pub look_key: u64,
 }
 
 pub struct World {
@@ -118,7 +128,9 @@ pub struct World {
     /// Not merely convenient: a creature display id supplies *skins* on top of
     /// its model path, so two display ids sharing one path are different-looking
     /// creatures. Keying by path would give the second one the first one's hide.
-    entity_cache: HashMap<u32, Option<Rc<CachedModel>>>,
+    /// Keyed by display *and* look: two players of one race share a display
+    /// id and not a face. Zero is the undressed key every creature uses.
+    entity_cache: HashMap<(u32, u64), Option<Rc<CachedModel>>>,
     /// Objects the server placed, as opposed to the ones the map files did.
     /// Owned by the world rather than a tile: they move, and they do not belong
     /// to the tile they happen to be standing on.
@@ -449,7 +461,9 @@ impl World {
     /// entity whose model has not loaded is not on screen either, and letting
     /// a click select something invisible would be worse than letting it miss.
     pub fn entity_bounds(&self, display_id: u32) -> Option<(Vec3, Vec3)> {
-        self.entity_cache.get(&display_id)?.as_ref()?.bounds
+        // Bounds are a property of the mesh, not of how it is dressed, so the
+        // undressed entry answers for every look of the same model.
+        self.entity_cache.get(&(display_id, 0))?.as_ref()?.bounds
     }
 
     /// Replaces the server-placed objects.
@@ -474,10 +488,13 @@ impl World {
         chain: &mut Chain,
         placements: &[EntityPlacement],
     ) -> usize {
-        let mut grouped: HashMap<(u32, bool), Vec<Mat4>> = HashMap::new();
+        // Keyed by look as well as display: see `EntityPlacement::look`.
+        let mut looks: HashMap<u64, Option<std::rc::Rc<crate::character::Look>>> = HashMap::new();
+        let mut grouped: HashMap<(u32, bool, u64), Vec<Mat4>> = HashMap::new();
         for placement in placements {
+            looks.insert(placement.look_key, placement.look.clone());
             grouped
-                .entry((placement.display_id, placement.moving))
+                .entry((placement.display_id, placement.moving, placement.look_key))
                 .or_default()
                 .push(Mat4::from_scale_rotation_translation(
                     Vec3::splat(placement.scale),
@@ -505,8 +522,10 @@ impl World {
         let mut built = Vec::new();
         let mut undrawable = 0;
         let mut wanted_bones: HashSet<(u32, bool)> = HashSet::new();
-        for ((display_id, moving), transforms) in grouped {
-            let Some(model) = self.entity_model(gpu, meshes, chain, display_id) else {
+        for ((display_id, moving, look_key), transforms) in grouped {
+            let look = looks.get(&look_key).cloned().flatten();
+            let Some(model) = self.entity_model(gpu, meshes, chain, display_id, look_key, look.as_deref())
+            else {
                 undrawable += transforms.len();
                 continue;
             };
@@ -592,14 +611,16 @@ impl World {
         meshes: &MeshRenderer,
         chain: &mut Chain,
         display_id: u32,
+        look_key: u64,
+        look: Option<&crate::character::Look>,
     ) -> Option<Rc<CachedModel>> {
-        if let Some(cached) = self.entity_cache.get(&display_id) {
+        if let Some(cached) = self.entity_cache.get(&(display_id, look_key)) {
             return cached.clone();
         }
 
         let entry = crate::model::creature(chain, display_id)
             .and_then(|(path, variations)| {
-                crate::model::load(gpu, chain, &path, &variations, 0)
+                crate::model::load_dressed(gpu, chain, &path, &variations, 0, look)
             })
             .map(|loaded| {
                 let binds = loaded
@@ -622,7 +643,7 @@ impl World {
             .map_err(|e| tracing::debug!("display id {display_id}: {e}"))
             .ok();
 
-        self.entity_cache.insert(display_id, entry.clone());
+        self.entity_cache.insert((display_id, look_key), entry.clone());
         entry
     }
 }

@@ -14,7 +14,7 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
 | Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated creatures and players slide along their actual path, turn to face it, and play the model's own walk/stand cycles |
 | Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, `F1` to rearrange, saved to `ui.toml` |
-| Game | **4.3 done**: spellbook, three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. Spell damage, threat and the corpse flow remain. Inventory and quests follow |
+| Game | **4.3 done**: spellbook, three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. Spell damage, threat and the corpse flow remain. Inventory and quests follow |
 
 Roughly 57% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
@@ -301,6 +301,15 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   placed — sent the search to the protocol instead of the renderer. When
   something is missing, confirm whether it was *submitted* before asking whether
   it was produced.
+- **Some rules can only be found by looking.** Geoset selection -- which of a
+  character model's seventeen haircuts and six beards to draw -- took four
+  attempts, and each wrong one was a *reasonable* reading of the same table.
+  Drawing everything gave every haircut at once; drawing only what the
+  character's own numbers name took the forearms, hands and legs off with the
+  phantom cloak, because variant one of an equipment group is the bare body
+  part. No amount of staring at `CharHairGeosets` distinguishes those. One
+  screenshot each did. When a rule is about what a *model file* contains rather
+  than what a table says, render it.
 - **An odd-looking render is often the camera.** A gnoll looked scrambled and a
   building looked misplaced; both were framing, not geometry. Render canonical
   angles before doubting the parser.

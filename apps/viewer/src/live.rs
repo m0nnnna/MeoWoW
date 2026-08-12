@@ -72,6 +72,14 @@ pub struct LiveWorld {
     /// once. The first body per opcode is the one that teaches; the rest are
     /// noise, and a busy zone would produce plenty.
     reported_failures: std::collections::HashSet<u16>,
+    /// How this character is dressed, resolved once at login.
+    ///
+    /// Resolved here rather than per frame because it cannot change without a
+    /// barber, and reading three DBCs every frame to learn the same answer
+    /// would be the login burst's thirty-seven seconds all over again.
+    pub look: std::rc::Rc<crate::character::Look>,
+    /// Distinguishes this look in the renderer's model cache.
+    pub look_key: u64,
     /// Kept alive rather than dropped at the end of [`connect`]: the viewer
     /// walks the character over this same connection, and RC4 header state
     /// cannot be shared or rewound, so a fresh connection could not pick up
@@ -164,6 +172,23 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
         state.spells.spells.len(),
     );
 
+    let appearance = crate::character::Appearance {
+        race: character.race,
+        gender: character.gender,
+        skin: character.skin,
+        face: character.face,
+        hair_style: character.hair_style,
+        hair_colour: character.hair_color,
+        facial_hair: character.facial_hair,
+    };
+    let look = crate::character::resolve(chain, appearance);
+    tracing::info!(
+        "character look: body {:?}, hair {:?}, geosets {:?}",
+        look.body,
+        look.hair,
+        look.geosets
+    );
+
     let (map_directory, map_name) = map_directory(chain, landed.map)?;
     let mut live = LiveWorld {
         character: character.name.clone(),
@@ -175,6 +200,8 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
         position: Vec3::new(landed.x, landed.y, landed.z),
         orientation: landed.orientation,
         state,
+        look: std::rc::Rc::new(look),
+        look_key: appearance.key(),
         fold_failures: 0,
         reported_failures: std::collections::HashSet::new(),
         connection,

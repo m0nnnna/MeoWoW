@@ -8,6 +8,7 @@
 //! opening a window, which keeps the render path checkable from a terminal and
 //! in CI.
 
+mod character;
 mod hud;
 mod live;
 mod model;
@@ -290,6 +291,10 @@ fn build_live_scene(
                     orientation: entity.orientation,
                     scale: entity.scale,
                     moving: entity.moving,
+                    // Only our own body is dressed; everything else takes its
+                    // appearance from its display id.
+                    look: (entity.guid == live.guid).then(|| live.look.clone()),
+                    look_key: if entity.guid == live.guid { live.look_key } else { 0 },
                 })
                 .collect();
         let undrawable = world.set_entities(gpu, meshes, chain, &placements);
@@ -1818,6 +1823,13 @@ impl App {
                                 orientation: entity.orientation,
                                 scale: entity.scale,
                                 moving: entity.moving,
+                                look: (entity.guid == live.guid)
+                                    .then(|| live.look.clone()),
+                                look_key: if entity.guid == live.guid {
+                                    live.look_key
+                                } else {
+                                    0
+                                },
                             })
                             .collect();
                     let undrawable =

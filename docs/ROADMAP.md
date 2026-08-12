@@ -576,6 +576,55 @@ display id 49's `CreatureDisplayInfo` texture columns are empty because players
 do not get their appearance that way. Every hairstyle geoset draws at once for
 the same reason. Both are appearance, not placement, and both are next.
 
+### The character is dressed
+
+`apps/viewer/src/character.rs` turns the five numbers a player picked at
+character creation into textures and geosets. The character now renders as a
+recognisable human rather than a white mannequin wearing every haircut at once.
+
+**The five numbers come from the character list**, which this client already
+parses and has confirmed against a live realm. They also live in the player
+object's update fields, at an index nothing here has verified -- and reading a
+field whose offset was guessed is the failure this project keeps paying for.
+The source that is already known to be right wins.
+
+Column meanings in `CharSections` were read off the data, not transcribed: for
+race 1 / sex 0, section type 0 yields `HumanMaleSkin00_00`, type 1
+`HumanMaleFaceLower00_00` beside `...FaceUpper00_00`, type 2
+`FacialLowerHair00_00`, type 4 `HumanMaleNakedPelvisSkin00_00`. Names that say
+what they are is about as unambiguous as a column gets.
+
+**Geoset selection took three renders and got it wrong twice, which is the
+point of having a headless render.** A character model ships every hairstyle
+and every beard in one file and expects the client to choose exactly one per
+group, where a geoset id is `group * 100 + variant`.
+
+- *Draw everything*: seventeen haircuts on one head.
+- *Draw only what the character's numbers name*: the haircut was right and the
+  character was wearing a large white sheet -- geoset 1501, equipment geometry
+  for a cloak nobody owns.
+- *Hide every equipment group*: the sheet went, and so did the forearms, hands,
+  pelvis and legs. A floating torso with its hands and feet lying on the grass
+  nearby. **Variant one of an equipment group is the bare body part**, not a
+  piece of gear.
+- *Show variant one of equipment groups, hide the rest, except group 15 which
+  has no bare variant*: a complete human.
+
+None of those four steps could have been distinguished by reasoning about the
+table. Each took one screenshot. The two tests that then failed were the tests
+being wrong, not the rule: geoset zero is the body and always draws, and group
+8 ships `802` and `803` with no variant one at all, so its default is to draw
+nothing. **A group's default is whatever the model actually contains**, not a
+number this code assumes every group has.
+
+**What is still missing, and it is one feature rather than several.** The face
+is blank and the character is nude, because the face, facial hair and underwear
+are *layers* meant to be composed onto the base skin -- `CharSections` hands
+back `FaceLower`/`FaceUpper` and `NakedPelvisSkin` as separate textures, and
+turning them into one skin needs a texture blit this client does not do yet.
+The base skin is used alone until it does. Hair renders geometrically but
+untextured for the same class of reason.
+
 ## 4.4: melee combat
 
 `wow-cli world --enter Testwolf --attack --stay 40 --capture <file>` walks a

@@ -386,6 +386,78 @@ dbc_table! {
 }
 
 dbc_table! {
+    /// A character's skin, face, hair and facial-hair textures.
+    ///
+    /// Players do not get their appearance from `CreatureDisplayInfo` the way
+    /// creatures do -- display id 49 is every human male alive, and its texture
+    /// columns are empty. The look comes from here instead, keyed by race,
+    /// gender, what *kind* of section it is, and the two indices the player
+    /// chose at character creation.
+    ///
+    /// Column meanings were read off the data rather than transcribed: for
+    /// race 1 / sex 0, section type 0 yields `HumanMaleSkin00_00`, type 1
+    /// `HumanMaleFaceLower00_00` alongside `...FaceUpper00_00`, type 2
+    /// `FacialLowerHair00_00`, and type 4 `HumanMaleNakedPelvisSkin00_00`.
+    /// Names that say what they are is about as unambiguous as a column gets.
+    CharSections, CharSectionsRow, path = r"DBFilesClient\CharSections.dbc", fields = 10, {
+        0 id: u32,
+        1 race: u32,
+        2 gender: u32,
+        /// 0 base skin, 1 face, 2 facial hair, 3 hair, 4 underwear.
+        3 section_type: u32,
+        /// Up to three layers. Only the first is used for a base skin; a face
+        /// splits into a lower and an upper half across the first two.
+        4 texture_0: str,
+        5 texture_1: str,
+        6 texture_2: str,
+        7 flags: u32,
+        /// Which variation of this section -- the face or hairstyle number.
+        8 variation: u32,
+        /// Which colour of it -- the skin or hair colour number.
+        9 colour: u32,
+    }
+}
+
+dbc_table! {
+    /// Which geoset a hairstyle turns on.
+    ///
+    /// A character model ships every hairstyle as a separate geoset in group
+    /// zero and expects the client to show exactly one. Draw them all and the
+    /// character wears every haircut at once, which is precisely what this
+    /// client did before reading this table.
+    CharHairGeosets, CharHairGeosetsRow, path = r"DBFilesClient\CharHairGeosets.dbc", fields = 6, {
+        0 id: u32,
+        1 race: u32,
+        2 gender: u32,
+        /// The hairstyle number the player chose.
+        3 variation: u32,
+        /// The geoset in group zero to show. Zero is the bald scalp.
+        4 geoset: u32,
+        /// Whether the scalp shows through, for styles that do not cover it.
+        5 show_scalp: u32,
+    }
+}
+
+dbc_table! {
+    /// Which geosets a facial-hair choice turns on, across three groups.
+    ///
+    /// The three columns are variants within geoset groups 1, 3 and 2 -- in
+    /// that order, which is not the order they are numbered. Confirmed against
+    /// `HumanMale.m2`, which ships exactly `101 102 201 202 301 302`: variants
+    /// one and two of each of the three groups, and nothing else that would
+    /// fit a different reading.
+    CharacterFacialHairStyles, CharacterFacialHairStylesRow,
+        path = r"DBFilesClient\CharacterFacialHairStyles.dbc", fields = 8, {
+        0 race: u32,
+        1 gender: u32,
+        2 variation: u32,
+        3 geoset_100: u32,
+        4 geoset_300: u32,
+        5 geoset_200: u32,
+    }
+}
+
+dbc_table! {
     /// How long an effect lasts, indexed by [`SpellRow::duration_index`].
     ///
     /// A handful of rows carry a nonsense [`SpellDurationRow::duration`]

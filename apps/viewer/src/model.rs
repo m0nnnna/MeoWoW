@@ -139,6 +139,24 @@ pub fn load(
     variations: &Variations,
     lod: u32,
 ) -> Result<LoadedModel> {
+    load_dressed(gpu, chain, path, variations, lod, None)
+}
+
+/// The same, for a model whose textures and geosets come from a character's
+/// own appearance rather than from `CreatureDisplayInfo`.
+///
+/// Split as an extra parameter rather than a second loader because everything
+/// else -- the LOD fallback, the batch walk, the bone palette -- is identical,
+/// and two copies of that would drift. See [`crate::character`] for why a
+/// player needs it at all.
+pub fn load_dressed(
+    gpu: &Gpu,
+    chain: &mut Chain,
+    path: &str,
+    variations: &Variations,
+    lod: u32,
+    look: Option<&crate::character::Look>,
+) -> Result<LoadedModel> {
     let path = m2::model_path(path);
     let model = m2::Model::parse(&chain.read(&path)?)
         .with_context(|| format!("parsing {path}"))?;
@@ -181,9 +199,21 @@ pub fn load(
         let file = if def.is_hardcoded() {
             Some(def.filename.clone())
         } else {
-            variations
-                .for_kind(def.kind)
-                .map(|name| variation_path(&path, name))
+            // A character's own textures are full archive paths already --
+            // `CharSections` stores `Character\Human\Male\HumanMaleSkin00_00`
+            // -- where a creature's are bare names resolved against the
+            // model's directory. Resolving one like the other produces a path
+            // that does not exist and a silently untextured model.
+            let dressed = look.and_then(|look| match def.kind {
+                1 => look.body.clone(),
+                6 => look.hair.clone(),
+                _ => None,
+            });
+            dressed.or_else(|| {
+                variations
+                    .for_kind(def.kind)
+                    .map(|name| variation_path(&path, name))
+            })
         };
 
         let uploaded = file.as_ref().and_then(|f| {
@@ -214,6 +244,13 @@ pub fn load(
         let Some(submesh) = skin.submeshes().get(batch.submesh_index as usize) else {
             continue;
         };
+        // A character model ships every hairstyle and beard at once and
+        // expects the client to pick. Skipped here rather than drawn with a
+        // transparent material: an unwanted geoset costs a draw call and
+        // overlapping geometry either way.
+        if look.is_some_and(|look| !look.shows(u32::from(submesh.id))) {
+            continue;
+        }
         let Some(resolved) = skin.submesh_indices(submesh) else {
             continue;
         };
