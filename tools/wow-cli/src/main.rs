@@ -652,7 +652,14 @@ fn hold_connection(
     let mut pings = 0usize;
     let mut last_ping = std::time::Instant::now();
 
-    let mut movers: std::collections::BTreeSet<u64> = Default::default();
+    /// What has been seen of one other mover's journey.
+    struct Track {
+        packets: usize,
+        first: world::Position,
+        last: world::Position,
+    }
+
+    let mut movers: std::collections::BTreeMap<u64, Track> = Default::default();
     while std::time::Instant::now() < until {
         let batch = connection.drain(std::time::Duration::from_millis(500), 256)?;
         packets += batch.len();
@@ -665,21 +672,35 @@ fn hold_connection(
                     | world::opcode::server::MOVE_STOP
                     | world::opcode::server::MOVE_HEARTBEAT
             );
-            if relayed {
-                match world::protocol::parse_movement(&packet.body) {
-                    Ok((mover, info)) => {
-                        if movers.insert(mover) {
-                            println!(
-                                "  {} moved: guid {mover:#x} at {:.1}, {:.1}, {:.1}",
-                                world::opcode::describe(packet.opcode),
-                                info.position.x,
-                                info.position.y,
-                                info.position.z
-                            );
-                        }
+            if !relayed {
+                continue;
+            }
+            match world::protocol::parse_movement(&packet.body) {
+                Ok((mover, info)) => match movers.entry(mover) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        println!(
+                            "  {} guid {mover:#x} first seen at {:.1}, {:.1}, {:.1}",
+                            world::opcode::describe(packet.opcode),
+                            info.position.x,
+                            info.position.y,
+                            info.position.z
+                        );
+                        slot.insert(Track {
+                            packets: 1,
+                            first: info.position,
+                            last: info.position,
+                        });
                     }
-                    Err(e) => println!("  undecodable relayed movement: {e}"),
-                }
+                    std::collections::btree_map::Entry::Occupied(mut slot) => {
+                        let track = slot.get_mut();
+                        track.packets += 1;
+                        track.last = info.position;
+                    }
+                },
+                // Worth printing rather than counting: a relayed packet that
+                // will not decode means the shared movement layout is wrong in
+                // the one direction nothing else exercises.
+                Err(e) => println!("  undecodable relayed movement: {e}"),
             }
         }
         if last_ping.elapsed() >= PING_EVERY {
@@ -696,6 +717,15 @@ fn hold_connection(
          {} other mover(s) reported",
         movers.len()
     );
+    for (guid, track) in &movers {
+        let travelled = ((track.last.x - track.first.x).powi(2)
+            + (track.last.y - track.first.y).powi(2))
+        .sqrt();
+        println!(
+            "    guid {guid:#x}: {} packets, {:.1}, {:.1} -> {:.1}, {:.1} ({travelled:.1} units)",
+            track.packets, track.first.x, track.first.y, track.last.x, track.last.y
+        );
+    }
     Ok(())
 }
 

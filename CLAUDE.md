@@ -12,7 +12,7 @@ streams. Phase 3 has started.
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation), WMO, ADT/WDT — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
-| Protocol | **3.1 logon, 3.2 handshake, 3.3 enter world done**; 3.4 movement half done — we move and it persists, being *seen* move needs a second account. All confirmed against a live realm |
+| Protocol | **3.1 logon, 3.2 handshake, 3.3 enter world, 3.4 movement done** — all confirmed against a live realm, movement including one client watching another move. 3.5 entity replication is next |
 | Game + UI | Not started. The largest remaining chunk. |
 
 Roughly 50% of the way to something a person could test by playing. See
@@ -64,6 +64,9 @@ when no window is available.
 - `ACCOUNT33` has two characters, `Testwolf` (human warrior) and `Testdruid`
   (night elf druid), created to give `SMSG_CHAR_ENUM` real data to parse. An
   account with no characters exercises none of that packet's field offsets.
+  `ACCOUNT34` has `Watcher` (human warrior), deliberately a human so it spawns
+  in Northshire within view range of `Testwolf` — two clients in different
+  starting zones cannot see each other and prove nothing.
 
 ## Rules that matter
 
@@ -123,6 +126,11 @@ Worth reading before debugging anything, because the same shapes keep recurring.
 - **Compare against something derived independently.** The SRP6 tests carry a
   server written from the protocol, not from the client. Agreement between two
   separate derivations is evidence; a thing checked against itself is not.
+  The strongest version of this available here is the two-client movement test:
+  the structure goes out through one client, through the server, and back in
+  through another, so the write and read halves are confirmed against each other
+  *via a third party* that had to understand both. Reach for that shape whenever
+  a format travels in both directions.
 - **When geometry is missing rather than wrong, suspect culling before data.**
   WMO winds counter-clockwise, M2 and terrain clockwise. Guessing from a
   neighbouring format culled a roof and looked like a hole in the mesh.

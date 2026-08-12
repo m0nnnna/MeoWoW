@@ -370,6 +370,33 @@ long since processed. Anything that sends a single packet and leaves needs to
 wait, and the CLI's `--face` now drains briefly before returning for exactly
 this reason.
 
+## Seen moving by another client
+
+Two accounts, two characters standing about thirty units apart in Northshire:
+`Testwolf` on one, `Watcher` on the other. `Watcher` held its connection open
+while `Testwolf` walked 40 units.
+
+```text
+Testwolf (walking):   -8949.9, -127.9  ->  -8912.3, -114.2
+Watcher  (observing): guid 0x32, 60 packets,
+                      -8949.9, -127.9  ->  -8912.3, -114.2  (40.0 units)
+```
+
+The observer's path, decoded from relayed `MSG_MOVE_*` packets, matches the
+walker's own record exactly.
+
+This is the most valuable test in the protocol work so far, and not because of
+the milestone it closed. The movement structure went **out** through one client,
+through the server, and **back in** through another. The write half and the read
+half of `MovementInfo` were therefore confirmed *against each other through a
+third party* — the server had to understand what was written in order to relay
+something the reader could understand. A shared bug in both halves would have to
+have been a bug the server also shared, which is a far narrower target than a
+self-consistent mistake.
+
+It also exercises the inbound relay path with real data for the first time. Up
+to this point it was written, wired, and had never received a packet.
+
 ## Open questions
 
 An unidentified opcode **0x029D** arrives exactly once per movement packet sent,
@@ -388,9 +415,5 @@ On the world side: interpreting the update fields beyond the handful named in
 `update.rs`. Spline paths are parsed exactly but discarded, because nothing
 consumes them until movement prediction exists.
 
-**Being seen moving by another client is not yet proven.** It needs a second
-account logged in at the same time, and only one is available here. The inbound
-half is written and wired up — a relayed `MSG_MOVE_*` is decoded and its mover
-reported — but with nobody else online it has never received a real packet. What
-*is* proven is that the server accepts our movement and persists it, which is
-the half that had to be right first.
+Interpreting the update fields beyond the handful named in `update.rs`, and
+`SMSG_MONSTER_MOVE`, whose spline payload is skipped rather than followed.

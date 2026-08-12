@@ -55,7 +55,7 @@ Target is a stock TrinityCore or MaNGOS 3.3.5a server.
 | 3.1 | **Auth server** ✅ | SRP6 login, realm list, stage-aware refusals; `wow-cli auth <host>` |
 | 3.2 | **World handshake** ✅ | RC4 header crypt, `SMSG_AUTH_CHALLENGE` → character list; `wow-cli world <host>` |
 | 3.3 | **Enter world** ✅ | Login to a character, parse the initial object update; `wow-cli world --enter <name>` |
-| 3.4 | **Movement** ◐ | Move and have it persist; `wow-cli world --enter <name> --walk <n>`. Being *seen* moving needs a second account and is unproven |
+| 3.4 | **Movement** ✅ | Move, and be seen moving by a second client; `wow-cli world --enter <name> --walk <n>`, or W/S/A/D in the viewer |
 | 3.5 | **Entity replication** | Other players and creatures visible and animating |
 
 3.2 was expected to be the single hardest protocol step, and the header cipher
@@ -96,17 +96,24 @@ coordinate conversion at all. The single bug was in the renderer and not the
 join — a shared bone palette sized for one matrix, which silently collapsed
 every skinned model to the origin. See `docs/RENDERING.md`.
 
-### 3.4 is half done, deliberately marked so
+### 3.4, and what closed it
 
 The client moves, the server accepts it, and the position persists — verified by
 walking a closed square and confirming each leg against the server's own reading
-of where the character was. What is *not* proven is the second half of the
-milestone as written: being seen moving by another client. That needs two
-accounts online at once and only one exists on the test realm. The inbound path
-is written and wired but has never received a real packet.
+of where the character was.
 
-It is left at ◐ rather than ✅ because the untested half is the half that would
-fail silently. The rest of the ladder does not depend on it.
+The second half of the milestone — being *seen* moving — sat unproven for a
+while, because it needs two accounts online at once. With a second account it
+closed cleanly: one client walked 40 units while another watched, and the
+watcher's independently decoded path matched the walker's own record exactly,
+over 60 relayed packets.
+
+That test is worth more than the milestone it closed. The movement structure
+went **out** through one client, through the server, and **back in** through
+another — so the write half and the read half of `MovementInfo` were confirmed
+against each other through a third party rather than against themselves. This
+project's standing rule is that a thing checked against itself is not evidence;
+this is the strongest form of the opposite available without a reference client.
 
 ## Phase 4 — Game
 
