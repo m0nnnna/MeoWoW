@@ -301,6 +301,17 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   placed — sent the search to the protocol instead of the renderer. When
   something is missing, confirm whether it was *submitted* before asking whether
   it was produced.
+- **Comparing two candidates tells you which is nicer, not which is right.**
+  The ADT placement offset shipped at `-90`, was "fixed" to `+90` because a
+  render of Northshire Abbey looked better that way, and both were 90 degrees
+  wrong -- every fence in Elwynn lay across its own line the whole time. A
+  building has four sides and every rotation shows a door to somebody, so the
+  test could never fail. What settled it was measuring something that could
+  not move: fence *runs* give a direction from positions alone with no
+  rotation involved, and the lamp pillars beside the abbey steps are doodads
+  whose world positions are fixed however the building is turned. **A movable
+  thing checked against another movable thing proves nothing.** And when a
+  user says a second thing is still wrong, that is data about the *first* fix.
 - **A value with nothing to compare it against is not verified by looking at
   it.** Entity facing was applied raw for four milestones under a comment
   claiming an M2's forward is +X, and every creature in the world was turned

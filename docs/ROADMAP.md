@@ -668,28 +668,46 @@ it against is not verified by looking at it**, however carefully. Drawing the
 player supplied the missing reference, which is why a rendering feature found
 a protocol-adjacent bug that four milestones of watching had not.
 
-### Every building was back to front too
+### Placement rotation, settled against a real client
 
-Reported from playing: "the church isn't facing the right direction". Correct,
-and it is the same fact as the creatures.
+Reported from playing: "the church isn't facing the right direction", and
+later, decisively: "the fences were like that before but now also 180". Both
+were right, and the second is what broke the problem open.
 
-`scene::placement_rotation` offset a placement's yaw by `-90` degrees where it
-should be `+90` -- 180 degrees out, arriving by the same wrong assumption that
-an M2 faces +X. So the abbey, the stable, the mine entrances and every fence in
-Elwynn were mirrored, and had been for as long as buildings have rendered.
+The offset in `scene::placement_rotation` had shipped as `-90`. It was changed
+to `+90` on the strength of a render of Northshire Abbey looking better. Both
+are **90 degrees wrong**: they lay every fence in Elwynn across its own line
+instead of along it. The correct value is `+180`, for doodads and world
+objects alike.
 
-**Northshire Abbey is a compass, and that is the whole reason this got fixed.**
-Rendered from the starting lawn at `-90`, it is a blank wall of stained glass
-with no way in -- the apse. At `+90` it is the entrance, with its steps and its
-portico, which is what a player standing there sees. A tree hides this
-perfectly. A fence hides it. A wolf hides it. A door does not.
+**Why a building could not settle it.** A church has four sides and every
+rotation shows a door to somebody. Comparing two candidate offsets against
+each other says which is nicer, never whether the truth is outside the pair --
+and it was. This is the same error as a test asserting a convention it also
+defines, one level up, and it was made here twice in a row.
 
-That is two separate 180-degree errors found in one session, both from the same
-root, and both invisible until something asymmetric with a known orientation
-was put in front of the camera. The rendering doc now says so where the
-convention is defined, and the old paragraph claiming "facing needed no offset
-at all" is gone -- it was confidently wrong, and it had been verified by
-watching a window, which is exactly the observation that could not disprove it.
+**What did settle it, in three independent measurements:**
+
+- **Fence runs.** A fence is copies of one model laid end to end, so the run's
+  direction comes from the placements' own *positions*, with no rotation
+  involved at all. Across three runs at different angles, `direction - yaw` is
+  one constant and `direction + yaw` is not: the yaw is not mirrored, and the
+  offset is zero modulo a half turn. The model is 4.3 units long in X against
+  0.3 in Y, so its long axis is local X, which is what makes that comparison
+  meaningful. Now pinned as `a_fence_run_lies_along_its_stored_yaw`, built from
+  the real placements.
+- **A screenshot of the real client**, side by side with ours from comparable
+  ground: the real one shows the abbey's portal where ours showed a windowed
+  side wall. A 90 degree error, not the 180 that had been "fixed".
+- **The lamp pillars.** The remaining half turn was decided by two things that
+  cannot move: the lamps flanking the abbey steps are *doodads*, so their world
+  positions are fixed whatever any rotation does, and the cobbled path is
+  painted into the terrain. Both say the entrance faces the path. Only `+180`
+  puts it there -- and the render then matches the reference photograph step
+  for step, arch, doors, steps and lamps.
+
+The lesson, which is now in `CLAUDE.md`: a movable thing checked against
+another movable thing proves nothing. Find something nailed down.
 
 ## 4.4: melee combat
 

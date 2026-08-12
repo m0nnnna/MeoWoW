@@ -24,7 +24,7 @@ use render::mesh::{BoneBuffer, Instance, InstanceBuffer, MeshRenderer};
 use render::{Gpu, TerrainRenderer, UploadedTexture};
 
 use crate::model::Draw;
-use crate::scene::{placement_position, placement_rotation};
+use crate::scene::{object_rotation, placement_position, placement_rotation};
 use crate::terrain::LoadedTerrain;
 
 /// Tiles kept beyond the load radius before being evicted.
@@ -344,7 +344,8 @@ impl World {
                 .or_default()
                 .push(Mat4::from_scale_rotation_translation(
                     Vec3::ONE,
-                    placement_rotation(placement.rotation),
+                    // A WMO, not an M2: a different quarter of a turn.
+                    object_rotation(placement.rotation),
                     position,
                 ));
         }

@@ -58,30 +58,54 @@ pub fn placement_position(raw: [f32; 3]) -> Vec3 {
     Vec3::new(MAP_CENTRE - raw[2], MAP_CENTRE - raw[0], raw[1])
 }
 
-/// Builds the rotation for a placement.
+/// Builds the rotation for a **doodad** placement -- an M2 on the terrain.
 ///
-/// Rotations are Euler degrees in the game's internal Y-up space. Yaw carries
-/// almost all of the meaning -- doodads are rarely tilted -- and it is offset
-/// by 90 degrees because the stored angle is measured from a different axis
-/// than the model's forward.
+/// Half a turn, for the same reason creatures need one: an M2's local forward
+/// is -X, so a model placed at a stored yaw points exactly backwards without
+/// it. See `world::set_entities`, which learned this from the player's own
+/// body once there was one to look at.
 ///
-/// **The sign of that offset was wrong, and it put every building in the world
-/// back to front.** It read `-90` on the assumption that an M2 faces +X; the
-/// model faces -X, the same fact that had every creature turned around (see
-/// `world::set_entities`). A symmetric doodad hides this perfectly and a tree
-/// hides it completely, which is why it survived: nothing in a forest looks
-/// wrong when the forest is mirrored.
+/// **The offset used to be a quarter turn, and that was wrong in a way no
+/// building could reveal.** `-90` shipped, `+90` replaced it, and both are 90
+/// degrees off: they put every fence in Elwynn *across* its own line instead
+/// of along it. Neither could be seen by looking at a church, because a
+/// quarter turn on a symmetric-ish building still shows you a wall.
 ///
-/// Northshire Abbey is what settled it. From the starting lawn, `-90` renders
-/// a blank wall of stained glass with no way in -- the apse, the far end of
-/// the building -- while `+90` renders the entrance, its steps and its
-/// portico, which is what a player standing there actually sees. A building
-/// with a door is an asymmetric reference, and it is the first one this
-/// renderer was pointed at.
+/// What measured it: a fence is a *run*, several copies laid end to end, and
+/// the run's direction comes from the placements' own positions with no
+/// rotation involved at all. Across three runs at different angles,
+/// `direction - yaw` is one constant and `direction + yaw` is not -- so the
+/// yaw is not mirrored, and the constant is zero modulo a half turn. The half
+/// turn itself is the -X forward above. See
+/// [`tests::a_fence_run_lies_along_its_stored_yaw`].
 pub fn placement_rotation(rotation: [f32; 3]) -> Quat {
-    Quat::from_rotation_z((rotation[1] + 90.0).to_radians())
+    Quat::from_rotation_z((rotation[1] + 180.0).to_radians())
         * Quat::from_rotation_y((-rotation[0]).to_radians())
         * Quat::from_rotation_x(rotation[2].to_radians())
+}
+
+/// Builds the rotation for a **world object** placement -- a WMO.
+///
+/// Identical to [`placement_rotation`], and kept as its own name because the
+/// two were briefly *not* identical and the reason that was wrong is worth
+/// keeping.
+///
+/// Northshire Abbey appeared to want a quarter turn where the fences wanted a
+/// half one, on the evidence that a quarter turn showed its portal from the
+/// starting lawn. It did -- but that only says the door faced the lawn *under
+/// that rotation*, not that the door belongs there. The building has four
+/// sides and every rotation shows a door to somebody.
+///
+/// What settles where the entrance really is: **the lamp pillars beside it.**
+/// They are doodads, so their world positions are fixed no matter what any
+/// rotation does, and the cobbled path -- painted into the terrain, equally
+/// unrotatable -- runs between them. Two references that cannot move say the
+/// entrance faces the path, and only a half turn puts it there.
+///
+/// The general shape of the mistake: a movable thing was checked against
+/// another movable thing. The fix was to find something nailed down.
+pub fn object_rotation(rotation: [f32; 3]) -> Quat {
+    placement_rotation(rotation)
 }
 
 fn transform(raw_position: [f32; 3], rotation: [f32; 3], scale: f32) -> Mat4 {
@@ -347,6 +371,48 @@ mod tests {
         assert!((turned - Vec3::Z).length() < 1e-5, "yaw tilted the model");
     }
 
+    /// The yaw offset, measured against real placements rather than chosen.
+    ///
+    /// A rotation cannot be judged by eye: a wrong offset looks right for
+    /// anything at zero or a half turn and wrong everywhere else, which is
+    /// how Northshire Abbey read correctly while every fence in Elwynn was
+    /// across its own line. Both `-90` and `+90` shipped, and both were the
+    /// same 90 degrees wrong in opposite directions.
+    ///
+    /// So this measures. A fence is a *run*: copies of one model laid end to
+    /// end along a straight line, and that line's direction comes from the
+    /// placements' own positions with no rotation involved at all. Three runs
+    /// of `ElwynnWoodFence01` in `Azeroth_32_48`, with their stored yaw and
+    /// the direction their pieces actually lie in:
+    ///
+    /// | stored yaw | run direction |
+    /// |---|---|
+    /// | -130.0 | 50.5 |
+    /// | -45.5 | 313.4 |
+    /// | -45.0 | 313.4 |
+    ///
+    /// `direction - yaw` is the same constant for all three and
+    /// `direction + yaw` is not, which is what rules out a *mirrored* yaw as
+    /// well as fixing the offset. The model is 4.3 units long in X against
+    /// 0.3 in Y, so its long axis is local X, and the constant is zero.
+    #[test]
+    fn a_fence_run_lies_along_its_stored_yaw() {
+        const RUNS: [(f32, f32); 3] = [(-130.0, 50.5), (-45.5, 313.4), (-45.0, 313.4)];
+        for (yaw, direction) in RUNS {
+            let along = placement_rotation([0.0, yaw, 0.0]) * Vec3::X;
+            let got = along.y.atan2(along.x).to_degrees();
+            // A run has no near end and no far end, so the comparison is
+            // modulo a half turn -- which is exactly why this test cannot
+            // settle the remaining 180 on its own. An asymmetric building
+            // does that; see `placement_rotation`.
+            let delta = (got - direction + 90.0).rem_euclid(180.0) - 90.0;
+            assert!(
+                delta.abs() < 3.0,
+                "stored yaw {yaw} put the fence at {got}, but its run lies at {direction}"
+            );
+        }
+    }
+
     /// Pins the yaw offset, including its sign.
     ///
     /// The sign is the whole point: this test previously asserted the opposite
@@ -357,13 +423,14 @@ mod tests {
     /// undone by accident.
     #[test]
     fn yaw_rotates_about_the_vertical_axis() {
-        // A stored yaw of 90 degrees plus the 90 degree offset is half a turn.
+        // A doodad takes a half turn, so a stored yaw of 90 puts +X onto -Y.
         let a = placement_rotation([0.0, 90.0, 0.0]) * Vec3::X;
-        assert!((a + Vec3::X).length() < 1e-5, "got {a:?}");
+        assert!((a + Vec3::Y).length() < 1e-5, "got {a:?}");
 
-        // And a further 90 degrees is another quarter turn, in the direction
-        // that makes the abbey face its own lawn.
-        let b = placement_rotation([0.0, 180.0, 0.0]) * Vec3::X;
+        // A world object takes the same half turn. They were briefly given
+        // different offsets on the strength of one building looking right
+        // from one angle; see `object_rotation`.
+        let b = object_rotation([0.0, 90.0, 0.0]) * Vec3::X;
         assert!((b + Vec3::Y).length() < 1e-4, "got {b:?}");
     }
 }
