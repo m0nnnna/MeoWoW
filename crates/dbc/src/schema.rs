@@ -573,6 +573,47 @@ pub fn float_band_id(params_id: u32, band: u32) -> u32 {
 }
 
 dbc_table! {
+    /// What a game object looks like: doors, chests, mailboxes, signposts,
+    /// campfires, and the ships and zeppelins the server sends every client.
+    ///
+    /// A different table from `CreatureDisplayInfo` and indexed by a different
+    /// update field, which matters more than it sounds: display 603 is a wolf in
+    /// one and an inn bench in the other, so a client that reads the wrong field
+    /// gets a plausible id and the wrong model. See
+    /// `update::fields::GAMEOBJECT_DISPLAY_ID` for how the right field was
+    /// found, and for the false positive that nearly passed.
+    ///
+    /// `model` may name an `.mdx` *or* a `.wmo` -- a mailbox is a small model
+    /// and a ship is a building -- so a caller must be prepared for both. The
+    /// renderer's path-keyed loader already is.
+    GameObjectDisplayInfo, GameObjectDisplayInfoRow,
+    path = r"DBFilesClient\GameObjectDisplayInfo.dbc", fields = 19, {
+        0 id: u32,
+        /// `.mdx` or `.wmo`, e.g. `World\Generic\Human\Passive Doodads\...`.
+        1 model: str,
+        /// Ten sound slots. Named for completeness; nothing here plays them.
+        2  sound_0: u32,
+        3  sound_1: u32,
+        4  sound_2: u32,
+        5  sound_3: u32,
+        6  sound_4: u32,
+        7  sound_5: u32,
+        8  sound_6: u32,
+        9  sound_7: u32,
+        10 sound_8: u32,
+        11 sound_9: u32,
+        /// The object's own extent, for hit-testing a click without loading it.
+        12 geo_box_min_x: f32,
+        13 geo_box_min_y: f32,
+        14 geo_box_min_z: f32,
+        15 geo_box_max_x: f32,
+        16 geo_box_max_y: f32,
+        17 geo_box_max_z: f32,
+        18 object_effect_package_id: u32,
+    }
+}
+
+dbc_table! {
     /// Names for animation ids. An M2 sequence stores only the numeric id, so
     /// this is the only way to know that sequence 0 is `Stand`.
     AnimationData, AnimationDataRow,

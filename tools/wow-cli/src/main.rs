@@ -187,6 +187,18 @@ enum Command {
         /// command like every other format here.
         #[arg(long)]
         units: Option<usize>,
+        /// After entering, print every replicated game object with its
+        /// position and every field it has set.
+        ///
+        /// Game objects -- doors, chests, mailboxes, signposts -- are created
+        /// and then dropped by this client, because `Entity::display_id` reads
+        /// only the *unit* display field. Which field carries a game object's
+        /// is not guessed at here: the printout is the raw material for the
+        /// same search that settled `PLAYER_BYTES`, and the answer is the field
+        /// whose value resolves to a real `GameObjectDisplayInfo` row for every
+        /// object rather than for some of them.
+        #[arg(long)]
+        objects: bool,
         /// After entering, find which update field carries the character's
         /// appearance by searching for the answer the character list gives.
         ///
@@ -431,6 +443,7 @@ fn main() -> Result<()> {
             face,
             stay,
             units,
+            objects,
             appearance,
             select,
             attack,
@@ -452,6 +465,7 @@ fn main() -> Result<()> {
                 face: *face,
                 stay: *stay,
                 units: *units,
+                objects: *objects,
                 appearance: *appearance,
                 select: *select,
                 attack: *attack,
@@ -579,6 +593,7 @@ struct WorldRequest<'a> {
     face: Option<f32>,
     stay: u64,
     units: Option<usize>,
+    objects: bool,
     appearance: bool,
     select: bool,
     attack: bool,
@@ -618,6 +633,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         face,
         stay,
         units,
+        objects,
         appearance,
         select,
         attack,
@@ -1095,6 +1111,10 @@ cast {spell_id} at {}",
             report_units(&state, character.guid, limit);
         }
 
+        if objects {
+            report_game_objects(&state);
+        }
+
         if appearance {
             report_appearance(&state, character);
         }
@@ -1447,6 +1467,38 @@ fn report_units(state: &world::WorldState, own_guid: u64, limit: usize) {
         "  power type: 0 mana, 1 rage, 2 focus, 3 energy, 6 runic power.\n  \
          A warrior reading anything but rage means the power array was indexed wrong."
     );
+}
+
+/// Prints every replicated game object, with its position and its set fields.
+///
+/// Deliberately raw. This command works without a game installation -- the
+/// protocol tools are useful on a machine that has no client data -- so it
+/// cannot resolve a display id against `GameObjectDisplayInfo` itself. What it
+/// can do is lay out the evidence: thirty-odd objects, each with a handful of
+/// fields, where exactly one field index will resolve for *all* of them.
+fn report_game_objects(state: &world::WorldState) {
+    let objects: Vec<&world::state::Entity> = state
+        .iter()
+        .filter(|entity| entity.object_type == world::ObjectType::GameObject)
+        .collect();
+    println!("
+{} game object(s):", objects.len());
+    for entity in &objects {
+        let position = entity
+            .position
+            .map(|p| format!("{:.1}, {:.1}, {:.1} facing {:.2}", p.x, p.y, p.z, p.orientation))
+            .unwrap_or_else(|| "no position".into());
+        println!("  {:#x}  {position}", entity.guid);
+        let fields: Vec<String> = entity
+            .fields
+            .iter()
+            .map(|(index, value)| format!("{index:#x}={value}"))
+            .collect();
+        println!("    {}", fields.join(" "));
+    }
+    if objects.is_empty() {
+        println!("  none in range -- stand somewhere with a door or a chest");
+    }
 }
 
 /// Finds which update field carries a player's appearance, by searching for an
@@ -3177,7 +3229,8 @@ fn dbc_rows(chain: &mut Chain, table: &str, limit: usize, ids: &[u32]) -> Result
         Light,
         LightParams,
         LightIntBand,
-        LightFloatBand
+        LightFloatBand,
+        GameObjectDisplayInfo
     )
     // `CharacterFacialHairStyles` is deliberately absent: it has no id column
     // at all -- race, gender and variation are its key -- so it cannot satisfy
@@ -3234,6 +3287,7 @@ fn dbc_check(chain: &mut Chain) -> Result<()> {
         LightParams,
         LightIntBand,
         LightFloatBand,
+        GameObjectDisplayInfo,
     );
     println!();
     if failures == 0 {

@@ -195,6 +195,13 @@ pub struct EntityPlacement {
     /// simply *moving*, and drawing the walk cycle for both makes the charge
     /// look like the model is being dragged.
     pub speed: f32,
+    /// What kind of thing this is.
+    ///
+    /// Decides which table the display id means: a unit's is a
+    /// `CreatureDisplayInfo` row and a game object's is a
+    /// `GameObjectDisplayInfo` row, and 603 is a wolf in one and an inn bench
+    /// in the other.
+    pub kind: ::world::ObjectType,
     /// How this instance is dressed, for a player character.
     ///
     /// `None` for everything else, which is nearly everything: a creature's
@@ -231,6 +238,10 @@ pub struct World {
     /// retries on every creature, which is the expensive failure repeated
     /// rather than reported.
     npc_looks_tried: bool,
+    /// Models for doors, chests and mailboxes. Read on first use for the same
+    /// reason the NPC tables are.
+    game_objects: Option<dbc::schema::GameObjectDisplayInfo>,
+    game_objects_tried: bool,
     /// Objects the server placed, as opposed to the ones the map files did.
     /// Owned by the world rather than a tile: they move, and they do not belong
     /// to the tile they happen to be standing on.
@@ -285,6 +296,8 @@ impl World {
             entity_cache: HashMap::new(),
             npc_looks: None,
             npc_looks_tried: false,
+            game_objects: None,
+            game_objects_tried: false,
             entities: Vec::new(),
             entity_bones: HashMap::new(),
             started: Instant::now(),
@@ -612,14 +625,24 @@ impl World {
     ) -> usize {
         // Keyed by look as well as display: see `EntityPlacement::look`.
         let mut looks: HashMap<u64, Option<std::rc::Rc<crate::character::Look>>> = HashMap::new();
+        let mut kinds: HashMap<u64, ::world::ObjectType> = HashMap::new();
         let mut grouped: HashMap<(u32, Motion, u64), Vec<Mat4>> = HashMap::new();
         for placement in placements {
             looks.insert(placement.look_key, placement.look.clone());
+            kinds.insert(
+                placement.look_key ^ game_object_key(placement.kind),
+                placement.kind,
+            );
             grouped
                 .entry((
                     placement.display_id,
                     Motion::from_speed(placement.speed),
-                    placement.look_key,
+                    // A game object shares the display-id space with creatures
+                    // and means something else by it, so it cannot share a
+                    // group with one. Folded into the look key rather than
+                    // widening every tuple: the key already exists to keep
+                    // things that look different apart.
+                    placement.look_key ^ game_object_key(placement.kind),
                 ))
                 .or_default()
                 .push(Mat4::from_scale_rotation_translation(
@@ -652,7 +675,9 @@ impl World {
         let mut wanted_bones: HashSet<(u32, Motion)> = HashSet::new();
         for ((display_id, motion, look_key), transforms) in grouped {
             let look = looks.get(&look_key).cloned().flatten();
-            let Some(model) = self.entity_model(gpu, meshes, chain, display_id, look_key, look.as_deref())
+            let kind = kinds.get(&look_key).copied().unwrap_or(::world::ObjectType::Unit);
+            let Some(model) =
+                self.entity_model(gpu, meshes, chain, display_id, look_key, look.as_deref(), kind)
             else {
                 undrawable += transforms.len();
                 continue;
@@ -738,9 +763,20 @@ impl World {
         display_id: u32,
         look_key: u64,
         look: Option<&crate::character::Look>,
+        kind: ::world::ObjectType,
     ) -> Option<Rc<CachedModel>> {
         if let Some(cached) = self.entity_cache.get(&(display_id, look_key)) {
             return cached.clone();
+        }
+
+        // A game object resolves to a *path*, which the tile loader's cache
+        // already keys by -- and that cache understands both `.mdx` and `.wmo`,
+        // which matters because a mailbox is a model and a ship is a building.
+        // So game objects reuse it wholesale rather than growing a second
+        // model cache that would load the abbey's benches once per bench.
+        if kind == ::world::ObjectType::GameObject {
+            let path = self.game_object_path(chain, display_id)?;
+            return self.model(gpu, meshes, chain, &path);
         }
 
         // A humanoid NPC's body texture lives in `CreatureDisplayInfoExtra` and
@@ -801,6 +837,33 @@ impl World {
         entry
     }
 
+    /// Which model a game object wears, loading the table on first use.
+    fn game_object_path(&mut self, chain: &mut Chain, display_id: u32) -> Option<String> {
+        use dbc::schema::GameObjectDisplayInfo;
+
+        if !self.game_objects_tried {
+            self.game_objects_tried = true;
+            self.game_objects = chain
+                .read(GameObjectDisplayInfo::PATH)
+                .ok()
+                .and_then(|bytes| GameObjectDisplayInfo::parse(&bytes).ok());
+        }
+        let path = self
+            .game_objects
+            .as_ref()?
+            .iter()
+            .find(|row| row.id() == display_id)
+            .map(|row| row.model().to_string())?;
+        if path.is_empty() {
+            tracing::debug!("game object display {display_id} names no model");
+            return None;
+        }
+        tracing::debug!("game object display {display_id} -> {path}");
+        // The table names `.mdx` even where the archive ships `.m2`; the model
+        // loader already rewrites that, and a `.wmo` passes through untouched.
+        Some(path)
+    }
+
     /// How a humanoid NPC is dressed, loading the tables on first use.
     fn npc_look(
         &mut self,
@@ -821,6 +884,18 @@ impl World {
             );
         }
         self.npc_looks.as_ref()?.look(display_id)
+    }
+}
+
+/// Keeps game objects out of creatures' half of the display-id space.
+///
+/// An arbitrary constant xored into the cache key: display 603 is a wolf to a
+/// unit and an inn bench to a game object, and without this the first of the
+/// two loaded would answer for both.
+fn game_object_key(kind: ::world::ObjectType) -> u64 {
+    match kind {
+        ::world::ObjectType::GameObject => 0x9111_0b1e_0000_0000,
+        _ => 0,
     }
 }
 

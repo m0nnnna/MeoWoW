@@ -59,8 +59,20 @@ impl Entity {
         self.fields.get(crate::update::fields::UNIT_LEVEL)
     }
 
+    /// Which model this object wears.
+    ///
+    /// The field depends on what the object *is*, and the two tables it indexes
+    /// are unrelated: a unit's display id is a `CreatureDisplayInfo` row and a
+    /// game object's is a `GameObjectDisplayInfo` row. Display 603 is a wolf in
+    /// one and an inn bench in the other, so a caller must know which it holds
+    /// -- see [`Entity::object_type`], which it already has.
     pub fn display_id(&self) -> Option<u32> {
-        self.fields.get(crate::update::fields::UNIT_DISPLAY_ID)
+        match self.object_type {
+            ObjectType::GameObject => self
+                .fields
+                .get(crate::update::fields::GAMEOBJECT_DISPLAY_ID),
+            _ => self.fields.get(crate::update::fields::UNIT_DISPLAY_ID),
+        }
     }
 
     pub fn health(&self) -> Option<u32> {

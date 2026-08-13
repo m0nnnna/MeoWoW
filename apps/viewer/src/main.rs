@@ -333,6 +333,7 @@ fn build_live_scene(
                         orientation: entity.orientation,
                         scale: entity.scale,
                         speed: entity.speed,
+                        kind: entity.kind,
                         look,
                         look_key,
                     }
@@ -2093,6 +2094,7 @@ impl App {
                                     orientation: entity.orientation + flip,
                                     scale: entity.scale,
                                     speed: entity.speed,
+                                    kind: entity.kind,
                                     look,
                                     look_key,
                                 }

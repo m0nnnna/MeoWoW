@@ -884,3 +884,47 @@ evidence about the renderer the moment either drifted.
 Still to do: a skybox proper (`LightSkybox` names the models), weather, the
 several sky bands that layer into a gradient rather than one flat colour, and
 the interior lights that matter once a building has an inside.
+
+### Game objects
+
+Doors, chests, mailboxes, signposts, benches, and the ships and zeppelins the
+server sends every client regardless of where it is. Thirty-two of them arrive
+in Northshire's login burst; until now every one was created in world state and
+then dropped, because `Entity::display_id` read the *unit* display field and
+nothing else.
+
+**The field was found by search, and the search caught a false positive worth
+recording.** Resolving every set field of all thirty-two objects against
+`GameObjectDisplayInfo` gives *two* fields that hit 100%: `0x08` and `0x02`. The
+table has 3,790 rows spread over ids up to 9,624, so at 39% density "is this a
+valid id" is nearly free -- the same trap `Spell.dbc`'s duration column set.
+
+What separates them is not validity but **variation**:
+
+| field | distinct values | resolves to |
+|---|---|---|
+| `0x02` | 1 (always 33) | `PowderKeg01.mdx`, thirty-two times |
+| `0x08` | 7 | inn benches x16, elevators, a zeppelin, ships |
+
+Thirty-two identical powder kegs is not Northshire. Sixteen inn benches at the
+abbey the player is standing in, is. `0x02` is the object's type mask and its
+validity was an accident of density.
+
+**A display id means different things to different objects.** 603 is a wolf in
+`CreatureDisplayInfo` and an inn bench in `GameObjectDisplayInfo`, so
+`Entity::display_id` now branches on `object_type` -- the caller already knows
+which kind it holds, and a client that reads the wrong field gets a plausible id
+and the wrong model. For the same reason the renderer's entity cache xors a
+constant into the key for game objects: without it, whichever of the two loaded
+first would answer for both.
+
+**Game objects reuse the tile loader's path-keyed cache rather than the
+creature one.** `GameObjectDisplayInfo.model` names an `.mdx` *or* a `.wmo` -- a
+mailbox is a model and a ship is a building -- and that cache already handles
+both and already deduplicates: Northshire's sixteen benches load one model
+between them.
+
+Their rotation is the orientation from the position block, which is right for
+anything standing on level ground. Game objects also carry a packed quaternion
+for genuinely tilted things, which is read past and not applied; a leaning
+signpost is the visible symptom, and there is not one in Northshire to look at.

@@ -929,6 +929,25 @@ pub mod fields {
     pub const UNIT_DISPLAY_ID: u16 = 0x43;
     pub const UNIT_NATIVE_DISPLAY_ID: u16 = 0x44;
 
+    /// Which model a game object wears -- a row in `GameObjectDisplayInfo`,
+    /// which is a different table from the one units use.
+    ///
+    /// **Found by search, and the search caught a false positive worth
+    /// recording.** Thirty-two game objects arrive in Northshire's login burst;
+    /// resolving every set field of every one of them against
+    /// `GameObjectDisplayInfo` gives *two* fields that hit 100%: this one and
+    /// `0x02`. The table has 3,790 rows spread over ids up to 9,624, so a 39%
+    /// density makes "is it a valid id" nearly free -- exactly the trap
+    /// `CLAUDE.md` describes for `Spell.dbc`'s duration column.
+    ///
+    /// What separates them is not validity but *variation*. `0x02` is the
+    /// constant 33 on every object -- it is the type mask -- and resolves to
+    /// one model, so all thirty-two would be identical powder kegs. This field
+    /// takes seven distinct values resolving to inn benches, elevators, ships
+    /// and a zeppelin, and the sixteen benches sit at the abbey the player is
+    /// standing in.
+    pub const GAMEOBJECT_DISPLAY_ID: u16 = 0x08;
+
     /// Skin, face, hairstyle and hair colour, one byte each, low byte first.
     ///
     /// This is how *another* player's appearance arrives: a player's display id
