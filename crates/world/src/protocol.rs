@@ -180,6 +180,19 @@ impl<'a> Reader<'a> {
         self.data.len() - self.at
     }
 
+    /// Takes everything left, for the tail of a packet whose fields are not
+    /// confirmed.
+    ///
+    /// Deliberately *takes* rather than peeks, so [`Reader::finish`] still
+    /// passes: a parser that keeps an unread tail is making a claim -- "I know
+    /// this much and no more" -- and one that silently ignored the rest would
+    /// be making no claim at all. Print the body, do not drop it.
+    pub fn rest(&mut self) -> &'a [u8] {
+        let from = self.at;
+        self.at = self.data.len();
+        &self.data[from..]
+    }
+
     /// Asserts the body was consumed exactly.
     ///
     /// This is the check that catches a field of the wrong width: the values

@@ -448,6 +448,11 @@ pub struct Replication {
     /// health arrives separately, as an ordinary field update, and is already
     /// folded into the entity by the time this is read.
     pub swings: Vec<crate::combat::MeleeSwing>,
+    /// Spell damage that landed this batch, the other half of the combat log.
+    /// Returned rather than stored for the same reason swings are: a hit is an
+    /// event, and what it did to a unit's health arrives separately as a field
+    /// update that is already folded in by the time this is read.
+    pub spell_damage: Vec<crate::combat::SpellDamage>,
     /// `SMSG_POWER_UPDATE`s folded into an entity's fields this batch.
     pub power_updates: usize,
     /// Threat lists that arrived this batch. Returned rather than stored: no
@@ -1028,6 +1033,16 @@ impl WorldState {
                                 Ok(packet.body.clone()),
                             )),
                         },
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::SPELL_NON_MELEE_DAMAGE_LOG => {
+                    match crate::combat::parse_spell_damage(&packet.body) {
+                        Ok(hit) => report.spell_damage.push(hit),
                         Err(error) => report.failures.push((
                             packet.opcode,
                             error,

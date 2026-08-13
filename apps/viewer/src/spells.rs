@@ -248,6 +248,19 @@ impl Spellbook {
         }
     }
 
+    /// The spell's real name, or `None` when the book has never heard of it.
+    ///
+    /// Distinct from [`Spellbook::name`], which always produces something to
+    /// put on a bar. A combat log needs the difference: `Wrath` is a name and
+    /// `#5176` is an admission, and the log says `spell 5176` rather than
+    /// dressing the admission up as one.
+    pub fn known_name(&self, spell: u32) -> Option<String> {
+        self.known
+            .get(&spell)
+            .map(|info| info.name.clone())
+            .filter(|name| !name.is_empty())
+    }
+
     /// The rank shown on a tooltip, e.g. `Rank 2`. Empty for the many spells
     /// -- most of them -- that have none.
     pub fn rank(&self, spell: u32) -> String {

@@ -208,6 +208,16 @@ enum Command {
         /// wrong face.
         #[arg(long)]
         appearance: bool,
+        /// Select the nearest unit whose name contains this, rather than the
+        /// nearest unit of any kind.
+        ///
+        /// The nearest thing to a character is very often a friendly quest
+        /// giver, and a damage spell aimed at one is refused with "cannot be
+        /// cast on that target" -- which looks exactly like a malformed cast.
+        /// Naming the target makes a capture rig reproducible. Implies
+        /// `--names`, since a name has to arrive before it can be matched.
+        #[arg(long)]
+        target: Option<String>,
         /// After entering, select the nearest unit and tell the server.
         ///
         /// Nothing is sent back, so this proves only that the packet is not
@@ -449,6 +459,7 @@ fn main() -> Result<()> {
             stay,
             units,
             objects,
+            target,
             appearance,
             select,
             attack,
@@ -471,6 +482,7 @@ fn main() -> Result<()> {
                 stay: *stay,
                 units: *units,
                 objects: *objects,
+                target: target.as_deref(),
                 appearance: *appearance,
                 select: *select,
                 attack: *attack,
@@ -599,6 +611,7 @@ struct WorldRequest<'a> {
     stay: u64,
     units: Option<usize>,
     objects: bool,
+    target: Option<&'a str>,
     appearance: bool,
     select: bool,
     attack: bool,
@@ -639,6 +652,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         stay,
         units,
         objects,
+        target,
         appearance,
         select,
         attack,
@@ -869,7 +883,41 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
             );
         }
 
-        if select {
+        // A named target, resolved through the same name table the unit frames
+        // read. Selected before `--cast` and `--attack` so both act on it.
+        let mut chosen = None;
+        if let Some(wanted) = target {
+            // Names first: a target is matched by name, and until the queries
+            // come back every unit is a bare guid. This is why `--target`
+            // implies `--names` rather than merely recommending it -- the first
+            // version matched against numbers and silently found nothing.
+            println!("
+resolving names to find {wanted:?}:");
+            resolve_names(&mut connection, &mut state, 2)?;
+            let mut candidates = nearest_ordered(&state, character.guid);
+            candidates.retain(|(_, entity)| {
+                unit_label(&state, entity)
+                    .to_lowercase()
+                    .contains(&wanted.to_lowercase())
+            });
+            match candidates.first() {
+                Some((distance, entity)) => {
+                    connection.set_selection(entity.guid)?;
+                    connection.drain(std::time::Duration::from_millis(500), 64)?;
+                    println!(
+                        "
+targeting {} ({:#x}), {distance:.1} units away",
+                        unit_label(&state, entity),
+                        entity.guid
+                    );
+                    chosen = Some(entity.guid);
+                }
+                None => println!("
+nothing replicated matches {wanted:?}"),
+            }
+        }
+
+        if select && chosen.is_none() {
             match nearest_unit(&state, character.guid) {
                 Some((guid, distance)) => {
                     connection.set_selection(guid)?;
@@ -1056,44 +1104,108 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
             let target = if cast_self {
                 None
             } else {
-                nearest_unit(&state, character.guid).map(|(guid, _)| guid)
+                // A `--target` name wins over "nearest", which is very often a
+                // friendly standing closer than anything worth casting at.
+                chosen.or_else(|| nearest_unit(&state, character.guid).map(|(guid, _)| guid))
             };
-            // The server decides whether a spell has a legal victim, so tell
-            // it what is selected before asking it to cast at it.
-            if let Some(guid) = target {
-                connection.set_selection(guid)?;
-            }
-            connection.cast_spell(spell_id, target)?;
-            println!(
-                "
-cast {spell_id} at {}",
-                match target {
-                    Some(guid) => format!("{guid:#x}"),
-                    None => "yourself".into(),
+
+            // Up to four attempts, re-facing before each. **A wandering target
+            // is the whole reason this is a loop.** The same cast at the same
+            // creature was refused `0x61` at 28 units and accepted at 44 -- not
+            // because of range, but because the creature had turned a corner
+            // between the facing packet and the cast. `--attack` learned this
+            // first and re-swings for the same reason; one attempt makes a
+            // working command look broken half the time, which is worse than
+            // failing every time.
+            for attempt in 1..=4 {
+                if let Some(guid) = target {
+                    // Tell the server what is selected before asking it to cast
+                    // at it: the server decides whether a spell has a legal
+                    // victim.
+                    connection.set_selection(guid)?;
+                    // And turn to face it. A spell aimed at something behind
+                    // the caster is refused with an empty body -- the same
+                    // shape that made a melee swing look like a wrong opcode
+                    // until the approach loop turned first.
+                    if let (Some(here), Some(there)) = (
+                        state.get(character.guid).and_then(|e| e.position),
+                        state.get(guid).and_then(|e| e.position),
+                    ) {
+                        let heading = (there.y - here.y).atan2(there.x - here.x);
+                        connection.set_facing(character.guid, here, heading)?;
+                        // Half a second: a packet sent immediately before the
+                        // next one is often not processed first.
+                        let settle =
+                            connection.drain(std::time::Duration::from_millis(500), 64)?;
+                        state.replicate(&settle, None);
+                    }
                 }
-            );
-            // Half a second, because a cast that is refused answers quickly
-            // and a cast that is accepted answers with the world changing.
-            let batch = connection.drain(std::time::Duration::from_millis(900), 128)?;
-            let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
-            for packet in &batch {
-                *seen.entry(packet.opcode).or_default() += 1;
-            }
-            let report = state.replicate(&batch, None);
-            for failure in &report.cast_failures {
+                connection.cast_spell(spell_id, target)?;
                 println!(
-                    "  refused: {} (spell {})",
-                    world::spell::describe_cast_failure(failure.reason),
-                    failure.spell_id
+                    "
+cast {spell_id} at {} (attempt {attempt})",
+                    match target {
+                        Some(guid) => format!("{guid:#x}"),
+                        None => "yourself".into(),
+                    }
                 );
-            }
-            for message in &report.chat {
-                println!("  {}", describe_chat(message, &state));
-            }
-            if report.cast_failures.is_empty() {
-                println!("  not refused. What arrived:");
-                for (opcode, count) in &seen {
-                    println!("    {:<32} x{count}", world::opcode::describe(*opcode));
+
+                let batch = connection.drain(std::time::Duration::from_millis(900), 128)?;
+                // Into the capture as well as the tally. Counting an opcode
+                // says a shape arrived; writing a parser needs the shape. This
+                // drain is where a spell's own reply lands -- the damage log,
+                // the threat update -- and it was counted and dropped, which is
+                // the exact failure `CLAUDE.md` records for
+                // SMSG_ATTACKERSTATEUPDATE: the one packet that could answer
+                // the question, seen and lost.
+                if let Some(capture) = capture.as_mut() {
+                    capture.record(&batch)?;
+                }
+                let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+                for packet in &batch {
+                    *seen.entry(packet.opcode).or_default() += 1;
+                }
+                let report = state.replicate(&batch, None);
+                for failure in &report.cast_failures {
+                    println!(
+                        "  refused: {} (spell {})",
+                        world::spell::describe_cast_failure(failure.reason),
+                        failure.spell_id
+                    );
+                }
+                for message in &report.chat {
+                    println!("  {}", describe_chat(message, &state));
+                }
+                // The whole point of the cast: what it did. Printed as the
+                // sentence the interface would show, built by the same
+                // function, so the two cannot describe one fight differently.
+                for hit in &report.spell_damage {
+                    println!(
+                        "  {}",
+                        world::combat::describe_spell_damage(
+                            hit,
+                            character.guid,
+                            |guid| unit_label_for(&state, guid),
+                            |_| None,
+                        )
+                    );
+                    println!(
+                        "    school {:#x}, {} unread trailing byte(s){}",
+                        hit.school_mask,
+                        hit.trailing.len(),
+                        if hit.trailing.iter().any(|b| *b != 0) {
+                            format!(": {:02x?} -- NOT all zero, worth a look", hit.trailing)
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
+                if report.cast_failures.is_empty() {
+                    println!("  not refused. What arrived:");
+                    for (opcode, count) in &seen {
+                        println!("    {:<32} x{count}", world::opcode::describe(*opcode));
+                    }
+                    break;
                 }
             }
         }
@@ -1616,6 +1728,14 @@ fn report_appearance(state: &world::WorldState, character: &world::Character) {
             ),
             None => println!("    no appearance could be read -- this player renders white"),
         }
+    }
+}
+
+/// What to call a guid, for a line of combat log.
+fn unit_label_for(state: &world::WorldState, guid: u64) -> String {
+    match state.get(guid) {
+        Some(entity) => unit_label(state, entity),
+        None => format!("{guid:#x}"),
     }
 }
 

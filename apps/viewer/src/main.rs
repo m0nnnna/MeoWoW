@@ -1579,6 +1579,7 @@ fn player_look(
 enum Line {
     Chat(::world::ChatMessage),
     Swing(::world::combat::MeleeSwing),
+    SpellHit(::world::combat::SpellDamage),
 }
 
 /// A damage number in flight, from the swing that spawned it to fully faded.
@@ -2687,6 +2688,37 @@ impl App {
                     }
                     self.chat.push(Line::Swing(swing.clone()));
                 }
+                // Spell damage, through the same two outlets as a swing: a
+                // line in the scrollback and a number above whoever was hit.
+                // Kept beside the melee loop rather than merged into it --
+                // they carry different packets -- but producing the same
+                // outputs, because a fight should read as one fight.
+                for hit in &report.spell_damage {
+                    tracing::debug!(
+                        "combat: {}",
+                        hud::spell_combat_entry(hit, live.guid, &live.state, Some(&self.spells))
+                            .rendered()
+                    );
+                    if let Some(pos) = live
+                        .state
+                        .get(hit.target)
+                        .and_then(|entity| entity.interpolated_position(Instant::now()))
+                    {
+                        self.combat_text.push(PendingCombatText {
+                            world_pos: glam::Vec3::new(pos.x, pos.y, pos.z),
+                            text: hit.damage.to_string(),
+                            // No critical flag is read: whatever marks one
+                            // lives in the twenty trailing bytes that were all
+                            // zero in the only capture, and a number coloured
+                            // "critical" on a guess is exactly the kind of
+                            // confident wrongness `extra_amount` is kept unnamed
+                            // to avoid.
+                            kind: ui::CombatTextKind::Damage,
+                            spawned: Instant::now(),
+                        });
+                    }
+                    self.chat.push(Line::SpellHit(hit.clone()));
+                }
                 for message in &report.chat {
                     if message.sender != 0 && message.sender_name.is_none() {
                         unknown_speakers.push(message.sender);
@@ -2874,6 +2906,9 @@ impl App {
                 .map(|line| match line {
                     Line::Chat(message) => hud::chat_entry(message, &live.state),
                     Line::Swing(swing) => hud::combat_entry(swing, live.guid, &live.state),
+                    Line::SpellHit(hit) => {
+                        hud::spell_combat_entry(hit, live.guid, &live.state, Some(&self.spells))
+                    }
                 })
                 .collect(),
             None => Vec::new(),

@@ -236,6 +236,105 @@ pub fn parse_attack_stop(body: &[u8]) -> Result<AttackStop, Error> {
         trailing,
     })
 }
+/// Damage from a spell, as `SMSG_SPELLNONMELEEDAMAGELOG` reports it.
+///
+/// The other half of the combat log. A melee swing arrives as
+/// [`MeleeSwing`]; everything cast arrives here, and until now this client
+/// counted the opcode and dropped it.
+///
+/// **Captured before it was parsed.** `wow-cli world --enter Testdruid
+/// --target Nightsaber --cast 5176` puts a Wrath into a Young Nightsaber and
+/// records the reply, and the 46-byte body it produced anchors every field
+/// named below: the target guid matches the creature that was selected, the
+/// caster guid matches the druid, the spell id reads 5176, the damage reads 17
+/// on a level-one Wrath, and the school reads 8 -- Wrath is a Nature spell.
+/// Five independent agreements in one packet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpellDamage {
+    /// Who was hit.
+    pub target: u64,
+    /// Who cast it.
+    pub caster: u64,
+    pub spell_id: u32,
+    pub damage: u32,
+    /// Damage past what the target had left. Zero in the capture, which is
+    /// consistent with a 42-health creature taking 17 -- consistent, not
+    /// confirmed.
+    pub overkill: u32,
+    /// Bitmask: `8` is Nature, which is what the captured Wrath reported.
+    pub school_mask: u32,
+    /// **Everything after the school, unread.** Twenty bytes, all zero in the
+    /// only capture on hand.
+    ///
+    /// They are widely said to be absorb, resist, a periodic flag, block and
+    /// hit info, and that may well be right -- but a hit that was partly
+    /// resisted is exactly the packet nobody here has captured, and a wrong
+    /// *name* on a combat log misexplains a fight to whoever reads it next.
+    /// The same restraint `MeleeSwing::extra_amount` and
+    /// `describe_cast_failure` already apply. Kept whole rather than skipped so
+    /// the shape survives the refusal: the first non-zero one settles it.
+    pub trailing: Vec<u8>,
+}
+
+impl SpellDamage {
+    /// Whether this killed the target outright.
+    pub fn overkilled(&self) -> bool {
+        self.overkill > 0
+    }
+}
+
+pub fn parse_spell_damage(body: &[u8]) -> Result<SpellDamage, Error> {
+    let mut r = Reader::new(body, "SMSG_SPELLNONMELEEDAMAGELOG");
+    let target = crate::update::read_packed_guid(&mut r)?;
+    let caster = crate::update::read_packed_guid(&mut r)?;
+    let spell_id = r.u32()?;
+    let damage = r.u32()?;
+    let overkill = r.u32()?;
+    let school_mask = r.u32()?;
+    let trailing = r.rest().to_vec();
+    Ok(SpellDamage {
+        target,
+        caster,
+        spell_id,
+        damage,
+        overkill,
+        school_mask,
+        trailing,
+    })
+}
+
+/// One line of combat log for a spell that landed.
+///
+/// Deliberately the same shape as [`describe_swing`]: a reader should not be
+/// able to tell from the sentence which packet it came from, only what
+/// happened. The spell is named by id here because naming it needs
+/// `Spell.dbc`, which this crate does not read -- the interface substitutes a
+/// name when it has one.
+pub fn describe_spell_damage(
+    hit: &SpellDamage,
+    own: u64,
+    name_of: impl Fn(u64) -> String,
+    spell_name: impl Fn(u32) -> Option<String>,
+) -> String {
+    let who = if hit.caster == own {
+        "You".to_string()
+    } else {
+        name_of(hit.caster)
+    };
+    let verb = if hit.caster == own { "hit" } else { "hits" };
+    let whom = if hit.target == own {
+        "you".to_string()
+    } else {
+        name_of(hit.target)
+    };
+    let spell = spell_name(hit.spell_id).unwrap_or_else(|| format!("spell {}", hit.spell_id));
+    let mut line = format!("{who} {verb} {whom} with {spell} for {}.", hit.damage);
+    if hit.overkilled() {
+        line.push_str(" Killing blow.");
+    }
+    line
+}
+
 
 /// One unit's threat list, from `SMSG_THREAT_UPDATE`.
 ///
@@ -318,6 +417,75 @@ pub fn describe_swing(swing: &MeleeSwing, own: u64, name_of: impl Fn(u64) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact 46 bytes `wow1.nekos.farm` sent when a level-one druid put a
+    /// Wrath into a Young Nightsaber.
+    ///
+    /// Five anchors in one packet, which is what makes this a measurement
+    /// rather than a layout that happens to parse: the target guid is the
+    /// creature that was selected, the caster guid is the druid, the spell id
+    /// is the one that was cast, the damage is right for a rank-one Wrath, and
+    /// the school is Nature -- which is Wrath's school and nothing else's.
+    const WRATH_HIT: [u8; 46] = [
+        0xdf, 0x11, 0xc1, 0x06, 0xef, 0x07, 0x30, 0xf1, // target, packed
+        0x01, 0x33, // caster, packed
+        0x38, 0x14, 0x00, 0x00, // spell 5176
+        0x11, 0x00, 0x00, 0x00, // 17 damage
+        0x00, 0x00, 0x00, 0x00, // no overkill
+        0x08, 0x00, 0x00, 0x00, // school 8, Nature
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn a_captured_spell_hit_decodes_to_what_was_cast() {
+        let hit = parse_spell_damage(&WRATH_HIT).expect("captured live");
+        assert_eq!(hit.target, 0xf130_0007_ef06_c111, "the nightsaber");
+        assert_eq!(hit.caster, 0x33, "the druid");
+        assert_eq!(hit.spell_id, 5176, "Wrath");
+        assert_eq!(hit.damage, 17);
+        assert_eq!(hit.overkill, 0);
+        assert_eq!(hit.school_mask, 8, "Nature");
+        assert!(!hit.overkilled());
+        // Everything past the school is kept rather than skipped, so the first
+        // non-zero one settles what it is.
+        assert_eq!(hit.trailing.len(), 20);
+        assert!(hit.trailing.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn a_truncated_spell_hit_is_refused() {
+        assert!(parse_spell_damage(&WRATH_HIT[..12]).is_err());
+    }
+
+    /// A spell line must read like a swing line: the reader should not be able
+    /// to tell which packet it came from, only what happened.
+    #[test]
+    fn a_spell_hit_reads_as_a_sentence() {
+        let hit = parse_spell_damage(&WRATH_HIT).unwrap();
+        let line = describe_spell_damage(&hit, 0x33, |_| "Young Nightsaber".into(), |id| {
+            (id == 5176).then(|| "Wrath".to_string())
+        });
+        assert_eq!(line, "You hit Young Nightsaber with Wrath for 17.");
+
+        // Seen from the other end, and with no spell name available.
+        let line = describe_spell_damage(&hit, 0xf130_0007_ef06_c111, |guid| {
+            if guid == 0x33 { "Testdruid".into() } else { "you".into() }
+        }, |_| None);
+        assert_eq!(line, "Testdruid hits you with spell 5176 for 17.");
+    }
+
+    /// Overkill is what turns a hit into a killing blow, and the log has to say
+    /// so -- the melee half already does.
+    #[test]
+    fn a_killing_spell_says_so() {
+        let mut body = WRATH_HIT;
+        body[18] = 3; // overkill
+        let hit = parse_spell_damage(&body).unwrap();
+        assert!(hit.overkilled());
+        let line = describe_spell_damage(&hit, 0x33, |_| "Young Nightsaber".into(), |_| None);
+        assert!(line.ends_with("Killing blow."), "got {line}");
+    }
 
     /// The character's guid in the capture, and the wolf's.
     const ME: u64 = 0x32;

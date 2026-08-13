@@ -576,3 +576,63 @@ consumes them until movement prediction exists.
 
 Interpreting the update fields beyond the handful named in `update.rs`, and
 `SMSG_MONSTER_MOVE`, whose spline payload is skipped rather than followed.
+
+## Spell damage
+
+`SMSG_SPELLNONMELEEDAMAGELOG` (`0x0250`) is the other half of the combat log.
+Melee arrives as `SMSG_ATTACKERSTATEUPDATE`; everything cast arrives here, and
+until now this client counted the opcode and dropped it.
+
+**Captured before it was parsed**, which is the rule this project adopted after
+`SMSG_SPELL_START`. A level-one druid put a Wrath into a Young Nightsaber:
+
+```
+wow-cli world <host> --user <acct> --enter Testdruid \
+  --target "Nightsaber" --cast 5176 --stay 8 --capture wrath.txt
+```
+
+The 46-byte body anchors five fields at once, which is what makes it a
+measurement rather than a layout that happens to parse:
+
+| field | value | why it is not a guess |
+|---|---|---|
+| target guid | `0xf1300007ef06c111` | the creature that was selected |
+| caster guid | `0x33` | the druid casting |
+| spell id | 5176 | the spell that was asked for |
+| damage | 17 | right for a rank-one Wrath |
+| school | 8 | Nature, and Wrath is a Nature spell |
+
+**The twenty bytes after the school are kept and not named.** They are all zero
+in the only capture. They are widely said to be absorb, resist, a periodic flag,
+block and hit info, and that may be right -- but a partly resisted hit is
+exactly the packet nobody here has captured, and a wrong *name* on a combat log
+misexplains a fight to whoever reads it next. `Reader::rest` takes them so
+`finish` still asserts the body was consumed exactly: a parser that ignored the
+tail would be making no claim at all, where this one claims "I know this much
+and no more". The first non-zero one settles it.
+
+For the same reason no critical flag is read, and a spell number is never
+coloured as a critical: whatever marks one lives in those bytes.
+
+### Two things the rig taught
+
+**The nearest unit is usually the wrong one.** `--select` picks the closest
+thing, which next to a starting character is a friendly quest giver, and a
+damage spell aimed at one is refused with "cannot be cast on that target" --
+indistinguishable from a malformed cast. `--target <name>` picks by name
+instead, resolving names first, because until the queries come back every unit
+is a bare guid.
+
+**A cast at a wandering creature has to be retried.** The same spell at the same
+creature was refused `0x61` at 22 units and accepted at 44 -- so not range, and
+not facing either, since the client turns first. Line of sight is what changed:
+the creature moved out from behind a tree. `--attack` learned the same lesson
+about swings and re-swings until they land; `--cast` now re-casts up to four
+times, re-facing before each. It is still not reliable, because the caster
+never *moves* -- the approach loop `--attack` has is what would fix it, and
+that is worth doing before the next capture of this shape.
+
+**The cast's own drain now feeds `--capture`.** It was being counted and
+dropped, which is exactly the failure recorded for `SMSG_ATTACKERSTATEUPDATE`:
+the one packet that could answer the question, seen and lost. A spell's reply --
+the damage log, the threat update -- lands in that drain and nowhere else.

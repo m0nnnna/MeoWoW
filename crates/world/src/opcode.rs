@@ -130,6 +130,9 @@ pub mod server {
     /// [`crate::update::PowerUpdate`].
     pub const POWER_UPDATE: u16 = 0x0480;
     /// Who is on a unit's threat list. See [`crate::combat::ThreatUpdate`].
+    /// Damage from a spell rather than a swing. Captured from a Wrath cast at
+    /// a Young Nightsaber; see `combat::parse_spell_damage`.
+    pub const SPELL_NON_MELEE_DAMAGE_LOG: u16 = 0x0250;
     pub const THREAT_UPDATE: u16 = 0x0483;
 
     /// The same body as [`MESSAGECHAT`], sent for a GM's lines.
@@ -178,6 +181,7 @@ pub fn describe(opcode: u16) -> String {
         server::ATTACK_SWING_REFUSED_A => "SMSG_ATTACKSWING_REFUSED(0x0145)",
         server::ATTACK_SWING_REFUSED_B => "SMSG_ATTACKSWING_REFUSED(0x0146)",
         server::POWER_UPDATE => "SMSG_POWER_UPDATE",
+        server::SPELL_NON_MELEE_DAMAGE_LOG => "SMSG_SPELLNONMELEEDAMAGELOG",
         server::THREAT_UPDATE => "SMSG_THREAT_UPDATE",
         server::GM_MESSAGECHAT => "SMSG_GM_MESSAGECHAT",
         other => return format!("opcode {other:#06x}"),

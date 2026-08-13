@@ -127,6 +127,37 @@ pub fn combat_entry(
     }
 }
 
+/// The same, for a spell that landed.
+///
+/// Its own function rather than a branch inside [`combat_entry`] because the
+/// two take different packets -- but they produce the same *kind* of line on
+/// purpose: a reader should learn what happened, not which opcode carried it.
+///
+/// The spell is named from `Spell.dbc` when the spellbook has been read, and
+/// falls back to `spell 5176` when it has not. A number nobody can check is
+/// worse than a blank, and an id is at least checkable.
+pub fn spell_combat_entry(
+    hit: &::world::combat::SpellDamage,
+    own: u64,
+    state: &::world::WorldState,
+    spells: Option<&crate::spells::Spellbook>,
+) -> ui::ChatEntry {
+    ui::ChatEntry {
+        kind: ui::ChatKind::Combat,
+        who: None,
+        text: ::world::combat::describe_spell_damage(
+            hit,
+            own,
+            |guid| match state.get(guid) {
+                Some(entity) => unit_name(state, entity),
+                None => format!("{guid:#x}"),
+            },
+            |id| spells.and_then(|book| book.known_name(id)),
+        ),
+        prefix: None,
+    }
+}
+
 /// The protocol's many chat types collapsed into the handful that read
 /// differently to a person.
 fn chat_kind(chat_type: ::world::ChatType) -> ui::ChatKind {
