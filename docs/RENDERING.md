@@ -757,3 +757,73 @@ are separate M2s on attachment points. And other players are still undressed:
 their visible-item fields carry item *entry* ids, which need `Item.dbc` to reach
 a display id, and those field indices want the same search treatment
 `PLAYER_BYTES` got.
+
+### Lighting, part one: the clock and the curves
+
+Lighting and a day/night cycle are **one piece of work, not two**, and the data
+says so before any code does. Every colour in `LightIntBand` and every distance
+in `LightFloatBand` is a *curve over time of day* -- sixteen keys in half-minutes
+since midnight. There is no static ambient colour to add a cycle to later; a
+client that hardcoded an hour would be rewriting this the moment the sun moved.
+
+So the clock came first.
+
+**The clock.** `SMSG_LOGIN_SETTIMESPEED` was named in `opcode.rs` and parsed
+nowhere. It is twelve bytes: a packed date-and-time word, a float, and a word
+that is zero in the only capture on hand and is therefore left unnamed. The
+float is `0x3C88888A`, which is 1/60 -- game minutes per real second, so this
+realm runs game time at wall-clock rate. A client that assumed that rate would
+drift on a realm that chose otherwise, so it is read rather than assumed.
+
+The packed word was **confirmed against the wall clock rather than
+transcribed**. One capture decoded to minute 2, hour 4, weekday 4, day 12, month
+7, year 26 -- and it was taken at 04:02 UTC on Thursday 13 August 2026. All six
+fields agree, including the two that are zero-based and the one that counts from
+2000. That is six independent checks against a calendar this project did not
+write, and a wrong layout could not match the date as well as the time. A second
+capture two game-minutes later differed in exactly one byte, the minute.
+
+**The curves.** Four tables, and the awkward part is that the curves are not
+addressed by a column:
+
+    LightIntBand.id   = (LightParams.id - 1) * 18 + n + 1
+    LightFloatBand.id = (LightParams.id - 1) * 6  + n + 1
+
+That was measured. The ids are *sparse* in all three tables -- `LightParams`
+runs to 917 across 850 rows -- so a rule that only worked for dense ids would
+have looked fine on the first row and failed later. It reproduces both maxima
+exactly: 916x18+18 = 16,506 and 916x6+6 = 5,502, the largest id in each band
+table, on top of exact 18:1 and 6:1 row-count ratios.
+
+**Lights are positional, not per-zone.** A `Light` row sits at a point on a map
+with an inner and outer radius. Northshire is covered by none of Azeroth's 82
+lights -- the nearest is 124,000 units away -- and falls back to light 1, whose
+position is the origin and whose radius is zero: the map default. `wow-cli
+light` prints the runners-up for exactly this reason, because "the wrong light
+was chosen" and "the right light looks like this" are indistinguishable from a
+single row.
+
+**Blue is the low byte, and the data settled it.** Byte order in a packed colour
+is the kind of thing that yields a blue sky or an orange one with equal
+confidence. Sampling Azeroth's sky bands at three hours decides it:
+
+| | midnight | dawn | noon |
+|---|---|---|---|
+| blue first | (0, 12, 32) near-black blue | (255, 171, 64) orange | (58, 162, 207) sky blue |
+| red first | (32, 12, 0) dark brown | (64, 171, 255) blue | (207, 162, 58) ochre |
+
+One of those is a sky and the other is not, three bands agree, and the
+disagreement is widest exactly where it is most obvious -- a sunrise.
+
+**What the eighteen bands mean is deliberately still blank.** They are ambient,
+diffuse, sky gradient, fog and so on, and none of that has been confirmed here.
+Naming them from memory is the `describe_cast_failure` mistake: a wrong offset
+fails loudly, a wrong *name* just misexplains for ever. `wow-cli light` prints
+all eighteen with their brightness at four hours of the day, which is the
+evidence needed to identify them by what they do -- band 0 goes pure orange at
+dawn and bands 3 to 5 track the sky. Settling it wants a render, not a table.
+
+Next: choosing the light for the camera's position each frame, sampling the
+bands at the running clock, and replacing the camera-following headlight in
+`mesh.rs` and `terrain.rs` -- which is where those band meanings get confirmed
+or corrected.

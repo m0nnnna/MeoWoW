@@ -472,6 +472,16 @@ pub struct WorldState {
     /// to `SMSG_SPELL_GO` with no bar ever worth showing, so removing an
     /// absent entry for one is a correct no-op, not a missed `SMSG_SPELL_START`.
     pub casts: HashMap<u64, Cast>,
+    /// The realm's clock, from `SMSG_LOGIN_SETTIMESPEED` at login, together
+    /// with when this client learned it.
+    ///
+    /// Kept as the reported time plus an instant rather than as a running
+    /// clock, for the same reason `Cooldown` and `Cast` are: the caller
+    /// supplies `now`, so the arithmetic is exercised by a fixed input instead
+    /// of by a hopefully-fast-enough sleep in a test. `None` until the packet
+    /// arrives, which is a real state -- a client that assumed noon would light
+    /// the world wrongly for the first second of every session.
+    pub game_time: Option<(crate::update::GameTime, std::time::Instant)>,
     /// Who each unit is currently swinging at, keyed by attacker.
     /// `SMSG_ATTACKSTART` inserts, `SMSG_ATTACKSTOP` removes.
     ///
@@ -775,6 +785,21 @@ impl WorldState {
                             };
                             report.failures.push((packet.opcode, error, payload));
                         }
+                    }
+                }
+                crate::opcode::server::LOGIN_SETTIMESPEED => {
+                    match update::parse_login_set_time_speed(&packet.body) {
+                        Ok(time) => {
+                            // Paired with the instant it arrived, so the clock
+                            // can be run forward: the server says this once at
+                            // login and never again.
+                            self.game_time = Some((time, std::time::Instant::now()));
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
                     }
                 }
                 crate::opcode::server::MONSTER_MOVE => {

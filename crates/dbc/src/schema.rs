@@ -419,6 +419,160 @@ dbc_table! {
 }
 
 dbc_table! {
+    /// A light: where in the world it applies, and which parameter sets to use
+    /// under each weather condition.
+    ///
+    /// Lighting in this game is positional, not per-zone-by-name. A light sits
+    /// at a point on a map with an inner and outer radius, and the client
+    /// blends between whichever lights contain the camera; the row with a zero
+    /// position and an enormous radius is the map's default.
+    ///
+    /// The eight parameter columns are conditions -- clear, storm, and so on.
+    /// Only the first few are populated on most rows: column 13 is zero on all
+    /// 715 rows and column 14 on 714 of them, which is what a sparsely used
+    /// tail of an array looks like rather than a mis-split field.
+    Light, LightRow, path = r"DBFilesClient\Light.dbc", fields = 15, {
+        0 id: u32,
+        1 map_id: u32,
+        /// Where the light applies, in world coordinates.
+        2 x: f32,
+        3 y: f32,
+        4 z: f32,
+        /// Inside `falloff_start` the light applies fully; past `falloff_end`
+        /// not at all.
+        5 falloff_start: f32,
+        6 falloff_end: f32,
+        /// `LightParams` id per weather condition. The first is the one to use
+        /// until weather exists.
+        7  params_clear: u32,
+        8  params_clear_water: u32,
+        9  params_storm: u32,
+        10 params_storm_water: u32,
+        11 params_death: u32,
+        12 params_unknown_1: u32,
+        13 params_unknown_2: u32,
+        14 params_unknown_3: u32,
+    }
+}
+
+dbc_table! {
+    /// One set of lighting parameters, which is really a pointer to two blocks
+    /// of curves.
+    ///
+    /// **The curves are not in this table and are not addressed by a column.**
+    /// Each row owns eighteen `LightIntBand` rows and six `LightFloatBand`
+    /// rows, found by arithmetic on the id:
+    ///
+    /// ```text
+    /// LightIntBand.id   = (LightParams.id - 1) * 18 + n + 1   for n in 0..18
+    /// LightFloatBand.id = (LightParams.id - 1) * 6  + n + 1   for n in 0..6
+    /// ```
+    ///
+    /// That rule was measured, not assumed, and it closes exactly. There are
+    /// 850 `LightParams` rows, 15,300 int bands (850 x 18) and 5,100 float
+    /// bands (850 x 6) -- but the ids are *sparse* in all three, running to 917,
+    /// 16,506 and 5,502. The arithmetic reproduces both maxima on the nose:
+    /// 916 x 18 + 18 = 16,506 and 916 x 6 + 6 = 5,502. Two independent
+    /// agreements at the ends of two tables, on top of exact row-count ratios.
+    LightParams, LightParamsRow,
+    path = r"DBFilesClient\LightParams.dbc", fields = 9, {
+        0 id: u32,
+        1 highlight_sky: u32,
+        2 light_skybox_id: u32,
+        3 glow: f32,
+        4 water_shallow_alpha: f32,
+        5 water_deep_alpha: f32,
+        6 ocean_shallow_alpha: f32,
+        7 ocean_deep_alpha: f32,
+        8 flags: u32,
+    }
+}
+
+dbc_table! {
+    /// One colour curve over the day: up to sixteen keys, each a time and a
+    /// packed colour.
+    ///
+    /// Time is in half-minutes since midnight, so a full day is 2,880 and a
+    /// key at 1,440 is noon.
+    ///
+    /// **Which of the eighteen bands is which is deliberately not named here.**
+    /// They are ambient, diffuse, sky gradient, fog and so on, and this client
+    /// has confirmed none of that against the data yet. Naming them from memory
+    /// is the mistake `describe_cast_failure` exists to avoid: a wrong *name*
+    /// never fails, it just misexplains. `wow-cli light` prints all eighteen so
+    /// they can be identified by what they do.
+    LightIntBand, LightIntBandRow,
+    path = r"DBFilesClient\LightIntBand.dbc", fields = 34, {
+        0 id: u32,
+        /// How many of the sixteen key slots are used. Zero is a real answer:
+        /// a band with no keys contributes nothing.
+        1 count: u32,
+    }
+}
+
+dbc_table! {
+    /// One scalar curve over the day -- fog distances and similar -- in the
+    /// same shape as [`LightIntBand`].
+    LightFloatBand, LightFloatBandRow,
+    path = r"DBFilesClient\LightFloatBand.dbc", fields = 34, {
+        0 id: u32,
+        1 count: u32,
+    }
+}
+
+/// Key slots in a lighting band. Both band tables carry sixteen.
+pub const LIGHT_BAND_KEYS: usize = 16;
+/// Colour curves per [`LightParams`].
+pub const INT_BANDS_PER_PARAMS: u32 = 18;
+/// Scalar curves per [`LightParams`].
+pub const FLOAT_BANDS_PER_PARAMS: u32 = 6;
+/// Half-minutes in a day, which is the unit a band's key times are in.
+pub const DAY_HALF_MINUTES: u32 = 2880;
+
+impl LightIntBandRow<'_> {
+    /// Key `index` as `(time in half-minutes, packed colour)`.
+    ///
+    /// Read positionally rather than through thirty-two named columns: these
+    /// are an array in the file and pretending otherwise would invite reading
+    /// `time_9` where `value_9` was meant.
+    pub fn key(&self, index: usize) -> Option<(u32, u32)> {
+        if index >= self.count() as usize || index >= LIGHT_BAND_KEYS {
+            return None;
+        }
+        Some((
+            self.row.u32(2 + index),
+            self.row.u32(2 + LIGHT_BAND_KEYS + index),
+        ))
+    }
+}
+
+impl LightFloatBandRow<'_> {
+    /// Key `index` as `(time in half-minutes, value)`.
+    pub fn key(&self, index: usize) -> Option<(u32, f32)> {
+        if index >= self.count() as usize || index >= LIGHT_BAND_KEYS {
+            return None;
+        }
+        Some((
+            self.row.u32(2 + index),
+            f32::from_bits(self.row.raw(2 + LIGHT_BAND_KEYS + index)),
+        ))
+    }
+}
+
+/// The id of one of a params row's colour curves.
+///
+/// See [`LightParams`] for why this is arithmetic rather than a column, and
+/// for the two independent checks that fix it.
+pub fn int_band_id(params_id: u32, band: u32) -> u32 {
+    (params_id - 1) * INT_BANDS_PER_PARAMS + band + 1
+}
+
+/// The id of one of a params row's scalar curves.
+pub fn float_band_id(params_id: u32, band: u32) -> u32 {
+    (params_id - 1) * FLOAT_BANDS_PER_PARAMS + band + 1
+}
+
+dbc_table! {
     /// Names for animation ids. An M2 sequence stores only the numeric id, so
     /// this is the only way to know that sequence 0 is `Stand`.
     AnimationData, AnimationDataRow,

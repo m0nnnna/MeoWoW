@@ -6,6 +6,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+
+mod light;
 use clap::{Parser, Subcommand};
 use mpq::{Archive, Chain};
 
@@ -67,6 +69,25 @@ enum Command {
     /// Inspect terrain.
     #[command(subcommand)]
     Adt(AdtCommand),
+    /// Resolve the lighting that applies at a place and an hour.
+    ///
+    /// Prints every colour and scalar curve owned by the chosen light, sampled
+    /// now and across the day, because which of the eighteen bands is which has
+    /// not been confirmed against the data and is not guessed at here. What
+    /// changes with the sun is a colour that follows the sun.
+    Light {
+        /// `Map.dbc` id: 0 is Azeroth.
+        #[arg(long, default_value_t = 0)]
+        map: u32,
+        /// Clap reads a bare negative number as a flag, so pass `--x=-8950`.
+        #[arg(long, allow_hyphen_values = true, default_value_t = -8950.0)]
+        x: f32,
+        #[arg(long, allow_hyphen_values = true, default_value_t = -132.5)]
+        y: f32,
+        /// Game hour, 0 to 24.
+        #[arg(long, default_value_t = 12.0)]
+        hour: f32,
+    },
     /// Log in to a realm's logon server and list its realms.
     ///
     /// Needs no game files, only an account on the server.
@@ -487,6 +508,7 @@ fn main() -> Result<()> {
         Command::M2(cmd) => m2_cmd(&mut chain, cmd),
         Command::Wmo(cmd) => wmo_cmd(&mut chain, cmd),
         Command::Adt(cmd) => adt_cmd(&mut chain, cmd),
+        Command::Light { map, x, y, hour } => light::report(&mut chain, map, x, y, hour),
         // Handled before the archives are opened.
         Command::Auth { .. } | Command::World { .. } => unreachable!(),
     }
@@ -3151,7 +3173,11 @@ fn dbc_rows(chain: &mut Chain, table: &str, limit: usize, ids: &[u32]) -> Result
         CharSections,
         CharHairGeosets,
         Item,
-        ItemDisplayInfo
+        ItemDisplayInfo,
+        Light,
+        LightParams,
+        LightIntBand,
+        LightFloatBand
     )
     // `CharacterFacialHairStyles` is deliberately absent: it has no id column
     // at all -- race, gender and variation are its key -- so it cannot satisfy
@@ -3204,6 +3230,10 @@ fn dbc_check(chain: &mut Chain) -> Result<()> {
         CharacterFacialHairStyles,
         Item,
         ItemDisplayInfo,
+        Light,
+        LightParams,
+        LightIntBand,
+        LightFloatBand,
     );
     println!();
     if failures == 0 {

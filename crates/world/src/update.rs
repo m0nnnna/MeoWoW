@@ -346,6 +346,145 @@ impl PowerUpdate {
     }
 }
 
+/// The realm's calendar and clock, as `SMSG_LOGIN_SETTIMESPEED` reports it.
+///
+/// Wanted for lighting rather than for a clock face: every colour in
+/// `LightIntBand` and every distance in `LightFloatBand` is a curve *over time
+/// of day*, so a client that cannot say what hour it is cannot light the world
+/// at all. See `docs/RENDERING.md`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GameTime {
+    /// 0-59.
+    pub minute: u8,
+    /// 0-23.
+    pub hour: u8,
+    /// 0 is Sunday.
+    pub weekday: u8,
+    /// 0-based, so 12 is the thirteenth.
+    pub day: u8,
+    /// 0-based, so 7 is August.
+    pub month: u8,
+    /// Years since 2000.
+    pub year: u8,
+    /// Game minutes per real second. `1/60` on the test realm, which makes
+    /// game time run at wall-clock rate; a realm may choose otherwise, and a
+    /// client that hardcoded the rate would drift on one that did.
+    pub speed: f32,
+}
+
+impl GameTime {
+    /// Minutes since midnight, 0..1440.
+    pub fn minute_of_day(&self) -> u32 {
+        u32::from(self.hour) * 60 + u32::from(self.minute)
+    }
+
+    /// Advances the clock by a real-time duration, at the realm's own rate.
+    ///
+    /// The server reports the time once at login and never again, so a client
+    /// that does not run the clock forward lights the whole session at the
+    /// minute it happened to log in.
+    pub fn advanced(&self, elapsed: std::time::Duration) -> Self {
+        let minutes = self.speed as f64 * elapsed.as_secs_f64();
+        let total = f64::from(self.minute_of_day()) + minutes;
+        let wrapped = total.rem_euclid(1440.0) as u32;
+        Self {
+            minute: (wrapped % 60) as u8,
+            hour: (wrapped / 60) as u8,
+            ..*self
+        }
+    }
+}
+
+/// Reads the realm's clock.
+///
+/// **The bit layout was confirmed against the wall clock, not transcribed.**
+/// One capture decoded to minute 2, hour 4, weekday 4, day 12, month 7, year
+/// 26 -- and it was taken at 04:02 UTC on Thursday 13 August 2026. Every field
+/// agrees, including the two that are zero-based and the one that counts from
+/// 2000, which is six independent checks against a clock this project did not
+/// write. A layout that was wrong could not have matched the date as well as
+/// the time.
+///
+/// The trailing `u32` is not named. It is zero in the only capture on hand, and
+/// this project's rule is that a number nobody can check is worse than a blank.
+pub fn parse_login_set_time_speed(body: &[u8]) -> Result<GameTime, Error> {
+    let mut r = Reader::new(body, "SMSG_LOGIN_SETTIMESPEED");
+    let packed = r.u32()?;
+    let speed = r.f32()?;
+    let _unconfirmed_trailing = r.u32()?;
+    r.finish()?;
+    Ok(GameTime {
+        minute: (packed & 0x3F) as u8,
+        hour: ((packed >> 6) & 0x1F) as u8,
+        weekday: ((packed >> 11) & 0x07) as u8,
+        day: ((packed >> 14) & 0x3F) as u8,
+        month: ((packed >> 20) & 0x0F) as u8,
+        year: ((packed >> 24) & 0xFF) as u8,
+        speed,
+    })
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+
+    /// The exact twelve bytes `wow1.nekos.farm` sent, and what the wall clock
+    /// said when they arrived.
+    ///
+    /// A known-good constant, which is this project's convention for
+    /// byte-level parsing -- and here it is unusually strong evidence, because
+    /// the six decoded fields are checked against a calendar rather than
+    /// against each other. Six agreements with something written by somebody
+    /// else is not a layout that happens to parse.
+    const CAPTURED: [u8; 12] = [
+        0x02, 0x21, 0x73, 0x1a, // packed date and time
+        0x8a, 0x88, 0x88, 0x3c, // game speed
+        0x00, 0x00, 0x00, 0x00, // unconfirmed trailing word
+    ];
+
+    #[test]
+    fn the_realms_clock_matches_the_wall_clock_it_was_captured_against() {
+        let time = parse_login_set_time_speed(&CAPTURED).expect("captured live");
+        // 04:02 UTC, Thursday 13 August 2026.
+        assert_eq!((time.hour, time.minute), (4, 2));
+        assert_eq!(time.weekday, 4, "Thursday, counting Sunday as zero");
+        assert_eq!(time.day, 12, "zero-based, so the thirteenth");
+        assert_eq!(time.month, 7, "zero-based, so August");
+        assert_eq!(time.year, 26, "years since 2000");
+        // 1/60 game minutes per real second: this realm runs at wall-clock
+        // rate. Worth pinning because a client that assumed it would drift on
+        // a realm that chose otherwise.
+        assert!((time.speed - 1.0 / 60.0).abs() < 1e-6, "got {}", time.speed);
+        assert_eq!(time.minute_of_day(), 4 * 60 + 2);
+    }
+
+    #[test]
+    fn a_short_or_long_body_is_refused() {
+        assert!(parse_login_set_time_speed(&CAPTURED[..8]).is_err());
+        let mut long = CAPTURED.to_vec();
+        long.push(0);
+        assert!(
+            parse_login_set_time_speed(&long).is_err(),
+            "trailing bytes must be an error, not ignored"
+        );
+    }
+
+    /// The clock has to run, because the server reports it once and never
+    /// again. An hour of real time at this realm's rate is an hour of game
+    /// time.
+    #[test]
+    fn the_clock_runs_forward_at_the_realms_rate() {
+        let time = parse_login_set_time_speed(&CAPTURED).unwrap();
+        let later = time.advanced(std::time::Duration::from_secs(3600));
+        assert_eq!((later.hour, later.minute), (5, 2));
+        // And it wraps at midnight rather than running to hour 25.
+        let midnight = time.advanced(std::time::Duration::from_secs(24 * 3600));
+        assert_eq!((midnight.hour, midnight.minute), (4, 2));
+        let past = time.advanced(std::time::Duration::from_secs(20 * 3600));
+        assert_eq!(past.hour, 0, "20 hours past 04:02 is just past midnight");
+    }
+}
+
 pub fn parse_power_update(body: &[u8]) -> Result<PowerUpdate, Error> {
     let mut r = Reader::new(body, "SMSG_POWER_UPDATE");
     let guid = read_packed_guid(&mut r)?;
