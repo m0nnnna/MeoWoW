@@ -1161,3 +1161,76 @@ The player's own body took the same change for free, and revealed a small lie
 in the process: `LIVE_WALK_SPEED` was 7.0, which is the *run* speed. The
 character has been running since 3.4 while playing a walk cycle. Renamed, and
 now it runs.
+
+### Everyone in the world has a skin
+
+Reported as one thing -- "NPCs are blank white ghosts" -- and it was two,
+with different causes and different fixes. The report also named "player hair"
+as missing, which turned out not to be a defect at all.
+
+**The NPCs.** `docs/RENDERING.md` had said for several milestones that humanoid
+NPCs render white because character models composite their skin at runtime and
+no compositor existed. That is true of a *player* and false of an NPC:
+`CreatureDisplayInfoExtra.bake_name` names a texture of the finished character,
+armour and all, already composed by an artist and shipped in the archives. The
+deferral was real; the reason recorded for it was wrong, and a wrong reason for
+a deferral is worse than none, because it makes the work look bigger than it is.
+
+15,446 of 24,262 display ids -- 64% of every creature appearance in build 12340
+-- have an extended row and no texture variation of their own. That is the
+population that was white.
+
+The near-miss worth recording: a coverage check said only 0.1% of the named
+bakes ship, which would have sunk the approach. It was built on `wow-cli ls`,
+and an MPQ resolves by hash rather than by listing -- the baked textures are in
+the archives and absent from the listfile. Forty of forty randomly sampled names
+read back fine. **Listing a directory and reading a path are different
+questions**, and the cheap one answered the wrong one convincingly.
+
+**The other players.** Once the NPCs were fixed, exactly one white figure
+remained in the Northshire scene, and it was not an NPC: display 49, which is
+every human male alive. A player's appearance is five numbers in their update
+fields, and this client had only ever read its *own* from the character list.
+
+Rather than transcribe the documented field index, it was searched for: the same
+five numbers arrive by two unrelated routes, so `wow-cli world --appearance`
+packs the character list's answer and asks which field holds it. The first two
+runs proved nothing, because every character this project has ever created was
+made with an all-zero appearance and a search for zero matches every zero field.
+`--create` grew appearance flags; a character made with five *different* values
+matched exactly one field, pinning the byte order as well as the index.
+
+**And the same tool then found the bug in the fix.** A stranger was still white,
+and `--appearance` showed `PLAYER_BYTES` unset while `PLAYER_BYTES_2` was
+present. **An absent update field is a zero, not an unknown** -- a create block
+carries only non-zero values -- so refusing on absence left exactly the
+default-looking players white. Both directions were then observed: the field
+appears when non-zero, and is omitted when zero.
+
+Verified through the two-client rig. A character was created on one account with
+skin 3, face 5, hair 7, colour 2, facial hair 4; a viewer on the *other* account
+read those five numbers back off the wire and resolved them to
+`HumanMaleSkin00_03.blp` and `Hair02_02.blp`. Out through creation, through the
+server, back in through a different client -- the strongest shape available here.
+
+**The number that says it worked**, and the reason it exists: on one Northshire
+scene of 17 drawn entities, no entity has an unfilled body texture, where before
+exactly one did. `load_dressed` had always collected the list of textures it
+could not resolve, and every caller had always dropped it -- so a white creature
+was invisible in the logs, which is the same failure as the packet body this
+project once refused and threw away. `World::entity_model` now warns with the
+display id and the slot, and that warning is what turned "one thing looks wrong
+in a screenshot" into "one entity, display 49, missing slot type 1".
+
+**Player hair was never broken.** Human-male hairstyle 0 is bald:
+`CharHairGeosets` maps only variation 0 to geoset 0, and all thirteen colours of
+that variation in `CharSections` have an empty texture. The character being
+looked at had chosen it. Worth the twenty minutes it took to establish, because
+the alternative was "fixing" a lookup that was already right.
+
+**Not done:** equipment. Slot type 2 -- the object/item skin -- is still
+unfilled on twelve of those seventeen entities, which is why NPCs wear their
+armour as a painted-on texture with no sleeves or boots to it, and why the
+player is in underwear. `CreatureDisplayInfoExtra` already carries eleven item
+display ids per NPC, read and named here but unused. Lighting and the day/night
+cycle are untouched, and game objects are still not drawn at all.

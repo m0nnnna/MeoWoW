@@ -36,6 +36,14 @@ pub struct Entity {
     /// when it is standing. The renderer picks a stand, walk or run cycle from
     /// it -- see `crate::world::Motion`.
     pub speed: f32,
+    /// The five character-creation numbers, for a *player*.
+    ///
+    /// `None` for every creature, and that is the whole distinction: a
+    /// creature's looks are in its display id, while display 49 is every human
+    /// male alive and says nothing about any of them. Carried rather than
+    /// resolved here because turning it into textures composes a skin, which
+    /// is far too expensive to redo every frame -- the caller caches on it.
+    pub appearance: Option<::world::Appearance>,
 }
 
 /// Where the player is and what can be seen from there.
@@ -382,6 +390,7 @@ pub fn drawable_entities(state: &world::WorldState, own_guid: u64) -> Vec<Entity
             // Zero when no move is in flight, which is what "standing" means
             // here -- see `world::state::Entity::move_speed`.
             speed: entity.move_speed(now).unwrap_or(0.0),
+            appearance: entity.appearance(),
         });
     }
     entities
@@ -434,6 +443,11 @@ pub fn own_entity(
         kind: entity.object_type,
         level: entity.level(),
         speed,
+        // Our own appearance is already resolved -- see `LiveWorld::look` --
+        // and came from the character list rather than from these fields,
+        // which is the source this project has confirmed. No reason to make
+        // the caller resolve it a second way.
+        appearance: None,
     })
 }
 

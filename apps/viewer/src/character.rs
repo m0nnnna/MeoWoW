@@ -33,6 +33,27 @@ pub struct Appearance {
     pub facial_hair: u8,
 }
 
+impl From<::world::Appearance> for Appearance {
+    /// The same five numbers, arriving from the network instead of from the
+    /// character list.
+    ///
+    /// `world::Appearance` carries a class as well, which says nothing about
+    /// how anyone looks -- a warrior and a mage of one race are the same model
+    /// wearing different gear -- so it is dropped here rather than carried into
+    /// the cache key, where it would build the same character twice.
+    fn from(value: ::world::Appearance) -> Self {
+        Self {
+            race: value.race,
+            gender: value.gender,
+            skin: value.skin,
+            face: value.face,
+            hair_style: value.hair_style,
+            hair_colour: value.hair_color,
+            facial_hair: value.facial_hair,
+        }
+    }
+}
+
 impl Appearance {
     /// A stable key for caching a built model.
     ///
@@ -149,8 +170,16 @@ pub fn resolve(chain: &mut Chain, look: Appearance) -> Look {
         .read(CharSections::PATH)
         .ok()
         .and_then(|bytes| CharSections::parse(&bytes).ok());
+    let hair_geosets = chain
+        .read(CharHairGeosets::PATH)
+        .ok()
+        .and_then(|bytes| CharHairGeosets::parse(&bytes).ok());
+    let facial = chain
+        .read(CharacterFacialHairStyles::PATH)
+        .ok()
+        .and_then(|bytes| CharacterFacialHairStyles::parse(&bytes).ok());
 
-    let (mut body, mut hair, mut skin) = (None, None, None);
+    let (mut body, mut skin) = (None, None);
     if let Some(sections) = &sections {
         skin = compose(chain, sections, look);
         // Section type 0 is the base skin, indexed by skin colour. The face,
@@ -160,24 +189,55 @@ pub fn resolve(chain: &mut Chain, look: Appearance) -> Look {
         // blank face. Stated rather than hidden: it is the visible limit of
         // this feature.
         body = find(sections, look.race, look.gender, 0, 0, look.skin);
-        // Type 3 is hair, indexed by style and colour.
-        hair = find(
+    }
+
+    let (hair, geosets) = hair_and_geosets(
+        sections.as_ref(),
+        hair_geosets.as_ref(),
+        facial.as_ref(),
+        look,
+    );
+
+    Look {
+        skin,
+        body,
+        hair,
+        geosets,
+    }
+}
+
+/// The hair texture and the geosets to draw, from tables already read.
+///
+/// Shared by the player's [`resolve`] and by an NPC's [`NpcAppearances::look`]
+/// rather than written twice. A player and an NPC differ in where their *body*
+/// texture comes from -- composed from layers versus baked by an artist -- and
+/// in nothing else: both pick one haircut out of seventeen in the same geoset
+/// group, by the same rule, and a second copy of that rule would be a second
+/// place for a character to end up wearing every hairstyle at once.
+fn hair_and_geosets(
+    sections: Option<&CharSections>,
+    hair_geosets: Option<&CharHairGeosets>,
+    facial: Option<&CharacterFacialHairStyles>,
+    look: Appearance,
+) -> (Option<String>, Vec<u32>) {
+    // Type 3 is hair, indexed by style and colour. `None` is a real answer
+    // rather than a failure: every colour of human male style 0 has an empty
+    // texture, because style 0 is bald.
+    let hair = sections.and_then(|sections| {
+        find(
             sections,
             look.race,
             look.gender,
             3,
             look.hair_style,
             look.hair_colour,
-        );
-    }
+        )
+    });
 
     let mut geosets = Vec::new();
     // Hair. A style names a geoset in group zero; zero itself is the bald
     // scalp, which is a real choice rather than a missing one.
-    let hair_geoset = chain
-        .read(CharHairGeosets::PATH)
-        .ok()
-        .and_then(|bytes| CharHairGeosets::parse(&bytes).ok())
+    let hair_geoset = hair_geosets
         .and_then(|table| {
             table
                 .iter()
@@ -194,11 +254,7 @@ pub fn resolve(chain: &mut Chain, look: Appearance) -> Look {
     // Facial hair, across three groups at once. The columns are variants in
     // groups 1, 3 and 2 -- in that order, which is not the order they are
     // numbered, and getting it wrong would put a moustache where a beard goes.
-    if let Some(table) = chain
-        .read(CharacterFacialHairStyles::PATH)
-        .ok()
-        .and_then(|bytes| CharacterFacialHairStyles::parse(&bytes).ok())
-    {
+    if let Some(table) = facial {
         if let Some(row) = table.iter().find(|row| {
             row.race() == u32::from(look.race)
                 && row.gender() == u32::from(look.gender)
@@ -217,11 +273,111 @@ pub fn resolve(chain: &mut Chain, look: Appearance) -> Look {
         }
     }
 
-    Look {
-        skin,
-        body,
-        hair,
-        geosets,
+    (hair, geosets)
+}
+
+/// Where a baked NPC texture lives. The table stores a bare filename.
+const BAKED_NPC_TEXTURES: &str = r"Textures\BakedNpcTextures";
+
+/// The tables a humanoid NPC's appearance needs, read once and kept.
+///
+/// Held rather than read per creature because these are megabytes: reading
+/// `CreatureDisplayInfoExtra` and `CharSections` again on the frame each new
+/// species first comes into view is the same shape as the thirty-seven-second
+/// login this project has already paid for once. A parsed `dbc` table owns its
+/// bytes, so keeping one costs nothing but the memory.
+pub struct NpcAppearances {
+    displays: dbc::schema::CreatureDisplayInfo,
+    extras: dbc::schema::CreatureDisplayInfoExtra,
+    sections: Option<CharSections>,
+    hair_geosets: Option<CharHairGeosets>,
+    facial: Option<CharacterFacialHairStyles>,
+}
+
+impl NpcAppearances {
+    /// Reads the tables. `None` without a game installation, or if either
+    /// creature table is missing -- there is nothing to answer with then.
+    pub fn load(chain: &mut Chain) -> Option<Self> {
+        use dbc::schema::{CreatureDisplayInfo, CreatureDisplayInfoExtra};
+
+        let displays = CreatureDisplayInfo::parse(&chain.read(CreatureDisplayInfo::PATH).ok()?)
+            .map_err(|e| tracing::warn!("CreatureDisplayInfo: {e}"))
+            .ok()?;
+        let extras =
+            CreatureDisplayInfoExtra::parse(&chain.read(CreatureDisplayInfoExtra::PATH).ok()?)
+                .map_err(|e| tracing::warn!("CreatureDisplayInfoExtra: {e}"))
+                .ok()?;
+        Some(Self {
+            displays,
+            extras,
+            sections: chain
+                .read(CharSections::PATH)
+                .ok()
+                .and_then(|b| CharSections::parse(&b).ok()),
+            hair_geosets: chain
+                .read(CharHairGeosets::PATH)
+                .ok()
+                .and_then(|b| CharHairGeosets::parse(&b).ok()),
+            facial: chain
+                .read(CharacterFacialHairStyles::PATH)
+                .ok()
+                .and_then(|b| CharacterFacialHairStyles::parse(&b).ok()),
+        })
+    }
+
+    /// How a display id is dressed, if it is a humanoid built from character
+    /// parts.
+    ///
+    /// `None` means "this creature is not one of those" -- a wolf, a kobold,
+    /// anything whose skins come from its own `CreatureDisplayInfo` row -- and
+    /// the caller should carry on exactly as before. That is the common case
+    /// by count of *rows read*, but not by count of rows in the table: 15,446
+    /// of 24,262 display ids have an extended row and no texture variation of
+    /// their own, and every one of those renders white without this.
+    pub fn look(&self, display_id: u32) -> Option<Look> {
+        let extended = self
+            .displays
+            .iter()
+            .find(|row| row.id() == display_id)?
+            .extended_display_info_id();
+        if extended == 0 {
+            return None;
+        }
+        let row = self.extras.iter().find(|row| row.id() == extended)?;
+
+        let appearance = Appearance {
+            race: row.race() as u8,
+            gender: row.gender() as u8,
+            skin: row.skin() as u8,
+            face: row.face() as u8,
+            hair_style: row.hair_style() as u8,
+            hair_colour: row.hair_colour() as u8,
+            facial_hair: row.facial_hair() as u8,
+        };
+        let (hair, geosets) = hair_and_geosets(
+            self.sections.as_ref(),
+            self.hair_geosets.as_ref(),
+            self.facial.as_ref(),
+            appearance,
+        );
+
+        // The baked texture *is* the composed skin, done by an artist, with
+        // this NPC's armour already painted into it. So `skin` stays `None`:
+        // there is nothing to compose, and composing the character-creation
+        // layers instead would strip the clothes off a guard and put him in
+        // underwear.
+        let bake = row.bake_name();
+        let body = (!bake.is_empty()).then(|| format!(r"{BAKED_NPC_TEXTURES}\{bake}"));
+        if body.is_none() {
+            tracing::debug!("display {display_id} (extra {extended}) names no baked texture");
+        }
+
+        Some(Look {
+            skin: None,
+            body,
+            hair,
+            geosets,
+        })
     }
 }
 

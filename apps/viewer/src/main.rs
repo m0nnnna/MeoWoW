@@ -20,6 +20,7 @@ mod world;
 mod world_object;
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -282,19 +283,31 @@ fn build_live_scene(
     )?;
 
     if args.entities {
+        let mut player_looks = std::collections::HashMap::new();
         let placements: Vec<world::EntityPlacement> =
             drawable_with_own(&live, 0.0)
                 .iter()
-                .map(|entity| world::EntityPlacement {
-                    display_id: entity.display_id,
-                    position: entity.position,
-                    orientation: entity.orientation,
-                    scale: entity.scale,
-                    speed: entity.speed,
-                    // Only our own body is dressed; everything else takes its
-                    // appearance from its display id.
-                    look: (entity.guid == live.guid).then(|| live.look.clone()),
-                    look_key: if entity.guid == live.guid { live.look_key } else { 0 },
+                .map(|entity| {
+                    // Same three sources as the windowed path -- see `redraw`.
+                    // A screenshot that dressed people differently from the
+                    // window would be the wrong kind of evidence about it.
+                    let (look, look_key) = if entity.guid == live.guid {
+                        (Some(live.look.clone()), live.look_key)
+                    } else if let Some(appearance) = entity.appearance {
+                        let (look, key) = player_look(&mut player_looks, chain, appearance);
+                        (Some(look), key)
+                    } else {
+                        (None, 0)
+                    };
+                    world::EntityPlacement {
+                        display_id: entity.display_id,
+                        position: entity.position,
+                        orientation: entity.orientation,
+                        scale: entity.scale,
+                        speed: entity.speed,
+                        look,
+                        look_key,
+                    }
                 })
                 .collect();
         let undrawable = world.set_entities(gpu, meshes, chain, &placements);
@@ -321,7 +334,27 @@ fn build_offline_scene(
 ) -> Result<Scene> {
     if let Some(display_id) = args.creature {
         let (path, variations) = model::creature(chain, display_id)?;
-        let loaded = model::load(gpu, chain, &path, &variations, args.lod)?;
+        // Dressed the same way the streaming world dresses it, so a screenshot
+        // of a display id shows what a player standing next to that creature
+        // would see. Rendering it undressed here instead would make this the
+        // one path that cannot answer the question it exists for -- and the
+        // white-ghost bug lived in exactly that gap: `--creature` looked fine
+        // because it was drawing beasts, which never needed the extra table.
+        let look = character::NpcAppearances::load(chain).and_then(|t| t.look(display_id));
+        match &look {
+            Some(look) => tracing::info!(
+                "display {display_id}: body {:?}, hair {:?}, geosets {:?}",
+                look.body,
+                look.hair,
+                look.geosets
+            ),
+            None => tracing::info!(
+                "display {display_id} has no extended appearance; \
+                 its skins come from its own display row"
+            ),
+        }
+        let loaded =
+            model::load_dressed(gpu, chain, &path, &variations, args.lod, look.as_ref())?;
         return Ok(Scene::Model(Box::new(loaded)));
     }
     if let Some(path) = &args.model {
@@ -1258,6 +1291,15 @@ struct App {
     /// runs every frame) warns once per change instead of every frame for the
     /// rest of the session.
     last_undrawable_warned: usize,
+    /// Composed looks for *other* players, keyed by `character::Appearance`.
+    ///
+    /// Cached because resolving one reads several DBCs and composes a skin
+    /// texture from its layers, and entities are rebuilt every frame -- doing
+    /// that per frame per player would be the thirty-seven-second login all
+    /// over again, at sixty hertz. Keyed by appearance rather than by guid so
+    /// two players who look alike share one entry, which is also exactly the
+    /// key the renderer's model cache uses.
+    player_looks: std::collections::HashMap<u64, Rc<character::Look>>,
     /// The player's own interface: where every frame sits, what it looks like,
     /// and whether it is currently being rearranged.
     hud: ui::Hud,
@@ -1376,6 +1418,38 @@ fn drawable_with_own(live: &live::LiveWorld, speed: f32) -> Vec<live::Entity> {
     entities
 }
 
+/// How another player looks, composing it once and remembering it.
+///
+/// A free function rather than a method on `App` because the caller holds a
+/// mutable borrow of the renderer and an immutable one of the live world at the
+/// same time; taking the cache and the archive chain as separate arguments
+/// keeps those borrows disjoint, where `&mut self` would collide with both.
+///
+/// Returns the key as well as the look because the renderer's model cache is
+/// keyed on it: two humans with different faces must not share one built model,
+/// which is the bug `EntityPlacement::look_key` exists to prevent.
+fn player_look(
+    cache: &mut std::collections::HashMap<u64, Rc<character::Look>>,
+    chain: &mut Chain,
+    appearance: ::world::Appearance,
+) -> (Rc<character::Look>, u64) {
+    let appearance = character::Appearance::from(appearance);
+    let key = appearance.key();
+    let look = cache
+        .entry(key)
+        .or_insert_with(|| {
+            let look = character::resolve(chain, appearance);
+            tracing::debug!(
+                "composed a look for {appearance:?}: body {:?}, hair {:?}",
+                look.body,
+                look.hair
+            );
+            Rc::new(look)
+        })
+        .clone();
+    (look, key)
+}
+
 /// One entry in the scrollback, before it is turned into text.
 ///
 /// The alternative -- rendering to a string at the moment of arrival -- is
@@ -1445,6 +1519,7 @@ impl App {
             last_heartbeat: Instant::now(),
             last_ping: Instant::now(),
             last_undrawable_warned: 0,
+            player_looks: std::collections::HashMap::new(),
             // Read before the window exists, so a layout that fails to parse
             // is reported at startup rather than at the first frame.
             hud: ui::Hud::load(),
@@ -1861,22 +1936,37 @@ impl App {
                     };
                     // F2. See `App::entity_flip`.
                     let flip = if self.entity_flip { std::f32::consts::PI } else { 0.0 };
+                    // Borrowed as fields rather than through `&mut self`: `r`
+                    // already holds the renderer, and `live` the live world.
+                    let looks = &mut self.player_looks;
+                    let chain = &mut self.chain;
                     let placements: Vec<crate::world::EntityPlacement> =
                         drawable_with_own(live, speed)
                             .iter()
-                            .map(|entity| crate::world::EntityPlacement {
-                                display_id: entity.display_id,
-                                position: entity.position,
-                                orientation: entity.orientation + flip,
-                                scale: entity.scale,
-                                speed: entity.speed,
-                                look: (entity.guid == live.guid)
-                                    .then(|| live.look.clone()),
-                                look_key: if entity.guid == live.guid {
-                                    live.look_key
+                            .map(|entity| {
+                                // Three sources, in order of what actually
+                                // knows: our own body's look was resolved at
+                                // login from the character list; another
+                                // player's comes off their update fields; a
+                                // creature has none and is dressed from its
+                                // display id inside the renderer.
+                                let (look, look_key) = if entity.guid == live.guid {
+                                    (Some(live.look.clone()), live.look_key)
+                                } else if let Some(appearance) = entity.appearance {
+                                    let (look, key) = player_look(looks, chain, appearance);
+                                    (Some(look), key)
                                 } else {
-                                    0
-                                },
+                                    (None, 0)
+                                };
+                                crate::world::EntityPlacement {
+                                    display_id: entity.display_id,
+                                    position: entity.position,
+                                    orientation: entity.orientation + flip,
+                                    scale: entity.scale,
+                                    speed: entity.speed,
+                                    look,
+                                    look_key,
+                                }
                             })
                             .collect();
                     let undrawable =

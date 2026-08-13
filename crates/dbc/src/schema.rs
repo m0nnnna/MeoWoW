@@ -233,6 +233,75 @@ dbc_table! {
 }
 
 dbc_table! {
+    /// What a *humanoid* creature looks like: the character-creation choices an
+    /// NPC was built from, and the pre-baked texture of the result.
+    ///
+    /// Reached through [`CreatureDisplayInfo::extended_display_info_id`], and it
+    /// is not an optional extra. 15,446 of the 24,262 display ids in build
+    /// 12340 -- **64% of every creature appearance in the game** -- have an
+    /// extended row and *no* texture variations at all, so this table is the
+    /// only thing that says what colour they are. Without it those models bind
+    /// a placeholder and every guard, innkeeper and quest giver in the world
+    /// renders as a white ghost.
+    ///
+    /// `bake_name` is the whole point: a texture of the finished NPC, armour
+    /// and all, already composed by the artist. A client that has it needs none
+    /// of the layer blending a *player's* skin requires -- see
+    /// `apps/viewer/src/character.rs`. It is a bare filename, resolved under
+    /// `Textures\BakedNpcTextures\`.
+    ///
+    /// **Those files are in the archives but not in the listfile**, which is a
+    /// trap worth naming: `wow-cli ls BakedNpcTextures` shows 50 of them and a
+    /// coverage check built on that listing concluded 0.1% of bakes ship. MPQ
+    /// resolves by hash, not by listing, so 40 of 40 randomly sampled names
+    /// read back fine. Listing a directory and reading a path are different
+    /// questions.
+    ///
+    /// The columns were confirmed by consistency rather than transcription:
+    /// grouping every row by `race` and `gender` and asking which *model* the
+    /// displays pointing at it use gives 33 groups, each dominated by exactly
+    /// the matching character model -- race 1 male by `HumanMale.mdx` 2,133
+    /// times, race 20 male by `NorthrendSkeletonMale.mdx` 30 times, and so on
+    /// through all 21 races. A tail of one to five rows per group names a
+    /// different model, which is the data reusing an extra row across displays,
+    /// not a column that means something else.
+    CreatureDisplayInfoExtra, CreatureDisplayInfoExtraRow,
+    path = r"DBFilesClient\CreatureDisplayInfoExtra.dbc", fields = 21, {
+        0  id: u32,
+        /// `ChrRaces` id, 1..=21. Races 12 and up are NPC-only -- fel orc,
+        /// naga, broken, vrykul, tuskarr, taunka and three kinds of skeleton
+        /// and troll -- which is why this runs past the ten playable ones.
+        1  race: u32,
+        /// 0 male, 1 female.
+        2  gender: u32,
+        3  skin: u32,
+        4  face: u32,
+        5  hair_style: u32,
+        6  hair_colour: u32,
+        7  facial_hair: u32,
+        /// Eleven equipped item display ids, in slot order. Read but unused
+        /// until this client draws equipment; named here because the next
+        /// person to want armour on an NPC should not have to rediscover that
+        /// the data was already in hand.
+        8  item_display_0: u32,
+        9  item_display_1: u32,
+        10 item_display_2: u32,
+        11 item_display_3: u32,
+        12 item_display_4: u32,
+        13 item_display_5: u32,
+        14 item_display_6: u32,
+        15 item_display_7: u32,
+        16 item_display_8: u32,
+        17 item_display_9: u32,
+        18 item_display_10: u32,
+        19 flags: u32,
+        /// Filename under `Textures\BakedNpcTextures\`, e.g.
+        /// `CreatureDisplayExtra-00036.blp`. Empty on 22 of 15,475 rows.
+        20 bake_name: str,
+    }
+}
+
+dbc_table! {
     /// The actual model file behind a creature, plus its collision and
     /// footprint properties.
     CreatureModelData, CreatureModelDataRow,

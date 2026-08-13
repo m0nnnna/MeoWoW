@@ -324,6 +324,7 @@ mod tests {
             kind: ::world::ObjectType::Unit,
             level: Some(1),
             speed: 0.0,
+            appearance: None,
         }
     }
 

@@ -14,6 +14,7 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
 | Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated creatures and players slide along their actual path, turn to face it, and play the model's own walk/stand cycles |
 | Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, `F1` to rearrange, saved to `ui.toml` |
+| Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. Equipment geometry is not drawn yet |
 | Game | **4.3 done**: spellbook, three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. Spell damage, threat and the corpse flow remain. Inventory and quests follow |
 
 Roughly 57% of the way to something a person could test by playing. See
@@ -110,6 +111,13 @@ have was caught by reading the viewer's own log rather than by looking at it.
 - Two accounts exist so that **two clients can be online at once**, which is the
   only way to test anything about one player observing another — relayed
   movement, entity replication. A single account cannot prove any of it.
+- `ACCOUNT33` also has `Facetest` (human warrior), created deliberately with
+  **five different non-zero appearance values** — skin 3, face 5, hairstyle 7,
+  hair colour 2, facial hair 4. Every other character here was made with the
+  all-zero default, and an all-zero appearance makes any search for it match
+  every zero field in the object, which is how two attempts at locating
+  `PLAYER_BYTES` settled nothing. Keep it: it is the only character on either
+  account that can distinguish a field from its neighbours, or show hair at all.
 - `ACCOUNT33` has two characters, `Testwolf` (human warrior) and `Testdruid`
   (night elf druid), created to give `SMSG_CHAR_ENUM` real data to parse. An
   account with no characters exercises none of that packet's field offsets.
@@ -301,6 +309,18 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   the eye and the eye is a fixed offset above a position whose Z was wrong.
   Before opening the second investigation, check whether the first cause
   reaches it.
+- **Listing a directory and reading a path are different questions.** An MPQ
+  resolves by hash, so a file absent from `(listfile)` still reads perfectly.
+  A coverage check for the baked NPC textures built on `wow-cli ls` concluded
+  0.1% of them shipped and would have sunk the approach; resolving forty random
+  names by path got forty hits. When a cheap check says a whole feature is
+  impossible, confirm it answered the question you asked.
+- **An absent update field is a zero, not an unknown.** An object-create block
+  carries only non-zero values, so a player with the default appearance has no
+  `PLAYER_BYTES` field at all. Treating absence as "not known" left exactly the
+  plainest-looking players white -- the bug the field had just been added to
+  fix. The rule generalises: for a sparse field set, missing and default are the
+  same statement, and only a dropped *object* means unknown.
 - **When geometry is missing rather than wrong, suspect culling before data.**
   WMO winds counter-clockwise, M2 and terrain clockwise. Guessing from a
   neighbouring format culled a roof and looked like a hole in the mesh.

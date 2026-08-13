@@ -790,6 +790,38 @@ pub mod fields {
     pub const UNIT_DISPLAY_ID: u16 = 0x43;
     pub const UNIT_NATIVE_DISPLAY_ID: u16 = 0x44;
 
+    /// Skin, face, hairstyle and hair colour, one byte each, low byte first.
+    ///
+    /// This is how *another* player's appearance arrives: a player's display id
+    /// is 49 for every human male alive and its `CreatureDisplayInfo` row has
+    /// no textures at all, so without these five numbers every other player in
+    /// the world renders as a white ghost.
+    ///
+    /// **Measured, not transcribed**, and the difference was not academic. The
+    /// obvious route -- write down the documented index -- produces a client
+    /// that parses perfectly and gives every stranger the wrong face, with
+    /// nothing in the output to say which field was misread. Instead the same
+    /// five numbers arrive twice by unrelated routes: `SMSG_CHAR_ENUM`, parsed
+    /// and confirmed against a live realm since 3.2, and these fields. So
+    /// `wow-cli world --enter <name> --appearance` packs the character list's
+    /// answer and asks which field holds it.
+    ///
+    /// The first two runs of that search returned *two* candidates and settled
+    /// nothing, because every character this project had ever created was made
+    /// with an all-zero appearance and a search for zero matches every zero
+    /// field in the object. A character deliberately created with five
+    /// different non-zero values (`--skin 3 --char-face 5 --hair-style 7
+    /// --hair-color 2 --facial-hair 4`) matched exactly one field, holding
+    /// `0x02070503` -- which pins the byte *order* as well as the index, since
+    /// any other packing would have matched nothing.
+    pub const PLAYER_BYTES: u16 = 0x99;
+    /// Facial hair in the low byte; the rest is bank slots and rest state,
+    /// which this client does not read.
+    ///
+    /// Confirmed by the same run: `0x02000004` with the character list saying
+    /// facial hair 4.
+    pub const PLAYER_BYTES_2: u16 = 0x9A;
+
     /// How many powers a unit has, and so how far past [`UNIT_POWER1`] a power
     /// index is allowed to reach.
     pub const POWER_COUNT: u16 = 7;

@@ -223,6 +223,14 @@ pub struct World {
     /// Keyed by display *and* look: two players of one race share a display
     /// id and not a face. Zero is the undressed key every creature uses.
     entity_cache: HashMap<(u32, u64), Option<Rc<CachedModel>>>,
+    /// Tables for dressing humanoid NPCs, read on first use rather than at
+    /// construction: a scene with no replicated entities in it never needs
+    /// them, and they are several megabytes of DBC.
+    npc_looks: Option<crate::character::NpcAppearances>,
+    /// Whether loading them has been attempted. Without this a failed load
+    /// retries on every creature, which is the expensive failure repeated
+    /// rather than reported.
+    npc_looks_tried: bool,
     /// Objects the server placed, as opposed to the ones the map files did.
     /// Owned by the world rather than a tile: they move, and they do not belong
     /// to the tile they happen to be standing on.
@@ -275,6 +283,8 @@ impl World {
             max_doodads,
             cache: HashMap::new(),
             entity_cache: HashMap::new(),
+            npc_looks: None,
+            npc_looks_tried: false,
             entities: Vec::new(),
             entity_bones: HashMap::new(),
             started: Instant::now(),
@@ -733,11 +743,40 @@ impl World {
             return cached.clone();
         }
 
+        // A humanoid NPC's body texture lives in `CreatureDisplayInfoExtra` and
+        // nowhere else -- see `character::NpcAppearances::look`. Only consulted
+        // when the caller supplied no look of its own, which is every case but
+        // the player's own body: a player's appearance comes off the character
+        // list, and a display id cannot answer for it.
+        //
+        // Not part of the cache key, and it must not be: this look is a pure
+        // function of the display id, so `(display_id, 0)` already
+        // distinguishes it from every other. A key that included it would
+        // reload one model per creature *instance*.
+        let npc_look = look.is_none().then(|| self.npc_look(chain, display_id)).flatten();
+        let look = look.or(npc_look.as_ref());
+
         let entry = crate::model::creature(chain, display_id)
             .and_then(|(path, variations)| {
                 crate::model::load_dressed(gpu, chain, &path, &variations, 0, look)
             })
             .map(|loaded| {
+                // A texture that failed to load is a *white* creature, not a
+                // missing one, and white is the one failure that looks
+                // deliberate. `load_dressed` has always collected these and
+                // every caller has always dropped them, so the whole
+                // white-humanoid problem was invisible in the logs -- the same
+                // shape as the packet body this project once refused and threw
+                // away. Named, at warning level, with the display id that
+                // produced it: that is enough to reproduce it offline with
+                // `wow-viewer --creature <id> --screenshot`.
+                if !loaded.missing_textures.is_empty() {
+                    tracing::warn!(
+                        "display {display_id} drew with {} placeholder texture(s): {}",
+                        loaded.missing_textures.len(),
+                        loaded.missing_textures.join(", ")
+                    );
+                }
                 let binds = loaded
                     .textures
                     .iter()
@@ -760,6 +799,28 @@ impl World {
 
         self.entity_cache.insert((display_id, look_key), entry.clone());
         entry
+    }
+
+    /// How a humanoid NPC is dressed, loading the tables on first use.
+    fn npc_look(
+        &mut self,
+        chain: &mut Chain,
+        display_id: u32,
+    ) -> Option<crate::character::Look> {
+        if !self.npc_looks_tried {
+            self.npc_looks_tried = true;
+            let started = Instant::now();
+            self.npc_looks = crate::character::NpcAppearances::load(chain);
+            // Timed because this is the only thing here that reads several
+            // megabytes on a render frame, and because a cost nobody measured
+            // is how a thirty-seven-second login went undiagnosed.
+            tracing::info!(
+                "npc appearance tables loaded in {:?} ({})",
+                started.elapsed(),
+                if self.npc_looks.is_some() { "ok" } else { "unavailable" }
+            );
+        }
+        self.npc_looks.as_ref()?.look(display_id)
     }
 }
 

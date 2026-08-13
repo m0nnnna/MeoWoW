@@ -110,6 +110,25 @@ enum Command {
         race: u8,
         #[arg(long, default_value_t = 1)]
         class: u8,
+        /// Appearance for `--create`. Defaults to all zeros, which is what
+        /// every character this tool has made so far looks like -- and that is
+        /// precisely why these exist. `--appearance` searches the update
+        /// fields for the packed appearance, and a character whose five
+        /// numbers are all zero matches every zero field in the object,
+        /// proving nothing. Give them distinct non-zero values and the search
+        /// identifies both the field *and* the byte order.
+        #[arg(long, default_value_t = 0)]
+        skin: u8,
+        /// Named `--char-face` because `--face` already means a heading to
+        /// turn to.
+        #[arg(long = "char-face", default_value_t = 0)]
+        char_face: u8,
+        #[arg(long, default_value_t = 0)]
+        hair_style: u8,
+        #[arg(long, default_value_t = 0)]
+        hair_color: u8,
+        #[arg(long, default_value_t = 0)]
+        facial_hair: u8,
         /// Delete the named character before listing.
         #[arg(long)]
         delete: Option<String>,
@@ -147,6 +166,15 @@ enum Command {
         /// command like every other format here.
         #[arg(long)]
         units: Option<usize>,
+        /// After entering, find which update field carries the character's
+        /// appearance by searching for the answer the character list gives.
+        ///
+        /// Dressing *other* players needs those five numbers off the wire, and
+        /// the indices that hold them have never been checked against this
+        /// build. A wrong one parses perfectly and gives every stranger the
+        /// wrong face.
+        #[arg(long)]
+        appearance: bool,
         /// After entering, select the nearest unit and tell the server.
         ///
         /// Nothing is sent back, so this proves only that the packet is not
@@ -369,6 +397,11 @@ fn main() -> Result<()> {
             create,
             race,
             class,
+            skin,
+            char_face,
+            hair_style,
+            hair_color,
+            facial_hair,
             delete,
             enter,
             dump_failed,
@@ -377,6 +410,7 @@ fn main() -> Result<()> {
             face,
             stay,
             units,
+            appearance,
             select,
             attack,
             capture,
@@ -397,6 +431,7 @@ fn main() -> Result<()> {
                 face: *face,
                 stay: *stay,
                 units: *units,
+                appearance: *appearance,
                 select: *select,
                 attack: *attack,
                 capture: capture.as_deref(),
@@ -415,6 +450,16 @@ fn main() -> Result<()> {
                 create: create.as_deref(),
                 race: *race,
                 class: *class,
+                look: world::Appearance {
+                    race: *race,
+                    class: *class,
+                    gender: 0,
+                    skin: *skin,
+                    face: *char_face,
+                    hair_style: *hair_style,
+                    hair_color: *hair_color,
+                    facial_hair: *facial_hair,
+                },
                 delete: delete.as_deref(),
                 enter: enter.as_deref(),
                 locale: &cli.locale,
@@ -500,6 +545,10 @@ struct WorldRequest<'a> {
     create: Option<&'a str>,
     race: u8,
     class: u8,
+    /// The full appearance `--create` should ask for, assembled from the
+    /// individual flags so the caller can make a character whose numbers are
+    /// all different -- see the `--skin` flag.
+    look: world::Appearance,
     delete: Option<&'a str>,
     enter: Option<&'a str>,
     dump_failed: Option<&'a std::path::Path>,
@@ -508,6 +557,7 @@ struct WorldRequest<'a> {
     face: Option<f32>,
     stay: u64,
     units: Option<usize>,
+    appearance: bool,
     select: bool,
     attack: bool,
     capture: Option<&'a std::path::Path>,
@@ -537,6 +587,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         create,
         race,
         class,
+        look,
         delete,
         enter,
         dump_failed,
@@ -545,6 +596,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         face,
         stay,
         units,
+        appearance,
         select,
         attack,
         capture,
@@ -601,16 +653,16 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
     }
 
     if let Some(name) = create {
-        let look = world::Appearance {
-            race,
-            class,
-            ..world::Appearance::human_warrior()
-        };
         let code = connection.create_character(name, &look)?;
         println!(
-            "create {name:?} ({} {}): {} ({code:#04x})",
+            "create {name:?} ({} {}, skin {} face {} hair {}/{} facial {}): {} ({code:#04x})",
             world::race_name(race),
             world::class_name(class),
+            look.skin,
+            look.face,
+            look.hair_style,
+            look.hair_color,
+            look.facial_hair,
             world::protocol::describe_char_result(code)
         );
     }
@@ -1004,6 +1056,10 @@ cast {spell_id} at {}",
         if let Some(limit) = units {
             report_units(&state, character.guid, limit);
         }
+
+        if appearance {
+            report_appearance(&state, character);
+        }
     }
     Ok(())
 }
@@ -1353,6 +1409,119 @@ fn report_units(state: &world::WorldState, own_guid: u64, limit: usize) {
         "  power type: 0 mana, 1 rage, 2 focus, 3 energy, 6 runic power.\n  \
          A warrior reading anything but rage means the power array was indexed wrong."
     );
+}
+
+/// Finds which update field carries a player's appearance, by searching for an
+/// answer that is already known from somewhere else.
+///
+/// **This exists because the obvious alternative is the mistake this project
+/// keeps paying for.** The five numbers that describe a character -- skin,
+/// face, hairstyle, hair colour, facial hair -- are packed into two update
+/// fields whose indices are widely documented and have never been checked
+/// against this build here. Transcribing an index from memory produces a
+/// client that parses perfectly and dresses every other player wrongly, and
+/// nothing about the result says which field was misread.
+///
+/// The search is possible because our *own* character's appearance arrives
+/// twice by two unrelated routes: once in `SMSG_CHAR_ENUM`, parsed and
+/// confirmed against a live realm since 3.2, and once in the update fields of
+/// our own player object. So pack the known answer and ask which field holds
+/// it. One match is a measurement; several would mean the question needs
+/// narrowing, and none would mean the packing order is not what was assumed --
+/// all three are more informative than a transcribed constant.
+fn report_appearance(state: &world::WorldState, character: &world::Character) {
+    println!("\nappearance, as the character list reports it:");
+    println!(
+        "  race {} class {} gender {}, skin {} face {} hair {}/{} facial {}",
+        character.race,
+        character.class,
+        character.gender,
+        character.skin,
+        character.face,
+        character.hair_style,
+        character.hair_color,
+        character.facial_hair
+    );
+
+    let Some(own) = state.get(character.guid) else {
+        println!("  our own player object is not in replicated state; nothing to search");
+        return;
+    };
+
+    // The order is the hypothesis under test, not an assumption: if the four
+    // bytes are packed some other way, nothing matches and that is the answer.
+    let packed = u32::from_le_bytes([
+        character.skin,
+        character.face,
+        character.hair_style,
+        character.hair_color,
+    ]);
+    println!(
+        "  searching {} set fields for {packed:#010x} \
+         (skin, face, hair style, hair colour, low byte first)",
+        own.fields.len()
+    );
+
+    let matches: Vec<u16> = own
+        .fields
+        .iter()
+        .filter(|(_, value)| *value == packed)
+        .map(|(index, _)| index)
+        .collect();
+    match matches.as_slice() {
+        [] => println!("  no field holds it -- the packing order is not this"),
+        indices => {
+            for index in indices {
+                println!("  field {index:#x} holds it");
+                // The facial hair lives in the *next* field's low byte in
+                // every account of this layout, so report what is actually
+                // there rather than assuming it.
+                if let Some(next) = own.fields.get(index + 1) {
+                    let bytes = next.to_le_bytes();
+                    println!(
+                        "    field {:#x} is {next:#010x}, bytes {bytes:?}; \
+                         facial hair from the character list is {}",
+                        index + 1,
+                        character.facial_hair
+                    );
+                }
+            }
+        }
+    }
+
+    // Worth printing whether or not the search succeeded: a second player is
+    // the case this is all for, and their fields either carry the same shape
+    // or the search proved nothing about anyone but us.
+    for entity in state.players() {
+        if entity.guid == character.guid {
+            continue;
+        }
+        let at = |index: u16| {
+            entity
+                .fields
+                .get(index)
+                .map(|v| format!("{v:#010x} {:?}", v.to_le_bytes()))
+                .unwrap_or_else(|| "unset".into())
+        };
+        println!("  another player {:#x}:", entity.guid);
+        // The constants the search settled on, always -- not only the indices
+        // that matched *this* character. A stranger whose appearance fields
+        // never arrived and one whose fields we read from the wrong place look
+        // identical from the outside, and only the raw values separate them.
+        for index in [
+            world::update::fields::PLAYER_BYTES,
+            world::update::fields::PLAYER_BYTES_2,
+        ] {
+            println!("    field {index:#x} = {}", at(index));
+        }
+        match entity.appearance() {
+            Some(look) => println!(
+                "    reads as skin {} face {} hair {}/{} facial {}",
+                look.skin, look.face, look.hair_style, look.hair_color, look.facial_hair
+            ),
+            None => println!("    no appearance could be read -- this player renders white"),
+        }
+    }
 }
 
 /// Replicated units other than the player, nearest first.
@@ -2955,14 +3124,20 @@ fn dbc_rows(chain: &mut Chain, table: &str, limit: usize, ids: &[u32]) -> Result
         Map,
         AreaTable,
         CreatureDisplayInfo,
+        CreatureDisplayInfoExtra,
         CreatureModelData,
         AnimationData,
         Spell,
         SpellIcon,
         SkillLineAbility,
         SpellDuration,
-        SpellRadius
+        SpellRadius,
+        CharSections,
+        CharHairGeosets
     )
+    // `CharacterFacialHairStyles` is deliberately absent: it has no id column
+    // at all -- race, gender and variation are its key -- so it cannot satisfy
+    // the `--id` filter every table here shares. `dbc check` still covers it.
 }
 
 fn dbc_check(chain: &mut Chain) -> Result<()> {
@@ -3000,11 +3175,15 @@ fn dbc_check(chain: &mut Chain) -> Result<()> {
         Map,
         AreaTable,
         CreatureDisplayInfo,
+        CreatureDisplayInfoExtra,
         CreatureModelData,
         AnimationData,
         Spell,
         SpellDuration,
-        SpellRadius
+        SpellRadius,
+        CharSections,
+        CharHairGeosets,
+        CharacterFacialHairStyles,
     );
     println!();
     if failures == 0 {

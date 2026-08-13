@@ -142,6 +142,57 @@ impl Entity {
         self.object_type == ObjectType::Player
     }
 
+    /// How this player looks, for a client that has to draw them.
+    ///
+    /// `None` for anything that is not a player, and for a player whose
+    /// appearance fields have not arrived: a creature's looks come from its
+    /// display id instead, and inventing an appearance for one would dress a
+    /// wolf as a night elf.
+    ///
+    /// Reuses [`crate::Appearance`], the same struct character *creation*
+    /// sends, because they are the same five numbers travelling the other way.
+    /// One definition means the packing this reads is the packing that is
+    /// written -- the round-trip rule this project applies to every structure
+    /// that travels both ways.
+    pub fn appearance(&self) -> Option<crate::Appearance> {
+        if !self.is_player() {
+            return None;
+        }
+        // **An absent field is a zero, not an unknown.** An object-create block
+        // carries only the fields whose values are not zero, so a character
+        // with the default appearance -- skin 0, face 0, hairstyle 0, colour 0
+        // -- has no `PLAYER_BYTES` in it at all, while `PLAYER_BYTES_2` still
+        // arrives because its upper bytes hold rest state. Refusing on absence
+        // therefore leaves exactly the plainest-looking players white, and the
+        // first version of this did.
+        //
+        // Both directions were observed: a character deliberately created with
+        // five non-zero numbers replicates `PLAYER_BYTES` as `0x02070503`, and
+        // one created with the all-zero default does not replicate it at all.
+        // The field appears exactly when it is non-zero, which is what makes
+        // "missing" readable as zero rather than as a dropped update.
+        let bytes = self
+            .fields
+            .get(crate::update::fields::PLAYER_BYTES)
+            .unwrap_or(0)
+            .to_le_bytes();
+        let bytes_2 = self
+            .fields
+            .get(crate::update::fields::PLAYER_BYTES_2)
+            .unwrap_or(0)
+            .to_le_bytes();
+        Some(crate::Appearance {
+            race: self.race()?,
+            class: self.class()?,
+            gender: self.gender()?,
+            skin: bytes[0],
+            face: bytes[1],
+            hair_style: bytes[2],
+            hair_color: bytes[3],
+            facial_hair: bytes_2[0],
+        })
+    }
+
     /// Clears any monster-move path in flight.
     ///
     /// Called whenever a fresher, authoritative position arrives -- a relayed
@@ -2039,6 +2090,102 @@ mod tests {
         let started = entity.move_started.unwrap();
         let speed = entity.move_speed(started).expect("a move is in flight");
         assert!((speed - 5.0).abs() < 1e-3, "got {speed}, expected the 3-4-5 hypotenuse");
+    }
+
+    /// The five appearance numbers unpack in the order the live search
+    /// confirmed, and only for players.
+    ///
+    /// The constant here is the one `wow-cli world --appearance` matched on a
+    /// character deliberately created with five different values -- so this
+    /// test fails if anyone reorders the bytes, which is the mistake that would
+    /// otherwise show up as strangers having the wrong hair.
+    #[test]
+    fn a_players_appearance_unpacks_in_the_measured_order() {
+        use crate::update::fields;
+
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            7,
+            ObjectType::Player,
+            Some(at(0.0, 0.0)),
+            &[
+                // race 1, class 1, gender 0, power type 1.
+                (fields::UNIT_BYTES_0, u32::from_le_bytes([1, 1, 0, 1])),
+                // The exact value observed on the live realm for a character
+                // created as skin 3, face 5, hair 7, colour 2.
+                (fields::PLAYER_BYTES, 0x0207_0503),
+                (fields::PLAYER_BYTES_2, 0x0200_0004),
+            ],
+        )]);
+
+        let look = world.get(7).unwrap().appearance().expect("a player");
+        assert_eq!(
+            (look.skin, look.face, look.hair_style, look.hair_color),
+            (3, 5, 7, 2)
+        );
+        assert_eq!(look.facial_hair, 4);
+        assert_eq!((look.race, look.class, look.gender), (1, 1, 0));
+    }
+
+    /// A player whose appearance is entirely default has no `PLAYER_BYTES`
+    /// field at all, and must still read as a valid appearance.
+    ///
+    /// This is the bug that shipped in the first version and was found by
+    /// looking at a live stranger's fields: an object-create block omits zero
+    /// values, so refusing on absence left every plainest-looking player white
+    /// -- the exact bug the field was added to fix.
+    #[test]
+    fn an_absent_appearance_field_reads_as_the_default_look() {
+        use crate::update::fields;
+
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            7,
+            ObjectType::Player,
+            Some(at(0.0, 0.0)),
+            &[
+                (fields::UNIT_BYTES_0, u32::from_le_bytes([1, 1, 0, 1])),
+                // Exactly what the realm sends for a default-looking player:
+                // no PLAYER_BYTES, and a PLAYER_BYTES_2 that is non-zero only
+                // in its upper bytes.
+                (fields::PLAYER_BYTES_2, 0x0200_0000),
+            ],
+        )]);
+
+        let look = world
+            .get(7)
+            .unwrap()
+            .appearance()
+            .expect("a default appearance is still an appearance");
+        assert_eq!(
+            (
+                look.skin,
+                look.face,
+                look.hair_style,
+                look.hair_color,
+                look.facial_hair
+            ),
+            (0, 0, 0, 0, 0)
+        );
+    }
+
+    /// A creature has no appearance to read: its looks come from its display
+    /// id, and answering for one would dress a wolf as a night elf.
+    #[test]
+    fn a_creature_has_no_player_appearance() {
+        use crate::update::fields;
+
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            7,
+            ObjectType::Unit,
+            Some(at(0.0, 0.0)),
+            &[
+                (fields::UNIT_BYTES_0, u32::from_le_bytes([1, 1, 0, 1])),
+                (fields::PLAYER_BYTES, 0x0207_0503),
+            ],
+        )]);
+        assert!(world.get(7).unwrap().appearance().is_none());
     }
 
     /// A stop (`to: None`) must read as not moving, the same as a move that

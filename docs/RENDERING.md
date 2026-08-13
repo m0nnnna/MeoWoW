@@ -603,14 +603,106 @@ in `cargo test` -- only in watching the window while a second client moved.
 
 ### What still looks wrong
 
-Humanoid NPCs render white. Character models composite their skin at runtime
-from `CharSections.dbc` — body, face, hair and equipment baked into one texture
-— and that compositor does not exist yet. Creature models are unaffected,
-because their skins are named outright in `CreatureDisplayInfo`; a critter next
-to a white night elf is the same code path working correctly on both.
+~~Humanoid NPCs render white.~~ Fixed; see "Everyone has a skin now" below.
+The diagnosis recorded here was also wrong in an instructive way, so it is kept:
+it said a runtime compositor was needed, when in fact an artist had already
+composed every one of those textures and shipped them in the archives.
 
 Facing uses the same quarter-turn offset as the doodad path, on the reasoning
 that the offset is a property of where an M2's forward axis points rather than
 of where the angle came from. Position is what these screenshots really assert;
 facing is inferred from that consistency and has not been checked against a
 reference client.
+
+### Everyone has a skin now
+
+Two different populations rendered as white ghosts, for two different reasons,
+and only one of them was the reason previously written down here.
+
+**Humanoid NPCs: the texture was already composed, by an artist.** The note
+above assumed a runtime compositor was needed, because that is what a *player*
+needs. It is not what an NPC needs. `CreatureDisplayInfo.extended_display_info_id`
+points at `CreatureDisplayInfoExtra`, whose `bake_name` column names a finished
+texture of the whole character — armour, tabard, face and all — under
+`Textures\BakedNpcTextures\`. Nothing to blend; one texture load.
+
+The scale of it is worth stating: **15,446 of build 12340's 24,262 display ids
+have an extended row and no texture variation of their own.** 64% of every
+creature appearance in the game had no skin from anywhere this client looked.
+Guards, innkeepers, quest givers — every humanoid that is not a beast.
+
+Two measurements made this safe to write rather than guess:
+
+- The columns were confirmed by *consistency*, not transcription. Group every
+  extra row by its race and gender columns and ask which model the displays
+  pointing at it actually use: 33 groups, each dominated by exactly the
+  matching character model — race 1 male by `HumanMale.mdx` 2,133 times, race
+  20 male by `NorthrendSkeletonMale.mdx` 30 times, through all 21 races. The
+  tail of one to five rows per group is the data reusing an extra row across
+  displays, not a column meaning something else.
+- **The bakes are in the archives but not in the listfile.** `wow-cli ls
+  BakedNpcTextures` shows 50 of them, and a coverage check built on that
+  listing concluded that 0.1% of bake names ship — which would have killed the
+  whole approach. MPQ resolves by hash, not by listing: 40 of 40 randomly
+  sampled names read back fine. *Listing a directory and reading a path are
+  different questions*, and the cheap one answered the wrong one.
+
+**Other players: the appearance is on the wire, at an index worth measuring.**
+A player's display id is 49 for every human male alive and its
+`CreatureDisplayInfo` row is empty, so a stranger's five character-creation
+numbers have to come from their update fields — `PLAYER_BYTES` and
+`PLAYER_BYTES_2`. Transcribing those indices from memory produces a client that
+parses perfectly and gives every stranger the wrong face.
+
+So they were searched for instead. The same five numbers arrive twice by
+unrelated routes — `SMSG_CHAR_ENUM`, confirmed against a live realm since 3.2,
+and the update fields — so `wow-cli world --enter <name> --appearance` packs the
+character list's answer and asks which field holds it.
+
+The first two runs returned *two* candidates and settled nothing, because every
+character this project had ever created was made with an all-zero appearance,
+and a search for zero matches every zero field in the object. That is the
+"a property test is only as good as the population you run it against" rule
+arriving for the third time. `--create` therefore grew appearance flags, and a
+character made with five *different* non-zero values matched exactly one field,
+holding `0x02070503` — which pins the byte order as well as the index, since any
+other packing would have matched nothing.
+
+**Then the same tooling found the bug in the first version of the fix.** A
+stranger standing in Northshire was still white, and `--appearance` said why:
+field `0x99` *unset*, field `0x9a` present. **An absent update field is a zero,
+not an unknown** — a create block carries only non-zero values, so a character
+with the default appearance has no `PLAYER_BYTES` at all, while
+`PLAYER_BYTES_2` still arrives because its upper bytes hold rest state.
+Refusing on absence left exactly the plainest-looking players white, which is
+the bug the field was added to fix. Both directions were then observed: the
+field appears when non-zero and is omitted when zero.
+
+Verified end to end through the two-client rig, which is the strongest shape
+available here: a character was *created* on one account with skin 3, face 5,
+hair 7, colour 2, facial hair 4, and a viewer logged in on the *other* account
+read those exact five numbers back out of the update fields and resolved them to
+`HumanMaleSkin00_03.blp` and `Hair02_02.blp`. The appearance went out through
+character creation, through the server, and back in through a different client's
+update stream — the write and the read confirmed against each other via a third
+party that had to understand both.
+
+The measurable end state, on one Northshire scene of 17 drawn entities: **no
+entity has an unfilled body texture.** Before, exactly one did, and that one
+number is a better regression test than any screenshot — which is why
+`World::entity_model` now warns, with the display id and the slot, whenever a
+model draws against a placeholder. `load_dressed` had always collected that list
+and every caller had always dropped it, so the entire white-humanoid problem was
+invisible in the logs. Same shape as the packet body this project once refused
+and threw away.
+
+What is still unfilled in that scene is slot type 2 — the object/item skin,
+which is equipment — and slot 6 on models whose hair geoset is bald. Equipment
+geometry and its textures are the next piece; `CreatureDisplayInfoExtra` already
+carries eleven item display ids per NPC, read and named but unused.
+
+Player hair was reported missing and is not: human-male hairstyle 0 is *bald*.
+`CharHairGeosets` maps only variation 0 to geoset 0, and all thirteen colours of
+`CharSections` type 3 for that variation have an empty texture. The character
+being looked at simply had no hair. A character created with hairstyle 7 draws
+its hair correctly.
