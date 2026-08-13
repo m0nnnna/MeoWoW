@@ -14,6 +14,7 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
 | Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated *creatures* slide along their actual path, turn to face it, and play the model's own walk/stand cycles. **Other players do not** — see the known defect below |
 | Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, `F1` to rearrange, saved to `ui.toml` |
+| World | Lighting and the day/night cycle come from `Light.dbc`'s curves and the realm's own clock: real sun, ambient and sky colour, dawn through midnight. Game objects — doors, benches, chests, ships — are drawn |
 | Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components; equipment *geometry* (sleeves, boot tops, weapons, shoulders) is not drawn yet, and other players' equipment needs their visible-item fields |
 | Game | **4.3 done**: spellbook, three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. Spell damage, threat and the corpse flow remain. Inventory and quests follow |
 
@@ -343,6 +344,13 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   at three hundred pixels. The render was right and the *look* at it was wrong,
   which is the inverse of the usual failure here and just as expensive. Anything
   assembled in memory from a dozen files gets a dump command.
+- **Validity is nearly free; *variation* is the discriminator.** Two update
+  fields both resolved 100% to real `GameObjectDisplayInfo` rows, because the
+  table is 39% dense and any small integer lands in it. One was the constant 33
+  -- the type mask -- and would have drawn thirty-two identical powder kegs;
+  the other took seven values that came out as inn benches in the abbey the
+  player was standing in. When a candidate column and a control both look
+  valid, ask whether the candidate *varies the way the thing it names varies*.
 - **Listing a directory and reading a path are different questions.** An MPQ
   resolves by hash, so a file absent from `(listfile)` still reads perfectly.
   A coverage check for the baked NPC textures built on `wow-cli ls` concluded
