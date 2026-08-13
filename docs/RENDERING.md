@@ -372,9 +372,39 @@ waiting for the pong. `Connection::ping` -- fine in a CLI, where the round trip
 the live realm, and up to the full read timeout if the server stalls, every
 `PING_INTERVAL`. The next frame's `drain` collects the echo instead.
 
-Z is left exactly as the server last reported it and never re-derived from
-terrain: walking across sloped ground floats or sinks the character, which is
-expected until height-following exists.
+Z follows the terrain. The keys drive the two horizontal axes; the altitude is
+then read back out of the height field the ground is drawn from
+(`World::height_at`, which resolves a position to its tile, its chunk and the
+surface inside it) rather than kept at whatever the server last reported.
+
+Carrying a stale Z presented as four apparently unrelated faults, which is
+worth recording because none of them pointed at altitude: the character sank
+into rising ground; the click marker landed off-centre, the picking ray
+starting from an eye that is a fixed offset above a wrong altitude; hills could
+not be walked up; and *another* client saw this one twitch, as the server
+corrected an altitude that had been wrong for a while. One cause, four bug
+reports.
+
+The height field is sampled the way it is drawn -- four triangles fanning from
+each cell's inner-lattice sample, not a bilinear patch across the outer four --
+so the ground a character stands on is the ground it can see. See
+`adt::height_in_chunk`, and `wow-cli adt height <map> --x= --y=` to ask about
+any position offline.
+
+What confirmed it was not the render: the human starting position the realm
+reports at login, `-8950.0, -132.5, 83.5`, against `wow-cli adt height Azeroth
+--x=-8950.0 --y=-132.5`, which answers **83.528** from the map files alone. Two
+derivations that share nothing -- one a value stored on a server, one an
+interpolation over an ADT -- agreeing to three centimetres. The offline version
+of the same check is in `crates/adt`'s real-data tests: a tile's doodads were
+placed by an artist standing them on this surface, and 706 of Northshire's 759
+sit within a unit of it, with a median offset of zero.
+
+Jumping, falling and collision are still absent, and so is standing on anything
+that is not terrain -- a bridge or an upper floor is WMO geometry, which
+nothing here can be asked about yet. Where the ADT describes no terrain at all
+(a hole, punched for a doorway or a cave mouth) the altitude is left alone
+rather than guessed.
 
 ### Drawing the replicated world
 
@@ -446,20 +476,43 @@ much larger population ever makes `set_entities` measurably expensive, the fix
 is updating existing instances' transforms in place rather than reallocating
 every buffer -- not reintroducing the same timer.
 
-**Animation is per-(display id, moving) bucket, not per display id.** Several
+**Animation is per-(display id, motion) bucket, not per display id.** Several
 instances routinely share one display id -- a zone's wolves, say -- and in a
 populated zone at least one of a given species is almost always moving.
 Animating or not animating a whole display id together is wrong either way:
 gate on "any instance moving" and every standing wolf plays the walk cycle
 forever; gate on "all instances moving" and a genuinely moving one stands
-rigid. `set_entities` splits each display id into up to two groups -- a moving
-bucket playing the model's walk sequence, a standing bucket playing its stand
-sequence -- each with its own instance buffer and its own bone buffer, keyed
-by `(display id, moving)`. The split is nearly free: the model itself is still
+rigid. `set_entities` splits each display id into up to three groups -- one per
+`Motion` -- each with its own instance buffer and its own bone buffer, keyed by
+`(display id, motion)`. The split is nearly free: the model itself is still
 cached by display id alone in `entity_cache`, so drawing a second bucket for
-one species is a clone of the same `Rc`, not a second load. Sequence ids (4 for
-walk, 0 for stand) come from `AnimationData.dbc`'s public row layout, the same
-convention for every 3.3.5a model.
+one species is a clone of the same `Rc`, not a second load. Sequence ids (0 for
+stand, 4 for walk, 5 for run) come from `AnimationData.dbc`'s public row
+layout, the same convention for every 3.3.5a model.
+
+**Three buckets rather than two, because "moving" does not say which cycle.**
+A wolf padding along a patrol route and a wolf charging you are both simply
+*moving*, and one flag has to pick a single cycle for both: walk, and the
+charge is dragged along by its own legs; run, and the patrol skates ahead of
+them. What separates them is a speed, and a speed is not on the wire either --
+`SMSG_MONSTER_MOVE` carries two endpoints and a duration, and the speed fields
+in a unit's update block say what it *can* do, not what it is doing.
+`Entity::move_speed` divides the one by the other, which is the only statement
+about the move actually in flight, and `Motion::from_speed` splits at 4.75
+units per second: the midpoint of 3.3.5a's 2.5 walk and 7.0 run, which also
+leaves the 4.5 backing-up speed on the walking side. A model with no run
+sequence falls back to its walk one rather than to the bind pose; nothing falls
+back as far as standing, which would be the "creature walking on the spot" bug
+inverted. `sequence_for` resolves that fallback for both `set_entities` (which
+creates the bone buffer) and `update_animations` (which writes the pose into
+it), so the two cannot disagree about which sequence a bucket is playing --
+a disagreement that would not error anywhere, just quietly pose one cycle into
+a buffer drawn as another.
+
+The player's own body takes the same path, from the keys rather than the wire:
+the server never relays our movement back to us. `LIVE_RUN_SPEED` is 7.0, which
+is the *run* speed -- 3.3.5a walks at 2.5, and walking is a toggle nothing here
+sends -- so holding W now runs rather than walking at run speed.
 
 **A deferral the bucket split does not fix: every instance in one bucket
 shares one pose.** One bone buffer per `(display id, moving)` key means one

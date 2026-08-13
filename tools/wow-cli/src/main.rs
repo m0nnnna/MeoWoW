@@ -225,6 +225,18 @@ enum AdtCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Ground height at a world position, the way the viewer resolves it.
+    ///
+    /// Takes network coordinates -- the ones the server reports and the ones
+    /// the viewer walks in -- not the permuted form placements are stored in.
+    Height {
+        map: String,
+        /// Clap reads a bare negative number as a flag, so pass `--x=-8950`.
+        #[arg(long, allow_hyphen_values = true)]
+        x: f32,
+        #[arg(long, allow_hyphen_values = true)]
+        y: f32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1519,10 +1531,24 @@ fn hold_connection(
             // the sampling above: polling can only see as many positions as it
             // takes snapshots, whereas this counts every update actually
             // applied.
+            // Altitude is printed as well as the two horizontal axes, and the
+            // distance stays horizontal. The client drives Z off the terrain
+            // now, so what the *server* relays about another player's altitude
+            // is a thing worth being able to read -- and a check against
+            // `wow-cli adt height` at the same x,y, which is the one comparison
+            // that can say whether an altitude this client sent was accepted or
+            // quietly corrected.
             Some((first, last, distance)) => println!(
-                "  player {:#x}: {:.1}, {:.1} -> {:.1}, {:.1} ({distance:.1} units over \
-                 {} applied updates)",
-                entity.guid, first.x, first.y, last.x, last.y, entity.updates
+                "  player {:#x}: {:.1}, {:.1}, {:.1} -> {:.1}, {:.1}, {:.1} \
+                 ({distance:.1} units over {} applied updates)",
+                entity.guid,
+                first.x,
+                first.y,
+                first.z,
+                last.x,
+                last.y,
+                last.z,
+                entity.updates
             ),
             None => println!("  player {:#x}: no position replicated", entity.guid),
         }
@@ -1694,7 +1720,64 @@ fn adt_cmd(chain: &mut Chain, cmd: AdtCommand) -> Result<()> {
         AdtCommand::Map { map } => adt_map(chain, &map),
         AdtCommand::Tile { map, x, y, limit } => adt_tile(chain, &map, x, y, limit),
         AdtCommand::Survey { map, limit } => adt_survey(chain, map.as_deref(), limit),
+        AdtCommand::Height { map, x, y } => adt_height(chain, &map, x, y),
     }
+}
+
+/// Resolves a world position to its tile, its chunk and the ground under it.
+///
+/// The point of printing every step rather than just the answer: a height that
+/// is wrong because the position landed on the wrong *tile* and one that is
+/// wrong because the interpolation is wrong look identical as a single number,
+/// and want completely different investigations.
+fn adt_height(chain: &mut Chain, map: &str, x: f32, y: f32) -> Result<()> {
+    // Both axes run inwards from the grid corner, and they swap: see
+    // `docs/RENDERING.md`.
+    let tile = (
+        (32.0 - y / adt::TILE_SIZE).floor() as i64,
+        (32.0 - x / adt::TILE_SIZE).floor() as i64,
+    );
+    println!("{map} at {x:.2}, {y:.2}");
+    println!("  tile {},{}", tile.0, tile.1);
+    if !(0..adt::TILES_PER_MAP as i64).contains(&tile.0)
+        || !(0..adt::TILES_PER_MAP as i64).contains(&tile.1)
+    {
+        anyhow::bail!("that position is off the {map} grid");
+    }
+
+    let wdt = load_wdt(chain, map)?;
+    if !wdt.has_tile(tile.0 as usize, tile.1 as usize) {
+        anyhow::bail!("{map} has no tile at {},{}", tile.0, tile.1);
+    }
+    let path = adt::tile_path(map, tile.0 as usize, tile.1 as usize);
+    let bytes = chain.read(&path).with_context(|| format!("reading {path}"))?;
+    let parsed = adt::Adt::parse(&bytes, wdt.big_alpha())?;
+
+    // Whichever chunk's footprint contains the point, found by asking rather
+    // than by indexing: this is a tool for checking the convention, so it
+    // should not assume it.
+    let found = parsed
+        .chunks
+        .iter()
+        .enumerate()
+        .find_map(|(i, chunk)| chunk.height_at(x, y).map(|h| (i, chunk, h)));
+    match found {
+        Some((index, chunk, height)) => {
+            println!(
+                "  chunk {index} (stored index {},{}) with origin {:.2}, {:.2}, {:.2}",
+                chunk.index.0, chunk.index.1, chunk.position[0], chunk.position[1], chunk.position[2]
+            );
+            println!("  ground at {height:.3}");
+        }
+        None => {
+            // A hole is the ordinary reason, and worth saying so: it means the
+            // ADT genuinely describes no terrain there, not that anything
+            // failed.
+            let holed = parsed.chunks.iter().filter(|c| c.holes != 0).count();
+            println!("  no ground here -- a hole, or off this tile ({holed} chunks on the tile have holes)");
+        }
+    }
+    Ok(())
 }
 
 /// Loads a map's WDT, which is where the alpha-map storage flag lives.

@@ -283,14 +283,14 @@ fn build_live_scene(
 
     if args.entities {
         let placements: Vec<world::EntityPlacement> =
-            drawable_with_own(&live, false)
+            drawable_with_own(&live, 0.0)
                 .iter()
                 .map(|entity| world::EntityPlacement {
                     display_id: entity.display_id,
                     position: entity.position,
                     orientation: entity.orientation,
                     scale: entity.scale,
-                    moving: entity.moving,
+                    speed: entity.speed,
                     // Only our own body is dressed; everything else takes its
                     // appearance from its display id.
                     look: (entity.guid == live.guid).then(|| live.look.clone()),
@@ -394,7 +394,11 @@ const LIVE_HEARTBEAT_EVERY: Duration = Duration::from_millis(100);
 
 /// Units per second on foot. Not tunable from the command line: it is a
 /// property of the character, not the viewer.
-const LIVE_WALK_SPEED: f32 = 7.0;
+///
+/// 7.0 is the *run* speed -- 3.3.5a walks at 2.5, and walking is a toggle
+/// nothing here sends -- which is why the character's own body draws with the
+/// run cycle. See `crate::world::Motion`.
+const LIVE_RUN_SPEED: f32 = 7.0;
 
 /// Radians per second turned by the A/D keys. Not verified against a
 /// reference client -- see the facing note in `docs/RENDERING.md` -- but close
@@ -1356,16 +1360,16 @@ fn action_slot(code: KeyCode) -> Option<usize> {
 /// the picking ray already follows by unprojecting the matrix the scene was
 /// drawn with.
 ///
-/// `moving` is the caller's own movement state rather than anything read back
+/// `speed` is the caller's own movement state rather than anything read back
 /// from the server -- see [`live::own_entity`].
-fn drawable_with_own(live: &live::LiveWorld, moving: bool) -> Vec<live::Entity> {
+fn drawable_with_own(live: &live::LiveWorld, speed: f32) -> Vec<live::Entity> {
     let mut entities = live::drawable_entities(&live.state, live.guid);
     if let Some(own) = live::own_entity(
         &live.state,
         live.guid,
         live.position,
         live.orientation,
-        moving,
+        speed,
     ) {
         entities.push(own);
     }
@@ -1847,18 +1851,25 @@ impl App {
             // timer again.
             if self.args.entities {
                 if let Some(live) = &self.live {
-                    let moving = self.live_move.is_some();
+                    // The keys, not the wire: the server never relays our own
+                    // movement back to us. Held means running -- there is no
+                    // walk toggle here, and `LIVE_RUN_SPEED` is the run speed.
+                    let speed = if self.live_move.is_some() {
+                        LIVE_RUN_SPEED
+                    } else {
+                        0.0
+                    };
                     // F2. See `App::entity_flip`.
                     let flip = if self.entity_flip { std::f32::consts::PI } else { 0.0 };
                     let placements: Vec<crate::world::EntityPlacement> =
-                        drawable_with_own(live, moving)
+                        drawable_with_own(live, speed)
                             .iter()
                             .map(|entity| crate::world::EntityPlacement {
                                 display_id: entity.display_id,
                                 position: entity.position,
                                 orientation: entity.orientation + flip,
                                 scale: entity.scale,
-                                moving: entity.moving,
+                                speed: entity.speed,
                                 look: (entity.guid == live.guid)
                                     .then(|| live.look.clone()),
                                 look_key: if entity.guid == live.guid {
@@ -1983,10 +1994,20 @@ impl App {
     /// Turns and walks the live character from held keys, sending whatever the
     /// movement stream requires, and keeps the camera behind it.
     ///
-    /// Terrain height, jumping and collision are out of scope here: Z is
-    /// whatever the server last reported, so walking across sloped ground
-    /// leaves the character floating or sinking. That is expected, not a bug
-    /// -- see the movement section of `docs/PROTOCOL.md`.
+    /// Altitude follows the terrain: the two horizontal axes come from the
+    /// keys, and Z is then read back out of the height field the ground is
+    /// drawn from (see [`crate::world::World::height_at`]) rather than left at
+    /// whatever the server last reported. Carrying a stale Z looked like four
+    /// unrelated faults -- the character sinking into rising ground, a click
+    /// marker landing off-centre because the picking ray starts at the eye and
+    /// the eye is a fixed offset from a wrong altitude, hills refusing to be
+    /// walked up, and *another* client seeing this one twitch as the server
+    /// corrected an altitude that had been wrong for a while.
+    ///
+    /// Jumping, falling and collision remain out of scope, and so does
+    /// standing on anything that is not terrain: a bridge or an upper floor is
+    /// WMO geometry, which nothing here can be asked about. See the movement
+    /// section of `docs/PROTOCOL.md`.
     fn drive_live_movement(&mut self) {
         use ::world::update::movement_flags;
         use ::world::{ClientOpcode, MovementInfo, Position};
@@ -2020,8 +2041,32 @@ impl App {
         if let Some(heading) = desired {
             let (dx, dy) = (live.orientation.cos(), live.orientation.sin());
             let sign = if heading == LiveMove::Forward { 1.0 } else { -1.0 };
-            live.position.x += dx * LIVE_WALK_SPEED * sign * dt;
-            live.position.y += dy * LIVE_WALK_SPEED * sign * dt;
+            live.position.x += dx * LIVE_RUN_SPEED * sign * dt;
+            live.position.y += dy * LIVE_RUN_SPEED * sign * dt;
+        }
+
+        // Stand on the ground under wherever those two axes put us.
+        //
+        // Every frame, not only while a key is held: the tile the character is
+        // standing on may only have finished streaming in this frame, and the
+        // very first sample -- the one that fixes the altitude the server sent
+        // at login -- would otherwise wait for the player to press something.
+        //
+        // Assigned rather than clamped upward. Upward alone fixes sinking into
+        // a hill and does nothing for the walk back down it, leaving the
+        // character hanging in the air over the valley with no way back to the
+        // ground. With no jumping or falling modelled, the feet are on the
+        // terrain or the position is wrong.
+        //
+        // `None` -- the tile is not resident yet, or this is a hole in the
+        // terrain -- deliberately leaves Z alone rather than substituting
+        // anything. The server's altitude is stale, but it is a real place; a
+        // guess is not.
+        if let Some(Scene::Streaming(world)) = self.renderer.as_ref().and_then(|r| r.scene.as_ref())
+        {
+            if let Some(ground) = world.height_at(live.position.x, live.position.y) {
+                live.position.z = ground;
+            }
         }
 
         let position = Position {
@@ -2306,7 +2351,11 @@ impl App {
         // Rebuilt rather than cached: the same interpolated positions the
         // renderer drew this frame, so a click hits where the creature looks
         // like it is rather than where it last reported being.
-        let entities = drawable_with_own(live, self.live_move.is_some());
+        // The speed only chooses an animation, which a click test does not care
+        // about -- but the same list has to come out here as the renderer drew,
+        // so it is passed the same way rather than left at a default.
+        let speed = if self.live_move.is_some() { LIVE_RUN_SPEED } else { 0.0 };
+        let entities = drawable_with_own(live, speed);
         let picked = hud::pick(&ray, &entities, &|display_id| world.entity_bounds(display_id));
 
         self.set_target(picked);

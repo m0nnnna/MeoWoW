@@ -1069,3 +1069,95 @@ appears-only-while-relevant behaviour the same way
 `a_cooldown_darkens_the_slot` pins the sweep -- painting more shapes at
 `0.6` progress than at `0.0` is proof the fill reached the screen, not only
 that the arithmetic behind it was right.
+
+### The character stands on the ground, and four reports were one bug
+
+Altitude had been left at whatever the server last reported since 3.4 -- an
+explicit deferral, written down in `docs/RENDERING.md` as expected until
+height-following existed. What made it worth doing now was not the deferral
+coming due. It was that **four separate things reported as wrong turned out to
+be the same missing feature**, and not one of them said "altitude":
+
+- the character sinking into the ground;
+- the click marker landing off-centre -- the picking ray starts at the eye, and
+  the eye is a fixed offset from a position whose Z was wrong;
+- walking *into* hills rather than up them;
+- another client watching this one twitch, as the server corrected an altitude
+  that had been drifting for a while.
+
+That is the mirror of a rule already in `CLAUDE.md` -- two bugs can share one
+symptom, so a symptom that survives a fix may have a second cause -- and the
+reverse is just as expensive: four symptoms with one cause invite four separate
+investigations, three of which are into things that were never broken. The
+click marker in particular reads as a picking-ray bug, which is where the
+search would have gone.
+
+`World::height_at` resolves a position to its tile, its chunk and the surface
+inside it. **The interpolation lives in `crates/adt`, not the viewer**, because
+the awkward part is the lattice convention that crate already documents: 145
+samples per chunk, a 9x9 outer grid interleaved with an 8x8 inner one at the
+cell centres, both axes running inwards from the chunk's corner. Sampling is
+the *drawn* surface -- four triangles fanning from each cell's inner sample,
+matching `emit_chunk_indices` -- rather than a bilinear patch across the outer
+four, which would ignore the inner sample and flatten every ridge running
+through a cell centre. A character standing a little above or below ground it
+can see reads as the terrain being wrong, not as two different surfaces.
+
+**Holes return `None`, and so does a tile that is not resident.** Both mean the
+same thing to the caller and get the same treatment: leave the altitude alone.
+The server's Z is stale, but it is a real place; a guess is not. A hole is a
+doorway or a cave mouth, where the floor is WMO geometry nothing here can yet
+be asked about.
+
+**What confirmed it was not a screenshot.** Three checks, none of which needs a
+window, and the strongest of them needs nothing but the map files:
+
+- 37,080 of a real tile's 37,120 height samples resolve to their own recorded
+  vertex position -- the remaining 40 fall in genuine holes. That pins the
+  index convention against `vertex_position`, which is what the renderer builds
+  its mesh from.
+- Northshire's doodads were placed by an artist standing them on this surface,
+  and they arrive through a different chunk of the file in a different
+  coordinate convention. 706 of 759 sit within a unit of the interpolated
+  ground; the median offset is zero. An axis swap does not shift that median by
+  a metre, it destroys the relationship.
+- The realm reports the human starting position as `-8950.0, -132.5, 83.5`.
+  `wow-cli adt height Azeroth --x=-8950.0 --y=-132.5` answers **83.528** from
+  the map files alone. Two derivations sharing nothing -- one a value stored on
+  a server, one an interpolation over an ADT -- agreeing to three centimetres.
+
+The CLI command exists for the same reason every other format got one first:
+"the height is wrong" and "the position landed on the wrong tile" are the same
+observation until something separates them, and `adt height` prints the tile
+and the chunk it went through, not just the answer.
+
+### Running, walking and standing
+
+The same rebuild now picks between three cycles instead of two. `moving` as a
+flag could not choose: a wolf on patrol and a wolf charging are both moving,
+and committing to one cycle for both is wrong either way round -- walk, and the
+charge is dragged along by its own legs; run, and the patrol skates ahead of
+them.
+
+**The speed is not on the wire.** `SMSG_MONSTER_MOVE` carries two endpoints and
+a duration; the speed fields in a unit's update block describe what it is
+*capable* of, which is not what it is doing -- a creature ambling home moves at
+a fraction of its run speed without either number changing.
+`Entity::move_speed` divides the path by its duration, which is the only
+statement about the move actually in flight, and is the same pair of numbers
+the position being drawn was interpolated from. `Motion::from_speed` splits at
+4.75 units per second, the midpoint of 3.3.5a's 2.5 walk and 7.0 run, which
+also leaves the 4.5 backing-up speed on the walking side.
+
+A model with no run sequence falls back to its walk one. Nothing falls back as
+far as standing: a unit sliding along in its stand cycle is the 3.5 bug
+inverted, and worth failing loudly-looking rather than quietly. `sequence_for`
+resolves that fallback once and both `set_entities` and `update_animations`
+consult it, because a disagreement between the buffer that gets created and the
+pose written into it would not error anywhere -- it would pose one cycle into a
+buffer drawn as another.
+
+The player's own body took the same change for free, and revealed a small lie
+in the process: `LIVE_WALK_SPEED` was 7.0, which is the *run* speed. The
+character has been running since 3.4 while playing a walk cycle. Renamed, and
+now it runs.

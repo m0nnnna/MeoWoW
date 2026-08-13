@@ -323,7 +323,7 @@ mod tests {
             scale: 1.0,
             kind: ::world::ObjectType::Unit,
             level: Some(1),
-            moving: false,
+            speed: 0.0,
         }
     }
 

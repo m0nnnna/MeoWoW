@@ -224,6 +224,43 @@ impl Entity {
         };
         now.saturating_duration_since(started).as_millis() < duration as u128
     }
+
+    /// How fast this entity is travelling along the move in flight, in world
+    /// units per second, or `None` when it is not travelling at all.
+    ///
+    /// Derived from the path rather than read off the wire, because the wire
+    /// does not carry it: `SMSG_MONSTER_MOVE` gives two endpoints and a
+    /// duration, and the speed fields in a unit's update block describe what it
+    /// is *capable* of, which is not what it is doing -- a creature ambling
+    /// home moves at a fraction of its run speed without either number
+    /// changing. Distance over duration is the only statement about this
+    /// particular move.
+    ///
+    /// A caller drawing this entity gets the same answer the position it draws
+    /// was interpolated from, which is the point: an entity animated as running
+    /// while it crosses a metre a second looks broken in a way neither value
+    /// alone reveals.
+    pub fn move_speed(&self, now: std::time::Instant) -> Option<f32> {
+        if !self.is_moving(now) {
+            return None;
+        }
+        let (Some(start), Some(end), Some(duration)) =
+            (self.position, self.destination, self.move_duration)
+        else {
+            return None;
+        };
+        // `is_moving` already implies this, since nothing is less than zero
+        // elapsed; belt and braces against a divide by zero that would produce
+        // an infinity nothing downstream checks for.
+        if duration == 0 {
+            return None;
+        }
+        let distance = ((end.x - start.x).powi(2)
+            + (end.y - start.y).powi(2)
+            + (end.z - start.z).powi(2))
+        .sqrt();
+        Some(distance / (duration as f32 / 1000.0))
+    }
 }
 
 /// A spell mid-cooldown, timed from when this client learned about it rather
@@ -1944,6 +1981,64 @@ mod tests {
              even though destination is still set to the old target"
         );
         assert!(entity.destination.is_some(), "the premise: destination outlives the move");
+    }
+
+    /// The distinction the renderer picks a walk or a run cycle from, so it
+    /// has to come out in the units those speeds are quoted in: world units
+    /// per second, from a path length and a duration in milliseconds.
+    #[test]
+    fn move_speed_is_the_paths_length_over_its_duration() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+        // 30 units in 4 seconds: 7.5, a run.
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(at(30.0, 0.0)),
+            duration: 4000,
+            stopped: false,
+            facing: None,
+        });
+
+        let entity = world.get(7).unwrap();
+        let started = entity.move_started.unwrap();
+        let speed = entity
+            .move_speed(started + std::time::Duration::from_millis(1000))
+            .expect("a move is in flight");
+        assert!((speed - 7.5).abs() < 1e-3, "got {speed}");
+
+        // A move that has arrived has no speed at all, for the same reason
+        // `is_moving` goes false: the creature is standing there.
+        assert!(entity
+            .move_speed(started + std::time::Duration::from_secs(30))
+            .is_none());
+    }
+
+    /// The path is measured in three dimensions, so a creature climbing a
+    /// slope is not reported as slower than one crossing flat ground.
+    #[test]
+    fn move_speed_counts_the_climb() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+        let uphill = Position {
+            x: 3.0,
+            y: 0.0,
+            z: 4.0,
+            orientation: 0.0,
+        };
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(uphill),
+            duration: 1000,
+            stopped: false,
+            facing: None,
+        });
+
+        let entity = world.get(7).unwrap();
+        let started = entity.move_started.unwrap();
+        let speed = entity.move_speed(started).expect("a move is in flight");
+        assert!((speed - 5.0).abs() < 1e-3, "got {speed}, expected the 3-4-5 hypotenuse");
     }
 
     /// A stop (`to: None`) must read as not moving, the same as a move that

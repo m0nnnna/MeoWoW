@@ -62,22 +62,108 @@ pub struct Group {
     pub model: Rc<CachedModel>,
     pub instances: InstanceBuffer,
     pub count: u32,
-    /// Set only for a replicated-entity group: display id plus whether this
-    /// is the group's moving bucket (walk cycle) or standing bucket (stand
-    /// cycle), used to look up its own animated bone buffer instead of
-    /// drawing with the scene's shared bind pose. The bucket has to be part
-    /// of the key, not just the display id -- a species with both moving and
-    /// standing instances needs two different poses live at once, and a
-    /// display-id-only key would have the later of the two overwrite the
-    /// other's buffer every rebuild. `None` for every tile-owned group
-    /// (doodads and buildings never animate) and when the model has no
-    /// matching sequence to play.
-    pub animation: Option<(u32, bool)>,
+    /// Set only for a replicated-entity group: display id plus which cycle
+    /// this bucket plays, used to look up its own animated bone buffer instead
+    /// of drawing with the scene's shared bind pose. The bucket has to be part
+    /// of the key, not just the display id -- a species with instances
+    /// standing, walking and running at once needs three different poses live
+    /// at once, and a display-id-only key would have the last of them
+    /// overwrite the others' buffers every rebuild. `None` for every
+    /// tile-owned group (doodads and buildings never animate) and when the
+    /// model has no matching sequence to play.
+    pub animation: Option<(u32, Motion)>,
 }
 
 pub struct Tile {
     pub terrain: LoadedTerrain,
     pub groups: Vec<Group>,
+    /// Kept alongside the uploaded mesh so the ground can be *asked* about,
+    /// not only drawn -- see [`World::height_at`]. The GPU copy cannot answer:
+    /// reading a vertex buffer back per frame to find out how high the ground
+    /// is under one character would be absurd.
+    heights: TileHeights,
+}
+
+/// One tile's height field, in a form that answers "how high is the ground
+/// here" cheaply.
+///
+/// Deliberately not the parsed [`adt::Chunk`]s it was built from. Those carry
+/// their alpha maps -- 4KB per layer per chunk, megabytes per tile -- and
+/// keeping them resident for every loaded tile to consult 145 floats each would
+/// cost more memory than the entire rest of the streaming set.
+struct TileHeights {
+    /// The tile's origin corner. Both axes run *inwards* (negative) from it,
+    /// the same convention placements and vertices use -- see
+    /// `docs/RENDERING.md`.
+    origin: (f32, f32),
+    /// The 16x16 grid, indexed by how far in from `origin` a chunk sits rather
+    /// than by its order in the file or by its stored `IndexX`/`IndexY`.
+    ///
+    /// Derived from each chunk's own recorded position on purpose. The file
+    /// order and the stored indices are both *correlated* with the grid -- and
+    /// the stored `IndexX` tracks the world *y* axis, which is exactly the kind
+    /// of swap this project has paid for twice. A position is the thing being
+    /// asked about, so a position is what places the chunk.
+    chunks: Vec<Option<ChunkHeights>>,
+}
+
+/// The part of a chunk that answers for its own footprint.
+struct ChunkHeights {
+    position: [f32; 3],
+    holes: u16,
+    heights: Vec<f32>,
+}
+
+impl TileHeights {
+    fn new(chunks: &[adt::Chunk]) -> Self {
+        // Both axes run inwards, so the origin corner is the largest of each.
+        let origin = chunks.iter().fold((f32::MIN, f32::MIN), |(x, y), chunk| {
+            (x.max(chunk.position[0]), y.max(chunk.position[1]))
+        });
+
+        let mut grid = Vec::new();
+        grid.resize_with(adt::CHUNK_COUNT, || None);
+        for chunk in chunks {
+            let (cx, cy) = (
+                ((origin.0 - chunk.position[0]) / adt::CHUNK_SIZE).round() as i64,
+                ((origin.1 - chunk.position[1]) / adt::CHUNK_SIZE).round() as i64,
+            );
+            let side = adt::CHUNKS_PER_TILE as i64;
+            if !(0..side).contains(&cx) || !(0..side).contains(&cy) {
+                // A tile whose chunks do not form the 16x16 grid is a parser
+                // bug, not terrain: say so rather than silently dropping it.
+                tracing::warn!(
+                    "chunk at {:?} sits at {cx},{cy} of its tile, outside the grid",
+                    chunk.position
+                );
+                continue;
+            }
+            grid[(cy * side + cx) as usize] = Some(ChunkHeights {
+                position: chunk.position,
+                holes: chunk.holes,
+                heights: chunk.heights.clone(),
+            });
+        }
+
+        Self {
+            origin,
+            chunks: grid,
+        }
+    }
+
+    /// Ground height at a position inside this tile, or `None` where the tile
+    /// has no terrain (a hole) or the position is not on it at all.
+    fn height_at(&self, x: f32, y: f32) -> Option<f32> {
+        let side = adt::CHUNKS_PER_TILE as i64;
+        // Clamped rather than rejected: a position exactly on the tile's far
+        // edge computes as chunk 16 through float rounding, and the chunk's own
+        // bounds check refuses anything genuinely past the edge anyway, since
+        // the offset is remeasured there from the chunk's own position.
+        let cx = (((self.origin.0 - x) / adt::CHUNK_SIZE).floor() as i64).clamp(0, side - 1);
+        let cy = (((self.origin.1 - y) / adt::CHUNK_SIZE).floor() as i64).clamp(0, side - 1);
+        let chunk = self.chunks.get((cy * side + cx) as usize)?.as_ref()?;
+        adt::height_in_chunk(chunk.position, &chunk.heights, chunk.holes, x, y)
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -99,10 +185,16 @@ pub struct EntityPlacement {
     /// Heading in radians, as the server reports it.
     pub orientation: f32,
     pub scale: f32,
-    /// Whether a monster move is in flight for this specific instance. Drives
-    /// whether its display id's group is drawn with a walk cycle -- see
-    /// `Group::animated_display_id`.
-    pub moving: bool,
+    /// How fast this specific instance is travelling, in world units per
+    /// second; zero when it is standing. Chooses which cycle its bucket plays
+    /// -- see [`Motion::from_speed`].
+    ///
+    /// A speed rather than the "is it moving" flag this used to be, because
+    /// the two cycles a moving creature can play are told apart by nothing
+    /// else: a wolf padding along its patrol and a wolf charging you are both
+    /// simply *moving*, and drawing the walk cycle for both makes the charge
+    /// look like the model is being dragged.
+    pub speed: f32,
     /// How this instance is dressed, for a player character.
     ///
     /// `None` for everything else, which is nearly everything: a creature's
@@ -140,7 +232,7 @@ pub struct World {
     /// `update_bones` rewrites a buffer's contents in place, so the GPU
     /// buffer and its bind group only need to be created once per
     /// (display id, moving) pair, not once per rebuild tick.
-    entity_bones: HashMap<(u32, bool), BoneBuffer>,
+    entity_bones: HashMap<(u32, Motion), BoneBuffer>,
     /// Origin for the animation clock. The server does not say which frame of
     /// a walk cycle a creature is on -- nothing does, since 3.3.5a leaves that
     /// entirely to the client -- so any fixed origin that advances is enough
@@ -389,7 +481,26 @@ impl World {
         Ok(Tile {
             terrain,
             groups: built,
+            heights: TileHeights::new(&parsed.chunks),
         })
+    }
+
+    /// Ground height at a world position, or `None` if this client cannot
+    /// answer for it.
+    ///
+    /// Three separate reasons for `None`, and the caller wants the same thing
+    /// for all of them -- leave the altitude alone: the tile is not resident
+    /// (streaming has not reached it, or the position is off the map), or the
+    /// position falls on a hole, which is a doorway or a cave mouth whose floor
+    /// the ADT does not describe. Guessing a height in any of those cases would
+    /// put a character through the ground rather than on it.
+    ///
+    /// Only terrain. Standing on a bridge, a building's upper floor or any
+    /// other WMO surface is a separate question this cannot answer -- see
+    /// `docs/ROADMAP.md`.
+    pub fn height_at(&self, x: f32, y: f32) -> Option<f32> {
+        let tile = tile_at(Vec3::new(x, y, 0.0));
+        self.tiles.get(&tile)?.heights.height_at(x, y)
     }
 
     /// Loads a model, or returns the cached one. Failures are cached too.
@@ -491,11 +602,15 @@ impl World {
     ) -> usize {
         // Keyed by look as well as display: see `EntityPlacement::look`.
         let mut looks: HashMap<u64, Option<std::rc::Rc<crate::character::Look>>> = HashMap::new();
-        let mut grouped: HashMap<(u32, bool, u64), Vec<Mat4>> = HashMap::new();
+        let mut grouped: HashMap<(u32, Motion, u64), Vec<Mat4>> = HashMap::new();
         for placement in placements {
             looks.insert(placement.look_key, placement.look.clone());
             grouped
-                .entry((placement.display_id, placement.moving, placement.look_key))
+                .entry((
+                    placement.display_id,
+                    Motion::from_speed(placement.speed),
+                    placement.look_key,
+                ))
                 .or_default()
                 .push(Mat4::from_scale_rotation_translation(
                     Vec3::splat(placement.scale),
@@ -524,8 +639,8 @@ impl World {
 
         let mut built = Vec::new();
         let mut undrawable = 0;
-        let mut wanted_bones: HashSet<(u32, bool)> = HashSet::new();
-        for ((display_id, moving, look_key), transforms) in grouped {
+        let mut wanted_bones: HashSet<(u32, Motion)> = HashSet::new();
+        for ((display_id, motion, look_key), transforms) in grouped {
             let look = looks.get(&look_key).cloned().flatten();
             let Some(model) = self.entity_model(gpu, meshes, chain, display_id, look_key, look.as_deref())
             else {
@@ -538,17 +653,15 @@ impl World {
                 .map(|t| Instance::from_cols_array_2d(t.to_cols_array_2d()))
                 .collect();
 
-            // Walking while moving, standing while not -- not every model has
-            // both, or either. Only the buffer is created here; `update_animations`
-            // writes the pose every frame rather than only on this rebuild, so
-            // neither cycle visibly stutters at the rebuild rate.
-            let sequence_id = if moving { WALK_ANIMATION_ID } else { STAND_ANIMATION_ID };
-            let has_sequence = model.sequences.iter().any(|s| s.id == sequence_id);
-            let animation = has_sequence.then(|| {
+            // Running, walking or standing -- not every model has the cycle its
+            // speed calls for, or any of them. Only the buffer is created here;
+            // `update_animations` writes the pose every frame rather than only
+            // on this rebuild, so no cycle visibly stutters at the rebuild rate.
+            let animation = sequence_for(&model, motion).map(|_| {
                 self.entity_bones
-                    .entry((display_id, moving))
+                    .entry((display_id, motion))
                     .or_insert_with(|| meshes.create_bones(gpu, model.bones.len().max(1)));
-                (display_id, moving)
+                (display_id, motion)
             });
             if let Some(key) = animation {
                 wanted_bones.insert(key);
@@ -581,13 +694,12 @@ impl World {
     /// of once per frame.
     pub fn update_animations(&self, gpu: &Gpu, meshes: &MeshRenderer) {
         for group in &self.entities {
-            let Some((display_id, moving)) = group.animation else {
+            let Some((display_id, motion)) = group.animation else {
                 continue;
             };
-            let sequence_id = if moving { WALK_ANIMATION_ID } else { STAND_ANIMATION_ID };
             let (Some(sequence), Some(bones)) = (
-                group.model.sequences.iter().position(|s| s.id == sequence_id),
-                self.entity_bones.get(&(display_id, moving)),
+                sequence_for(&group.model, motion),
+                self.entity_bones.get(&(display_id, motion)),
             ) else {
                 continue;
             };
@@ -603,7 +715,7 @@ impl World {
 
     /// The animated bone buffer for a `Group::animation` key, if `set_entities`
     /// gave it one this rebuild.
-    pub fn entity_bone_buffer(&self, key: (u32, bool)) -> Option<&BoneBuffer> {
+    pub fn entity_bone_buffer(&self, key: (u32, Motion)) -> Option<&BoneBuffer> {
         self.entity_bones.get(&key)
     }
 
@@ -651,12 +763,77 @@ impl World {
     }
 }
 
-/// `AnimationData.dbc` rows for the walk and stand cycles -- public spec
+/// `AnimationData.dbc` rows for the cycles this client plays -- public spec
 /// (documented on wowdev.wiki as part of the client's own animation-id
 /// table), not derived from any server implementation. Every 3.3.5a model's
 /// sequences use the same ids for the same actions.
-const WALK_ANIMATION_ID: u16 = 4;
 const STAND_ANIMATION_ID: u16 = 0;
+const WALK_ANIMATION_ID: u16 = 4;
+const RUN_ANIMATION_ID: u16 = 5;
+
+/// Which cycle a replicated entity should be playing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Motion {
+    Stand,
+    Walk,
+    Run,
+}
+
+/// Where a walk becomes a run, in world units per second.
+///
+/// 3.3.5a's default ground speeds are 2.5 walking and 7.0 running, so the
+/// midpoint separates the two with the widest margin either way -- and a
+/// creature whose speed has been scaled a little in either direction still
+/// lands on the right side. It also sits above the 4.5 backing-up speed, so a
+/// unit reversing reads as a walk rather than as a run played at a jog.
+const RUN_SPEED: f32 = 4.75;
+
+impl Motion {
+    /// The cycle a ground speed calls for.
+    ///
+    /// Speed rather than a moving/not-moving flag because that flag cannot tell
+    /// the two moving cycles apart, and picking one for everything is wrong
+    /// both ways round: a patrolling creature drawn running skates ahead of its
+    /// own legs, and a charging one drawn walking is dragged along by them.
+    pub fn from_speed(speed: f32) -> Self {
+        if speed <= 0.0 {
+            Motion::Stand
+        } else if speed < RUN_SPEED {
+            Motion::Walk
+        } else {
+            Motion::Run
+        }
+    }
+
+    /// The animation ids to try, in order.
+    ///
+    /// A model with no run cycle should still walk rather than freeze in its
+    /// bind pose, which is what an unmatched id gets. Nothing falls back as far
+    /// as standing: a model with neither travelling cycle has nothing sensible
+    /// to play while it moves, and drawing it standing still as it slides along
+    /// is the "every creature walks on the spot" bug from the other direction.
+    fn animation_ids(self) -> &'static [u16] {
+        match self {
+            Motion::Stand => &[STAND_ANIMATION_ID],
+            Motion::Walk => &[WALK_ANIMATION_ID],
+            Motion::Run => &[RUN_ANIMATION_ID, WALK_ANIMATION_ID],
+        }
+    }
+}
+
+/// Which of a model's sequences a motion plays, if it has one.
+///
+/// Resolved here and consulted by both `set_entities` (which creates the bone
+/// buffer) and `update_animations` (which writes the pose into it), so the two
+/// cannot disagree about which sequence a bucket is playing -- a disagreement
+/// that would not error anywhere, just pose one cycle into a buffer drawn as
+/// another.
+fn sequence_for(model: &CachedModel, motion: Motion) -> Option<usize> {
+    motion
+        .animation_ids()
+        .iter()
+        .find_map(|id| model.sequences.iter().position(|s| s.id == *id))
+}
 
 #[cfg(test)]
 mod tests {
@@ -693,6 +870,134 @@ mod tests {
         let south = tile_at(base + Vec3::new(-adt::TILE_SIZE, 0.0, 0.0));
         assert_eq!(east, (33, 48));
         assert_eq!(south, (32, 49));
+    }
+
+    /// A tile's worth of chunks, each flat at a height that says where in the
+    /// grid it sits, handed over in *reverse* file order.
+    ///
+    /// The order is the point: `TileHeights` places a chunk by its recorded
+    /// position, and a build that quietly relied on the order instead would
+    /// pass every test that fed it chunks in order and put a character on the
+    /// wrong hill in the world.
+    fn heights_for_tile(tile: (i32, i32)) -> TileHeights {
+        let origin = (
+            (32.0 - tile.1 as f32) * adt::TILE_SIZE,
+            (32.0 - tile.0 as f32) * adt::TILE_SIZE,
+        );
+        let mut chunks = Vec::new();
+        for cy in 0..adt::CHUNKS_PER_TILE {
+            for cx in 0..adt::CHUNKS_PER_TILE {
+                chunks.push(adt::Chunk {
+                    index: (cx as u32, cy as u32),
+                    position: [
+                        origin.0 - cx as f32 * adt::CHUNK_SIZE,
+                        origin.1 - cy as f32 * adt::CHUNK_SIZE,
+                        (cy * adt::CHUNKS_PER_TILE + cx) as f32,
+                    ],
+                    area_id: 0,
+                    holes: 0,
+                    heights: vec![0.0; adt::HEIGHTS_PER_CHUNK],
+                    normals: vec![[0, 0, 127]; adt::HEIGHTS_PER_CHUNK],
+                    layers: Vec::new(),
+                    alpha_maps: Vec::new(),
+                    doodad_refs: Vec::new(),
+                    object_refs: Vec::new(),
+                });
+            }
+        }
+        chunks.reverse();
+        TileHeights::new(&chunks)
+    }
+
+    /// A position resolves to the chunk it is actually standing on.
+    #[test]
+    fn a_position_finds_its_own_chunk() {
+        let tile = (32, 48);
+        let heights = heights_for_tile(tile);
+        let origin = (
+            (32.0 - tile.1 as f32) * adt::TILE_SIZE,
+            (32.0 - tile.0 as f32) * adt::TILE_SIZE,
+        );
+
+        for cy in 0..adt::CHUNKS_PER_TILE {
+            for cx in 0..adt::CHUNKS_PER_TILE {
+                // The chunk's centre, which no rounding can push into a
+                // neighbour.
+                let x = origin.0 - (cx as f32 + 0.5) * adt::CHUNK_SIZE;
+                let y = origin.1 - (cy as f32 + 0.5) * adt::CHUNK_SIZE;
+                let expected = (cy * adt::CHUNKS_PER_TILE + cx) as f32;
+                assert_eq!(
+                    heights.height_at(x, y),
+                    Some(expected),
+                    "chunk {cx},{cy} at {x},{y}"
+                );
+            }
+        }
+    }
+
+    /// The height field covers every position `tile_at` assigns to its tile --
+    /// no gap in the middle of the map -- and nothing beyond that tile's own
+    /// footprint.
+    ///
+    /// This is the join between two independently written pieces of the same
+    /// convention: `tile_at` derives a tile from a position, and `TileHeights`
+    /// derives an origin from the chunks it was given. Both are "inwards from
+    /// the corner", and either could have been inverted on its own.
+    ///
+    /// The two are not quite complementary and must not be asserted to be. A
+    /// tile's footprint here is closed at both ends, by the hair of tolerance
+    /// `adt::height_in_chunk` allows so that a point exactly on a seam is not
+    /// refused by float rounding; `tile_at`'s is half-open, as a grid's has to
+    /// be. So both tiles either side of a seam answer for the seam itself,
+    /// which costs nothing: `World::height_at` picks the tile first and only
+    /// ever consults one of them.
+    #[test]
+    fn a_tiles_height_field_covers_exactly_its_tile() {
+        let tile = (32, 48);
+        let heights = heights_for_tile(tile);
+        let centre = tile_centre(tile);
+        let origin = (
+            (32.0 - tile.1 as f32) * adt::TILE_SIZE,
+            (32.0 - tile.0 as f32) * adt::TILE_SIZE,
+        );
+        // Rather wider than the tolerance being allowed for, and far narrower
+        // than anything a wrong axis or a half-tile offset would produce.
+        const SEAM: f32 = 0.1;
+
+        // A grid across the tile and a little way past every edge of it.
+        let steps = 40;
+        for row in -4..=steps + 4 {
+            for col in -4..=steps + 4 {
+                let offset = |i: i32| (i as f32 / steps as f32 - 0.5) * adt::TILE_SIZE;
+                let (x, y) = (centre.x + offset(row), centre.y + offset(col));
+                let answered = heights.height_at(x, y).is_some();
+
+                if tile_at(Vec3::new(x, y, 0.0)) == tile {
+                    assert!(answered, "at {x},{y}, which is on tile {tile:?}");
+                }
+                if answered {
+                    let (dx, dy) = (origin.0 - x, origin.1 - y);
+                    let footprint = -SEAM..=adt::TILE_SIZE + SEAM;
+                    assert!(
+                        footprint.contains(&dx) && footprint.contains(&dy),
+                        "answered at {x},{y}, which is {dx},{dy} in from the corner"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The three cycles, and where the boundaries between them are.
+    #[test]
+    fn speed_chooses_the_cycle() {
+        assert_eq!(Motion::from_speed(0.0), Motion::Stand);
+        // 3.3.5a's own default ground speeds.
+        assert_eq!(Motion::from_speed(2.5), Motion::Walk, "the walk speed");
+        assert_eq!(Motion::from_speed(4.5), Motion::Walk, "backing up");
+        assert_eq!(Motion::from_speed(7.0), Motion::Run, "the run speed");
+        // A creature crawling is still walking, not standing: standing is
+        // reserved for no move in flight at all, so a slow patrol animates.
+        assert_eq!(Motion::from_speed(0.2), Motion::Walk);
     }
 
     /// Height must not affect which tile a position is on.

@@ -142,6 +142,143 @@ fn chunks_form_a_regular_grid() {
     assert!((first[1] - last[1] - step).abs() < 0.1);
 }
 
+/// Sampling the surface at a stored sample returns that sample, on real
+/// terrain.
+///
+/// The unit test for this builds a synthetic height field; this one runs the
+/// same property over an entire tile of Elwynn, which brings real slopes, real
+/// holes and real coordinate magnitudes -- a chunk eight thousand units from
+/// the origin has a float ulp of about a millimetre, and a boundary test that
+/// is a hair too strict rejects points that are genuinely on the terrain.
+#[test]
+fn sampled_heights_agree_with_the_vertices_they_sit_on() {
+    let mut chain = require_data!();
+    let tile = load_tile(&mut chain, MAP, TILE.0, TILE.1);
+
+    let mut sampled = 0;
+    let mut holed = 0;
+    for (i, chunk) in tile.chunks.iter().enumerate() {
+        for index in 0..HEIGHTS_PER_CHUNK {
+            let p = chunk.vertex_position(index);
+            let Some(height) = chunk.height_at(p[0], p[1]) else {
+                // The only legitimate refusal inside a chunk's own footprint.
+                assert!(chunk.holes != 0, "chunk {i} refused sample {index}");
+                holed += 1;
+                continue;
+            };
+            assert!(
+                (height - p[2]).abs() < 0.05,
+                "chunk {i} sample {index}: got {height}, vertex is at {}",
+                p[2]
+            );
+            sampled += 1;
+        }
+    }
+    assert!(sampled > CHUNK_COUNT * 100, "only sampled {sampled} points");
+    // Not an assertion about this tile, just worth seeing in the log.
+    eprintln!("{sampled} samples matched, {holed} fell in holes");
+}
+
+/// A point on the seam between two chunks gets the same height from either
+/// side.
+///
+/// Terrain chunks tile exactly -- `validate` already checks their stored edges
+/// agree -- so the interpolation on top of them has to agree too. A stride or
+/// axis error inside one chunk shows up here as a step at every seam, which is
+/// what a character walking across a tile would feel as a stumble.
+#[test]
+fn neighbouring_chunks_agree_along_their_seam() {
+    let mut chain = require_data!();
+    let tile = load_tile(&mut chain, MAP, TILE.0, TILE.1);
+
+    let mut checked = 0;
+    for y in 0..CHUNKS_PER_TILE {
+        for x in 0..CHUNKS_PER_TILE - 1 {
+            let (here, next) = (tile.chunk(x, y).unwrap(), tile.chunk(x + 1, y).unwrap());
+            // Wherever the two chunks' footprints touch, sample from both.
+            for step in 1..8 {
+                let along = step as f32 * adt::UNIT_SIZE;
+                for (px, py) in [
+                    (next.position[0], next.position[1] - along),
+                    (next.position[0] - along, next.position[1]),
+                ] {
+                    let (Some(a), Some(b)) = (here.height_at(px, py), next.height_at(px, py))
+                    else {
+                        continue;
+                    };
+                    assert!(
+                        (a - b).abs() < 0.05,
+                        "chunks {x},{y} and {},{y} disagree at {px},{py}: {a} vs {b}",
+                        x + 1
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 100, "only checked {checked} seam points");
+}
+
+/// The interpolated surface sits where the objects standing on it think the
+/// ground is.
+///
+/// Everything else about heights here is checked against the height field
+/// itself, which cannot catch a surface that is internally consistent and in
+/// the wrong place. A tile's doodads are an independent statement about the
+/// same ground: they were placed by an artist standing them on it, and they
+/// arrive through a different chunk of the file with a different coordinate
+/// convention. If the two agree, the surface a character stands on is the one
+/// the world was built around.
+///
+/// Only the *median* offset is asserted, and loosely. Plenty of individual
+/// doodads genuinely do not touch the ground -- hanging signs, rocks sunk into
+/// a hillside, anything on a building -- so a tight bound on all of them would
+/// fail on correct data. A wrong axis or a mis-indexed chunk does not shift the
+/// median by a metre; it destroys any relationship at all.
+#[test]
+fn doodads_stand_on_the_interpolated_surface() {
+    let mut chain = require_data!();
+    let tile = load_tile(&mut chain, MAP, TILE.0, TILE.1);
+
+    // Placements store the axes permuted, both horizontals measured inwards
+    // from the far corner of the map, and the middle component as height. See
+    // `docs/RENDERING.md`; written out here rather than shared with the
+    // renderer's own converter deliberately, so this stays a second opinion.
+    let centre = 32.0 * adt::TILE_SIZE;
+    let mut offsets: Vec<f32> = Vec::new();
+    for doodad in &tile.doodads {
+        let (x, y, z) = (
+            centre - doodad.position[2],
+            centre - doodad.position[0],
+            doodad.position[1],
+        );
+        // Whichever chunk owns the spot. Scanned rather than indexed so this
+        // test does not depend on the grid convention it is checking.
+        let Some(ground) = tile.chunks.iter().find_map(|c| c.height_at(x, y)) else {
+            continue;
+        };
+        offsets.push(z - ground);
+    }
+
+    assert!(offsets.len() > 500, "only {} doodads landed on the tile", offsets.len());
+    offsets.sort_by(f32::total_cmp);
+    let median = offsets[offsets.len() / 2];
+    let near_ground = offsets.iter().filter(|o| o.abs() < 1.0).count();
+    eprintln!(
+        "{} doodads: median offset {median:.3}, {near_ground} within a unit of the ground",
+        offsets.len()
+    );
+    assert!(
+        median.abs() < 1.0,
+        "doodads sit a median {median} from the interpolated ground"
+    );
+    assert!(
+        near_ground * 2 > offsets.len(),
+        "only {near_ground} of {} doodads are within a unit of the ground",
+        offsets.len()
+    );
+}
+
 /// Alpha maps decode to a full 64x64 whichever way they were stored, and every
 /// layer beyond the first has one.
 #[test]

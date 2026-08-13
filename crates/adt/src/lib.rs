@@ -196,10 +196,14 @@ pub struct Chunk {
 impl Chunk {
     /// Whether a 4x4 sub-square has been punched out.
     pub fn has_hole(&self, x: usize, y: usize) -> bool {
-        if x >= 4 || y >= 4 {
-            return false;
-        }
-        self.holes & (1 << (y * 4 + x)) != 0
+        has_hole(self.holes, x, y)
+    }
+
+    /// Height of the terrain surface at a world position inside this chunk.
+    ///
+    /// See [`height_in_chunk`], which this is the convenient form of.
+    pub fn height_at(&self, x: f32, y: f32) -> Option<f32> {
+        height_in_chunk(self.position, &self.heights, self.holes, x, y)
     }
 
     /// Position of one height sample, in world space.
@@ -240,6 +244,111 @@ impl Chunk {
             })
             .collect()
     }
+}
+
+/// Whether a 4x4 sub-square has been punched out of a chunk's hole mask.
+///
+/// Free-standing so a caller holding a chunk's `holes` word without the chunk
+/// itself can ask -- see [`height_in_chunk`].
+pub fn has_hole(holes: u16, x: usize, y: usize) -> bool {
+    if x >= 4 || y >= 4 {
+        return false;
+    }
+    holes & (1 << (y * 4 + x)) != 0
+}
+
+/// Height of the terrain surface at a world position inside one chunk.
+///
+/// Takes the pieces rather than a whole [`Chunk`] because a caller that keeps
+/// terrain resident for a *map* -- which is what standing on it requires --
+/// wants the 145 heights and nothing else: a parsed chunk carries its alpha
+/// maps too, and those are megabytes per tile.
+///
+/// `position` is the chunk's origin corner and `x`/`y` are world coordinates,
+/// so both axes run *inwards* (negative) from that corner, exactly as in
+/// [`Chunk::vertex_position`]. Returns `None` outside the chunk's footprint,
+/// and inside a hole: a doorway or cave mouth has no terrain, and reporting a
+/// height there would put a character on a floor that is not drawn.
+///
+/// The surface interpolated is the one the renderer draws, and deliberately so:
+/// each 8x8 cell is four triangles fanning from the inner-lattice sample at its
+/// centre, not a bilinear patch across the outer four. Bilinear would ignore
+/// the inner sample entirely, flattening every ridge that runs through a cell
+/// centre -- and a character would stand a little above or below the ground it
+/// can see, which reads as the terrain being wrong rather than as two different
+/// surfaces.
+pub fn height_in_chunk(
+    position: [f32; 3],
+    heights: &[f32],
+    holes: u16,
+    x: f32,
+    y: f32,
+) -> Option<f32> {
+    // In units from the origin corner: `u` along the axis `vertex_position`
+    // calls `row`, `v` along the one it calls `col`.
+    let u = (position[0] - x) / UNIT_SIZE;
+    let v = (position[1] - y) / UNIT_SIZE;
+    // A world coordinate eight thousand units from the origin has a float ulp
+    // of about a millimetre, so a point *exactly* on a chunk's far edge lands a
+    // hair outside it and a strict test rejects it. Absorb that much and clamp:
+    // the alternative is a character over a chunk boundary occasionally finding
+    // no ground under it, for a reason invisible to anyone reading this.
+    const EDGE_TOLERANCE: f32 = 0.01;
+    if !(-EDGE_TOLERANCE..=8.0 + EDGE_TOLERANCE).contains(&u)
+        || !(-EDGE_TOLERANCE..=8.0 + EDGE_TOLERANCE).contains(&v)
+    {
+        return None;
+    }
+    let (u, v) = (u.clamp(0.0, 8.0), v.clamp(0.0, 8.0));
+
+    // `min(7)` keeps a point exactly on the far edge, where the coordinate is
+    // 8.0, in the last cell rather than one past it.
+    let cell_u = (u.floor() as usize).min(7);
+    let cell_v = (v.floor() as usize).min(7);
+    // Holes are punched at 4x4 granularity, two cells per hole. `has_hole`
+    // takes them in the other order: its `x` is the `col` axis.
+    if has_hole(holes, cell_v / 2, cell_u / 2) {
+        return None;
+    }
+
+    // The cell's four outer corners and its inner-lattice centre. Outer sample
+    // `(a, b)` is at index `a * 17 + b`; the inner one for the cell is nine
+    // further along its row. See [`lattice_coords`].
+    let outer = |du: usize, dv: usize| heights.get((cell_u + du) * 17 + cell_v + dv).copied();
+    let (h00, h10) = (outer(0, 0)?, outer(1, 0)?);
+    let (h01, h11) = (outer(0, 1)?, outer(1, 1)?);
+    let centre = heights.get(cell_u * 17 + 9 + cell_v).copied()?;
+
+    // Where in the cell, and therefore which of the four triangles: the fan's
+    // seams are the cell's two diagonals, `t == s` and `s + t == 1`.
+    let (s, t) = (u - cell_u as f32, v - cell_v as f32);
+    let (a, b) = match (s + t < 1.0, t < s) {
+        (true, true) => (((0.0, 0.0), h00), ((1.0, 0.0), h10)),
+        (true, false) => (((0.0, 0.0), h00), ((0.0, 1.0), h01)),
+        (false, false) => (((0.0, 1.0), h01), ((1.0, 1.0), h11)),
+        (false, true) => (((1.0, 0.0), h10), ((1.0, 1.0), h11)),
+    };
+    let height = plane_height((s, t), a, b, ((0.5, 0.5), centre));
+    Some(position[2] + height)
+}
+
+/// Height at `p` on the plane through three `((x, y), height)` samples.
+fn plane_height(
+    p: (f32, f32),
+    a: ((f32, f32), f32),
+    b: ((f32, f32), f32),
+    c: ((f32, f32), f32),
+) -> f32 {
+    let (((ax, ay), ha), ((bx, by), hb), ((cx, cy), hc)) = (a, b, c);
+    let det = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+    // Only reachable if a caller invents a degenerate triangle; the fan's are
+    // all a quarter of a cell.
+    if det == 0.0 {
+        return ha;
+    }
+    let wa = ((by - cy) * (p.0 - cx) + (cx - bx) * (p.1 - cy)) / det;
+    let wb = ((cy - ay) * (p.0 - cx) + (ax - cx) * (p.1 - cy)) / det;
+    ha * wa + hb * wb + hc * (1.0 - wa - wb)
 }
 
 /// Which side of a chunk an edge is on.
@@ -656,6 +765,160 @@ mod tests {
         assert!(map[..100].iter().all(|&v| v == 0x40));
         assert_eq!(&map[100..103], &[1, 2, 3]);
         assert_eq!(map[200], 0xFF);
+    }
+
+    /// A chunk with a given height field, at a known origin corner.
+    fn height_chunk(heights: Vec<f32>, holes: u16) -> Chunk {
+        Chunk {
+            index: (0, 0),
+            // Deliberately not the origin: a base height folded in wrongly, or
+            // an axis measured outwards instead of inwards, both survive a
+            // chunk sitting at zero.
+            position: [-8533.0, -1600.0, 100.0],
+            area_id: 0,
+            holes,
+            heights,
+            normals: vec![[0, 0, 127]; HEIGHTS_PER_CHUNK],
+            layers: Vec::new(),
+            alpha_maps: Vec::new(),
+            doodad_refs: Vec::new(),
+            object_refs: Vec::new(),
+        }
+    }
+
+    /// Sampling a height *at* a stored sample must return that sample.
+    ///
+    /// This is the test that pins the index convention, and it does it by
+    /// asking `vertex_position` -- which the renderer builds its mesh from --
+    /// where each of the 145 samples is. Any disagreement about which axis is
+    /// which, or about where the inner lattice sits, shows up as a sample
+    /// resolving to a neighbour's height rather than its own.
+    #[test]
+    fn every_sample_resolves_to_its_own_height() {
+        // Distinct per sample, so landing on a neighbour is off by at least a
+        // whole unit -- far outside a tolerance that only has to absorb the
+        // rounding in a coordinate eight thousand units from the origin.
+        let heights: Vec<f32> = (0..HEIGHTS_PER_CHUNK).map(|i| i as f32).collect();
+        let chunk = height_chunk(heights, 0);
+
+        for index in 0..HEIGHTS_PER_CHUNK {
+            let p = chunk.vertex_position(index);
+            let got = chunk.height_at(p[0], p[1]).expect("inside the chunk");
+            assert!(
+                (got - p[2]).abs() < 1e-2,
+                "sample {index} at {:.2},{:.2}: got {got}, expected {}",
+                p[0],
+                p[1],
+                p[2]
+            );
+        }
+    }
+
+    /// A height field lying on a plane must interpolate back to that plane
+    /// everywhere, whichever triangle of the fan a point lands in.
+    ///
+    /// A linear surface is reproduced exactly by any correct triangulation, so
+    /// this checks the barycentric weights without depending on which of the
+    /// four triangles the point fell in -- while still failing if a triangle is
+    /// picked whose corners are not the ones surrounding the point.
+    #[test]
+    fn a_sloped_field_interpolates_between_its_samples() {
+        let chunk_at = |index: usize| {
+            let (row, col, inner) = lattice_coords(index);
+            let column_offset = if inner { 0.5 } else { 0.0 };
+            (row as f32 * 0.5, col as f32 + column_offset)
+        };
+        // A plane: 2 units up per unit along u, 5 per unit along v.
+        let heights: Vec<f32> = (0..HEIGHTS_PER_CHUNK)
+            .map(|i| {
+                let (u, v) = chunk_at(i);
+                7.0 + 2.0 * u + 5.0 * v
+            })
+            .collect();
+        let chunk = height_chunk(heights, 0);
+
+        // Sample off the lattice on both axes, including inside every quarter
+        // of a cell.
+        for step_u in 0..40 {
+            for step_v in 0..40 {
+                let (u, v) = (step_u as f32 * 0.2, step_v as f32 * 0.2);
+                let (x, y) = (
+                    chunk.position[0] - u * UNIT_SIZE,
+                    chunk.position[1] - v * UNIT_SIZE,
+                );
+                let expected = chunk.position[2] + 7.0 + 2.0 * u + 5.0 * v;
+                let got = chunk.height_at(x, y).expect("inside the chunk");
+                assert!(
+                    (got - expected).abs() < 1e-2,
+                    "at {u},{v}: got {got}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// The inner sample is real geometry, not a redundant midpoint: a spike at
+    /// a cell's centre must be visible to a caller standing on it. Bilinear
+    /// interpolation across the four outer corners would miss it entirely.
+    #[test]
+    fn the_inner_lattice_shapes_the_surface() {
+        let mut heights = vec![0.0f32; HEIGHTS_PER_CHUNK];
+        // The inner sample of cell (0, 0), at half a unit in on both axes.
+        heights[9] = 20.0;
+        let chunk = height_chunk(heights, 0);
+
+        let centre = chunk
+            .height_at(
+                chunk.position[0] - 0.5 * UNIT_SIZE,
+                chunk.position[1] - 0.5 * UNIT_SIZE,
+            )
+            .expect("inside the chunk");
+        assert!((centre - (chunk.position[2] + 20.0)).abs() < 1e-2);
+        // Half way from the centre to a corner is half way up the spike.
+        let half = chunk
+            .height_at(
+                chunk.position[0] - 0.25 * UNIT_SIZE,
+                chunk.position[1] - 0.25 * UNIT_SIZE,
+            )
+            .expect("inside the chunk");
+        assert!((half - (chunk.position[2] + 10.0)).abs() < 1e-2);
+    }
+
+    /// Outside the chunk there is no answer, rather than an extrapolated one.
+    #[test]
+    fn a_position_outside_the_chunk_has_no_height() {
+        let chunk = height_chunk(vec![5.0; HEIGHTS_PER_CHUNK], 0);
+        // The origin corner runs *inwards*, so anything on its far side is out.
+        assert!(chunk.height_at(chunk.position[0] + 1.0, chunk.position[1]).is_none());
+        assert!(chunk.height_at(chunk.position[0], chunk.position[1] + 1.0).is_none());
+        assert!(chunk
+            .height_at(chunk.position[0] - CHUNK_SIZE - 1.0, chunk.position[1])
+            .is_none());
+        // Both corners of the footprint are inside it.
+        assert!(chunk.height_at(chunk.position[0], chunk.position[1]).is_some());
+        assert!(chunk
+            .height_at(
+                chunk.position[0] - CHUNK_SIZE,
+                chunk.position[1] - CHUNK_SIZE
+            )
+            .is_some());
+    }
+
+    /// A hole is an absence of terrain, not terrain at some height: a doorway
+    /// has a floor the ADT does not describe.
+    #[test]
+    fn a_hole_reports_no_height() {
+        // Sub-square (0, 0) punched out: cells 0 and 1 on both axes.
+        let chunk = height_chunk(vec![5.0; HEIGHTS_PER_CHUNK], 0b1);
+        let at = |u: f32, v: f32| {
+            chunk.height_at(
+                chunk.position[0] - u * UNIT_SIZE,
+                chunk.position[1] - v * UNIT_SIZE,
+            )
+        };
+        assert!(at(0.5, 0.5).is_none(), "inside the hole");
+        assert!(at(1.5, 1.5).is_none(), "still inside the hole");
+        assert!(at(2.5, 0.5).is_some(), "past it on one axis");
+        assert!(at(0.5, 2.5).is_some(), "past it on the other");
     }
 
     #[test]

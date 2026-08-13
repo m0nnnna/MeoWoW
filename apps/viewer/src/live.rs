@@ -32,10 +32,10 @@ pub struct Entity {
     pub scale: f32,
     pub kind: world::ObjectType,
     pub level: Option<u32>,
-    /// Whether a monster move is currently in flight for this entity, which
-    /// is what the renderer uses to decide whether to animate a walk cycle
-    /// rather than draw the bind pose.
-    pub moving: bool,
+    /// How fast this entity is travelling, in world units per second, and zero
+    /// when it is standing. The renderer picks a stand, walk or run cycle from
+    /// it -- see `crate::world::Motion`.
+    pub speed: f32,
 }
 
 /// Where the player is and what can be seen from there.
@@ -379,7 +379,9 @@ pub fn drawable_entities(state: &world::WorldState, own_guid: u64) -> Vec<Entity
                 .unwrap_or(1.0),
             kind: entity.object_type,
             level: entity.level(),
-            moving: entity.is_moving(now),
+            // Zero when no move is in flight, which is what "standing" means
+            // here -- see `world::state::Entity::move_speed`.
+            speed: entity.move_speed(now).unwrap_or(0.0),
         });
     }
     entities
@@ -395,8 +397,8 @@ pub fn drawable_entities(state: &world::WorldState, own_guid: u64) -> Vec<Entity
 /// is the only thing that knows: the server does not echo our movement back,
 /// so the replicated position is frozen at login.
 ///
-/// `moving` likewise comes from the keys being held rather than from
-/// `Entity::is_moving`, which reads the same replicated movement that never
+/// `speed` likewise comes from the keys being held rather than from
+/// `Entity::move_speed`, which reads the same replicated movement that never
 /// arrives for us. Without it the character would slide across the ground in
 /// its standing pose -- the exact bug 3.5 hit for *other* players, arriving
 /// here by a different route.
@@ -405,7 +407,7 @@ pub fn own_entity(
     own_guid: u64,
     position: Vec3,
     orientation: f32,
-    moving: bool,
+    speed: f32,
 ) -> Option<Entity> {
     use world::update;
 
@@ -431,7 +433,7 @@ pub fn own_entity(
             .unwrap_or(1.0),
         kind: entity.object_type,
         level: entity.level(),
-        moving,
+        speed,
     })
 }
 

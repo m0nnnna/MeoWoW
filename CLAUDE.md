@@ -34,7 +34,9 @@ replicated world moving.** `wow-viewer --realm-host <host> --user <account>
 chose around the position it reported. Holding W/S walks the character forward
 or backward and A/D turns it, each sent as a real `MSG_MOVE_*` stream
 (`MoveStartForward`/`MoveHeartbeat`/`MoveStop`), and the camera follows behind
-rather than flying freely. `LiveWorld` keeps a `world::WorldState` alongside
+rather than flying freely. Altitude follows the terrain — the keys drive the
+two horizontal axes and Z is read back out of the height field the ground is
+drawn from, so the character walks over hills rather than into them. `LiveWorld` keeps a `world::WorldState` alongside
 the connection and folds every drained packet into it, so creatures and other
 players slide along their actual path instead of jumping between snapshots or
 standing wherever they were at login — turning to face the way they're moving,
@@ -290,6 +292,15 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   variable at a time, with the person at the window pressing the key. When a
   symptom persists across a fix that should have worked, suspect that it has
   two causes rather than that the fix was too small.
+- **And one bug can produce several unrelated-looking reports.** The mirror of
+  the rule above, and it costs the same way. A character sinking into the
+  ground, a click marker landing off-centre, hills that could not be walked up,
+  and another client seeing this one twitch were four separate complaints, none
+  of which said "altitude" — and they were one missing feature. The click
+  marker in particular reads as a picking-ray bug, because the ray starts at
+  the eye and the eye is a fixed offset above a position whose Z was wrong.
+  Before opening the second investigation, check whether the first cause
+  reaches it.
 - **When geometry is missing rather than wrong, suspect culling before data.**
   WMO winds counter-clockwise, M2 and terrain clockwise. Guessing from a
   neighbouring format culled a roof and looked like a hole in the mesh.
