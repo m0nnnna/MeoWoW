@@ -105,6 +105,15 @@ pub struct Look {
     /// Geosets to draw, one per group. A group absent from this list is left
     /// alone rather than hidden -- see [`Look::shows`].
     pub geosets: Vec<u32>,
+    /// Equipment groups this character's gear has an opinion about.
+    ///
+    /// Separate from [`Look::geosets`] because "wearing nothing in this group"
+    /// and "not knowing about this group" need different answers, and the
+    /// difference is visible: an *empty* group must fall back to the bare body
+    /// part, while a group the gear decided must show only what it named.
+    /// Without this, taking a glove off would leave the hand missing rather
+    /// than bare.
+    pub decided_groups: Vec<u32>,
 }
 
 impl Look {
@@ -132,8 +141,9 @@ impl Look {
             return true;
         }
         let (group, variant) = (id / 100, id % 100);
-        if MANAGED_GROUPS.contains(&group) {
-            // A group this character's own numbers decide: only what they name.
+        if MANAGED_GROUPS.contains(&group) || self.decided_groups.contains(&group) {
+            // A group this character's own numbers or its gear decide: only
+            // what they name, and they have already been checked above.
             return false;
         }
         // Everything else is an equipment group, and **variant one is the bare
@@ -145,6 +155,66 @@ impl Look {
         !HIDDEN_WITHOUT_EQUIPMENT.contains(&group) && variant == 1
     }
 }
+
+/// Which geoset group a slot switches on, and which of an item's three
+/// `geoset_group` columns selects the variant within it.
+///
+/// **Grounded in the data, not transcribed, and deliberately incomplete.**
+/// Every entry here was established the same way: take every item of that
+/// inventory type, look at which `geoset_group` values it uses, and check them
+/// against the variants a character model actually contains. A slot whose items
+/// use values 1 to 3 where the model holds `401`-`404` is switching group 4.
+///
+/// | slot | type | values in the data | model has | group |
+/// |---|---|---|---|---|
+/// | hands | 10 | 1, 2, 3 | 401-404 | 4 |
+/// | feet | 8 | 1, 2, 3 | 501-505 | 5 |
+/// | back | 16 | 1, 2, 5 | 1501-1506 | 15 |
+/// | shirt, chest | 4, 5 | 1, 2 | 802, 803 | 8 |
+/// | robe | 20 | 1, 2 | 1301, 1302 | 13 |
+///
+/// **Belt, legs and tabard are left out on purpose.** Their values do not line
+/// up with the variants the model has -- a tabard uses value 1 where the only
+/// tabard geoset is `1202`, and legs drive two columns at once -- so a mapping
+/// for them would be a guess dressed as a table. This project has already paid
+/// four attempts for geoset rules read rather than rendered. Leaving a slot out
+/// costs a missing belt buckle; getting it wrong puts a robe's skirt on
+/// somebody's arm.
+fn geoset_rule(inventory_type: u8) -> Option<(u32, usize)> {
+    Some(match inventory_type {
+        // Shirt and chest both drive sleeves. Value 1 selects `801`, which no
+        // character model contains -- a short sleeve needs no geometry -- so it
+        // draws nothing, which is right rather than a gap.
+        4 | 5 => (8, 0),
+        8 => (5, 0),
+        10 => (4, 0),
+        16 => (15, 0),
+        20 => (13, 0),
+        _ => return None,
+    })
+}
+
+/// The eleven item slots `CreatureDisplayInfoExtra` carries, as inventory
+/// types, in the order its columns run.
+///
+/// The order was measured rather than remembered: each column was identified by
+/// what the items in it *paint*. The column whose 23,102 items set a foot
+/// texture is the feet slot; the one whose items set only a lower-arm texture
+/// is wrists; the one with almost no textures at all but a thousand cape
+/// geosets is the back.
+const NPC_ITEM_SLOTS: [u8; 11] = [
+    1,  // head
+    3,  // shoulders
+    4,  // shirt
+    5,  // chest
+    6,  // belt
+    7,  // legs
+    8,  // feet
+    9,  // wrists
+    10, // hands
+    19, // tabard
+    16, // back
+];
 
 /// The geoset groups a character's own choices decide. Everything above these
 /// is equipment -- see [`Look::shows`].
@@ -166,7 +236,7 @@ const HIDDEN_WITHOUT_EQUIPMENT: [u32; 1] = [15];
 /// looks without changing any of the five numbers: two humans in different
 /// armour must not share a built model, which is the same bug `look_key`
 /// already exists to prevent for faces.
-pub fn look_key(appearance: &Appearance, equipment: &[u32]) -> u64 {
+pub fn look_key(appearance: &Appearance, equipment: &[(u32, u8)]) -> u64 {
     // FNV-1a. Any stable hash would do -- this is a cache key, not a checksum,
     // and the appearance key alone is the part that has to be exact.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -177,8 +247,9 @@ pub fn look_key(appearance: &Appearance, equipment: &[u32]) -> u64 {
         }
     };
     eat(appearance.key());
-    for display in equipment {
+    for (display, slot) in equipment {
         eat(u64::from(*display));
+        eat(u64::from(*slot));
     }
     hash
 }
@@ -254,7 +325,7 @@ pub fn resolve(chain: &mut Chain, look: Appearance) -> Look {
 /// boot. So no table of slot meanings has to be transcribed to get the layering
 /// right, and the one thing that would be wrong -- an item painted over the
 /// thing that should cover it -- is exactly what a render shows.
-pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[u32]) -> Look {
+pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[(u32, u8)]) -> Look {
     let sections = chain
         .read(CharSections::PATH)
         .ok()
@@ -269,10 +340,13 @@ pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[u32]) -
         .and_then(|bytes| CharacterFacialHairStyles::parse(&bytes).ok());
 
     let (mut body, mut skin) = (None, None);
+    let (mut equipped, mut decided) = (Vec::new(), Vec::new());
     if let Some(sections) = &sections {
         skin = compose(chain, sections, look);
         if let Some(skin) = skin.as_mut() {
-            dress(chain, skin, look, equipment);
+            let (worn, groups) = dress(chain, skin, look, equipment);
+            equipped = worn;
+            decided = groups;
         }
         // Section type 0 is the base skin, indexed by skin colour. The face,
         // facial hair and underwear are separate *layers* meant to be composed
@@ -294,7 +368,8 @@ pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[u32]) -
         skin,
         body,
         hair,
-        geosets,
+        geosets: geosets.into_iter().chain(equipped).collect(),
+        decided_groups: decided,
     }
 }
 
@@ -384,6 +459,9 @@ pub struct NpcAppearances {
     sections: Option<CharSections>,
     hair_geosets: Option<CharHairGeosets>,
     facial: Option<CharacterFacialHairStyles>,
+    /// For the geometry an NPC's gear switches on. Its *textures* are already
+    /// in the baked skin, so this is read for geosets alone.
+    items: Option<dbc::schema::ItemDisplayInfo>,
 }
 
 impl NpcAppearances {
@@ -414,6 +492,10 @@ impl NpcAppearances {
                 .read(CharacterFacialHairStyles::PATH)
                 .ok()
                 .and_then(|b| CharacterFacialHairStyles::parse(&b).ok()),
+            items: chain
+                .read(dbc::schema::ItemDisplayInfo::PATH)
+                .ok()
+                .and_then(|b| dbc::schema::ItemDisplayInfo::parse(&b).ok()),
         })
     }
 
@@ -464,11 +546,49 @@ impl NpcAppearances {
             tracing::debug!("display {display_id} (extra {extended}) names no baked texture");
         }
 
+        // The eleven item columns, by the slot each was measured to be.
+        let equipment: Vec<(u32, u8)> = [
+            row.item_display_0(), row.item_display_1(), row.item_display_2(),
+            row.item_display_3(), row.item_display_4(), row.item_display_5(),
+            row.item_display_6(), row.item_display_7(), row.item_display_8(),
+            row.item_display_9(), row.item_display_10(),
+        ]
+        .into_iter()
+        .zip(NPC_ITEM_SLOTS)
+        .filter(|(display, _)| *display != 0)
+        .collect();
+
+        let mut worn = Vec::new();
+        let mut decided = Vec::new();
+        if !equipment.is_empty() {
+            if let Some(items) = &self.items {
+                for (display, inventory_type) in &equipment {
+                    let Some((group, column)) = geoset_rule(*inventory_type) else {
+                        continue;
+                    };
+                    let Some(item) = items.iter().find(|r| r.id() == *display) else {
+                        continue;
+                    };
+                    let variant = [
+                        item.geoset_group_0(),
+                        item.geoset_group_1(),
+                        item.geoset_group_2(),
+                    ][column];
+                    // Zero adds nothing -- see the same guard in `dress`.
+                    if variant != 0 {
+                        decided.push(group);
+                        worn.push(group * 100 + variant);
+                    }
+                }
+            }
+        }
+
         Some(Look {
             skin: None,
             body,
             hair,
-            geosets,
+            geosets: geosets.into_iter().chain(worn).collect(),
+            decided_groups: decided,
         })
     }
 }
@@ -541,13 +661,19 @@ fn layer(chain: &mut Chain, path: &str) -> Option<(u32, u32, Vec<u8>)> {
 ///
 /// Reads `ItemDisplayInfo` once for the whole outfit rather than once per item:
 /// it is 58,000 rows, and a character wears up to nineteen things.
-fn dress(chain: &mut Chain, skin: &mut Skin, look: Appearance, equipment: &[u32]) {
+fn dress(
+    chain: &mut Chain,
+    skin: &mut Skin,
+    look: Appearance,
+    equipment: &[(u32, u8)],
+) -> (Vec<u32>, Vec<u32>) {
     use dbc::schema::ItemDisplayInfo;
 
     // `display` alone shadows a `tracing` helper of that name inside its
     // macros, so the binding is spelled out.
-    if equipment.iter().all(|display_id| *display_id == 0) {
-        return;
+    let (mut geosets, mut decided) = (Vec::new(), Vec::new());
+    if equipment.iter().all(|(display_id, _)| *display_id == 0) {
+        return (geosets, decided);
     }
     let started = std::time::Instant::now();
     let Some(table) = chain
@@ -556,15 +682,31 @@ fn dress(chain: &mut Chain, skin: &mut Skin, look: Appearance, equipment: &[u32]
         .and_then(|bytes| ItemDisplayInfo::parse(&bytes).ok())
     else {
         tracing::warn!("no ItemDisplayInfo: equipment will not be drawn");
-        return;
+        return (geosets, decided);
     };
 
     let mut worn = 0;
-    for display_id in equipment.iter().filter(|id| **id != 0) {
+    for (display_id, inventory_type) in equipment.iter().filter(|(id, _)| *id != 0) {
         match table.iter().find(|row| row.id() == *display_id) {
             Some(row) => {
                 wear(chain, skin, &row, look.gender);
                 worn += 1;
+                // Geometry as well as paint. A slot with no rule here switches
+                // nothing on, which leaves the bare body showing -- the safe
+                // direction, and the one `Look::shows` already fails towards.
+                if let Some((group, column)) = geoset_rule(*inventory_type) {
+                    let variant = [row.geoset_group_0(), row.geoset_group_1(), row.geoset_group_2()]
+                        [column];
+                    // **Variant zero means the item adds no geometry**, not
+                    // that it decides the group is empty. Treating it as a
+                    // decision hides the bare body part underneath, which is
+                    // how a character in ordinary boots ends up with no feet --
+                    // Testwolf's boots are exactly this case.
+                    if variant != 0 {
+                        decided.push(group);
+                        geosets.push(group * 100 + variant);
+                    }
+                }
             }
             // A display id with no row is worth naming: it means the item
             // exists and this client cannot say what it looks like, which is
@@ -572,7 +714,11 @@ fn dress(chain: &mut Chain, skin: &mut Skin, look: Appearance, equipment: &[u32]
             None => tracing::debug!("no ItemDisplayInfo row for display {display_id}"),
         }
     }
-    tracing::debug!("dressed in {worn} item(s) in {:?}", started.elapsed());
+    tracing::debug!(
+        "dressed in {worn} item(s) in {:?}; geosets {geosets:?}",
+        started.elapsed()
+    );
+    (geosets, decided)
 }
 
 fn blend(skin: &mut Skin, rect: region::Rect, layer: (u32, u32, Vec<u8>)) {
@@ -781,6 +927,44 @@ mod tests {
         assert_eq!(narrow, ["hand", "torso lower", "foot"]);
     }
 
+    /// A group the gear decided shows only what the gear named -- but a group
+    /// it said nothing about still falls back to the bare body part.
+    ///
+    /// The difference is the whole reason `decided_groups` exists. Without it,
+    /// taking a glove off leaves a hand missing rather than bare.
+    #[test]
+    fn gear_decides_its_own_group_and_leaves_the_rest_alone() {
+        let gloved = Look {
+            geosets: vec![403],
+            decided_groups: vec![4],
+            ..Default::default()
+        };
+        assert!(gloved.shows(403), "the glove it is wearing");
+        assert!(!gloved.shows(401), "the bare hand it is covering");
+        assert!(!gloved.shows(402), "a glove it is not wearing");
+        // Boots were never decided, so the bare foot still shows.
+        assert!(gloved.shows(501));
+        assert!(!gloved.shows(502));
+    }
+
+    /// An item whose variant is zero adds no geometry and must not count as a
+    /// decision.
+    ///
+    /// This is the bug the first version had, and it would have shown up as a
+    /// character in ordinary boots having no feet: Testwolf's boots carry a
+    /// geoset group of zero, which is the common case for starting gear.
+    #[test]
+    fn an_item_that_adds_no_geometry_leaves_the_bare_body() {
+        let plain = Look {
+            geosets: vec![],
+            decided_groups: vec![],
+            ..Default::default()
+        };
+        assert!(plain.shows(501), "the bare foot must survive plain boots");
+        assert!(plain.shows(401), "and the bare hand");
+        assert!(!plain.shows(502), "without turning gear on");
+    }
+
     /// Equipment has to reach the cache key, or two characters in different
     /// armour share one built model -- the same bug the appearance key exists
     /// to prevent for faces.
@@ -796,16 +980,26 @@ mod tests {
             facial_hair: 0,
         };
         let naked = look_key(&appearance, &[]);
-        assert_ne!(naked, look_key(&appearance, &[9891]));
-        assert_ne!(look_key(&appearance, &[9891]), look_key(&appearance, &[9892]));
+        assert_ne!(naked, look_key(&appearance, &[(9891, 5)]));
+        assert_ne!(
+            look_key(&appearance, &[(9891, 5)]),
+            look_key(&appearance, &[(9892, 7)])
+        );
         // Order matters too: it is the paint order, so a different order is a
         // different character even with the same items.
         assert_ne!(
-            look_key(&appearance, &[9891, 9892]),
-            look_key(&appearance, &[9892, 9891])
+            look_key(&appearance, &[(9891, 5), (9892, 7)]),
+            look_key(&appearance, &[(9892, 7), (9891, 5)])
         );
         // And an empty slot is not the same as no slot at all being read.
         assert_eq!(naked, look_key(&appearance, &[]));
+        // The slot is part of the key too: an item switches on a different
+        // geoset group depending on which slot it is in, so the same display id
+        // in two slots is two different characters.
+        assert_ne!(
+            look_key(&appearance, &[(9891, 5)]),
+            look_key(&appearance, &[(9891, 10)])
+        );
     }
 
     fn look_with(geosets: Vec<u32>) -> Look {

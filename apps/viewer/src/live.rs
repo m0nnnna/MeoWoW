@@ -193,10 +193,12 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
     // body needs no `Item.dbc` lookup at all, where another player's visible
     // items arrive as entry ids and do. In the order the wire sends them, which
     // is also the order they must be painted: see `resolve_wearing`.
-    let equipment: Vec<u32> = character
+    // Display id *and* inventory type: the type is what says whether an item
+    // switches on a glove or a boot, and the character list carries it.
+    let equipment: Vec<(u32, u8)> = character
         .equipment
         .iter()
-        .map(|slot| slot.display_id)
+        .map(|slot| (slot.display_id, slot.inventory_type))
         .collect();
     let look = crate::character::resolve_wearing(chain, appearance, &equipment);
     tracing::info!(
@@ -205,7 +207,7 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
         look.body,
         look.hair,
         look.geosets,
-        equipment.iter().filter(|id| **id != 0).count()
+        equipment.iter().filter(|(id, _)| *id != 0).count()
     );
 
     let (map_directory, map_name) = map_directory(chain, landed.map)?;

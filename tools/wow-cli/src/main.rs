@@ -326,6 +326,11 @@ enum M2Command {
         /// Level of detail to describe.
         #[arg(long, default_value_t = 0)]
         lod: u32,
+        /// How many batches to list. A character model has sixty-odd and the
+        /// question is usually "which geoset groups does this model contain",
+        /// which a truncated list cannot answer.
+        #[arg(long, default_value_t = 24)]
+        limit: usize,
     },
     /// Parse every model and its skins, validating the index tables.
     Survey {
@@ -2408,7 +2413,7 @@ fn wmo_survey(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> 
 
 fn m2_cmd(chain: &mut Chain, cmd: M2Command) -> Result<()> {
     match cmd {
-        M2Command::Info { path, lod } => m2_info(chain, &path, lod),
+        M2Command::Info { path, lod, limit } => m2_info(chain, &path, lod, limit),
         M2Command::Survey { filter, limit } => m2_survey(chain, filter.as_deref(), limit),
         M2Command::Creature { display_id } => m2_creature(chain, display_id),
         M2Command::Anims { path, limit } => m2_anims(chain, &path, limit),
@@ -2520,7 +2525,7 @@ fn m2_anims(chain: &mut Chain, path: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn m2_info(chain: &mut Chain, path: &str, lod: u32) -> Result<()> {
+fn m2_info(chain: &mut Chain, path: &str, lod: u32, limit: usize) -> Result<()> {
     let path = m2::model_path(path);
     let model = m2::Model::parse(&chain.read(&path)?)?;
 
@@ -2606,7 +2611,7 @@ fn m2_info(chain: &mut Chain, path: &str, lod: u32) -> Result<()> {
             let combos = model.texture_combos();
             let textures = model.textures();
             println!("\n    batches:");
-            for (i, b) in skin.batches().iter().enumerate().take(24) {
+            for (i, b) in skin.batches().iter().enumerate().take(limit) {
                 let sub = skin.submeshes().get(b.submesh_index as usize);
                 // A batch names its texture indirectly, through the combo
                 // table; this is the lookup the renderer performs per draw.
@@ -2629,8 +2634,8 @@ fn m2_info(chain: &mut Chain, path: &str, lod: u32) -> Result<()> {
                     b.material_index,
                 );
             }
-            if skin.batches().len() > 24 {
-                println!("      ... {} more", skin.batches().len() - 24);
+            if skin.batches().len() > limit {
+                println!("      ... {} more", skin.batches().len() - limit);
             }
         }
         Err(e) => println!("\n  {skin_path}: {e}"),

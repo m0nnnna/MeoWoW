@@ -928,3 +928,55 @@ Their rotation is the orientation from the position block, which is right for
 anything standing on level ground. Game objects also carry a packed quaternion
 for genuinely tilted things, which is read past and not applied; a leaning
 signpost is the visible symptom, and there is not one in Northshire to look at.
+
+### Equipment geometry
+
+Gloves, boot tops, sleeves and cloaks are geometry, not paint: geosets inside the
+character model, switched on by `ItemDisplayInfo.geoset_group_*`. Which *group*
+an item switches depends on the slot it is worn in, and that mapping is client
+logic rather than a column -- the shape `CLAUDE.md` warns can only be found by
+looking.
+
+**So it was found by looking, twice over.** First at the data, then at a render.
+
+The model says which groups exist. `wow-cli m2 info --limit 200` on `HumanMale`
+lists `401`-`404`, `501`-`505`, `802`-`803`, `902`-`903`, `1002`, `1102`, `1104`,
+`1202`, `1301`-`1302`, `1501`-`1506`, `1703`, `1802`. (The `--limit` exists
+because the list was truncated at 24 with "37 more", and a dump that cannot show
+the thing being asked about is not a dump.)
+
+The items say which values each slot uses. Every inventory type was identified
+by **what its items paint** rather than from a remembered enum: type 8's items
+set a foot texture, type 10's a hand texture, type 16's almost nothing but a
+thousand cape geosets. Then the two are matched:
+
+| slot | type | values in the data | model has | group |
+|---|---|---|---|---|
+| hands | 10 | 1, 2, 3 | 401-404 | 4 |
+| feet | 8 | 1, 2, 3 | 501-505 | 5 |
+| back | 16 | 1, 2, 5 | 1501-1506 | 15 |
+| shirt, chest | 4, 5 | 1, 2 | 802, 803 | 8 |
+| robe | 20 | 1, 2 | 1301, 1302 | 13 |
+
+**Belt, legs and tabard are deliberately absent.** Their values do not line up:
+a tabard uses value 1 where the only tabard geoset is `1202`, and legs drive two
+of the three columns at once. A mapping for them would be a guess dressed as a
+table, and this project has already paid four attempts for geoset rules read
+rather than rendered. A missing belt buckle costs nothing; a robe's skirt on
+somebody's arm costs an afternoon.
+
+The same measurement identified `CreatureDisplayInfoExtra`'s eleven item
+columns, which have no inventory type of their own -- their *position* is the
+slot. Column 6's 23,102 items set a foot texture; column 7's set only a lower
+arm; column 10's set almost no texture and a thousand capes.
+
+**Variant zero means "adds no geometry", not "this group is empty".** The first
+version treated every equipped item as a decision about its group, which hides
+the bare body part underneath -- and starting gear routinely carries a geoset
+group of zero, so Testwolf's ordinary boots would have left him with no feet.
+`Look::decided_groups` now records only the groups something actually switched
+on, and everything else falls back to the bare-body rule that was already there.
+
+Verified by rendering. A Stormwind guard, whose gear is all variant zero, keeps
+his bare hands and plain boots; an NPC wearing real gear comes back with
+flared gauntlet cuffs, armoured boot tops and a cloak.

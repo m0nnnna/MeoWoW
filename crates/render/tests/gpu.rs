@@ -106,6 +106,12 @@ fn identity_camera() -> CameraUniform {
         view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
         eye: [0.0, 0.0, 1.0, 1.0],
         light: [0.0, 0.0, 1.0, 0.0],
+        // Unlit: the shaders read `sun.w` of zero as "no light data" and use
+        // their placeholder, which is what this test has always exercised.
+        sun: [0.0; 4],
+        ambient: [0.0; 4],
+        fog: [0.0; 4],
+        fog_range: [0.0; 4],
     }
 }
 
