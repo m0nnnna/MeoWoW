@@ -1234,3 +1234,59 @@ armour as a painted-on texture with no sleeves or boots to it, and why the
 player is in underwear. `CreatureDisplayInfoExtra` already carries eleven item
 display ids per NPC, read and named here but unused. Lighting and the day/night
 cycle are untouched, and game objects are still not drawn at all.
+
+### Equipment, the texture half
+
+Clothes before geometry, because that is where the visible difference is: the
+player was standing in Northshire in its underwear, and a character's armour is
+in the first instance eight texture patches blended onto the same composed skin
+the face and underwear already use.
+
+`ItemDisplayInfo` and `Item` are transcribed, and both were verified rather than
+trusted:
+
+- The eight component columns **name themselves**. Every value carries its
+  component as a suffix (`..._Chest_TU`, `..._Pant_LL`), and across 57,986 rows
+  each column is 98.9%-100% dominated by exactly its own suffix in order. That
+  is a stronger check than any external documentation, because it is the data
+  agreeing with itself.
+- The regions those components land on were pinned by aspect ratio -- hand,
+  torso-lower and foot are 4:1, the rest 2:1 -- and by the fact that all ten
+  regions **tile the 512x512 skin exactly**, which a layout guessed one region
+  at a time would not do. There is a test for it now.
+- `Item.display_info_id` was picked out **against a control**: 100.0% of its
+  46,096 values are real `ItemDisplayInfo` ids, where the item id in column 0 --
+  a number of the same magnitude from an overlapping range -- manages 89.6%.
+  This project has already been burned by a column that looked valid because any
+  small integer points somewhere inside a big table, so the gap is the argument,
+  not the hit rate.
+
+**No slot enum was transcribed.** Items are painted in the order the character
+list sends them, and that order is already inner-to-outer wherever two items
+share a component -- shirt before chest, bracer before glove, trouser before
+boot -- so the layering falls out of the wire order.
+
+**The best thing to come out of this was `--skin-out`.** At walking distance the
+dressed character looked bare-chested, and the obvious diagnosis was that the
+torso regions were wrong. Dumping the composed atlas to a PNG showed every one
+of the ten regions painted correctly, with the torso wearing a white shirt and
+brown braces that simply read as skin at that size. **The render was right and
+the look at it was wrong** -- the inverse of the usual failure here, and it would
+have cost an afternoon of moving correct regions around. A composite assembled
+from a dozen files in memory needs a way to be seen as itself, not only as three
+hundred pixels of character on a screen.
+
+**Not done, and each is its own piece of work:**
+
+- **Geometry.** Sleeves, boot tops and glove cuffs that stand off the body are
+  geosets, switched on by `ItemDisplayInfo.geoset_group_*` against the item's
+  inventory type. Which group each applies to is client logic rather than a
+  column, so it wants rendering to settle, exactly like the four attempts
+  hairstyles took.
+- **Weapons, shields and shoulders**, which are separate M2s on attachment
+  points -- `model_left` and `model_right` are read and named but nothing draws
+  them.
+- **Other players' equipment.** Their visible-item fields carry item *entry*
+  ids, which is why `Item.dbc` is transcribed here at all; the field indices
+  want the same search treatment `PLAYER_BYTES` got, against a character whose
+  gear is known from the character list.

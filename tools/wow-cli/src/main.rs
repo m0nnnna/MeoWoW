@@ -697,6 +697,22 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
                 ""
             },
         );
+        // What the character is wearing, which the list has always carried and
+        // never shown. These are *display* ids, which is what makes our own
+        // body cheap to dress: another player's visible items arrive as entry
+        // ids and need `Item.dbc` to get here.
+        let worn: Vec<String> = character
+            .equipment
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.display_id != 0)
+            .map(|(index, slot)| {
+                format!("{index}:display {} type {}", slot.display_id, slot.inventory_type)
+            })
+            .collect();
+        if !worn.is_empty() {
+            println!("      wearing {}", worn.join(", "));
+        }
     }
 
     if let Some(name) = enter {
@@ -3133,7 +3149,9 @@ fn dbc_rows(chain: &mut Chain, table: &str, limit: usize, ids: &[u32]) -> Result
         SpellDuration,
         SpellRadius,
         CharSections,
-        CharHairGeosets
+        CharHairGeosets,
+        Item,
+        ItemDisplayInfo
     )
     // `CharacterFacialHairStyles` is deliberately absent: it has no id column
     // at all -- race, gender and variation are its key -- so it cannot satisfy
@@ -3184,6 +3202,8 @@ fn dbc_check(chain: &mut Chain) -> Result<()> {
         CharSections,
         CharHairGeosets,
         CharacterFacialHairStyles,
+        Item,
+        ItemDisplayInfo,
     );
     println!();
     if failures == 0 {

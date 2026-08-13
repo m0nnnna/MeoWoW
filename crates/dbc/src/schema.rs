@@ -328,6 +328,97 @@ dbc_table! {
 }
 
 dbc_table! {
+    /// What a piece of equipment looks like: the textures painted onto the
+    /// wearer, and the geometry switched on for it.
+    ///
+    /// **The texture columns name themselves, which is why they did not have to
+    /// be transcribed.** Every stored name carries the component it belongs to
+    /// as a suffix -- `Generic_HuWk_01_Sleeve_AU` is an arm-upper, `..._TL` a
+    /// torso-lower -- so the column order is checkable against the data rather
+    /// than against memory. Over all 57,986 rows each column is 98.9% to 100%
+    /// dominated by exactly its own suffix, in the order below. The stragglers
+    /// are Blizzard's own typos: a handful of names ending `_A`, and a few
+    /// truncated to a bare trailing underscore.
+    ///
+    /// Their *regions* on the composed skin were confirmed the same way. The
+    /// eight components come in two resolutions -- 128 wide and 256 wide -- so
+    /// size alone says nothing, but the aspect ratio does: hand, torso-lower
+    /// and foot measure 4:1 and the other five 2:1, which is exactly what the
+    /// character layout in `apps/viewer/src/character.rs` predicts and what
+    /// would break if any two regions were swapped.
+    ItemDisplayInfo, ItemDisplayInfoRow,
+    path = r"DBFilesClient\ItemDisplayInfo.dbc", fields = 25, {
+        0  id: u32,
+        /// Attached geometry, e.g. `LShoulder_Cloth_AhnQiraj_A_01.mdx`. 100% of
+        /// the 19,702 non-empty values end in `.mdx`, which is what identifies
+        /// the column. Not drawn yet -- shoulders, weapons and helms hang off
+        /// M2 attachment points, which is its own piece of work.
+        1  model_left: str,
+        2  model_right: str,
+        3  model_texture_left: str,
+        4  model_texture_right: str,
+        /// 97.5% of non-empty values begin `INV_`.
+        5  inventory_icon: str,
+        6  inventory_icon_2: str,
+        /// Which variant of the geoset groups this item turns on. **Not
+        /// verified**: nothing here reads them yet, and which *group* each
+        /// applies to depends on the item's inventory type, which is client
+        /// logic rather than a column. Named so the next person knows the data
+        /// is in hand; do not trust the meaning without rendering it.
+        7  geoset_group_0: u32,
+        8  geoset_group_1: u32,
+        9  geoset_group_2: u32,
+        10 flags: u32,
+        11 spell_visual_id: u32,
+        12 group_sound_index: u32,
+        13 helmet_geoset_vis_male: u32,
+        14 helmet_geoset_vis_female: u32,
+        /// The eight body components, in the order their own name suffixes
+        /// confirm. Bare names: the path is
+        /// `Item\TextureComponents\<Component>\<name>_<M|F|U>.blp`.
+        15 arm_upper: str,
+        16 arm_lower: str,
+        17 hand: str,
+        18 torso_upper: str,
+        19 torso_lower: str,
+        20 leg_upper: str,
+        21 leg_lower: str,
+        22 foot: str,
+        23 item_visual: u32,
+        24 particle_colour_id: u32,
+    }
+}
+
+dbc_table! {
+    /// The bridge from an item to its appearance.
+    ///
+    /// Needed because the wire carries item *entry* ids while everything about
+    /// looks is keyed by display id. `SMSG_CHAR_ENUM` helpfully sends display
+    /// ids directly, so our own character needs none of this; another player's
+    /// visible-item fields do.
+    ///
+    /// `display_info_id` was picked out against a control rather than
+    /// transcribed: all 46,096 of its values are real `ItemDisplayInfo` ids,
+    /// where the item id in column 0 -- a number of the same magnitude, drawn
+    /// from an overlapping range -- manages only 89.6%. That gap is the whole
+    /// argument; this project has been burned before by a column that looked
+    /// valid because *any* small integer points somewhere inside a big table.
+    Item, ItemRow, path = r"DBFilesClient\Item.dbc", fields = 8, {
+        0 id: u32,
+        1 class_id: u32,
+        2 subclass_id: u32,
+        3 sound_override_subclass: i32,
+        4 material: i32,
+        /// Row in [`ItemDisplayInfo`].
+        5 display_info_id: u32,
+        /// Which slot the item occupies, and therefore which geosets and
+        /// texture components it may touch.
+        6 inventory_type: u32,
+        7 sheathe_type: u32,
+    }
+}
+
+dbc_table! {
     /// Names for animation ids. An M2 sequence stores only the numeric id, so
     /// this is the only way to know that sequence 0 is `Stand`.
     AnimationData, AnimationDataRow,

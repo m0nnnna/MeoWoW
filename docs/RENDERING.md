@@ -706,3 +706,54 @@ Player hair was reported missing and is not: human-male hairstyle 0 is *bald*.
 `CharSections` type 3 for that variation have an empty texture. The character
 being looked at simply had no hair. A character created with hairstyle 7 draws
 its hair correctly.
+
+### Armour, painted on
+
+A character's clothes are not geometry in the first instance -- they are eight
+texture patches blended onto the same composed skin the face and underwear go
+onto. `ItemDisplayInfo` names them per item, and this client now paints them for
+the player's own body.
+
+**The columns named themselves, so nothing had to be transcribed.** Every stored
+component name carries its own suffix: `Leather_A_05Yellow_Chest_TU` is a
+torso-upper, `..._Pant_LL` a leg-lower. Across all 57,986 rows each of the eight
+columns is 98.9%-100% dominated by exactly its own suffix, in order. The
+stragglers are Blizzard's own typos -- a few names ending `_A`, a few truncated
+to a bare trailing underscore -- which is also why the check is stated as a
+percentage rather than an assertion.
+
+**The regions were confirmed twice over.** The five new ones (arms, hand, torso
+upper and lower, leg lower, foot) join the three the face and underwear had
+already pinned. Component textures ship at two resolutions, 128 wide and 256
+wide, so their sizes prove nothing alone -- but their aspect ratios do: hand,
+torso-lower and foot measure 4:1 and the other five 2:1, exactly as the layout
+predicts, and swapping any two regions breaks that. The stronger check is that
+the ten regions **tile the 512x512 skin exactly**, left column 128+128+64+64+128
+and right column 128+64+128+128+64, both reaching 512 with nothing overlapping
+and nothing left over. A layout guessed a region at a time would not close, and
+`the_skin_regions_tile_it_exactly` now fails if anyone moves one.
+
+**No slot enum had to be transcribed either.** Items are painted in the order
+`SMSG_CHAR_ENUM` sends them, and that order is already inner-to-outer wherever
+two items share a component: shirt before chest, bracer before glove, trouser
+before boot. So the layering falls out of the wire order, and the one thing that
+could be wrong -- something painted over what should cover it -- is exactly what
+a render shows.
+
+**`--skin-out` writes the composed atlas to a PNG**, and it earned its place
+immediately. Seen at walking distance the character looked bare-chested, and the
+obvious reading was that the torso regions were wrong. The atlas showed all ten
+regions painted correctly and the torso wearing a white shirt with brown braces
+-- which at that size reads as skin. *The character was correct and the look at
+it was not.* Ten regions assembled from a dozen files are far too small on
+screen to judge individually; the atlas answers in one glance which is the same
+reason every format here has a dump command.
+
+Still texture-only. Sleeves, boot tops and glove cuffs that stand off the body
+are geometry, switched on by `ItemDisplayInfo.geoset_group_*` against the item's
+inventory type -- a mapping that lives in client logic rather than in a column,
+so it wants rendering rather than transcribing. Weapons, shields and shoulders
+are separate M2s on attachment points. And other players are still undressed:
+their visible-item fields carry item *entry* ids, which need `Item.dbc` to reach
+a display id, and those field indices want the same search treatment
+`PLAYER_BYTES` got.

@@ -106,6 +106,16 @@ struct Args {
     #[arg(long)]
     screenshot: Option<PathBuf>,
 
+    /// Write the logged-in character's composed skin to this PNG.
+    ///
+    /// The skin is ten regions of one 512x512 atlas -- face, arms, hands,
+    /// torso, legs, feet -- assembled in memory from a dozen files, and a
+    /// character seen at walking distance is far too small to say which of them
+    /// got painted. Looking at the atlas answers that in one glance, which is
+    /// the same reason every format here has a dump command.
+    #[arg(long)]
+    skin_out: Option<PathBuf>,
+
     /// Camera yaw in degrees, for reproducible screenshots.
     #[arg(long)]
     yaw: Option<f32>,
@@ -275,6 +285,15 @@ fn build_live_scene(
     };
 
     let live = live::connect(chain, &login)?;
+    if let Some(path) = &args.skin_out {
+        match &live.look.skin {
+            Some(skin) => {
+                write_png(path, &skin.rgba, skin.width, skin.height)?;
+                tracing::info!("composed skin written to {}", path.display());
+            }
+            None => tracing::warn!("no composed skin to write"),
+        }
+    }
     let mut world = world::World::new(
         chain,
         &live.map_directory,

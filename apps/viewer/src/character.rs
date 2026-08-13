@@ -160,12 +160,101 @@ const MANAGED_GROUPS: [u32; 4] = [0, 1, 2, 3];
 /// reasoning from this one.
 const HIDDEN_WITHOUT_EQUIPMENT: [u32; 1] = [15];
 
-/// Resolves an appearance into textures and geosets.
+/// A cache key for an appearance *and* what it is wearing.
+///
+/// Separate from [`Appearance::key`] because equipment changes how a character
+/// looks without changing any of the five numbers: two humans in different
+/// armour must not share a built model, which is the same bug `look_key`
+/// already exists to prevent for faces.
+pub fn look_key(appearance: &Appearance, equipment: &[u32]) -> u64 {
+    // FNV-1a. Any stable hash would do -- this is a cache key, not a checksum,
+    // and the appearance key alone is the part that has to be exact.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |value: u64| {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    };
+    eat(appearance.key());
+    for display in equipment {
+        eat(u64::from(*display));
+    }
+    hash
+}
+
+/// The eight body components an item can paint on, and where each lives.
+///
+/// The directory names are the ones in the archive; the region is where that
+/// component lands on the composed skin. Ordered as `ItemDisplayInfo` stores
+/// them, so the two cannot drift.
+const COMPONENTS: [(&str, region::Rect); 8] = [
+    ("ArmUpperTexture", region::ARM_UPPER),
+    ("ArmLowerTexture", region::ARM_LOWER),
+    ("HandTexture", region::HAND),
+    ("TorsoUpperTexture", region::TORSO_UPPER),
+    ("TorsoLowerTexture", region::TORSO_LOWER),
+    ("LegUpperTexture", region::PELVIS),
+    ("LegLowerTexture", region::LEG_LOWER),
+    ("FootTexture", region::FOOT),
+];
+
+/// Paints one item's components onto a skin already composed.
+///
+/// The gender-specific file is preferred and the unisex one is the fallback.
+/// Most components ship as `_U` only; a few are cut for one body and not the
+/// other, and taking `_U` first would quietly use the wrong shape for those.
+fn wear(chain: &mut Chain, skin: &mut Skin, row: &dbc::schema::ItemDisplayInfoRow<'_>, gender: u8) {
+    let names = [
+        row.arm_upper(),
+        row.arm_lower(),
+        row.hand(),
+        row.torso_upper(),
+        row.torso_lower(),
+        row.leg_upper(),
+        row.leg_lower(),
+        row.foot(),
+    ];
+    let sex = if gender == 1 { 'F' } else { 'M' };
+    for (name, (directory, rect)) in names.iter().zip(COMPONENTS) {
+        if name.is_empty() {
+            continue;
+        }
+        let candidates = [
+            format!(r"Item\TextureComponents\{directory}\{name}_{sex}.blp"),
+            format!(r"Item\TextureComponents\{directory}\{name}_U.blp"),
+        ];
+        match candidates.iter().find_map(|path| layer(chain, path)) {
+            Some(pixels) => blend(skin, rect, pixels),
+            // Worth a line rather than a silent skip: a component that will not
+            // load is a bare patch of skin where armour should be, which looks
+            // like the character is wearing nothing there rather than like a
+            // missing file.
+            None => tracing::debug!("no {directory} texture for {name:?}"),
+        }
+    }
+}
+
+/// Resolves an appearance into textures and geosets, wearing nothing.
 ///
 /// Every lookup degrades to `None` rather than failing: without a game
 /// installation there are no tables to read, and the character still has to
 /// draw -- untextured, as it did before this existed, rather than not at all.
 pub fn resolve(chain: &mut Chain, look: Appearance) -> Look {
+    resolve_wearing(chain, look, &[])
+}
+
+/// Resolves an appearance, dressed in the items whose display ids are given.
+///
+/// `equipment` is taken in the order `SMSG_CHAR_ENUM` sends it, and that order
+/// is used directly for the paint order rather than being mapped through a slot
+/// enum -- which is worth stating, because it looks like luck and is not
+/// *quite*. Where two items paint the same component, the array already runs
+/// inner to outer: shirt before chest, bracer before glove, trouser before
+/// boot. So no table of slot meanings has to be transcribed to get the layering
+/// right, and the one thing that would be wrong -- an item painted over the
+/// thing that should cover it -- is exactly what a render shows.
+pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[u32]) -> Look {
     let sections = chain
         .read(CharSections::PATH)
         .ok()
@@ -182,6 +271,9 @@ pub fn resolve(chain: &mut Chain, look: Appearance) -> Look {
     let (mut body, mut skin) = (None, None);
     if let Some(sections) = &sections {
         skin = compose(chain, sections, look);
+        if let Some(skin) = skin.as_mut() {
+            dress(chain, skin, look, equipment);
+        }
         // Section type 0 is the base skin, indexed by skin colour. The face,
         // facial hair and underwear are separate *layers* meant to be composed
         // onto this one; composing them needs a texture blit this client does
@@ -401,13 +493,32 @@ impl NpcAppearances {
 /// Three exact agreements between a layout and files that know nothing about
 /// it is the same kind of evidence as two parsers arriving at the same rage
 /// value. A wrong layout would have to be wrong by zero pixels three times.
+/// The eight armour components were added later and confirm the same layout
+/// from a second direction. They ship at two resolutions, 128 wide and 256
+/// wide, so their *sizes* prove nothing on their own -- but their aspect ratios
+/// do, and they agree with every region here: hand, torso-lower and foot are
+/// 4:1, the other five 2:1. Swap any two regions and that stops being true.
+///
+/// The stronger check is that the ten regions **tile the 512x512 skin exactly**
+/// with nothing left over and nothing overlapping: the left column runs
+/// 128+128+64+64+128 and the right 128+64+128+128+64, both reaching 512. A
+/// layout guessed one region at a time would not close.
 mod region {
     /// `(x, y, width, height)` on a 512x512 base skin.
     pub type Rect = (u32, u32, u32, u32);
+
+    pub const ARM_UPPER: Rect = (0, 0, 256, 128);
+    pub const ARM_LOWER: Rect = (0, 128, 256, 128);
+    pub const HAND: Rect = (0, 256, 256, 64);
     pub const FACE_UPPER: Rect = (0, 320, 256, 64);
     pub const FACE_LOWER: Rect = (0, 384, 256, 128);
-    /// Underwear sits on the upper legs.
+
+    pub const TORSO_UPPER: Rect = (256, 0, 256, 128);
+    pub const TORSO_LOWER: Rect = (256, 128, 256, 64);
+    /// Underwear sits here too, which is why this one was already known.
     pub const PELVIS: Rect = (256, 192, 256, 128);
+    pub const LEG_LOWER: Rect = (256, 320, 256, 128);
+    pub const FOOT: Rect = (256, 448, 256, 64);
 }
 
 /// Reads a texture and expands it to RGBA.
@@ -426,6 +537,44 @@ fn layer(chain: &mut Chain, path: &str) -> Option<(u32, u32, Vec<u8>)> {
 /// the skin and face layers are opaque and simply overwrite, but facial hair
 /// carries an 8-bit alpha and a beard drawn as an opaque rectangle would be a
 /// box on the chin.
+/// Paints every equipped item onto an already-composed skin.
+///
+/// Reads `ItemDisplayInfo` once for the whole outfit rather than once per item:
+/// it is 58,000 rows, and a character wears up to nineteen things.
+fn dress(chain: &mut Chain, skin: &mut Skin, look: Appearance, equipment: &[u32]) {
+    use dbc::schema::ItemDisplayInfo;
+
+    // `display` alone shadows a `tracing` helper of that name inside its
+    // macros, so the binding is spelled out.
+    if equipment.iter().all(|display_id| *display_id == 0) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let Some(table) = chain
+        .read(ItemDisplayInfo::PATH)
+        .ok()
+        .and_then(|bytes| ItemDisplayInfo::parse(&bytes).ok())
+    else {
+        tracing::warn!("no ItemDisplayInfo: equipment will not be drawn");
+        return;
+    };
+
+    let mut worn = 0;
+    for display_id in equipment.iter().filter(|id| **id != 0) {
+        match table.iter().find(|row| row.id() == *display_id) {
+            Some(row) => {
+                wear(chain, skin, &row, look.gender);
+                worn += 1;
+            }
+            // A display id with no row is worth naming: it means the item
+            // exists and this client cannot say what it looks like, which is
+            // different from wearing nothing there.
+            None => tracing::debug!("no ItemDisplayInfo row for display {display_id}"),
+        }
+    }
+    tracing::debug!("dressed in {worn} item(s) in {:?}", started.elapsed());
+}
+
 fn blend(skin: &mut Skin, rect: region::Rect, layer: (u32, u32, Vec<u8>)) {
     let (rx, ry, rw, rh) = rect;
     let (lw, lh, pixels) = layer;
@@ -565,6 +714,99 @@ fn find(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ten regions tile the 512x512 skin exactly: every pixel covered once,
+    /// none twice, nothing off the edge.
+    ///
+    /// This is the check that makes the layout a measurement rather than ten
+    /// separate guesses. A single region placed wrongly -- the mistake that
+    /// paints a sleeve across a face -- either leaves a hole or overlaps a
+    /// neighbour, and both show up here. It also fails loudly if someone adds
+    /// an eleventh region without deciding what it displaces.
+    #[test]
+    fn the_skin_regions_tile_it_exactly() {
+        const SIDE: usize = 512;
+        let regions = [
+            ("arm upper", region::ARM_UPPER),
+            ("arm lower", region::ARM_LOWER),
+            ("hand", region::HAND),
+            ("face upper", region::FACE_UPPER),
+            ("face lower", region::FACE_LOWER),
+            ("torso upper", region::TORSO_UPPER),
+            ("torso lower", region::TORSO_LOWER),
+            ("pelvis", region::PELVIS),
+            ("leg lower", region::LEG_LOWER),
+            ("foot", region::FOOT),
+        ];
+
+        let mut covered = vec![0u8; SIDE * SIDE];
+        for (name, (x, y, w, h)) in regions {
+            assert!(
+                x as usize + w as usize <= SIDE && y as usize + h as usize <= SIDE,
+                "{name} runs off the skin"
+            );
+            for row in y..y + h {
+                for column in x..x + w {
+                    let cell = &mut covered[row as usize * SIDE + column as usize];
+                    assert_eq!(*cell, 0, "{name} overlaps another region at {column},{row}");
+                    *cell = 1;
+                }
+            }
+        }
+        assert!(
+            covered.iter().all(|c| *c == 1),
+            "{} pixels of the skin belong to no region",
+            covered.iter().filter(|c| **c == 0).count()
+        );
+    }
+
+    /// Components with the same shape must not be mixed up: the three 4:1
+    /// regions are exactly the ones whose textures measure 4:1 in the archive.
+    #[test]
+    fn the_narrow_regions_are_hand_torso_lower_and_foot() {
+        let narrow: Vec<&str> = [
+            ("arm upper", region::ARM_UPPER),
+            ("arm lower", region::ARM_LOWER),
+            ("hand", region::HAND),
+            ("torso upper", region::TORSO_UPPER),
+            ("torso lower", region::TORSO_LOWER),
+            ("pelvis", region::PELVIS),
+            ("leg lower", region::LEG_LOWER),
+            ("foot", region::FOOT),
+        ]
+        .into_iter()
+        .filter(|(_, (_, _, w, h))| w / h == 4)
+        .map(|(name, _)| name)
+        .collect();
+        assert_eq!(narrow, ["hand", "torso lower", "foot"]);
+    }
+
+    /// Equipment has to reach the cache key, or two characters in different
+    /// armour share one built model -- the same bug the appearance key exists
+    /// to prevent for faces.
+    #[test]
+    fn what_a_character_wears_changes_its_cache_key() {
+        let appearance = Appearance {
+            race: 1,
+            gender: 0,
+            skin: 0,
+            face: 0,
+            hair_style: 0,
+            hair_colour: 0,
+            facial_hair: 0,
+        };
+        let naked = look_key(&appearance, &[]);
+        assert_ne!(naked, look_key(&appearance, &[9891]));
+        assert_ne!(look_key(&appearance, &[9891]), look_key(&appearance, &[9892]));
+        // Order matters too: it is the paint order, so a different order is a
+        // different character even with the same items.
+        assert_ne!(
+            look_key(&appearance, &[9891, 9892]),
+            look_key(&appearance, &[9892, 9891])
+        );
+        // And an empty slot is not the same as no slot at all being read.
+        assert_eq!(naked, look_key(&appearance, &[]));
+    }
 
     fn look_with(geosets: Vec<u32>) -> Look {
         Look {

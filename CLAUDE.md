@@ -14,7 +14,7 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
 | Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated creatures and players slide along their actual path, turn to face it, and play the model's own walk/stand cycles |
 | Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, `F1` to rearrange, saved to `ui.toml` |
-| Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. Equipment geometry is not drawn yet |
+| Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components; equipment *geometry* (sleeves, boot tops, weapons, shoulders) is not drawn yet, and other players' equipment needs their visible-item fields |
 | Game | **4.3 done**: spellbook, three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. Spell damage, threat and the corpse flow remain. Inventory and quests follow |
 
 Roughly 57% of the way to something a person could test by playing. See
@@ -309,6 +309,13 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   the eye and the eye is a fixed offset above a position whose Z was wrong.
   Before opening the second investigation, check whether the first cause
   reaches it.
+- **A composite needs a way to be seen as itself.** A dressed character looked
+  bare-chested at walking distance and the obvious diagnosis was that the torso
+  region was wrong. Dumping the composed 512x512 skin to a PNG showed all ten
+  regions correct and the torso wearing a white shirt that simply reads as skin
+  at three hundred pixels. The render was right and the *look* at it was wrong,
+  which is the inverse of the usual failure here and just as expensive. Anything
+  assembled in memory from a dozen files gets a dump command.
 - **Listing a directory and reading a path are different questions.** An MPQ
   resolves by hash, so a file absent from `(listfile)` still reads perfectly.
   A coverage check for the baked NPC textures built on `wow-cli ls` concluded

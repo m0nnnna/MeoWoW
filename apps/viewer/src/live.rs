@@ -189,13 +189,23 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
         hair_colour: character.hair_color,
         facial_hair: character.facial_hair,
     };
-    let look = crate::character::resolve(chain, appearance);
+    // Straight from the character list, which sends *display* ids -- so our own
+    // body needs no `Item.dbc` lookup at all, where another player's visible
+    // items arrive as entry ids and do. In the order the wire sends them, which
+    // is also the order they must be painted: see `resolve_wearing`.
+    let equipment: Vec<u32> = character
+        .equipment
+        .iter()
+        .map(|slot| slot.display_id)
+        .collect();
+    let look = crate::character::resolve_wearing(chain, appearance, &equipment);
     tracing::info!(
-        "character look: skin {:?}, body {:?}, hair {:?}, geosets {:?}",
+        "character look: skin {:?}, body {:?}, hair {:?}, geosets {:?}, wearing {:?}",
         look.skin,
         look.body,
         look.hair,
-        look.geosets
+        look.geosets,
+        equipment.iter().filter(|id| **id != 0).count()
     );
 
     let (map_directory, map_name) = map_directory(chain, landed.map)?;
@@ -210,7 +220,7 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
         orientation: landed.orientation,
         state,
         look: std::rc::Rc::new(look),
-        look_key: appearance.key(),
+        look_key: crate::character::look_key(&appearance, &equipment),
         fold_failures: 0,
         reported_failures: std::collections::HashSet::new(),
         connection,
