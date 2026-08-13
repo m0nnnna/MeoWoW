@@ -12,7 +12,7 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation), WMO, ADT/WDT — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
-| Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated creatures and players slide along their actual path, turn to face it, and play the model's own walk/stand cycles |
+| Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated *creatures* slide along their actual path, turn to face it, and play the model's own walk/stand cycles. **Other players do not** — see the known defect below |
 | Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, `F1` to rearrange, saved to `ui.toml` |
 | Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components; equipment *geometry* (sleeves, boot tops, weapons, shoulders) is not drawn yet, and other players' equipment needs their visible-item fields |
 | Game | **4.3 done**: spellbook, three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. Spell damage, threat and the corpse flow remain. Inventory and quests follow |
@@ -38,11 +38,28 @@ or backward and A/D turns it, each sent as a real `MSG_MOVE_*` stream
 rather than flying freely. Altitude follows the terrain — the keys drive the
 two horizontal axes and Z is read back out of the height field the ground is
 drawn from, so the character walks over hills rather than into them. `LiveWorld` keeps a `world::WorldState` alongside
-the connection and folds every drained packet into it, so creatures and other
-players slide along their actual path instead of jumping between snapshots or
-standing wherever they were at login — turning to face the way they're moving,
-playing the model's own walk cycle in motion and its stand cycle at rest, all
-re-evaluated every frame. Verified with two clients, one walking while the
+the connection and folds every drained packet into it, so creatures slide along
+their actual path instead of jumping between snapshots or standing wherever they
+were at login — turning to face the way they're moving, playing the model's own
+walk cycle in motion and its stand cycle at rest, all re-evaluated every frame.
+
+**Known defect: this is true of creatures and not of other players.** A creature
+moves by `SMSG_MONSTER_MOVE`, which carries a start, an end and a duration, and
+that is what `interpolated_position` was built for. A player moves by relayed
+`MSG_MOVE_*`, which carries a position and no path at all, so
+`update_movement` stores it and clears any prediction — the player snaps from
+packet to packet and, having no duration, reads as `speed: 0.0` and never leaves
+the stand cycle. Two symptoms, one cause, and a live report was what surfaced
+it.
+
+**Why 3.5's two-client test missed it is the more useful half.** Both clients in
+that test were *this* client, which heartbeats every 100ms; a hundred
+milliseconds of snap between two nearby points reads as movement. A real client
+sends roughly every 500ms, and at that spacing the same bug is unmistakable —
+which is exactly how it was reported. Two copies of our own client agreeing is
+the weakest form of the two-client rig, and this is the first time that has cost
+anything: the rig proves a *format* travels both ways, and proves nothing about
+timing that both copies share. See `foss-wow#22`. Verified with two clients, one walking while the
 other, running the real viewer, drew it happen; four real bugs in that
 drawing path (an animation that never went idle, a whole species animating
 because one instance of it moved, entities facing a constant wrong direction,
@@ -282,6 +299,16 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   the creature *beside* the one under the cursor, which reads as the server
   disagreeing about positions rather than as a stale copy of a matrix. Same
   reasoning as defining a both-ways structure once and round-tripping it.
+- **Two copies of your own client are not two independent derivations.** The
+  two-client rig is this project's strongest shape *for formats*: a structure
+  goes out through one client and back in through another, so the write and read
+  halves are confirmed via a third party. It proves nothing about behaviour the
+  two copies share. 3.5 declared replicated players smooth on exactly that
+  evidence, and they were not — both clients heartbeat every 100ms, and a
+  hundred milliseconds of snap between nearby points reads as movement. A real
+  client sends every ~500ms and the same missing interpolation is obvious. When
+  the thing under test is *timing* rather than layout, one of the two ends has
+  to be something you did not write.
 - **Compare against something derived independently.** The SRP6 tests carry a
   server written from the protocol, not from the client. Agreement between two
   separate derivations is evidence; a thing checked against itself is not.

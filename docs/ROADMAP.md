@@ -1290,3 +1290,32 @@ hundred pixels of character on a screen.
   ids, which is why `Item.dbc` is transcribed here at all; the field indices
   want the same search treatment `PLAYER_BYTES` got, against a character whose
   gear is known from the character list.
+
+### Known defect: other players jump rather than walk
+
+Reported from live play and not caught by any test here: another player vanishes
+from one spot and reappears further along their path, with no animation playing.
+
+The cause is traced and recorded in `foss-wow#22`. Briefly: a creature moves by
+`SMSG_MONSTER_MOVE`, which carries a start, an end and a duration, and that is
+the packet `Entity::interpolated_position` was built around. A player moves by
+relayed `MSG_MOVE_*`, which carries a position and no path, so
+`WorldState::update_movement` stores it and calls `clear_predicted_move`. With
+no duration there is nothing to interpolate along and nothing for
+`Entity::move_speed` to divide, so the player snaps between points and
+`Motion::from_speed` picks the stand cycle. Two symptoms, one cause, again.
+
+**The interesting part is why 3.5 passed.** That milestone was verified with two
+clients, one walking while the other drew it -- and both of them were *this*
+client, which sends a movement heartbeat every 100ms. A snap of a hundred
+milliseconds between two nearby points reads as movement. A real client sends
+roughly every 500ms, and at that spacing the missing interpolation is
+unmistakable, which is exactly how it came in.
+
+So the two-client rig has a limit worth naming, because it has been described
+here as the strongest evidence available and mostly is. It confirms a *format*
+travels both ways, through a third party that had to understand both halves. It
+confirms nothing about behaviour the two copies share -- and identical timing is
+the most obvious thing two copies of one binary share. When what is under test
+is timing rather than layout, one end has to be software this project did not
+write.
