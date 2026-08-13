@@ -100,6 +100,13 @@ impl Orbit {
             view_proj: self.view_proj(aspect).to_cols_array_2d(),
             eye: [eye.x, eye.y, eye.z, 1.0],
             light: [light.x, light.y, light.z, 0.0],
+            // Unlit by default. A camera knows where it is, not what hour it
+            // is; the viewer overwrites these once it has a world clock and a
+            // position to resolve a light for. See `CameraUniform::UNLIT`.
+            sun: [0.0; 4],
+            ambient: [0.0; 4],
+            fog: [0.0; 4],
+            fog_range: [0.0; 4],
         }
     }
 }
@@ -291,6 +298,13 @@ impl Fly {
             view_proj: self.view_proj(aspect).to_cols_array_2d(),
             eye: [self.position.x, self.position.y, self.position.z, 1.0],
             light: [light.x, light.y, light.z, 0.0],
+            // Unlit by default. A camera knows where it is, not what hour it
+            // is; the viewer overwrites these once it has a world clock and a
+            // position to resolve a light for. See `CameraUniform::UNLIT`.
+            sun: [0.0; 4],
+            ambient: [0.0; 4],
+            fog: [0.0; 4],
+            fog_range: [0.0; 4],
         }
     }
 }

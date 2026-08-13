@@ -827,3 +827,60 @@ Next: choosing the light for the camera's position each frame, sampling the
 bands at the running clock, and replacing the camera-following headlight in
 `mesh.rs` and `terrain.rs` -- which is where those band meanings get confirmed
 or corrected.
+
+### Lighting, part two: on screen, and the band a render rejected
+
+The headlight is gone. `sun.w` in the camera uniform carries "there is light
+data"; where there is, both shaders use the world's own ambient and diffuse and
+a real sun direction, and where there is not -- a model view, a texture view,
+any scene with no place and no hour -- they fall back to the fixed
+ambient-plus-headlight they always had, so an offline render still reads as
+shape rather than going black.
+
+**Terrain and models share the lighting functions verbatim.** Terrain lit one
+way and the buildings standing on it lit another is the seam a player notices
+first.
+
+**The sun's direction is chosen, not measured, and that is stated wherever it is
+used.** No table carries one: `Light.dbc` and its bands describe colours over
+time and say nothing about direction. `sun_direction` rises at 06:00, is
+overhead at noon, sets at 18:00 and spends the night below the horizon -- where
+the dot product clamps to zero and only ambient remains, which is what makes
+night look like night with no second code path.
+
+**Band 0 was the first guess at the direct light, and a render refused it.**
+It looked plausible from the numbers: bright at every hour, shifting hue rather
+than intensity. Rendered, midday Elwynn had olive grass and an orange road,
+because band 0 reads (255, 136, 0) at noon. Band 6 is neutral grey
+(180, 180, 180) at noon and dim blue (49, 86, 123) at midnight -- a sun that
+becomes a moon -- and with band 1's blue-grey fill the pair lands close to the
+0.38/0.62 placeholder it replaced. That closeness is the sanity check: real data
+arriving at roughly where a hand-tuned constant already was.
+
+This is the fourth time on this project that a table has been identified by
+rendering it rather than by reading it, and the first three are why `bands` is
+a named module of constants rather than numbers scattered through the shader
+feed. One wrong index there does not fail -- it just makes the world the wrong
+colour.
+
+**The sky is cleared to the world's own colour too.** No skybox is drawn yet,
+but without this a midnight scene is lit for night and framed by a daytime
+horizon, which reads as a bug in the lighting rather than as a missing feature.
+Dawn now comes up peach, noon pale blue, midnight dark blue.
+
+**Fog is wired and currently invisible**, which is worth saying rather than
+leaving to be discovered: the distance band reads 18,000 units on Azeroth and
+fog starts at a quarter of that, so nothing within kilometres of the camera is
+touched. The colour band it uses is unconfirmed. Both are left connected rather
+than disabled, so the day the distance turns out to mean something else, it
+shows up as fog appearing rather than as nothing happening.
+
+`--hour` overrides the realm's clock, because the curves are functions of the
+hour and waiting six real hours for dusk is not a debugging loop. `wow-cli
+light` prints exactly what the renderer will use, resolved **through the same
+code** -- a verification tool that computed its own numbers would stop being
+evidence about the renderer the moment either drifted.
+
+Still to do: a skybox proper (`LightSkybox` names the models), weather, the
+several sky bands that layer into a gradient rather than one flat colour, and
+the interior lights that matter once a building has an inside.

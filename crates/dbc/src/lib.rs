@@ -24,6 +24,7 @@
 //!   *shorter* than declared is truncated and rejected.
 
 pub mod infer;
+pub mod light;
 pub mod schema;
 
 use std::fmt;

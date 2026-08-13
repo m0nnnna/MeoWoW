@@ -61,6 +61,30 @@ pub struct CameraUniform {
     pub eye: [f32; 4],
     /// Direction *towards* the light, plus an unused w.
     pub light: [f32; 4],
+    /// Colour of the direct light, and in `w` how much of it to apply. Zero
+    /// there means "no lighting data": the shaders fall back to the fixed
+    /// ambient-plus-headlight they used before this existed, so a scene with no
+    /// `Light.dbc` -- an offline model view, a test -- still reads as shape
+    /// rather than going black.
+    pub sun: [f32; 4],
+    /// Ambient colour, plus an unused w.
+    pub ambient: [f32; 4],
+    /// Fog colour, plus an unused w.
+    pub fog: [f32; 4],
+    /// `x` where fog begins, `y` where it is total, both in world units. `y`
+    /// of zero disables fog.
+    pub fog_range: [f32; 4],
+}
+
+impl CameraUniform {
+    /// The lighting a scene with no light data gets: none, which the shaders
+    /// read as "use the placeholder".
+    pub const UNLIT: ([f32; 4], [f32; 4], [f32; 4], [f32; 4]) = (
+        [0.0; 4],
+        [0.0; 4],
+        [0.0; 4],
+        [0.0; 4],
+    );
 }
 
 /// How a batch's material maps onto fixed-function state.
@@ -133,6 +157,10 @@ struct Camera {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     light: vec4<f32>,
+    sun: vec4<f32>,
+    ambient: vec4<f32>,
+    fog: vec4<f32>,
+    fog_range: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -159,6 +187,9 @@ struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) uv: vec2<f32>,
+    // Carried so the fragment stage can measure distance for fog. The clip
+    // position cannot answer that after the divide.
+    @location(2) world: vec3<f32>,
 };
 
 @vertex
@@ -195,7 +226,9 @@ fn vs(in: VsIn) -> VsOut {
     }
 
     let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
-    out.clip = camera.view_proj * model * position;
+    let world = model * position;
+    out.clip = camera.view_proj * world;
+    out.world = world.xyz;
     // Placements are rigid with uniform scale, so the model matrix rotates
     // normals correctly without a separate inverse-transpose.
     out.normal = (model * vec4<f32>(normal, 0.0)).xyz;
@@ -205,24 +238,47 @@ fn vs(in: VsIn) -> VsOut {
 
 // Placeholder lighting: a single directional term plus ambient, enough to read
 // shape. Real lighting comes from the light DBCs much later.
-fn shade(normal: vec3<f32>, uv: vec2<f32>) -> vec4<f32> {
+// Lighting from the world's own tables when there is any, and the old fixed
+// headlight when there is not -- an offline model view has no hour and no
+// place, and must still read as shape rather than going black. `sun.w` is the
+// switch: zero means no data. Shared verbatim with the terrain shader, because
+// terrain and the things standing on it disagreeing about what noon looks like
+// is exactly the seam a player would notice first.
+fn sky_light(normal: vec3<f32>) -> vec3<f32> {
     let n = normalize(normal);
+    if (camera.sun.w <= 0.0) {
+        let ndl = max(dot(n, normalize(camera.light.xyz)), 0.0);
+        return vec3<f32>(0.38 + 0.62 * ndl);
+    }
     let ndl = max(dot(n, normalize(camera.light.xyz)), 0.0);
-    let lit = 0.38 + 0.62 * ndl;
+    return camera.ambient.rgb + camera.sun.rgb * ndl * camera.sun.w;
+}
+
+// Distance fog, applied after lighting. `fog_range.y` of zero disables it.
+fn fogged(colour: vec3<f32>, world: vec3<f32>) -> vec3<f32> {
+    if (camera.fog_range.y <= 0.0) {
+        return colour;
+    }
+    let distance = length(world - camera.eye.xyz);
+    let t = clamp((distance - camera.fog_range.x) / max(camera.fog_range.y - camera.fog_range.x, 1.0), 0.0, 1.0);
+    return mix(colour, camera.fog.rgb, t);
+}
+
+fn shade(normal: vec3<f32>, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
     let texel = textureSample(tex, samp, uv);
-    return vec4<f32>(texel.rgb * lit, texel.a);
+    return vec4<f32>(fogged(texel.rgb * sky_light(normal), world), texel.a);
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    return shade(in.normal, in.uv);
+    return shade(in.normal, in.uv, in.world);
 }
 
 // Cutout materials: reject rather than blend, so the batch can still write
 // depth and be drawn in the opaque pass.
 @fragment
 fn fs_alpha_key(in: VsOut) -> @location(0) vec4<f32> {
-    let c = shade(in.normal, in.uv);
+    let c = shade(in.normal, in.uv, in.world);
     if (c.a < 0.5) {
         discard;
     }

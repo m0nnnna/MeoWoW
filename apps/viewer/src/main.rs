@@ -106,6 +106,15 @@ struct Args {
     #[arg(long)]
     screenshot: Option<PathBuf>,
 
+    /// Light the world as if it were this game hour, 0 to 24.
+    ///
+    /// Overrides the realm's own clock, which is otherwise where the hour comes
+    /// from. Exists because the lighting curves are functions of the hour and
+    /// the only way to see what one looks like is to be standing in it -- and
+    /// waiting six real hours for dusk is not a debugging loop.
+    #[arg(long)]
+    hour: Option<f32>,
+
     /// Write the logged-in character's composed skin to this PNG.
     ///
     /// The skin is ten regions of one 512x512 atlas -- face, arms, hands,
@@ -602,6 +611,10 @@ fn draw_scene(
     bones: Option<&BoneBuffer>,
     world_binds: &[Vec<wgpu::BindGroup>],
     identity: &render::mesh::InstanceBuffer,
+    // The world's own lighting, when there is a place and an hour to resolve
+    // it for. `None` everywhere else -- a model or texture view has neither,
+    // and gets the placeholder headlight.
+    lighting: Option<(dbc::light::Sample, f32)>,
 ) {
     // Terrain has its own pipeline, so both the tile and world scenes route
     // their landscape through here.
@@ -623,6 +636,7 @@ fn draw_scene(
             meshes,
             terrain_renderer,
             bones,
+            lighting,
         );
         return;
     }
@@ -859,9 +873,10 @@ fn draw_streaming(
     meshes: &MeshRenderer,
     terrain_renderer: &TerrainRenderer,
     bones: Option<&BoneBuffer>,
+    lighting: Option<(dbc::light::Sample, f32)>,
 ) {
     let aspect = size.0 as f32 / size.1.max(1) as f32;
-    meshes.update_camera(gpu, &camera.uniform(aspect));
+    meshes.update_camera(gpu, &lit_uniform(camera, aspect, lighting));
 
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("streaming world"),
@@ -870,12 +885,7 @@ fn draw_streaming(
             depth_slice: None,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color {
-                    r: 0.42,
-                    g: 0.55,
-                    b: 0.70,
-                    a: 1.0,
-                }),
+                load: wgpu::LoadOp::Clear(sky_colour(lighting.as_ref())),
                 store: wgpu::StoreOp::Store,
             },
         })],
@@ -1211,6 +1221,17 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     let world_binds = world_bind_groups(&gpu, &meshes, &scene);
     let identity = render::mesh::InstanceBuffer::upload(&gpu, &[render::mesh::Instance::IDENTITY]);
 
+    // Read here rather than at startup: a texture or model view has no world to
+    // light, and these are four tables worth of DBC.
+    let lighting = live
+        .is_some()
+        .then(|| dbc::light::Lighting::load(|path| chain.read(path).ok()))
+        .flatten();
+    let camera_eye = match &camera {
+        Camera::Fly(f) => f.position,
+        Camera::Orbit(o) => o.eye(),
+    };
+
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1231,6 +1252,7 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
         bones.as_ref(),
         &world_binds,
         &identity,
+        resolve_lighting(lighting.as_ref(), live.as_ref(), args.hour, camera_eye),
     );
     gpu.queue.submit([encoder.finish()]);
 
@@ -1319,6 +1341,8 @@ struct App {
     /// two players who look alike share one entry, which is also exactly the
     /// key the renderer's model cache uses.
     player_looks: std::collections::HashMap<u64, Rc<character::Look>>,
+    /// The world's lighting tables, read once when a live world exists to light.
+    lighting: Option<dbc::light::Lighting>,
     /// The player's own interface: where every frame sits, what it looks like,
     /// and whether it is currently being rearranged.
     hud: ui::Hud,
@@ -1437,6 +1461,82 @@ fn drawable_with_own(live: &live::LiveWorld, speed: f32) -> Vec<live::Entity> {
     entities
 }
 
+/// The lighting in force for a camera, if the world can say.
+///
+/// Wants three things: the tables, a map and position to choose a light for,
+/// and an hour. The hour comes from the realm's own clock -- run forward from
+/// when it was reported, since the server says it once -- unless `--hour`
+/// overrides it.
+fn resolve_lighting(
+    lighting: Option<&dbc::light::Lighting>,
+    live: Option<&live::LiveWorld>,
+    override_hour: Option<f32>,
+    at: glam::Vec3,
+) -> Option<(dbc::light::Sample, f32)> {
+    let lighting = lighting?;
+    let live = live?;
+    let hour = match override_hour {
+        Some(hour) => hour,
+        None => {
+            let (time, learned) = live.state.game_time?;
+            let now = time.advanced(learned.elapsed());
+            now.minute_of_day() as f32 / 60.0
+        }
+    };
+    let minute_of_day = (hour * 60.0).rem_euclid(1440.0) as u32;
+    let sample = lighting.sample(live.map_id, at.x, at.y, minute_of_day)?;
+    Some((sample, hour))
+}
+
+/// What to clear the sky to: the world's own sky colour, or the fixed one.
+///
+/// Worth doing even though this client draws no skybox. Without it a midnight
+/// scene is lit for night and framed by a daytime horizon, which reads as a bug
+/// in the lighting rather than as a missing feature.
+fn sky_colour(lighting: Option<&(dbc::light::Sample, f32)>) -> wgpu::Color {
+    let [r, g, b] = lighting.map_or([0.42, 0.55, 0.70], |(sample, _)| sample.sky);
+    wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }
+}
+
+/// Where the sun is at a given hour, as a direction *towards* it.
+///
+/// **Chosen, not measured.** No table in the client carries a sun position:
+/// `Light.dbc` and its bands describe colours over time and say nothing about
+/// direction, so this is a plausible arc rather than a reconstruction of the
+/// original. It rises at 06:00, is overhead at noon, sets at 18:00 and spends
+/// the night below the horizon, where the dot product clamps to zero and only
+/// the ambient term remains -- which is what makes night look like night
+/// without a second code path.
+///
+/// The axis it swings along is likewise a choice. Getting it wrong tilts
+/// shadows the wrong way, which is visible and fixable; the thing that would
+/// *not* be visible is claiming this came from the data.
+fn sun_direction(hour: f32) -> glam::Vec3 {
+    let t = (hour - 6.0) / 12.0 * std::f32::consts::PI;
+    glam::Vec3::new(0.0, -t.cos(), t.sin()).normalize_or_zero()
+}
+
+/// The camera uniform with real lighting folded in, or the placeholder when
+/// there is none.
+fn lit_uniform(
+    camera: &Camera,
+    aspect: f32,
+    lighting: Option<(dbc::light::Sample, f32)>,
+) -> render::mesh::CameraUniform {
+    let mut uniform = camera.uniform(aspect);
+    let Some((sample, hour)) = lighting else {
+        return uniform;
+    };
+    let sun = sun_direction(hour);
+    uniform.light = [sun.x, sun.y, sun.z, 0.0];
+    // `w` carries "there is light data", which is what the shaders switch on.
+    uniform.sun = [sample.diffuse[0], sample.diffuse[1], sample.diffuse[2], 1.0];
+    uniform.ambient = [sample.ambient[0], sample.ambient[1], sample.ambient[2], 0.0];
+    uniform.fog = [sample.fog[0], sample.fog[1], sample.fog[2], 0.0];
+    uniform.fog_range = [sample.fog_start, sample.fog_end, 0.0, 0.0];
+    uniform
+}
+
 /// How another player looks, composing it once and remembering it.
 ///
 /// A free function rather than a method on `App` because the caller holds a
@@ -1539,6 +1639,7 @@ impl App {
             last_ping: Instant::now(),
             last_undrawable_warned: 0,
             player_looks: std::collections::HashMap::new(),
+            lighting: None,
             // Read before the window exists, so a layout that fails to parse
             // is reported at startup rather than at the first frame.
             hud: ui::Hud::load(),
@@ -1634,6 +1735,15 @@ impl ApplicationHandler for App {
                     self.last_heartbeat = Instant::now();
                     self.last_ping = Instant::now();
                     self.last_undrawable_warned = 0;
+                    // Only a live world has a map and an hour to light.
+                    let started = Instant::now();
+                    self.lighting =
+                        dbc::light::Lighting::load(|path| self.chain.read(path).ok());
+                    tracing::info!(
+                        "lighting tables loaded in {:?} ({})",
+                        started.elapsed(),
+                        if self.lighting.is_some() { "ok" } else { "unavailable" }
+                    );
                 }
                 self.live = live;
                 Some(scene)
@@ -2037,6 +2147,18 @@ impl App {
             });
 
         let size = (r.config.width, r.config.height);
+        // Resolved per frame, not per session: the clock runs, and the camera
+        // can walk out of one light's radius into another's.
+        let eye = match camera {
+            Camera::Fly(f) => f.position,
+            Camera::Orbit(o) => o.eye(),
+        };
+        let lighting = resolve_lighting(
+            self.lighting.as_ref(),
+            self.live.as_ref(),
+            self.args.hour,
+            eye,
+        );
         if let Some(scene) = &r.scene {
             draw_scene(
                 &r.gpu,
@@ -2053,6 +2175,7 @@ impl App {
                 r.bones.as_ref(),
                 &r.world_binds,
                 &r.identity,
+                lighting,
             );
         }
 

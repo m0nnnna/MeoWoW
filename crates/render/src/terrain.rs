@@ -17,6 +17,10 @@ struct Camera {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     light: vec4<f32>,
+    sun: vec4<f32>,
+    ambient: vec4<f32>,
+    fog: vec4<f32>,
+    fog_range: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -41,12 +45,16 @@ struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) uv: vec2<f32>,
+    // For fog: terrain vertices are already in world space, so this is a copy
+    // rather than a transform.
+    @location(2) world: vec3<f32>,
 };
 
 @vertex
 fn vs(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip = camera.view_proj * vec4<f32>(in.position, 1.0);
+    out.world = in.position;
     out.normal = in.normal;
     out.uv = in.uv;
     return out;
@@ -68,9 +76,24 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     color = mix(color, textureSample(layer2, tile_sampler, tiled).rgb, a.g);
     color = mix(color, textureSample(layer3, tile_sampler, tiled).rgb, a.b);
 
+    // The same two functions the mesh shader uses, kept identical on purpose:
+    // terrain lit one way and the buildings standing on it lit another is the
+    // seam a player notices first. `sun.w` of zero means no light data, and
+    // falls back to the fixed headlight this had before.
     let n = normalize(in.normal);
     let ndl = max(dot(n, normalize(camera.light.xyz)), 0.0);
-    return vec4<f32>(color * (0.45 + 0.55 * ndl), 1.0);
+    var lit: vec3<f32>;
+    if (camera.sun.w <= 0.0) {
+        lit = color * (0.45 + 0.55 * ndl);
+    } else {
+        lit = color * (camera.ambient.rgb + camera.sun.rgb * ndl * camera.sun.w);
+    }
+    if (camera.fog_range.y > 0.0) {
+        let distance = length(in.world - camera.eye.xyz);
+        let t = clamp((distance - camera.fog_range.x) / max(camera.fog_range.y - camera.fog_range.x, 1.0), 0.0, 1.0);
+        lit = mix(lit, camera.fog.rgb, t);
+    }
+    return vec4<f32>(lit, 1.0);
 }
 "#;
 
