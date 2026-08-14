@@ -23,6 +23,7 @@ use mpq::Chain;
 use render::mesh::{BoneBuffer, Instance, InstanceBuffer, MeshRenderer};
 use render::{Gpu, TerrainRenderer, UploadedTexture};
 
+use crate::character::Stance;
 use crate::model::Draw;
 use crate::scene::{object_rotation, placement_position, placement_rotation};
 use crate::terrain::LoadedTerrain;
@@ -259,6 +260,21 @@ pub struct EntityPlacement {
     pub look: Option<std::rc::Rc<crate::character::Look>>,
     /// Distinguishes one look from another for caching. Zero means undressed.
     pub look_key: u64,
+    /// How this unit holds itself when armed. Taken from the look rather than
+    /// passed separately, so it cannot disagree with the geometry it belongs
+    /// to -- see `set_entities`.
+    ///
+    /// Only meaningful with a weapon drawn: the stance decides which ready and
+    /// attack cycles are tried, and a stowed weapon leaves the character at
+    /// ease whatever it is carrying.
+    pub stance: Stance,
+    /// Whether this unit's weapons are stowed rather than in its hands.
+    ///
+    /// Folded into the group key rather than read per instance, because it
+    /// changes *which attachment* a held item hangs from and every instance in
+    /// a group shares one answer. Two players in identical armour, one with a
+    /// sword drawn and one without, must not share a bucket.
+    pub sheathed: bool,
 }
 
 pub struct World {
@@ -651,6 +667,19 @@ impl World {
         } else {
             crate::model::load(gpu, chain, path, variations, 0)
                 .map(|m| {
+                    // Named rather than dropped. `load_dressed` has always
+                    // collected these and callers have always thrown them
+                    // away -- which is how every humanoid NPC rendered white
+                    // in silence once already. A weapon whose skin fails to
+                    // resolve is a grey sword, not a missing one, and nothing
+                    // else would ever say so.
+                    if !m.missing_textures.is_empty() {
+                        tracing::warn!(
+                            "{path} drew with {} placeholder texture(s): {}",
+                            m.missing_textures.len(),
+                            m.missing_textures.join(", ")
+                        );
+                    }
                     (
                         m.mesh,
                         m.draws,
@@ -729,17 +758,31 @@ impl World {
         // Keyed by look as well as display: see `EntityPlacement::look`.
         let mut looks: HashMap<u64, Option<std::rc::Rc<crate::character::Look>>> = HashMap::new();
         let mut kinds: HashMap<u64, ::world::ObjectType> = HashMap::new();
+        let mut sheathed: HashMap<u64, bool> = HashMap::new();
         let mut grouped: HashMap<(u32, Motion, u64), Vec<Mat4>> = HashMap::new();
         // One clock reading for the whole rebuild, so two units that died in
         // the same frame land in the same bucket and share a pose rather than
         // missing each other by a millisecond.
         let now_ms = self.started.elapsed().as_millis() as u32;
         for placement in placements {
-            looks.insert(placement.look_key, placement.look.clone());
-            kinds.insert(
-                placement.look_key ^ game_object_key(placement.kind),
-                placement.kind,
-            );
+            // **One key, computed once, used by every side table.** A game
+            // object shares the display-id space with creatures and means
+            // something else by it, and a drawn weapon hangs somewhere a
+            // stowed one does not, so both are folded in here rather than
+            // widening every tuple -- the key already exists to keep things
+            // that look different apart.
+            //
+            // Computed once because it was not, briefly, and the looks table
+            // was then filled under the bare look key and read under the
+            // combined one. Every match was an accident of the extra terms
+            // being zero for units, and the first non-zero one would have
+            // undressed the player rather than failing.
+            let key = placement.look_key
+                ^ game_object_key(placement.kind)
+                ^ sheath_key(placement.sheathed);
+            looks.insert(key, placement.look.clone());
+            kinds.insert(key, placement.kind);
+            sheathed.insert(key, placement.sheathed);
             grouped
                 .entry((
                     placement.display_id,
@@ -750,13 +793,15 @@ impl World {
                         placement.swung_ms_ago,
                         placement.fighting,
                         now_ms,
+                        // Stowed weapons leave the hands free, so the stance
+                        // only applies while something is drawn.
+                        if placement.sheathed {
+                            Stance::Unarmed
+                        } else {
+                            placement.stance
+                        },
                     ),
-                    // A game object shares the display-id space with creatures
-                    // and means something else by it, so it cannot share a
-                    // group with one. Folded into the look key rather than
-                    // widening every tuple: the key already exists to keep
-                    // things that look different apart.
-                    placement.look_key ^ game_object_key(placement.kind),
+                    key,
                 ))
                 .or_default()
                 .push(Mat4::from_scale_rotation_translation(
@@ -844,11 +889,19 @@ impl World {
             // rather than in the draw loop because a held item is an ordinary
             // group in every respect except where its transforms come from --
             // see `Held`.
+            let stowed = sheathed.get(&look_key).copied().unwrap_or(false);
             for item in look.iter().flat_map(|look| look.held.iter()) {
+                // Stowed items move to their resting place; one with nowhere to
+                // rest -- a bow, a thrown axe -- stays in the hand, which is
+                // what a `sheathe_type` of zero means rather than a gap.
+                let wanted = match stowed {
+                    true => sheath_override().or(item.stowed).unwrap_or(item.attachment),
+                    false => item.attachment,
+                };
                 let Some(attachment) = model
                     .attachments
                     .iter()
-                    .find(|a| a.id == item.attachment)
+                    .find(|a| a.id == wanted)
                     .copied()
                 else {
                     // A model that has no such attachment point cannot hold the
@@ -856,9 +909,9 @@ impl World {
                     // put a sword through the character's feet. Named, because
                     // "this race has no right hand" is a real finding.
                     tracing::debug!(
-                        "display {display_id} has no attachment {} for {}",
-                        item.attachment,
-                        item.model
+                        "display {display_id} has no attachment {wanted} for {} ({})",
+                        item.model,
+                        if stowed { "stowed" } else { "drawn" }
                     );
                     continue;
                 };
@@ -1211,6 +1264,33 @@ fn game_object_key(kind: ::world::ObjectType) -> u64 {
     }
 }
 
+/// `OWC_SHEATH_ATTACH=<id>` hangs every stowed item from one attachment point.
+///
+/// A diagnostic, kept for the same reason `OWC_NO_CULL` is: it is how the
+/// resting places were identified, and it is how the next one will be. The
+/// geometry narrows the candidates to a handful -- a mirrored pair high on the
+/// shoulder blades, another on the upper back, a third at the hips -- but
+/// which of them a greatsword actually uses is a question about how a model
+/// looks, and only a render answers those. Sweeping it beats rebuilding once
+/// per guess.
+fn sheath_override() -> Option<u32> {
+    std::env::var("OWC_SHEATH_ATTACH").ok()?.trim().parse().ok()
+}
+
+/// Keeps a unit with its weapon drawn out of the same bucket as one without.
+///
+/// The same trick as [`game_object_key`], and for the same reason: the sheath
+/// state decides which attachment a held item hangs from, so two otherwise
+/// identical characters need separate groups or the first drawn would put
+/// everyone's sword in their hand.
+fn sheath_key(sheathed: bool) -> u64 {
+    if sheathed {
+        0x5ea7_4ed0_0000_0000
+    } else {
+        0
+    }
+}
+
 /// `AnimationData.dbc` rows for the cycles this client plays -- public spec
 /// (documented on wowdev.wiki as part of the client's own animation-id
 /// table), not derived from any server implementation. Every 3.3.5a model's
@@ -1228,6 +1308,8 @@ const DEAD_ANIMATION_ID: u16 = 6;
 /// `AnimationData.dbc`'s own fallback column, which is the order tried here --
 /// a wolf has no one-handed swing and a warrior has both.
 const ATTACK_1H_ANIMATION_ID: u16 = 17;
+/// `Attack2H`, whose own fallback in the table is `Attack1H`.
+const ATTACK_2H_ANIMATION_ID: u16 = 18;
 const ATTACK_UNARMED_ANIMATION_ID: u16 = 16;
 /// Standing *in* a fight, between swings: weapon up, guard raised. `Ready1H`
 /// (26) falls back to `ReadyUnarmed` (25), again per the table's own column.
@@ -1238,6 +1320,8 @@ const ATTACK_UNARMED_ANIMATION_ID: u16 = 16;
 /// uses in town -- which is what "the player stands still while the fight
 /// happens" actually describes.
 const READY_1H_ANIMATION_ID: u16 = 26;
+/// `Ready2H`, whose own fallback in the table is `ReadyUnarmed`.
+const READY_2H_ANIMATION_ID: u16 = 27;
 const READY_UNARMED_ANIMATION_ID: u16 = 25;
 
 /// How long any one-shot cycle is allowed to run before the unit is treated as
@@ -1309,9 +1393,11 @@ pub enum Motion {
     /// Settled: lying still, and no longer tied to when death happened.
     Dead,
     /// Mid-swing, from the world-clock millisecond the blow landed.
-    Attacking(u32),
-    /// In a fight but between swings: guard up rather than at ease.
-    Ready,
+    Attacking(u32, Stance),
+    /// Weapon out: guard up rather than at ease. Held for as long as the
+    /// weapon is drawn, not only during a fight -- a character standing in
+    /// town with a greatsword in hand still grips it with both hands.
+    Ready(Stance),
 }
 
 /// Where a walk becomes a run, in world units per second.
@@ -1365,6 +1451,7 @@ impl Motion {
         swung_ms_ago: Option<u32>,
         fighting: bool,
         now_ms: u32,
+        stance: Stance,
     ) -> Self {
         if dead {
             return match died_ms_ago {
@@ -1378,11 +1465,16 @@ impl Motion {
         if moving == Motion::Stand {
             if let Some(age) = swung_ms_ago {
                 if age < ATTACK_CEILING_MS {
-                    return Motion::Attacking(bucket(now_ms.saturating_sub(age)));
+                    return Motion::Attacking(bucket(now_ms.saturating_sub(age)), stance);
                 }
             }
-            if fighting {
-                return Motion::Ready;
+            // **A drawn weapon is enough on its own.** This used to require
+            // `fighting`, which was right while nothing was ever drawn outside
+            // a fight -- and wrong the moment weapons appeared, because a
+            // character standing with a sword out was drawn in the at-ease
+            // idle with an open hand and the grip floating through it.
+            if fighting || stance != Stance::Unarmed {
+                return Motion::Ready(stance);
             }
         }
         moving
@@ -1396,7 +1488,7 @@ impl Motion {
     /// When a one-shot cycle began, on the caller's world clock.
     fn started_at(self) -> Option<u32> {
         match self {
-            Motion::Dying(at) | Motion::Attacking(at) => Some(at),
+            Motion::Dying(at) | Motion::Attacking(at, _) => Some(at),
             _ => None,
         }
     }
@@ -1427,12 +1519,35 @@ impl Motion {
             // than the idle it replaced. Checked against the real models
             // rather than assumed: `wow-cli m2 anims` lists what each one
             // actually carries.
-            Motion::Attacking(_) => &[
+            // **The chains follow `AnimationData.dbc`'s own fallback column,
+            // not a guess.** Row 18 (`Attack2H`) names 17 (`Attack1H`), which
+            // names 16 (`AttackUnarmed`), which names 0 (`Stand`); rows 26 and
+            // 27 (`Ready1H`, `Ready2H`) both name 25 (`ReadyUnarmed`). Reading
+            // the table beats inventing an order, and the table happens to
+            // agree with what a two-handed model should do when it has no
+            // two-handed cycle.
+            //
+            // The final `Stand` is not decoration: `Creature\Wolf\Wolf.m2`
+            // has `AttackUnarmed` and `Death` and **no ready stance at all**,
+            // so without it a wolf entering combat resolves to no sequence and
+            // draws its bind pose, stiff and T-posed.
+            Motion::Attacking(_, Stance::TwoHand) => &[
+                ATTACK_2H_ANIMATION_ID,
                 ATTACK_1H_ANIMATION_ID,
                 ATTACK_UNARMED_ANIMATION_ID,
                 STAND_ANIMATION_ID,
             ],
-            Motion::Ready => &[
+            Motion::Attacking(_, _) => &[
+                ATTACK_1H_ANIMATION_ID,
+                ATTACK_UNARMED_ANIMATION_ID,
+                STAND_ANIMATION_ID,
+            ],
+            Motion::Ready(Stance::TwoHand) => &[
+                READY_2H_ANIMATION_ID,
+                READY_UNARMED_ANIMATION_ID,
+                STAND_ANIMATION_ID,
+            ],
+            Motion::Ready(_) => &[
                 READY_1H_ANIMATION_ID,
                 READY_UNARMED_ANIMATION_ID,
                 STAND_ANIMATION_ID,
@@ -1452,7 +1567,10 @@ impl Motion {
 fn plays_once(animation_id: u16) -> bool {
     matches!(
         animation_id,
-        DEATH_ANIMATION_ID | ATTACK_1H_ANIMATION_ID | ATTACK_UNARMED_ANIMATION_ID
+        DEATH_ANIMATION_ID
+            | ATTACK_1H_ANIMATION_ID
+            | ATTACK_2H_ANIMATION_ID
+            | ATTACK_UNARMED_ANIMATION_ID
     )
 }
 
@@ -1526,6 +1644,79 @@ mod tests {
         );
     }
 
+    /// A drawn weapon holds the guard up on its own, without a fight.
+    ///
+    /// Reported the first time weapons were ever drawn: *"the hand is open
+    /// holding the sword like he was precombat"*. Standing at ease resolved to
+    /// the plain idle, whose hands are open, so the grip floated through the
+    /// fingers. The `Ready` stance was already here and was gated on
+    /// `fighting`, which was indistinguishable from correct while nothing was
+    /// ever drawn outside combat.
+    #[test]
+    fn a_drawn_weapon_is_enough_to_hold_the_guard() {
+        // Not fighting, standing still, weapon out.
+        assert_eq!(
+            Motion::resolve(0.0, false, None, None, false, 4_000, Stance::TwoHand),
+            Motion::Ready(Stance::TwoHand),
+        );
+        // And with nothing drawn it still relaxes, which is the half that
+        // stops this from simply making everyone stand guard forever.
+        assert_eq!(
+            Motion::resolve(0.0, false, None, None, false, 4_000, Stance::Unarmed),
+            Motion::Stand,
+        );
+        // Moving still outranks it: a character runs, weapon or no weapon.
+        assert_eq!(
+            Motion::resolve(7.0, false, None, None, false, 4_000, Stance::TwoHand),
+            Motion::Run,
+        );
+    }
+
+    /// A two-handed weapon asks for the two-handed cycles first, and every
+    /// chain still ends somewhere a model without them can go.
+    ///
+    /// The order is `AnimationData.dbc`'s own fallback column, not a guess:
+    /// row 18 (`Attack2H`) names 17, row 27 (`Ready2H`) names 25.
+    #[test]
+    fn the_two_handed_stance_prefers_its_own_cycles() {
+        let ready = Motion::Ready(Stance::TwoHand).animation_ids();
+        assert_eq!(ready.first(), Some(&READY_2H_ANIMATION_ID));
+        let swing = Motion::Attacking(0, Stance::TwoHand).animation_ids();
+        assert_eq!(swing.first(), Some(&ATTACK_2H_ANIMATION_ID));
+
+        // A one-handed character must not get them, or every dagger is held
+        // like a greatsword -- the half that a "prefers 2H" assertion alone
+        // would pass without.
+        assert!(!Motion::Ready(Stance::OneHand)
+            .animation_ids()
+            .contains(&READY_2H_ANIMATION_ID));
+        assert!(!Motion::Attacking(0, Stance::OneHand)
+            .animation_ids()
+            .contains(&ATTACK_2H_ANIMATION_ID));
+
+        for stance in [Stance::Unarmed, Stance::OneHand, Stance::TwoHand] {
+            for motion in [Motion::Ready(stance), Motion::Attacking(0, stance)] {
+                assert_eq!(
+                    motion.animation_ids().last(),
+                    Some(&STAND_ANIMATION_ID),
+                    "{motion:?} can resolve to nothing"
+                );
+            }
+        }
+    }
+
+    /// A swing that plays once must be recognised whichever grip threw it.
+    ///
+    /// `plays_once` keys on the resolved animation id, so a new attack id has
+    /// to be added there as well -- miss it and a two-handed swing *loops*,
+    /// which is a character flailing rather than striking.
+    #[test]
+    fn a_two_handed_swing_plays_once_like_the_others() {
+        assert!(plays_once(ATTACK_2H_ANIMATION_ID));
+        assert!(plays_once(ATTACK_1H_ANIMATION_ID));
+        assert!(!plays_once(READY_2H_ANIMATION_ID));
+    }
+
     /// A corpse does not walk, however fast it was going a moment ago.
     ///
     /// The speed attached to a creature killed mid-charge is stale but not
@@ -1535,7 +1726,7 @@ mod tests {
     #[test]
     fn death_outranks_a_stale_speed() {
         assert_eq!(
-            Motion::resolve(7.0, true, None, None, false, 10_000),
+            Motion::resolve(7.0, true, None, None, false, 10_000, Stance::Unarmed),
             Motion::Dead,
             "a corpse was drawn running"
         );
@@ -1547,10 +1738,10 @@ mod tests {
     #[test]
     fn only_a_death_we_watched_plays_the_fall() {
         assert_eq!(
-            Motion::resolve(0.0, true, Some(200), None, false, 10_000),
+            Motion::resolve(0.0, true, Some(200), None, false, 10_000, Stance::Unarmed),
             Motion::Dying(9_800)
         );
-        assert_eq!(Motion::resolve(0.0, true, None, None, false, 10_000), Motion::Dead);
+        assert_eq!(Motion::resolve(0.0, true, None, None, false, 10_000, Stance::Unarmed), Motion::Dead);
     }
 
     /// And it stops falling eventually, rather than holding a one-shot bucket
@@ -1558,7 +1749,7 @@ mod tests {
     #[test]
     fn a_fall_settles_once_it_has_had_time_to_finish() {
         assert_eq!(
-            Motion::resolve(0.0, true, Some(ONE_SHOT_CEILING_MS + 1), None, false, 10_000),
+            Motion::resolve(0.0, true, Some(ONE_SHOT_CEILING_MS + 1), None, false, 10_000, Stance::Unarmed),
             Motion::Dead
         );
     }
@@ -1573,15 +1764,15 @@ mod tests {
     /// play correctly and the cost would be invisible.
     #[test]
     fn a_one_shot_keeps_its_bucket_as_the_clock_advances() {
-        let first = Motion::resolve(0.0, true, Some(100), None, false, 5_000);
+        let first = Motion::resolve(0.0, true, Some(100), None, false, 5_000, Stance::Unarmed);
         // A second later: the death is a second older and the clock a second
         // further on, which is the same death.
-        let later = Motion::resolve(0.0, true, Some(1_100), None, false, 6_000);
+        let later = Motion::resolve(0.0, true, Some(1_100), None, false, 6_000, Stance::Unarmed);
         assert_eq!(first, later, "the bucket moved with the clock");
 
         // Two deaths a second apart must *not* share, or one pops to the
         // other's frame.
-        let other = Motion::resolve(0.0, true, Some(100), None, false, 6_000);
+        let other = Motion::resolve(0.0, true, Some(100), None, false, 6_000, Stance::Unarmed);
         assert_ne!(first, other);
     }
 
@@ -1600,7 +1791,7 @@ mod tests {
     fn a_one_shot_bucket_survives_drift_between_two_clock_reads() {
         // The same swing, seen over eight frames, with the two clock readings
         // drifting a few milliseconds apart each time as they really do.
-        let reference = Motion::resolve(0.0, false, None, Some(40), true, 8_000);
+        let reference = Motion::resolve(0.0, false, None, Some(40), true, 8_000, Stance::Unarmed);
         for frame in 0..8u32 {
             let drift = frame * 3;
             let seen = Motion::resolve(
@@ -1610,6 +1801,7 @@ mod tests {
                 Some(40 + frame * 16),
                 true,
                 8_000 + frame * 16 + drift,
+                Stance::Unarmed,
             );
             assert_eq!(
                 seen, reference,
@@ -1639,8 +1831,8 @@ mod tests {
             "a fighter would be frozen on its follow-through between swings"
         );
         assert_eq!(
-            Motion::resolve(0.0, false, None, Some(ATTACK_CEILING_MS + 1), true, 9_000),
-            Motion::Ready
+            Motion::resolve(0.0, false, None, Some(ATTACK_CEILING_MS + 1), true, 9_000, Stance::Unarmed),
+            Motion::Ready(Stance::Unarmed)
         );
     }
 
@@ -1650,13 +1842,13 @@ mod tests {
     #[test]
     fn a_swing_interrupts_standing_but_not_running() {
         assert_eq!(
-            Motion::resolve(0.0, false, None, Some(50), true, 4_000),
-            Motion::Attacking(3_900)
+            Motion::resolve(0.0, false, None, Some(50), true, 4_000, Stance::Unarmed),
+            Motion::Attacking(3_900, Stance::Unarmed)
         );
-        assert_eq!(Motion::resolve(7.0, false, None, Some(50), true, 4_000), Motion::Run);
+        assert_eq!(Motion::resolve(7.0, false, None, Some(50), true, 4_000, Stance::Unarmed), Motion::Run);
         // And an old swing has stopped mattering.
         assert_eq!(
-            Motion::resolve(0.0, false, None, Some(ONE_SHOT_CEILING_MS + 1), false, 4_000),
+            Motion::resolve(0.0, false, None, Some(ONE_SHOT_CEILING_MS + 1), false, 4_000, Stance::Unarmed),
             Motion::Stand
         );
     }
@@ -1672,22 +1864,22 @@ mod tests {
     #[test]
     fn a_fighter_between_swings_keeps_its_guard_up() {
         assert_eq!(
-            Motion::resolve(0.0, false, None, None, true, 4_000),
-            Motion::Ready
+            Motion::resolve(0.0, false, None, None, true, 4_000, Stance::Unarmed),
+            Motion::Ready(Stance::Unarmed)
         );
         // Out of the fight, it relaxes.
         assert_eq!(
-            Motion::resolve(0.0, false, None, None, false, 4_000),
+            Motion::resolve(0.0, false, None, None, false, 4_000, Stance::Unarmed),
             Motion::Stand
         );
         // A swing still beats the guard, and running still beats both.
         assert_eq!(
-            Motion::resolve(0.0, false, None, Some(50), true, 4_000),
-            Motion::Attacking(3_900)
+            Motion::resolve(0.0, false, None, Some(50), true, 4_000, Stance::Unarmed),
+            Motion::Attacking(3_900, Stance::Unarmed)
         );
-        assert_eq!(Motion::resolve(7.0, false, None, None, true, 4_000), Motion::Run);
+        assert_eq!(Motion::resolve(7.0, false, None, None, true, 4_000, Stance::Unarmed), Motion::Run);
         // And a corpse is not "in a fight" whatever the map still says.
-        assert_eq!(Motion::resolve(0.0, true, None, None, true, 4_000), Motion::Dead);
+        assert_eq!(Motion::resolve(0.0, true, None, None, true, 4_000, Stance::Unarmed), Motion::Dead);
     }
 
     /// Which cycles hold their last frame is a property of the *animation*,
@@ -1720,8 +1912,8 @@ mod tests {
     #[test]
     fn only_the_states_that_mark_an_instant_carry_a_start_time() {
         assert_eq!(Motion::Dying(1234).started_at(), Some(1234));
-        assert_eq!(Motion::Attacking(99).started_at(), Some(99));
-        for looping in [Motion::Stand, Motion::Walk, Motion::Run, Motion::Ready, Motion::Dead] {
+        assert_eq!(Motion::Attacking(99, Stance::Unarmed).started_at(), Some(99));
+        for looping in [Motion::Stand, Motion::Walk, Motion::Run, Motion::Ready(Stance::Unarmed), Motion::Dead] {
             assert_eq!(looping.started_at(), None, "{looping:?}");
         }
     }
@@ -1735,7 +1927,7 @@ mod tests {
     /// drawn T-posed.
     #[test]
     fn the_combat_stances_fall_back_to_standing() {
-        for motion in [Motion::Attacking(0), Motion::Ready] {
+        for motion in [Motion::Attacking(0, Stance::Unarmed), Motion::Ready(Stance::Unarmed)] {
             assert_eq!(
                 motion.animation_ids().last(),
                 Some(&STAND_ANIMATION_ID),
@@ -1754,8 +1946,8 @@ mod tests {
             Motion::Run,
             Motion::Dying(0),
             Motion::Dead,
-            Motion::Attacking(0),
-            Motion::Ready,
+            Motion::Attacking(0, Stance::Unarmed),
+            Motion::Ready(Stance::Unarmed),
         ] {
             assert!(!motion.animation_ids().is_empty(), "{motion:?}");
         }

@@ -106,11 +106,33 @@ impl BlendMode {
     ///
     /// The values beyond 3 are variations on modulation that all read
     /// acceptably as alpha blending until the shader models them properly.
+    /// Maps an M2 material's blend value.
+    ///
+    /// **4 is additive, and getting that wrong paints a black sword.** It is
+    /// 17.2% of the 58,479 materials in the archives, so it collapsed into
+    /// plain alpha blending for a long time without anyone noticing what it
+    /// was doing.
+    ///
+    /// The reason it must not be alpha is structural rather than a matter of
+    /// taste. A weapon draws its blade *twice*: once with the item texture
+    /// `ItemDisplayInfo` names, and again over the very same submesh with a
+    /// hardcoded reflection map like `ARMORREFLECT3.BLP`. That reflection is a
+    /// DXT1 with no alpha channel at all, so under alpha blending it is fully
+    /// opaque and covers the first pass completely -- which would make
+    /// `model_texture_left`, a column filled in for 19,702 items, invisible on
+    /// every weapon that has a reflect layer. A column exists to be seen, so
+    /// the second pass has to lighten rather than replace.
+    ///
+    /// 3 and 4 are the two additive members of the enum and are treated alike
+    /// here; the difference between them is whether alpha scales the
+    /// contribution, which this renderer does not yet distinguish. 5 and 6 are
+    /// modulate and modulate-2x, still folded into `Blend` and still wrong --
+    /// together they are 3.8%, and neither has been looked at.
     pub fn from_m2(blend: u16) -> Self {
         match blend {
             0 => Self::Opaque,
             1 => Self::AlphaKey,
-            3 => Self::Additive,
+            3 | 4 => Self::Additive,
             _ => Self::Blend,
         }
     }

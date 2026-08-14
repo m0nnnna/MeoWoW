@@ -21,3 +21,4 @@ wmo = { version = "0.0.1", path = "../../crates/wmo" }
 adt = { version = "0.0.1", path = "../../crates/adt" }
 auth = { version = "0.0.1", path = "../../crates/auth" }
 world = { version = "0.0.1", path = "../../crates/world" }
+glam.workspace = true

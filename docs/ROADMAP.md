@@ -2131,3 +2131,122 @@ combat animation when killing a wolf.
   the *body*, measured column by column in 4.4. A guard's sword is simply not
   in that table.
 - Shoulders, helms and ranged weapons, for the reason above.
+
+### 4.8: sheathing, and a black blade that was never the blade
+
+`foss-wow#42`, opened by the first live look at weapons: *"its still in hand
+there is no sheath state."*
+
+#### The server does not draw your weapon
+
+The starting assumption was that entering combat would set a sheath state to
+read. It does not. A whole fight was driven against the realm -- selection,
+swings landing both ways, real damage -- while every replicated field was
+watched: `UNIT_FLAGS` gained its in-combat bit and **byte 0 of
+`UNIT_FIELD_BYTES_2` never moved off zero**. Drawing a weapon is a decision the
+*client* makes and reports with `CMSG_SET_SHEATHED`; the server only
+republishes it so other players can draw it too. A client that never sends is a
+character who never unsheathes, which is exactly what this one was.
+
+Both the opcode and the field were confirmed by varying the input, the
+`CMSG_ATTACKSWING` shape: nothing acknowledges the send, but asking for each
+state in turn moved that byte to match -- unarmed, melee, ranged, and back.
+Each run also *started* in the state the last one left, so it persists
+server-side.
+
+The field index was not taken on trust either. `UNIT_FIELD_BYTES_2` is
+`OBJECT_END + 0x74`, and the same expression gives `0x36` for the level and
+`0x3B` for the unit flags -- both of which this client already reads, and both
+of which matched a live character (level 5, and the in-combat bit appearing
+exactly when a fight started).
+
+#### `sheathe_type` is a real column, and the control says so
+
+`wow-cli item sheath` cross-tabulates it against inventory type over all 46,096
+items. Every slot that only *paints* the body is 100% type zero with a single
+distinct value; the slots that hang geometry spread across five. So the column
+is filled in because an item can be sheathed, not incidentally. Item by item: a
+claymore is 1, a stave 2, a short sword 3, a shield 4, and bows, guns and
+thrown weapons are 0 -- meaning **no resting place**, not "unknown". Those stay
+in the hand.
+
+One wrinkle: the column is keyed by item *entry* and the character list only
+gives display ids, so the real question is whether a display id determines a
+sheath type. 98.9% do. The remaining 1.1% is resolved toward the non-zero
+value, because zero means nowhere to rest and preferring it would leave a sword
+in the hand of somebody who should have stowed it.
+
+#### The attachment points, and why looking could not settle them
+
+The same posed-skeleton dump that found the hands narrows the resting places to
+four families, each making physical sense: **32/33** at hip height with the
+blade trailing backward, **26/27** high on the shoulder blades with the blade
+pointing down, **30/31** on the upper back pointing up, and **28**, the only
+centred point behind the torso. Consistent across human, orc, night elf and
+tauren.
+
+Rendering then produced two candidates that both look completely correct,
+because a greatsword slung across a back has two mirror images and *both* look
+like a greatsword slung across a back. That is the placement-rotation trap
+again: a movable thing checked against another movable thing proves nothing.
+
+What is asymmetric is not the picture but the **animation**. Character models
+carry cycles named `Sheath` and `HipSheath`, and during them the hand travels
+to wherever the weapon is stowed. `wow-cli m2 attach-trace` plays a sequence
+and reports which static attachment the moving hand approaches: over `Sheath`
+the right hand gets two to three times closer to 26 than to 27, on human, orc
+and dwarf alike. So a right-hand weapon rests on the right of the back, and the
+mirror follows.
+
+The equivalent trace for `HipSheath` does **not** separate 32 from 33 -- three
+races give three different answers -- so the hip follows the rule the back
+established rather than a measurement of its own. Recorded as the weaker half.
+
+#### Two things the first live look found immediately
+
+**The blade was black, and it was never the blade.** A weapon draws its
+geometry *twice*: once with the item texture `ItemDisplayInfo` names, and again
+over the very same submesh with a hardcoded reflection map. That second pass is
+material blend 4, which this renderer collapsed into plain alpha blending --
+and the reflection is a DXT1 with no alpha channel, so it was fully opaque and
+covered the first pass completely. Blend 4 is additive. It is **17.2% of the
+58,479 materials in the archives**, so this was never a weapon bug; weapons
+were just the first place anyone looked closely.
+
+The argument is structural rather than aesthetic, which matters because "it
+looks better now" is not evidence: if blend 4 painted over, then
+`model_texture_left` -- a column filled in for 19,702 items -- would be
+invisible on every weapon with a reflect layer. A column exists to be seen.
+
+**The hands were open.** With the weapon drawn, a standing character resolved
+to the plain idle, whose hands are open, so the grip floated through the
+fingers: *"the hand is open holding the sword like he was precombat."* The
+`Ready` stance already existed and was gated on `fighting`, which was
+indistinguishable from correct for as long as nothing was ever drawn outside a
+fight. A drawn weapon is now enough on its own, and the stance carries which
+grip it is -- Testwolf's claymore resolves `Ready2H` rather than `Ready1H`.
+
+The fallback chains come from `AnimationData.dbc`'s own fallback column rather
+than an invented order: row 18 (`Attack2H`) names 17, rows 26 and 27 both name
+25 (`ReadyUnarmed`). Reading the table beats guessing, and it happens to agree
+with what a model lacking two-handed cycles should do.
+
+#### A validation that was right about the wrong thing
+
+The attachment sanity check shipped with a fixed 100-unit ceiling on how far an
+attachment may sit from the origin, which is a sensible number for a character
+and nonsense for `Creature\TREE\AshenvaleTreeFalling01.m2` -- a hundred and
+fifty units of falling tree whose perfectly good attachment sits at Z=127. It
+now scales with the model's own declared extent. A threshold that scales with
+its subject cannot make that mistake.
+
+#### Still missing
+
+- **`Ready2HL`, `ReadyBow`, `ReadyRifle` and `ReadyThrown` are not used.** The
+  cycles exist; which items want the long two-handed hold has not been
+  measured, and this client does not draw a bow at all.
+- **Blend modes 5 and 6** (modulate and modulate-2x) are still folded into
+  plain alpha. Together they are 3.8% of materials and neither has been looked
+  at.
+- Sheathing applies to the player only, because only the player has held
+  geometry -- other players' weapons are still `foss-wow#23`.

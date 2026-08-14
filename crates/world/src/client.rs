@@ -578,6 +578,25 @@ impl Connection {
         self.send(ClientOpcode::AttackStop, &[])
     }
 
+    /// Draws or stows the weapon.
+    ///
+    /// Nothing acknowledges this either, but unlike most sends here it *is*
+    /// directly observable: the server writes the value straight into byte 0
+    /// of the sender's `UNIT_FIELD_BYTES_2`, so the next object update carries
+    /// it back. That is what confirmed both this opcode and the field, by
+    /// sending each state in turn and watching the byte follow.
+    ///
+    /// **The server never sends this on its own.** Entering combat does not
+    /// draw a weapon -- see [`crate::combat::SheathState`] -- so a client that
+    /// does not call this leaves every character it controls permanently
+    /// stowed, and every other player sees them that way.
+    pub fn set_sheathed(&mut self, state: crate::combat::SheathState) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::SetSheathed,
+            &crate::combat::set_sheathed(state),
+        )
+    }
+
     /// Acknowledges a teleport within the current map.
     ///
     /// **The server will not finish the move until this arrives, and will

@@ -122,6 +122,9 @@ pub struct Look {
     /// cannot share a cache entry. Everything else here paints the character's
     /// own mesh; this is the one part that is a mesh of its own.
     pub held: Vec<HeldItem>,
+    /// How this character holds itself with its weapon drawn, from whatever it
+    /// is carrying. [`Stance::Unarmed`] for anyone holding nothing.
+    pub stance: Stance,
 }
 
 /// One model a character carries, and where on the skeleton it hangs.
@@ -133,8 +136,16 @@ pub struct HeldItem {
     /// against the model's directory by the loader, the same way a creature's
     /// texture variation is.
     pub texture: String,
-    /// Which [`m2::Attachment`] id on the *wielder* this hangs from.
+    /// Which [`m2::Attachment`] id on the *wielder* this hangs from when it is
+    /// drawn and in the hands.
     pub attachment: u32,
+    /// Where it rests when stowed, or `None` for an item with nowhere to go --
+    /// which is not a gap: bows, guns and thrown weapons all record a
+    /// `sheathe_type` of zero, and an item with no resting place stays in the
+    /// hand rather than disappearing.
+    pub stowed: Option<u32>,
+    /// The stance this item calls for while it is drawn.
+    pub stance: Stance,
 }
 
 impl Look {
@@ -254,6 +265,113 @@ fn held_rule(inventory_type: u8) -> Option<(&'static str, u32)> {
         13 | 17 | 21 => ("Weapon", m2::Attachment::HAND_RIGHT),
         22 | 23 => ("Weapon", m2::Attachment::HAND_LEFT),
         14 => ("Shield", m2::Attachment::HAND_LEFT),
+        _ => return None,
+    })
+}
+
+/// How a character holds itself when its weapon is out.
+///
+/// Not cosmetic. A character standing in the plain idle cycle with a drawn
+/// weapon has its hands open and the grip floating somewhere near one of them,
+/// which was the first thing noticed the moment weapons were drawn at all:
+/// *"the hand is open holding the sword like he was precombat"*. Every
+/// character model carries `ReadyUnarmed`, `Ready1H` and `Ready2H` precisely so
+/// the hands close around what they are holding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Stance {
+    /// Nothing in hand, or nothing this client can identify.
+    #[default]
+    Unarmed,
+    OneHand,
+    TwoHand,
+}
+
+/// Which stance an equipped item calls for.
+///
+/// Reuses the inventory types [`held_rule`] already measured, so there is one
+/// list of what counts as a weapon rather than two that can drift. Ranged
+/// weapons are absent for the same reason they are absent there -- `ReadyBow`
+/// and `ReadyRifle` exist, but this client does not draw a bow yet, and a
+/// stance without geometry to match it would be a character miming.
+fn stance_for(inventory_type: u8) -> Option<Stance> {
+    match inventory_type {
+        // Two-handed. `Ready2HL` exists for the long ones (staves, polearms)
+        // and is not distinguished here: it is a different *hold*, and which
+        // items want it has not been measured.
+        17 => Some(Stance::TwoHand),
+        13 | 21 | 22 | 23 => Some(Stance::OneHand),
+        // A shield changes nothing about how the other arm is held.
+        _ => None,
+    }
+}
+
+/// Where a stowed weapon rests, from `Item.dbc`'s `sheathe_type`.
+///
+/// **The vocabulary was measured, and so was the fact that it is a real one.**
+/// `wow-cli item sheath` cross-tabulates the column against inventory type
+/// over all 46,096 items: every slot that only *paints* the body is 100% type
+/// zero with a single distinct value, while the slots that hang geometry
+/// spread across five. So the column is set because an item can be sheathed,
+/// not incidentally. Confirmed item by item too -- a claymore reads 1, a stave
+/// 2, a short sword 3, a shield 4.
+///
+/// | type | what carries it | rests |
+/// |---|---|---|
+/// | 1 | two-handed swords, axes, maces | back |
+/// | 2 | staves and polearms | back, angled differently |
+/// | 3 | one-handed weapons | hip |
+/// | 4 | shields | back, centred |
+/// | 7 | fist weapons and holdables | hip |
+/// | 0 | bows, guns, thrown | nowhere -- they stay in hand |
+///
+/// The attachment ids come from the same geometric argument that identified
+/// the hands, run over every playable race at once (`m2 attachments --anim 0`
+/// poses the skeleton and reports where a weapon hung at each point would
+/// *aim*, since an item model runs along its own +X):
+///
+/// - **32 and 33** sit at hip height, offset left and right, with the blade
+///   pointing backward and slightly down -- a sword hanging hilt-forward at
+///   the belt. Consistent on human, orc, night elf and tauren.
+/// - **26 and 27** sit high on the shoulder blades with the blade pointing
+///   *down*, which is a greatsword carried hilt-above-the-shoulder.
+/// - **30 and 31** sit on the upper back with the blade pointing *up*, the
+///   other way a long shaft is carried.
+/// - **28** is the only centred point behind the torso.
+///
+/// Every one of these is a mirrored pair except 28, **and the side is the same
+/// side as the hand**, which was measured rather than assumed. `m2
+/// attach-trace` plays the model's own `Sheath` animation and reports which
+/// static attachment the moving hand approaches: over the whole cycle the right
+/// hand gets two to three times closer to 26 than to 27, on human, orc and
+/// dwarf alike. So a right-hand weapon rests on the right of the back, and the
+/// mirror follows.
+///
+/// That measurement matters because the alternative was going to be settled by
+/// looking, and looking cannot settle it. A greatsword slung across a back has
+/// two mirror images and *both* look like a greatsword slung across a back --
+/// the same trap as the placement rotation that shipped 90 degrees wrong
+/// because a building looks plausible from any side. What is asymmetric here is
+/// not the picture but the animation: the character reaches over one specific
+/// shoulder.
+///
+/// The equivalent trace for `HipSheath` does **not** separate 32 from 33 --
+/// three races give three different answers -- so the hip follows the rule the
+/// back established rather than a measurement of its own. Stated because it is
+/// the weaker half, and the one to re-examine if a sheathed dagger looks wrong.
+fn sheath_rule(sheathe_type: u32, hand: u32) -> Option<u32> {
+    let right_handed = hand == m2::Attachment::HAND_RIGHT;
+    let side = |right: u32, left: u32| if right_handed { right } else { left };
+    Some(match sheathe_type {
+        // A greatsword rides high on the shoulder blade, hilt up, blade down
+        // across the back.
+        1 => side(26, 27),
+        // A shaft is carried the other way up, on the upper back.
+        2 => side(31, 30),
+        // A one-hander hangs at the belt, hilt forward and blade trailing.
+        3 | 7 => side(33, 32),
+        // A shield goes flat and centred on the back whichever arm carries it,
+        // and 28 is the only point behind the torso that is not one of a pair.
+        4 => 28,
         _ => return None,
     })
 }
@@ -419,9 +537,29 @@ pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[(u32, u
     if items.is_none() && equipment.iter().any(|(id, _)| *id != 0) {
         tracing::warn!("no ItemDisplayInfo: equipment will not be drawn");
     }
+    // `Item.dbc` is read only when something is actually held, and only for
+    // the sheath position: it is 46,000 rows, and a character carrying nothing
+    // has no use for it. Everything else about equipment comes from
+    // `ItemDisplayInfo` above.
     let held = items
         .as_ref()
-        .map(|table| held_items(table, equipment))
+        .map(|table| {
+            let carries_geometry = equipment
+                .iter()
+                .any(|(id, kind)| *id != 0 && held_rule(*kind).is_some());
+            let entries = carries_geometry
+                .then(|| {
+                    let started = std::time::Instant::now();
+                    let parsed = chain
+                        .read(dbc::schema::Item::PATH)
+                        .ok()
+                        .and_then(|bytes| dbc::schema::Item::parse(&bytes).ok());
+                    tracing::debug!("read Item.dbc for sheath positions in {:?}", started.elapsed());
+                    parsed
+                })
+                .flatten();
+            held_items(table, entries.as_ref(), equipment)
+        })
         .unwrap_or_default();
 
     let (mut body, mut skin) = (None, None);
@@ -455,8 +593,42 @@ pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[(u32, u
         hair,
         geosets: geosets.into_iter().chain(equipped).collect(),
         decided_groups: decided,
+        // The two-handed grip wins if anything calls for it: a character
+        // cannot hold a greatsword in both hands and a dagger in one.
+        stance: held
+            .iter()
+            .map(|item| item.stance)
+            .max_by_key(|stance| match stance {
+                Stance::TwoHand => 2,
+                Stance::OneHand => 1,
+                Stance::Unarmed => 0,
+            })
+            .unwrap_or_default(),
         held,
     }
+}
+
+/// The sheath type of whatever item wears a display id.
+///
+/// **The lookup runs the wrong way round and has to.** `sheathe_type` is a
+/// column on `Item.dbc`, keyed by item *entry*; the character list gives this
+/// client display ids and nothing else. So the question is not "what is this
+/// item's sheath type" but "does a display id determine one", and that is
+/// measurable: over every item in a held slot, 98.9% of displays are used at a
+/// single sheath type.
+///
+/// The remaining 1.1% is settled towards the non-zero value on purpose. Almost
+/// every disagreement is between zero and a real position, and zero means *no
+/// resting place* -- so preferring it would leave a sword in the hand of a
+/// character who should have stowed it, which is the failure this whole feature
+/// exists to remove. Preferring the real position is wrong for at most a
+/// handful of items and wrong visibly, which is the better direction.
+fn sheathe_type_of(items: &dbc::schema::Item, display_id: u32) -> Option<u32> {
+    items
+        .iter()
+        .filter(|item| item.display_info_id() == display_id)
+        .map(|item| item.sheathe_type())
+        .max()
 }
 
 /// Resolves the equipment that hangs off the skeleton rather than painting it.
@@ -466,6 +638,7 @@ pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[(u32, u
 /// tying the two together would make one failure hide the other.
 fn held_items(
     table: &dbc::schema::ItemDisplayInfo,
+    items: Option<&dbc::schema::Item>,
     equipment: &[(u32, u8)],
 ) -> Vec<HeldItem> {
     let mut held = Vec::new();
@@ -485,6 +658,9 @@ fn held_items(
         if model.is_empty() {
             continue;
         }
+        let stowed = items
+            .and_then(|items| sheathe_type_of(items, *display_id))
+            .and_then(|sheathe| sheath_rule(sheathe, attachment));
         held.push(HeldItem {
             model: format!(
                 r"Item\ObjectComponents\{folder}\{}",
@@ -492,6 +668,8 @@ fn held_items(
             ),
             texture: row.model_texture_left().to_string(),
             attachment,
+            stowed,
+            stance: stance_for(*inventory_type).unwrap_or_default(),
         });
     }
     // The paths, not the count. A held item that resolves to the wrong file and
@@ -733,6 +911,7 @@ impl NpcAppearances {
             // simply not in this table, and inventing a twelfth column to hold
             // it would be worse than a guard with empty hands.
             held: Vec::new(),
+            stance: Stance::Unarmed,
         })
     }
 }
@@ -1123,9 +1302,18 @@ mod tests {
         let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
         let table = ItemDisplayInfo::parse(&chain.read(ItemDisplayInfo::PATH).unwrap()).unwrap();
 
-        let held = held_items(&table, &[(2380, 17)]);
+        // With `Item.dbc` supplied, so the resting place resolves too -- the
+        // claymore is a sheathe type 1 and must land on the back.
+        let entries = dbc::schema::Item::parse(&chain.read(dbc::schema::Item::PATH).unwrap())
+            .unwrap();
+        let held = held_items(&table, Some(&entries), &[(2380, 17)]);
         assert_eq!(held.len(), 1, "the claymore was not resolved");
         assert_eq!(held[0].attachment, m2::Attachment::HAND_RIGHT);
+        assert_eq!(
+            held[0].stowed,
+            Some(26),
+            "a two-handed sword should rest on the back"
+        );
         assert!(
             held[0].model.ends_with(".m2"),
             "{} was not rewritten from .mdx",
@@ -1155,6 +1343,78 @@ mod tests {
             human.attachment(held[0].attachment).is_some(),
             "the wielder has no right hand to hold it with"
         );
+    }
+
+    /// A stowed weapon rests on the same side as the hand that draws it, and
+    /// never in the same place as the other hand's.
+    ///
+    /// The side is the half that was measured -- the `Sheath` animation carries
+    /// the right hand two to three times closer to 26 than to 27 on every race
+    /// tried. Asserting only "a two-hander goes to 26" would pass under a rule
+    /// that sent *everything* to 26, so the mirror is asserted with it.
+    #[test]
+    fn a_stowed_weapon_rests_on_its_own_side() {
+        const HAND_RIGHT: u32 = m2::Attachment::HAND_RIGHT;
+        const HAND_LEFT: u32 = m2::Attachment::HAND_LEFT;
+
+        for sheathe in [1, 2, 3, 7] {
+            let right = sheath_rule(sheathe, HAND_RIGHT).expect("a right-hand resting place");
+            let left = sheath_rule(sheathe, HAND_LEFT).expect("a left-hand resting place");
+            assert_ne!(
+                right, left,
+                "sheathe type {sheathe} sends both hands to one point"
+            );
+        }
+        assert_eq!(sheath_rule(1, HAND_RIGHT), Some(26), "greatsword, right hand");
+        assert_eq!(sheath_rule(3, HAND_RIGHT), Some(33), "one-hander, right hip");
+        // A shield is the exception: one centred point, whichever arm holds it.
+        assert_eq!(sheath_rule(4, HAND_RIGHT), sheath_rule(4, HAND_LEFT));
+    }
+
+    /// A weapon with nowhere to rest keeps to the hand rather than vanishing.
+    ///
+    /// Sheathe type 0 is 97% or more of bows, guns and thrown weapons, and it
+    /// means *no resting place* rather than "not known". Returning a position
+    /// anyway would put a rifle somewhere nobody measured; returning `None`
+    /// leaves it drawn, which is visibly odd rather than silently wrong.
+    #[test]
+    fn an_unsheathable_weapon_has_no_resting_place() {
+        assert_eq!(sheath_rule(0, m2::Attachment::HAND_RIGHT), None);
+        // And an unknown value is treated the same, not guessed at.
+        assert_eq!(sheath_rule(99, m2::Attachment::HAND_RIGHT), None);
+    }
+
+    /// Every resting place is a real attachment on a real character model.
+    ///
+    /// The rule names six ids that were read off a posed human male. A number
+    /// that is not on the model draws nothing at all and logs one debug line --
+    /// exactly the silent failure this project keeps paying for -- so the ids
+    /// are checked against the archives rather than trusted.
+    #[test]
+    fn every_resting_place_exists_on_the_model() {
+        let Some(data) = std::env::var_os("WOW_DATA") else {
+            eprintln!("skipping: WOW_DATA not set");
+            return;
+        };
+        let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
+        for path in [
+            r"Character\Human\Male\HumanMale.m2",
+            r"Character\Orc\Male\OrcMale.m2",
+            r"Character\Tauren\Female\TaurenFemale.m2",
+        ] {
+            let model = m2::Model::parse(&chain.read(path).expect(path)).expect("parsing");
+            for sheathe in [1, 2, 3, 4, 7] {
+                for hand in [m2::Attachment::HAND_RIGHT, m2::Attachment::HAND_LEFT] {
+                    let Some(id) = sheath_rule(sheathe, hand) else {
+                        continue;
+                    };
+                    assert!(
+                        model.attachment(id).is_some(),
+                        "{path} has no attachment {id} (sheathe type {sheathe})"
+                    );
+                }
+            }
+        }
     }
 
     /// The two hands must be different attachment points.

@@ -21,10 +21,13 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 Roughly 58% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
 
-**Weapons are drawn and sheathing does not exist.** `Item.dbc`'s
-`sheathe_type` is transcribed and never read, and this client has no
-drawn/undrawn state to hang it on, so a character stands in town holding a
-claymore. `foss-wow#42`.
+**Weapons are drawn, and they sheathe.** `Z` draws and stows, attacking draws
+automatically, and a stowed weapon goes where `Item.dbc`'s `sheathe_type` says
+— a greatsword on the back, a one-hander at the hip. **The server never draws a
+weapon for you**: sheathing is a client decision reported with
+`CMSG_SET_SHEATHED`, and a whole fight passes without the state moving on its
+own. With a weapon out the character holds the matching ready stance rather
+than the at-ease idle.
 
 **The UI question is answered: this client draws its own interface and does not
 run addons.** Reimplementing `FrameXML` faithfully enough for third-party addons
@@ -437,6 +440,23 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   the hand would have put every weapon in the game in the wrong one, silently.
   When a column's name suggests an answer, find the rows where the name is
   unambiguous -- the pairs, the extremes -- and let those define it.
+- **When looking cannot settle it, find the thing that moves.** A greatsword
+  slung across a back has two mirror images, and *both* look exactly like a
+  greatsword slung across a back — the placement-rotation trap over again, and
+  a render was never going to break the tie. What was asymmetric was not the
+  picture but the **animation**: character models carry a cycle named `Sheath`
+  in which the hand travels to wherever the weapon is stowed, and tracing that
+  hand showed it passing two to three times closer to one candidate than the
+  other, on three races. When two static candidates look equally right, ask
+  what *moves* between them.
+- **A wrong constant is right for whatever it was written against.** The
+  attachment sanity check capped offsets at 100 units, which is generous for a
+  character and absurd for a hundred-and-fifty-unit falling tree whose
+  perfectly good attachment sits at Z=127. The check was not too strict or too
+  loose; it was measured against the wrong thing. A threshold that scales with
+  its subject — here the model's own declared extent — cannot make that
+  mistake, and this is the second time a fixed limit has been the bug (see the
+  turn-rate cap above).
 - **When every measurement says it is right, stop measuring and move.** A
   weapon that would not appear on screen produced four clean diagnostics in a
   row: the item resolved, the group was built, the transform put it exactly at
@@ -527,6 +547,15 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   `write_text` containing a character the console codec could not encode
   truncated `docs/ROADMAP.md` to zero bytes. Prefer the editing tools; if a
   script must write, write UTF-8 explicitly.
+- **And a script that writes cleanly can still rewrite every line.** This tree
+  is LF; Python's `io.open(p, 'w')` on Windows is *text* mode, which translates
+  every `\n` to `\r\n` on the way out. Five files edited that way came back
+  byte-different on every line, and the commit went from a 1,400-line diff to a
+  26,000-line one that no reviewer could read. The build and the tests are
+  entirely happy, so nothing catches it but `git show --stat`. Use the editing
+  tools; if a script must write, open in **binary** mode. Check the stat before
+  committing — a file you changed three lines of has no business showing
+  thousands.
 - `wgpu`/`egui`/`egui-wgpu`/`egui-winit` versions are coupled, and the `windows`
   crate needs a pin to build the DX12 backend at all — see `docs/RENDERING.md`
   before touching any of them.

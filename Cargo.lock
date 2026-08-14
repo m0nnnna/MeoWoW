@@ -3946,6 +3946,7 @@ dependencies = [
  "blp",
  "clap",
  "dbc",
+ "glam",
  "m2",
  "mpq",
  "png 0.17.16",

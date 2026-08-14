@@ -262,6 +262,28 @@ impl Entity {
         self.is_dead_or_ghost() && !self.is_ghost()
     }
 
+    /// Whether this unit is carrying its weapon in hand rather than stowed.
+    ///
+    /// **This one field the server does echo back for our own character**, so
+    /// unlike position it can be read here for everyone alike. Worth stating on
+    /// the accessor rather than at a call site, because the surrounding rule is
+    /// the opposite one and has already been walked into twice: the server
+    /// never relays our own *movement*, so replicated state holds our login
+    /// position forever. Sheath state is not like that. It changes only when a
+    /// client says so with `CMSG_SET_SHEATHED`, and the server republishes it
+    /// to everyone including the sender -- which is exactly how the field was
+    /// identified.
+    ///
+    /// An absent field reads as stowed, which is both the default the realm
+    /// starts a character at and the safe direction: a weapon drawn when it
+    /// should not be is more obviously wrong than one left on the back.
+    pub fn sheath(&self) -> crate::combat::SheathState {
+        self.fields
+            .get(crate::update::fields::UNIT_BYTES_2)
+            .map(crate::combat::SheathState::from_bytes_2)
+            .unwrap_or_default()
+    }
+
     /// Records a crossing of the alive/dead line, given what was true before
     /// the fields were merged.
     ///

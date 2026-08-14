@@ -140,6 +140,26 @@ Unresolved slots fall back to a 1x1 white texture so the geometry still renders
 as shaded shape rather than failing to draw, and the overlay lists what was
 missing.
 
+### Blend mode 4 is additive, and it is 17% of everything
+
+A material's blend value maps to a pipeline blend state. `0` is opaque, `1` is
+alpha-tested, `3` and `4` are **both additive**; `2`, `5` and `6` currently all
+collapse into straight alpha blending, and `5`/`6` (modulate and modulate-2x,
+3.8% of materials between them) are still wrong.
+
+`4` mattered enough to find on its own. A weapon draws its blade twice: once
+with the item texture `ItemDisplayInfo` names, and again over the *same
+submesh* with a hardcoded reflection map such as `ARMORREFLECT3.BLP`. That
+reflection is a DXT1 with no alpha channel, so under alpha blending it is fully
+opaque and hides the first pass completely — which rendered every reflective
+weapon in the game as a flat dark silhouette. It reads as "the texture failed
+to load", and it is not; the texture loads and is then painted over.
+
+The argument for additive is structural, not aesthetic. If blend 4 covered what
+was beneath it, `model_texture_left` — a column filled in for 19,702 items —
+could never be seen on any weapon carrying a reflect layer. A column exists to
+be seen.
+
 ## Skinning
 
 Bone matrices go to the GPU in a **storage** buffer rather than a uniform: bone

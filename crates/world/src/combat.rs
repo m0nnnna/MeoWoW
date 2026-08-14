@@ -414,6 +414,58 @@ pub fn describe_swing(swing: &MeleeSwing, own: u64, name_of: impl Fn(u64) -> Str
     line
 }
 
+/// Whether a unit is carrying its weapon in hand, and which kind.
+///
+/// **This is a client-side decision that the server merely records.** Driving a
+/// whole fight against the realm -- selecting a wolf, swinging, taking damage,
+/// watching `UNIT_FLAGS` gain its in-combat bit -- never moved this value off
+/// `Unarmed`. Nothing on the server draws a weapon for you. The client decides,
+/// says so with [`crate::ClientOpcode::SetSheathed`], and the server
+/// republishes it in byte 0 of `UNIT_FIELD_BYTES_2` so *other* clients can draw
+/// it. That is the whole mechanism, and it means a client that never sends is a
+/// character who never unsheathes.
+///
+/// The three states are the ones the realm accepts: anything else is refused
+/// outright, which is how the range was established rather than assumed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SheathState {
+    /// Stowed. Weapons rest wherever `Item.dbc`'s `sheathe_type` says.
+    #[default]
+    Unarmed = 0,
+    /// Melee weapon drawn and in the hands.
+    Melee = 1,
+    /// Ranged weapon drawn.
+    Ranged = 2,
+}
+
+impl SheathState {
+    /// Reads the state out of a replicated `UNIT_FIELD_BYTES_2`.
+    ///
+    /// Byte 0 of the field, and an unknown value reads as [`Self::Unarmed`]
+    /// rather than erroring: this decides how to *draw* a unit, and a
+    /// character with a weapon stowed is the safe wrong answer. The
+    /// alternative -- refusing to draw the unit at all -- would turn a value
+    /// this client has not seen into a missing person.
+    pub fn from_bytes_2(field: u32) -> Self {
+        match field & 0xFF {
+            1 => Self::Melee,
+            2 => Self::Ranged,
+            _ => Self::Unarmed,
+        }
+    }
+
+    /// Whether a weapon is in the hands rather than stowed.
+    pub fn drawn(self) -> bool {
+        self != Self::Unarmed
+    }
+}
+
+/// The body of `CMSG_SET_SHEATHED`: one `u32`.
+pub fn set_sheathed(state: SheathState) -> [u8; 4] {
+    (state as u32).to_le_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,6 +808,47 @@ mod tests {
                 trailing: 0,
             }
         );
+    }
+
+    /// The three states the realm accepts, round-tripped through the byte the
+    /// server publishes them in.
+    ///
+    /// Both halves were confirmed live: `wow-cli world --sheath N` sends each
+    /// value and reads byte 0 of `UNIT_FIELD_BYTES_2` back, and it followed the
+    /// request every time -- unarmed to melee to ranged and back. That is the
+    /// only kind of proof available for an opcode nothing acknowledges.
+    #[test]
+    fn every_sheath_state_survives_the_byte_it_travels_in() {
+        for state in [SheathState::Unarmed, SheathState::Melee, SheathState::Ranged] {
+            let sent = u32::from_le_bytes(set_sheathed(state));
+            assert_eq!(
+                SheathState::from_bytes_2(sent),
+                state,
+                "{state:?} did not survive the round trip"
+            );
+        }
+    }
+
+    /// The state lives in byte 0 and nothing else in the field may disturb it.
+    ///
+    /// The other three bytes are occupied -- a live character came back as
+    /// `0x11000000`, which is a shapeshift form in the top byte and a sheath
+    /// state of zero in the bottom. Reading the field as a whole number would
+    /// make that character permanently ranged.
+    #[test]
+    fn only_the_lowest_byte_is_the_sheath_state() {
+        assert_eq!(SheathState::from_bytes_2(0x1100_0000), SheathState::Unarmed);
+        assert_eq!(SheathState::from_bytes_2(0x1100_0001), SheathState::Melee);
+        assert_eq!(SheathState::from_bytes_2(0xffff_ff02), SheathState::Ranged);
+    }
+
+    /// An unknown value draws a stowed weapon rather than refusing to draw.
+    #[test]
+    fn an_unknown_state_stows_rather_than_vanishing() {
+        assert_eq!(SheathState::from_bytes_2(0x00ff), SheathState::Unarmed);
+        assert!(!SheathState::from_bytes_2(0x00ff).drawn());
+        assert!(SheathState::Melee.drawn());
+        assert!(SheathState::Ranged.drawn());
     }
 
     /// The two packets really do disagree about guid encoding, so reading one

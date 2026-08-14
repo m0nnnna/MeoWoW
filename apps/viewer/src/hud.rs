@@ -360,6 +360,7 @@ mod tests {
             swung_ms_ago: None,
             fighting: false,
             appearance: None,
+            sheathed: true,
         }
     }
 

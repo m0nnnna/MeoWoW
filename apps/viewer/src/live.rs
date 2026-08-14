@@ -61,6 +61,15 @@ pub struct Entity {
     /// resolved here because turning it into textures composes a skin, which
     /// is far too expensive to redo every frame -- the caller caches on it.
     pub appearance: Option<::world::Appearance>,
+    /// Whether this unit is carrying its weapon in hand rather than stowed.
+    ///
+    /// Read from replicated state for *everyone, this client's own character
+    /// included* -- unlike position, which the server never echoes back. That
+    /// asymmetry is worth stating because it is the opposite of the trap
+    /// documented on `own_entity`: the server does republish what a client
+    /// says about its sheath, so the round trip is the confirmation rather
+    /// than a thing to work around.
+    pub sheathed: bool,
 }
 
 /// Where the player is and what can be seen from there.
@@ -495,6 +504,7 @@ pub fn drawable_entities(
             swung_ms_ago: entity.swung_ago(now).map(|d| d.as_millis() as u32),
             fighting: state.is_fighting(entity.guid),
             appearance: entity.appearance(),
+            sheathed: !entity.sheath().drawn(),
         });
     }
     entities
@@ -621,10 +631,12 @@ pub fn own_entity(
     // Worth a line: a body that is not drawn and a body drawn somewhere
     // unexpected look identical from the outside, and this says which.
     tracing::debug!(
-        "own body: display {display_id} at {:.1}, {:.1}, {:.1} facing {orientation:.2}",
+        "own body: display {display_id} at {:.1}, {:.1}, {:.1} facing {orientation:.2}, \
+         weapon {:?}",
         position.x,
         position.y,
-        position.z
+        position.z,
+        entity.sheath(),
     );
     Some(Entity {
         guid: own_guid,
@@ -655,6 +667,10 @@ pub fn own_entity(
         // which is the source this project has confirmed. No reason to make
         // the caller resolve it a second way.
         appearance: None,
+        // Read from replicated state like everyone else's, and unlike our
+        // position: the server does echo this one back -- see
+        // `world::state::Entity::sheath`.
+        sheathed: !entity.sheath().drawn(),
     })
 }
 

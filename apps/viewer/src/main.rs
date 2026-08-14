@@ -338,8 +338,10 @@ fn build_live_scene(
                         swung_ms_ago: entity.swung_ms_ago,
                         fighting: entity.fighting,
                         kind: entity.kind,
+                        stance: look.as_deref().map(|l| l.stance).unwrap_or_default(),
                         look,
                         look_key,
+                        sheathed: entity.sheathed,
                     }
                 })
                 .collect();
@@ -2059,6 +2061,24 @@ impl ApplicationHandler for App {
                                 window.request_redraw();
                                 return;
                             }
+                            // `Z` draws and stows, as 3.3.5a binds it. The
+                            // weapon's resting place comes from the item, so
+                            // this only says drawn or not.
+                            KeyCode::KeyZ => {
+                                let drawn = self
+                                    .live
+                                    .as_ref()
+                                    .and_then(|live| live.state.get(live.guid))
+                                    .is_some_and(|entity| entity.sheath().drawn());
+                                let wanted = if drawn {
+                                    ::world::combat::SheathState::Unarmed
+                                } else {
+                                    ::world::combat::SheathState::Melee
+                                };
+                                self.set_sheath(wanted);
+                                window.request_redraw();
+                                return;
+                            }
                             KeyCode::F2 => {
                                 self.entity_flip = !self.entity_flip;
                                 let state = if self.entity_flip { "flipped" } else { "as shipped" };
@@ -2305,8 +2325,13 @@ impl App {
                                     swung_ms_ago: entity.swung_ms_ago,
                                     fighting: entity.fighting,
                                     kind: entity.kind,
+                                    stance: look
+                                        .as_deref()
+                                        .map(|l| l.stance)
+                                        .unwrap_or_default(),
                                     look,
                                     look_key,
+                                    sheathed: entity.sheathed,
                                 }
                             })
                             .collect();
@@ -2893,6 +2918,30 @@ impl App {
                 self.chat
                     .push(Line::Chat(local_notice(format!("could not attack: {e}"))));
             }
+        }
+        // Swinging with the sword still on your back is the state this client
+        // was in until now. **Nothing on the server fixes it** -- a whole fight
+        // was driven against the realm without the sheath state moving off
+        // zero, because drawing a weapon is a decision the client makes and
+        // reports. See `world::combat::SheathState`.
+        self.set_sheath(::world::combat::SheathState::Melee);
+    }
+
+    /// Draws or stows the weapon, and tells the server so other players see it.
+    ///
+    /// The drawn state is not tracked here on purpose: it is read back out of
+    /// replicated state like everyone else's, because the server echoes this
+    /// field for its sender -- see `world::state::Entity::sheath`. Keeping a
+    /// local copy as well would give two answers that agree until they do not.
+    fn set_sheath(&mut self, wanted: ::world::combat::SheathState) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if live.state.get(live.guid).map(|e| e.sheath()) == Some(wanted) {
+            return;
+        }
+        if let Err(e) = live.connection.set_sheathed(wanted) {
+            tracing::warn!("could not set sheath state: {e:#}");
         }
     }
 
@@ -3587,9 +3636,10 @@ impl App {
                     } else {
                         "left-click to target, right-click to target and attack, \
                          right-drag to steer, wheel to zoom, Q/E strafe, space \
-                         jumps, Num Lock autoruns. P for the spellbook (click a \
-                         spell then a slot; right-click a slot to clear it), F1 \
-                         to rearrange the interface"
+                         jumps, Num Lock autoruns, Z draws or stows the weapon. \
+                         P for the spellbook (click a spell then a slot; \
+                         right-click a slot to clear it), F1 to rearrange the \
+                         interface"
                     });
                     if let Some(status) = &layout_status {
                         ui.weak(format!("interface: {status}"));

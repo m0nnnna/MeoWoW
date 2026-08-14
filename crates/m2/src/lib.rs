@@ -890,15 +890,33 @@ impl Model {
                 bones.len()
             ));
         }
-        // Same idea one field over: an offset from a bone is a local nudge, not
-        // a world position, so it stays small even on the largest models.
+        // Same idea one field over, measured against the model's *own* extent
+        // rather than a constant. An attachment is a point on the model, so it
+        // belongs inside the box the model already declares -- with room to
+        // spare, since the box covers the bind pose and an attachment can sit
+        // a little outside it.
+        //
+        // A fixed ceiling was tried first and was wrong in the direction that
+        // matters: `Creature\TREE\AshenvaleTreeFalling01.m2` is a hundred and
+        // fifty units tall, so its perfectly good attachment at Z=127 tripped
+        // a limit chosen with characters in mind. A threshold that scales with
+        // the subject cannot make that mistake.
+        let (min, max) = self.bounding_box();
+        let extent = (0..3)
+            .map(|i| (max[i] - min[i]).abs())
+            .fold(0.0f32, f32::max)
+            .max(10.0);
         let wild = attachments
             .iter()
-            .filter(|a| a.position.iter().any(|c| !c.is_finite() || c.abs() > 100.0))
+            .filter(|a| {
+                a.position
+                    .iter()
+                    .any(|c| !c.is_finite() || c.abs() > extent * 4.0)
+            })
             .count();
         if wild > 0 {
             issues.push(format!(
-                "{wild}/{} attachment offsets are not plausible local offsets",
+                "{wild}/{} attachments sit far outside the model's own {extent:.0}-unit extent",
                 attachments.len()
             ));
         }

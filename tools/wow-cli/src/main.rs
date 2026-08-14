@@ -277,6 +277,16 @@ enum Command {
         /// of a corpse run rather than a shortcut past one.
         #[arg(long)]
         reclaim: bool,
+        /// Draw or stow the weapon, then report the sheath state the server
+        /// echoes back.
+        ///
+        /// The whole confirmation for `CMSG_SET_SHEATHED` in one flag: nothing
+        /// acknowledges the send, but the server writes the value into byte 0
+        /// of the sender's `UNIT_FIELD_BYTES_2`, so passing each state in turn
+        /// and watching the byte follow proves the opcode and the field at
+        /// once.
+        #[arg(long)]
+        sheath: Option<u32>,
         /// Select the nearest unit and swing at it, then hold the line.
         ///
         /// Auto-attack is a state rather than an action: one swing request
@@ -426,6 +436,26 @@ enum M2Command {
     },
     /// Resolve a creature display id to its model, the way the renderer will.
     Creature { display_id: u32 },
+    /// Find where a moving attachment goes, by asking which other attachment
+    /// it comes closest to over an animation.
+    ///
+    /// Identifies the sheath points without transcribing a table. A character
+    /// model carries animations named `Sheath` and `HipSheath`, and during
+    /// them the hand carries the weapon to wherever it is stowed -- so the
+    /// static attachment the *hand* approaches most nearly is the resting
+    /// place, measured rather than assumed.
+    AttachTrace {
+        path: String,
+        /// Sequence index to play. `m2 anims` lists them by name.
+        #[arg(long)]
+        anim: usize,
+        /// The attachment that moves. Defaults to the right hand.
+        #[arg(long, default_value_t = m2::Attachment::HAND_RIGHT)]
+        track: u32,
+        /// How many closest candidates to report.
+        #[arg(long, default_value_t = 6)]
+        limit: usize,
+    },
     /// List a model's animations and how much of the skeleton each moves.
     Anims {
         path: String,
@@ -436,6 +466,16 @@ enum M2Command {
     /// each names and where that bone sits.
     Attachments {
         path: String,
+        /// Pose the skeleton with this sequence index before reporting, and
+        /// show how far each attachment's bone is turned.
+        ///
+        /// The bind pose of an M2 is the identity by construction, so an
+        /// attachment that must hold something at an *angle* -- a sword lying
+        /// diagonally across a back -- can only get that angle from its bone's
+        /// animation. A large rotation on a torso-mounted point is therefore
+        /// evidence about what hangs there.
+        #[arg(long)]
+        anim: Option<usize>,
         /// Report every attachment id across the whole archive set instead,
         /// tallying how many models carry each and which side of the model
         /// they sit on. A stride error shows up here as a flood of ids.
@@ -457,6 +497,12 @@ enum ItemCommand {
     /// separate from the ones that only paint the skin, without transcribing
     /// a single constant.
     Held,
+    /// Cross-tabulate `Item.dbc`'s `sheathe_type` against inventory type.
+    ///
+    /// Says how many places a stowed weapon can rest and which slots share
+    /// each, which is what decides how many attachment points sheathing needs
+    /// before any of them are identified.
+    Sheath,
 }
 
 #[derive(Subcommand)]
@@ -575,6 +621,7 @@ fn main() -> Result<()> {
             release,
             reclaim,
             attack,
+            sheath,
             capture,
             names,
             say,
@@ -605,6 +652,7 @@ fn main() -> Result<()> {
                 release: *release,
                 reclaim: *reclaim,
                 attack: *attack,
+                sheath: *sheath,
                 capture: capture.as_deref(),
                 names: *names,
                 say: say.as_deref(),
@@ -742,6 +790,7 @@ struct WorldRequest<'a> {
     release: bool,
     reclaim: bool,
     attack: bool,
+    sheath: Option<u32>,
     capture: Option<&'a std::path::Path>,
     names: bool,
     say: Option<&'a str>,
@@ -797,6 +846,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         release,
         reclaim,
         attack,
+        sheath,
         capture,
         names,
         say,
@@ -1130,6 +1180,37 @@ nothing replicated matches {wanted:?}"),
                 }
                 None => println!("\nnothing replicated to select"),
             }
+        }
+
+        if let Some(asked) = sheath {
+            use world::combat::SheathState;
+
+            // Read the byte back before and after, because the value alone
+            // proves nothing: this field is zero by default and stays zero
+            // through an entire fight, so "it is 0" and "the send was ignored"
+            // are the same observation. What separates them is the byte
+            // *following* the value asked for.
+            let before = own_sheath(&state, character.guid);
+            let wanted = match asked {
+                1 => SheathState::Melee,
+                2 => SheathState::Ranged,
+                _ => SheathState::Unarmed,
+            };
+            connection.set_sheathed(wanted)?;
+            // Give the server time to act. A packet sent and immediately
+            // followed by a disconnect is often never processed at all.
+            let packets = connection.drain(std::time::Duration::from_millis(1500), 256)?;
+            state.replicate(&packets, None);
+            let after = own_sheath(&state, character.guid);
+            println!("\nasked for sheath state {asked} ({wanted:?})");
+            println!(
+                "  UNIT_FIELD_BYTES_2 byte 0: {before:?} -> {after:?}{}",
+                if after == Some(wanted) {
+                    "  (the server took it)"
+                } else {
+                    "  (unchanged -- the send was not understood, or nothing was resent)"
+                }
+            );
         }
 
         if attack {
@@ -1989,6 +2070,19 @@ fn report_appearance(state: &world::WorldState, character: &world::Character) {
 /// character that is alive differ in some field, and which one is the question
 /// -- asking it by *comparing two states* rather than by looking up a flag is
 /// the same technique that found `PLAYER_BYTES` and the game-object display id.
+/// Byte 0 of our own `UNIT_FIELD_BYTES_2`, as a sheath state.
+///
+/// `None` when the object is not replicated at all, which is a different thing
+/// from being unarmed and needs to stay distinguishable: a probe that cannot
+/// see itself proves nothing either way.
+fn own_sheath(
+    state: &world::WorldState,
+    own_guid: u64,
+) -> Option<world::combat::SheathState> {
+    let field = state.get(own_guid)?.fields.get(world::update::fields::UNIT_BYTES_2)?;
+    Some(world::combat::SheathState::from_bytes_2(field))
+}
+
 fn report_own_fields(state: &world::WorldState, own_guid: u64, when: &str) {
     let Some(entity) = state.get(own_guid) else {
         println!("\nown object not replicated ({when})");
@@ -3573,11 +3667,17 @@ fn m2_cmd(chain: &mut Chain, cmd: M2Command) -> Result<()> {
         M2Command::Survey { filter, limit } => m2_survey(chain, filter.as_deref(), limit),
         M2Command::Creature { display_id } => m2_creature(chain, display_id),
         M2Command::Anims { path, limit } => m2_anims(chain, &path, limit),
-        M2Command::Attachments { path, survey } => {
+        M2Command::AttachTrace {
+            path,
+            anim,
+            track,
+            limit,
+        } => m2_attach_trace(chain, &path, anim, track, limit),
+        M2Command::Attachments { path, anim, survey } => {
             if survey {
                 m2_attachment_survey(chain, &path)
             } else {
-                m2_attachments(chain, &path)
+                m2_attachments(chain, &path, anim)
             }
         }
     }
@@ -3587,7 +3687,133 @@ fn item_cmd(chain: &mut Chain, cmd: ItemCommand) -> Result<()> {
     match cmd {
         ItemCommand::Display { display_id } => item_display(chain, display_id),
         ItemCommand::Held => item_held(chain),
+        ItemCommand::Sheath => item_sheath(chain),
     }
+}
+
+/// Cross-tabulates sheathe type against inventory type.
+///
+/// A weapon's stowed position is not a client constant, it is a column -- so
+/// the first question is how many distinct values it takes and whether they
+/// partition the held slots the way a set of resting places would. If every
+/// two-hander shares one value and every one-hander another, the column means
+/// what its name says; if the values scatter across slots, it means something
+/// else and nothing should be built on it.
+fn item_sheath(chain: &mut Chain) -> Result<()> {
+    use dbc::schema::Item;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let items = Item::parse(&chain.read(Item::PATH)?)?;
+
+    // Only the slots that hang geometry can be sheathed at all; the rest paint
+    // the body and have nowhere to be stowed from.
+    let held: BTreeSet<u32> = [13, 14, 15, 17, 21, 22, 23, 25, 26].into_iter().collect();
+
+    let mut grid: BTreeMap<u32, BTreeMap<u32, usize>> = BTreeMap::new();
+    let mut totals: BTreeMap<u32, usize> = BTreeMap::new();
+    for item in items.iter() {
+        *grid
+            .entry(item.inventory_type())
+            .or_default()
+            .entry(item.sheathe_type())
+            .or_default() += 1;
+        *totals.entry(item.sheathe_type()).or_default() += 1;
+    }
+
+    println!("\nsheathe_type across all {} items: {:?}", items.len(), totals);
+    println!("\nheld slots only:");
+    println!("  {:>5} {:>8}  distribution of sheathe_type", "slot", "items");
+    for (slot, row) in &grid {
+        if !held.contains(slot) {
+            continue;
+        }
+        let count: usize = row.values().sum();
+        let mut parts: Vec<String> = row
+            .iter()
+            .map(|(sheathe, n)| {
+                format!("{sheathe}: {n} ({:.0}%)", 100.0 * *n as f32 / count as f32)
+            })
+            .collect();
+        parts.sort();
+        println!("  {slot:>5} {count:>8}  {}", parts.join(", "));
+    }
+
+    // A slot that splits across two sheathe types is the interesting case: it
+    // means the resting place depends on something finer than the slot, and
+    // `Item.dbc`'s own class/subclass is the only other thing it could be.
+    println!("\nheld slots by weapon subclass, for the slots that split:");
+    let mut by_subclass: BTreeMap<(u32, u32, u32), BTreeMap<u32, usize>> = BTreeMap::new();
+    for item in items.iter() {
+        if !held.contains(&item.inventory_type()) {
+            continue;
+        }
+        *by_subclass
+            .entry((item.inventory_type(), item.class_id(), item.subclass_id()))
+            .or_default()
+            .entry(item.sheathe_type())
+            .or_default() += 1;
+    }
+    println!(
+        "  {:>5} {:>6} {:>9} {:>8}  sheathe_type",
+        "slot", "class", "subclass", "items"
+    );
+    for ((slot, class, subclass), row) in &by_subclass {
+        let count: usize = row.values().sum();
+        if count < 20 {
+            continue;
+        }
+        let mut parts: Vec<String> = row
+            .iter()
+            .filter(|(_, n)| **n * 20 >= count)
+            .map(|(sheathe, n)| {
+                format!("{sheathe}: {:.0}%", 100.0 * *n as f32 / count as f32)
+            })
+            .collect();
+        parts.sort();
+        println!("  {slot:>5} {class:>6} {subclass:>9} {count:>8}  {}", parts.join(", "));
+    }
+
+    // The lookup this client actually has to perform. Our own equipment
+    // arrives from the character list as *display* ids, and `sheathe_type` is
+    // keyed by item entry -- several of which can share one display. So the
+    // question is not "what is the sheathe type" but "does a display id
+    // determine one", and a display whose items disagree cannot answer.
+    let mut per_display: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for item in items.iter() {
+        if !held.contains(&item.inventory_type()) || item.display_info_id() == 0 {
+            continue;
+        }
+        per_display
+            .entry(item.display_info_id())
+            .or_default()
+            .insert(item.sheathe_type());
+    }
+    let ambiguous = per_display.values().filter(|s| s.len() > 1).count();
+    println!(
+        "\ndisplay id -> sheathe_type: {} displays on held items, {ambiguous} ambiguous ({:.2}%)",
+        per_display.len(),
+        100.0 * ambiguous as f32 / per_display.len().max(1) as f32
+    );
+    for (display, states) in per_display.iter().filter(|(_, s)| s.len() > 1).take(5) {
+        println!("  display {display} is used at {states:?}");
+    }
+
+    println!("\nthe painted slots, as a control:");
+    for (slot, row) in &grid {
+        if held.contains(slot) {
+            continue;
+        }
+        let count: usize = row.values().sum();
+        let dominant = row.iter().max_by_key(|(_, n)| **n);
+        if let Some((sheathe, n)) = dominant {
+            println!(
+                "  {slot:>5} {count:>8}  mostly {sheathe} ({:.0}%), {} distinct",
+                100.0 * *n as f32 / count as f32,
+                row.len()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Shows what one `ItemDisplayInfo` row hangs on the character.
@@ -3600,7 +3826,23 @@ fn item_display(chain: &mut Chain, display_id: u32) -> Result<()> {
         .find(|r| r.id() == display_id)
         .with_context(|| format!("no ItemDisplayInfo row {display_id}"))?;
 
+    // The lookup the renderer has to make, run the same way round: from a
+    // display id, because that is all the character list gives us.
+    let sheathe: Vec<u32> = dbc::schema::Item::parse(&chain.read(dbc::schema::Item::PATH)?)
+        .map(|items| {
+            let mut seen: Vec<u32> = items
+                .iter()
+                .filter(|i| i.display_info_id() == display_id)
+                .map(|i| i.sheathe_type())
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            seen
+        })
+        .unwrap_or_default();
+
     println!("item display {display_id}");
+    println!("  sheathe_type from the items using this display: {sheathe:?}");
     for (hand, model, texture) in [
         ("right", row.model_right(), row.model_texture_right()),
         ("left", row.model_left(), row.model_texture_left()),
@@ -3763,17 +4005,145 @@ fn item_held(chain: &mut Chain) -> Result<()> {
     Ok(())
 }
 
+/// Traces one attachment through an animation and reports which others it
+/// approaches.
+///
+/// The point is to identify a *destination* from motion rather than from a
+/// table. In `Sheath`, the character's hand carries the weapon to its resting
+/// place and comes back; whichever static attachment the hand passes closest
+/// to is where the weapon ends up. A candidate that is merely nearby all the
+/// time -- the elbow, the other hip -- is separated from the real answer by
+/// the *contrast* between its closest approach and its typical distance, so
+/// both are reported.
+fn m2_attach_trace(
+    chain: &mut Chain,
+    path: &str,
+    anim: usize,
+    track: u32,
+    limit: usize,
+) -> Result<()> {
+    let path = m2::model_path(path);
+    let model = m2::Model::parse(&chain.read(&path)?)?;
+    let attachments = model.attachments();
+    let sequences = model.sequences();
+
+    let tracked = attachments
+        .iter()
+        .find(|a| a.id == track)
+        .copied()
+        .with_context(|| format!("{path} has no attachment {track}"))?;
+    let sequence = sequences
+        .get(anim)
+        .with_context(|| format!("{path} has no sequence {anim}"))?;
+
+    let mut external = std::collections::BTreeMap::new();
+    for (i, seq) in sequences.iter().enumerate() {
+        if seq.is_inline() {
+            continue;
+        }
+        if let Ok(bytes) = chain.read(&m2::anim::external_anim_path(&path, seq)) {
+            external.insert(i, bytes);
+        }
+    }
+    let bones = model.animated_bones_with(&external);
+
+    let names = dbc::schema::AnimationData::parse(&chain.read(dbc::schema::AnimationData::PATH)?)
+        .ok();
+    let name = names
+        .as_ref()
+        .and_then(|t| t.iter().find(|r| r.id() == sequence.id as u32))
+        .map(|r| r.name().to_string())
+        .unwrap_or_else(|| format!("#{}", sequence.id));
+
+    println!("{path}");
+    println!(
+        "  tracing attachment {track} through sequence {anim} ({name}, {}ms)",
+        sequence.duration_ms
+    );
+
+    let at = |pose: &[glam::Mat4], a: &m2::Attachment| -> glam::Vec3 {
+        pose.get(a.bone as usize)
+            .copied()
+            .unwrap_or(glam::Mat4::IDENTITY)
+            .transform_point3(glam::Vec3::from(a.position))
+    };
+
+    // Sample densely: the hand is only at the sheath for an instant, and a
+    // coarse sample walks straight past the moment that identifies it.
+    const SAMPLES: u32 = 240;
+    let mut closest: Vec<(u32, f32, f32, f32)> = Vec::new();
+    for candidate in &attachments {
+        if candidate.id == track {
+            continue;
+        }
+        let (mut nearest, mut total) = (f32::MAX, 0.0f32);
+        for step in 0..=SAMPLES {
+            let time = sequence.duration_ms * step / SAMPLES;
+            let pose = m2::Model::pose_bones(&bones, anim, time);
+            let distance = at(&pose, &tracked).distance(at(&pose, candidate));
+            nearest = nearest.min(distance);
+            total += distance;
+        }
+        let mean = total / (SAMPLES + 1) as f32;
+        closest.push((candidate.id, nearest, mean, mean - nearest));
+    }
+
+    // Ranked by how much closer than usual the tracked point gets, not by
+    // absolute distance: the hand is always near the hip and that proves
+    // nothing, whereas *approaching and leaving* is the signature of a
+    // destination.
+    closest.sort_by(|a, b| b.3.total_cmp(&a.3));
+    println!(
+        "\n  {:>4} {:>10} {:>10} {:>10}   ranked by approach",
+        "id", "closest", "mean", "approach"
+    );
+    for (id, nearest, mean, approach) in closest.iter().take(limit) {
+        println!("  {id:>4} {nearest:>10.3} {mean:>10.3} {approach:>10.3}");
+    }
+
+    let by_distance = closest
+        .iter()
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|c| c.0);
+    println!(
+        "\n  nearest approach overall: attachment {:?}",
+        by_distance
+    );
+    Ok(())
+}
+
 /// Dumps one model's attachment points.
 ///
 /// Prints the bone each names beside the bone's own pivot, because those two
 /// are the check: an attachment is drawn through its bone's matrix, and in the
 /// bind pose that matrix is the identity, so the offset reads as a model-space
 /// point and must land on -- not merely near -- the bone it hangs from.
-fn m2_attachments(chain: &mut Chain, path: &str) -> Result<()> {
+fn m2_attachments(chain: &mut Chain, path: &str, anim: Option<usize>) -> Result<()> {
     let path = m2::model_path(path);
     let model = m2::Model::parse(&chain.read(&path)?)?;
     let bones = model.bones();
     let attachments = model.attachments();
+
+    // Posed only when asked: decoding every track and loading the external
+    // `.anim` files is far more work than reading the hierarchy.
+    let posed = anim.map(|sequence| {
+        let sequences = model.sequences();
+        let mut external = std::collections::BTreeMap::new();
+        for (i, seq) in sequences.iter().enumerate() {
+            if seq.is_inline() {
+                continue;
+            }
+            if let Ok(bytes) = chain.read(&m2::anim::external_anim_path(&path, seq)) {
+                external.insert(i, bytes);
+            }
+        }
+        let animated = model.animated_bones_with(&external);
+        let name = sequences
+            .get(sequence)
+            .map(|s| format!("sequence {sequence} (animation id {})", s.id))
+            .unwrap_or_else(|| format!("sequence {sequence} (absent)"));
+        (m2::Model::pose_bones(&animated, sequence, 0), name)
+    });
 
     let (min, max) = model.bounding_box();
     println!("{path}");
@@ -3788,15 +4158,61 @@ fn m2_attachments(chain: &mut Chain, path: &str) -> Result<()> {
         max[1],
         max[2]
     );
-    println!(
-        "\n  {:>4} {:>5} {:>4}  {:>26}  {:>26}  {:>7}",
-        "id", "bone", "key", "attachment offset", "bone pivot", "apart"
-    );
+    match &posed {
+        Some((_, name)) => {
+            println!("  posed with {name}\n");
+            println!(
+                "  {:>4} {:>5}  {:>26}  {:>26}  {:>7}",
+                "id", "bone", "bind position", "posed position", "turned"
+            );
+        }
+        None => println!(
+            "\n  {:>4} {:>5} {:>4}  {:>26}  {:>26}  {:>7}",
+            "id", "bone", "key", "attachment offset", "bone pivot", "apart"
+        ),
+    }
     for a in &attachments {
         let (key, pivot) = match bones.get(a.bone as usize) {
             Some(b) => (b.key_bone_id.to_string(), b.pivot),
             None => ("-".to_string(), [f32::NAN; 3]),
         };
+        if let Some((pose, _)) = &posed {
+            let matrix = pose
+                .get(a.bone as usize)
+                .copied()
+                .unwrap_or(glam::Mat4::IDENTITY);
+            let at = matrix.transform_point3(glam::Vec3::from(a.position));
+            // How far the bone is turned, as an angle. The rotation is what
+            // decides the pose of whatever hangs here; the translation only
+            // decides where.
+            let (_, rotation, _) = matrix.to_scale_rotation_translation();
+            let turned = rotation.to_axis_angle().1.to_degrees();
+            // Where a weapon hung here would *point*. An item model runs along
+            // its own +X (a claymore's blade spans 1.81 units of it), so the
+            // bone's rotated +X is the blade direction -- and that is the
+            // constraint that separates a resting place from a grip. A stowed
+            // sword lies up and back across the spine; a held one points
+            // forward out of the fist.
+            let blade = (matrix.transform_point3(glam::Vec3::X)
+                - matrix.transform_point3(glam::Vec3::ZERO))
+            .normalize_or_zero();
+            println!(
+                "  {:>4} {:>5}  {:>8.3} {:>8.3} {:>8.3}  {:>8.3} {:>8.3} {:>8.3}  \
+                 {turned:>6.1}deg  blade {:>6.2} {:>6.2} {:>6.2}",
+                a.id,
+                a.bone,
+                a.position[0],
+                a.position[1],
+                a.position[2],
+                at.x,
+                at.y,
+                at.z,
+                blade.x,
+                blade.y,
+                blade.z,
+            );
+            continue;
+        }
         let apart = (0..3)
             .map(|i| (a.position[i] - pivot[i]).powi(2))
             .sum::<f32>()
@@ -4153,6 +4569,10 @@ fn m2_survey(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> R
         .collect();
 
     let mut failures: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    // Tallied because the blend enum is a *shared* mapping: changing what one
+    // value means changes every model that uses it, and the population is the
+    // only thing that says how many that is.
+    let mut blends: BTreeMap<u16, usize> = BTreeMap::new();
     let (mut models, mut skins, mut verts, mut tris) = (0usize, 0usize, 0u64, 0u64);
     let (mut no_skin, mut max_verts, mut max_bones) = (0usize, 0usize, 0usize);
     let mut unresolved = 0usize;
@@ -4180,6 +4600,9 @@ fn m2_survey(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> R
         verts += model.vertex_count() as u64;
         max_verts = max_verts.max(model.vertex_count());
         max_bones = max_bones.max(model.bones().len());
+        for material in model.materials() {
+            *blends.entry(material.blend).or_insert(0usize) += 1;
+        }
 
         let mut found_any = false;
         for lod in 0..model.skin_count().min(4) {
@@ -4214,6 +4637,15 @@ fn m2_survey(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> R
     println!("  largest model: {max_verts} vertices, {max_bones} bones");
     println!("  {no_skin} models had no readable skin");
     println!("  {unresolved} listed paths did not resolve (tombstoned or stale)");
+    let total: usize = blends.values().sum();
+    println!("
+  material blend modes across {total} materials:");
+    for (blend, count) in &blends {
+        println!(
+            "    {blend:>3}: {count:>8}  ({:.1}%)",
+            100.0 * *count as f32 / total.max(1) as f32
+        );
+    }
     if failures.is_empty() {
         println!("\nno failures");
     } else {

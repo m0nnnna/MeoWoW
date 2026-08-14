@@ -975,6 +975,18 @@ pub mod fields {
     pub const UNIT_DISPLAY_ID: u16 = 0x43;
     pub const UNIT_NATIVE_DISPLAY_ID: u16 = 0x44;
 
+    /// Four packed bytes; byte 0 is the sheath state -- see
+    /// [`crate::combat::SheathState`].
+    ///
+    /// Located by arithmetic that was checked against fields already confirmed
+    /// here rather than taken on trust: the index is `OBJECT_END + 0x74` with
+    /// `OBJECT_END = 6`, and the same expression gives `0x36` for the level and
+    /// `0x3B` for the unit flags, both of which this client already reads and
+    /// both of which matched a live character (level 5, and the in-combat bit
+    /// appearing exactly when a fight started). Then confirmed directly, by
+    /// sending each sheath state and watching byte 0 follow.
+    pub const UNIT_BYTES_2: u16 = 0x7A;
+
     /// Which model a game object wears -- a row in `GameObjectDisplayInfo`,
     /// which is a different table from the one units use.
     ///

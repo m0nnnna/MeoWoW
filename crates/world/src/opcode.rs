@@ -49,6 +49,20 @@ pub enum ClientOpcode {
     AttackSwing = 0x0141,
     AttackStop = 0x0142,
 
+    /// Draw or stow the weapon: one `u32` naming a [`crate::SheathState`].
+    ///
+    /// **Sheathing is a client-side decision, and this is the surprise.** A
+    /// whole fight was driven against the realm -- selection, swings landing
+    /// both ways, the in-combat flag appearing in `UNIT_FLAGS` -- and byte 0
+    /// of `UNIT_FIELD_BYTES_2` never moved off zero. The server does not draw
+    /// a weapon for you and never will; it only records what the client says
+    /// here and republishes it so *other* players see it.
+    ///
+    /// Confirmed the way `AttackSwing` was, by varying the input rather than
+    /// waiting for a reply: nothing acknowledges this, but sending each state
+    /// in turn moves that byte to the matching value and back.
+    SetSheathed = 0x01E0,
+
     /// Release the spirit: give up the body and become a ghost at the nearest
     /// graveyard. Carries one byte the server reads and discards.
     ///
