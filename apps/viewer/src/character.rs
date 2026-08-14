@@ -18,7 +18,7 @@
 //! client that draws them all puts every haircut on one head at once -- which
 //! is what a screenshot of this viewer showed before this module existed.
 
-use dbc::schema::{CharHairGeosets, CharSections, CharacterFacialHairStyles};
+use dbc::schema::{CharHairGeosets, CharSections, CharacterFacialHairStyles, ItemDisplayInfo};
 use mpq::Chain;
 
 /// The five choices that describe a character, plus who they are.
@@ -114,6 +114,27 @@ pub struct Look {
     /// Without this, taking a glove off would leave the hand missing rather
     /// than bare.
     pub decided_groups: Vec<u32>,
+    /// Separate models this character carries, hung off the skeleton.
+    ///
+    /// Lives on the look rather than beside it because a look is exactly what
+    /// the renderer caches equipment-aware geometry by -- [`look_key`] already
+    /// folds the equipment in, so two characters in different weapons already
+    /// cannot share a cache entry. Everything else here paints the character's
+    /// own mesh; this is the one part that is a mesh of its own.
+    pub held: Vec<HeldItem>,
+}
+
+/// One model a character carries, and where on the skeleton it hangs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldItem {
+    /// Full archive path of the geometry, with `.mdx` already rewritten.
+    pub model: String,
+    /// The item's own skin, as the bare name `ItemDisplayInfo` stores. Resolved
+    /// against the model's directory by the loader, the same way a creature's
+    /// texture variation is.
+    pub texture: String,
+    /// Which [`m2::Attachment`] id on the *wielder* this hangs from.
+    pub attachment: u32,
 }
 
 impl Look {
@@ -190,6 +211,49 @@ fn geoset_rule(inventory_type: u8) -> Option<(u32, usize)> {
         10 => (4, 0),
         16 => (15, 0),
         20 => (13, 0),
+        _ => return None,
+    })
+}
+
+/// Which folder an item's geometry lives in, and which hand it goes in.
+///
+/// **Measured, not transcribed** -- `wow-cli item held` joins all 46,096 rows
+/// of `Item.dbc` to `ItemDisplayInfo` and asks which slots name geometry at
+/// all, then resolves those names against every `Item\ObjectComponents`
+/// folder. The held slots separate from the painted ones completely: each of
+/// the types below fills its model column for 99.2% or more of its items and
+/// resolves in exactly one folder, while a chest or a belt manages under 2%.
+///
+/// | type | items | names a model | folder |
+/// |---|---|---|---|
+/// | one-hand | 13 | 99.8% | Weapon |
+/// | two-hand | 17 | 100% | Weapon |
+/// | main hand | 21 | 100% | Weapon |
+/// | off hand | 22 | 100% | Weapon |
+/// | holdable | 23 | 99.2% | Weapon |
+/// | shield | 14 | 100% | Shield |
+///
+/// **The column is `model_left` for every one of them, and that does not mean
+/// the left hand.** The pair is really "first model, second model", and only a
+/// genuinely paired item fills both: shoulders (type 3) put `LShoulder_...` in
+/// one and `RShoulder_...` in the other, which is what proves the column names
+/// themselves are right. A sword is a single model, so it sits in the first
+/// column and goes in whichever hand its *slot* names. Reading the column as
+/// the hand would put every weapon in the game in the wrong one.
+///
+/// **Bows, guns, thrown weapons and shoulders are deliberately absent.** Their
+/// data resolves perfectly well -- ranged weapons are 100% in `Weapon`, and
+/// shoulders 98.6% in `Shoulder` -- but this table's second column is a claim
+/// about *which attachment point*, and that has been confirmed for the two
+/// hands and nothing else. A shoulder needs the two shoulder attachments and a
+/// bow is held differently again; guessing would put a rifle through a
+/// character's palm, which renders plausibly and is never an error. Same
+/// reasoning, and the same precedent, as [`geoset_rule`] leaving out belts.
+fn held_rule(inventory_type: u8) -> Option<(&'static str, u32)> {
+    Some(match inventory_type {
+        13 | 17 | 21 => ("Weapon", m2::Attachment::HAND_RIGHT),
+        22 | 23 => ("Weapon", m2::Attachment::HAND_LEFT),
+        14 => ("Shield", m2::Attachment::HAND_LEFT),
         _ => return None,
     })
 }
@@ -339,12 +403,33 @@ pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[(u32, u
         .ok()
         .and_then(|bytes| CharacterFacialHairStyles::parse(&bytes).ok());
 
+    // Read once and shared. `dress` needs it to paint and `held_items` needs it
+    // to find geometry, and it is 58,000 rows -- the same table that taught this
+    // project to measure a suspected cost rather than reason about it.
+    let items = equipment
+        .iter()
+        .any(|(display_id, _)| *display_id != 0)
+        .then(|| {
+            chain
+                .read(ItemDisplayInfo::PATH)
+                .ok()
+                .and_then(|bytes| ItemDisplayInfo::parse(&bytes).ok())
+        })
+        .flatten();
+    if items.is_none() && equipment.iter().any(|(id, _)| *id != 0) {
+        tracing::warn!("no ItemDisplayInfo: equipment will not be drawn");
+    }
+    let held = items
+        .as_ref()
+        .map(|table| held_items(table, equipment))
+        .unwrap_or_default();
+
     let (mut body, mut skin) = (None, None);
     let (mut equipped, mut decided) = (Vec::new(), Vec::new());
     if let Some(sections) = &sections {
         skin = compose(chain, sections, look);
-        if let Some(skin) = skin.as_mut() {
-            let (worn, groups) = dress(chain, skin, look, equipment);
+        if let (Some(skin), Some(items)) = (skin.as_mut(), items.as_ref()) {
+            let (worn, groups) = dress(chain, skin, look, equipment, items);
             equipped = worn;
             decided = groups;
         }
@@ -370,7 +455,59 @@ pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[(u32, u
         hair,
         geosets: geosets.into_iter().chain(equipped).collect(),
         decided_groups: decided,
+        held,
     }
+}
+
+/// Resolves the equipment that hangs off the skeleton rather than painting it.
+///
+/// Separate from [`dress`] and not gated on the composed skin, deliberately: a
+/// character whose body texture failed to compose still holds its sword, and
+/// tying the two together would make one failure hide the other.
+fn held_items(
+    table: &dbc::schema::ItemDisplayInfo,
+    equipment: &[(u32, u8)],
+) -> Vec<HeldItem> {
+    let mut held = Vec::new();
+    for (display_id, inventory_type) in equipment.iter().filter(|(id, _)| *id != 0) {
+        let Some((folder, attachment)) = held_rule(*inventory_type) else {
+            continue;
+        };
+        let Some(row) = table.iter().find(|row| row.id() == *display_id) else {
+            // Worth a line for the same reason `dress` logs it: the item exists
+            // and this client cannot say what it looks like, which is not the
+            // same as holding nothing.
+            tracing::debug!("no ItemDisplayInfo row for held display {display_id}");
+            continue;
+        };
+        // The first column, whichever hand the slot named -- see `held_rule`.
+        let model = row.model_left();
+        if model.is_empty() {
+            continue;
+        }
+        held.push(HeldItem {
+            model: format!(
+                r"Item\ObjectComponents\{folder}\{}",
+                m2::model_path(model)
+            ),
+            texture: row.model_texture_left().to_string(),
+            attachment,
+        });
+    }
+    // The paths, not the count. A held item that resolves to the wrong file and
+    // one that resolves to no file both end as a character with empty hands,
+    // and only the name says which -- the same reason this project logs the
+    // body of a packet it refuses rather than its length.
+    if !held.is_empty() {
+        tracing::info!(
+            "holding {}",
+            held.iter()
+                .map(|h| format!("{} on attachment {}", h.model, h.attachment))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    held
 }
 
 /// The hair texture and the geosets to draw, from tables already read.
@@ -589,6 +726,13 @@ impl NpcAppearances {
             hair,
             geosets: geosets.into_iter().chain(worn).collect(),
             decided_groups: decided,
+            // Empty, and not for want of data: `NPC_ITEM_SLOTS` carries no
+            // weapon slot at all. `CreatureDisplayInfoExtra`'s eleven columns
+            // are the eleven that paint the *body*, which was established by
+            // measuring what each column's items paint -- so a guard's sword is
+            // simply not in this table, and inventing a twelfth column to hold
+            // it would be worse than a guard with empty hands.
+            held: Vec::new(),
         })
     }
 }
@@ -666,9 +810,8 @@ fn dress(
     skin: &mut Skin,
     look: Appearance,
     equipment: &[(u32, u8)],
+    table: &dbc::schema::ItemDisplayInfo,
 ) -> (Vec<u32>, Vec<u32>) {
-    use dbc::schema::ItemDisplayInfo;
-
     // `display` alone shadows a `tracing` helper of that name inside its
     // macros, so the binding is spelled out.
     let (mut geosets, mut decided) = (Vec::new(), Vec::new());
@@ -676,14 +819,6 @@ fn dress(
         return (geosets, decided);
     }
     let started = std::time::Instant::now();
-    let Some(table) = chain
-        .read(ItemDisplayInfo::PATH)
-        .ok()
-        .and_then(|bytes| ItemDisplayInfo::parse(&bytes).ok())
-    else {
-        tracing::warn!("no ItemDisplayInfo: equipment will not be drawn");
-        return (geosets, decided);
-    };
 
     let mut worn = 0;
     for (display_id, inventory_type) in equipment.iter().filter(|(id, _)| *id != 0) {
@@ -925,6 +1060,111 @@ mod tests {
         .map(|(name, _)| name)
         .collect();
         assert_eq!(narrow, ["hand", "torso lower", "foot"]);
+    }
+
+    /// The hands, and the slots that must *not* be confused with them.
+    ///
+    /// Asserting only that a sword lands in the right hand would pass just as
+    /// well under the wrong rule, because nearly every held slot goes there.
+    /// What separates a correct rule from a plausible one is the other half:
+    /// the off-hand slots go to the *other* hand, and the slots that merely
+    /// paint the skin -- chest, legs, boots -- hang nothing at all, even though
+    /// a handful of their items do name a model. Same shape as the auto-attack
+    /// filter, which had to prove the junk beside it was still refused.
+    #[test]
+    fn held_slots_choose_a_hand_and_the_painted_ones_choose_neither() {
+        for slot in [13, 17, 21] {
+            assert_eq!(
+                held_rule(slot),
+                Some(("Weapon", m2::Attachment::HAND_RIGHT)),
+                "inventory type {slot} should be a right-hand weapon"
+            );
+        }
+        assert_eq!(held_rule(22), Some(("Weapon", m2::Attachment::HAND_LEFT)));
+        assert_eq!(held_rule(23), Some(("Weapon", m2::Attachment::HAND_LEFT)));
+        assert_eq!(held_rule(14), Some(("Shield", m2::Attachment::HAND_LEFT)));
+
+        // Painted, not held. Types 4/5 (shirt, chest), 7 (legs), 8 (feet),
+        // 10 (hands) and 16 (back) all appear in `geoset_rule` or paint a
+        // texture component, and a few of their items do fill a model column --
+        // 16% of gloves do. None of them may put geometry in a hand.
+        for slot in [1, 3, 4, 5, 6, 7, 8, 9, 10, 16, 19, 20] {
+            assert_eq!(held_rule(slot), None, "inventory type {slot} is not held");
+        }
+        // Ranged and thrown are held in the real game and deliberately are not
+        // here: which attachment they use has not been confirmed. See
+        // `held_rule` -- this asserts the omission is a decision, not a gap
+        // somebody closes by guessing.
+        for slot in [15, 25, 26] {
+            assert_eq!(
+                held_rule(slot),
+                None,
+                "inventory type {slot} is deliberately unhandled"
+            );
+        }
+    }
+
+    /// A real equipped weapon resolves to a file that actually reads.
+    ///
+    /// The folder and the `.mdx` rename are both rules this client applies to a
+    /// name it did not choose, and both fail the same silent way: a path that
+    /// does not resolve is a character with empty hands, which looks exactly
+    /// like the feature not being finished. Display 2380 is what `Testwolf` is
+    /// carrying on the test realm -- a two-handed claymore, inventory type 17.
+    ///
+    /// Skipped without `WOW_DATA`, like every other test here that needs the
+    /// archives.
+    #[test]
+    fn an_equipped_weapon_resolves_to_a_readable_model() {
+        let Some(data) = std::env::var_os("WOW_DATA") else {
+            eprintln!("skipping: WOW_DATA not set");
+            return;
+        };
+        let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
+        let table = ItemDisplayInfo::parse(&chain.read(ItemDisplayInfo::PATH).unwrap()).unwrap();
+
+        let held = held_items(&table, &[(2380, 17)]);
+        assert_eq!(held.len(), 1, "the claymore was not resolved");
+        assert_eq!(held[0].attachment, m2::Attachment::HAND_RIGHT);
+        assert!(
+            held[0].model.ends_with(".m2"),
+            "{} was not rewritten from .mdx",
+            held[0].model
+        );
+        let bytes = chain
+            .read(&held[0].model)
+            .unwrap_or_else(|e| panic!("{}: {e}", held[0].model));
+        let model = m2::Model::parse(&bytes).expect("parsing the weapon");
+        assert!(model.vertex_count() > 0);
+
+        // The texture is a bare name resolved against the model's directory by
+        // the loader; check the file it will look for is really there, because
+        // a miss here is a grey sword rather than an error.
+        let directory = held[0].model.rsplit_once('\\').unwrap().0;
+        let texture = format!("{directory}\\{}.blp", held[0].texture);
+        assert!(chain.read(&texture).is_ok(), "{texture} does not resolve");
+
+        // And the hand it is going into exists on the model that will hold it.
+        let human = m2::Model::parse(
+            &chain
+                .read(r"Character\Human\Male\HumanMale.m2")
+                .expect("human male"),
+        )
+        .expect("parsing the wielder");
+        assert!(
+            human.attachment(held[0].attachment).is_some(),
+            "the wielder has no right hand to hold it with"
+        );
+    }
+
+    /// The two hands must be different attachment points.
+    ///
+    /// Trivial to state and exactly the mistake that a copy-paste in
+    /// `held_rule` would make -- and one that draws a shield and a sword in the
+    /// same fist, which reads as "the shield is not being drawn".
+    #[test]
+    fn the_two_hands_are_not_the_same_point() {
+        assert_ne!(m2::Attachment::HAND_LEFT, m2::Attachment::HAND_RIGHT);
     }
 
     /// A group the gear decided shows only what the gear named -- but a group

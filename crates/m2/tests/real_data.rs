@@ -189,6 +189,111 @@ fn every_creature_model_path_resolves() {
 
 /// Broad structural sweep. `wow-cli m2 survey` covers all 22k; this samples so
 /// the suite stays quick.
+/// The attachment stride, checked by a property the format guarantees rather
+/// than by the byte count.
+///
+/// A wrong stride still parses: it reads an id out of the middle of a float and
+/// a bone index out of its low half. What it cannot do is keep producing bone
+/// indices that are in range, land those bones' pivots exactly on the positions
+/// it reads, and do it on every playable race at once.
+#[test]
+fn attachments_land_on_the_bones_they_name() {
+    let mut chain = require_data!();
+    let races = [
+        r"Character\Human\Male\HumanMale.m2",
+        r"Character\Orc\Male\OrcMale.m2",
+        r"Character\NightElf\Female\NightElfFemale.m2",
+        r"Character\Dwarf\Male\DwarfMale.m2",
+        r"Character\Tauren\Female\TaurenFemale.m2",
+    ];
+
+    for path in races {
+        let model = load(&mut chain, path);
+        let bones = model.bones();
+        let attachments = model.attachments();
+        assert!(
+            attachments.len() > 20,
+            "{path}: only {} attachments",
+            attachments.len()
+        );
+
+        for a in &attachments {
+            let bone = bones
+                .get(a.bone as usize)
+                .unwrap_or_else(|| panic!("{path}: attachment {} names bone {}", a.id, a.bone));
+            // Model space, not a delta from the bone -- see `Attachment`.
+            for axis in 0..3 {
+                assert!(
+                    (a.position[axis] - bone.pivot[axis]).abs() < 1e-3,
+                    "{path}: attachment {} at {:?} but bone {} pivots at {:?}",
+                    a.id,
+                    a.position,
+                    a.bone,
+                    bone.pivot
+                );
+            }
+        }
+    }
+}
+
+/// The hands are a mirrored pair, and the right one is on -Y.
+///
+/// This is the fact the renderer hangs a weapon on, and it is worth asserting
+/// separately from the stride: a client that puts every sword in the wrong hand
+/// is wrong in a way no parse error will ever report. The sign convention comes
+/// from the renderer's live-confirmed "an M2's forward is +X" -- drawn Z-up and
+/// right-handed, the model's left is +Y.
+#[test]
+fn hand_attachments_mirror_across_the_body() {
+    let mut chain = require_data!();
+    let races = [
+        r"Character\Human\Male\HumanMale.m2",
+        r"Character\Orc\Male\OrcMale.m2",
+        r"Character\NightElf\Female\NightElfFemale.m2",
+        r"Character\Dwarf\Male\DwarfMale.m2",
+        r"Character\Tauren\Female\TaurenFemale.m2",
+    ];
+
+    for path in races {
+        let model = load(&mut chain, path);
+        let right = model
+            .attachment(m2::Attachment::HAND_RIGHT)
+            .unwrap_or_else(|| panic!("{path}: no right hand"));
+        let left = model
+            .attachment(m2::Attachment::HAND_LEFT)
+            .unwrap_or_else(|| panic!("{path}: no left hand"));
+
+        assert!(
+            right.position[1] < -0.05,
+            "{path}: right hand at {:?} is not on -Y",
+            right.position
+        );
+        assert!(
+            left.position[1] > 0.05,
+            "{path}: left hand at {:?} is not on +Y",
+            left.position
+        );
+        // Mirrored: the same point on either side of the plane of symmetry.
+        assert!(
+            (right.position[1] + left.position[1]).abs() < 0.05,
+            "{path}: hands are not mirrored: {:?} and {:?}",
+            right.position,
+            left.position
+        );
+        // Looser than the Y check on purpose. The plane of symmetry is exact,
+        // but the bind pose is hand-authored and need not be: the female tauren
+        // rests one arm 6cm lower than the other. A stride error misses by
+        // metres, so this still separates the two.
+        assert!(
+            (right.position[2] - left.position[2]).abs() < 0.15,
+            "{path}: hands are at different heights: {:?} and {:?}",
+            right.position,
+            left.position
+        );
+        assert_ne!(right.bone, left.bone, "{path}: both hands on one bone");
+    }
+}
+
 #[test]
 fn sampled_models_parse_and_validate() {
     let mut chain = require_data!();

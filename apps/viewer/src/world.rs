@@ -47,6 +47,9 @@ pub struct CachedModel {
     /// this costs them nothing and keeps one loader path instead of two.
     pub bones: Vec<m2::AnimatedBone>,
     pub sequences: Vec<m2::Sequence>,
+    /// Where things this model carries hang from. Empty for everything that
+    /// carries nothing, which is nearly everything.
+    pub attachments: Vec<m2::Attachment>,
     /// The model's own extent, in its local space. Carried so a replicated
     /// entity can be clicked on: a click needs a volume to test a ray against,
     /// and the model already knows how big it is. `None` for a WMO, which is
@@ -72,6 +75,37 @@ pub struct Group {
     /// tile-owned group (doodads and buildings never animate) and when the
     /// model has no matching sequence to play.
     pub animation: Option<(u32, Motion)>,
+    /// Set only when this group *is* an item held by another group, in which
+    /// case its instance transforms are recomputed every frame from the
+    /// wielder's pose. See [`Held`].
+    pub held: Option<Held>,
+}
+
+/// A group that hangs off another group's skeleton.
+///
+/// Modelled as an ordinary [`Group`] rather than as something the wielder owns,
+/// so the draw loop needs no knowledge of it at all: a sword is a mesh with
+/// transforms like any other, and the only thing that makes it held is *where
+/// those transforms come from*. Its own [`Group::animation`] stays `None` --
+/// a weapon's skeleton is rigid and draws in its bind pose against the scene's
+/// identity palette; the movement all comes from the hand.
+pub struct Held {
+    /// The wielder's animation key, which is how its current pose is found.
+    /// `None` when the wielder has no cycle to play, in which case the hand
+    /// stays at its bind-pose position -- still correct, just still.
+    pub wielder: Option<(u32, Motion)>,
+    /// The wielder's own per-instance transforms, kept because the held item's
+    /// transform is this times the hand.
+    ///
+    /// A copy rather than a reference to the wielder's group: the two are
+    /// rebuilt together and the alternative is threading a lifetime through
+    /// every group in the scene to save a handful of matrices.
+    pub wielders: Vec<Mat4>,
+    /// Bone in the *wielder's* skeleton that the item hangs from.
+    pub bone: usize,
+    /// The attachment point, in the wielder's model space. A point, not an
+    /// offset -- see [`m2::Attachment`].
+    pub offset: Vec3,
 }
 
 pub struct Tile {
@@ -243,6 +277,13 @@ pub struct World {
     /// Keyed by display *and* look: two players of one race share a display
     /// id and not a face. Zero is the undressed key every creature uses.
     entity_cache: HashMap<(u32, u64), Option<Rc<CachedModel>>>,
+    /// Weapons and shields, keyed by path *and* texture.
+    ///
+    /// The texture has to be in the key: `Sword_1H_Short_A_02` is one file and
+    /// the two items that use it -- a rusty one and a green one -- differ only
+    /// in the skin the display row names. Keying by path alone would give the
+    /// second character the first one's blade.
+    held_cache: HashMap<(String, String), Option<Rc<CachedModel>>>,
     /// Tables for dressing humanoid NPCs, read on first use rather than at
     /// construction: a scene with no replicated entities in it never needs
     /// them, and they are several megabytes of DBC.
@@ -277,6 +318,21 @@ pub struct World {
     pub stats: Stats,
 }
 
+/// Where a held item is drawn: the wielder's placement, through the hand, at
+/// the attachment point.
+///
+/// A free function because the composition is the whole feature and the order
+/// of it is the part that is easy to get wrong in a way nothing reports.
+/// `offset` is a **point in the wielder's model space, not a delta from the
+/// bone** -- an M2 attachment stores the same coordinate as the bone's own
+/// pivot, and a bone matrix is built pivot-relative so the bind pose is the
+/// identity. Adding the offset to the hand's translation instead of placing it
+/// *through* the hand counts the pivot twice, which puts the sword out at
+/// arm's length from the fist and looks like a model with a bad origin.
+fn held_transform(wielder: Mat4, hand: Mat4, offset: Vec3) -> Mat4 {
+    wielder * hand * Mat4::from_translation(offset)
+}
+
 /// Which tile a world position sits on.
 ///
 /// Inverts the tile grid: a tile's origin is at `(32 - tile_y) * TILE_SIZE` on
@@ -307,6 +363,7 @@ impl World {
             max_doodads,
             cache: HashMap::new(),
             entity_cache: HashMap::new(),
+            held_cache: HashMap::new(),
             npc_looks: None,
             npc_looks_tried: false,
             game_objects: None,
@@ -511,6 +568,7 @@ impl World {
                 instances: InstanceBuffer::upload(gpu, &raw),
                 count: raw.len() as u32,
                 animation: None,
+                held: None,
             });
         }
 
@@ -551,14 +609,47 @@ impl World {
             return cached.clone();
         }
 
+        let entry = self.build(gpu, meshes, chain, path, &crate::model::Variations::default());
+        if entry.is_none() {
+            tracing::debug!("could not load {path}");
+        }
+        self.cache.insert(path.to_string(), entry.clone());
+        entry
+    }
+
+    /// Loads a path into a `CachedModel`, without consulting or filling a cache.
+    ///
+    /// Shared by the tile loader and the held-item loader, which want the same
+    /// work under different keys: a doodad is identified by its path alone,
+    /// while a sword and the same sword in a different finish are one path and
+    /// two textures.
+    fn build(
+        &self,
+        gpu: &Gpu,
+        meshes: &MeshRenderer,
+        chain: &mut Chain,
+        path: &str,
+        variations: &crate::model::Variations,
+    ) -> Option<Rc<CachedModel>> {
         let lower = path.to_lowercase();
         let built = if lower.ends_with(".wmo") {
-            // No skeleton to speak of, so nothing to animate.
+            // No skeleton to speak of, so nothing to animate and nothing to
+            // hang off it.
             crate::world_object::load(gpu, chain, path, None)
-                .map(|w| (w.mesh, w.draws, w.textures, Vec::new(), Vec::new(), None))
+                .map(|w| {
+                    (
+                        w.mesh,
+                        w.draws,
+                        w.textures,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    )
+                })
                 .ok()
         } else {
-            crate::model::load(gpu, chain, path, &crate::model::Variations::default(), 0)
+            crate::model::load(gpu, chain, path, variations, 0)
                 .map(|m| {
                     (
                         m.mesh,
@@ -566,32 +657,31 @@ impl World {
                         m.textures,
                         m.bones,
                         m.sequences,
+                        m.attachments,
                         Some((m.min, m.max)),
                     )
                 })
                 .ok()
         };
 
-        let entry = built.map(|(mesh, draws, textures, bones, sequences, bounds)| {
-            let binds = textures
-                .iter()
-                .map(|t| meshes.material_bind_group(gpu, &t.view))
-                .collect();
-            Rc::new(CachedModel {
-                mesh,
-                draws,
-                binds,
-                bones,
-                sequences,
-                bounds,
-                textures,
-            })
-        });
-        if entry.is_none() {
-            tracing::debug!("could not load {path}");
-        }
-        self.cache.insert(path.to_string(), entry.clone());
-        entry
+        built.map(
+            |(mesh, draws, textures, bones, sequences, attachments, bounds)| {
+                let binds = textures
+                    .iter()
+                    .map(|t| meshes.material_bind_group(gpu, &t.view))
+                    .collect();
+                Rc::new(CachedModel {
+                    mesh,
+                    draws,
+                    binds,
+                    bones,
+                    sequences,
+                    attachments,
+                    bounds,
+                    textures,
+                })
+            },
+        )
     }
 
     pub fn tiles(&self) -> impl Iterator<Item = &Tile> {
@@ -750,11 +840,84 @@ impl World {
                 wanted_bones.insert(key);
             }
 
+            // Whatever this group is carrying, as groups of its own. Built here
+            // rather than in the draw loop because a held item is an ordinary
+            // group in every respect except where its transforms come from --
+            // see `Held`.
+            for item in look.iter().flat_map(|look| look.held.iter()) {
+                let Some(attachment) = model
+                    .attachments
+                    .iter()
+                    .find(|a| a.id == item.attachment)
+                    .copied()
+                else {
+                    // A model that has no such attachment point cannot hold the
+                    // item, and drawing it at the model's origin instead would
+                    // put a sword through the character's feet. Named, because
+                    // "this race has no right hand" is a real finding.
+                    tracing::debug!(
+                        "display {display_id} has no attachment {} for {}",
+                        item.attachment,
+                        item.model
+                    );
+                    continue;
+                };
+                let Some(held_model) = self.held_model(gpu, meshes, chain, item) else {
+                    // Deliberately not counted as an undrawable *object*: the
+                    // wielder is on screen and the count exists to say how much
+                    // of the world is missing.
+                    tracing::warn!("{} could not be loaded", item.model);
+                    continue;
+                };
+                meshes.prepare(gpu, held_model.draws.iter().map(|d| d.state));
+                // Trace, not debug: this runs on every rebuild, several times a
+                // second, and at debug it buried a session's log in nineteen
+                // megabytes of the same line. What is worth saying once --
+                // which item resolved to which file -- is said at login by
+                // `character::held_items`.
+                tracing::trace!(
+                    "display {display_id} holds {} on bone {} at {:?} ({} draw(s), {} instance(s))",
+                    item.model,
+                    attachment.bone,
+                    attachment.position,
+                    held_model.draws.len(),
+                    transforms.len(),
+                );
+                // Seeded with the bind-pose answer rather than with zeroes.
+                // `update_animations` overwrites this before the frame is
+                // drawn, but a buffer that must be written before it is read
+                // should still start as something *visible*: a zero matrix
+                // collapses a model to the origin in complete silence, which
+                // this project has already lost a whole feature to once.
+                let bind_pose: Vec<Instance> = transforms
+                    .iter()
+                    .map(|t| {
+                        Instance::from_cols_array_2d(
+                            (*t * Mat4::from_translation(Vec3::from(attachment.position)))
+                                .to_cols_array_2d(),
+                        )
+                    })
+                    .collect();
+                built.push(Group {
+                    model: held_model,
+                    instances: InstanceBuffer::upload(gpu, &bind_pose),
+                    count: raw.len() as u32,
+                    animation: None,
+                    held: Some(Held {
+                        wielder: animation,
+                        wielders: transforms.clone(),
+                        bone: attachment.bone as usize,
+                        offset: Vec3::from(attachment.position),
+                    }),
+                });
+            }
+
             built.push(Group {
                 model,
                 instances: InstanceBuffer::upload(gpu, &raw),
                 count: raw.len() as u32,
                 animation,
+                held: None,
             });
         }
         // Drop bone buffers for creatures that changed bucket or left view,
@@ -776,6 +939,13 @@ impl World {
     /// predicted -- since it only ever advanced a few times a second instead
     /// of once per frame.
     pub fn update_animations(&self, gpu: &Gpu, meshes: &MeshRenderer) {
+        // Poses are kept rather than discarded because a second consumer needs
+        // the same matrices: an item in a hand is placed by the very bone the
+        // wielder was posed with. Recomputing it separately would be the
+        // opposite of the rule that says two things which must agree exactly
+        // should be derived from one source -- and a hand that disagreed with
+        // its own model by a frame is a sword that trails behind the arm.
+        let mut poses: HashMap<(u32, Motion), Vec<Mat4>> = HashMap::new();
         for group in &self.entities {
             let Some((display_id, motion)) = group.animation else {
                 continue;
@@ -822,11 +992,46 @@ impl World {
             } else {
                 now_ms % duration
             };
-            let pose: Vec<[[f32; 4]; 4]> = m2::Model::pose_bones(&group.model.bones, sequence, time_ms)
-                .iter()
-                .map(|m| m.to_cols_array_2d())
-                .collect();
+            let posed = m2::Model::pose_bones(&group.model.bones, sequence, time_ms);
+            let pose: Vec<[[f32; 4]; 4]> = posed.iter().map(|m| m.to_cols_array_2d()).collect();
             meshes.update_bones(gpu, bones, &pose);
+            poses.insert((display_id, motion), posed);
+        }
+
+        // Then everything hanging off those poses. A held item's transform is
+        // the wielder's own instance transform times the hand's animated
+        // matrix, so it has to be rewritten every frame for the same reason the
+        // pose does -- a weapon updated at the rebuild rate visibly lags the
+        // arm holding it.
+        for group in &self.entities {
+            let Some(held) = &group.held else { continue };
+            // No pose means the wielder had no cycle to play. Its bones are
+            // identity, so the hand is at its bind-pose position and the item
+            // belongs there -- still, but in the right place.
+            let hand = held
+                .wielder
+                .and_then(|key| poses.get(&key))
+                .and_then(|pose| pose.get(held.bone))
+                .copied()
+                .unwrap_or(Mat4::IDENTITY);
+            let instances: Vec<Instance> = held
+                .wielders
+                .iter()
+                .map(|t| {
+                    Instance::from_cols_array_2d(
+                        held_transform(*t, hand, held.offset).to_cols_array_2d(),
+                    )
+                })
+                .collect();
+            if let Some(first) = held.wielders.first() {
+                tracing::trace!(
+                    "held item at {:?} (wielder at {:?}, posed: {})",
+                    held_transform(*first, hand, held.offset).transform_point3(Vec3::ZERO),
+                    first.transform_point3(Vec3::ZERO),
+                    held.wielder.is_some_and(|key| poses.contains_key(&key)),
+                );
+            }
+            group.instances.write(gpu, &instances);
         }
     }
 
@@ -834,6 +1039,30 @@ impl World {
     /// gave it one this rebuild.
     pub fn entity_bone_buffer(&self, key: (u32, Motion)) -> Option<&BoneBuffer> {
         self.entity_bones.get(&key)
+    }
+
+    /// Loads a weapon or shield, with the skin its item display names.
+    ///
+    /// The texture arrives as a bare name -- `Sword_1H_Short_A_02Rusty` -- and
+    /// is resolved against the model's own directory by the same
+    /// [`crate::model::Variations`] path a creature's skin takes. That is not a
+    /// coincidence worth hiding: a weapon leaves its texture slot to be filled
+    /// at runtime exactly as a creature does, and the loader already knew how.
+    fn held_model(
+        &mut self,
+        gpu: &Gpu,
+        meshes: &MeshRenderer,
+        chain: &mut Chain,
+        item: &crate::character::HeldItem,
+    ) -> Option<Rc<CachedModel>> {
+        let key = (item.model.clone(), item.texture.clone());
+        if let Some(cached) = self.held_cache.get(&key) {
+            return cached.clone();
+        }
+        let variations = crate::model::Variations(vec![item.texture.clone()]);
+        let entry = self.build(gpu, meshes, chain, &item.model, &variations);
+        self.held_cache.insert(key, entry.clone());
+        entry
     }
 
     /// Loads a creature model by display id, with the skins that id selects.
@@ -906,6 +1135,7 @@ impl World {
                     binds,
                     bones: loaded.bones,
                     sequences: loaded.sequences,
+                    attachments: loaded.attachments,
                     // This is the cache click-to-target reads from, so this is
                     // the one that has to carry the model's extent.
                     bounds: Some((loaded.min, loaded.max)),
@@ -1243,6 +1473,58 @@ fn sequence_for(model: &CachedModel, motion: Motion) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In the bind pose a held item lands exactly on the attachment point, in
+    /// the wielder's own frame -- turned with the wielder, not left facing
+    /// north.
+    ///
+    /// The rotation is the half that a plausible-looking wrong answer gets
+    /// wrong. `wielder.translation + offset` puts the sword in the right place
+    /// for a character facing north and beside a character facing any other
+    /// way, which on a moving player reads as the weapon orbiting them.
+    #[test]
+    fn a_held_item_sits_at_the_attachment_point_in_the_wielders_frame() {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let wielder = Mat4::from_rotation_translation(
+            glam::Quat::from_rotation_z(quarter),
+            Vec3::new(100.0, 200.0, 30.0),
+        );
+        // A right hand: forward a little, out to -Y, up at chest height.
+        let offset = Vec3::new(-0.06, -0.48, 0.90);
+
+        let placed = held_transform(wielder, Mat4::IDENTITY, offset)
+            .transform_point3(Vec3::ZERO);
+        // A quarter turn about Z takes (x, y) to (-y, x).
+        let expected = Vec3::new(100.0 + 0.48, 200.0 - 0.06, 30.9);
+        assert!(
+            (placed - expected).length() < 1e-4,
+            "held item at {placed} rather than {expected}"
+        );
+        assert!(
+            (placed - wielder.transform_point3(Vec3::ZERO)).length() > 0.5,
+            "the item was drawn at the wielder's origin, not in its hand"
+        );
+    }
+
+    /// The hand's own matrix moves the item, and moves it *with* the wielder's
+    /// placement rather than in world space.
+    ///
+    /// This is the composition order. Swap the two and a character standing a
+    /// hundred metres from the origin swings a sword that stays near the
+    /// origin -- which looks like the weapon failing to load rather than like
+    /// a matrix in the wrong order.
+    #[test]
+    fn the_hands_animation_applies_inside_the_wielders_placement() {
+        let wielder = Mat4::from_translation(Vec3::new(1000.0, 0.0, 0.0));
+        let raised = Mat4::from_translation(Vec3::new(0.0, 0.0, 1.0));
+        let offset = Vec3::new(0.0, -0.5, 1.0);
+
+        let placed = held_transform(wielder, raised, offset).transform_point3(Vec3::ZERO);
+        assert!(
+            (placed - Vec3::new(1000.0, -0.5, 2.0)).length() < 1e-4,
+            "hand motion applied outside the placement: {placed}"
+        );
+    }
 
     /// A corpse does not walk, however fast it was going a moment ago.
     ///

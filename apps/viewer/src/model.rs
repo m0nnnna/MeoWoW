@@ -30,6 +30,10 @@ pub struct LoadedModel {
     /// frame rather than baked at load.
     pub bones: Vec<m2::AnimatedBone>,
     pub sequences: Vec<m2::Sequence>,
+    /// Points other models hang from. Cheap to carry -- a character model has
+    /// thirty-nine and a tree none -- and the only way to hang a weapon on a
+    /// hand after the file has been dropped.
+    pub attachments: Vec<m2::Attachment>,
     /// Human-readable name per sequence, from `AnimationData.dbc`.
     pub sequence_names: Vec<String>,
     pub min: Vec3,
@@ -363,6 +367,7 @@ pub fn load_dressed(
         textures,
         bones,
         sequences,
+        attachments: model.attachments(),
         sequence_names,
         min,
         max,

@@ -63,6 +63,9 @@ enum Command {
     /// Inspect models.
     #[command(subcommand)]
     M2(M2Command),
+    /// Inspect items: what an equipped thing looks like and what it hangs off.
+    #[command(subcommand)]
+    Item(ItemCommand),
     /// Inspect world objects: buildings, dungeons, bridges.
     #[command(subcommand)]
     Wmo(WmoCommand),
@@ -429,6 +432,31 @@ enum M2Command {
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
+    /// List the points where other models hang off this one, with the bone
+    /// each names and where that bone sits.
+    Attachments {
+        path: String,
+        /// Report every attachment id across the whole archive set instead,
+        /// tallying how many models carry each and which side of the model
+        /// they sit on. A stride error shows up here as a flood of ids.
+        #[arg(long)]
+        survey: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ItemCommand {
+    /// Show one item display's held geometry and textures.
+    Display { display_id: u32 },
+    /// Tally which inventory slots carry held geometry, and in which hand.
+    ///
+    /// The question this answers is not "could inventory type 17 be a weapon"
+    /// but "is `model_right` filled in *because* an item is a weapon" -- a
+    /// distinction this project has paid for before. Join `Item.dbc` to
+    /// `ItemDisplayInfo` and the slots that hang a model off the skeleton
+    /// separate from the ones that only paint the skin, without transcribing
+    /// a single constant.
+    Held,
 }
 
 #[derive(Subcommand)]
@@ -628,6 +656,7 @@ fn main() -> Result<()> {
         Command::Dbc(cmd) => dbc_cmd(&mut chain, cmd),
         Command::Blp(cmd) => blp_cmd(&mut chain, cmd),
         Command::M2(cmd) => m2_cmd(&mut chain, cmd),
+        Command::Item(cmd) => item_cmd(&mut chain, cmd),
         Command::Wmo(cmd) => wmo_cmd(&mut chain, cmd),
         Command::Adt(cmd) => adt_cmd(&mut chain, cmd),
         Command::Light { map, x, y, hour } => light::report(&mut chain, map, x, y, hour),
@@ -3544,7 +3573,346 @@ fn m2_cmd(chain: &mut Chain, cmd: M2Command) -> Result<()> {
         M2Command::Survey { filter, limit } => m2_survey(chain, filter.as_deref(), limit),
         M2Command::Creature { display_id } => m2_creature(chain, display_id),
         M2Command::Anims { path, limit } => m2_anims(chain, &path, limit),
+        M2Command::Attachments { path, survey } => {
+            if survey {
+                m2_attachment_survey(chain, &path)
+            } else {
+                m2_attachments(chain, &path)
+            }
+        }
     }
+}
+
+fn item_cmd(chain: &mut Chain, cmd: ItemCommand) -> Result<()> {
+    match cmd {
+        ItemCommand::Display { display_id } => item_display(chain, display_id),
+        ItemCommand::Held => item_held(chain),
+    }
+}
+
+/// Shows what one `ItemDisplayInfo` row hangs on the character.
+fn item_display(chain: &mut Chain, display_id: u32) -> Result<()> {
+    use dbc::schema::ItemDisplayInfo;
+
+    let table = ItemDisplayInfo::parse(&chain.read(ItemDisplayInfo::PATH)?)?;
+    let row = table
+        .iter()
+        .find(|r| r.id() == display_id)
+        .with_context(|| format!("no ItemDisplayInfo row {display_id}"))?;
+
+    println!("item display {display_id}");
+    for (hand, model, texture) in [
+        ("right", row.model_right(), row.model_texture_right()),
+        ("left", row.model_left(), row.model_texture_left()),
+    ] {
+        if model.is_empty() {
+            println!("  {hand:<5}  (no geometry)");
+            continue;
+        }
+        // The DBC names `.mdx`; the archives hold `.m2`. Same rename the
+        // character loader already does.
+        let path = format!(r"Item\ObjectComponents\Weapon\{}", m2::model_path(model));
+        let readable = chain.read(&path).is_ok();
+        println!(
+            "  {hand:<5}  {model}  texture {:?}\n         {path} {}",
+            texture,
+            if readable { "reads" } else { "MISSING" }
+        );
+        if readable {
+            let bytes = chain.read(&path)?;
+            let held = m2::Model::parse(&bytes)?;
+            let (min, max) = held.bounding_box();
+            println!(
+                "         {} vertices, {} bones, {} attachments, extent {:.2} x {:.2} x {:.2}",
+                held.vertex_count(),
+                held.bones().len(),
+                held.attachment_count(),
+                max[0] - min[0],
+                max[1] - min[1],
+                max[2] - min[2],
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Tallies held geometry by inventory slot.
+fn item_held(chain: &mut Chain) -> Result<()> {
+    use dbc::schema::{Item, ItemDisplayInfo};
+    use std::collections::BTreeMap;
+
+    let items = Item::parse(&chain.read(Item::PATH)?)?;
+    let displays = ItemDisplayInfo::parse(&chain.read(ItemDisplayInfo::PATH)?)?;
+
+    // One pass to index the displays; the join is 46,000 by 58,000 otherwise.
+    let mut geometry: BTreeMap<u32, (bool, bool)> = BTreeMap::new();
+    for row in displays.iter() {
+        geometry.insert(
+            row.id(),
+            (!row.model_right().is_empty(), !row.model_left().is_empty()),
+        );
+    }
+
+    // Which folder an item's geometry sits in is not a column either, so it is
+    // measured the same way: try every folder that exists and see which one
+    // answers. An MPQ resolves by hash, so a miss costs a lookup, not a scan.
+    let folders = [
+        "Weapon", "Shield", "Shoulder", "Head", "Cape", "Quiver", "Pouch", "Ammo",
+    ];
+    let mut resolved: BTreeMap<String, Option<&'static str>> = BTreeMap::new();
+
+    #[derive(Default)]
+    struct Slot {
+        items: usize,
+        right: usize,
+        left: usize,
+        both: usize,
+        example: u32,
+        folders: BTreeMap<&'static str, usize>,
+        unresolved: usize,
+    }
+    let mut slots: BTreeMap<u32, Slot> = BTreeMap::new();
+    for item in items.iter() {
+        let inventory_type = item.inventory_type();
+        let (right, left) = geometry
+            .get(&item.display_info_id())
+            .copied()
+            .unwrap_or((false, false));
+
+        // Borrowed separately from the folder probe below, which needs the
+        // chain mutably while the slot entry would still be alive.
+        {
+            let slot = slots.entry(inventory_type).or_default();
+            slot.items += 1;
+            if right {
+                slot.right += 1;
+            }
+            if left {
+                slot.left += 1;
+            }
+            if right && left {
+                slot.both += 1;
+            }
+            if (right || left) && slot.example == 0 {
+                slot.example = item.display_info_id();
+            }
+        }
+
+        if !(right || left) {
+            continue;
+        }
+        let Some(row) = displays.iter().find(|r| r.id() == item.display_info_id()) else {
+            continue;
+        };
+        let name = if left { row.model_left() } else { row.model_right() };
+        let file = m2::model_path(name);
+        let found = match resolved.get(&file) {
+            Some(found) => *found,
+            None => {
+                let found = folders.iter().copied().find(|folder| {
+                    chain
+                        .read(&format!(r"Item\ObjectComponents\{folder}\{file}"))
+                        .is_ok()
+                });
+                resolved.insert(file.clone(), found);
+                found
+            }
+        };
+        let slot = slots.entry(inventory_type).or_default();
+        match found {
+            Some(folder) => *slot.folders.entry(folder).or_default() += 1,
+            None => slot.unresolved += 1,
+        }
+    }
+
+    println!(
+        "\n{} items across {} inventory types\n",
+        items.len(),
+        slots.len()
+    );
+    println!(
+        "  {:>5} {:>8}  {:>16} {:>16} {:>6}  {:>7}  folders",
+        "slot", "items", "model_right", "model_left", "both", "example"
+    );
+    for (slot, t) in &slots {
+        let pct = |n: usize| 100.0 * n as f32 / t.items.max(1) as f32;
+        let mut folders: Vec<String> = t
+            .folders
+            .iter()
+            .map(|(name, count)| format!("{name} x{count}"))
+            .collect();
+        if t.unresolved > 0 {
+            folders.push(format!("UNRESOLVED x{}", t.unresolved));
+        }
+        println!(
+            "  {slot:>5} {:>8}  {:>9} {:>5.1}% {:>9} {:>5.1}% {:>6}  {:>7}  {}",
+            t.items,
+            t.right,
+            pct(t.right),
+            t.left,
+            pct(t.left),
+            t.both,
+            if t.example == 0 {
+                "-".to_string()
+            } else {
+                t.example.to_string()
+            },
+            folders.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Dumps one model's attachment points.
+///
+/// Prints the bone each names beside the bone's own pivot, because those two
+/// are the check: an attachment is drawn through its bone's matrix, and in the
+/// bind pose that matrix is the identity, so the offset reads as a model-space
+/// point and must land on -- not merely near -- the bone it hangs from.
+fn m2_attachments(chain: &mut Chain, path: &str) -> Result<()> {
+    let path = m2::model_path(path);
+    let model = m2::Model::parse(&chain.read(&path)?)?;
+    let bones = model.bones();
+    let attachments = model.attachments();
+
+    let (min, max) = model.bounding_box();
+    println!("{path}");
+    println!(
+        "  {} attachments, {} bones, bounds [{:.2} {:.2} {:.2}]..[{:.2} {:.2} {:.2}]",
+        attachments.len(),
+        bones.len(),
+        min[0],
+        min[1],
+        min[2],
+        max[0],
+        max[1],
+        max[2]
+    );
+    println!(
+        "\n  {:>4} {:>5} {:>4}  {:>26}  {:>26}  {:>7}",
+        "id", "bone", "key", "attachment offset", "bone pivot", "apart"
+    );
+    for a in &attachments {
+        let (key, pivot) = match bones.get(a.bone as usize) {
+            Some(b) => (b.key_bone_id.to_string(), b.pivot),
+            None => ("-".to_string(), [f32::NAN; 3]),
+        };
+        let apart = (0..3)
+            .map(|i| (a.position[i] - pivot[i]).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        println!(
+            "  {:>4} {:>5} {:>4}  {:>8.3} {:>8.3} {:>8.3}  {:>8.3} {:>8.3} {:>8.3}  {apart:>7.3}",
+            a.id,
+            a.bone,
+            key,
+            a.position[0],
+            a.position[1],
+            a.position[2],
+            pivot[0],
+            pivot[1],
+            pivot[2],
+        );
+    }
+
+    for issue in model.validate() {
+        println!("\n  ! {issue}");
+    }
+    Ok(())
+}
+
+/// Tallies every attachment id across the archives.
+///
+/// The point is the shape of the population, not any single model: a wrong
+/// stride reads ids out of the middle of a float and produces thousands of
+/// distinct values, where the real vocabulary is small and heavily reused. The
+/// side column is the other half -- ids that come in mirrored pairs (the two
+/// hands, the two shoulders) sit consistently on one side of the model's plane
+/// of symmetry, which is what identifies them without transcribing a table.
+fn m2_attachment_survey(chain: &mut Chain, filter: &str) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let needle = filter.to_lowercase();
+    let names: Vec<String> = chain
+        .list()?
+        .into_iter()
+        .filter(|n| {
+            let l = n.to_lowercase();
+            l.ends_with(".m2") && (needle.is_empty() || l.contains(needle.as_str()))
+        })
+        .collect();
+
+    #[derive(Default)]
+    struct Tally {
+        models: usize,
+        left: usize,
+        right: usize,
+        centre: usize,
+        example: String,
+        example_pos: [f32; 3],
+    }
+
+    let mut ids: BTreeMap<u32, Tally> = BTreeMap::new();
+    let (mut parsed, mut with_any, mut stray_bone) = (0usize, 0usize, 0usize);
+
+    for name in &names {
+        let Ok(bytes) = chain.read(name) else { continue };
+        let Ok(model) = m2::Model::parse(&bytes) else {
+            continue;
+        };
+        parsed += 1;
+        let bone_count = model.bones().len();
+        let attachments = model.attachments();
+        if !attachments.is_empty() {
+            with_any += 1;
+        }
+        for a in attachments {
+            if a.bone as usize >= bone_count {
+                stray_bone += 1;
+            }
+            let t = ids.entry(a.id).or_default();
+            t.models += 1;
+            // Model space here is the raw M2 frame: +Y is one side of the
+            // model, -Y the other. Which side is which is settled by rendering,
+            // not by this tally; what the tally shows is that a given id picks
+            // a side and stays there.
+            if a.position[1] > 0.02 {
+                t.left += 1;
+            } else if a.position[1] < -0.02 {
+                t.right += 1;
+            } else {
+                t.centre += 1;
+            }
+            if t.example.is_empty() {
+                t.example = name.clone();
+                t.example_pos = a.position;
+            }
+        }
+    }
+
+    println!(
+        "\n{parsed}/{} models parsed, {with_any} carry at least one attachment",
+        names.len()
+    );
+    println!("{} distinct attachment ids, {stray_bone} naming a bone that does not exist", ids.len());
+    println!(
+        "\n  {:>4} {:>8}  {:>7} {:>7} {:>7}  example",
+        "id", "models", "+Y", "-Y", "centre"
+    );
+    for (id, t) in &ids {
+        println!(
+            "  {id:>4} {:>8}  {:>7} {:>7} {:>7}  {} at [{:.2} {:.2} {:.2}]",
+            t.models,
+            t.left,
+            t.right,
+            t.centre,
+            t.example,
+            t.example_pos[0],
+            t.example_pos[1],
+            t.example_pos[2]
+        );
+    }
+    Ok(())
 }
 
 fn m2_anims(chain: &mut Chain, path: &str, limit: usize) -> Result<()> {

@@ -32,6 +32,9 @@ const VERTEX_SIZE: usize = 48;
 const BONE_SIZE: usize = 88;
 const TEXTURE_SIZE: usize = 16;
 const MATERIAL_SIZE: usize = 4;
+/// Bytes per `M2Attachment`: id, bone, two bytes of padding, a position, and a
+/// 20-byte visibility track.
+const ATTACHMENT_SIZE: usize = 40;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -193,6 +196,54 @@ pub struct Bone {
     pub pivot: [f32; 3],
 }
 
+/// A point on the skeleton where a second model hangs: a weapon in a hand, a
+/// shield on a forearm, a spell effect at a fingertip.
+///
+/// The attached model is drawn at [`Model::pose`]'s matrix for [`bone`] applied
+/// to [`position`] -- so it follows the hand through the animation for free.
+///
+/// [`position`] is a **model-space point, not a delta from the bone**, which
+/// the dump makes obvious: on every character model it is bit-for-bit the
+/// pivot of the bone it names. That falls out of how a bone matrix is built
+/// here (`translate(pivot) * transform * translate(-pivot)`, so the bind pose
+/// is the identity rather than a translation), and it matters because treating
+/// it as a delta adds the pivot in twice and puts the sword out at arm's length
+/// from the hand -- a mistake that renders plausibly and is never an error.
+///
+/// [`bone`]: Attachment::bone
+/// [`position`]: Attachment::position
+#[derive(Clone, Copy, Debug)]
+pub struct Attachment {
+    /// Which slot this is, from a vocabulary shared by every model in the game.
+    /// Only the ids confirmed against the archives are named here -- see
+    /// [`Attachment::HAND_RIGHT`].
+    pub id: u32,
+    /// Bone this hangs from, indexing [`Model::bones`].
+    pub bone: u16,
+    /// Where the attached model sits, in model space. See the type's note: this
+    /// is a point, not an offset.
+    pub position: [f32; 3],
+}
+
+impl Attachment {
+    /// Main hand.
+    ///
+    /// Named from the data rather than transcribed. `m2 attachments --survey`
+    /// reads all 22,779 models: ids 1 and 2 are a mirrored pair sitting at the
+    /// end of the two arm chains, and each keeps to its own side of the plane
+    /// of symmetry (id 1 is on -Y in 684 models against 103 on +Y; id 2 is the
+    /// reverse). Which side is which then follows from the one fact the
+    /// renderer has already confirmed live -- an M2's forward is +X, drawn Z-up
+    /// and right-handed, so the model's left is +Y and this id, on -Y, is the
+    /// right hand.
+    ///
+    /// Corroborated independently by id 0, which sits just outboard of the +Y
+    /// hand: that is the shield, and a shield is worn in the off hand.
+    pub const HAND_RIGHT: u32 = 1;
+    /// Off hand, the mirror of [`Attachment::HAND_RIGHT`].
+    pub const HAND_LEFT: u32 = 2;
+}
+
 /// A bone together with its animation tracks.
 pub struct AnimatedBone {
     pub bone: Bone,
@@ -309,6 +360,7 @@ impl Model {
         model.slice("materials", model.header.materials, MATERIAL_SIZE)?;
         model.slice("texture_combos", model.header.texture_combos, 2)?;
         model.slice("bone_combos", model.header.bone_combos, 2)?;
+        model.slice("attachments", model.header.attachments, ATTACHMENT_SIZE)?;
         Ok(model)
     }
 
@@ -697,6 +749,33 @@ impl Model {
         self.header.attachments.count
     }
 
+    /// Where other models hang off this one.
+    pub fn attachments(&self) -> Vec<Attachment> {
+        let Ok(raw) = self.slice("attachments", self.header.attachments, ATTACHMENT_SIZE) else {
+            return Vec::new();
+        };
+        raw.chunks_exact(ATTACHMENT_SIZE)
+            .map(|a| {
+                let f = |o: usize| f32::from_le_bytes(a[o..o + 4].try_into().unwrap());
+                Attachment {
+                    id: u32::from_le_bytes(a[0..4].try_into().unwrap()),
+                    bone: u16::from_le_bytes([a[4], a[5]]),
+                    // Bytes 6..8 are padding that keeps the position aligned.
+                    position: [f(8), f(12), f(16)],
+                }
+            })
+            .collect()
+    }
+
+    /// The attachment with a given id, if this model has one.
+    ///
+    /// Ids are sparse and unordered -- a model with a right hand need not have
+    /// a left, and the array is not indexed by id -- so this is a search rather
+    /// than a lookup.
+    pub fn attachment(&self, id: u32) -> Option<Attachment> {
+        self.attachments().into_iter().find(|a| a.id == id)
+    }
+
     pub fn color_count(&self) -> u32 {
         self.header.colors.count
     }
@@ -793,6 +872,35 @@ impl Model {
             if !issues.is_empty() && issues.last().unwrap().contains("cycle") {
                 break;
             }
+        }
+
+        // The sharpest available probe on the attachment stride: every entry
+        // names a bone, so a wrong stride walks into the middle of the next
+        // record and the "bone" it reads is a float's low half. Those are
+        // enormous or zero, and out of range immediately.
+        let attachments = self.attachments();
+        let stray = attachments
+            .iter()
+            .filter(|a| a.bone as usize >= bones.len())
+            .count();
+        if stray > 0 {
+            issues.push(format!(
+                "{stray}/{} attachments name a bone outside the {}-bone skeleton",
+                attachments.len(),
+                bones.len()
+            ));
+        }
+        // Same idea one field over: an offset from a bone is a local nudge, not
+        // a world position, so it stays small even on the largest models.
+        let wild = attachments
+            .iter()
+            .filter(|a| a.position.iter().any(|c| !c.is_finite() || c.abs() > 100.0))
+            .count();
+        if wild > 0 {
+            issues.push(format!(
+                "{wild}/{} attachment offsets are not plausible local offsets",
+                attachments.len()
+            ));
         }
 
         issues

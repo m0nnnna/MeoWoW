@@ -709,9 +709,25 @@ impl InstanceBuffer {
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("instances"),
                     contents: bytemuck::cast_slice(data),
-                    usage: wgpu::BufferUsages::VERTEX,
+                    // Writable so a buffer whose transforms are recomputed every
+                    // frame -- an item held in an animated hand -- can be
+                    // rewritten rather than reallocated per frame.
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 }),
             len: data.len(),
+        }
+    }
+
+    /// Rewrites the transforms in place.
+    ///
+    /// Silently writes only what fits: the buffer's length was fixed when it
+    /// was created, and a caller with more instances than that needs a new
+    /// buffer, not a partial overwrite of somebody else's memory.
+    pub fn write(&self, gpu: &Gpu, instances: &[Instance]) {
+        let n = instances.len().min(self.len);
+        if n > 0 {
+            gpu.queue
+                .write_buffer(&self.buffer, 0, bytemuck::cast_slice(&instances[..n]));
         }
     }
 }

@@ -15,11 +15,16 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated *creatures* slide along their actual path, turn to face it, and play the model's own walk/stand cycles. **Other players do not** — see the known defect below |
 | Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, a spellbook you arrange the bars from, `F1` to rearrange, saved to `ui.toml` |
 | World | Lighting and the day/night cycle come from `Light.dbc`'s curves and the realm's own clock: real sun, ambient and sky colour, dawn through midnight. Game objects — doors, benches, chests, ships — are drawn |
-| Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components; equipment *geometry* (sleeves, boot tops, weapons, shoulders) is not drawn yet, and other players' equipment needs their visible-item fields |
+| Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components. **The player's weapon is drawn**: the M2 attachment table parses, and a sword or shield hangs off the hand's animated bone and swings with it. Shoulders, helms and ranged weapons are not, and there is no sheathed state — see below. Other players' equipment still needs their visible-item fields |
 | Game | **4.3 done**: three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. **A spellbook panel** (`P`) now lists what the character can do and puts it on a bar by click, auto-attack included -- see the note below on why the seeding filter had to reject it. Threat and the corpse *interface* remain (the corpse protocol is done). Inventory and quests follow |
 
-Roughly 57% of the way to something a person could test by playing. See
+Roughly 58% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
+
+**Weapons are drawn and sheathing does not exist.** `Item.dbc`'s
+`sheathe_type` is transcribed and never read, and this client has no
+drawn/undrawn state to hang it on, so a character stands in town holding a
+claymore. `foss-wow#42`.
 
 **The UI question is answered: this client draws its own interface and does not
 run addons.** Reimplementing `FrameXML` faithfully enough for third-party addons
@@ -421,6 +426,26 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   admitted passes just as well under the wrong fix, so the check has to assert
   the junk beside it is still refused. Whenever an exception is carved into a
   filter, test the exception **and** the thing it is indistinguishable from.
+- **A column can be named correctly and still not mean what its name says
+  here.** Every held item in the game -- main-hand swords included -- stores
+  its geometry in `ItemDisplayInfo.model_left`, and `model_right` is empty.
+  The obvious conclusion is that the two columns are swapped, and it is wrong:
+  shoulders fill both and put `LShoulder_...` in one and `RShoulder_...` in
+  the other, which proves the names. The pair is really "first model, second
+  model", and only a genuinely *paired* item uses both, so a single-model item
+  sits in the first column whichever hand it belongs in. Reading the column as
+  the hand would have put every weapon in the game in the wrong one, silently.
+  When a column's name suggests an answer, find the rows where the name is
+  unambiguous -- the pairs, the extremes -- and let those define it.
+- **When every measurement says it is right, stop measuring and move.** A
+  weapon that would not appear on screen produced four clean diagnostics in a
+  row: the item resolved, the group was built, the transform put it exactly at
+  the hand, the model rendered fine alone. Nothing was wrong. The camera sits
+  behind the character and a blade held forward at hip height is entirely
+  behind its owner from there. One render from the side settled it. The
+  sibling of "a composite needs a way to be seen as itself", and the tell is
+  the *pattern*: diagnostics that keep coming back correct are evidence about
+  the observer, not the code.
 - **Validity is nearly free; *variation* is the discriminator.** Two update
   fields both resolved 100% to real `GameObjectDisplayInfo` rows, because the
   table is 39% dense and any small integer lands in it. One was the constant 33

@@ -2017,3 +2017,117 @@ that comment.
 caller is the only thing that knows it, and there is a test pinning a creature
 told to face a player whose replicated position says north while they have
 actually walked east.
+
+### 4.7: weapons in hand
+
+Reported at a window after 4.6, in four words: *"there is no item in his
+hand"*. Tickets `foss-wow#25` (parse the M2 attachment table) and `#26` (draw
+what a character carries).
+
+**The attachment table.** An `M2Attachment` is 40 bytes -- an id, a bone index,
+two bytes of padding, a position, and a 20-byte visibility track. The stride is
+the part worth proving, because a wrong one still parses: it reads an id out of
+the middle of a float and a bone index out of its low half. Two properties
+settle it, and neither is a size check. Across all 22,779 models the ids come
+out as a *contiguous vocabulary of 50*, 0 to 49, with **zero** out-of-range
+bone indices -- a wrong stride gives thousands of distinct ids and strays
+everywhere. And every attachment's position lands bit-for-bit on the pivot of
+the bone it names.
+
+That second property is not decoration, it is the drawing rule. An attachment
+position is a **model-space point, not a delta from the bone**, which follows
+from how a bone matrix is built here: `translate(pivot) * transform *
+translate(-pivot)`, so the bind pose is the identity rather than a
+translation. Treating it as a delta adds the pivot in twice and hangs the sword
+out at arm's length from the fist -- which renders perfectly and is never an
+error. `held_transform` is a named free function for exactly that reason, with
+tests pinning both the composition order and the rotation.
+
+**Which id is which hand, derived rather than transcribed.** Ids 1 and 2 are a
+mirrored pair at the ends of the two arm chains, and each keeps to its own side
+of the plane of symmetry: id 1 sits on -Y in 684 models against 103 on +Y, id 2
+the reverse. Which side *is* the left then follows from the one fact the
+renderer had already confirmed live -- an M2's forward is +X, drawn Z-up and
+right-handed, so the model's left is +Y and id 1 is the right hand.
+Corroborated independently by id 0, which sits just outboard of the +Y hand:
+that is the shield, and a shield is worn in the off hand. Two derivations, one
+answer, and then a person at a window.
+
+#### Two things in the item data were not what they looked like
+
+`wow-cli item held` joins all 46,096 rows of `Item.dbc` to `ItemDisplayInfo`
+and asks which inventory types name geometry at all. The separation is total:
+the held slots fill their model column for 99.2% or more of their items, where
+a chest or a belt manages under 2%. But the column they fill is
+**`model_left` -- for every one of them, main-hand swords included.**
+
+The names are not wrong. Shoulders (type 3) fill *both* columns and put
+`LShoulder_Leather_A_01` in one and `RShoulder_...` in the other, which is what
+proves it. The pair is really "first model, second model", and only a genuinely
+paired item uses both. A sword is a single model, so it sits in the first
+column and goes in whichever hand its **slot** names. Reading the column as the
+hand would have put every weapon in the game in the wrong one, and it is the
+reading anybody would reach for first.
+
+The folder is not a column either, so it was measured the same way: resolve
+each name against every `Item\ObjectComponents` directory and see which
+answers. Weapons land in `Weapon` and shields in `Shield`, each at 100%.
+
+**Bows, guns, thrown weapons and shoulders are deliberately left out.** Their
+data resolves perfectly -- ranged weapons are 100% in `Weapon` -- but the
+second half of the rule is a claim about *which attachment point*, and that has
+been confirmed for the two hands and nothing else. A guess there puts a rifle
+through a character's palm. Same precedent as `geoset_rule` leaving out belts,
+and a test asserts the omission is a decision rather than a gap.
+
+The test that matters asserts both halves: the held slots choose a hand **and**
+the painted ones choose neither, even though 16% of gloves do name a model.
+Asserting only that a sword lands in the right hand passes under the wrong rule
+too -- the same trap the auto-attack filter had in 4.4.
+
+#### The renderer needed no new draw path
+
+A held item is an ordinary `Group` whose transforms happen to come from
+somewhere else: `wielder_placement * hand_matrix * translate(attachment)`,
+rewritten every frame in `update_animations` from the very pose the wielder was
+drawn with. Deriving it from the same matrices rather than recomputing it is
+deliberate -- two things that must agree exactly should have one source, and a
+hand that disagreed with its own model by a frame is a sword that trails the
+arm. Its own `animation` stays `None`: a weapon's skeleton is rigid and draws
+in bind pose against the identity palette, and all the movement comes from the
+hand. `InstanceBuffer` gained `COPY_DST` and a `write`, and the buffer is
+seeded with the bind-pose answer rather than zeroes, per the rule that anything
+written before it is read should start as something you can *see*.
+
+#### The bug that was not one
+
+The first live screenshot showed no sword, and the diagnostics all came back
+clean: the item resolved, the group was built with three draws, the transform
+put it 0.9 up and 0.36 out from the wielder -- exactly a right hand. The model
+rendered fine on its own. Nothing was wrong. The camera sits directly behind
+the character, and a blade held forward at hip height is entirely behind its
+owner's body from there. One render from the side showed it held correctly.
+
+That is the trap already written up in `CLAUDE.md` about a composite needing a
+way to be seen as itself, walked into anyway, and it cost a full round of
+diagnostics that all reported "correct". The tell was there the whole time:
+when every measurement says the thing is where it should be, stop measuring and
+change where you are standing.
+
+Confirmed at a window: the sword is in the hand, textured, and swings with the
+combat animation when killing a wolf.
+
+#### What is deliberately still missing
+
+- **There is no sheathed state at all**, which was the first thing noticed
+  live. `Item.dbc`'s `sheathe_type` column is transcribed and never read, and
+  this client has no drawn/undrawn concept to hang it on -- so every weapon is
+  always in hand, including while standing in town. That is a feature, not a
+  bug in this one: `foss-wow#42`.
+- **Other players' weapons** need their visible-item fields, which arrive as
+  item *entry* ids rather than display ids -- `foss-wow#23`, unchanged.
+- **NPCs hold nothing**, and not for want of trying:
+  `CreatureDisplayInfoExtra`'s eleven item columns are the eleven that paint
+  the *body*, measured column by column in 4.4. A guard's sword is simply not
+  in that table.
+- Shoulders, helms and ranged weapons, for the reason above.
