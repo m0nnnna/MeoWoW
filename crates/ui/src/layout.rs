@@ -39,10 +39,11 @@ pub enum ElementId {
     ActionBar1,
     ActionBar2,
     ActionBar3,
+    Spellbook,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 7] = [
+    pub const ALL: [ElementId; 8] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -50,6 +51,7 @@ impl ElementId {
         ElementId::ActionBar1,
         ElementId::ActionBar2,
         ElementId::ActionBar3,
+        ElementId::Spellbook,
     ];
 
     /// Which action bar this element is, if it is one.
@@ -72,6 +74,7 @@ impl ElementId {
             ElementId::ActionBar1 => "action-bar-1",
             ElementId::ActionBar2 => "action-bar-2",
             ElementId::ActionBar3 => "action-bar-3",
+            ElementId::Spellbook => "spellbook",
         }
     }
 
@@ -89,6 +92,7 @@ impl ElementId {
             ElementId::ActionBar1 => "Action bar (no modifier)",
             ElementId::ActionBar2 => "Action bar (Shift)",
             ElementId::ActionBar3 => "Action bar (Ctrl)",
+            ElementId::Spellbook => "Spellbook",
         }
     }
 
@@ -143,6 +147,19 @@ impl ElementId {
                 anchor: Anchor::Bottom,
                 offset: [0.0, -120.0],
                 visible: false,
+                ..Default::default()
+            },
+            // Against the right edge, clear of everything else the default
+            // layout draws -- the book is opened over the world mid-play and
+            // covering the chat log or the bars with it would be a poor trade.
+            // `visible` stays true because it means "this element may be
+            // drawn", not "it is on screen now": the book only appears while
+            // it is open, the same way the target frame only appears with a
+            // target. Unticking it in the edit window switches the book off
+            // altogether.
+            ElementId::Spellbook => Element {
+                anchor: Anchor::Right,
+                offset: [-24.0, 0.0],
                 ..Default::default()
             },
         }
@@ -408,17 +425,20 @@ mod tests {
     /// quietly dropped.
     #[test]
     fn an_unknown_element_is_reported_and_skipped() {
+        // `quest-log` rather than `spellbook`: this test's example has to be an
+        // element that genuinely does not exist, and the spellbook -- which
+        // was that example until it was built -- is now one of the known keys.
         let text = r#"
             [elements.player-frame]
             offset = [10.0, 10.0]
 
-            [elements.spellbook]
+            [elements.quest-log]
             offset = [0.0, 0.0]
         "#;
         let (profile, warnings) = Profile::from_toml(text).unwrap();
         assert_eq!(profile.get(ElementId::PlayerFrame).offset, [10.0, 10.0]);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("spellbook"), "{warnings:?}");
+        assert!(warnings[0].contains("quest-log"), "{warnings:?}");
     }
 
     /// An element the file never mentions falls back to where it belongs,

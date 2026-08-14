@@ -18,7 +18,9 @@ pub mod cast_bar;
 pub mod chat;
 pub mod combat_text;
 pub mod marker;
+pub mod spellbook;
 pub mod unit;
 
 pub use cast_bar::CastBarView;
+pub use spellbook::SpellbookEntry;
 pub use unit::UnitView;

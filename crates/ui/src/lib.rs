@@ -36,7 +36,7 @@ pub use edit::{EditAction, EditState};
 pub use element::{Anchor, Element};
 pub use frames::chat::{ChatEntry, ChatKind};
 pub use frames::combat_text::{CombatTextKind, FloatingText};
-pub use frames::{CastBarView, UnitView};
+pub use frames::{CastBarView, SpellbookEntry, UnitView};
 pub use layout::{default_path, ElementId, Profile};
 pub use style::{Color, PowerType, Style};
 
@@ -81,13 +81,25 @@ pub struct HudData<'a> {
     /// is absent outside edit mode exactly the way the target frame is
     /// absent with nothing targeted.
     pub cast_bar: Option<&'a frames::CastBarView>,
+    /// Everything the character can put on a bar, or `None` when the book is
+    /// closed. Like the cast bar, "closed" is expressed by having nothing to
+    /// draw rather than by a flag: the caller already decides when the book is
+    /// open, and a second copy of that decision here could disagree with it.
+    pub spellbook: Option<&'a [frames::SpellbookEntry]>,
 }
 
 /// What the user did to the interface this frame.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HudResponse {
-    /// `(bar, slot)` of an action slot that was clicked.
+    /// `(bar, slot)` of an action slot that was clicked with nothing held --
+    /// the request to actually *use* what is in it.
     pub activated: Option<(usize, usize)>,
+    /// Whether the layout changed in a way worth writing to disk: a spell put
+    /// on a bar, or a slot cleared. Reported rather than saved here because
+    /// this crate does the arranging and the caller owns when files get
+    /// written -- and because a save on every frame of a drag would be a file
+    /// write per frame.
+    pub layout_changed: bool,
 }
 
 /// The interface, ready to draw.
@@ -112,6 +124,16 @@ pub struct Hud {
     /// answer is the right one for a debug overlay and the wrong one for an
     /// interface that is part of the game.
     occupied: Vec<egui::Rect>,
+    /// The spell picked up out of the spellbook and not yet put down.
+    ///
+    /// Interface state rather than game state, so it lives here rather than
+    /// being handed in each frame: picking a spell up and dropping it on a
+    /// slot is entirely a thing that happens to the layout, and the layout is
+    /// what this crate owns. The caller never has to know a drag is in
+    /// progress.
+    held: Option<u32>,
+    /// The first spell shown in the book, as it is scrolled.
+    spellbook_scroll: usize,
 }
 
 impl Default for Hud {
@@ -122,6 +144,8 @@ impl Default for Hud {
             path: None,
             status: None,
             occupied: Vec::new(),
+            held: None,
+            spellbook_scroll: 0,
         }
     }
 }
@@ -265,6 +289,7 @@ impl Hud {
             let chat_placeholder;
             let cast_bar_placeholder;
             let bar_placeholder;
+            let spellbook_placeholder;
             let content = match id {
                 ElementId::PlayerFrame | ElementId::TargetFrame => {
                     let live = if id == ElementId::PlayerFrame {
@@ -300,6 +325,17 @@ impl Hud {
                     }
                     None => continue,
                 },
+                // Absent when closed, exactly like the cast bar -- and present
+                // in edit mode regardless, or it could only be positioned
+                // while open and would have to stay open for the whole drag.
+                ElementId::Spellbook => match data.spellbook {
+                    Some(entries) => Content::Spellbook(entries),
+                    None if editing => {
+                        spellbook_placeholder = frames::spellbook::placeholder();
+                        Content::Spellbook(&spellbook_placeholder)
+                    }
+                    None => continue,
+                },
                 _ => {
                     // An action bar. Unlike the other frames, an empty one
                     // still draws: the slots are where spells get *put*, so
@@ -322,9 +358,56 @@ impl Hud {
                 Content::Chat(_) => frames::chat::size(&style, element.scale),
                 Content::Bar { .. } => frames::action_bar::size(&style, element.scale),
                 Content::CastBar(_) => frames::cast_bar::size(&style, element.scale),
+                Content::Spellbook(_) => frames::spellbook::size(&style, element.scale),
             };
             let rect = element.rect(screen, size);
             self.occupied.push(rect);
+
+            // The book's wheel scrolling is answered here, before it is drawn,
+            // and from `rect` rather than from egui's hover state. Both halves
+            // are deliberate: reading the wheel after the frame is painted
+            // would apply it a frame late, and the rectangle is already known,
+            // so asking egui whether it thinks the panel is hovered would be
+            // consulting a second opinion about a question this loop can
+            // answer itself.
+            //
+            // Clamping happens every frame rather than only on a scroll,
+            // because the entry list changes as the character learns things.
+            // An offset left past the end shows a panel of blank rows, which
+            // is indistinguishable from a book that failed to load.
+            let scroll = match content {
+                Content::Spellbook(entries) => {
+                    let limit =
+                        frames::spellbook::max_scroll(entries.len(), rect, &style, element.scale);
+                    if !editing && limit > 0 {
+                        if let Some(pointer) = ctx.input(|i| i.pointer.interact_pos()) {
+                            if rect.contains(pointer) {
+                                let wheel = ctx.input(|i| i.smooth_scroll_delta.y);
+                                // A positive wheel delta moves the content
+                                // down, which means *earlier* in the list.
+                                //
+                                // Applied by saturating add and subtract
+                                // rather than by casting the offset to a
+                                // signed type and adding: the offset is a
+                                // `usize`, and a large one casts to a negative
+                                // number, which would silently scroll the
+                                // wrong way instead of failing.
+                                let rows = (wheel / (style.spellbook_row * element.scale)) as i32;
+                                self.spellbook_scroll = if rows >= 0 {
+                                    self.spellbook_scroll.saturating_sub(rows as usize)
+                                } else {
+                                    self.spellbook_scroll.saturating_add(rows.unsigned_abs() as usize)
+                                };
+                            }
+                        }
+                    }
+                    self.spellbook_scroll = self.spellbook_scroll.min(limit);
+                    self.spellbook_scroll
+                }
+                _ => 0,
+            };
+            let held = self.held;
+
             let response = egui::Area::new(egui::Id::new(("hud-element", id.key())))
                 // Behind the debug and edit windows, which are ordinary egui
                 // windows: the interface is the thing being worked on, not the
@@ -334,9 +417,9 @@ impl Hud {
                 .show(ctx, |ui| {
                     let sense = if editing {
                         egui::Sense::drag()
-                    } else if matches!(content, Content::Bar { .. }) {
-                        // A bar is the one frame you interact with while
-                        // playing, so it senses clicks rather than only hover.
+                    } else if matches!(content, Content::Bar { .. } | Content::Spellbook(_)) {
+                        // The two frames you interact with while playing, so
+                        // they sense clicks rather than only hover.
                         egui::Sense::click()
                     } else {
                         // Still sensed, so `captures_pointer` knows the
@@ -371,6 +454,15 @@ impl Hud {
                             &style,
                             element.scale,
                         ),
+                        Content::Spellbook(entries) => frames::spellbook::draw(
+                            &painter,
+                            response.rect,
+                            entries,
+                            scroll,
+                            held,
+                            &style,
+                            element.scale,
+                        ),
                     }
                     if editing {
                         paint_edit_chrome(&painter, response.rect, id, &style, element.scale);
@@ -387,26 +479,84 @@ impl Hud {
             // The two are equal today; they would stop being equal the moment
             // egui constrained the area, and the failure then is a click that
             // casts the neighbouring spell.
-            let bar_rect = response.rect;
-            if let (false, Content::Bar { index, slots }) = (editing, content) {
-                if response.clicked() {
-                    if let Some(pointer) = response.interact_pointer_pos() {
+            let drawn_rect = response.rect;
+            match (editing, content) {
+                (false, Content::Bar { index, slots }) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            if let Some(slot) = frames::action_bar::slot_at(
+                                drawn_rect,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                match self.held.take() {
+                                    // Holding a spell makes the click a *put*
+                                    // rather than a use. Which of the two a
+                                    // click means therefore depends on state
+                                    // the user set a moment ago by clicking a
+                                    // spell in the book -- and the held icon
+                                    // follows the cursor precisely so that
+                                    // state is never invisible.
+                                    Some(spell) => {
+                                        self.profile.bars.set(index, slot, Some(spell));
+                                        response_out.layout_changed = true;
+                                    }
+                                    None => response_out.activated = Some((index, slot)),
+                                }
+                            }
+                        }
+                    }
+                    // Right-click empties a slot. The only way to *remove*
+                    // something without also putting something else there,
+                    // and the alternative -- a modifier, or an edit-mode-only
+                    // control -- would make clearing a slot a different kind
+                    // of gesture from filling one.
+                    if response.secondary_clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            if let Some(slot) = frames::action_bar::slot_at(
+                                drawn_rect,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                if self.profile.bars.get(index, slot).is_some() {
+                                    self.profile.bars.set(index, slot, None);
+                                    response_out.layout_changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(pointer) = response.hover_pos() {
                         if let Some(slot) =
-                            frames::action_bar::slot_at(bar_rect, &style, element.scale, pointer)
+                            frames::action_bar::slot_at(drawn_rect, &style, element.scale, pointer)
                         {
-                            response_out.activated = Some((index, slot));
+                            if let Some(spell) = slots.get(slot).and_then(|s| s.spell.as_ref()) {
+                                frames::action_bar::hover_tooltip(&response, spell);
+                            }
                         }
                     }
                 }
-                if let Some(pointer) = response.hover_pos() {
-                    if let Some(slot) =
-                        frames::action_bar::slot_at(bar_rect, &style, element.scale, pointer)
-                    {
-                        if let Some(spell) = slots.get(slot).and_then(|s| s.spell.as_ref()) {
-                            frames::action_bar::hover_tooltip(&response, spell);
+                (false, Content::Spellbook(entries)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            if let Some(row) =
+                                frames::spellbook::row_at(drawn_rect, &style, element.scale, pointer)
+                            {
+                                // The row is an index into what is *on
+                                // screen*; the scroll offset turns it into an
+                                // index into the book. Conflating the two is
+                                // the bug this separation exists to prevent,
+                                // and it only shows up once the book is long
+                                // enough to scroll.
+                                if let Some(entry) = entries.get(scroll + row) {
+                                    self.held = Some(entry.id);
+                                }
+                            }
                         }
                     }
                 }
+                _ => {}
             }
 
             if editing {
@@ -423,6 +573,43 @@ impl Hud {
                     self.profile.set(id, element);
                 }
             }
+        }
+
+        // The spell being carried, drawn against the cursor.
+        //
+        // **A hold does not outlive the book.** The indicator is drawn from
+        // the book's own entry, so a hold that survived the book closing would
+        // be a mode with nothing on screen to show it -- and a click that
+        // silently means "put" instead of "cast" is exactly the surprise this
+        // interface should not have. Closing the book therefore puts the spell
+        // back, as do Escape and a right-click anywhere.
+        match (self.held, data.spellbook) {
+            (Some(spell), Some(entries)) => {
+                let dropped = ctx.input(|i| {
+                    i.key_pressed(egui::Key::Escape) || i.pointer.secondary_clicked()
+                });
+                match entries.iter().find(|entry| entry.id == spell) {
+                    Some(entry) if !dropped => {
+                        if let Some(pointer) = ctx.input(|i| i.pointer.hover_pos()) {
+                            let painter = ctx.layer_painter(egui::LayerId::new(
+                                egui::Order::Tooltip,
+                                egui::Id::new("hud-held-spell"),
+                            ));
+                            frames::spellbook::draw_held(
+                                &painter,
+                                pointer,
+                                entry,
+                                &style,
+                                self.profile.get(ElementId::Spellbook).scale,
+                            );
+                        }
+                    }
+                    // Dropped, or a spell the book no longer lists.
+                    _ => self.held = None,
+                }
+            }
+            (Some(_), None) => self.held = None,
+            _ => {}
         }
 
         if editing {
@@ -443,6 +630,7 @@ impl Hud {
                         ElementId::ActionBar1 | ElementId::ActionBar2 | ElementId::ActionBar3 => {
                             frames::action_bar::size(&style, scale)
                         }
+                        ElementId::Spellbook => frames::spellbook::size(&style, scale),
                         ElementId::PlayerFrame | ElementId::TargetFrame => {
                             let unit = if id == ElementId::PlayerFrame {
                                 data.player
@@ -497,6 +685,7 @@ enum Content<'a> {
         slots: &'a [frames::action_bar::SlotView],
     },
     CastBar(&'a frames::CastBarView),
+    Spellbook(&'a [frames::SpellbookEntry]),
 }
 
 /// The outline and label that mark a frame as draggable.
@@ -932,6 +1121,258 @@ mod tests {
         }
     }
 
+    /// Drives the interface through real egui passes, one batch of events per
+    /// pass, and returns the last [`HudResponse`].
+    ///
+    /// A click cannot be delivered in one pass: egui decides what a press
+    /// landed on from the rectangles the *previous* pass registered, and
+    /// reports `clicked()` on the release. So the script below is the whole of
+    /// what a click is, spelled out -- and spelling it out is the point, since
+    /// this is the harness that lets an assignment gesture be tested without a
+    /// window.
+    fn drive(hud: &mut Hud, data: &HudData<'_>, script: &[Vec<egui::Event>]) -> HudResponse {
+        let ctx = egui::Context::default();
+        let mut last = HudResponse::default();
+        for events in script {
+            let input = egui::RawInput {
+                screen_rect: Some(screen()),
+                events: events.clone(),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                last = hud.show(ui, data);
+            });
+            output.drop_without_applying_deltas();
+        }
+        last
+    }
+
+    /// One complete click at a point, as the passes it takes.
+    fn click_script(pos: egui::Pos2, button: egui::PointerButton) -> Vec<Vec<egui::Event>> {
+        let modifiers = egui::Modifiers::default();
+        vec![
+            vec![egui::Event::PointerMoved(pos)],
+            vec![egui::Event::PointerMoved(pos)],
+            vec![egui::Event::PointerButton {
+                pos,
+                button,
+                pressed: true,
+                modifiers,
+            }],
+            vec![egui::Event::PointerButton {
+                pos,
+                button,
+                pressed: false,
+                modifiers,
+            }],
+        ]
+    }
+
+    /// Where the rows of the spellbook and the slots of the first action bar
+    /// are on screen, given the default layout.
+    fn spellbook_rows(profile: &Profile) -> Vec<egui::Pos2> {
+        let element = profile.get(ElementId::Spellbook);
+        let rect = element.rect(
+            screen(),
+            frames::spellbook::size(&profile.style, element.scale),
+        );
+        frames::spellbook::row_rects(rect, &profile.style, element.scale)
+            .map(|row| row.center())
+            .collect()
+    }
+
+    fn bar_slots(profile: &Profile) -> Vec<egui::Pos2> {
+        let element = profile.get(ElementId::ActionBar1);
+        let rect = element.rect(
+            screen(),
+            frames::action_bar::size(&profile.style, element.scale),
+        );
+        frames::action_bar::slot_rects(rect, &profile.style, element.scale)
+            .map(|slot| slot.center())
+            .collect()
+    }
+
+    fn book(count: usize) -> Vec<SpellbookEntry> {
+        (0..count)
+            .map(|i| SpellbookEntry {
+                id: 100 + i as u32,
+                name: format!("Spell {i}"),
+                rank: String::new(),
+                icon: None,
+            })
+            .collect()
+    }
+
+    /// The book is absent when closed and present in edit mode, the same
+    /// asymmetry `a_cast_bar_appears_only_while_casting_or_editing` pins for
+    /// the cast bar -- and for the same reason: it could otherwise only be
+    /// positioned while open, and would have to stay open for the whole drag.
+    #[test]
+    fn a_spellbook_appears_only_when_open_or_editing() {
+        let mut quiet = Hud::default();
+        hide_bars(&mut quiet);
+        assert!(
+            painted(&mut quiet, &HudData::default()).is_empty(),
+            "a spellbook was painted with the book closed"
+        );
+
+        let entries = book(4);
+        let mut open = Hud::default();
+        hide_bars(&mut open);
+        assert!(
+            !painted(
+                &mut open,
+                &HudData {
+                    spellbook: Some(&entries),
+                    ..Default::default()
+                }
+            )
+            .is_empty(),
+            "an open spellbook painted nothing"
+        );
+    }
+
+    /// The whole assignment gesture, end to end: click a spell, click a slot,
+    /// and the layout holds it.
+    ///
+    /// This is the test the standing rule asks for -- the feature exists so a
+    /// bar can be arranged in-game, and every part of that (which row was
+    /// clicked, that a held spell turns a slot click into a put rather than a
+    /// cast, that the layout is reported as changed so it gets saved) is
+    /// invisible from outside and would otherwise only ever be checked by a
+    /// person at a window.
+    #[test]
+    fn clicking_a_spell_then_a_slot_puts_it_on_the_bar() {
+        let entries = book(4);
+        let data = HudData {
+            spellbook: Some(&entries),
+            ..Default::default()
+        };
+        let profile = Profile::default();
+        let rows = spellbook_rows(&profile);
+        let slots = bar_slots(&profile);
+
+        let mut hud = Hud::default();
+        let mut script = click_script(rows[1], egui::PointerButton::Primary);
+        script.extend(click_script(slots[3], egui::PointerButton::Primary));
+        let response = drive(&mut hud, &data, &script);
+
+        assert_eq!(
+            hud.profile.bars.get(0, 3),
+            Some(entries[1].id),
+            "the second spell in the book did not land in the fourth slot"
+        );
+        assert!(
+            response.layout_changed,
+            "an assignment has to be reported, or it is never written to disk"
+        );
+        assert_eq!(
+            response.activated, None,
+            "a slot clicked while holding a spell must not also cast it"
+        );
+    }
+
+    /// A slot with nothing held is still a cast, which is the behaviour that
+    /// existed before assignment did and must not have been broken by it.
+    #[test]
+    fn a_slot_clicked_with_nothing_held_is_a_cast() {
+        let mut hud = Hud::default();
+        hud.profile.bars.set(0, 2, Some(78));
+        let slots = bar_slots(&hud.profile);
+        let response = drive(
+            &mut hud,
+            &HudData::default(),
+            &click_script(slots[2], egui::PointerButton::Primary),
+        );
+        assert_eq!(response.activated, Some((0, 2)));
+        assert!(!response.layout_changed);
+        assert_eq!(hud.profile.bars.get(0, 2), Some(78), "casting emptied the slot");
+    }
+
+    /// A scrolled book has to pick up the spell *under the cursor*, not the
+    /// one at that position in the list.
+    ///
+    /// The row index and the entry index are deliberately different things --
+    /// see `frames::spellbook::row_at`. Conflating them is the obvious mistake
+    /// here, and it is invisible until the book is long enough to scroll,
+    /// which no short test and no first look at a new character would reach.
+    #[test]
+    fn a_scrolled_book_picks_up_the_spell_under_the_cursor() {
+        let profile = Profile::default();
+        let page = frames::spellbook::page_rows(
+            &profile.style,
+            profile.get(ElementId::Spellbook).scale,
+        );
+        let entries = book(page + 5);
+        let data = HudData {
+            spellbook: Some(&entries),
+            ..Default::default()
+        };
+        let rows = spellbook_rows(&profile);
+        let slots = bar_slots(&profile);
+
+        let mut hud = Hud::default();
+        // Scrolled past the end, which clamps to the last full page -- so the
+        // first row on screen is entry number five rather than entry zero.
+        // Deliberately `usize::MAX` rather than 5: an offset that large is
+        // what the clamp exists for, and casting it to a signed type to apply
+        // a wheel delta would turn it into -1 and scroll the other way.
+        hud.spellbook_scroll = usize::MAX;
+        let mut script = click_script(rows[0], egui::PointerButton::Primary);
+        script.extend(click_script(slots[0], egui::PointerButton::Primary));
+        drive(&mut hud, &data, &script);
+
+        assert_eq!(
+            hud.profile.bars.get(0, 0),
+            Some(entries[5].id),
+            "a scrolled book picked up the wrong spell"
+        );
+    }
+
+    /// Right-clicking a slot is the only way to empty one without putting
+    /// something else there.
+    #[test]
+    fn right_clicking_a_slot_empties_it() {
+        let mut hud = Hud::default();
+        hud.profile.bars.set(0, 5, Some(78));
+        let slots = bar_slots(&hud.profile);
+        let response = drive(
+            &mut hud,
+            &HudData::default(),
+            &click_script(slots[5], egui::PointerButton::Secondary),
+        );
+        assert_eq!(hud.profile.bars.get(0, 5), None);
+        assert!(response.layout_changed);
+    }
+
+    /// Closing the book puts down whatever was picked up.
+    ///
+    /// The held spell is drawn from the book's own entry, so a hold that
+    /// outlived the book would be a mode with nothing on screen to show it --
+    /// and the next click on a bar would silently mean "put" instead of
+    /// "cast".
+    #[test]
+    fn closing_the_book_drops_what_was_held() {
+        let entries = book(4);
+        let profile = Profile::default();
+        let rows = spellbook_rows(&profile);
+
+        let mut hud = Hud::default();
+        drive(
+            &mut hud,
+            &HudData {
+                spellbook: Some(&entries),
+                ..Default::default()
+            },
+            &click_script(rows[0], egui::PointerButton::Primary),
+        );
+        assert_eq!(hud.held, Some(entries[0].id), "the click picked nothing up");
+
+        // One frame with the book closed.
+        drive(&mut hud, &HudData::default(), &[vec![]]);
+        assert_eq!(hud.held, None, "a hold outlived the book it came from");
+    }
+
     fn hide_bars(hud: &mut Hud) {
         for id in ElementId::ALL {
             if id.action_bar().is_some() {
@@ -951,6 +1392,7 @@ mod tests {
             ElementId::ActionBar1 | ElementId::ActionBar2 | ElementId::ActionBar3 => {
                 frames::action_bar::size(&profile.style, scale)
             }
+            ElementId::Spellbook => frames::spellbook::size(&profile.style, scale),
             ElementId::PlayerFrame | ElementId::TargetFrame => {
                 frames::unit::size(&profile.style, scale, true)
             }

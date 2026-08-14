@@ -203,6 +203,17 @@ pub struct Style {
     /// The key printed in the slot's corner.
     pub slot_binding: Color,
 
+    /// The spellbook panel at scale 1.0, and the height of one spell in it.
+    /// Its own row height rather than the action bar's `slot_size`: the two
+    /// are independently tunable, and a book of bar-sized icons would show
+    /// four spells at a time.
+    pub spellbook_width: f32,
+    pub spellbook_height: f32,
+    pub spellbook_row: f32,
+    pub spellbook_background: Color,
+    /// Behind the spell currently picked up, waiting to be put on a bar.
+    pub spellbook_selected: Color,
+
     /// Width of the cast bar at scale 1.0. Reuses `bar_height` for its
     /// thickness -- a cast bar is one bar, the same shape as a health bar
     /// turned wide, and does not need a dimension of its own for that.
@@ -301,6 +312,12 @@ impl Default for Style {
             slot_empty_border: Color::rgba(120, 130, 150, 70),
             slot_binding: Color::rgba(230, 235, 245, 200),
 
+            spellbook_width: 250.0,
+            spellbook_height: 320.0,
+            spellbook_row: 30.0,
+            spellbook_background: Color::rgba(16, 18, 24, 235),
+            spellbook_selected: Color::rgba(240, 190, 70, 90),
+
             cast_bar_width: 260.0,
             casting: Color::rgb(220, 170, 60),
 
@@ -373,6 +390,9 @@ impl Style {
         self.slot_size = self.slot_size.clamp(12.0, 200.0);
         self.slot_gap = self.slot_gap.clamp(0.0, 40.0);
         self.cast_bar_width = self.cast_bar_width.clamp(60.0, 1200.0);
+        self.spellbook_width = self.spellbook_width.clamp(120.0, 1200.0);
+        self.spellbook_height = self.spellbook_height.clamp(60.0, 1600.0);
+        self.spellbook_row = self.spellbook_row.clamp(10.0, 200.0);
         self.chat_width = self.chat_width.clamp(120.0, 2000.0);
         self.chat_height = self.chat_height.clamp(40.0, 1200.0);
         self.chat_scrollback = self.chat_scrollback.clamp(10, 10_000);

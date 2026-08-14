@@ -73,6 +73,27 @@ fn values_of(
 /// necessary but nowhere near sufficient -- see [`Spellbook::castable`].
 const ATTR_PASSIVE: u32 = 0x0000_0040;
 
+/// `Auto Attack`, the ability that starts and stops melee.
+///
+/// A hardcoded id, which this project usually refuses to do -- so the evidence
+/// is worth writing down rather than the number alone. `Spell.dbc` row 6603 in
+/// build 12340 is named `Auto Attack`, is not passive (attributes `0x10`), and
+/// carries the description *"Automatically attacks a target in melee with an
+/// equipped weapon until cancelled."* It is also the only spell in
+/// `SkillLineAbility` that sits on the generic line 183 with a class mask of
+/// zero *and* every character knows -- `Testwolf`'s 54 known spells include it.
+///
+/// The number is fixed for the client build this project targets, the same way
+/// a `Map.dbc` id is, and unlike a *field offset* a wrong value here fails
+/// loudly and immediately: the slot would name some other spell, and pressing
+/// it would cast that spell rather than swing.
+///
+/// It is special-cased rather than left to the ordinary cast path because
+/// auto-attack is not a cast. `CMSG_CAST_SPELL` with 6603 is not what a real
+/// client sends; `CMSG_ATTACKSWING` is, and the server answers it with
+/// `SMSG_ATTACKSTART`. See `App::activate_slot`.
+pub const AUTO_ATTACK: u32 = 6603;
+
 /// Names, icons and the GPU textures they turned into.
 #[derive(Default)]
 pub struct Spellbook {
@@ -348,25 +369,46 @@ impl Spellbook {
     ///
     /// Without game data nothing can be filtered, because nothing is known --
     /// and a bar of numbers the player can actually press beats an empty one.
+    ///
+    /// **Auto-attack is the one deliberate exception, and it has to be one.**
+    /// `SkillLineAbility` puts spell 6603 on line 183 with a class mask of
+    /// zero -- the same bucket as `Opening`, `Closing` and `Honorless Target`,
+    /// which is precisely the bucket the rule above exists to reject. So the
+    /// mechanism that correctly keeps a warrior's bar free of junk necessarily
+    /// rejects the one ability every character in the game uses. Widening the
+    /// rule to admit line 183 would readmit all of it; naming the single spell
+    /// admits exactly what was checked.
     pub fn castable(&self, known: &[u32], class: u8) -> Vec<u32> {
         // Class ids count from 1, and the mask's bit 0 is the first class.
         let wanted_class = 1u32 << class.saturating_sub(1) as u32;
         let mut castable: Vec<u32> = known
             .iter()
             .copied()
-            .filter(|id| match self.known.get(id) {
-                Some(info) => {
-                    !info.passive
-                        && self
-                            .class_masks
-                            .get(id)
-                            .is_some_and(|mask| mask & wanted_class != 0)
+            .filter(|id| {
+                if *id == AUTO_ATTACK {
+                    return true;
                 }
-                None => !self.have_data,
+                match self.known.get(id) {
+                    Some(info) => {
+                        !info.passive
+                            && self
+                                .class_masks
+                                .get(id)
+                                .is_some_and(|mask| mask & wanted_class != 0)
+                    }
+                    None => !self.have_data,
+                }
             })
             .collect();
         // Stable across sessions, so a slot keeps its spell.
         castable.sort_unstable();
+        // Auto-attack first, in both the book and the bar it seeds: it is the
+        // ability a melee character uses most and the only one every class
+        // has, and burying it among the sorted ids would make the list read as
+        // though it were missing.
+        if let Some(at) = castable.iter().position(|id| *id == AUTO_ATTACK) {
+            castable[..=at].rotate_right(1);
+        }
         castable
     }
 }
@@ -424,6 +466,55 @@ mod tests {
             "a referenced spell's duration did not resolve: {shield}"
         );
         assert!(!shield.contains('$'), "a token survived: {shield}");
+    }
+
+    /// Auto-attack survives the filter that exists to reject everything it
+    /// looks like.
+    ///
+    /// This is the check the whole exception is for. Spell 6603 sits on
+    /// `SkillLineAbility`'s generic line 183 with a class mask of zero -- the
+    /// same row shape as `Opening`, `Duel` and `Honorless Target`, which is
+    /// exactly what [`Spellbook::castable`] is built to throw away. So the two
+    /// halves have to be asserted together: the one spell is admitted, *and*
+    /// the junk it is indistinguishable from is still refused. Testing only
+    /// the first would pass just as well if the filter had been widened to
+    /// admit line 183 wholesale, which is the wrong fix and the tempting one.
+    ///
+    /// Run against a real warrior's spell list rather than an invented one:
+    /// the ids below are `Testwolf`'s, and the junk ones are the specific
+    /// spells that turned up on a bar during 4.3 and prompted the filter.
+    #[test]
+    fn auto_attack_is_admitted_and_the_junk_beside_it_is_not() {
+        let mut chain = match chain() {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping: WOW_DATA not set");
+                return;
+            }
+        };
+
+        // Auto Attack, Opening, Closing, Duel, Honorless Target, Heroic
+        // Strike, Battle Shout, and one passive weapon skill.
+        let known = [AUTO_ATTACK, 6233, 6246, 7266, 2479, 78, 6673, 196];
+        let book = Spellbook::load(&mut chain, &HashSet::from(known));
+        // Class 1 is warrior.
+        let castable = book.castable(&known, 1);
+
+        assert_eq!(
+            castable.first(),
+            Some(&AUTO_ATTACK),
+            "auto-attack has to lead the list, and is instead {castable:?}"
+        );
+        assert!(castable.contains(&78), "Heroic Strike was filtered out");
+        assert!(castable.contains(&6673), "Battle Shout was filtered out");
+        for junk in [6233u32, 6246, 7266, 2479, 196] {
+            assert!(
+                !castable.contains(&junk),
+                "{} ({junk}) reached the bar; the filter was widened rather than \
+                 given one exception",
+                book.name(junk)
+            );
+        }
     }
 
     /// The survey: run every description in the build through substitution and

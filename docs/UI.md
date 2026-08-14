@@ -51,7 +51,7 @@ overlay, and the layout editor. Those are meant to look like tools.
 | `element` | Where a frame sits: anchor, offset, scale, visibility |
 | `style` | Every dimension and colour the frames draw with |
 | `layout` | The whole profile, and the file it lives in |
-| `frames` | The frames themselves: `unit`, `chat`, `action_bar`, `cast_bar`, `marker` |
+| `frames` | The frames themselves: `unit`, `chat`, `action_bar`, `cast_bar`, `spellbook`, `marker`, `combat_text` |
 | `edit` | Rearranging it from inside the running client |
 | `Hud` | What a caller holds: profile + edit state + the draw call |
 
@@ -278,6 +278,54 @@ on that packet arriving to disappear. `WorldState::active_cast` reads `None`
 once a cast's own duration has elapsed regardless of whether
 `SMSG_SPELL_GO` ever lands -- a stuck cast bar is not a failure mode this
 client has.
+
+## Spellbook, and arranging a bar from inside the client
+
+`crates/ui/src/frames/spellbook.rs`, opened with `P`. It lists what the
+character can do; a left click picks a spell up, a left click on an action
+slot puts it down, and a right click on a slot empties it. The held spell is
+drawn against the cursor, and Escape or a right click anywhere puts it back.
+
+**Why it had to exist before combat could be tried.** Until it did, the bars
+were filled once at login by `App::seed_action_bars` and could never be
+changed from inside the client, so any ability the seeder's filter rejected
+was unreachable no matter what the character knew. Auto-attack was exactly
+that, and not by accident: `SkillLineAbility` puts spell 6603 on the generic
+line 183 with a class mask of zero -- the same row shape as `Opening`,
+`Closing`, `Duel` and `Honorless Target`, which is precisely the shape
+`Spellbook::castable` exists to throw away. The mechanism that correctly
+keeps a warrior's bar free of junk necessarily rejected the one ability every
+character in the game uses.
+
+That left two fixes and only one of them is right. Widening the filter to
+admit line 183 readmits all the junk with it; naming the single spell admits
+exactly what was checked. `spells::AUTO_ATTACK` is therefore a hardcoded id
+with its evidence written next to it, and
+`auto_attack_is_admitted_and_the_junk_beside_it_is_not` asserts *both* halves
+against the real archives -- because a test of the first half alone would pass
+just as well under the wrong fix.
+
+**A slot still stores a plain spell id.** `ui.toml` is unchanged and a layout
+written before any of this existed still loads. Which message a slot sends is
+derived from the spell rather than stored beside it, so a bar arranged by hand
+in the file behaves identically to one arranged in-game. Auto-attack is the
+one spell that does not travel by `CMSG_CAST_SPELL`: it is a *state*, bracketed
+by `SMSG_ATTACKSTART` and `SMSG_ATTACKSTOP`, so its slot toggles, and whether
+it is currently on is read out of `WorldState::attacking` rather than kept as a
+local flag. The server ends an attack by itself when the target dies or walks
+out of range; a local flag would be inverted from that moment on, and the next
+press would send a stop for a fight that was already over and look like the
+key had failed.
+
+**A hold does not outlive the book.** Closing the spellbook puts down whatever
+was picked up, because the held indicator is drawn from the book's own entry --
+a hold that survived would be a mode with nothing on screen to show it, and the
+next click on a bar would silently mean "put" instead of "cast".
+
+An assignment writes `ui.toml` immediately rather than waiting for edit mode's
+Save button. Arranging a bar is not editing the layout: it happens mid-play
+with the edit window shut, and a spell that has to be dragged on again after
+every restart is worse than no spellbook at all.
 
 ## What is deliberately not here yet
 

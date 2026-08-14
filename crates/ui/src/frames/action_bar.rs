@@ -207,7 +207,7 @@ pub fn hover_tooltip(response: &egui::Response, spell: &SlotSpell) {
 /// Initials rather than a truncation, because `Heroic Strike` and `Heroic
 /// Throw` truncate to the same thing at this width, and two slots that look
 /// identical are worse than two that look cryptic.
-fn abbreviate(name: &str) -> String {
+pub(crate) fn abbreviate(name: &str) -> String {
     let words: Vec<&str> = name.split_whitespace().collect();
     match words.len() {
         0 => String::new(),
