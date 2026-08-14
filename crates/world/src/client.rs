@@ -319,27 +319,65 @@ impl Connection {
         distance: f32,
         speed: f32,
     ) -> Result<(crate::update::Position, Vec<Packet>), Error> {
+        self.travel(
+            mover,
+            from,
+            heading,
+            crate::motion::Motion {
+                forward: true,
+                ..Default::default()
+            },
+            distance,
+            speed,
+        )
+    }
+
+    /// The same, in any direction the movement keys can express.
+    ///
+    /// [`Self::walk`] is this with `forward` held, and exists because most
+    /// callers want exactly that. The general form is what makes strafing
+    /// testable from the command line: a character *facing* one way and
+    /// *travelling* another is the whole difference between walking and
+    /// sidestepping, and it is a difference no single heading can express.
+    ///
+    /// The opcodes and flags come from [`crate::motion::Motion`] rather than
+    /// being chosen here, so this rig and the viewer cannot disagree about
+    /// what a strafe is -- which matters, because this rig is how the viewer's
+    /// version gets checked against a real server.
+    pub fn travel(
+        &mut self,
+        mover: u64,
+        from: crate::update::Position,
+        facing: f32,
+        motion: crate::motion::Motion,
+        distance: f32,
+        speed: f32,
+    ) -> Result<(crate::update::Position, Vec<Packet>), Error> {
         use crate::movement::MovementInfo;
-        use crate::update::movement_flags;
 
         // A tenth of a second between heartbeats, which is roughly what a real
         // client sends while moving.
         const STEP: Duration = Duration::from_millis(100);
 
         let steps = ((distance / speed) / STEP.as_secs_f32()).ceil().max(1.0) as u32;
-        let (dx, dy) = (heading.cos(), heading.sin());
+        // Where the character *goes*, which is not where it faces once
+        // strafing is involved.
+        let (dx, dy) = motion.direction(facing);
+        let flags = motion.flags();
 
         let mut at = crate::update::Position {
-            orientation: heading,
+            orientation: facing,
             ..from
         };
         let start = MovementInfo {
-            flags: movement_flags::FORWARD,
+            flags,
             time: self.tick(),
             position: at,
             ..MovementInfo::default()
         };
-        self.send_movement(ClientOpcode::MoveStartForward, mover, &start)?;
+        for opcode in crate::motion::Motion::transitions(Default::default(), motion) {
+            self.send_movement(opcode, mover, &start)?;
+        }
 
         // Kept and returned rather than discarded: movement is unacknowledged,
         // so what the server volunteers during it is the only evidence
@@ -353,7 +391,7 @@ impl Connection {
             at.y = from.y + dy * travelled;
 
             let beat = MovementInfo {
-                flags: movement_flags::FORWARD,
+                flags,
                 time: self.tick(),
                 position: at,
                 ..MovementInfo::default()
@@ -365,17 +403,74 @@ impl Connection {
             seen.extend(self.drain(Duration::from_millis(1), 64)?);
         }
 
-        // Stopping matters: a character left in the FORWARD state keeps moving
-        // in the server's simulation after the client goes quiet.
+        // Stopping matters: a character left in a moving state keeps moving in
+        // the server's simulation after the client goes quiet. Both axes get
+        // stopped, by the same transition logic that started them.
         let stop = MovementInfo {
             flags: 0,
             time: self.tick(),
             position: at,
             ..MovementInfo::default()
         };
-        self.send_movement(ClientOpcode::MoveStop, mover, &stop)?;
+        for opcode in crate::motion::Motion::transitions(motion, Default::default()) {
+            self.send_movement(opcode, mover, &stop)?;
+        }
         seen.extend(self.drain(Duration::from_millis(300), 128)?);
         Ok((at, seen))
+    }
+
+    /// Jumps on the spot and lands again, reporting what arrived in between.
+    ///
+    /// The whole arc, because a jump is a pair of statements and the second is
+    /// the one that is easy to forget: `MSG_MOVE_JUMP` says a character left
+    /// the ground at a given velocity, and `MSG_MOVE_FALL_LAND` says it
+    /// arrived. Without the landing the server goes on believing the character
+    /// is in the air, and nothing complains.
+    ///
+    /// Timed against [`crate::motion::GRAVITY`] rather than slept for a round
+    /// number, so `fall_time` is the time the arc actually took -- that field
+    /// is what fall damage is computed from, and a value that disagrees with
+    /// the height fallen is exactly the kind of inconsistency a server with
+    /// movement checks looks for.
+    pub fn jump_in_place(
+        &mut self,
+        mover: u64,
+        at: crate::update::Position,
+    ) -> Result<Vec<Packet>, Error> {
+        use crate::movement::{Falling, MovementInfo};
+        use crate::update::movement_flags;
+
+        let jump = crate::motion::Jump::begin((0.0, 0.0), 0.0);
+        let takeoff = MovementInfo {
+            flags: movement_flags::FALLING,
+            time: self.tick(),
+            position: at,
+            fall_time: 0,
+            falling: Some(Falling {
+                velocity: jump.velocity,
+                sin_angle: jump.sin_angle,
+                cos_angle: jump.cos_angle,
+                xy_speed: jump.xy_speed,
+            }),
+            ..MovementInfo::default()
+        };
+        self.send_movement(ClientOpcode::MoveJump, mover, &takeoff)?;
+
+        // Up and back down: `2v/g` seconds, which for the constants involved
+        // is a little under a second.
+        let airborne = Duration::from_secs_f32(2.0 * crate::motion::JUMP_VELOCITY / crate::motion::GRAVITY);
+        let mut seen = self.drain(airborne, 128)?;
+
+        let landing = MovementInfo {
+            flags: 0,
+            time: self.tick(),
+            position: at,
+            fall_time: airborne.as_millis() as u32,
+            ..MovementInfo::default()
+        };
+        self.send_movement(ClientOpcode::MoveFallLand, mover, &landing)?;
+        seen.extend(self.drain(Duration::from_millis(300), 128)?);
+        Ok(seen)
     }
 
     /// Turns on the spot, without translating.
@@ -481,6 +576,55 @@ impl Connection {
     /// progress, so there is nothing to name.
     pub fn attack_stop(&mut self) -> Result<(), Error> {
         self.send(ClientOpcode::AttackStop, &[])
+    }
+
+    /// Acknowledges a teleport within the current map.
+    ///
+    /// **The server will not finish the move until this arrives, and will
+    /// throw away every movement packet sent in the meantime.** Both halves are
+    /// silent, which is what makes forgetting it expensive: the character
+    /// stands still on the server while the client walks it around locally, and
+    /// nothing anywhere reports a problem.
+    ///
+    /// The reply is `{packed guid, u32, u32}`. The server reads the last two
+    /// as flags and a time and uses neither, so the counter it sent is echoed
+    /// into the first -- returning what was sent is a better default than
+    /// inventing a value, and costs nothing.
+    pub fn acknowledge_teleport(&mut self, mover: u64, counter: u32) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(16);
+        crate::update::write_packed_guid(mover, &mut body);
+        body.extend_from_slice(&counter.to_le_bytes());
+        body.extend_from_slice(&self.tick().to_le_bytes());
+        self.send(ClientOpcode::MoveTeleportAck, &body)
+    }
+
+    /// Asks where this character's body is. The request has no body at all.
+    pub fn query_corpse(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::CorpseQuery, &[])
+    }
+
+    /// Releases the spirit, turning a corpse into a ghost at the graveyard.
+    ///
+    /// The body is one byte the server reads and throws away. Sending nothing
+    /// at all is *not* the same thing: the read happens before any of the
+    /// checks, so a zero-length body is a short read rather than a request.
+    ///
+    /// Nothing acknowledges this directly. What confirms it is the state
+    /// changing -- `PLAYER_FLAGS` gaining its ghost bit, health going to one,
+    /// and a corpse object appearing where the body fell.
+    pub fn release_spirit(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::RepopRequest, &[0])
+    }
+
+    /// Takes the body back, resurrecting at the corpse.
+    ///
+    /// The guid is **unpacked**, like [`Self::attack_swing`]'s and unlike the
+    /// packed form the update blocks use. Getting that wrong would send a
+    /// shorter body that reads as a different guid entirely, and the failure
+    /// would be silence -- this request has five separate silent refusals
+    /// already, so it is the last place to also be guessing at an encoding.
+    pub fn reclaim_corpse(&mut self, corpse: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::ReclaimCorpse, &corpse.to_le_bytes())
     }
 
     /// Milliseconds since the connection opened, as the movement clock.

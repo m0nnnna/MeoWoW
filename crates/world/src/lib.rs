@@ -12,6 +12,8 @@ pub mod chat;
 pub mod combat;
 pub mod client;
 pub mod crypt;
+pub mod death;
+pub mod motion;
 pub mod movement;
 pub mod names;
 pub mod opcode;

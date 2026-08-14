@@ -49,6 +49,23 @@ pub enum ClientOpcode {
     AttackSwing = 0x0141,
     AttackStop = 0x0142,
 
+    /// Release the spirit: give up the body and become a ghost at the nearest
+    /// graveyard. Carries one byte the server reads and discards.
+    ///
+    /// Refused in silence when the player is alive or is already a ghost, which
+    /// is worth knowing before concluding the opcode is wrong -- the first
+    /// attempt at this produced nothing at all because the character had been
+    /// killed in an earlier run and was already released.
+    RepopRequest = 0x015A,
+    /// Take the body back, standing at the corpse. Carries the corpse's guid,
+    /// **unpacked** -- eight plain bytes, unlike almost every other guid this
+    /// protocol sends.
+    ///
+    /// Refused in silence unless the player is dead, has released, has a
+    /// corpse, is within reclaim range of it, and the reclaim delay has
+    /// elapsed. Five ways to get nothing back, none of which says which.
+    ReclaimCorpse = 0x01D2,
+
     // Movement. These are `MSG_` rather than `CMSG_`: the same opcode travels
     // in both directions, the client reporting its own movement and the server
     // relaying someone else's. Only the framing differs -- inbound packets are
@@ -56,9 +73,47 @@ pub enum ClientOpcode {
     MoveStartForward = 0x00B5,
     MoveStartBackward = 0x00B6,
     MoveStop = 0x00B7,
+    /// Sidestepping. A separate axis from forward and backward, with its own
+    /// start and stop: a character can begin strafing without stopping running,
+    /// and the opcode names only the axis that changed while the flags carry
+    /// the whole state.
+    ///
+    /// These three are the same three that a real client's capture showed this
+    /// project dropping -- `0x00B8`, `0x00B9` and `0x00BA` were among the five
+    /// unnamed movement opcodes in `wow-cli moves`, each carrying a body that
+    /// parsed as `{packed guid, MovementInfo}` and consumed to the byte. The
+    /// capture said *these opcodes are movement*; it could not say which
+    /// movement each was, which is why they went unnamed at the time.
+    MoveStartStrafeLeft = 0x00B8,
+    MoveStartStrafeRight = 0x00B9,
+    MoveStopStrafe = 0x00BA,
     MoveJump = 0x00BB,
+    /// The end of a jump or a fall. Carries the total time spent in the air in
+    /// `MovementInfo::fall_time`, which is what fall damage is computed from --
+    /// so a client that jumps and never lands is one the server believes is
+    /// still falling.
+    MoveFallLand = 0x00C9,
     MoveSetFacing = 0x00DA,
     MoveHeartbeat = 0x00EE,
+    /// Confirming a teleport within the same map. The server sends this
+    /// opcode, and the client must send it back before the move takes effect.
+    ///
+    /// **Not optional, and its absence is silent.** Until the acknowledgement
+    /// arrives the server holds the character at the old position *and
+    /// discards every movement packet the client sends* -- so a client that
+    /// ignores this is frozen where it stood, while believing it is walking.
+    /// Found because a released ghost reclaimed its corpse from 58 yards away
+    /// when the limit is 39: the ghost had never actually left the body.
+    MoveTeleportAck = 0x00C7,
+
+    /// Ask the server where this character's body is. Empty request; the
+    /// reply shares the opcode.
+    ///
+    /// The replicated world cannot answer this: corpse-type objects include
+    /// the bones of bodies already reclaimed, they all carry their owner's
+    /// guid, and a graveyard accumulates them. One live run saw seven while
+    /// the server had two.
+    CorpseQuery = 0x0216,
 }
 
 /// The server-to-client opcodes this client reacts to.
@@ -94,6 +149,59 @@ pub mod server {
     pub const MOVE_START_FORWARD: u16 = 0x00B5;
     pub const MOVE_STOP: u16 = 0x00B7;
     pub const MOVE_HEARTBEAT: u16 = 0x00EE;
+
+    /// Every `MSG_MOVE_*` that carries a plain `{packed guid, MovementInfo}`
+    /// and is relayed to the players who can see the mover.
+    ///
+    /// **This client read three of these twenty-four and threw the rest away.**
+    /// The gap was found by watching a real 3.3.5a client walk about and asking
+    /// `wow-cli moves` which opcodes in the capture had that shape: five more
+    /// turned up, and `MSG_MOVE_SET_FACING` alone was 93% of that client's
+    /// entire movement stream. Every one of 1,202 packets across those five
+    /// parsed as a packed guid followed by a `MovementInfo` and consumed its
+    /// body **exactly**, and every one named the single player in view -- where
+    /// the control in the same capture, `MONSTER_MOVE`, managed 75 of 944 with
+    /// 358 left over across 23 different guids.
+    ///
+    /// The list is completed from the server's own dispatch table rather than
+    /// from the five that happened to be observed, because "which opcodes
+    /// exist" is a question about the protocol and not about what a particular
+    /// player did in three minutes -- nobody swam, pitched or flew during that
+    /// capture, and those bodies are the same shape regardless. The five
+    /// confirmed by observation are `START_BACKWARD`, `START_STRAFE_LEFT`,
+    /// `START_STRAFE_RIGHT`, `STOP_STRAFE` and `SET_FACING`, plus `FALL_LAND`
+    /// in an earlier run and the three already handled.
+    ///
+    /// The discriminator worth keeping is that `MSG_` travels in both
+    /// directions and `CMSG_` does not: `CMSG_MOVE_FALL_RESET`,
+    /// `CMSG_MOVE_SET_FLY` and `CMSG_MOVE_CHNG_TRANSPORT` share the same
+    /// handler and are deliberately **not** here, because nothing relays them.
+    pub const MOVE_RELAYED: [u16; 24] = [
+        0x00B5, // START_FORWARD
+        0x00B6, // START_BACKWARD
+        0x00B7, // STOP
+        0x00B8, // START_STRAFE_LEFT
+        0x00B9, // START_STRAFE_RIGHT
+        0x00BA, // STOP_STRAFE
+        0x00BB, // JUMP
+        0x00BC, // START_TURN_LEFT
+        0x00BD, // START_TURN_RIGHT
+        0x00BE, // STOP_TURN
+        0x00BF, // START_PITCH_UP
+        0x00C0, // START_PITCH_DOWN
+        0x00C1, // STOP_PITCH
+        0x00C2, // SET_RUN_MODE
+        0x00C3, // SET_WALK_MODE
+        0x00C9, // FALL_LAND
+        0x00CA, // START_SWIM
+        0x00CB, // STOP_SWIM
+        0x00DA, // SET_FACING
+        0x00DB, // SET_PITCH
+        0x00EE, // HEARTBEAT
+        0x0359, // START_ASCEND
+        0x035A, // STOP_ASCEND
+        0x03A7, // START_DESCEND
+    ];
 
     /// Answers to the two name queries. Neither is guaranteed to arrive: the
     /// server simply does not reply to a guid it has forgotten, which is why
@@ -137,6 +245,49 @@ pub mod server {
 
     /// The same body as [`MESSAGECHAT`], sent for a GM's lines.
     pub const GM_MESSAGECHAT: u16 = 0x03B3;
+
+    /// The server moving this character within the current map, and asking to
+    /// be told the client noticed: `{packed guid, u32 counter, MovementInfo}`.
+    /// See [`crate::ClientOpcode::MoveTeleportAck`] for why answering matters.
+    pub const MOVE_TELEPORT_ACK: u16 = 0x00C7;
+
+    /// The answer to [`crate::ClientOpcode::CorpseQuery`], sharing its
+    /// number. See [`crate::death::parse_corpse_query`].
+    pub const CORPSE_QUERY: u16 = 0x0216;
+
+    /// Where to run back to: `{u32 map, f32 x, f32 y, f32 z}` naming the
+    /// graveyard a released ghost was sent to.
+    ///
+    /// **This is why the corpse run needs no `WorldSafeLocs.dbc`.** The
+    /// obvious reading of a graveyard run is that the client picks the nearest
+    /// graveyard out of the table and shows it; the server picks it and says
+    /// which, so the table is only needed to put a *name* on the place. A map
+    /// of `0xFFFFFFFF` with three zeroes is the same packet used to take the
+    /// marker back off the minimap, which is what arrives on resurrection.
+    pub const DEATH_RELEASE_LOC: u16 = 0x0378;
+    /// Sent on death: how long before the corpse can be reclaimed, in
+    /// milliseconds. Observed carrying exactly 30000.
+    pub const CORPSE_RECLAIM_DELAY: u16 = 0x0269;
+    /// A unit's threat list dropping someone: `{packed guid, packed guid}`,
+    /// the list's owner then whoever left it. Arrives twice on death, once per
+    /// creature that had us.
+    pub const THREAT_REMOVE: u16 = 0x0484;
+    /// The fight ending because one side stopped existing. Empty body.
+    pub const CANCEL_COMBAT: u16 = 0x014E;
+    /// Equipment losing durability from dying. Not parsed.
+    pub const DURABILITY_DAMAGE_DEATH: u16 = 0x02BD;
+}
+
+/// Whether this opcode carries `{packed guid, MovementInfo}` from another
+/// mover.
+///
+/// One list, consulted by the dispatcher that folds these and by the capture
+/// analysis that hunts for ones being missed. Two copies would drift, and the
+/// way they would drift is the analysis reporting an opcode as handled after
+/// someone removed it from the fold -- a tool agreeing with itself, which is
+/// the one shape of evidence this project does not accept.
+pub fn is_relayed_movement(opcode: u16) -> bool {
+    server::MOVE_RELAYED.contains(&opcode)
 }
 
 /// A human-readable name for an incoming opcode, for logs and dumps.
@@ -183,7 +334,20 @@ pub fn describe(opcode: u16) -> String {
         server::POWER_UPDATE => "SMSG_POWER_UPDATE",
         server::SPELL_NON_MELEE_DAMAGE_LOG => "SMSG_SPELLNONMELEEDAMAGELOG",
         server::THREAT_UPDATE => "SMSG_THREAT_UPDATE",
+        server::MOVE_TELEPORT_ACK => "MSG_MOVE_TELEPORT_ACK",
+        server::CORPSE_QUERY => "MSG_CORPSE_QUERY",
+        server::DEATH_RELEASE_LOC => "SMSG_DEATH_RELEASE_LOC",
+        server::CORPSE_RECLAIM_DELAY => "SMSG_CORPSE_RECLAIM_DELAY",
+        server::THREAT_REMOVE => "SMSG_THREAT_REMOVE",
+        server::CANCEL_COMBAT => "SMSG_CANCEL_COMBAT",
+        server::DURABILITY_DAMAGE_DEATH => "SMSG_DURABILITY_DAMAGE_DEATH",
         server::GM_MESSAGECHAT => "SMSG_GM_MESSAGECHAT",
+        // Understood as movement without this client caring which movement it
+        // is: every one of them is a position for a mover, and that is all it
+        // does with them. The number stays visible so a log still says which.
+        other if is_relayed_movement(other) => {
+            return format!("MSG_MOVE_* relayed ({other:#06x})")
+        }
         other => return format!("opcode {other:#06x}"),
     };
     name.to_string()

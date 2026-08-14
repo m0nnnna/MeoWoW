@@ -170,6 +170,22 @@ enum Command {
         /// character is already facing.
         #[arg(long)]
         heading: Option<f32>,
+        /// Sidestep instead of walking forward: `left` or `right`.
+        ///
+        /// The character keeps facing its heading and travels at a right angle
+        /// to it, which is the whole difference between strafing and walking --
+        /// and the reason this is worth driving from here. The check is not
+        /// that the packets were accepted (nothing acknowledges them) but that
+        /// the position the *server* stores moved sideways: run again without
+        /// `--enter`, or read `characters.position_x` out of the database.
+        #[arg(long)]
+        strafe: Option<Strafe>,
+        /// After entering, jump on the spot.
+        ///
+        /// Exercises the one part of `MovementInfo` that only a jump populates
+        /// -- the falling block, and `fall_time` with it.
+        #[arg(long)]
+        jump: bool,
         /// Turn on the spot to this heading, in degrees, without walking.
         #[arg(long)]
         face: Option<f32>,
@@ -208,6 +224,24 @@ enum Command {
         /// wrong face.
         #[arg(long)]
         appearance: bool,
+        /// Print every field set on this character's own object, for diffing
+        /// one state against another -- alive against dead, say.
+        #[arg(long)]
+        own_fields: bool,
+        /// Keep fighting until this character dies, for capturing the death
+        /// and corpse flow.
+        ///
+        /// **The only way to see those packets is to be killed by something**,
+        /// so this picks a fight, holds it, and picks another when the target
+        /// dies -- health does not recover between rounds, so a level-one
+        /// character loses eventually. Bounded by a wall clock, because "fight
+        /// until dead" against something too weak to win is otherwise a loop
+        /// with no exit.
+        ///
+        /// Pair with `--target Wolf`: the closest thing to a starting character
+        /// is usually a friendly guard, and swinging at one is refused.
+        #[arg(long)]
+        until_death: bool,
         /// Select the nearest unit whose name contains this, rather than the
         /// nearest unit of any kind.
         ///
@@ -225,6 +259,21 @@ enum Command {
         /// drops the session.
         #[arg(long)]
         select: bool,
+        /// Target your own character, the way clicking your own portrait
+        /// does. Several GM commands act on the caller only once
+        /// `UNIT_FIELD_TARGET` is set.
+        #[arg(long)]
+        select_self: bool,
+        /// Release the spirit: give up the body and become a ghost at the
+        /// nearest graveyard. Only does anything to a character who is
+        /// dead and has not already released.
+        #[arg(long)]
+        release: bool,
+        /// Take the body back. Needs the ghost to be standing at its own
+        /// corpse and the reclaim delay to have run out, so it is the end
+        /// of a corpse run rather than a shortcut past one.
+        #[arg(long)]
+        reclaim: bool,
         /// Select the nearest unit and swing at it, then hold the line.
         ///
         /// Auto-attack is a state rather than an action: one swing request
@@ -274,6 +323,30 @@ enum Command {
         port: u16,
         #[arg(long, default_value_t = 8)]
         timeout: u64,
+    },
+    /// Ask which opcodes in a `--capture` file carry relayed movement.
+    ///
+    /// The question this answers came out of a live run: watching one real
+    /// client walk about produced nine movement-shaped opcodes, of which this
+    /// client folds exactly three. Every other one is a position thrown away,
+    /// which does not error and shows up only as a mover whose samples look
+    /// further apart than they are.
+    ///
+    /// **Nothing is named from memory.** The test is structural and is the one
+    /// this project already trusts: a relayed movement packet is a packed guid
+    /// followed by a `MovementInfo`, and it must consume its body *exactly*.
+    /// An opcode where every sample parses clean and every guid names the same
+    /// handful of movers is carrying movement; one where the cursor is left
+    /// holding bytes is not, whatever it is called elsewhere. The parser used
+    /// is the shipped one rather than a second copy written for this command,
+    /// because two parsers for one layout can disagree and only one of them is
+    /// the one the client actually runs.
+    Moves {
+        /// A file written by `world --capture`.
+        capture: PathBuf,
+        /// Also print the movers and sample intervals for this opcode.
+        #[arg(long)]
+        detail: Option<String>,
     },
 }
 
@@ -437,6 +510,10 @@ fn main() -> Result<()> {
             port,
             timeout,
         } => return auth_login(host, *port, user, password, &cli.locale, *timeout),
+        // Reads a capture file, not an archive.
+        Command::Moves { capture, detail } => {
+            return report_capture_moves(capture, detail.as_deref())
+        }
         Command::World {
             host,
             user,
@@ -455,13 +532,20 @@ fn main() -> Result<()> {
             dump_failed,
             walk,
             heading,
+            strafe,
+            jump,
             face,
             stay,
             units,
             objects,
             target,
+            own_fields,
+            until_death,
             appearance,
             select,
+            select_self,
+            release,
+            reclaim,
             attack,
             capture,
             names,
@@ -478,13 +562,20 @@ fn main() -> Result<()> {
                 dump_failed: dump_failed.as_deref(),
                 walk: *walk,
                 heading: *heading,
+                strafe: *strafe,
+                jump: *jump,
                 face: *face,
                 stay: *stay,
                 units: *units,
                 objects: *objects,
                 target: target.as_deref(),
+                own_fields: *own_fields,
+                until_death: *until_death,
                 appearance: *appearance,
                 select: *select,
+                select_self: *select_self,
+                release: *release,
+                reclaim: *reclaim,
                 attack: *attack,
                 capture: capture.as_deref(),
                 names: *names,
@@ -541,7 +632,7 @@ fn main() -> Result<()> {
         Command::Adt(cmd) => adt_cmd(&mut chain, cmd),
         Command::Light { map, x, y, hour } => light::report(&mut chain, map, x, y, hour),
         // Handled before the archives are opened.
-        Command::Auth { .. } | Command::World { .. } => unreachable!(),
+        Command::Auth { .. } | Command::World { .. } | Command::Moves { .. } => unreachable!(),
     }
 }
 
@@ -607,13 +698,20 @@ struct WorldRequest<'a> {
     dump_failed: Option<&'a std::path::Path>,
     walk: Option<f32>,
     heading: Option<f32>,
+    strafe: Option<Strafe>,
+    jump: bool,
     face: Option<f32>,
     stay: u64,
     units: Option<usize>,
     objects: bool,
     target: Option<&'a str>,
+    own_fields: bool,
+    until_death: bool,
     appearance: bool,
     select: bool,
+    select_self: bool,
+    release: bool,
+    reclaim: bool,
     attack: bool,
     capture: Option<&'a std::path::Path>,
     names: bool,
@@ -625,6 +723,13 @@ struct WorldRequest<'a> {
     cast_self: bool,
     locale: &'a str,
     timeout: u64,
+}
+
+/// Which way to sidestep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Strafe {
+    Left,
+    Right,
 }
 
 /// Logs in and walks all the way through to the character list.
@@ -648,13 +753,20 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         dump_failed,
         walk,
         heading,
+        strafe,
+        jump,
         face,
         stay,
         units,
         objects,
         target,
+        own_fields,
+        until_death,
         appearance,
         select,
+        select_self,
+        release,
+        reclaim,
         attack,
         capture,
         names,
@@ -837,12 +949,32 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
             // than this is what a server's movement checks exist to catch.
             const RUN_SPEED: f32 = 7.0;
 
+            let motion = match strafe {
+                None => world::motion::Motion {
+                    forward: true,
+                    ..Default::default()
+                },
+                Some(Strafe::Left) => world::motion::Motion {
+                    strafe_left: true,
+                    ..Default::default()
+                },
+                Some(Strafe::Right) => world::motion::Motion {
+                    strafe_right: true,
+                    ..Default::default()
+                },
+            };
+            let (dx, dy) = motion.direction(heading);
             println!(
-                "\nwalking {distance:.0} units on heading {:.2} rad",
-                heading
+                "\n{} {distance:.0} units, facing {heading:.2} rad, travelling ({dx:+.2}, {dy:+.2})",
+                match strafe {
+                    None => "walking",
+                    Some(Strafe::Left) => "strafing left",
+                    Some(Strafe::Right) => "strafing right",
+                }
             );
+            println!("  movement flags {:#06x}", motion.flags());
             let (arrived, seen) =
-                connection.walk(character.guid, from, heading, distance, RUN_SPEED)?;
+                connection.travel(character.guid, from, heading, motion, distance, RUN_SPEED)?;
             println!(
                 "  client is now at {:.1}, {:.1}, {:.1}",
                 arrived.x, arrived.y, arrived.z
@@ -883,6 +1015,30 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
             );
         }
 
+        if jump {
+            let at = world::Position {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                orientation: position.orientation,
+            };
+            println!("\njumping on the spot at {:.1}, {:.1}, {:.1}", at.x, at.y, at.z);
+            let seen = connection.jump_in_place(character.guid, at)?;
+            println!(
+                "  take-off velocity {:.4}, gravity {:.4}",
+                world::motion::JUMP_VELOCITY,
+                world::motion::GRAVITY
+            );
+            println!("  server sent {} packets during the jump", seen.len());
+            for packet in &seen {
+                println!(
+                    "    {:<32} {} bytes",
+                    world::opcode::describe(packet.opcode),
+                    packet.body.len()
+                );
+            }
+        }
+
         // A named target, resolved through the same name table the unit frames
         // read. Selected before `--cast` and `--attack` so both act on it.
         let mut chosen = None;
@@ -915,6 +1071,19 @@ targeting {} ({:#x}), {distance:.1} units away",
                 None => println!("
 nothing replicated matches {wanted:?}"),
             }
+        }
+
+        // Targeting yourself, which a real client does whenever the player
+        // clicks their own portrait -- and which several GM commands require
+        // before they will act on you. `.die` is the one that matters here: it
+        // falls back to the caller when nothing is selected, but then refuses
+        // unless `UNIT_FIELD_TARGET` is actually set, so a session that has
+        // never targeted anything cannot kill itself. That is a one-line
+        // difference between "the command does nothing" and a death capture.
+        if select_self {
+            connection.set_selection(character.guid)?;
+            connection.drain(std::time::Duration::from_millis(500), 64)?;
+            println!("\nselected self ({:#x})", character.guid);
         }
 
         if select && chosen.is_none() {
@@ -1028,6 +1197,18 @@ nothing replicated matches {wanted:?}"),
             }
         }
 
+        // Before the fight as well as after it, because the question this flag
+        // exists to answer is *which field changed*, and one snapshot of a dead
+        // character cannot answer it. A field that is set on both sides says
+        // nothing; a field that appears, vanishes or moves is the answer.
+        if own_fields {
+            report_own_fields(&state, character.guid, "before");
+        }
+
+        if until_death {
+            fight_until_death(&mut connection, &mut state, character, target, capture.as_mut())?;
+        }
+
         // Before `--stay`, so the names are in hand when chat starts arriving
         // and a line from another player is attributed rather than numbered.
         if names {
@@ -1094,6 +1275,33 @@ nothing replicated matches {wanted:?}"),
                     println!("    {:<32} x{count}", world::opcode::describe(*opcode));
                 }
             }
+        }
+
+        // **After `--say`, deliberately.** Releasing is only legal for a
+        // character who is already dead, and the way this rig kills one is a GM
+        // command sent as chat. Run in the order the flags are declared instead
+        // and the release goes out while the character is still alive, is
+        // refused in silence, and reads as the opcode being wrong -- which is
+        // exactly what the first attempt looked like, right down to the
+        // reclaim-delay packet arriving afterwards to prove the death had
+        // happened all along.
+        // Where the release left us, threaded into the reclaim: a ghost is
+        // somewhere the server chose and this client was told once, and the
+        // replicated copy of our own position is frozen at login because the
+        // server never relays our movement back to us.
+        let mut ghost_at = None;
+        if release {
+            ghost_at = report_release(&mut connection, &mut state, character, capture.as_mut())?;
+        }
+
+        if reclaim {
+            report_reclaim(
+                &mut connection,
+                &mut state,
+                character,
+                ghost_at,
+                capture.as_mut(),
+            )?;
         }
 
         if spells {
@@ -1234,6 +1442,10 @@ cast {spell_id} at {} (attempt {attempt})",
 
         if appearance {
             report_appearance(&state, character);
+        }
+
+        if own_fields {
+            report_own_fields(&state, character.guid, "after");
         }
     }
     Ok(())
@@ -1594,18 +1806,29 @@ fn report_units(state: &world::WorldState, own_guid: u64, limit: usize) {
 /// can do is lay out the evidence: thirty-odd objects, each with a handful of
 /// fields, where exactly one field index will resolve for *all* of them.
 fn report_game_objects(state: &world::WorldState) {
+    // Corpses as well as game objects, and labelled, because they are the same
+    // question asked twice: an object in the world that is not a unit, whose
+    // fields nothing here reads yet. A corpse is what a graveyard run runs
+    // back to, so leaving it out of the one command that dumps world objects
+    // meant the object at the centre of the death flow was the only one that
+    // could not be looked at.
     let objects: Vec<&world::state::Entity> = state
         .iter()
-        .filter(|entity| entity.object_type == world::ObjectType::GameObject)
+        .filter(|entity| {
+            matches!(
+                entity.object_type,
+                world::ObjectType::GameObject | world::ObjectType::Corpse
+            )
+        })
         .collect();
     println!("
-{} game object(s):", objects.len());
+{} game object(s) and corpse(s):", objects.len());
     for entity in &objects {
         let position = entity
             .position
             .map(|p| format!("{:.1}, {:.1}, {:.1} facing {:.2}", p.x, p.y, p.z, p.orientation))
             .unwrap_or_else(|| "no position".into());
-        println!("  {:#x}  {position}", entity.guid);
+        println!("  {:#x}  {:?}  {position}", entity.guid, entity.object_type);
         let fields: Vec<String> = entity
             .fields
             .iter()
@@ -1614,7 +1837,7 @@ fn report_game_objects(state: &world::WorldState) {
         println!("    {}", fields.join(" "));
     }
     if objects.is_empty() {
-        println!("  none in range -- stand somewhere with a door or a chest");
+        println!("  none in range -- stand somewhere with a door, a chest or a corpse");
     }
 }
 
@@ -1731,6 +1954,298 @@ fn report_appearance(state: &world::WorldState, character: &world::Character) {
     }
 }
 
+/// Prints every field set on this character's own object.
+///
+/// For diffing one state against another. A character that is dead and a
+/// character that is alive differ in some field, and which one is the question
+/// -- asking it by *comparing two states* rather than by looking up a flag is
+/// the same technique that found `PLAYER_BYTES` and the game-object display id.
+fn report_own_fields(state: &world::WorldState, own_guid: u64, when: &str) {
+    let Some(entity) = state.get(own_guid) else {
+        println!("\nown object not replicated ({when})");
+        return;
+    };
+    println!(
+        "\nown object {own_guid:#x} ({when}), {} field(s) set:",
+        entity.fields.len()
+    );
+    for (index, value) in entity.fields.iter() {
+        println!("  {index:#06x} = {value:#010x} ({value})");
+    }
+}
+
+/// Picks fights until this character is killed, and reports what arrives.
+///
+/// **A death cannot be captured without dying**, and a level-one character wins
+/// most single fights, so this keeps going: when a target falls and we are
+/// still standing, it picks the next one. Health does not recover between
+/// rounds, so the outcome is only a question of how many rounds it takes.
+///
+/// Everything is reported rather than interpreted. Nothing here is parsed as
+/// "you died" -- this client has never seen the death flow, and finding which
+/// opcodes carry it is the whole point of the run. What it prints is own health
+/// each round, every event the fold produced, and every opcode seen.
+fn fight_until_death(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    character: &world::Character,
+    target: Option<&str>,
+    mut capture: Option<&mut Capture>,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    const MELEE_REACH: f32 = 2.5;
+    const RUN_SPEED: f32 = 7.0;
+    // Long enough for several rounds, short enough that a fight this character
+    // cannot lose still ends.
+    let deadline = Instant::now() + Duration::from_secs(540);
+
+    let mut here = state
+        .get(character.guid)
+        .and_then(|entity| entity.position)
+        .unwrap_or_default();
+    let mut round = 0;
+    let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+
+    // **A character that is already dead cannot be killed, and looks exactly
+    // like one that is nearly dead.** A ghost has one health, so `1/79` reads
+    // as a warrior about to fall over rather than as a warrior who already
+    // has. Four runs of this command were spent swinging as a ghost: every
+    // request came back `SMSG_ATTACKSTOP` with no `SMSG_ATTACKSTART`, no
+    // swings, no refusals, and the distances closing correctly the whole time,
+    // which is indistinguishable from an attack opcode that has stopped
+    // working. The character list said `ghost` on every one of those runs and
+    // nothing read it.
+    //
+    // The general form is already in `CLAUDE.md` -- confirm the thing being
+    // read is the thing being written -- and this is its other face: confirm
+    // the precondition still holds before concluding the action failed.
+    if character.is_ghost() {
+        println!(
+            "\n{} is already a ghost, and a ghost cannot fight. Its one health is\n\
+             the ghost's, not a survivor's. Release or resurrect it first, or run\n\
+             this against a living character.",
+            character.name
+        );
+        return Ok(());
+    }
+
+    println!("\nfighting until dead (up to 5 minutes)");
+    let own_max = state
+        .get(character.guid)
+        .and_then(|entity| entity.max_health())
+        .unwrap_or(0);
+
+    while Instant::now() < deadline {
+        round += 1;
+        let own_health = state
+            .get(character.guid)
+            .and_then(|entity| entity.health())
+            .unwrap_or(0);
+        println!("\nround {round}: {own_health}/{own_max}");
+        if own_max > 0 && own_health == 0 {
+            println!("  dead.");
+            break;
+        }
+
+        // The nearest thing matching the name, or the nearest of anything --
+        // measured from `here`, which is where this client has actually walked
+        // to, not from the login position replicated state still believes in.
+        let chosen = {
+            let mut rows = nearest_ordered_from(state, character.guid, here);
+            if let Some(wanted) = target {
+                let wanted = wanted.to_lowercase();
+                rows.retain(|(_, entity)| {
+                    unit_label(state, entity).to_lowercase().contains(&wanted)
+                });
+            }
+            // Something already dead is not worth swinging at, and is exactly
+            // what the previous round left lying there.
+            rows.retain(|(_, entity)| entity.health().is_none_or(|hp| hp > 0));
+            // Whatever is already hitting us wins, wherever it is in the list.
+            //
+            // Without this the run stalls in a way that looks like nothing at
+            // all: a wolf chews the character down to 4 health, the next round
+            // picks a *different* wolf thirty units away, walking there breaks
+            // combat, and health regenerates on the way. The character then
+            // never dies, having spent every round walking between fights it
+            // keeps leaving. Being killed is the entire purpose of this
+            // command, so the thing killing us is the thing to stand still and
+            // let finish.
+            let engaged = rows
+                .iter()
+                .find(|(_, entity)| {
+                    state.attacking.get(&entity.guid) == Some(&character.guid)
+                })
+                .map(|(distance, entity)| (entity.guid, *distance));
+            engaged.or_else(|| rows.first().map(|(distance, entity)| (entity.guid, *distance)))
+        };
+        let Some((guid, distance)) = chosen else {
+            println!("  nothing left to fight");
+            break;
+        };
+
+        // Close, face, swing -- the three steps `--attack` established,
+        // repeated per round because the next target is somewhere else.
+        //
+        // **Closed on the horizontal distance, not the straight-line one**, and
+        // both are printed so the difference is visible rather than inferred.
+        // This client's own Z is not tracked while walking: `Connection::walk`
+        // advances x and y and carries the starting altitude along unchanged,
+        // because the terrain height that would correct it lives in the
+        // renderer. So the vertical term of a 3D distance is a known-wrong
+        // number, and including it in the approach makes the walk stop short by
+        // however wrong it is -- observed as a fight that closed from 97 units
+        // to 10.5 and then refused to close any further, one wolf-length short
+        // of melee, for as long as the run lasted.
+        if let Some(there) = state.get(guid).and_then(|e| e.position) {
+            let flat = ((there.x - here.x).powi(2) + (there.y - here.y).powi(2)).sqrt();
+            println!(
+                "  target {guid:#x} at {flat:.1} units ({distance:.1} straight line, \
+                 dz {:.1})",
+                there.z - here.z
+            );
+            if flat > MELEE_REACH {
+                let heading = (there.y - here.y).atan2(there.x - here.x);
+                let (arrived, _) =
+                    connection.walk(character.guid, here, heading, flat - MELEE_REACH, RUN_SPEED)?;
+                here = arrived;
+                here.orientation = heading;
+                // **And take the target's altitude as our own.**
+                //
+                // `Connection::walk` advances x and y and carries the starting
+                // Z along, so a walk of ninety units across Northshire's hills
+                // tells the server this character is hovering wherever the
+                // ground was at login. That is not a display problem: the
+                // position we send is the position the server believes, and it
+                // measures melee range in three dimensions, so a swing from
+                // two yards away and six above is refused exactly as if it came
+                // from eight yards away. Observed here as a fight that closed
+                // to 2.2 flat units and never landed a blow, with `dz 5.1`
+                // printed beside it.
+                //
+                // The right answer is the terrain height, which `wow-cli adt
+                // height` already computes to within three centimetres -- but
+                // it needs `--data`, and these protocol commands deliberately
+                // work on a machine with no game installation. A creature
+                // stands *on* the ground, so the altitude of the thing we just
+                // walked up to is the best statement about the ground here that
+                // this command can make without one. It is an approximation,
+                // and it is the target's own number rather than a guess.
+                here.z = there.z;
+            }
+        } else {
+            println!("  target {guid:#x} at {distance:.1} units, position unknown");
+        }
+        if let Some(there) = state.get(guid).and_then(|e| e.position) {
+            let heading = (there.y - here.y).atan2(there.x - here.x);
+            connection.set_facing(character.guid, here, heading)?;
+            here.orientation = heading;
+        }
+        connection.set_selection(guid)?;
+        connection.attack_swing(guid)?;
+
+        // **Swing once to be noticed, then stop swinging and let it win.**
+        //
+        // `CMSG_ATTACKSWING` starts an auto-attack that repeats until stopped,
+        // and that is the wrong thing for a command whose goal is to be killed:
+        // a level-one character beats a level-one creature most of the time, so
+        // the rig killed each attacker in turn and regenerated on the walk to
+        // the next one. Two runs of this ended with more health than they
+        // started, which reads as the damage not being applied rather than as
+        // the rig winning fights it was trying to lose.
+        //
+        // So the aggro is kept and the auto-attack is dropped. Health then only
+        // moves in one direction, and the fight ends the way this command needs
+        // it to. `--attack` remains the flag for actually fighting something.
+        let mut soaking = false;
+        let mut last_health = own_health;
+        let mut last_drop = Instant::now();
+
+        let round_end = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < round_end && Instant::now() < deadline {
+            let batch = connection.drain(Duration::from_millis(800), 128)?;
+            if let Some(capture) = capture.as_mut() {
+                capture.record(&batch)?;
+            }
+            for packet in &batch {
+                *seen.entry(packet.opcode).or_default() += 1;
+            }
+            let report = state.replicate(&batch, None);
+            print_events(&report, state, character.guid);
+
+            let own = state
+                .get(character.guid)
+                .and_then(|entity| entity.health())
+                .unwrap_or(0);
+            if own == 0 && own_max > 0 {
+                println!("  health reached zero");
+                break;
+            }
+
+            // Once anything has actually landed on us, stop hitting back.
+            if !soaking && own < last_health {
+                connection.attack_stop()?;
+                soaking = true;
+                println!("  taking damage -- stopping the auto-attack and soaking");
+            }
+            if own < last_health {
+                last_drop = Instant::now();
+            }
+            last_health = own;
+
+            // Nothing has hurt us for a while: whatever had aggro lost it or
+            // died, so go and find something else rather than standing in an
+            // empty field for the rest of the round.
+            if soaking && last_drop.elapsed() > Duration::from_secs(15) {
+                println!("  nothing is hitting us any more");
+                break;
+            }
+            // Only relevant before the soak begins; once soaking we no longer
+            // care whether this particular target is alive, only whether
+            // something is still hitting us.
+            if !soaking
+                && state
+                    .get(guid)
+                    .and_then(|entity| entity.health())
+                    .is_none_or(|hp| hp == 0)
+            {
+                println!("  target down");
+                break;
+            }
+        }
+    }
+
+    // Then hold with nothing being sent. Whatever the server says about a
+    // corpse arrives after the killing blow rather than with it, and a client
+    // that disconnects immediately would never see it -- the same trap that
+    // once got a facing opcode written off as wrong.
+    println!("\nholding after the fight, sending nothing:");
+    let quiet_end = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < quiet_end {
+        let batch = connection.drain(Duration::from_millis(1000), 128)?;
+        if let Some(capture) = capture.as_mut() {
+            capture.record(&batch)?;
+        }
+        for packet in &batch {
+            *seen.entry(packet.opcode).or_default() += 1;
+        }
+        let report = state.replicate(&batch, None);
+        print_events(&report, state, character.guid);
+    }
+
+    let health = state
+        .get(character.guid)
+        .and_then(|entity| entity.health())
+        .unwrap_or(0);
+    println!("\nfinal health: {health}/{own_max}");
+    println!("every opcode seen during the fight:");
+    for (opcode, count) in &seen {
+        println!("  {:<34} x{count}", world::opcode::describe(*opcode));
+    }
+    Ok(())
+}
+
 /// What to call a guid, for a line of combat log.
 fn unit_label_for(state: &world::WorldState, guid: u64) -> String {
     match state.get(guid) {
@@ -1744,6 +2259,26 @@ fn nearest_ordered(state: &world::WorldState, own_guid: u64) -> Vec<(f32, &world
     let Some(own) = state.get(own_guid).and_then(|entity| entity.position) else {
         return Vec::new();
     };
+    nearest_ordered_from(state, own_guid, own)
+}
+
+/// The same ordering, measured from a position the caller supplies.
+///
+/// **Which caller needs this is the whole point.** [`nearest_ordered`] measures
+/// from replicated state, and replicated state is wrong about where *we* are:
+/// the server never relays this client's own movement back to it, so an entity
+/// that has walked anywhere is still recorded at the position it logged in at.
+/// That is fine for a caller that has not moved, and silently wrong for one
+/// that has -- it computes every approach from the login spot, arrives out of
+/// range, and reads as the attack opcode being broken rather than as a stale
+/// origin. That exact bug cost 4.4 a debugging session; it came back in
+/// `fight_until_death`, where it looked like a fight that never closed to melee
+/// while the printed distance sat unchanged across two rounds.
+fn nearest_ordered_from(
+    state: &world::WorldState,
+    own_guid: u64,
+    own: world::Position,
+) -> Vec<(f32, &world::state::Entity)> {
     let mut rows: Vec<(f32, &world::state::Entity)> = state
         .iter()
         .filter(|entity| entity.guid != own_guid)
@@ -1896,6 +2431,7 @@ fn hold_connection(
         stats.movement_updates,
         stats.orphaned
     );
+    report_relayed_movement(&stats);
 
     // Other players are the interesting case: their movement arrives by a
     // different route than creatures' and is what proves replication of a
@@ -2071,7 +2607,478 @@ fn report_object_updates(
         stats.removed,
         stats.orphaned
     );
+    report_relayed_movement(&stats);
     Ok(state)
+}
+
+/// Answers any teleport the server is waiting on, and says where it went.
+///
+/// Called after every drain in the flows that can be teleported. The
+/// alternative -- answering it in one place and forgetting the others -- is how
+/// this project has lost four returned categories already, and this one fails
+/// worse than the rest: the server discards movement from a client that has not
+/// acknowledged, so the character silently stops moving while the client
+/// carries on believing it walked.
+fn answer_teleport(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+) -> Result<Option<world::update::Position>> {
+    let Some(teleport) = state.pending_teleport.take() else {
+        return Ok(None);
+    };
+    if teleport.mover != own_guid {
+        println!(
+            "  a teleport for {:#x}, which is not us -- not answering it",
+            teleport.mover
+        );
+        return Ok(None);
+    }
+    connection.acknowledge_teleport(teleport.mover, teleport.counter)?;
+    let at = teleport.info.position;
+    println!(
+        "  teleported to {:.1}, {:.1}, {:.1} (acknowledged)",
+        at.x, at.y, at.z
+    );
+    Ok(Some(at))
+}
+
+/// Releases the spirit and reports what the state became.
+///
+/// **Nothing acknowledges this request**, and there are two silent refusals
+/// behind it -- being alive, and having already released -- so the only useful
+/// output is a before-and-after of the things that must change: the ghost flag,
+/// health going to one, a corpse object appearing, and the server naming a
+/// graveyard. A run that prints the same state twice is a refusal, and says so
+/// rather than claiming success.
+fn report_release(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    character: &world::Character,
+    mut capture: Option<&mut Capture>,
+) -> Result<Option<world::update::Position>> {
+    use std::time::Duration;
+
+    let mut moved_to = None;
+    let was_ghost = state.get(character.guid).is_some_and(|e| e.is_ghost());
+    println!(
+        "\nreleasing: ghost before = {was_ghost}, health {:?}",
+        state.get(character.guid).and_then(|e| e.health())
+    );
+    connection.release_spirit()?;
+
+    // Give the server time to act before concluding it ignored us. A packet
+    // sent immediately before disconnecting is often never processed, and that
+    // is indistinguishable from having sent the wrong thing.
+    for _ in 0..6 {
+        let batch = connection.drain(Duration::from_millis(700), 128)?;
+        if let Some(capture) = capture.as_mut() {
+            capture.record(&batch)?;
+        }
+        let report = state.replicate(&batch, None);
+        print_events(&report, state, character.guid);
+        // Releasing *is* a teleport -- to the graveyard -- so this is the flow
+        // that most needs answering, and the one where forgetting it looked
+        // like success: an unanswered teleport leaves the ghost standing on its
+        // own corpse, which then reclaims from well inside the range check that
+        // should have refused it.
+        if let Some(at) = answer_teleport(connection, state, character.guid)? {
+            moved_to = Some(at);
+        }
+    }
+
+    let entity = state.get(character.guid);
+    let is_ghost = entity.is_some_and(|e| e.is_ghost());
+    println!(
+        "  ghost after = {is_ghost}, health {:?}",
+        entity.and_then(|e| e.health())
+    );
+    match state.release_location {
+        Some(at) => println!(
+            "  graveyard: map {:?} at {:.1}, {:.1}, {:.1}",
+            at.map, at.x, at.y, at.z
+        ),
+        None => println!("  no graveyard named"),
+    }
+    if let Some(delay) = state.reclaim_delay_ms {
+        println!("  reclaim delay: {delay}ms");
+    }
+    // Counted, not identified. Which of ours is the *current* body is a
+    // question only `MSG_CORPSE_QUERY` answers, and claiming one here would be
+    // the guess that already sent a run back to a previous death site.
+    println!(
+        "  {} corpse(s) in view, {} of them ours",
+        state.corpses().count(),
+        state.own_corpses(character.guid).count()
+    );
+    if was_ghost && is_ghost {
+        println!("  nothing changed -- already a ghost, which is one of the two silent refusals");
+    }
+    Ok(moved_to)
+}
+
+/// Takes the body back, and reports whether it worked.
+///
+/// Five separate conditions refuse this in silence -- alive, not released, no
+/// corpse, out of range, delay not elapsed -- so as with the release the report
+/// is a before-and-after rather than a claim.
+fn report_reclaim(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    character: &world::Character,
+    from: Option<world::update::Position>,
+    mut capture: Option<&mut Capture>,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    /// Well inside the server's 39-yard reclaim radius, so that arriving a
+    /// little short of the corpse still counts as arriving.
+    const CLOSE_ENOUGH: f32 = 12.0;
+    const GHOST_SPEED: f32 = 10.0;
+
+    // **Ask the server where the body is rather than looking around for it.**
+    // Corpse-shaped objects include the bones of bodies already reclaimed, they
+    // all carry their owner's guid, and a graveyard accumulates them -- one run
+    // here saw seven while the server had two, picked a stale one at a previous
+    // death site, ran fifty-eight yards to it and was refused in silence.
+    connection.query_corpse()?;
+    for _ in 0..4 {
+        let batch = connection.drain(Duration::from_millis(500), 128)?;
+        if let Some(capture) = capture.as_mut() {
+            capture.record(&batch)?;
+        }
+        state.replicate(&batch, None);
+        answer_teleport(connection, state, character.guid)?;
+        if state.corpse_location.is_some() {
+            break;
+        }
+    }
+    let Some(body_at) = state.corpse_location else {
+        println!("\nthe server says this character has no corpse");
+        return Ok(());
+    };
+    println!(
+        "\nthe server puts our body on map {} at {:.1}, {:.1}, {:.1}",
+        body_at.map, body_at.x, body_at.y, body_at.z
+    );
+
+    // The guid still has to come from a replicated object, since the query
+    // answers *where* and not *which*. Nearest-to-the-answer among the ones we
+    // own is the discriminator: two of our own corpses are never in the same
+    // place, and the stale ones are exactly the ones that are somewhere else.
+    let Some(corpse) = state
+        .own_corpses(character.guid)
+        .filter_map(|c| c.position.map(|p| (c.guid, p)))
+        .min_by(|a, b| {
+            let d = |p: &world::update::Position| {
+                (p.x - body_at.x).powi(2) + (p.y - body_at.y).powi(2)
+            };
+            d(&a.1).total_cmp(&d(&b.1))
+        })
+        .map(|(guid, _)| guid)
+    else {
+        println!(
+            "  but no corpse object of ours is replicated here -- {} in view belong to \
+             someone else",
+            state.corpses().count()
+        );
+        return Ok(());
+    };
+    println!(
+        "\nreclaiming corpse {corpse:#x}: ghost before = {}",
+        state.get(character.guid).is_some_and(|e| e.is_ghost())
+    );
+
+    // **Run back to the body.** This is the corpse run, and it is a real one:
+    // the server puts the ghost at a graveyard and refuses a reclaim from
+    // further than 39 yards away, so a client that does not walk is refused in
+    // silence. This was invisible until teleports were acknowledged -- before
+    // that the ghost never left the corpse, the range check passed at nought
+    // yards, and the whole feature looked finished.
+    let corpse_at = Some(world::update::Position {
+        x: body_at.x,
+        y: body_at.y,
+        z: body_at.z,
+        orientation: 0.0,
+    });
+    if let (Some(mut here), Some(there)) = (from, corpse_at) {
+        let flat = ((there.x - here.x).powi(2) + (there.y - here.y).powi(2)).sqrt();
+        println!("  corpse is {flat:.1} units away");
+        if flat > CLOSE_ENOUGH {
+            let heading = (there.y - here.y).atan2(there.x - here.x);
+            let (arrived, seen) = connection.walk(
+                character.guid,
+                here,
+                heading,
+                flat - CLOSE_ENOUGH,
+                GHOST_SPEED,
+            )?;
+            if let Some(capture) = capture.as_mut() {
+                capture.record(&seen)?;
+            }
+            state.replicate(&seen, None);
+            here = arrived;
+            here.z = there.z;
+            let left = ((there.x - here.x).powi(2) + (there.y - here.y).powi(2)).sqrt();
+            println!("  ran back, {left:.1} units short of the body");
+        }
+    } else {
+        println!("  no idea where we are, so no run back -- reclaiming from where we stand");
+    }
+
+    // **Wait out the delay the server named, rather than sending and hoping.**
+    // The body cannot be taken back until it has lain there for
+    // `SMSG_CORPSE_RECLAIM_DELAY`, and a request sent early is refused in
+    // silence like the other four refusals -- so an impatient client cannot
+    // tell "too soon" from "wrong opcode". The delay is not a constant either:
+    // it was 30s on a first death, 60s on the second and 120s on the third,
+    // because dying repeatedly stacks it. Anything that hardcoded thirty
+    // seconds would work exactly once per character.
+    if let Some(delay) = state.reclaim_delay_ms {
+        // Capped so a server with an unusual penalty cannot hang the run; the
+        // cap is announced rather than silently applied.
+        const CAP_MS: u32 = 180_000;
+        let waiting = delay.min(CAP_MS);
+        if waiting < delay {
+            println!("  delay is {delay}ms; waiting only {waiting}ms and expecting a refusal");
+        } else {
+            println!("  waiting {waiting}ms for the corpse to become reclaimable");
+        }
+        let until = Instant::now() + Duration::from_millis(waiting as u64 + 1_000);
+        while Instant::now() < until {
+            // Drained rather than slept: a session that stops answering
+            // keepalives is dropped, and the drop looks exactly like a
+            // desynchronised cipher.
+            let batch = connection.drain(Duration::from_millis(1_000), 128)?;
+            if let Some(capture) = capture.as_mut() {
+                capture.record(&batch)?;
+            }
+            state.replicate(&batch, None);
+            answer_teleport(connection, state, character.guid)?;
+        }
+    }
+
+    connection.reclaim_corpse(corpse)?;
+
+    for _ in 0..6 {
+        let batch = connection.drain(Duration::from_millis(700), 128)?;
+        if let Some(capture) = capture.as_mut() {
+            capture.record(&batch)?;
+        }
+        let report = state.replicate(&batch, None);
+        print_events(&report, state, character.guid);
+        answer_teleport(connection, state, character.guid)?;
+    }
+
+    let entity = state.get(character.guid);
+    println!(
+        "  ghost after = {}, health {:?}",
+        entity.is_some_and(|e| e.is_ghost()),
+        entity.and_then(|e| e.health())
+    );
+    Ok(())
+}
+
+/// Asks which opcodes in a capture carry relayed movement, structurally.
+///
+/// See [`Command::Moves`] for why this is asked rather than looked up. The
+/// discriminator has three parts, and the third is the one that matters:
+///
+/// - the body parses as a packed guid followed by a `MovementInfo`,
+/// - **and consumes the body exactly** -- leftovers mean the layout is not this
+///   one, which is the check that has caught four separate world-protocol bugs
+///   here,
+/// - **and the guids it names are few and repeat.** Any body of the right
+///   length parses as *something*; a movement opcode names the same one or two
+///   movers over and over, because there are one or two movers in view. An
+///   opcode that yields a different guid every time is being misread. That is
+///   the validity-versus-variation rule, pointed the other way round: here the
+///   *lack* of variation is the evidence.
+fn report_capture_moves(path: &std::path::Path, detail: Option<&str>) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Tally {
+        packets: usize,
+        parsed: usize,
+        leftovers: usize,
+        failed: usize,
+        movers: BTreeMap<u64, usize>,
+        times: Vec<(u64, u32)>,
+    }
+
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading capture {}", path.display()))?;
+    let mut tallies: BTreeMap<u16, Tally> = BTreeMap::new();
+
+    for line in text.lines() {
+        // `<opcode> <name> <len> <hex bytes...>`, as `Capture::record` writes it
+        // -- but **the name is not one token**. `opcode::describe` renders
+        // anything it does not know as `opcode 0x00da`, with a space in it, so
+        // splitting on whitespace and taking the third field lands on the
+        // *length* for exactly the opcodes this command exists to investigate.
+        // That shifted every unknown body by one byte and reported them all as
+        // "not movement" -- a confident negative result produced entirely by
+        // the tool's own formatting, and the second time in this project that
+        // a capture has been seen and effectively thrown away.
+        //
+        // So the body is found from the right instead: it is the trailing run
+        // of two-character hex tokens, and the token before it must be its
+        // length. Cross-checking those two is what makes the parse
+        // self-verifying rather than merely different.
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some(opcode) = tokens.first() else {
+            continue;
+        };
+        let Ok(opcode) = u16::from_str_radix(opcode.trim_start_matches("0x"), 16) else {
+            continue;
+        };
+        // The length field is the anchor, found by *agreeing with what follows
+        // it*: the first token that parses as a number equal to the count of
+        // tokens after it. Scanned left to right, not right to left -- a body
+        // ending in `00` also satisfies "parses as 0, and 0 tokens follow", so
+        // searching from the right finds a byte rather than the length. And
+        // the length cannot simply be taken as the third token, because
+        // `opcode::describe` renders an unknown opcode as `opcode 0x00da`,
+        // which is two tokens; nor can the body be taken as the trailing run
+        // of two-hex-digit tokens, because a 32-byte packet's length is `32`,
+        // which is itself two hex digits.
+        //
+        // Each of those three readings was tried and each produced a confident,
+        // wrong answer with no error anywhere -- the first reported every
+        // unknown opcode as "not movement", which is precisely the conclusion
+        // this command exists to avoid drawing by accident.
+        let Some(length_at) = (1..tokens.len())
+            .find(|index| tokens[*index].parse::<usize>() == Ok(tokens.len() - index - 1))
+        else {
+            continue;
+        };
+        let body: Vec<u8> = tokens[length_at + 1..]
+            .iter()
+            .filter_map(|byte| u8::from_str_radix(byte, 16).ok())
+            .collect();
+        if body.len() != tokens.len() - length_at - 1 {
+            continue;
+        }
+
+        let tally = tallies.entry(opcode).or_default();
+        tally.packets += 1;
+
+        let mut reader = world::protocol::Reader::new(&body, "capture");
+        let parsed = world::update::read_packed_guid(&mut reader)
+            .and_then(|guid| world::movement::MovementInfo::read(&mut reader).map(|i| (guid, i)));
+        match parsed {
+            Ok((guid, info)) => {
+                if reader.remaining() == 0 {
+                    tally.parsed += 1;
+                    *tally.movers.entry(guid).or_default() += 1;
+                    tally.times.push((guid, info.time));
+                } else {
+                    tally.leftovers += 1;
+                }
+            }
+            Err(_) => tally.failed += 1,
+        }
+    }
+
+    println!(
+        "{:<8} {:>7} {:>7} {:>6} {:>6} {:>7}  movers",
+        "opcode", "packets", "movement", "extra", "refused", "handled"
+    );
+    for (opcode, tally) in &tallies {
+        // Nothing to say about an opcode that never looked like movement.
+        if tally.parsed == 0 {
+            continue;
+        }
+        let handled = world::opcode::is_relayed_movement(*opcode);
+        println!(
+            "{:#06x} {:>7} {:>7} {:>6} {:>6} {:>7}  {}",
+            opcode,
+            tally.packets,
+            tally.parsed,
+            tally.leftovers,
+            tally.failed,
+            if handled { "yes" } else { "NO" },
+            tally.movers.len()
+        );
+    }
+
+    if let Some(detail) = detail {
+        let Ok(wanted) = u16::from_str_radix(detail.trim_start_matches("0x"), 16) else {
+            anyhow::bail!("--detail wants an opcode like 0x00da");
+        };
+        let Some(tally) = tallies.get(&wanted) else {
+            anyhow::bail!("no {wanted:#06x} in this capture");
+        };
+        println!("\n{wanted:#06x} in detail:");
+        for (guid, count) in &tally.movers {
+            println!("  mover {guid:#x}: {count} sample(s)");
+        }
+        // The mover's own clock, differenced. This is the number the relayed
+        // path duration is taken from, so seeing it directly is the point:
+        // a run whose intervals are all 100ms came from this client, and one
+        // spread around a few hundred did not.
+        let mut previous: BTreeMap<u64, u32> = BTreeMap::new();
+        let mut intervals = Vec::new();
+        for (guid, time) in &tally.times {
+            if let Some(before) = previous.insert(*guid, *time) {
+                intervals.push(time.wrapping_sub(before));
+            }
+        }
+        intervals.sort_unstable();
+        if !intervals.is_empty() {
+            let median = intervals[intervals.len() / 2];
+            println!(
+                "  {} interval(s): min {}ms, median {median}ms, max {}ms",
+                intervals.len(),
+                intervals[0],
+                intervals[intervals.len() - 1]
+            );
+        }
+    }
+    Ok(())
+}
+
+/// How the relayed movement of *other* players was handled.
+///
+/// Silent when none arrived, which is the common case: a run with nobody else
+/// in view has nothing to say here, and a line of zeroes would read as a
+/// failure rather than as an empty room.
+///
+/// This exists because the fix for `foss-wow#22` rests on a claim about another
+/// client's behaviour -- that it samples its own position every few hundred
+/// milliseconds -- and the claim has never been measured. Two copies of this
+/// client agreeing proves nothing about it: they share a 100ms heartbeat no
+/// real client sends, which is precisely how 3.5 came to declare replicated
+/// players smooth when they were not. The mean interval below is that
+/// measurement, and it only means anything when the mover at the other end is
+/// software this project did not write.
+fn report_relayed_movement(stats: &world::state::Stats) {
+    let snapped = stats.relayed_first_sample + stats.relayed_gap + stats.relayed_teleport;
+    let total = stats.relayed_paths + snapped;
+    if total == 0 {
+        return;
+    }
+    print!(
+        "  relayed movement: {total} sample(s), {} walked",
+        stats.relayed_paths
+    );
+    if stats.relayed_paths > 0 {
+        print!(
+            " (mean interval {}ms)",
+            stats.relayed_interval_ms / stats.relayed_paths as u64
+        );
+    }
+    println!();
+    // Broken out rather than summed: these are three different statements, and
+    // only one of them would be a defect. A first sighting has nothing to
+    // measure against, and a gap is a mover who stopped and started again --
+    // both snap correctly. A teleport that is not a teleport would be the
+    // interesting one.
+    println!(
+        "    snapped: {} first sighting, {} after a pause, {} too fast to be a walk",
+        stats.relayed_first_sample, stats.relayed_gap, stats.relayed_teleport
+    );
 }
 
 /// Chooses which realm to enter.

@@ -119,6 +119,18 @@ pub mod movement_flags {
     /// Running or walking forwards. Set while moving, cleared on stop.
     pub const FORWARD: u32 = 0x0000_0001;
     pub const BACKWARD: u32 = 0x0000_0002;
+    /// Sidestepping, without turning. Combines with [`FORWARD`] and
+    /// [`BACKWARD`] -- a character running forward and strafing left carries
+    /// both bits and travels the diagonal.
+    ///
+    /// Unlike most constants here these two were not needed until this client
+    /// could strafe, so they arrive later than their neighbours. They are not
+    /// transcribed from memory: the surrounding values in this module were
+    /// established earlier and independently, and every one of them agrees
+    /// with the same enum these came from, which is what makes reading a bit
+    /// off the end of a confirmed run different from guessing at it.
+    pub const STRAFE_LEFT: u32 = 0x0000_0004;
+    pub const STRAFE_RIGHT: u32 = 0x0000_0008;
     pub const WALKING: u32 = 0x0000_0100;
     pub const ON_TRANSPORT: u32 = 0x0000_0200;
     pub const FALLING: u32 = 0x0000_1000;
@@ -775,6 +787,8 @@ pub struct MonsterMove {
     pub duration: u32,
     pub stopped: bool,
     /// An explicit facing to arrive at, when the move type provides one.
+    /// See [`MoveFacing`] -- three of the four move types carry one, and only
+    /// [`MoveFacing::Angle`] is usable without a world to look things up in.
     /// `FACING_ANGLE` carries it directly and is parsed; `FACING_SPOT` and
     /// `FACING_TARGET` also carry one, as a point or a guid to face rather
     /// than a bare angle, and are still only skipped -- the former is a small
@@ -782,7 +796,30 @@ pub struct MonsterMove {
     /// latter needs another entity's live position, which is a `WorldState`
     /// lookup this parser has no access to. Neither `from` nor `to` ever
     /// carries an orientation of its own; those fields decode fixed at zero.
-    pub facing: Option<f32>,
+    pub facing: Option<MoveFacing>,
+}
+
+/// Where a monster move says the creature should end up looking.
+///
+/// Three of the four modes carry real information and the parser used to keep
+/// only one of them, skipping the other two as padding. That is how a creature
+/// came to stand side-on to the player it was chewing on: **a melee attacker
+/// turns to face its victim with `FACING_TARGET`**, whose body is the victim's
+/// guid, and eight skipped bytes are indistinguishable from a packet that said
+/// nothing.
+///
+/// [`MoveFacing::Target`] is the one that cannot be resolved here. A guid is
+/// not an angle until somebody knows where that unit is, and a parser has no
+/// world to ask -- so it is carried out intact and turned into a heading by
+/// [`crate::WorldState::facing_of`], which does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MoveFacing {
+    /// A heading in radians, straight off the wire.
+    Angle(f32),
+    /// A point in the world to look at.
+    Spot { x: f32, y: f32, z: f32 },
+    /// Another unit to look at, by guid.
+    Target(u64),
 }
 
 /// How the creature should be facing when it arrives.
@@ -835,9 +872,18 @@ pub fn parse_monster_move(body: &[u8]) -> Result<MonsterMove, Error> {
                 facing: None,
             });
         }
-        monster_move_type::FACING_SPOT => reader.skip(12)?,
-        monster_move_type::FACING_TARGET => reader.skip(8)?,
-        monster_move_type::FACING_ANGLE => facing = Some(reader.f32()?),
+        monster_move_type::FACING_SPOT => {
+            facing = Some(MoveFacing::Spot {
+                x: reader.f32()?,
+                y: reader.f32()?,
+                z: reader.f32()?,
+            })
+        }
+        // A raw guid, not a packed one: this field is a fixed eight bytes,
+        // which is why skipping it happened to keep the rest of the packet in
+        // step and cost only the answer.
+        monster_move_type::FACING_TARGET => facing = Some(MoveFacing::Target(reader.u64()?)),
+        monster_move_type::FACING_ANGLE => facing = Some(MoveFacing::Angle(reader.f32()?)),
         monster_move_type::NORMAL => {}
         other => return Err(Error::UnknownUpdateType { got: other }),
     }
@@ -983,6 +1029,76 @@ pub mod fields {
     /// How many powers a unit has, and so how far past [`UNIT_POWER1`] a power
     /// index is allowed to reach.
     pub const POWER_COUNT: u16 = 7;
+
+    /// `PLAYER_FIELD_BYTES`. Only one bit of it is read here:
+    /// [`PLAYER_RELEASE_TIMER_BIT`].
+    ///
+    /// **This field is a cautionary tale about how a large sample can still be
+    /// one sample.** It was found by diffing a living character's fields
+    /// against a dead one's, and across *six* snapshots -- three characters,
+    /// two accounts, two zones, a warrior and a druid -- it was the only field
+    /// whose presence separated alive from not-alive with no exceptions. On
+    /// that evidence it was named `PLAYER_NOT_ALIVE`, and it was wrong.
+    ///
+    /// Every one of those six came from the same *path*: a character dying
+    /// naturally and staying dead. Given a server we control, a GM `revive`
+    /// produced a character with full health and this bit still set, which no
+    /// amount of watching natural deaths could have shown. The population was
+    /// broad in characters, accounts, zones and classes, and narrow in the one
+    /// dimension that mattered.
+    ///
+    /// It is the release-timer display flag -- "show the countdown to
+    /// automatically releasing spirit" -- so it tracks *the release window
+    /// being open*, not being dead. Those coincide for an ordinary death and
+    /// come apart the moment anything else resurrects you.
+    pub const PLAYER_FIELD_BYTES: u16 = 0x4AD;
+    /// The release-timer bit of [`PLAYER_FIELD_BYTES`]. Set while the client
+    /// should be showing a countdown to auto-release; **not** a death flag.
+    pub const PLAYER_RELEASE_TIMER_BIT: u32 = 0x08;
+
+    /// Whose body a corpse object is, as a guid pair at the start of a corpse's
+    /// own fields.
+    ///
+    /// Needed because "the corpse in view" is not a well-formed question: a
+    /// graveyard collects them, and a run that picked whichever came first out
+    /// of a hash map would send a player to reclaim someone else's body. The
+    /// answer is silence, since reclaiming a corpse that is not yours is one of
+    /// the five conditions this request refuses without a word.
+    pub const CORPSE_OWNER: u16 = 0x06;
+
+    /// `PLAYER_FLAGS`. Only [`PLAYER_GHOST_BIT`] is read here.
+    ///
+    /// Set on a player who has **released** and is running back as a ghost, and
+    /// not on one merely lying dead where they fell.
+    ///
+    /// **Dead and ghost are two states, not one, and the first snapshot said
+    /// otherwise.** A single before-and-after on one character showed this
+    /// field appearing exactly when that character stopped being alive, which
+    /// is a complete and wrong explanation: that character had already
+    /// released. Killing a *second* character and looking again showed it dead
+    /// with health `0` and this field **absent**. Had the first observation
+    /// been written down it would have been labelled "dead", and every later
+    /// reader would have inherited a flag that is silent for the entire window
+    /// between dying and releasing -- which is precisely the window a corpse
+    /// run happens in.
+    ///
+    /// What the three states look like, over six snapshots:
+    ///
+    /// | state | health | [`PLAYER_NOT_ALIVE`] | this field |
+    /// |---|---|---|---|
+    /// | alive (3 characters) | > 1 | absent | absent |
+    /// | dead, not yet released | `0` | `0x08` | absent |
+    /// | ghost, released (2 characters) | `1` | `0x08` | `0x10` |
+    ///
+    /// Two independent structures agree with the split: the character list's
+    /// own `flags & 0x2000` (see `Character::is_ghost`) reads `ghost` for both
+    /// released characters and not for the freshly killed one, and it is parsed
+    /// from `SMSG_CHAR_ENUM` with no code in common with the update-field path.
+    /// The corpse *object* likewise only exists after releasing -- a player
+    /// lying dead has none in view.
+    pub const PLAYER_GHOST: u16 = 0x96;
+    /// The bit of [`PLAYER_GHOST`] that was observed, and the only one.
+    pub const PLAYER_GHOST_BIT: u32 = 0x10;
 }
 
 #[cfg(test)]
@@ -1387,10 +1503,53 @@ mod tests {
         body
     }
 
+    /// The two facing modes that used to be skipped as padding.
+    ///
+    /// **`FACING_TARGET` is how a creature in melee turns to face what it is
+    /// hitting**, and its eight bytes were being discarded -- which reads, in
+    /// the world, as a wolf chewing on you side-on. `FACING_SPOT`'s three
+    /// floats went the same way. Both parsed to the byte the whole time,
+    /// because a skip of the right *length* keeps the rest of the packet in
+    /// step; the cursor discipline that catches every other layout error here
+    /// cannot catch a field that is correctly sized and thrown away.
+    #[test]
+    fn the_facing_modes_that_name_something_are_kept_not_skipped() {
+        fn tail() -> Vec<u8> {
+            let mut extra = 0u32.to_le_bytes().to_vec(); // spline flags: none
+            extra.extend_from_slice(&4000u32.to_le_bytes()); // duration
+            extra.extend_from_slice(&1u32.to_le_bytes()); // one path point
+            for value in [10.0f32, 20.0, 30.0] {
+                extra.extend_from_slice(&value.to_le_bytes());
+            }
+            extra
+        }
+
+        // Facing a unit: a raw eight-byte guid, not a packed one.
+        let mut extra = 0xF130_0000_4500_0A4Bu64.to_le_bytes().to_vec();
+        extra.extend_from_slice(&tail());
+        let parsed =
+            parse_monster_move(&monster_move_body(monster_move_type::FACING_TARGET, &extra))
+                .unwrap();
+        assert_eq!(parsed.facing, Some(MoveFacing::Target(0xF130_0000_4500_0A4B)));
+
+        // Facing a place: three floats.
+        let mut extra = Vec::new();
+        for value in [11.0f32, 22.0, 33.0] {
+            extra.extend_from_slice(&value.to_le_bytes());
+        }
+        extra.extend_from_slice(&tail());
+        let parsed =
+            parse_monster_move(&monster_move_body(monster_move_type::FACING_SPOT, &extra)).unwrap();
+        assert_eq!(
+            parsed.facing,
+            Some(MoveFacing::Spot { x: 11.0, y: 22.0, z: 33.0 })
+        );
+    }
+
     /// `FACING_ANGLE` is the one move type carrying a facing this parser can
-    /// use directly (`FACING_SPOT` and `FACING_TARGET` need more than this
-    /// parser alone has -- see `MonsterMove::facing`), so its float has to
-    /// land in `facing`, not be silently skipped.
+    /// resolve on its own -- the other two name a place or a unit, which need
+    /// a world to look up. Its float has to land in `facing`, not be silently
+    /// skipped.
     #[test]
     fn facing_angle_is_parsed_into_facing() {
         let mut extra = 1.25f32.to_le_bytes().to_vec(); // the facing itself
@@ -1403,7 +1562,7 @@ mod tests {
         let body = monster_move_body(monster_move_type::FACING_ANGLE, &extra);
 
         let parsed = parse_monster_move(&body).unwrap();
-        assert_eq!(parsed.facing, Some(1.25));
+        assert_eq!(parsed.facing, Some(MoveFacing::Angle(1.25)));
         assert_eq!(
             parsed.from,
             Position { x: 1.0, y: 2.0, z: 3.0, orientation: 0.0 }

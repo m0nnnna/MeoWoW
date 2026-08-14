@@ -314,6 +314,80 @@ against elapsed time, and one jump across the whole distance is the exact shape
 of a speed hack. Stopping matters too — a character left in the `FORWARD` state
 keeps moving in the server's simulation after the client goes quiet.
 
+## Movement is two axes, and the opcode names only the one that changed
+
+Walking and strafing are independent: a character can begin sidestepping
+without stopping running, and does so constantly in play. The wire says this
+with a *pair* of start/stop opcode sets, one per axis:
+
+| axis | start | stop |
+|---|---|---|
+| longitudinal | `MSG_MOVE_START_FORWARD` `0x0B5`, `MSG_MOVE_START_BACKWARD` `0x0B6` | `MSG_MOVE_STOP` `0x0B7` |
+| lateral | `MSG_MOVE_START_STRAFE_LEFT` `0x0B8`, `MSG_MOVE_START_STRAFE_RIGHT` `0x0B9` | `MSG_MOVE_STOP_STRAFE` `0x0BA` |
+
+**The opcode names the transition; the flags carry the whole state.** Beginning
+to strafe while already running forward sends `MSG_MOVE_START_STRAFE_LEFT`
+with *both* `MOVEMENTFLAG_FORWARD` (`0x1`) and `MOVEMENTFLAG_STRAFE_LEFT`
+(`0x4`) set. A client that sent only the bit matching its opcode would be
+telling the server it had stopped running the moment it started strafing --
+and since nothing acknowledges movement, the only symptom would be a character
+that drifts.
+
+`MSG_MOVE_STOP` likewise ends only its own axis. A character that stops running
+while still holding a strafe key keeps strafing, and the flags say so.
+
+## Jumping is a pair of statements
+
+`MSG_MOVE_JUMP` `0x0BB` says a character left the ground and carries the
+falling block -- `zspeed`, `sinAngle`, `cosAngle`, `xyspeed`, in that order,
+present only while `MOVEMENTFLAG_FALLING` (`0x1000`) is set.
+`MSG_MOVE_FALL_LAND` `0x0C9` says it arrived, with the flag cleared and
+`fall_time` carrying how long the fall lasted -- which is what fall damage is
+computed from.
+
+**The landing is not optional.** The server believes a client that said it was
+falling until it says otherwise, so a jump that never lands leaves the
+character permanently airborne in the server's view, silently.
+
+The server does not simulate the arc. It is told the take-off velocity and the
+landing and believes the client in between, which is why the client carries its
+own gravity: `19.29110527038574` units per second squared, matching the
+server's own constant so a reported `fall_time` agrees with the height fallen.
+The *take-off* velocity is the client's choice and appears in no server table;
+this project uses `7.9558` and says plainly that it was chosen rather than
+measured. One capture of a real client's `MSG_MOVE_JUMP` would settle it.
+
+### Confirmed by relay, which is the only way an outgoing opcode can be
+
+Nothing acknowledges any of these, so the check is the two-client rig: one
+session moves, a second session on a different account watches what the server
+relays. Against the local realm, `wow-cli world --enter Testwolf --jump`
+produced, in the watcher's opcode census:
+
+```text
+MSG_MOVE_* relayed (0x00bb)      x1
+MSG_MOVE_* relayed (0x00c9)      x1
+```
+
+and `--strafe right --walk 15`:
+
+```text
+MSG_MOVE_* relayed (0x00b9)      x1
+MSG_MOVE_* relayed (0x00ba)      x1
+```
+
+Exactly one of each, in order. That is a stronger statement than "the session
+survived": a body the server could not parse as a jump would not have been
+relayed *as a jump* to somebody else. The write half is confirmed through a
+third party that had to understand both.
+
+The strafe has a second, independent confirmation that does not involve
+opcodes at all. Facing 4.61 rad, `--strafe left --walk 20` moved the server's
+own position from `-8939.3, -197.5` to `-8919.4, -199.5` -- **+19.9 in x and
+-2.0 in y, with the orientation unchanged**. Sideways without turning is
+something a forward walk cannot produce at any heading, so the direction is
+right and not merely plausible.
+
 ## Nothing acknowledges movement
 
 There is no reply. A rejected move produces no error; the server simply keeps

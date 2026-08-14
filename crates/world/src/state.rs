@@ -49,9 +49,60 @@ pub struct Entity {
     /// active `SMSG_MONSTER_MOVE` is interpolated by direction of travel
     /// regardless, so a value read mid-flight is simply never seen. This has
     /// to live as its own field, checked only when `t >= 1.0`.
-    pub arrival_facing: Option<f32>,
+    pub arrival_facing: Option<crate::update::MoveFacing>,
+    /// Where the facing of the path in flight comes from. The two kinds of
+    /// path disagree about this, and getting it wrong is visible.
+    pub path_facing: PathFacing,
+    /// The mover's own clock, in milliseconds, from the last relayed
+    /// `MSG_MOVE_*`. Kept so the *next* one can be timed against it.
+    ///
+    /// The mover's clock rather than ours on purpose: it measures the interval
+    /// between the two samples as the sender actually spaced them, where a
+    /// local arrival interval also measures whatever the network and our own
+    /// scheduler did in between. The start of the segment still comes from our
+    /// clock, because that is when we can begin drawing it.
+    pub last_move_time: Option<u32>,
+    /// When this unit was *seen to die*, as opposed to merely being dead.
+    ///
+    /// The distinction is the whole point, and it is the difference between a
+    /// creature toppling over and a corpse that was already lying there when
+    /// it came into view. Only the first should play the falling-over cycle;
+    /// the second has to be drawn already settled, or every corpse in a
+    /// graveyard re-dies each time the player walks past.
+    ///
+    /// So this is set on the *transition* from alive to dead and nowhere else.
+    /// An object created already dead leaves it `None`, which reads as "dead,
+    /// and we did not watch it happen". Cleared again on resurrection, which
+    /// GM commands make routine on the test realm.
+    pub died_at: Option<std::time::Instant>,
+    /// When this unit last swung at something, for the same reason: a swing is
+    /// an instant, and the animation it triggers has to start from it.
+    ///
+    /// Kept per attacker rather than as a single "in combat" flag because two
+    /// creatures fighting the same player swing on their own timers, and one
+    /// flag would make them animate in lockstep.
+    pub last_swing: Option<std::time::Instant>,
     /// How many updates of any kind have touched this object.
     pub updates: usize,
+}
+
+/// Where the facing of a path in flight comes from.
+///
+/// The two kinds of path this client receives disagree, and the difference is
+/// not cosmetic -- see [`Entity::interpolated_position`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PathFacing {
+    /// `SMSG_MONSTER_MOVE`. Neither endpoint carries an orientation -- the wire
+    /// does not report one, and the parser hands back a hardcoded zero -- so
+    /// the only statement about facing available is the direction of travel.
+    #[default]
+    DirectionOfTravel,
+    /// A relayed `MSG_MOVE_*`. Both endpoints carry the mover's *own*
+    /// orientation, which is a different thing from the direction of travel: a
+    /// player strafing or walking backwards faces somewhere other than the way
+    /// they are going, and inferring facing from the path would spin them
+    /// round. When the wire says which way someone is facing, believe it.
+    Reported,
 }
 
 impl Entity {
@@ -154,6 +205,112 @@ impl Entity {
         self.object_type == ObjectType::Player
     }
 
+    /// Whether this player is dead -- either lying where they fell or running
+    /// back as a ghost.
+    ///
+    /// **Health cannot answer this and it is not close.** A player lying dead
+    /// reads `0`, but a ghost reads **`1`**, which is indistinguishable from a
+    /// living character one hit from the end. Four runs of
+    /// `wow-cli world --until-death` were spent swinging as a ghost on exactly
+    /// that misreading: `1/79` looked like a warrior about to fall over, every
+    /// attack came back `SMSG_ATTACKSTOP` with no swings and no refusals, and
+    /// the whole thing was indistinguishable from the attack opcode having
+    /// stopped working.
+    ///
+    /// So death is read from the two things that do mean it: a ghost is a
+    /// ghost, and anything else with a known maximum and no health left is a
+    /// corpse. The maximum is required because `hud::unit_view` renders an
+    /// absent field as zero on purpose, so `health == 0` alone greys out every
+    /// unit whose fields have not arrived yet -- a hundred at once, the moment
+    /// after login, looking like the feature rather than the bug.
+    ///
+    /// An earlier version of this read a single flag that appeared to mean
+    /// "not alive" across six live snapshots. It was the release-timer display
+    /// bit, and a GM resurrection leaves it set on a living character -- see
+    /// [`crate::update::fields::PLAYER_FIELD_BYTES`].
+    /// Note the `unwrap_or(0)` on health and *not* on the maximum. They look
+    /// symmetrical and are not: a dead player's health is zero, so the create
+    /// block omits the field altogether and an absent value must read as the
+    /// zero it is. A unit whose fields have simply not arrived yet has no
+    /// maximum either, and that is what separates the two cases.
+    pub fn is_dead_or_ghost(&self) -> bool {
+        self.is_ghost()
+            || self
+                .max_health()
+                .is_some_and(|max| max > 0 && self.health().unwrap_or(0) == 0)
+    }
+
+    /// Whether this unit is lying dead on the ground, as opposed to walking
+    /// around as a ghost.
+    ///
+    /// (See also [`crate::WorldState::is_fighting`], which answers the other
+    /// half of what a renderer wants to know about a unit in a fight.)
+    ///
+    /// **Not the same question as [`Self::is_dead_or_ghost`], and the
+    /// difference is visible.** That one asks "is this unit out of the fight",
+    /// which is right for a health bar and for deciding whether a target can
+    /// be attacked. This one asks "should it be drawn face down", and a ghost
+    /// answers no: releasing your spirit stands you up at a graveyard and you
+    /// run back on your own feet. A renderer that used the broader test would
+    /// lay every ghost flat and leave the player sliding to their corpse on
+    /// their back.
+    ///
+    /// For creatures the two coincide, because nothing that is not a player
+    /// ever carries the ghost flag -- which is exactly why this was easy to
+    /// get wrong and only showed up on a *player* corpse run.
+    pub fn is_corpse(&self) -> bool {
+        self.is_dead_or_ghost() && !self.is_ghost()
+    }
+
+    /// Records a crossing of the alive/dead line, given what was true before
+    /// the fields were merged.
+    ///
+    /// Both directions matter. Dying starts the fall; being resurrected has to
+    /// *clear* the mark, or a unit healed back up would keep its death time
+    /// and topple over again the moment it next died -- with the animation
+    /// already finished, so it would simply appear flat.
+    fn note_death_transition(&mut self, was_dead: bool) {
+        match (was_dead, self.is_dead_or_ghost()) {
+            (false, true) => self.died_at = Some(std::time::Instant::now()),
+            (true, false) => self.died_at = None,
+            _ => {}
+        }
+    }
+
+    /// How long ago this unit was seen to die, if it was seen to.
+    pub fn dying_for(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.died_at.map(|at| now.saturating_duration_since(at))
+    }
+
+    /// How long ago this unit last swung, if it has.
+    pub fn swung_ago(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.last_swing
+            .map(|at| now.saturating_duration_since(at))
+    }
+
+    /// Whether the client should be showing a countdown to releasing spirit.
+    ///
+    /// A display hint, not a state: it is set while the release window is open
+    /// and stays set through a GM resurrection, so it answers "should the
+    /// timer be on screen", never "is this player dead".
+    pub fn release_timer_running(&self) -> bool {
+        self.fields
+            .get(crate::update::fields::PLAYER_FIELD_BYTES)
+            .is_some_and(|bytes| bytes & crate::update::fields::PLAYER_RELEASE_TIMER_BIT != 0)
+    }
+
+    /// Whether this player has released their corpse and is a ghost, as
+    /// opposed to still lying dead beside it.
+    ///
+    /// The distinction is the whole of the corpse run: releasing is what
+    /// creates the corpse object and moves the player to a graveyard, so a
+    /// client that treats the two as one state has nothing to run back to.
+    pub fn is_ghost(&self) -> bool {
+        self.fields
+            .get(crate::update::fields::PLAYER_GHOST)
+            .is_some_and(|flags| flags & crate::update::fields::PLAYER_GHOST_BIT != 0)
+    }
+
     /// How this player looks, for a client that has to draw them.
     ///
     /// `None` for anything that is not a player, and for a player whose
@@ -218,6 +375,7 @@ impl Entity {
         self.move_duration = None;
         self.move_started = None;
         self.arrival_facing = None;
+        self.path_facing = PathFacing::default();
     }
 
     /// Where this entity actually is right now, interpolated along a monster
@@ -239,6 +397,12 @@ impl Entity {
     /// computation otherwise -- never to either endpoint's own hardcoded-zero
     /// orientation, which a duration of exactly zero would otherwise expose
     /// by returning `end` verbatim.
+    ///
+    /// All of which describes a `SMSG_MONSTER_MOVE` path, and is wrong for the
+    /// other kind. A path assembled from two relayed `MSG_MOVE_*` samples has
+    /// a real orientation at *both* ends, so it interpolates between them
+    /// along the shortest arc and never consults the direction of travel --
+    /// see [`PathFacing`].
     pub fn interpolated_position(&self, now: std::time::Instant) -> Option<Position> {
         let (Some(start), Some(end), Some(duration), Some(started)) = (
             self.position,
@@ -257,10 +421,25 @@ impl Entity {
         };
 
         let direction_of_travel = || (end.y - start.y).atan2(end.x - start.x);
-        let orientation = if t >= 1.0 {
-            self.arrival_facing.unwrap_or_else(direction_of_travel)
-        } else {
-            direction_of_travel()
+        // `MoveFacing::Target` is deliberately *not* resolved here: it names a
+        // unit, and turning a unit into an angle needs the world this entity
+        // is only a part of. It falls back to the direction of travel, and
+        // `WorldState::facing_of` -- which does have the world -- answers it
+        // properly. An entity asked in isolation gives the best answer
+        // available in isolation.
+        let arrival = self.arrival_facing.and_then(|facing| match facing {
+            crate::update::MoveFacing::Angle(angle) => Some(angle),
+            crate::update::MoveFacing::Spot { x, y, .. } => {
+                Some((y - end.y).atan2(x - end.x))
+            }
+            crate::update::MoveFacing::Target(_) => None,
+        });
+        let orientation = match self.path_facing {
+            PathFacing::Reported => lerp_angle(start.orientation, end.orientation, t),
+            PathFacing::DirectionOfTravel if t >= 1.0 => {
+                arrival.unwrap_or_else(direction_of_travel)
+            }
+            PathFacing::DirectionOfTravel => direction_of_travel(),
         };
 
         Some(Position {
@@ -324,6 +503,18 @@ impl Entity {
         .sqrt();
         Some(distance / (duration as f32 / 1000.0))
     }
+}
+
+/// Interpolates between two headings the short way round.
+///
+/// A plain lerp between 6.2 and 0.1 radians -- two headings a few degrees
+/// apart -- turns the long way through a whole circle, which reads as a player
+/// spinning on the spot every time they cross north. Taking the difference into
+/// `-PI..=PI` first is what makes the turn go the way the mover actually turned.
+fn lerp_angle(from: f32, to: f32, t: f32) -> f32 {
+    let two_pi = std::f32::consts::TAU;
+    let delta = (to - from + std::f32::consts::PI).rem_euclid(two_pi) - std::f32::consts::PI;
+    from + delta * t
 }
 
 /// A spell mid-cooldown, timed from when this client learned about it rather
@@ -404,6 +595,33 @@ pub struct Stats {
     /// Updates naming a guid never created. Each one is a change applied to
     /// nothing, and a rising count means create blocks are being lost.
     pub orphaned: usize,
+    /// Relayed `MSG_MOVE_*` samples that became a walkable path, and those that
+    /// fell back to a snap -- see [`WorldState::apply_relayed_movement_at`].
+    ///
+    /// These exist because the assumption underneath that method is about
+    /// *another* client's behaviour, and this project has been wrong about that
+    /// before: 3.5 declared replicated players smooth on the evidence of two
+    /// copies of this same client, which share a 100ms heartbeat no real client
+    /// sends. A run against software we did not write either produces mostly
+    /// paths or it does not, and the ratio says which without anyone having to
+    /// watch a window.
+    pub relayed_paths: usize,
+    /// Snaps, split by *why*, because the total on its own cannot be read.
+    ///
+    /// A third of one live run's samples snapped, which looks like a third of
+    /// the fix not working and is nothing of the sort if they are all first
+    /// sightings and pauses -- a mover who walks, stops, stands about and walks
+    /// again produces exactly one unwalkable gap per resumption, and snapping
+    /// across it is the correct answer. Told apart, the counters say which; a
+    /// single number says only that something happened.
+    pub relayed_first_sample: usize,
+    pub relayed_gap: usize,
+    pub relayed_teleport: usize,
+    /// Summed sample interval over [`Self::relayed_paths`], in milliseconds, so
+    /// a mean can be taken. The mean is the measurement that matters: "a real
+    /// client sends roughly every 500ms" is the claim the fix is built on, and
+    /// it has never been measured here.
+    pub relayed_interval_ms: u64,
 }
 
 /// What one batch of packets did to a [`WorldState`].
@@ -417,6 +635,12 @@ pub struct Replication {
     pub object_updates: usize,
     pub monster_moves: usize,
     pub relayed_moves: usize,
+    /// `SMSG_DEATH_RELEASE_LOC`s folded this batch, whether placing a marker or
+    /// clearing one.
+    pub release_locations: usize,
+    /// Teleports the server is waiting to have acknowledged. Any number above
+    /// zero means the caller owes it a reply before movement works again.
+    pub teleports: usize,
     pub destroys: usize,
     /// Names that arrived this batch, already folded into [`WorldState::names`].
     pub names: usize,
@@ -508,6 +732,25 @@ pub struct WorldState {
     /// rather than sending a stop for itself in every case, and the entry
     /// would otherwise claim forever that a corpse is still attacking.
     pub attacking: HashMap<u64, u64>,
+    /// A teleport the server is waiting to be told we noticed.
+    ///
+    /// Stored rather than handed back, and stored as *state* rather than an
+    /// event, because it stays true until something answers it. This crate has
+    /// now produced four categories a caller forgot to consume; an
+    /// unacknowledged teleport is the worst of them to drop, since the server
+    /// then silently discards every movement packet the client sends and the
+    /// character is frozen while appearing to walk.
+    pub pending_teleport: Option<crate::protocol::Teleport>,
+    /// Where the server sent this character's ghost, while a marker should be
+    /// showing. `None` both before dying and once the server clears it.
+    pub release_location: Option<crate::death::ReleaseLocation>,
+    /// Where the server says this character's body is, from the last
+    /// `MSG_CORPSE_QUERY`. The authoritative answer, as opposed to whichever
+    /// corpse-shaped object happens to be replicated nearby.
+    pub corpse_location: Option<crate::death::CorpseLocation>,
+    /// How long the body must lie there before it can be reclaimed, in
+    /// milliseconds, as last stated on death.
+    pub reclaim_delay_ms: Option<u32>,
     /// What things are called, and the bookkeeping that asks once.
     ///
     /// Lives here rather than beside the state because the answers arrive in
@@ -545,6 +788,136 @@ impl WorldState {
 
     pub fn players(&self) -> impl Iterator<Item = &Entity> {
         self.entities.values().filter(|e| e.is_player())
+    }
+
+    /// Corpse objects in view.
+    ///
+    /// A corpse is its own object type rather than a dead player's entity, and
+    /// it exists only once that player has *released* -- a body lying where it
+    /// fell has none. That timing is the reason this is worth its own accessor:
+    /// "is there a corpse in view" is how a client knows whether a run back is
+    /// even possible yet.
+    pub fn corpses(&self) -> impl Iterator<Item = &Entity> {
+        self.entities
+            .values()
+            .filter(|e| e.object_type == ObjectType::Corpse)
+    }
+
+    /// Corpse objects in view that carry this player's guid as their owner.
+    ///
+    /// **Owning one is not the same as it being the body to run back to**, and
+    /// the difference is not cosmetic. Bones left behind by a body already
+    /// reclaimed are corpse objects too and keep the same owner, so a graveyard
+    /// visited more than once holds several of ours. Picking the first was
+    /// tried and chose a stale one at a *previous* death site: the run back went
+    /// fifty-eight yards to the wrong place and the reclaim was refused without
+    /// a word.
+    ///
+    /// Which body is current is a question only the server can answer, and
+    /// `MSG_CORPSE_QUERY` is the question -- see
+    /// [`crate::death::parse_corpse_query`]. This narrows the candidates; the
+    /// query decides between them.
+    /// Which way a unit is looking, resolving a facing that names *another*
+    /// unit.
+    ///
+    /// The reason this lives on the world rather than on the entity: a melee
+    /// attacker turns to face its victim with a `SMSG_MONSTER_MOVE` carrying
+    /// [`crate::update::MoveFacing::Target`], which is a guid. A guid is not
+    /// an angle until somebody can say where that unit is, and only the world
+    /// can. `Entity::interpolated_position` gives the best answer available to
+    /// an entity alone -- the direction it travelled -- and this improves on
+    /// it where it can.
+    ///
+    /// The target's position is taken *interpolated*, like everything else
+    /// drawn, so an attacker tracks a victim that is moving instead of aiming
+    /// at where it last reported being.
+    ///
+    /// Falls back rather than failing: a facing at a unit that is not in
+    /// replicated state (out of view, or a create block we missed) leaves the
+    /// entity looking the way it was already looking. Better than turning it
+    /// to a default heading, which would be a confident lie about something
+    /// this client does not know.
+    ///
+    /// **What it faces comes from `UNIT_FIELD_TARGET` first, not from the
+    /// facing packet**, and the difference is the whole of what a player
+    /// notices. A `SMSG_MONSTER_MOVE` carrying a facing is a statement made
+    /// *once*, when the server decides a creature has turned; a creature
+    /// standing in melee is otherwise left holding the heading it walked in
+    /// on. `UNIT_FIELD_TARGET` is a replicated field that simply says who it
+    /// is fighting, for as long as it is fighting them -- so deriving the
+    /// heading from it gives a creature that tracks its victim continuously,
+    /// including while the victim strafes around it. The facing packet remains
+    /// the fallback, and is still the only answer for a creature turning to
+    /// look at something it is *not* targeting.
+    /// **`own` is not optional in practice and the whole thing is wrong
+    /// without it.** The server never relays a client's own movement back, so
+    /// this state's copy of *our* position is frozen at wherever we logged in
+    /// -- the same trap `live::drawable_entities` documents for drawing our
+    /// body. A creature facing its victim resolves that victim's position
+    /// through here, and for the overwhelmingly common case where the victim
+    /// is the player, the replicated answer is stale by however far they have
+    /// walked since login. It reads as a creature that looks slightly past
+    /// you, then further past you, until you can stand behind it -- reported
+    /// from play exactly that way.
+    ///
+    /// So the caller, which is the only thing that knows where it actually is,
+    /// says: `Some((own guid, own position))`.
+    pub fn facing_of(
+        &self,
+        guid: u64,
+        now: std::time::Instant,
+        own: Option<(u64, Position)>,
+    ) -> Option<f32> {
+        let entity = self.get(guid)?;
+        let here = entity.interpolated_position(now)?;
+        // A creature still running at you is drawn facing the way it is
+        // running, which is where you are anyway. Turning it separately while
+        // it travels would fight the path's own facing.
+        if entity.is_moving(now) {
+            return Some(here.orientation);
+        }
+
+        let position_of = |target: u64| match own {
+            Some((own_guid, at)) if own_guid == target => Some(at),
+            _ => self.get(target).and_then(|t| t.interpolated_position(now)),
+        };
+        let look_at = |target: u64| {
+            position_of(target).map(|at| (at.y - here.y).atan2(at.x - here.x))
+        };
+
+        // Its own target first, then whatever the last facing packet named.
+        if let Some(angle) = entity.target().and_then(look_at) {
+            return Some(angle);
+        }
+        match entity.arrival_facing {
+            Some(crate::update::MoveFacing::Target(target)) => {
+                Some(look_at(target).unwrap_or(here.orientation))
+            }
+            _ => Some(here.orientation),
+        }
+    }
+
+    /// Whether this unit is in a melee, on either side of it.
+    ///
+    /// Both directions, because a character being swung at is just as much in
+    /// a fight as one swinging -- and a renderer that only asked the first
+    /// would leave a player standing at ease while a wolf chewed on them.
+    ///
+    /// Derived from [`Self::attacking`] rather than kept as a second flag, so
+    /// there is one account of who is fighting whom. That map is maintained by
+    /// `SMSG_ATTACKSTART`/`SMSG_ATTACKSTOP` and cleared when either party
+    /// leaves the world, which is exactly the lifetime this question wants.
+    pub fn is_fighting(&self, guid: u64) -> bool {
+        self.attacking.contains_key(&guid) || self.attacking.values().any(|victim| *victim == guid)
+    }
+
+    pub fn own_corpses(&self, owner: u64) -> impl Iterator<Item = &Entity> {
+        self.corpses().filter(move |corpse| {
+            corpse
+                .fields
+                .get_u64(crate::update::fields::CORPSE_OWNER)
+                == Some(owner)
+        })
     }
 
     /// How much of a spell's cooldown remains, `0.0` if it is not on one at
@@ -605,7 +978,9 @@ impl WorldState {
             self.stats.recreated += 1;
             existing.updates += 1;
             existing.object_type = object_type;
+            let was_dead = existing.is_dead_or_ghost();
             existing.fields.merge(fields);
+            existing.note_death_transition(was_dead);
             if movement.position.is_some() {
                 existing.position = movement.position;
                 existing.clear_predicted_move();
@@ -629,6 +1004,13 @@ impl WorldState {
                 move_duration: None,
                 move_started: None,
                 arrival_facing: None,
+                path_facing: PathFacing::default(),
+                last_move_time: None,
+                // Deliberately `None` even when the create block says this
+                // thing is already dead -- see the field's own comment. We did
+                // not watch it die, so it must not fall over again.
+                died_at: None,
+                last_swing: None,
                 updates: 1,
             },
         );
@@ -645,7 +1027,12 @@ impl WorldState {
         };
         self.stats.value_updates += 1;
         entity.updates += 1;
+        // Read before the merge and compared after: death arrives as an
+        // ordinary field update with no packet of its own, so the only way to
+        // notice it is to watch the value change.
+        let was_dead = entity.is_dead_or_ghost();
         entity.fields.merge(fields);
+        entity.note_death_transition(was_dead);
     }
 
     fn update_movement(
@@ -671,7 +1058,130 @@ impl WorldState {
 
     /// Applies a relayed `MSG_MOVE_*` from another mover.
     pub fn apply_relayed_movement(&mut self, guid: u64, info: &MovementInfo) {
-        self.update_movement(guid, Some(info.position), Some(*info));
+        self.apply_relayed_movement_at(guid, info, std::time::Instant::now());
+    }
+
+    /// Applies a relayed `MSG_MOVE_*`, walking the mover from where it was to
+    /// where this packet says it is rather than teleporting it there.
+    ///
+    /// **This is the fix for `foss-wow#22`, and the shape of the problem is
+    /// worth keeping.** A creature moves by `SMSG_MONSTER_MOVE`, which carries
+    /// a start, an end and a duration -- a *path*, which is what
+    /// [`Entity::interpolated_position`] was built around. A player moves by
+    /// relayed `MSG_MOVE_*`, which carries a position and nothing else. Storing
+    /// it and clearing the prediction, as this used to, left the player
+    /// snapping from packet to packet and -- having no duration for
+    /// [`Entity::move_speed`] to divide -- reading as `speed: 0.0`, so they
+    /// never left the stand cycle either. Two symptoms, one cause.
+    ///
+    /// The path is assembled from *two consecutive samples*: the previous one
+    /// is where the mover was, this one is where they are, and the interval
+    /// between them is how long they took. Nothing here is predicted forward --
+    /// every position drawn is one the server actually reported, and the cost
+    /// is that the mover is drawn one packet-interval behind. That trade is
+    /// deliberate. Extrapolating ahead from movement flags and the speed
+    /// fields would remove the lag and start inventing positions, and a mover
+    /// invented into a wall is a bug nothing can check; a mover drawn half a
+    /// second late is merely late.
+    ///
+    /// **The interval comes from the mover's own clock** (`MovementInfo::time`),
+    /// not from when the two packets reached us, because that is the one
+    /// measurement of how they actually spaced their samples. Our arrival times
+    /// also measure the network and this client's own scheduler.
+    ///
+    /// Anything implausible falls back to the old snap, which matters more than
+    /// it looks: the fallback is exactly the previous behaviour, so a mover
+    /// whose clock this client cannot make sense of is no worse off than before.
+    /// Three things are implausible -- an interval too short to be a real
+    /// sample, one long enough that the mover was standing still or out of view
+    /// (interpolating across it would have them crawl), and a distance no
+    /// legitimate movement covers in that interval, which is a teleport and
+    /// must not be drawn as a walk.
+    pub fn apply_relayed_movement_at(
+        &mut self,
+        guid: u64,
+        info: &MovementInfo,
+        now: std::time::Instant,
+    ) {
+        /// Only zero is rejected, and only because it divides.
+        ///
+        /// This was 40ms, on the reasoning that nothing real samples itself
+        /// faster than that. Then the rate was actually measured against a
+        /// live client: across 1,132 samples the **median interval was 21ms**,
+        /// and the floor would have thrown away most of the stream in the name
+        /// of protecting it. A 1ms segment interpolates to a snap on its own
+        /// without needing a rule to say so, which is the better way for this
+        /// to degrade.
+        const MIN_INTERVAL_MS: u32 = 1;
+        /// Beyond this the previous sample is not the start of a walk -- the
+        /// mover was standing, or out of view, or we missed packets.
+        const MAX_INTERVAL_MS: u32 = 2_000;
+        /// Well past any legitimate speed in 3.3.5a -- run is 7.0 and the
+        /// fastest mount a little over 21 -- so this rejects teleports without
+        /// having to enumerate what a mover might be riding.
+        const MAX_SPEED: f32 = 30.0;
+
+        let Some(entity) = self.entities.get_mut(&guid) else {
+            self.stats.orphaned += 1;
+            return;
+        };
+        self.stats.movement_updates += 1;
+        entity.updates += 1;
+
+        let previous_time = entity.last_move_time.replace(info.time);
+        // Where the mover is being *drawn* right now, which is not the same as
+        // the last packet's position when a segment is still in flight. Taking
+        // the raw one would jerk them back to the start of the segment they are
+        // halfway along. `apply_monster_move` starts from the interpolated
+        // position for exactly this reason.
+        let from = entity.interpolated_position(now);
+        entity.movement = Some(*info);
+
+        let interval = previous_time.map(|previous| info.time.wrapping_sub(previous));
+        // Each arm records why, so a run's snap count can be read rather than
+        // merely counted -- see [`Stats::relayed_first_sample`].
+        let plausible = match (from, interval) {
+            (None, _) | (_, None) => {
+                self.stats.relayed_first_sample += 1;
+                None
+            }
+            (Some(_), Some(ms)) if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&ms) => {
+                self.stats.relayed_gap += 1;
+                None
+            }
+            (Some(from), Some(ms)) => {
+                let distance = ((info.position.x - from.x).powi(2)
+                    + (info.position.y - from.y).powi(2)
+                    + (info.position.z - from.z).powi(2))
+                .sqrt();
+                if distance / (ms as f32 / 1000.0) > MAX_SPEED {
+                    self.stats.relayed_teleport += 1;
+                    None
+                } else {
+                    Some((from, ms))
+                }
+            }
+        };
+
+        match plausible {
+            Some((from, ms)) => {
+                self.stats.relayed_paths += 1;
+                self.stats.relayed_interval_ms += ms as u64;
+                entity.position = Some(from);
+                entity.destination = Some(info.position);
+                entity.move_duration = Some(ms);
+                entity.move_started = Some(now);
+                // A relayed move has no separate arrival facing: both ends
+                // carry the mover's own, and `PathFacing::Reported` reads them
+                // directly.
+                entity.arrival_facing = None;
+                entity.path_facing = PathFacing::Reported;
+            }
+            None => {
+                entity.position = Some(info.position);
+                entity.clear_predicted_move();
+            }
+        }
     }
 
     /// Applies a creature's path.
@@ -705,12 +1215,22 @@ impl WorldState {
         self.stats.movement_updates += 1;
         entity.updates += 1;
 
-        let orientation = move_.facing.unwrap_or_else(|| {
+        // The *starting* facing for the new path. Only an explicit angle can
+        // serve: a spot or a target names a place to end up looking, which is
+        // resolved against the arrival, not against wherever the creature is
+        // standing as it sets off. Anything else keeps the facing it had,
+        // which is what a creature turning to attack should look like it is
+        // turning *from*.
+        let held = || {
             entity
                 .interpolated_position(std::time::Instant::now())
                 .map(|p| p.orientation)
                 .unwrap_or(0.0)
-        });
+        };
+        let orientation = match move_.facing {
+            Some(crate::update::MoveFacing::Angle(angle)) => angle,
+            _ => held(),
+        };
         entity.position = Some(Position {
             orientation,
             ..move_.from
@@ -719,6 +1239,7 @@ impl WorldState {
         entity.move_duration = move_.to.map(|_| move_.duration);
         entity.move_started = move_.to.map(|_| std::time::Instant::now());
         entity.arrival_facing = move_.facing;
+        entity.path_facing = PathFacing::DirectionOfTravel;
     }
 
     pub fn remove(&mut self, guid: u64) -> bool {
@@ -832,9 +1353,7 @@ impl WorldState {
                         )),
                     }
                 }
-                crate::opcode::server::MOVE_START_FORWARD
-                | crate::opcode::server::MOVE_STOP
-                | crate::opcode::server::MOVE_HEARTBEAT => {
+                other if crate::opcode::is_relayed_movement(other) => {
                     match crate::protocol::parse_movement(&packet.body) {
                         Ok((mover, info)) => {
                             report.relayed_moves += 1;
@@ -865,6 +1384,65 @@ impl WorldState {
                         Ok(answer) => {
                             report.names += 1;
                             self.names.apply_creature(&answer);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // Where a released ghost was sent. Stored rather than returned:
+                // unlike chat or a swing this is *state* -- the marker stays on
+                // the minimap until the server takes it off again with the same
+                // opcode -- and the three callers that have now dropped a
+                // returned category between them are argument enough not to add
+                // a fourth.
+                // Checked before the relayed-movement arm, which would
+                // otherwise swallow it: this opcode carries a counter between
+                // the guid and the movement block, so reading it as an ordinary
+                // relayed move parses a plausible position out of the wrong
+                // offset and leaves bytes over.
+                crate::opcode::server::MOVE_TELEPORT_ACK => {
+                    match crate::protocol::parse_teleport(&packet.body) {
+                        Ok(teleport) => {
+                            report.teleports += 1;
+                            self.pending_teleport = Some(teleport);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::CORPSE_QUERY => {
+                    match crate::death::parse_corpse_query(&packet.body) {
+                        Ok(found) => self.corpse_location = found,
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::DEATH_RELEASE_LOC => {
+                    match crate::death::parse_release_location(&packet.body) {
+                        Ok(at) => {
+                            report.release_locations += 1;
+                            self.release_location = (!at.is_clear()).then_some(at);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::CORPSE_RECLAIM_DELAY => {
+                    match crate::death::parse_reclaim_delay(&packet.body) {
+                        Ok(delay) => {
+                            self.reclaim_delay_ms = Some(delay);
                         }
                         Err(error) => report.failures.push((
                             packet.opcode,
@@ -1000,7 +1578,21 @@ impl WorldState {
                 // as an ordinary field update and needs nothing here.
                 crate::opcode::server::ATTACKER_STATE_UPDATE => {
                     match crate::combat::parse_melee_swing(&packet.body) {
-                        Ok(swing) => report.swings.push(swing),
+                        Ok(swing) => {
+                            // Stamped on the attacker as well as reported, so
+                            // a renderer can start a swing animation from the
+                            // moment the swing actually happened. Stored
+                            // rather than returned for the reason five
+                            // returned categories have already been dropped by
+                            // a caller: an animation that only plays when
+                            // somebody remembers to look at the report is one
+                            // that stops playing the first time a caller does
+                            // not.
+                            if let Some(attacker) = self.entities.get_mut(&swing.attacker) {
+                                attacker.last_swing = Some(std::time::Instant::now());
+                            }
+                            report.swings.push(swing);
+                        }
                         Err(error) => report.failures.push((
                             packet.opcode,
                             error,
@@ -1921,6 +2513,116 @@ mod tests {
     /// -- at every `t`, including `t == 1.0`. An entity that had "arrived"
     /// kept reporting the heading it walked in on forever, and the wire's
     /// own arrival hint was silently discarded after being parsed.
+    /// A creature told to face *another unit* actually turns to it.
+    ///
+    /// This is the shape a melee attacker uses, and it is the one that cannot
+    /// be answered by the entity alone: the wire says "look at guid X", and
+    /// only the world knows where X is. Reported from play as a mob standing
+    /// side-on to the player it was attacking.
+    #[test]
+    fn a_facing_at_another_unit_is_resolved_against_that_unit() {
+        let mut world = WorldState::new();
+        // The attacker stops at the origin; its victim stands due north.
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+        world.apply(&[create(9, ObjectType::Unit, Some(at(0.0, 50.0)), &[])]);
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(at(0.0, 0.0)),
+            // Arrives immediately, which is what a turn-on-the-spot is.
+            duration: 0,
+            stopped: false,
+            facing: Some(crate::update::MoveFacing::Target(9)),
+        });
+
+        let now = std::time::Instant::now();
+        let facing = world.facing_of(7, now, None).unwrap();
+        // Due north from the origin is +y, which is a quarter turn.
+        assert!(
+            (facing - std::f32::consts::FRAC_PI_2).abs() < 1e-4,
+            "faced {facing} rather than at the unit it was told to face"
+        );
+
+        // And a facing at a unit that is not in view leaves it as it was,
+        // rather than snapping to a default heading nothing asked for.
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(at(0.0, 0.0)),
+            duration: 0,
+            stopped: false,
+            facing: Some(crate::update::MoveFacing::Target(0xDEAD)),
+        });
+        assert!(world.facing_of(7, now, None).is_some(), "an unknown target lost the facing");
+    }
+
+    /// **A creature facing the player must use where the player actually is,
+    /// not where this state thinks they are.**
+    ///
+    /// The server never relays a client's own movement back, so our entry in
+    /// replicated state is frozen at the login position however far we have
+    /// since walked. A creature resolving its facing through that entry aims
+    /// at the login spot -- which starts out right, drifts as the player
+    /// moves, and ends with the player able to stand behind a creature that is
+    /// supposedly attacking them. Reported from play in exactly that
+    /// progression.
+    #[test]
+    fn a_creature_faces_where_the_player_is_not_where_state_last_heard() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+        // The player's *replicated* position: due north, and stale.
+        world.apply(&[create(9, ObjectType::Player, Some(at(0.0, 50.0)), &[])]);
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(at(0.0, 0.0)),
+            duration: 0,
+            stopped: false,
+            facing: Some(crate::update::MoveFacing::Target(9)),
+        });
+
+        let now = std::time::Instant::now();
+        // Believing replicated state: the creature looks north.
+        let stale = world.facing_of(7, now, None).unwrap();
+        assert!((stale - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+
+        // The player has actually walked due *east* since logging in. Told
+        // where they really are, the creature turns to them instead.
+        let real = world
+            .facing_of(7, now, Some((9, at(50.0, 0.0))))
+            .unwrap();
+        assert!(
+            real.abs() < 1e-4,
+            "faced {real} -- still aiming at the replicated login position"
+        );
+    }
+
+    /// A facing at a *place* is resolved by the entity itself, needing no
+    /// world -- unlike one at a unit.
+    #[test]
+    fn a_facing_at_a_spot_is_resolved_without_the_world() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(at(0.0, 0.0)),
+            duration: 0,
+            stopped: false,
+            facing: Some(crate::update::MoveFacing::Spot { x: 0.0, y: 50.0, z: 0.0 }),
+        });
+        let arrived = world
+            .get(7)
+            .unwrap()
+            .interpolated_position(std::time::Instant::now())
+            .unwrap();
+        assert!(
+            (arrived.orientation - std::f32::consts::FRAC_PI_2).abs() < 1e-4,
+            "faced {} rather than at the spot",
+            arrived.orientation
+        );
+    }
+
     #[test]
     fn arrival_facing_takes_over_once_the_move_completes_but_not_before() {
         let mut world = WorldState::new();
@@ -1931,7 +2633,7 @@ mod tests {
             to: Some(at(100.0, 0.0)), // due "east": direction of travel is 0 rad
             duration: 4000,
             stopped: false,
-            facing: Some(2.5), // deliberately unrelated to the direction of travel
+            facing: Some(crate::update::MoveFacing::Angle(2.5)), // deliberately unrelated to the direction of travel
         });
 
         let entity = world.get(7).unwrap();
@@ -1974,7 +2676,7 @@ mod tests {
             to: Some(at(0.0, 5.0)),
             duration: 0,
             stopped: false,
-            facing: Some(1.1),
+            facing: Some(crate::update::MoveFacing::Angle(1.1)),
         });
 
         let entity = world.get(7).unwrap();
@@ -2026,7 +2728,7 @@ mod tests {
             to: Some(at(100.0, 0.0)),
             duration: 4000,
             stopped: false,
-            facing: Some(2.5),
+            facing: Some(crate::update::MoveFacing::Angle(2.5)),
         });
         assert!(world.get(7).unwrap().destination.is_some());
         assert!(world.get(7).unwrap().arrival_facing.is_some());
@@ -2050,6 +2752,286 @@ mod tests {
             Some(at(3.0, 4.0)),
             "with no path in flight, the position must be exactly what was reported"
         );
+    }
+
+    /// Position with an explicit heading, for the relayed-movement tests: the
+    /// whole point of those is that the mover's own facing is not the direction
+    /// it is travelling, and `at` hardcodes zero.
+    fn facing(x: f32, y: f32, orientation: f32) -> Position {
+        Position {
+            x,
+            y,
+            z: 0.0,
+            orientation,
+        }
+    }
+
+    fn relayed(position: Position, time: u32) -> MovementInfo {
+        MovementInfo::standing(position, time)
+    }
+
+    /// `foss-wow#22`, in the form it was reported: another player vanishes from
+    /// one spot and reappears further along their path, playing no animation.
+    ///
+    /// Two consecutive relayed samples have to become a *path*, because that is
+    /// the only thing `interpolated_position` and `move_speed` can read. The
+    /// speed assertion is not decoration -- a mover with a position but no
+    /// duration divides nothing, reads as `0.0`, and picks the stand cycle,
+    /// which is the second half of the same defect.
+    #[test]
+    fn two_relayed_samples_become_a_path_that_is_walked_rather_than_jumped() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Player, Some(at(0.0, 0.0)), &[])]);
+
+        let start = std::time::Instant::now();
+        world.apply_relayed_movement_at(7, &relayed(at(0.0, 0.0), 1_000), start);
+        // 5 units in half a second: walking pace, and a plausible sample gap.
+        world.apply_relayed_movement_at(7, &relayed(at(5.0, 0.0), 1_500), start);
+
+        let entity = world.get(7).unwrap();
+        assert_eq!(entity.move_duration, Some(500));
+        assert_eq!(entity.destination, Some(at(5.0, 0.0)));
+
+        let halfway = entity
+            .interpolated_position(start + std::time::Duration::from_millis(250))
+            .unwrap();
+        assert!(
+            (halfway.x - 2.5).abs() < 0.01,
+            "the mover must be drawn between the two samples, not at either one: {halfway:?}"
+        );
+        assert!(
+            entity.is_moving(start + std::time::Duration::from_millis(250)),
+            "a mover mid-segment is moving"
+        );
+        let speed = entity
+            .move_speed(start + std::time::Duration::from_millis(250))
+            .unwrap();
+        assert!(
+            (speed - 10.0).abs() < 0.01,
+            "5 units in 500ms is 10 units per second, not the 0.0 that picks the stand cycle: {speed}"
+        );
+    }
+
+    /// The three states of a player, as six live snapshots reported them.
+    ///
+    /// Built from the literal values captured against the realm rather than
+    /// from invented ones, because the point of the test is that a ghost's
+    /// health is `1` and reads as alive to anything that only looks at health.
+    #[test]
+    fn dead_and_ghost_are_two_states_and_neither_is_readable_from_health() {
+        let bytes = crate::update::fields::PLAYER_FIELD_BYTES;
+        let ghost = crate::update::fields::PLAYER_GHOST;
+        let health = crate::update::fields::UNIT_HEALTH;
+        let max = crate::update::fields::UNIT_MAX_HEALTH;
+
+        let mut world = WorldState::new();
+        // Alive: no flags at all. An absent field is a zero here.
+        world.apply(&[create(
+            1,
+            ObjectType::Player,
+            None,
+            &[(health, 60), (max, 60)],
+        )]);
+        // Dead where they fell: no health, release window open, no ghost flag.
+        world.apply(&[create(
+            2,
+            ObjectType::Player,
+            None,
+            &[(max, 60), (bytes, 0x08)],
+        )]);
+        // Released, running back: a ghost's single health point, and the flag.
+        world.apply(&[create(
+            3,
+            ObjectType::Player,
+            None,
+            &[(health, 1), (max, 60), (bytes, 0x08), (ghost, 0x10)],
+        )]);
+        // Resurrected by a GM: alive and well, with the release-timer bit
+        // still set. This is the case that six live snapshots of ordinary
+        // deaths could not produce, and that a "not alive" reading of that bit
+        // gets exactly wrong.
+        world.apply(&[create(
+            4,
+            ObjectType::Player,
+            None,
+            &[(health, 60), (max, 60), (bytes, 0x08)],
+        )]);
+
+        let alive = world.get(1).unwrap();
+        assert!(!alive.is_dead_or_ghost());
+        assert!(!alive.is_ghost());
+
+        let dead = world.get(2).unwrap();
+        assert!(dead.is_dead_or_ghost());
+        assert!(
+            !dead.is_ghost(),
+            "a player who has not released is dead, not a ghost -- the corpse \
+             run happens entirely inside this state"
+        );
+
+        let ghost_player = world.get(3).unwrap();
+        assert!(ghost_player.is_dead_or_ghost());
+        assert!(ghost_player.is_ghost());
+        assert_eq!(
+            ghost_player.health(),
+            Some(1),
+            "the ghost's health is what makes reading death off health wrong"
+        );
+
+        let revived = world.get(4).unwrap();
+        assert!(
+            !revived.is_dead_or_ghost(),
+            "full health and no ghost flag is alive, whatever the release-timer \
+             bit still says"
+        );
+        assert!(
+            revived.release_timer_running(),
+            "and the bit really is still set -- that is the whole point"
+        );
+    }
+
+    /// A real client's samples are far denser than this project assumed, and
+    /// the assumption was written into a constant before anyone measured it.
+    ///
+    /// `MIN_INTERVAL_MS` started at 40ms because "nothing samples itself faster
+    /// than that". Against a live 3.3.5a client the median interval across
+    /// 1,132 relayed samples was **21ms**, so that floor would have rejected
+    /// most of the stream and snapped it -- reintroducing the very defect the
+    /// surrounding code exists to fix, in the name of guarding against
+    /// something that does not happen. This test holds the measurement.
+    #[test]
+    fn samples_arriving_faster_than_a_frame_still_build_a_path() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Player, Some(at(0.0, 0.0)), &[])]);
+
+        let start = std::time::Instant::now();
+        world.apply_relayed_movement_at(7, &relayed(at(0.0, 0.0), 1_000), start);
+        world.apply_relayed_movement_at(7, &relayed(at(0.15, 0.0), 1_021), start);
+
+        let entity = world.get(7).unwrap();
+        assert_eq!(
+            entity.move_duration,
+            Some(21),
+            "21ms is the measured median, not an edge case to be rejected"
+        );
+        assert_eq!(world.stats().relayed_paths, 1);
+        assert_eq!(world.stats().relayed_gap, 0);
+    }
+
+    /// The reason [`PathFacing`] exists. A relayed sample carries the mover's
+    /// *own* orientation at both ends, and a player walking backwards faces the
+    /// opposite way to their direction of travel. Inferring facing from the
+    /// path -- correct for `SMSG_MONSTER_MOVE`, where the wire reports none --
+    /// would turn them round.
+    #[test]
+    fn a_relayed_path_believes_the_reported_facing_over_the_direction_of_travel() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Player, Some(at(0.0, 0.0)), &[])]);
+
+        let start = std::time::Instant::now();
+        // Travelling along +X, but facing back down -X the whole way.
+        let backwards = std::f32::consts::PI;
+        world.apply_relayed_movement_at(7, &relayed(facing(0.0, 0.0, backwards), 1_000), start);
+        world.apply_relayed_movement_at(7, &relayed(facing(5.0, 0.0, backwards), 1_500), start);
+
+        let mid = world
+            .get(7)
+            .unwrap()
+            .interpolated_position(start + std::time::Duration::from_millis(250))
+            .unwrap();
+        assert!(
+            (mid.orientation - backwards).abs() < 0.01,
+            "the mover reported facing {backwards}, and travel direction is 0.0: {}",
+            mid.orientation
+        );
+    }
+
+    /// Headings wrap, and a plain lerp between two a few degrees apart on
+    /// either side of zero spins the mover the long way round the circle.
+    #[test]
+    fn a_turn_across_zero_goes_the_short_way() {
+        let just_under = std::f32::consts::TAU - 0.1;
+        let just_over = 0.1;
+        let mid = lerp_angle(just_under, just_over, 0.5);
+        // Halfway between them is zero itself, give or take the wrap.
+        let normalised = mid.rem_euclid(std::f32::consts::TAU);
+        assert!(
+            normalised < 0.01 || normalised > std::f32::consts::TAU - 0.01,
+            "a 0.2 radian turn must not become a 6.1 radian one: {mid}"
+        );
+    }
+
+    /// A hearthstone, a portal, or simply losing sight of a mover for a while.
+    /// Whatever produced it, a jump no legitimate movement could cover has to
+    /// be drawn as a jump -- sliding a player across a zone at 400 units a
+    /// second is worse than the snap it replaced.
+    #[test]
+    fn a_teleport_snaps_rather_than_sliding_across_the_zone() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Player, Some(at(0.0, 0.0)), &[])]);
+
+        let start = std::time::Instant::now();
+        world.apply_relayed_movement_at(7, &relayed(at(0.0, 0.0), 1_000), start);
+        world.apply_relayed_movement_at(7, &relayed(at(4_000.0, 0.0), 1_500), start);
+
+        let entity = world.get(7).unwrap();
+        assert!(
+            entity.destination.is_none(),
+            "4000 units in half a second is not a walk"
+        );
+        assert_eq!(entity.position, Some(at(4_000.0, 0.0)));
+    }
+
+    /// A mover who stood still for ten seconds and then took one step. The gap
+    /// between the samples is real, but it is not how long the step took --
+    /// interpolating across it would have them creep forward for ten seconds.
+    #[test]
+    fn a_long_gap_between_samples_snaps_rather_than_crawling() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Player, Some(at(0.0, 0.0)), &[])]);
+
+        let start = std::time::Instant::now();
+        world.apply_relayed_movement_at(7, &relayed(at(0.0, 0.0), 1_000), start);
+        world.apply_relayed_movement_at(7, &relayed(at(1.0, 0.0), 11_000), start);
+
+        assert!(
+            world.get(7).unwrap().destination.is_none(),
+            "a ten second gap is a mover who was standing still, not a ten second step"
+        );
+    }
+
+    /// The invariant the older test above protects, checked on the path that
+    /// now *replaces* the prediction rather than clearing it: a stale
+    /// `SMSG_MONSTER_MOVE` destination and its arrival facing must not survive
+    /// into a relayed path either.
+    #[test]
+    fn a_relayed_path_supersedes_a_stale_monster_move() {
+        let mut world = WorldState::new();
+        world.apply(&[create(7, ObjectType::Player, Some(at(0.0, 0.0)), &[])]);
+        world.apply_monster_move(&MonsterMove {
+            guid: 7,
+            from: at(0.0, 0.0),
+            to: Some(at(100.0, 0.0)),
+            duration: 4000,
+            stopped: false,
+            facing: Some(crate::update::MoveFacing::Angle(2.5)),
+        });
+
+        let start = std::time::Instant::now();
+        world.apply_relayed_movement_at(7, &relayed(at(1.0, 0.0), 1_000), start);
+        world.apply_relayed_movement_at(7, &relayed(at(2.0, 0.0), 1_500), start);
+
+        let entity = world.get(7).unwrap();
+        assert_eq!(
+            entity.destination,
+            Some(at(2.0, 0.0)),
+            "the relayed sample is where the mover is going now"
+        );
+        assert!(
+            entity.arrival_facing.is_none(),
+            "a monster move's arrival hint must not steer a relayed path"
+        );
+        assert_eq!(entity.path_facing, PathFacing::Reported);
     }
 
     /// The bug `is_moving` exists to prevent: `destination` alone stays set

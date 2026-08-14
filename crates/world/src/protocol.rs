@@ -658,6 +658,37 @@ pub fn parse_movement(
     Ok((mover, info))
 }
 
+/// A teleport within the current map, which the client must acknowledge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Teleport {
+    /// Who is being moved. Always this client -- the server does not send
+    /// these for anybody else -- but checked rather than assumed, because
+    /// acknowledging someone else's teleport with our own guid is the kind of
+    /// write that gets read as a different valid request.
+    pub mover: u64,
+    /// The server's ordering counter, echoed straight back.
+    pub counter: u32,
+    /// Where the character now is. The reason this is worth parsing rather
+    /// than only replying to: a client that acks without moving is a client
+    /// whose own idea of its position is now wrong by however far it was sent.
+    pub info: crate::movement::MovementInfo,
+}
+
+/// Reads `MSG_MOVE_TELEPORT_ACK` as the server sends it:
+/// `{packed guid, u32 counter, MovementInfo}`.
+pub fn parse_teleport(body: &[u8]) -> Result<Teleport, Error> {
+    let mut reader = Reader::new(body, "MSG_MOVE_TELEPORT_ACK");
+    let mover = crate::update::read_packed_guid(&mut reader)?;
+    let counter = reader.u32()?;
+    let info = crate::movement::MovementInfo::read(&mut reader)?;
+    reader.finish()?;
+    Ok(Teleport {
+        mover,
+        counter,
+        info,
+    })
+}
+
 /// Equipment slots reported per character.
 ///
 /// Nineteen worn slots -- head through tabard, including both weapons and the
