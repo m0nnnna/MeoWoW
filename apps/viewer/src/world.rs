@@ -195,6 +195,19 @@ pub struct EntityPlacement {
     /// simply *moving*, and drawing the walk cycle for both makes the charge
     /// look like the model is being dragged.
     pub speed: f32,
+    /// Whether this unit has no health left, so it should be drawn down rather
+    /// than standing. Outranks `speed`: a creature killed mid-charge still has
+    /// the charge's speed attached to it.
+    pub dead: bool,
+    /// How long ago it was seen to *die*, when this client watched it happen.
+    /// `None` for a corpse that was already lying there when it came into
+    /// view -- which must start settled rather than topple over again.
+    pub died_ms_ago: Option<u32>,
+    /// How long ago it last swung at something.
+    pub swung_ms_ago: Option<u32>,
+    /// Whether it is in a melee, on either side. Holds the guard up between
+    /// swings instead of dropping back to the town idle.
+    pub fighting: bool,
     /// What kind of thing this is.
     ///
     /// Decides which table the display id means: a unit's is a
@@ -627,6 +640,10 @@ impl World {
         let mut looks: HashMap<u64, Option<std::rc::Rc<crate::character::Look>>> = HashMap::new();
         let mut kinds: HashMap<u64, ::world::ObjectType> = HashMap::new();
         let mut grouped: HashMap<(u32, Motion, u64), Vec<Mat4>> = HashMap::new();
+        // One clock reading for the whole rebuild, so two units that died in
+        // the same frame land in the same bucket and share a pose rather than
+        // missing each other by a millisecond.
+        let now_ms = self.started.elapsed().as_millis() as u32;
         for placement in placements {
             looks.insert(placement.look_key, placement.look.clone());
             kinds.insert(
@@ -636,7 +653,14 @@ impl World {
             grouped
                 .entry((
                     placement.display_id,
-                    Motion::from_speed(placement.speed),
+                    Motion::resolve(
+                        placement.speed,
+                        placement.dead,
+                        placement.died_ms_ago,
+                        placement.swung_ms_ago,
+                        placement.fighting,
+                        now_ms,
+                    ),
                     // A game object shares the display-id space with creatures
                     // and means something else by it, so it cannot share a
                     // group with one. Folded into the look key rather than
@@ -692,7 +716,31 @@ impl World {
             // speed calls for, or any of them. Only the buffer is created here;
             // `update_animations` writes the pose every frame rather than only
             // on this rebuild, so no cycle visibly stutters at the rebuild rate.
-            let animation = sequence_for(&model, motion).map(|_| {
+            let resolved = sequence_for(&model, motion);
+            // The one-shot cycles are rare, and each one is a claim that
+            // something visible just happened -- so each is worth a line.
+            //
+            // Reporting whether a sequence was actually *found* is the point.
+            // A model with no death cycle silently falls back to no animation
+            // at all, which draws the bind pose: standing upright, exactly the
+            // symptom this feature exists to remove. "Playing the death
+            // animation" and "having a death animation to play" are different
+            // claims, and only the second is checkable from here.
+            if motion.is_notable() {
+                match resolved {
+                    Some(index) => tracing::debug!(
+                        "display {display_id}: {motion:?} -> sequence {index} \
+                         (animation id {}), {} instance(s)",
+                        model.sequences[index].id,
+                        transforms.len()
+                    ),
+                    None => tracing::debug!(
+                        "display {display_id}: {motion:?} but the model has no \
+                         matching cycle; it will draw its bind pose"
+                    ),
+                }
+            }
+            let animation = resolved.map(|_| {
                 self.entity_bones
                     .entry((display_id, motion))
                     .or_insert_with(|| meshes.create_bones(gpu, model.bones.len().max(1)));
@@ -739,7 +787,41 @@ impl World {
                 continue;
             };
             let duration = group.model.sequences[sequence].duration_ms.max(1);
-            let time_ms = (self.started.elapsed().as_millis() as u32) % duration;
+            let now_ms = self.started.elapsed().as_millis() as u32;
+            // A loop wraps; a cycle that plays once *holds its last frame*.
+            //
+            // Holding is what makes a corpse stay down. Wrapping a death cycle
+            // would stand the creature back up and drop it again, forever,
+            // which is worse than not animating at all -- and it is the
+            // failure this branch exists to prevent, since every other cycle
+            // in this client is a loop and the modulo was the obvious thing to
+            // write.
+            //
+            // **The decision is made on the animation that resolved, not on
+            // the motion that asked for it**, and the difference is not
+            // academic. `Motion::Attacking` falls back to plain standing on a
+            // model with no attack cycle, and a Stand frozen at its last frame
+            // is a statue. Meanwhile `Motion::Dead` carries no start time at
+            // all and yet must hold, because on most models it resolves to the
+            // *fall* -- looping that is a creature dying over and over.
+            let played = group.model.sequences[sequence].id;
+            let time_ms = if played == DEATH_ANIMATION_ID && motion == Motion::Dead {
+                // Settled onto the last frame of the fall. No start time is
+                // needed or wanted: this pose is the same however long ago the
+                // unit died, which is why every settled corpse of a display
+                // can share one bucket.
+                duration - 1
+            } else if plays_once(played) {
+                match motion.started_at() {
+                    Some(started) => now_ms.saturating_sub(started).min(duration - 1),
+                    // A play-once cycle with nothing to time it from: hold the
+                    // end rather than loop, which is the safer of the two
+                    // wrong answers.
+                    None => duration - 1,
+                }
+            } else {
+                now_ms % duration
+            };
             let pose: Vec<[[f32; 4]; 4]> = m2::Model::pose_bones(&group.model.bones, sequence, time_ms)
                 .iter()
                 .map(|m| m.to_cols_array_2d())
@@ -906,13 +988,100 @@ fn game_object_key(kind: ::world::ObjectType) -> u64 {
 const STAND_ANIMATION_ID: u16 = 0;
 const WALK_ANIMATION_ID: u16 = 4;
 const RUN_ANIMATION_ID: u16 = 5;
+/// Falling over, and lying still afterwards. Two rows, not one, and the table
+/// says so itself: `Dead` (6) lists `Death` (1) as its *fallback*, which is
+/// exactly the relationship between them -- a model with no settled-corpse
+/// cycle holds the last frame of the toppling one instead.
+const DEATH_ANIMATION_ID: u16 = 1;
+const DEAD_ANIMATION_ID: u16 = 6;
+/// Swinging a weapon. `Attack1H` (17) falls back to `AttackUnarmed` (16) in
+/// `AnimationData.dbc`'s own fallback column, which is the order tried here --
+/// a wolf has no one-handed swing and a warrior has both.
+const ATTACK_1H_ANIMATION_ID: u16 = 17;
+const ATTACK_UNARMED_ANIMATION_ID: u16 = 16;
+/// Standing *in* a fight, between swings: weapon up, guard raised. `Ready1H`
+/// (26) falls back to `ReadyUnarmed` (25), again per the table's own column.
+///
+/// Worth having as a state of its own rather than letting combat look like
+/// idling. A swing is an instant and a fight is a minute, so without this a
+/// fighting character spends nearly all of it in the same relaxed stand it
+/// uses in town -- which is what "the player stands still while the fight
+/// happens" actually describes.
+const READY_1H_ANIMATION_ID: u16 = 26;
+const READY_UNARMED_ANIMATION_ID: u16 = 25;
+
+/// How long any one-shot cycle is allowed to run before the unit is treated as
+/// settled.
+///
+/// A ceiling rather than the real duration, because the thing that *chooses* a
+/// motion (a placement being built from replicated state) has no model loaded
+/// and cannot ask how long its death animation is. `update_animations`, which
+/// does have the model, clamps to the real duration -- so this only has to be
+/// long enough not to cut anything short. No 3.3.5a death or attack cycle is
+/// close to three seconds.
+const ONE_SHOT_CEILING_MS: u32 = 3_000;
+
+/// A swing is done with sooner than a death, and the difference is visible.
+///
+/// A one-shot holds its last frame until the state lapses, so a ceiling far
+/// longer than the animation leaves the unit **frozen on its follow-through**
+/// until the next swing snaps it back to the start. At the ceiling above, with
+/// swings roughly two seconds apart, a fighter would spend more of the fight
+/// frozen mid-swing than moving. Long enough for the longest attack cycle in
+/// the models this client draws (`Creature\Wolf\Wolf.m2`'s `AttackUnarmed` is
+/// 1500ms, `HumanMale`'s 1000ms), and no longer.
+const ATTACK_CEILING_MS: u32 = 1_500;
+
+/// How coarsely a one-shot's start time is bucketed.
+///
+/// **This is not an optimisation, it is the difference between the animation
+/// working and not.** The stamp is part of the bone-buffer's cache key, and it
+/// is computed by subtracting one clock reading from another taken a moment
+/// earlier in the same frame -- so left raw it lands on a slightly different
+/// value *every frame*. Every frame would then be a fresh cache key, a fresh
+/// bone buffer, and a model drawn in its bind pose because nothing has posed
+/// the new buffer yet. The symptom is not a subtle inefficiency: it is a
+/// character that flickers instead of swinging.
+///
+/// A tenth of a second is coarse enough to be stable across the drift between
+/// two clock reads and fine enough that two units swinging a tenth of a second
+/// apart still animate separately.
+const ONE_SHOT_BUCKET_MS: u32 = 100;
+
+/// Rounds a one-shot's start time to its bucket. See [`ONE_SHOT_BUCKET_MS`].
+fn bucket(at_ms: u32) -> u32 {
+    at_ms / ONE_SHOT_BUCKET_MS * ONE_SHOT_BUCKET_MS
+}
 
 /// Which cycle a replicated entity should be playing.
+///
+/// The looping states carry nothing; the one-shot states carry **when they
+/// started**, as a world-clock millisecond stamp.
+///
+/// That stamp is in the key rather than looked up per entity because bone
+/// poses are shared: every instance in a bucket is drawn from one buffer, so
+/// two creatures can only share a pose if they are at the same point of the
+/// same cycle. For a loop that is free -- everything standing is in step
+/// anyway. For a one-shot it is the whole difficulty, and putting the start
+/// time in the key solves it exactly: units that died together share a bucket
+/// and units that died a second apart do not.
+///
+/// The stamp is *absolute*, not an age. An age changes every frame, which
+/// would rebuild the bone buffer every frame and defeat the cache; a start
+/// time is fixed for the life of the animation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Motion {
     Stand,
     Walk,
     Run,
+    /// Toppling over, from the world-clock millisecond it began.
+    Dying(u32),
+    /// Settled: lying still, and no longer tied to when death happened.
+    Dead,
+    /// Mid-swing, from the world-clock millisecond the blow landed.
+    Attacking(u32),
+    /// In a fight but between swings: guard up rather than at ease.
+    Ready,
 }
 
 /// Where a walk becomes a run, in world units per second.
@@ -941,6 +1110,67 @@ impl Motion {
         }
     }
 
+    /// What a unit should be playing, given everything known about it.
+    ///
+    /// The order of precedence is the whole of the rule and each step earns
+    /// its place:
+    ///
+    /// - **Dead outranks everything.** A corpse does not walk, however fast
+    ///   the last movement packet said it was going -- and a creature killed
+    ///   mid-charge still has a stale speed attached to it.
+    /// - **A death we watched plays the fall; one we did not starts settled.**
+    ///   `died_ms_ago` is `None` for a corpse that was already lying there
+    ///   when it came into view, which is most of them in a graveyard.
+    /// - **A swing only interrupts standing.** A creature chasing you swings
+    ///   as it runs, and a swing animation played over a run reads as a
+    ///   stumble; the run is the more informative of the two, so it wins.
+    ///
+    /// `now_ms` is the caller's world clock, and the one-shot stamps are
+    /// derived from it by subtraction so they land on the same timeline
+    /// `update_animations` reads.
+    pub fn resolve(
+        speed: f32,
+        dead: bool,
+        died_ms_ago: Option<u32>,
+        swung_ms_ago: Option<u32>,
+        fighting: bool,
+        now_ms: u32,
+    ) -> Self {
+        if dead {
+            return match died_ms_ago {
+                Some(age) if age < ONE_SHOT_CEILING_MS => {
+                    Motion::Dying(bucket(now_ms.saturating_sub(age)))
+                }
+                _ => Motion::Dead,
+            };
+        }
+        let moving = Motion::from_speed(speed);
+        if moving == Motion::Stand {
+            if let Some(age) = swung_ms_ago {
+                if age < ATTACK_CEILING_MS {
+                    return Motion::Attacking(bucket(now_ms.saturating_sub(age)));
+                }
+            }
+            if fighting {
+                return Motion::Ready;
+            }
+        }
+        moving
+    }
+
+    /// Whether this cycle is about a fight or a death, and so worth a log line.
+    fn is_notable(self) -> bool {
+        !matches!(self, Motion::Stand | Motion::Walk | Motion::Run)
+    }
+
+    /// When a one-shot cycle began, on the caller's world clock.
+    fn started_at(self) -> Option<u32> {
+        match self {
+            Motion::Dying(at) | Motion::Attacking(at) => Some(at),
+            _ => None,
+        }
+    }
+
     /// The animation ids to try, in order.
     ///
     /// A model with no run cycle should still walk rather than freeze in its
@@ -953,8 +1183,47 @@ impl Motion {
             Motion::Stand => &[STAND_ANIMATION_ID],
             Motion::Walk => &[WALK_ANIMATION_ID],
             Motion::Run => &[RUN_ANIMATION_ID, WALK_ANIMATION_ID],
+            Motion::Dying(_) => &[DEATH_ANIMATION_ID],
+            // Settled last: a model with no lying-still cycle holds the final
+            // frame of the toppling one, which `update_animations` produces by
+            // clamping rather than looping. `AnimationData.dbc` lists exactly
+            // this fallback against row 6.
+            Motion::Dead => &[DEAD_ANIMATION_ID, DEATH_ANIMATION_ID],
+            // Both combat stances end at plain standing, and that last entry
+            // is not decoration. `Creature\Wolf\Wolf.m2` has `AttackUnarmed`
+            // and `Death` and **no ready stance at all** -- so without a
+            // fallback a wolf that entered combat would resolve to no sequence
+            // and be drawn in its bind pose, stiff and T-posed, which is worse
+            // than the idle it replaced. Checked against the real models
+            // rather than assumed: `wow-cli m2 anims` lists what each one
+            // actually carries.
+            Motion::Attacking(_) => &[
+                ATTACK_1H_ANIMATION_ID,
+                ATTACK_UNARMED_ANIMATION_ID,
+                STAND_ANIMATION_ID,
+            ],
+            Motion::Ready => &[
+                READY_1H_ANIMATION_ID,
+                READY_UNARMED_ANIMATION_ID,
+                STAND_ANIMATION_ID,
+            ],
         }
     }
+}
+
+/// Whether an animation id names a cycle that runs once and stops, rather than
+/// one that repeats.
+///
+/// A property of the *animation*, not of the state that asked for it. A death
+/// or a swing happens once; standing, walking and holding a guard go on until
+/// something else happens. Getting this from the resolved id rather than from
+/// the requesting motion is what lets a fallback change the answer -- see
+/// [`World::update_animations`].
+fn plays_once(animation_id: u16) -> bool {
+    matches!(
+        animation_id,
+        DEATH_ANIMATION_ID | ATTACK_1H_ANIMATION_ID | ATTACK_UNARMED_ANIMATION_ID
+    )
 }
 
 /// Which of a model's sequences a motion plays, if it has one.
@@ -974,6 +1243,241 @@ fn sequence_for(model: &CachedModel, motion: Motion) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A corpse does not walk, however fast it was going a moment ago.
+    ///
+    /// The speed attached to a creature killed mid-charge is stale but not
+    /// zero -- nothing zeroes it, because dying is not a movement packet. So
+    /// death has to outrank it explicitly, and this is the case that made the
+    /// original `from_speed` insufficient rather than merely incomplete.
+    #[test]
+    fn death_outranks_a_stale_speed() {
+        assert_eq!(
+            Motion::resolve(7.0, true, None, None, false, 10_000),
+            Motion::Dead,
+            "a corpse was drawn running"
+        );
+    }
+
+    /// A death this client watched plays the fall; one it did not starts
+    /// settled. Otherwise every corpse in a graveyard topples over again each
+    /// time the player walks into view of it.
+    #[test]
+    fn only_a_death_we_watched_plays_the_fall() {
+        assert_eq!(
+            Motion::resolve(0.0, true, Some(200), None, false, 10_000),
+            Motion::Dying(9_800)
+        );
+        assert_eq!(Motion::resolve(0.0, true, None, None, false, 10_000), Motion::Dead);
+    }
+
+    /// And it stops falling eventually, rather than holding a one-shot bucket
+    /// for the life of the corpse.
+    #[test]
+    fn a_fall_settles_once_it_has_had_time_to_finish() {
+        assert_eq!(
+            Motion::resolve(0.0, true, Some(ONE_SHOT_CEILING_MS + 1), None, false, 10_000),
+            Motion::Dead
+        );
+    }
+
+    /// **The stamp must not move as time passes.**
+    ///
+    /// This is the invariant the whole design rests on. The bone pose for a
+    /// bucket is cached under the motion, so if the key changed every frame
+    /// the buffer would be rebuilt every frame and the cache would be worse
+    /// than useless. Writing the age into the key instead of the start time is
+    /// the obvious mistake, and it would look *fine* -- the animation would
+    /// play correctly and the cost would be invisible.
+    #[test]
+    fn a_one_shot_keeps_its_bucket_as_the_clock_advances() {
+        let first = Motion::resolve(0.0, true, Some(100), None, false, 5_000);
+        // A second later: the death is a second older and the clock a second
+        // further on, which is the same death.
+        let later = Motion::resolve(0.0, true, Some(1_100), None, false, 6_000);
+        assert_eq!(first, later, "the bucket moved with the clock");
+
+        // Two deaths a second apart must *not* share, or one pops to the
+        // other's frame.
+        let other = Motion::resolve(0.0, true, Some(100), None, false, 6_000);
+        assert_ne!(first, other);
+    }
+
+    /// **The bucket has to survive the clocks disagreeing slightly**, which in
+    /// the real thing they always do.
+    ///
+    /// The age and the current time are read at different moments of the same
+    /// frame, so their difference lands a few milliseconds apart each time.
+    /// The version of this test above uses arithmetic that happens to cancel
+    /// exactly, so it passed while the running client flickered: every frame
+    /// produced a new key, a new bone buffer, and a model drawn in its bind
+    /// pose because nothing had posed the new buffer yet. Reported as "the
+    /// attack animation is very jittery", and no test then in the suite could
+    /// have found it.
+    #[test]
+    fn a_one_shot_bucket_survives_drift_between_two_clock_reads() {
+        // The same swing, seen over eight frames, with the two clock readings
+        // drifting a few milliseconds apart each time as they really do.
+        let reference = Motion::resolve(0.0, false, None, Some(40), true, 8_000);
+        for frame in 0..8u32 {
+            let drift = frame * 3;
+            let seen = Motion::resolve(
+                0.0,
+                false,
+                None,
+                Some(40 + frame * 16),
+                true,
+                8_000 + frame * 16 + drift,
+            );
+            assert_eq!(
+                seen, reference,
+                "frame {frame}: the bucket moved, so the bone buffer is rebuilt \
+                 and the model draws its bind pose"
+            );
+        }
+    }
+
+    /// A swing lapses back to the guard once the animation is over, rather
+    /// than freezing on its follow-through until the next one.
+    ///
+    /// The ceiling has to be close to the longest attack cycle in the models
+    /// actually drawn -- a one-shot holds its last frame until the state
+    /// lapses, so a generous ceiling is a character frozen mid-swing for most
+    /// of the fight.
+    #[test]
+    fn a_swing_lapses_before_the_next_one_lands() {
+        // Wolf `AttackUnarmed` is 1500ms, `HumanMale`'s 1000ms; swings are
+        // roughly two seconds apart.
+        assert!(
+            ATTACK_CEILING_MS >= 1_500,
+            "the longest attack cycle would be cut off"
+        );
+        assert!(
+            ATTACK_CEILING_MS < 2_000,
+            "a fighter would be frozen on its follow-through between swings"
+        );
+        assert_eq!(
+            Motion::resolve(0.0, false, None, Some(ATTACK_CEILING_MS + 1), true, 9_000),
+            Motion::Ready
+        );
+    }
+
+    /// A swing interrupts standing and not running: a creature chasing you
+    /// swings as it runs, and the swing played over the run reads as a
+    /// stumble.
+    #[test]
+    fn a_swing_interrupts_standing_but_not_running() {
+        assert_eq!(
+            Motion::resolve(0.0, false, None, Some(50), true, 4_000),
+            Motion::Attacking(3_900)
+        );
+        assert_eq!(Motion::resolve(7.0, false, None, Some(50), true, 4_000), Motion::Run);
+        // And an old swing has stopped mattering.
+        assert_eq!(
+            Motion::resolve(0.0, false, None, Some(ONE_SHOT_CEILING_MS + 1), false, 4_000),
+            Motion::Stand
+        );
+    }
+
+    /// Between swings, a unit still in a fight keeps its guard up rather than
+    /// dropping to the town idle.
+    ///
+    /// This is the state a fight is mostly *made of*: a swing is an instant
+    /// and a fight is a minute, so without it a fighting character spends
+    /// nearly all of the fight standing at ease -- which is what "the player
+    /// stands still while the fight happens" actually describes, and it is not
+    /// fixed by the swing animation alone.
+    #[test]
+    fn a_fighter_between_swings_keeps_its_guard_up() {
+        assert_eq!(
+            Motion::resolve(0.0, false, None, None, true, 4_000),
+            Motion::Ready
+        );
+        // Out of the fight, it relaxes.
+        assert_eq!(
+            Motion::resolve(0.0, false, None, None, false, 4_000),
+            Motion::Stand
+        );
+        // A swing still beats the guard, and running still beats both.
+        assert_eq!(
+            Motion::resolve(0.0, false, None, Some(50), true, 4_000),
+            Motion::Attacking(3_900)
+        );
+        assert_eq!(Motion::resolve(7.0, false, None, None, true, 4_000), Motion::Run);
+        // And a corpse is not "in a fight" whatever the map still says.
+        assert_eq!(Motion::resolve(0.0, true, None, None, true, 4_000), Motion::Dead);
+    }
+
+    /// Which cycles hold their last frame is a property of the *animation*,
+    /// not of the state that asked for it.
+    ///
+    /// That distinction is load-bearing in both directions. A wolf has no
+    /// ready stance, so `Motion::Attacking` on one falls all the way back to
+    /// Stand -- and a Stand frozen at its final frame is a statue. Meanwhile a
+    /// wolf has no settled-corpse cycle either, so `Motion::Dead` resolves to
+    /// the *fall*, which must hold rather than loop or the creature dies over
+    /// and over. Keying off the requesting motion gets exactly one of those
+    /// two right, whichever way round it is written.
+    #[test]
+    fn holding_the_last_frame_follows_the_animation_not_the_request() {
+        assert!(plays_once(DEATH_ANIMATION_ID));
+        assert!(plays_once(ATTACK_1H_ANIMATION_ID));
+        assert!(plays_once(ATTACK_UNARMED_ANIMATION_ID));
+        // The fallbacks a combat state can land on, which must keep looping.
+        assert!(!plays_once(STAND_ANIMATION_ID), "a frozen stand is a statue");
+        assert!(!plays_once(READY_1H_ANIMATION_ID));
+        assert!(!plays_once(READY_UNARMED_ANIMATION_ID));
+        assert!(!plays_once(WALK_ANIMATION_ID));
+        assert!(!plays_once(RUN_ANIMATION_ID));
+        // `Dead` (6) is a real lying-still loop where a model has one.
+        assert!(!plays_once(DEAD_ANIMATION_ID));
+    }
+
+    /// Only the states that mark an instant carry one, and the looping states
+    /// must not -- a walk with a start time would freeze mid-stride.
+    #[test]
+    fn only_the_states_that_mark_an_instant_carry_a_start_time() {
+        assert_eq!(Motion::Dying(1234).started_at(), Some(1234));
+        assert_eq!(Motion::Attacking(99).started_at(), Some(99));
+        for looping in [Motion::Stand, Motion::Walk, Motion::Run, Motion::Ready, Motion::Dead] {
+            assert_eq!(looping.started_at(), None, "{looping:?}");
+        }
+    }
+
+    /// Every combat and death state has to end its fallback list somewhere a
+    /// model is guaranteed to have, or it draws the bind pose.
+    ///
+    /// Found against real data rather than reasoned about: `Creature\Wolf\
+    /// Wolf.m2` carries `AttackUnarmed` and `Death` and no ready stance at
+    /// all, so a wolf entering combat resolved to nothing and would have been
+    /// drawn T-posed.
+    #[test]
+    fn the_combat_stances_fall_back_to_standing() {
+        for motion in [Motion::Attacking(0), Motion::Ready] {
+            assert_eq!(
+                motion.animation_ids().last(),
+                Some(&STAND_ANIMATION_ID),
+                "{motion:?} can resolve to nothing"
+            );
+        }
+    }
+
+    /// Every motion has to name at least one animation, or it silently draws
+    /// the bind pose -- which this project has already paid for once.
+    #[test]
+    fn every_motion_names_an_animation() {
+        for motion in [
+            Motion::Stand,
+            Motion::Walk,
+            Motion::Run,
+            Motion::Dying(0),
+            Motion::Dead,
+            Motion::Attacking(0),
+            Motion::Ready,
+        ] {
+            assert!(!motion.animation_ids().is_empty(), "{motion:?}");
+        }
+    }
 
     /// A position inside a tile must map back to it, on both axes and with the
     /// swap the grid uses.

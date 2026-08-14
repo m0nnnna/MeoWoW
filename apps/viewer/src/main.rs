@@ -333,6 +333,10 @@ fn build_live_scene(
                         orientation: entity.orientation,
                         scale: entity.scale,
                         speed: entity.speed,
+                        dead: entity.dead,
+                        died_ms_ago: entity.died_ms_ago,
+                        swung_ms_ago: entity.swung_ms_ago,
+                        fighting: entity.fighting,
                         kind: entity.kind,
                         look,
                         look_key,
@@ -438,17 +442,17 @@ fn bind_pose(count: usize) -> Vec<[[f32; 4]; 4]> {
     vec![glam::Mat4::IDENTITY.to_cols_array_2d(); count]
 }
 
-/// Which direction, if any, is currently being reported to the world server.
+/// How far behind the character the camera sits before the wheel moves it, and
+/// the range the wheel may move it through.
 ///
-/// Tracked separately from the held keys so a transition -- key pressed,
-/// released, or swapped -- can be told apart from "still moving the same way",
-/// which is what decides whether a `MoveStart*`/`MoveStop` is due or just
-/// another heartbeat.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LiveMove {
-    Forward,
-    Backward,
-}
+/// The near end is deliberately not zero: a true first-person view would put
+/// the camera inside the character's own head geometry, which this client
+/// draws, and the result is a screenful of the inside of a face.
+const FOLLOW_DISTANCE: f32 = 9.0;
+const FOLLOW_NEAR: f32 = 2.5;
+const FOLLOW_FAR: f32 = 30.0;
+/// How high above the character's feet the camera sits.
+const FOLLOW_HEIGHT: f32 = 4.0;
 
 /// A tenth of a second between heartbeats, matching `Connection::walk`'s
 /// cadence -- roughly what a real client sends while moving.
@@ -468,12 +472,22 @@ const LIVE_RUN_SPEED: f32 = 7.0;
 const LIVE_TURN_RATE: f32 = std::f32::consts::PI;
 
 /// Which movement keys are currently held.
+///
+/// One set of keys serves two quite different cameras, so several of them mean
+/// different things depending on whether a character is being driven. `Q`/`E`
+/// strafe a live character and raise/lower a free camera; `Space` jumps or
+/// rises. That dual reading is why the fields are named after the *key's
+/// role* rather than after a direction in space -- `strafe_left` is what `Q`
+/// does in the world, and `up` is what the free camera does with the keys the
+/// world has no vertical use for.
 #[derive(Default, Clone, Copy)]
 struct KeyState {
     forward: bool,
     back: bool,
     left: bool,
     right: bool,
+    strafe_left: bool,
+    strafe_right: bool,
     up: bool,
     down: bool,
     fast: bool,
@@ -486,13 +500,31 @@ impl KeyState {
             KeyCode::KeyS | KeyCode::ArrowDown => &mut self.back,
             KeyCode::KeyA | KeyCode::ArrowLeft => &mut self.left,
             KeyCode::KeyD | KeyCode::ArrowRight => &mut self.right,
-            KeyCode::Space | KeyCode::KeyE => &mut self.up,
-            KeyCode::KeyQ | KeyCode::ControlLeft => &mut self.down,
+            KeyCode::KeyQ => &mut self.strafe_left,
+            KeyCode::KeyE => &mut self.strafe_right,
+            KeyCode::Space => &mut self.up,
+            KeyCode::ControlLeft => &mut self.down,
             KeyCode::ShiftLeft | KeyCode::ShiftRight => &mut self.fast,
             _ => return false,
         };
         *slot = pressed;
         true
+    }
+
+    /// What these keys mean for a character in the world.
+    ///
+    /// `A`/`D` turn rather than strafe, which is the arrangement 3.3.5a ships
+    /// with -- strafing is `Q`/`E`. Holding the right mouse button changes
+    /// that: steering comes from the mouse, so `A`/`D` become strafe keys and
+    /// the player can circle a target while facing it, which is the whole
+    /// point of steering with the mouse.
+    fn motion(&self, steering: bool) -> ::world::motion::Motion {
+        ::world::motion::Motion {
+            forward: self.forward,
+            backward: self.back,
+            strafe_left: self.strafe_left || (steering && self.left),
+            strafe_right: self.strafe_right || (steering && self.right),
+        }
     }
 
     /// Movement in camera-local axes: x right, y forward, z world up.
@@ -976,7 +1008,7 @@ fn material_bind_groups(
 /// reported is on screen next to the tile the renderer chose.
 fn describe_live(live: &live::LiveWorld) -> String {
     let tile = world::tile_at(live.position);
-    let entities = live::drawable_entities(&live.state, live.guid);
+    let entities = live::drawable_entities(&live.state, live.guid, live.position);
     let mut text = format!(
         "{} on {} (map {}, {})\nat {:.1}, {:.1}, {:.1} facing {:.2} rad\n\
          tile {},{}\n{} objects drawable",
@@ -1040,6 +1072,22 @@ fn describe_live(live: &live::LiveWorld) -> String {
         stats.movement_updates,
         stats.orphaned,
     ));
+    // The relayed half, split out because it is the one under test: a mover
+    // that snapped is a mover drawn the old, jumping way. See
+    // `world::WorldState::apply_relayed_movement_at`.
+    let snapped = stats.relayed_first_sample + stats.relayed_gap + stats.relayed_teleport;
+    if stats.relayed_paths + snapped > 0 {
+        text.push_str(&format!(
+            "\n{} relayed walked, {snapped} snapped",
+            stats.relayed_paths,
+        ));
+        if stats.relayed_paths > 0 {
+            text.push_str(&format!(
+                " (mean {}ms)",
+                stats.relayed_interval_ms / stats.relayed_paths as u64
+            ));
+        }
+    }
     if live.fold_failures > 0 {
         text.push_str(&format!(
             "\n{} update packet(s) failed to parse",
@@ -1324,9 +1372,21 @@ struct App {
     speed: f32,
     /// Present when the world was entered over the network.
     live: Option<live::LiveWorld>,
-    /// The direction currently reported to the server, if any -- `None` means
-    /// the last packet sent was a `MoveStop`, or nothing has moved yet.
-    live_move: Option<LiveMove>,
+    /// The movement state currently reported to the server. Compared against
+    /// what the keys say each frame; the difference is what has to be sent.
+    live_move: ::world::motion::Motion,
+    /// The jump in progress, if the character is off the ground.
+    ///
+    /// The server does not simulate the arc -- it is told the take-off and the
+    /// landing and believes the client in between -- so this is the only copy
+    /// of it, and it is why the landing has to be sent explicitly.
+    jump: Option<::world::motion::Jump>,
+    /// Sustained forward movement, toggled rather than held.
+    ///
+    /// Cleared by pressing a movement key, which is what every game with an
+    /// autorun does: a player who grabs the keys to dodge something should not
+    /// have to remember to switch it off first.
+    autorun: bool,
     last_heartbeat: Instant,
     last_ping: Instant,
     /// The `undrawable` count last logged, so entity rebuilding (which now
@@ -1352,10 +1412,27 @@ struct App {
     /// Where the left button went down, so a click can be told from the drag
     /// that turns the camera. Both arrive as the same pair of events.
     press_at: Option<(f64, f64)>,
+    /// The same for the right button, which has the same two gestures on it:
+    /// dragged it steers the character, clicked it selects and attacks.
+    right_press_at: Option<(f64, f64)>,
     /// How far the camera has been swung around the character by dragging,
     /// added to the character's own facing rather than replacing it. Only
     /// meaningful while following a live character.
     camera_yaw_offset: f32,
+    /// Whether the *right* button is down, which steers the character rather
+    /// than the camera.
+    ///
+    /// The two drags are deliberately different verbs, as they are in the game
+    /// this is modelled on: a left drag swings the camera and leaves the
+    /// character facing where it was, a right drag turns the character and the
+    /// camera comes along because it follows. Collapsing them into one would
+    /// lose the ability to look sideways while running straight.
+    steering: bool,
+    /// How far behind the character the camera sits, in world units, set by
+    /// the wheel. Only meaningful while following a live character -- a free
+    /// camera has no subject to be a distance from, so the wheel trims its
+    /// speed instead.
+    camera_distance: f32,
     /// Chat scrollback, oldest first, capped at the style's limit. Owned here
     /// rather than in `world`: chat is a stream of events, and replicated
     /// state has no business growing without bound.
@@ -1405,6 +1482,10 @@ struct App {
     /// Whether the bars have been filled from the spellbook yet. The spellbook
     /// arrives in the login burst, so this cannot happen at construction.
     bars_seeded: bool,
+    /// Whether the spellbook is open. Runtime state rather than a field in
+    /// `ui.toml`: where the book sits is a layout decision worth saving, and
+    /// whether it happened to be open when the client last closed is not.
+    spellbook_open: bool,
     /// Held modifiers, which choose which bar a number key drives.
     modifiers: winit::keyboard::ModifiersState,
 }
@@ -1449,7 +1530,7 @@ fn action_slot(code: KeyCode) -> Option<usize> {
 /// `speed` is the caller's own movement state rather than anything read back
 /// from the server -- see [`live::own_entity`].
 fn drawable_with_own(live: &live::LiveWorld, speed: f32) -> Vec<live::Entity> {
-    let mut entities = live::drawable_entities(&live.state, live.guid);
+    let mut entities = live::drawable_entities(&live.state, live.guid, live.position);
     if let Some(own) = live::own_entity(
         &live.state,
         live.guid,
@@ -1636,7 +1717,9 @@ impl App {
             playing: true,
             speed: 1.0,
             live: None,
-            live_move: None,
+            live_move: ::world::motion::Motion::default(),
+            jump: None,
+            autorun: false,
             last_heartbeat: Instant::now(),
             last_ping: Instant::now(),
             last_undrawable_warned: 0,
@@ -1647,7 +1730,10 @@ impl App {
             hud: ui::Hud::load(),
             target: None,
             press_at: None,
+            right_press_at: None,
             camera_yaw_offset: 0.0,
+            steering: false,
+            camera_distance: FOLLOW_DISTANCE,
             chat: Vec::new(),
             combat_text: Vec::new(),
             entity_flip: false,
@@ -1655,6 +1741,7 @@ impl App {
             composing: None,
             spells: spells::Spellbook::default(),
             bars_seeded: false,
+            spellbook_open: false,
             modifiers: Default::default(),
         }
     }
@@ -1854,7 +1941,51 @@ impl ApplicationHandler for App {
                             self.click_at(release);
                         }
                     }
-                    self.last_cursor = None;
+                    // `last_cursor` deliberately survives the release.
+                    //
+                    // Clearing it here is what the first version did, and it
+                    // quietly discarded every *second* click made without
+                    // moving the mouse: the next press reads `press_at` from
+                    // this field, finds `None`, and the release then has
+                    // nothing to measure against. Rare with a left click,
+                    // which is only a selection -- but right-click-to-attack
+                    // is a gesture people repeat on the same pixel when it
+                    // does not seem to have worked, which is precisely when it
+                    // would have kept not working.
+                    //
+                    // Nothing needs it cleared: `CursorMoved` fires whether or
+                    // not a button is down, so the field is current, and the
+                    // drag branches only read it while their own button is
+                    // held.
+                }
+            }
+            // The right button does two different things depending on whether
+            // it moves, exactly as the left button does: dragged, it steers the
+            // character; clicked, it selects what is under it and attacks.
+            //
+            // Nothing but the distance travelled separates them, which is why
+            // this mirrors the left button's structure rather than inventing a
+            // second one -- and why `last_cursor` is *not* cleared on press.
+            // A click that never moves the mouse has to measure as zero
+            // distance, and it can only do that if the field still holds where
+            // the press happened; the first version of this cleared it, and
+            // right-clicking a creature without twitching the mouse did
+            // nothing at all.
+            WindowEvent::MouseInput { state, button, .. } if button == MouseButton::Right => {
+                let pressed = state == ElementState::Pressed;
+                self.steering = pressed && self.live.is_some();
+                if pressed {
+                    self.right_press_at = self.last_cursor;
+                } else {
+                    if let (Some(press), Some(release)) =
+                        (self.right_press_at.take(), self.last_cursor)
+                    {
+                        let moved =
+                            ((release.0 - press.0).powi(2) + (release.1 - press.1).powi(2)).sqrt();
+                        if moved <= CLICK_SLOP {
+                            self.right_click_at(release);
+                        }
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(state) => {
@@ -1895,8 +2026,39 @@ impl ApplicationHandler for App {
                             window.request_redraw();
                             return;
                         }
+                        // Space jumps in the world and raises a free camera.
+                        // Handled before the toggles so it can fall through to
+                        // `keys.set` when there is no character to jump.
+                        if code == KeyCode::Space && self.live.is_some() {
+                            self.begin_jump();
+                            window.request_redraw();
+                            return;
+                        }
+                        // Autorun, on the key 3.3.5a uses for it. Pressing it
+                        // again, or pressing a key that means "stop", clears
+                        // it -- see `drive_live_movement`.
+                        if code == KeyCode::NumLock && self.live.is_some() {
+                            self.autorun = !self.autorun;
+                            window.request_redraw();
+                            return;
+                        }
+                        // Grabbing the movement keys cancels autorun, which is
+                        // what every game with one does: a player reaching for
+                        // the keys to dodge something should not have to
+                        // remember to switch it off first.
+                        if self.autorun && matches!(code, KeyCode::KeyS | KeyCode::ArrowDown) {
+                            self.autorun = false;
+                        }
                         match code {
                             KeyCode::F1 => self.hud.toggle_edit(),
+                            // `P` for the spellbook, as 3.3.5a binds it. Not a
+                            // movement key and not a bar key, so it costs
+                            // nothing that was already spoken for.
+                            KeyCode::KeyP => {
+                                self.spellbook_open = !self.spellbook_open;
+                                window.request_redraw();
+                                return;
+                            }
                             KeyCode::F2 => {
                                 self.entity_flip = !self.entity_flip;
                                 let state = if self.entity_flip { "flipped" } else { "as shipped" };
@@ -1934,6 +2096,39 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let now = (position.x, position.y);
+                if self.steering {
+                    // Steering turns the *character*. The camera needs no
+                    // separate handling: it is rebuilt from the character's
+                    // facing every frame, so turning the body brings the view
+                    // with it, which is exactly what a right drag should feel
+                    // like. Vertical movement still pitches the camera alone --
+                    // a character has no pitch to steer.
+                    if let Some(prev) = self.last_cursor {
+                        const SPEED: f32 = 0.008;
+                        let dx = -(now.0 - prev.0) as f32 * SPEED;
+                        let dy = (now.1 - prev.1) as f32 * SPEED;
+                        // Steering takes over the character's facing, so any
+                        // swing a left drag had given the camera is folded
+                        // away -- otherwise the view jumps by that offset the
+                        // moment the character starts turning under it.
+                        //
+                        // Done here, on the first actual movement, rather than
+                        // at the press: a right *click* must not snap the
+                        // camera, and at the press there is no way to know yet
+                        // which of the two gestures this is.
+                        self.camera_yaw_offset = 0.0;
+                        if let Some(live) = self.live.as_mut() {
+                            live.orientation =
+                                (live.orientation + dx).rem_euclid(std::f32::consts::TAU);
+                        }
+                        if let Camera::Fly(c) = &mut self.camera {
+                            c.look(0.0, -dy);
+                        }
+                    }
+                    self.last_cursor = Some(now);
+                    window.request_redraw();
+                    return;
+                }
                 if self.dragging {
                     if let Some(prev) = self.last_cursor {
                         // Roughly half a turn across the window, which reads as
@@ -1969,11 +2164,19 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
                 };
-                match &mut self.camera {
-                    Camera::Orbit(c) => c.zoom(0.88f32.powf(notches)),
-                    // Flying has no zoom; the wheel trims travel speed instead.
-                    Camera::Fly(c) => {
-                        c.speed = (c.speed * 1.15f32.powf(notches)).clamp(1.0, 5000.0)
+                // Following a character, the wheel pulls the camera in and
+                // pushes it out, which is what it does in the game. A free
+                // camera has no subject to be a distance from, so there it
+                // keeps trimming travel speed.
+                if self.live.is_some() {
+                    self.camera_distance = (self.camera_distance * 0.88f32.powf(notches))
+                        .clamp(FOLLOW_NEAR, FOLLOW_FAR);
+                } else {
+                    match &mut self.camera {
+                        Camera::Orbit(c) => c.zoom(0.88f32.powf(notches)),
+                        Camera::Fly(c) => {
+                            c.speed = (c.speed * 1.15f32.powf(notches)).clamp(1.0, 5000.0)
+                        }
                     }
                 }
             }
@@ -2036,11 +2239,6 @@ impl App {
                 &mut self.chain,
                 eye,
             );
-            // Every frame, not throttled: see `World::update_animations` for
-            // why animation and instance-position rebuilding run on different
-            // clocks.
-            world.update_animations(&r.gpu, &r.meshes);
-
             // Also every frame, despite rebuilding every instance buffer.
             // This was originally throttled (see git history for
             // `LIVE_ENTITY_REBUILD_EVERY`) on the reasoning that rebuilding
@@ -2056,11 +2254,11 @@ impl App {
             // reallocating every buffer, rather than reaching for the same
             // timer again.
             if self.args.entities {
-                if let Some(live) = &self.live {
+                if let Some(live) = self.live.as_mut() {
                     // The keys, not the wire: the server never relays our own
                     // movement back to us. Held means running -- there is no
                     // walk toggle here, and `LIVE_RUN_SPEED` is the run speed.
-                    let speed = if self.live_move.is_some() {
+                    let speed = if self.live_move.is_moving() {
                         LIVE_RUN_SPEED
                     } else {
                         0.0
@@ -2071,8 +2269,15 @@ impl App {
                     // already holds the renderer, and `live` the live world.
                     let looks = &mut self.player_looks;
                     let chain = &mut self.chain;
+                    // Eased before they are placed, so a creature turning to
+                    // face its victim swings round rather than snapping. The
+                    // player's own body is excluded inside `ease_facings` --
+                    // its heading comes from the keys and is already smooth,
+                    // and easing it would make the camera lag the character.
+                    let mut drawn = drawable_with_own(live, speed);
+                    live.ease_facings(&mut drawn, self.frame_ms / 1000.0);
                     let placements: Vec<crate::world::EntityPlacement> =
-                        drawable_with_own(live, speed)
+                        drawn
                             .iter()
                             .map(|entity| {
                                 // Three sources, in order of what actually
@@ -2095,6 +2300,10 @@ impl App {
                                     orientation: entity.orientation + flip,
                                     scale: entity.scale,
                                     speed: entity.speed,
+                                    dead: entity.dead,
+                                    died_ms_ago: entity.died_ms_ago,
+                                    swung_ms_ago: entity.swung_ms_ago,
+                                    fighting: entity.fighting,
                                     kind: entity.kind,
                                     look,
                                     look_key,
@@ -2112,6 +2321,23 @@ impl App {
                     self.last_undrawable_warned = undrawable;
                 }
             }
+
+            // Posed *after* the rebuild, not before it, and every frame
+            // regardless of whether the rebuild placed anything new.
+            //
+            // The order is the whole point. `set_entities` creates a bone
+            // buffer the moment a bucket appears -- a unit starting a swing,
+            // or dying -- and a fresh buffer holds only the bind pose until
+            // something writes a real one into it. Posing first meant every
+            // new bucket was drawn unposed for a frame: a character that
+            // snapped to its bind pose at the start of every swing, which is
+            // exactly what "the attack animation is very jittery" looks like.
+            //
+            // It stays every-frame rather than folding into the rebuild for
+            // the original reason: animation and instance positions run on
+            // different clocks, and tying a walk cycle to the coarser one made
+            // it visibly stutter.
+            world.update_animations(&r.gpu, &r.meshes);
         }
 
         if let (Some(Scene::Model(m)), Some(bones)) = (&r.scene, &r.bones) {
@@ -2255,29 +2481,38 @@ impl App {
         // Turning is purely local: nothing here reports it to the server
         // unless a translation is also in flight, since the position sent
         // with every Start/Heartbeat carries the current orientation anyway.
-        let turn = match (self.keys.left, self.keys.right) {
-            (true, false) => LIVE_TURN_RATE,
-            (false, true) => -LIVE_TURN_RATE,
-            _ => 0.0,
+        //
+        // While steering with the mouse, `A`/`D` are strafe keys instead --
+        // see `KeyState::motion`. They must not do both: a key that turned the
+        // character *and* pushed it sideways would send it round in a circle,
+        // and the cause reads as a mouse problem rather than a keyboard one.
+        let turn = if self.steering {
+            0.0
+        } else {
+            match (self.keys.left, self.keys.right) {
+                (true, false) => LIVE_TURN_RATE,
+                (false, true) => -LIVE_TURN_RATE,
+                _ => 0.0,
+            }
         };
         if turn != 0.0 {
             live.orientation =
                 (live.orientation + turn * dt).rem_euclid(std::f32::consts::TAU);
         }
 
-        let desired = if self.keys.forward {
-            Some(LiveMove::Forward)
-        } else if self.keys.back {
-            Some(LiveMove::Backward)
-        } else {
-            None
-        };
+        let mut desired = self.keys.motion(self.steering);
+        // Autorun is forward that nobody is holding. Ignored while the player
+        // is actually holding a longitudinal key, so pressing S while running
+        // stops rather than fighting the toggle -- and `drive_live_movement`'s
+        // caller clears the toggle in that case.
+        if self.autorun && !desired.backward {
+            desired.forward = true;
+        }
 
-        if let Some(heading) = desired {
-            let (dx, dy) = (live.orientation.cos(), live.orientation.sin());
-            let sign = if heading == LiveMove::Forward { 1.0 } else { -1.0 };
-            live.position.x += dx * LIVE_RUN_SPEED * sign * dt;
-            live.position.y += dy * LIVE_RUN_SPEED * sign * dt;
+        let (dx, dy) = desired.direction(live.orientation);
+        if (dx, dy) != (0.0, 0.0) {
+            live.position.x += dx * LIVE_RUN_SPEED * dt;
+            live.position.y += dy * LIVE_RUN_SPEED * dt;
         }
 
         // Stand on the ground under wherever those two axes put us.
@@ -2290,17 +2525,36 @@ impl App {
         // Assigned rather than clamped upward. Upward alone fixes sinking into
         // a hill and does nothing for the walk back down it, leaving the
         // character hanging in the air over the valley with no way back to the
-        // ground. With no jumping or falling modelled, the feet are on the
-        // terrain or the position is wrong.
+        // ground.
         //
         // `None` -- the tile is not resident yet, or this is a hole in the
         // terrain -- deliberately leaves Z alone rather than substituting
         // anything. The server's altitude is stale, but it is a real place; a
         // guess is not.
+        //
+        // A jump rides *on top of* this rather than replacing it: the ground
+        // is still whatever the terrain says, and the arc is a height above
+        // it. That is what makes jumping up a slope work without a second
+        // notion of where the ground is -- and it is also why landing is
+        // detected from the arc reaching zero rather than from comparing two
+        // altitudes, which would trigger every time the terrain rose under a
+        // running character.
+        // `Some(ms)` on the frame the ground is reached, carrying how long the
+        // character was in the air -- which is the number fall damage is
+        // measured from, and is gone the moment the jump is cleared.
+        let mut landed: Option<u32> = None;
         if let Some(Scene::Streaming(world)) = self.renderer.as_ref().and_then(|r| r.scene.as_ref())
         {
             if let Some(ground) = world.height_at(live.position.x, live.position.y) {
                 live.position.z = ground;
+            }
+        }
+        if let Some(jump) = self.jump.as_mut() {
+            let down = jump.advance(dt);
+            live.position.z += jump.height;
+            if down {
+                landed = Some(jump.elapsed_ms);
+                self.jump = None;
             }
         }
 
@@ -2311,40 +2565,74 @@ impl App {
             orientation: live.orientation,
         };
 
-        if desired != self.live_move {
-            let (opcode, flags) = match desired {
-                Some(LiveMove::Forward) => (ClientOpcode::MoveStartForward, movement_flags::FORWARD),
-                Some(LiveMove::Backward) => {
-                    (ClientOpcode::MoveStartBackward, movement_flags::BACKWARD)
-                }
-                // Left in the FORWARD/BACKWARD state, the character keeps
-                // moving in the server's own simulation after we go quiet.
-                None => (ClientOpcode::MoveStop, 0),
-            };
+        // Every packet from here carries the *whole* movement state, jump
+        // included, and only the opcode says what changed. Building the info
+        // once and reusing it is what keeps that true: an earlier version
+        // computed flags separately per branch, which is precisely how a
+        // heartbeat comes to disagree with the start it is continuing.
+        let airborne = self.jump.as_ref();
+        let info_now = |live: &live::LiveWorld, extra: u32| MovementInfo {
+            flags: desired.flags()
+                | extra
+                | if airborne.is_some() {
+                    movement_flags::FALLING
+                } else {
+                    0
+                },
+            time: live.connection.tick(),
+            position,
+            fall_time: airborne.map(|j| j.elapsed_ms).unwrap_or(0),
+            falling: airborne.map(|j| ::world::movement::Falling {
+                velocity: j.velocity,
+                sin_angle: j.sin_angle,
+                cos_angle: j.cos_angle,
+                xy_speed: j.xy_speed,
+            }),
+            ..MovementInfo::default()
+        };
+
+        // The landing goes first and unconditionally.
+        //
+        // It is *not* an `else` of the transition below, which is where this
+        // was first written and was wrong: releasing a key on the very frame
+        // the ground is reached would have sent the key change and swallowed
+        // the landing, leaving the server holding a character it believes is
+        // still in the air. The two are different facts about the same frame
+        // and both have to travel.
+        if let Some(fall_time) = landed {
             let info = MovementInfo {
-                flags,
+                // The falling bit is *cleared* here: this packet is the
+                // statement that the fall is over. `fall_time` still carries
+                // how long it lasted, which is what fall damage is computed
+                // from.
+                flags: desired.flags(),
                 time: live.connection.tick(),
                 position,
+                fall_time,
                 ..MovementInfo::default()
             };
-            if let Err(e) = live.connection.send_movement(opcode, live.guid, &info) {
-                tracing::warn!("sending movement failed: {e:#}");
+            if let Err(e) =
+                live.connection
+                    .send_movement(ClientOpcode::MoveFallLand, live.guid, &info)
+            {
+                tracing::warn!("sending landing failed: {e:#}");
+            }
+            self.last_heartbeat = Instant::now();
+        }
+
+        let transitions = ::world::motion::Motion::transitions(self.live_move, desired);
+        if !transitions.is_empty() {
+            for opcode in transitions {
+                let info = info_now(live, 0);
+                if let Err(e) = live.connection.send_movement(opcode, live.guid, &info) {
+                    tracing::warn!("sending movement failed: {e:#}");
+                }
             }
             self.live_move = desired;
             self.last_heartbeat = Instant::now();
-        } else if let Some(heading) = desired {
+        } else if landed.is_none() && (desired.is_moving() || airborne.is_some()) {
             if self.last_heartbeat.elapsed() >= LIVE_HEARTBEAT_EVERY {
-                let flags = if heading == LiveMove::Forward {
-                    movement_flags::FORWARD
-                } else {
-                    movement_flags::BACKWARD
-                };
-                let info = MovementInfo {
-                    flags,
-                    time: live.connection.tick(),
-                    position,
-                    ..MovementInfo::default()
-                };
+                let info = info_now(live, 0);
                 if let Err(e) =
                     live.connection
                         .send_movement(ClientOpcode::MoveHeartbeat, live.guid, &info)
@@ -2389,12 +2677,10 @@ impl App {
         // facing wherever it was facing, which is what a left drag does in the
         // game this is modelled on.
         if let Camera::Fly(fly) = &mut self.camera {
-            const BEHIND: f32 = 9.0;
-            const ABOVE: f32 = 4.0;
             let yaw = live.orientation + self.camera_yaw_offset;
             fly.position = live.position
-                - glam::Vec3::new(yaw.cos(), yaw.sin(), 0.0) * BEHIND
-                + glam::Vec3::Z * ABOVE;
+                - glam::Vec3::new(yaw.cos(), yaw.sin(), 0.0) * self.camera_distance
+                + glam::Vec3::Z * FOLLOW_HEIGHT;
             fly.yaw = yaw;
         }
     }
@@ -2465,16 +2751,27 @@ impl App {
         // back like any other, and adding it here too would show it twice.
     }
 
-    /// Casts whatever is in an action slot.
+    /// Uses whatever is in an action slot.
     ///
     /// A bound key fires whether or not its bar is visible. Hiding a bar is
     /// about screen space, not about unbinding it -- and a key that silently
     /// stopped working because a checkbox was unticked would be a poor
     /// surprise mid-fight.
+    ///
+    /// Two kinds of thing can be in a slot and they travel by different
+    /// opcodes -- see [`spells::AUTO_ATTACK`]. The slot itself still stores a
+    /// plain spell id, so `ui.toml` is unchanged and a layout written before
+    /// any of this existed still loads: which message to send is a fact about
+    /// the *spell*, not about the slot, and deriving it here means a bar
+    /// arranged by hand in the file behaves the same as one arranged in-game.
     fn activate_slot(&mut self, bar: usize, slot: usize) {
         let Some(spell) = self.hud.profile.bars.get(bar, slot) else {
             return;
         };
+        if spell == spells::AUTO_ATTACK {
+            self.toggle_auto_attack();
+            return;
+        }
         let target = self.target;
         let name = self.spells.name(spell);
         let Some(live) = self.live.as_mut() else {
@@ -2487,6 +2784,162 @@ impl App {
                 self.chat.push(Line::Chat(local_notice(format!("could not cast: {e}"))));
             }
         }
+    }
+
+    /// Leaves the ground, if there is ground to leave.
+    ///
+    /// The jump is announced *here*, at the press, rather than by the movement
+    /// driver on its next pass. `MSG_MOVE_JUMP` is the packet that tells the
+    /// server a jump began and carries the take-off velocity it will simulate
+    /// against; a heartbeat that merely arrived with the falling bit set would
+    /// leave the server to guess when the character left the ground, and it
+    /// does not guess -- it believes the position it was last told.
+    ///
+    /// Refused while already airborne. Double-jumping is not a thing the
+    /// server accepts, and sending a second take-off mid-arc reports a
+    /// velocity from an altitude the server has not seen yet.
+    fn begin_jump(&mut self) {
+        use ::world::{ClientOpcode, MovementInfo, Position};
+
+        if self.jump.is_some() {
+            return;
+        }
+        let moving = self.live_move;
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        // The heading at take-off, kept for the whole arc: a jump carries the
+        // direction it began with, which is why turning in mid-air does not
+        // steer it.
+        let jump = ::world::motion::Jump::begin(moving.direction(live.orientation), LIVE_RUN_SPEED);
+        let info = MovementInfo {
+            flags: moving.flags() | ::world::update::movement_flags::FALLING,
+            time: live.connection.tick(),
+            position: Position {
+                x: live.position.x,
+                y: live.position.y,
+                z: live.position.z,
+                orientation: live.orientation,
+            },
+            fall_time: 0,
+            falling: Some(::world::movement::Falling {
+                velocity: jump.velocity,
+                sin_angle: jump.sin_angle,
+                cos_angle: jump.cos_angle,
+                xy_speed: jump.xy_speed,
+            }),
+            ..MovementInfo::default()
+        };
+        if let Err(e) = live
+            .connection
+            .send_movement(ClientOpcode::MoveJump, live.guid, &info)
+        {
+            tracing::warn!("sending jump failed: {e:#}");
+            return;
+        }
+        self.jump = Some(jump);
+        self.last_heartbeat = Instant::now();
+    }
+
+    /// Starts or stops swinging at the current target.
+    ///
+    /// **Auto-attack is a state, not an action**, which is why this is a
+    /// toggle rather than a send: `SMSG_ATTACKSTART` and `SMSG_ATTACKSTOP`
+    /// bracket it, `WorldState::attacking` already folds both, and pressing
+    /// the key a second time has to end the fight rather than start a second
+    /// one. Reading whether we are attacking out of replicated state rather
+    /// than keeping a local flag is deliberate: the server ends an attack on
+    /// its own when the target dies or walks out of range, and a local flag
+    /// would then be inverted -- the next press would send a stop for a fight
+    /// that was already over, and look like the key had failed.
+    ///
+    /// Refusals are silent on the wire (see `crate::spells::AUTO_ATTACK` and
+    /// `world::combat`), so the two conditions this client can check itself --
+    /// having a target at all, and being connected -- are reported in the
+    /// chat log rather than left to be inferred from nothing happening.
+    fn toggle_auto_attack(&mut self) {
+        let attacking = self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.state.attacking.contains_key(&live.guid));
+        if attacking {
+            self.stop_auto_attack();
+        } else {
+            self.start_auto_attack();
+        }
+    }
+
+    /// Begins swinging, and says so if there is nothing to swing at.
+    ///
+    /// Separate from the toggle because right-clicking a creature must *start*
+    /// a fight rather than flip one: right-clicking the thing you are already
+    /// fighting would otherwise stop the fight, which is the opposite of what
+    /// the gesture means everywhere it exists. Sending a second start at a
+    /// target already being attacked is harmless -- the server is already in
+    /// that state.
+    fn start_auto_attack(&mut self) {
+        let Some(target) = self.target else {
+            self.chat
+                .push(Line::Chat(local_notice("You have no target.".to_string())));
+            return;
+        };
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        match live.connection.attack_swing(target) {
+            Ok(()) => tracing::debug!("auto-attack started on {target:#x}"),
+            Err(e) => {
+                tracing::warn!("starting auto-attack failed: {e:#}");
+                self.chat
+                    .push(Line::Chat(local_notice(format!("could not attack: {e}"))));
+            }
+        }
+    }
+
+    fn stop_auto_attack(&mut self) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        match live.connection.attack_stop() {
+            Ok(()) => tracing::debug!("auto-attack stopped"),
+            Err(e) => {
+                tracing::warn!("stopping auto-attack failed: {e:#}");
+                self.chat
+                    .push(Line::Chat(local_notice(format!("could not stop attacking: {e}"))));
+            }
+        }
+    }
+
+    /// Whether right-clicking this thing should start a fight.
+    ///
+    /// **This is deliberately not a hostility test, because this client cannot
+    /// yet make one.** A unit's faction arrives as `UNIT_FACTION`, but turning
+    /// that into "hostile to *me*" needs `FactionTemplate.dbc`, which is not
+    /// transcribed -- so inventing a judgement here would be exactly the
+    /// fabricated-number problem `describe_cast_failure` exists to avoid, one
+    /// layer up: a client that decides a guard is hostile attacks the guard.
+    ///
+    /// What it does instead is rule out the things that are *never* a fight on
+    /// any reading -- yourself, a corpse, a bench, something already dead --
+    /// and let the server arbitrate the rest, which it does anyway and is the
+    /// only party that actually knows. The cost is that right-clicking a
+    /// friendly NPC sends a swing the server refuses; the alternative was
+    /// guessing, and a wrong guess here is an unprovoked attack rather than a
+    /// blank.
+    fn is_attack_candidate(&self, guid: u64) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        if guid == live.guid {
+            return false;
+        }
+        let Some(entity) = live.state.get(guid) else {
+            return false;
+        };
+        matches!(
+            entity.object_type,
+            ::world::ObjectType::Unit | ::world::ObjectType::Player
+        ) && !entity.is_dead_or_ghost()
     }
 
     /// Reads names and icons for whatever the character knows, once.
@@ -2566,34 +3019,64 @@ impl App {
 
     /// Selects whatever is under the cursor, and tells the server.
     fn click_at(&mut self, at: (f64, f64)) {
-        let Some(r) = self.renderer.as_ref() else {
+        if let Some(picked) = self.pick_at(at) {
+            self.set_target(picked);
+        }
+    }
+
+    /// A right click: select, and start a fight if the thing selected is one.
+    ///
+    /// Right-click does *both* jobs in the game this is modelled on -- it is
+    /// select-and-do-the-obvious-thing, where left-click only selects. Attack
+    /// is the only "obvious thing" this client implements so far; talking to a
+    /// vendor and looting a corpse are the same gesture and are not built.
+    ///
+    /// Clicking empty ground still clears the selection, exactly as a left
+    /// click does. What it must not do is leave the previous target selected
+    /// and attack *that* -- the click said "this", and "this" was nothing.
+    fn right_click_at(&mut self, at: (f64, f64)) {
+        let Some(picked) = self.pick_at(at) else {
             return;
         };
+        self.set_target(picked);
+        if let Some(guid) = picked {
+            if self.is_attack_candidate(guid) {
+                self.start_auto_attack();
+            }
+        }
+    }
+
+    /// What is under the cursor, if the world is in a state to be asked.
+    ///
+    /// `None` means the question could not be put -- no world, or the pointer
+    /// was over the interface -- which is different from `Some(None)`, the
+    /// answer "nothing is there". Collapsing the two would make a click on a
+    /// health bar clear the selection.
+    fn pick_at(&self, at: (f64, f64)) -> Option<Option<u64>> {
+        let r = self.renderer.as_ref()?;
         // A click on the interface belongs to the interface: clicking a health
         // bar must not target whatever is standing behind it.
         if self.hud.captures_pointer(&r.egui_ctx) {
-            return;
+            return None;
         }
         let (Some(live), Some(Scene::Streaming(world))) = (self.live.as_ref(), r.scene.as_ref())
         else {
-            return;
+            return None;
         };
 
         let viewport = (r.config.width as f32, r.config.height as f32);
-        let Some(ray) = self.camera.ray_through((at.0 as f32, at.1 as f32), viewport) else {
-            return;
-        };
+        let ray = self.camera.ray_through((at.0 as f32, at.1 as f32), viewport)?;
         // Rebuilt rather than cached: the same interpolated positions the
         // renderer drew this frame, so a click hits where the creature looks
         // like it is rather than where it last reported being.
         // The speed only chooses an animation, which a click test does not care
         // about -- but the same list has to come out here as the renderer drew,
         // so it is passed the same way rather than left at a default.
-        let speed = if self.live_move.is_some() { LIVE_RUN_SPEED } else { 0.0 };
+        let speed = if self.live_move.is_moving() { LIVE_RUN_SPEED } else { 0.0 };
         let entities = drawable_with_own(live, speed);
-        let picked = hud::pick(&ray, &entities, &|display_id| world.entity_bounds(display_id));
-
-        self.set_target(picked);
+        Some(hud::pick(&ray, &entities, &|display_id| {
+            world.entity_bounds(display_id)
+        }))
     }
 
     /// Changes what is selected, telling the server when it actually changed.
@@ -2635,6 +3118,25 @@ impl App {
             Ok(packets) => {
                 let report = live::replicate(&mut live.state, &packets);
                 live.note_failures(&report);
+                // Fifth category, and the one that punishes being dropped
+                // hardest: an unacknowledged teleport makes the server discard
+                // every movement packet this client sends, so the character
+                // freezes where it stood while the viewer happily walks the
+                // camera around. Stored on the state rather than returned
+                // precisely so it survives a caller that forgets it -- but a
+                // caller still has to answer it, which is the lesson this
+                // project keeps re-learning.
+                if live::answer_teleport(live) {
+                    tracing::info!(
+                        "teleported to {:.1}, {:.1}, {:.1}",
+                        live.position.x,
+                        live.position.y,
+                        live.position.z
+                    );
+                    self.chat.push(Line::Chat(local_notice(
+                        "You have been moved.".to_string(),
+                    )));
+                }
                 // Why a cast did not happen, in the one place the player is
                 // looking. This was missed on the first pass -- the failures
                 // were parsed and then dropped on the floor, so pressing a key
@@ -2947,6 +3449,42 @@ impl App {
             bars.push(slots);
         }
 
+        // The spellbook, built only while it is open.
+        //
+        // Rebuilt every frame like the bars, and for the same reason: an icon
+        // that failed to load earlier can succeed later, and a spell learned
+        // mid-session should appear without a relog. The cost is a filter over
+        // a few dozen ids, which is nothing beside the icons it resolves --
+        // and those are cached by path inside `Spellbook`.
+        let spellbook: Vec<ui::SpellbookEntry> = if self.spellbook_open {
+            let (known, class) = match self.live.as_ref() {
+                Some(live) => (
+                    live.state.spells.spells.iter().map(|s| s.id).collect(),
+                    live.state
+                        .get(live.guid)
+                        .and_then(|entity| entity.class())
+                        .unwrap_or(1),
+                ),
+                None => (Vec::new(), 1),
+            };
+            self.spells
+                .castable(&known, class)
+                .into_iter()
+                .map(|id| {
+                    let icon =
+                        self.spells.icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, id);
+                    ui::SpellbookEntry {
+                        id,
+                        name: self.spells.name(id),
+                        rank: self.spells.rank(id),
+                        icon,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Re-measured every frame against the clock for the same reason the
         // cooldown sweep is: the bar's fill has to move even though nothing
         // in replicated state changed between frames.
@@ -2960,6 +3498,7 @@ impl App {
         });
 
         let mut hud_response = ui::HudResponse::default();
+        let spellbook_open = self.spellbook_open;
         let interface = &mut self.hud;
         let editing = interface.edit.active;
         let layout_status = interface.status.clone();
@@ -2976,6 +3515,10 @@ impl App {
                     composing: composing.as_deref(),
                     bars: &bars,
                     cast_bar: cast_bar.as_ref(),
+                    // `None` when closed rather than an empty list: an empty
+                    // book and a closed one are different things, and the
+                    // interface draws the first and hides the second.
+                    spellbook: spellbook_open.then_some(spellbook.as_slice()),
                 },
             );
 
@@ -3042,7 +3585,11 @@ impl App {
                     ui.weak(if editing {
                         "F1: stop editing the interface"
                     } else {
-                        "click to target, F1 to rearrange the interface"
+                        "left-click to target, right-click to target and attack, \
+                         right-drag to steer, wheel to zoom, Q/E strafe, space \
+                         jumps, Num Lock autoruns. P for the spellbook (click a \
+                         spell then a slot; right-click a slot to clear it), F1 \
+                         to rearrange the interface"
                     });
                     if let Some(status) = &layout_status {
                         ui.weak(format!("interface: {status}"));
@@ -3060,6 +3607,18 @@ impl App {
         // A clicked slot casts, after the closure has released `self.hud`.
         if let Some((bar, slot)) = hud_response.activated {
             self.activate_slot(bar, slot);
+        }
+
+        // A bar that was rearranged is written straight back to `ui.toml`.
+        //
+        // Saved here rather than left to the edit window's Save button because
+        // arranging a bar is not editing the layout -- it happens mid-play,
+        // with the edit window closed -- and a spell that has to be dragged on
+        // again after every restart is worse than no spellbook at all. The
+        // write is atomic (see `Profile::save`), and only happens on the frame
+        // an assignment actually landed.
+        if hud_response.layout_changed {
+            self.hud.save();
         }
 
         if let Some(r) = self.renderer.as_mut() {

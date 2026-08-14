@@ -355,6 +355,10 @@ mod tests {
             kind: ::world::ObjectType::Unit,
             level: Some(1),
             speed: 0.0,
+            dead: false,
+            died_ms_ago: None,
+            swung_ms_ago: None,
+            fighting: false,
             appearance: None,
         }
     }
@@ -529,6 +533,10 @@ mod tests {
             move_duration: None,
             move_started: None,
             arrival_facing: None,
+            path_facing: ::world::state::PathFacing::default(),
+            last_move_time: None,
+            died_at: None,
+            last_swing: None,
             updates: 0,
         };
         let view = unit_view(&entity, "Creature".into());

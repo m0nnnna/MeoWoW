@@ -874,6 +874,171 @@ entry actually reaches the screen and that age moves it upward, and
 pins the same behind-the-camera refusal `marker_rect` already has. Not yet
 watched live -- see the paragraph above.
 
+### 4.4 continued: dying, and the two states that look like one
+
+The corpse flow starts by being killed, and **a death cannot be captured without
+dying**, so `wow-cli world --until-death` exists to pick fights until the
+character loses. Getting it to work cost five separate bugs, none of which
+errored and all of which presented identically -- as combat not happening:
+
+- **Distance measured from replicated state**, which is frozen at login because
+  the server never relays this client's own movement back to it. Every approach
+  was computed from the login position, so the walk arrived out of range. This
+  is the *same* bug 4.4 already paid for once in `--attack`, reintroduced in a
+  new function; `nearest_ordered_from` now takes the origin as a parameter and
+  the doc comment says why.
+- **The rig walked away from the thing killing it.** At four health it picked a
+  fresh wolf thirty units off, which broke combat, and health regenerated on the
+  way. It now prefers whatever is already attacking us, wherever it is in the
+  list.
+- **Altitude.** `Connection::walk` advances x and y and carries the starting Z
+  along, so after a ninety-unit walk over Northshire's hills the client was
+  *telling the server* it was six yards in the air. The server measures melee
+  range in three dimensions, so a swing from two yards away and six above is
+  refused exactly like one from eight yards away -- printed as `dz 5.1` beside a
+  flat distance of 2.2. The rig now takes the target's Z as ground truth, on the
+  grounds that creatures stand on the ground. That is the fifth report tracing
+  back to the same missing feature.
+- **A ghost has one health.** Four runs were spent swinging as a ghost, because
+  `1/79` reads as a warrior about to fall over. Every attack came back
+  `SMSG_ATTACKSTOP` with no `SMSG_ATTACKSTART`, no swings and *no refusals* --
+  indistinguishable from the attack opcode having stopped working. The character
+  list had said `ghost` on every one of those runs and nothing read it.
+- **Auto-attack wins fights.** `CMSG_ATTACKSWING` starts a *repeating* attack,
+  so a command whose entire purpose is to be killed was efficiently killing each
+  attacker and regenerating between them; two runs ended with more health than
+  they started. It now swings once to be noticed and then sends
+  `CMSG_ATTACKSTOP` and soaks. Health fell 54 to 0 in three rounds.
+
+**Dead and ghost are two states, and one snapshot said otherwise.** Diffing a
+living character's update fields against a dead one's -- the technique that
+settled `PLAYER_BYTES` and the game object display id -- showed a field
+appearing exactly when that character stopped being alive. Complete, plausible,
+and wrong: that character had already *released*. Killing a second character and
+looking again showed it dead with health `0` and that field **absent**. Written
+down after one observation it would have been labelled "dead", and would have
+been silent for the entire window between dying and releasing -- which is the
+window a corpse run happens in.
+
+Six snapshots, three characters, two accounts, two zones, a warrior and a druid:
+
+| state | health | `0x04AD` | `0x0096` | corpse object |
+|---|---|---|---|---|
+| alive (3 characters) | > 1 | absent | absent | none |
+| dead, not yet released | `0` | `0x08` | absent | **none** |
+| ghost, released (2 characters) | `1` | `0x08` | `0x10` | present |
+
+`0x04AD` is the *only* field whose presence separates alive from not-alive with
+no exceptions. Absence is meaningful rather than unknown, by the rule
+`PLAYER_BYTES` established: a create block carries only non-zero values, so a
+field missing from a living player's set is a zero.
+
+Two independently-derived structures agree with the split. The character list's
+`flags & 0x2000` is parsed out of `SMSG_CHAR_ENUM` with no code in common with
+the update-field path, and it reads `ghost` for the two released characters and
+not for the freshly killed one. And the corpse *object* only exists after
+releasing -- a player lying dead has none in view, which is also why the corpse
+run needs the distinction rather than merely liking it.
+
+**Neither flag is named beyond what was measured.** The constants are
+`PLAYER_NOT_ALIVE` and `PLAYER_GHOST`, one observed bit each; what the rest of
+either field holds is not established and is not guessed.
+
+**What the death itself sends** is a differential rather than a reading: the
+same character, same zone, same creatures, one run that died and one that did
+not. Nine opcodes appear only in the run that died. Two are worth naming as
+observations, and neither is yet parsed -- `0x0269` carries a single `30000`,
+which is a thirty-second timer arriving at the moment of death, and `0x0484`
+carries `{creature guid, our guid}` twice, which is the shape of a unit's threat
+list losing us. The remaining seven are recorded in the capture and left alone.
+
+### 4.4 finished: the corpse run, and a local realm to find it with
+
+A character can now die, release, run back to its body and take it. Every step
+was confirmed against a **local AzerothCore** rather than the shared test realm,
+and the change of venue is most of the story: on the remote realm each death
+cost a five-minute fight and consumed a character's state permanently, so a
+wrong guess was expensive and a *second* observation of anything was rare.
+Locally a death is a GM command, a resurrection is another, and the same
+scenario can be run twenty times.
+
+The two writes and what they cost:
+
+- **`CMSG_REPOP_REQUEST`** carries one byte the server reads and discards.
+  Sending an empty body is not the same thing -- the read happens before any
+  check, so a zero-length body is a short read rather than a request.
+- **`CMSG_RECLAIM_CORPSE`** carries the corpse's guid *unpacked*, eight plain
+  bytes, unlike almost every other guid this protocol sends.
+
+Both are refused in silence -- seven separate conditions between them, none of
+which says which -- so `--release` and `--reclaim` report a before-and-after of
+the things that must change rather than claiming success.
+
+**Three bugs, each of which made the previous one look finished.**
+
+The first attempt released before the character was dead, because the flags ran
+in declaration order and the kill is a GM command sent as chat. It produced
+nothing at all, which is what a wrong opcode produces -- and the reclaim-delay
+packet arriving afterwards, proving the death had happened, is what separated
+them.
+
+The second was found by a number that did not add up. The reclaim *succeeded*
+from 58 yards away when the server's limit is 39. The cause was
+`MSG_MOVE_TELEPORT_ACK`: the server moves a released ghost to the graveyard and
+waits to be told the client noticed, **and discards every movement packet until
+it is** -- so the ghost had never left the corpse, the range check passed at
+nought yards, and the whole feature looked complete. Acknowledging the teleport
+made a passing test fail, correctly, and turned the corpse run into a real one.
+The same obligation applies to *any* teleport, so a viewer that ignored it would
+freeze server-side while walking its camera around; that is fixed in the same
+change.
+
+The third was picking the wrong body. Corpse-shaped objects include the bones of
+bodies already reclaimed, they all carry their owner's guid, and a graveyard
+accumulates them -- one run saw nine, five of them ours. Choosing by owner sent
+the run back fifty-eight yards to a previous death site. `MSG_CORPSE_QUERY` asks
+the server which body is current, which is both simpler and correct; the
+replicated objects then only supply the guid, chosen as the one nearest the
+answer.
+
+**The graveyard needs no `WorldSafeLocs.dbc`.** `SMSG_DEATH_RELEASE_LOC` carries
+the map and position of the grave the server picked. The obvious design is the
+opposite -- look up the nearest row and walk there -- and building it that way
+would have put a table on the critical path of a feature that needs none. The
+table is wanted later only to put a *name* on a place we are already given the
+coordinates of.
+
+**The reclaim delay is not a constant.** Observed at 30s on a first death, 60s
+on the second and 120s on the third: it stacks. Anything that hardcoded thirty
+seconds would have worked exactly once per character, which is precisely how
+often it would have been tested.
+
+### An entire population can still be one sample
+
+The sharpest lesson of the milestone, and it invalidated a conclusion this
+document previously recorded as solid.
+
+Field `0x04AD` bit `0x08` was identified as "not alive" from six live snapshots
+-- three characters, two accounts, two zones, a warrior and a druid -- where it
+was the *only* field separating alive from not-alive with no exceptions. That is
+a broad population by every measure this project usually applies.
+
+It is the release-timer display flag. Every one of those six came from the same
+*path*: an ordinary death. A GM resurrection produces a living character at full
+health with the bit still set, and no amount of watching people die naturally
+could have shown it. **Breadth in characters, accounts, zones and classes reads
+exactly like rigour, and none of those was the dimension that mattered.** The
+question to ask of a population is not how large it is but how many different
+ways the value could have been arrived at.
+
+What survived the correction: `PLAYER_FLAGS` bit `0x10` really is the ghost
+flag, and dead-versus-ghost really are two states. `Entity::is_dead_or_ghost`
+now reads the two things that do mean it, and the rewritten test immediately
+caught a second bug in the replacement -- it checked `health == Some(0)`, but a
+dead player's health *is* zero so the create block omits the field and it reads
+`None`. That is this project's own "an absent field is a zero" rule, which the
+live capture had shown plainly and the code still got wrong.
+
 ### 4.3 continued: tooltips, a cooldown sweep, and a width that was never 16
 
 Hovering a slot now shows the spell's name, rank and description, straight off
@@ -1291,7 +1456,7 @@ hundred pixels of character on a screen.
   want the same search treatment `PLAYER_BYTES` got, against a character whose
   gear is known from the character list.
 
-### Known defect: other players jump rather than walk
+### Fixed: other players jump rather than walk
 
 Reported from live play and not caught by any test here: another player vanishes
 from one spot and reappears further along their path, with no animation playing.
@@ -1319,3 +1484,536 @@ confirms nothing about behaviour the two copies share -- and identical timing is
 the most obvious thing two copies of one binary share. When what is under test
 is timing rather than layout, one end has to be software this project did not
 write.
+
+**The fix builds a path out of two samples rather than predicting one.**
+`WorldState::apply_relayed_movement_at` keeps the previous sample as the start,
+takes the new one as the destination, and uses the interval between them as the
+duration -- which is all `interpolated_position` and `move_speed` ever needed.
+Nothing is extrapolated forward. Every position drawn is one the server actually
+reported, and the price is that a mover is drawn one sample-interval behind.
+That trade is deliberate: dead-reckoning ahead from the movement flags and the
+speed fields would remove the lag and start inventing positions, and a player
+invented into a wall is a bug nothing here can check, where a player drawn half
+a second late is merely late.
+
+**The interval comes from the mover's own clock**, `MovementInfo::time`, not
+from when the two packets reached us -- that is the one measurement of how the
+sender actually spaced its samples, where arrival times also measure the network
+and our own scheduler. Three things fall back to the old snap: an interval too
+short to be a sample, one long enough that the mover was standing still or out
+of view, and a distance no legitimate movement covers in the time, which is a
+teleport and must not be drawn as a walk. The fallback being *exactly the
+previous behaviour* is the point -- a mover whose clock this client cannot make
+sense of is no worse off than before the fix.
+
+`PathFacing` came out of the same work, and is the half that a monster-move
+mental model gets wrong. `SMSG_MONSTER_MOVE` reports no orientation at either
+end, so facing has to be inferred from the direction of travel. A relayed
+`MSG_MOVE_*` carries the mover's *own* orientation at both ends, which is a
+different thing: a player strafing or walking backwards faces somewhere other
+than the way they are going, and inferring it from the path would spin them
+round. The enum makes `interpolated_position` ask which kind of path it is
+holding rather than assume.
+
+**And this time the live-only bug became six headless tests**, per the standing
+rule: two samples become a walked path with a real speed (the assertion that
+would have caught the stand-cycle half), a reported facing beating the direction
+of travel, a turn across zero going the short way, a teleport snapping, a long
+gap snapping, and a relayed path superseding a stale monster move.
+
+**What the live check then measured, and what it found instead.** A run of
+`wow-cli world --enter Watcher --stay` beside a real 3.3.5a client reported
+`92 sample(s), 63 walked (mean interval 795ms)` -- and the mover was a level-one
+human *rogue*, class 4 with energy, which is no character this project has ever
+created. That is the independent end the two-client rig could never supply.
+
+But the same run's opcode census is the more useful half, and it corrects that
+number completely. This client folded exactly **three** relayed movement
+opcodes. One real client walking about produced **five more** carrying the
+identical body, every one discarded -- including `0x00DA`, which on its own was
+**93% of that client's entire movement stream**. So 795ms was never how often a
+real client samples itself; it was the gap between the 7% this client bothered
+to read.
+
+`wow-cli moves <capture>` settled which, and the method matters more than the
+answer. It asks which opcodes carry `{packed guid, MovementInfo}` *structurally*
+-- the body parses, it consumes to the byte, and the guids it names are few and
+repeating -- using the shipped parser rather than a second copy written for the
+tool. Across one 180-second capture:
+
+| opcode | packets | parse as movement | bytes left over | movers |
+|---|---|---|---|---|
+| `0x00B5`, `0x00B7`, `0x00EE` (folded) | 68 | 68 | 0 | 1 |
+| `0x00B6`, `0x00B8`, `0x00B9`, `0x00BA`, `0x00DA` (dropped) | 1,202 | 1,202 | 0 | 1 |
+| `SMSG_MONSTER_MOVE` (control) | 944 | 75 | 358 | 23 |
+
+The control is what makes it evidence rather than a hit rate. Any body of about
+the right length parses as *something* -- the same trap as a column of small
+integers landing inside a 130-row table -- so the argument is the gap between a
+layout that consumes exactly and names one mover, and one that does neither.
+**None of the five is given a name**, because nothing here established which
+movement each is; they render as `MSG_MOVE_* relayed (0x00da)`, which says the
+packet is understood and its name is not. A fabricated `MSG_MOVE_START_STRAFE_LEFT`
+would say neither.
+
+**And measuring the rate immediately falsified a constant written from
+intuition.** `MIN_INTERVAL_MS` was 40ms, on the reasoning that nothing samples
+itself faster. The heartbeat this client already reads has a *minimum* of 500ms
+and a median of 1,140ms, which is where "roughly every 500ms" came from and is
+correct as far as it goes. `0x00DA`'s median interval is **21ms**. The floor
+would have rejected most of the real stream and snapped it -- reinstating the
+defect the surrounding code exists to remove, while guarding against something
+that never happens. It is now 1ms, and there is a test holding the measurement.
+
+**Three wrong readings of the capture file, none of which errored.** The tool
+that produced the table above got the answer wrong twice first, and both times
+confidently. `opcode::describe` renders an unknown opcode as `opcode 0x00da` --
+two tokens -- so splitting the line on whitespace and taking the third field
+landed on the length for exactly the opcodes under investigation, shifting every
+body by a byte and reporting all of them as "not movement". Reading the body as
+the trailing run of two-hex-digit tokens then failed differently: a 32-byte
+packet's length is `32`, which is itself two hex digits. The fix anchors on the
+length by making it *agree with what follows it*, scanning left to right --
+because a body ending in `00` also satisfies "parses as zero, and zero tokens
+follow", so a right-to-left scan finds a byte instead. A tool whose own output
+format defeats its own reader is the same failure as printing the length of a
+packet you refused, one layer up.
+
+### 4.4 continued: a spellbook, and the ability the filter had to reject
+
+Combat could be driven from `wow-cli` and not from the client, for a reason
+that had nothing to do with the protocol. Auto-attack is spell 6603, `Testwolf`
+has known it since the character was made, and `Connection::attack_swing` has
+worked since 4.4 opened -- but there was no way to put it on a bar. The bars
+were filled once at login by `App::seed_action_bars` and never touched again,
+so whatever that one filter rejected was unreachable from inside the client
+however much the character knew.
+
+**And it rejected auto-attack necessarily, not by oversight.** 4.3 established
+that a spell earns a slot by belonging to the character's own skill line --
+`Opening`, `Closing`, `Duel` and `Honorless Target` are not passive and belong
+on no bar, no attribute bit separates them from `Heroic Strike`, and what does
+separate them is that the junk all sits on `SkillLineAbility`'s generic line
+183 with a class mask of zero. `Auto Attack` sits on line 183 with a class mask
+of zero:
+
+```
+SkillLineAbilityRow { id: 3999, skill_line: 183, spell_id: 6603,
+                      race_mask: 0, class_mask: 0 }
+```
+
+So the mechanism that correctly keeps a warrior's bar free of junk is the same
+mechanism that hides the one ability every character in the game uses. That is
+a nicer shape of problem than it looks: the rule is not wrong, it is merely
+complete, and the fix is either to widen it or to name the exception. Widening
+it to admit line 183 readmits `Honorless Target` with it. Naming the spell
+admits exactly what was checked -- so `spells::AUTO_ATTACK` is a hardcoded
+6603 with its evidence beside it (row named `Auto Attack`, attributes `0x10`
+so not passive, description *"Automatically attacks a target in melee with an
+equipped weapon until cancelled"*), and the test asserts **both** halves
+against the real archives: the one spell is admitted, and the five junk spells
+it is structurally indistinguishable from are still refused. A test of the
+first half alone passes just as well under the wrong fix, which is the whole
+reason the second half is in it.
+
+**The general answer, though, is the book.** A per-spell exception fixes one
+spell; a list you can drag from fixes the category, and the category is real --
+a seeded bar is a guess about what a player wants, and no filter is going to
+get that right for every class. `crates/ui/src/frames/spellbook.rs` opens with
+`P`, a left click picks a spell up, a left click on a slot puts it down, and a
+right click on a slot empties it.
+
+**A slot still stores a plain `u32`.** The obvious shape was to give a slot an
+action *kind* -- `Spell(u32) | AutoAttack` -- and that would have been a
+serialisation change to a file users already have. Which message a slot sends
+is a fact about the *spell*, not about the slot, so it is derived at the point
+of sending instead: `ui.toml` is untouched, every existing layout still loads,
+and a bar arranged by hand in the file behaves exactly like one arranged
+in-game.
+
+**Auto-attack is a state, so its slot toggles**, and whether it is on is read
+out of `WorldState::attacking` rather than kept in a local flag. This is the
+same reasoning that put teleports on `WorldState` instead of returning them:
+the server ends an attack on its own when the target dies or walks out of
+range, and a local flag would be inverted from that instant. The next press
+would send a stop for a fight that was already over -- and since a refused
+attack is silent on the wire, that reads as the key having failed.
+
+#### The tests that would have caught it, written before it happened
+
+4.2 shipped with no live bugs because 4.1's failures had been converted into a
+headless egui pass. The same conversion is done here up front, because every
+part of an assignment gesture is invisible from outside: `drive` delivers real
+egui events across the passes a click actually takes (a press lands on the
+rectangles the *previous* pass registered, and `clicked()` reports on the
+release), and the checks are that clicking a spell then a slot puts it on the
+bar and reports the layout changed, that a slot clicked with nothing held is
+still a cast, that right-click empties, that closing the book drops what was
+held -- and that a **scrolled** book picks up the spell under the cursor.
+
+That last one earned its place immediately. The row index and the entry index
+are deliberately different things, and the test that pins them apart caught a
+different bug on its first run: the scroll offset is a `usize`, and applying a
+wheel delta by casting it to `i32` and adding turns a large offset into `-1`.
+The offset is clamped every frame so it can never legitimately *be* large --
+but a cast that is only safe because of an invariant somewhere else is exactly
+the kind of thing that stops being safe quietly. It is a saturating add and
+subtract now.
+
+#### What was checked live, and what was left to be
+
+Against the local AzerothCore realm, with `APPDATA` pointed at an empty
+directory so the layout was genuinely fresh and the seeder actually ran:
+
+```
+in world as Testwolf on map 0 at -8935.3, -188.6, 80.4
+login burst: 71 packets, 84 objects, 54 spells
+action bar seeded from 54 known spells (5 castable):
+    Auto Attack, Heroic Strike, Battle Stance, Activate Secondary Spec,
+    Activate Primary Spec
+```
+
+Auto-attack leading the bar of a real character, from the real archives, over a
+real connection -- the whole data path from `SMSG_INITIAL_SPELLS` through the
+filter to a slot, confirmed without a person at the window. What that run
+cannot confirm is a keystroke and a click, so the swing itself is still a live
+look: target a creature, press its key, and watch `SMSG_ATTACKSTART` and the
+combat log. `--screenshot` renders no egui, so this is the boundary of what is
+automatable here today.
+
+### 4.5: the controls — strafing, jumping, steering and a camera that zooms
+
+The client could walk forward, walk backward, and turn. That is genuinely all
+it could do: `Q`, `E` and `Space` were fly-camera leftovers that did nothing at
+all while connected, so there was no strafing, no jumping, and no way to point
+the character with the mouse. Getting combat to a state worth testing made the
+gap obvious -- circling a target is how melee is actually played.
+
+**Movement stopped being a heading and became two axes.** The old state was
+`Option<LiveMove>` with `Forward | Backward`, which cannot express running
+forward *and* sidestepping -- a thing a player does constantly. `Motion` holds
+both axes, and the wire agrees: there is a start/stop pair per axis, and
+`MSG_MOVE_STOP` ends only the longitudinal one. A character that stops running
+while still holding a strafe key keeps strafing.
+
+**The opcode names the axis that changed; the flags carry the whole state.**
+Beginning to strafe while already running sends `MSG_MOVE_START_STRAFE_LEFT`
+with *both* bits set. Sending only the bit matching the opcode would tell the
+server the character had stopped running the instant it started strafing --
+and, movement being unacknowledged, the symptom would be a drift with no
+error anywhere.
+
+#### Where the numbers came from, which is the part worth being careful about
+
+Five opcodes and two flags were needed and none of them were in the tree. This
+is the situation `CHAT_MSG_SAY = 0x00` came out of, so nothing was transcribed
+from memory.
+
+The AzerothCore source is on disk and reading it is authorised, so it made the
+hypothesis cheap: `Opcodes.h` gives the strafe block `0x0B8`/`0x0B9`/`0x0BA`,
+`MSG_MOVE_JUMP` `0x0BB` and `MSG_MOVE_FALL_LAND` `0x0C9`, and `UnitDefines.h`
+gives `MOVEMENTFLAG_STRAFE_LEFT` `0x4` and `_RIGHT` `0x8`. Two things then made
+that more than a transcription from a different source:
+
+- **Every constant this project already had agrees with the same enum.**
+  `FORWARD` `0x1` through `SPLINE_ENABLED` `0x8000000` were established
+  earlier and independently, and all nine match. Reading a bit off the end of a
+  confirmed run is a different act from guessing at it.
+- **The capture already said which opcodes were movement.** `wow-cli moves`
+  had found five unnamed opcodes in a real client's stream whose bodies parsed
+  as `{packed guid, MovementInfo}` and consumed to the byte -- `0x00B6`,
+  `0x00B8`, `0x00B9`, `0x00BA`, `0x00DA`. Three of those are exactly the strafe
+  block. The capture could say *these are movement* and not *which* movement;
+  the source names them; the two agree.
+
+And one reading was checked and came back *against* the obvious answer.
+`MovementHandler.cpp` writes a jump block as `sinAngle, cosAngle, xyspeed,
+zspeed` -- a different order from this project's `Falling`, which looked like a
+bug worth fixing. It is not: that is a different packet. The canonical
+`MovementInfo` codec in `WorldSession.cpp` reads `zspeed, sinAngle, cosAngle,
+xyspeed`, which is exactly what `world::movement::Falling` already had. The
+near-miss is the point -- a grep that finds the field names is not the same as
+a grep that finds the *structure*, and "fixing" the correct one would have been
+silent.
+
+#### Confirmed by relay, because an outgoing opcode cannot be confirmed any
+other way
+
+Nothing acknowledges movement, and a wrong outgoing number is read as some
+*other* valid request rather than refused -- the same problem `CMSG_ATTACKSWING`
+had. So the check is the two-client rig, which is the one shape here where the
+write half is confirmed through a third party that had to understand both.
+
+`wow-cli` gained `--strafe left|right` and `--jump` for exactly this, and they
+drive the *same* `Motion` the viewer does rather than a second copy -- which is
+why `Motion` lives in `crates/world` despite being fed by a keyboard. Two
+mappings from movement state to flags and opcodes would agree until one of them
+changed, and this rig exists to check the other.
+
+One session moved while a second, on a different account, logged what the
+server relayed:
+
+```text
+--jump                     --strafe right --walk 15
+0x00bb  x1  (jump)         0x00b9  x1  (start strafe right)
+0x00c9  x1  (fall land)    0x00ba  x1  (stop strafe)
+```
+
+Exactly one of each, in order. A body the server could not parse as a jump
+would not have been relayed *as a jump* to somebody else.
+
+The strafe also has a confirmation involving no opcodes at all, which is
+better still because it tests the *direction* rather than the framing. Facing
+4.61 rad, strafing left 20 units moved the server's own position from
+`-8939.3, -197.5` to `-8919.4, -199.5` -- +19.9 in x, -2.0 in y, **orientation
+unchanged**. Sideways without turning is something a forward walk cannot
+produce at any heading. Strafing right moved it back -14.9 in x, the mirror.
+
+#### The rest of the controls
+
+- **Right-drag steers the character**, left-drag still swings the camera around
+  it. Deliberately two verbs, as in the game this is modelled on: collapsing
+  them would lose the ability to look sideways while running straight. While
+  steering, `A`/`D` become strafe keys -- and are then *stopped* from also
+  turning, because a key that turned the character and pushed it sideways at
+  once would send it round in a circle, and the cause reads as a mouse problem.
+- **The wheel zooms** from 2.5 to 30 units back while following a character,
+  and still trims fly speed when there is no character to follow. The near
+  limit is not zero on purpose: this client draws the player's own head, and a
+  true first-person view is a screenful of the inside of a face.
+- **Autorun** on `Num Lock`, cleared by pressing a key that means stop.
+
+#### Two bugs found by writing the tests, before either could be seen
+
+The arithmetic went into `crates/world/src/motion.rs` with ten tests precisely
+because a movement bug is invisible until a server disagrees with you, and both
+of the mistakes made here were in the packet-ordering rather than the maths:
+
+- **The landing was written as an `else` of the key-transition branch.**
+  Releasing a key on the very frame the ground was reached would have sent the
+  key change and swallowed the `MSG_MOVE_FALL_LAND`, leaving the server holding
+  a character it believed was still in the air. They are two different facts
+  about one frame and both have to travel; the landing is unconditional now.
+- **`A`/`D` did double duty while steering**, turning the character *and*
+  strafing it.
+
+And the jump arc integrates with the midpoint term rather than stepping the
+height by an already-updated velocity, with a test asserting the peak is the
+same at 20fps as at 240. A jump whose height depends on the frame rate is a
+fault that only ever appears on someone else's machine.
+
+#### Right-click, which is two gestures and three jobs
+
+The controls above shipped with right-drag steering and nothing else on the
+right button, which is half of what that button does in the game. Right-click
+is *select-and-do-the-obvious-thing*: it targets what is under it, and then
+performs the default action -- attack a creature, talk to a vendor, loot a
+corpse. Left-click only ever selects.
+
+Telling the two apart needs no new machinery, because the left button already
+had this exact problem: a press and a release in the same place is a click, the
+same two events with movement between them is a drag, and nothing but the
+distance separates them. So the right button mirrors that structure rather than
+inventing a second one.
+
+**Mirroring it turned up a bug in the original.** The left button cleared
+`last_cursor` on release -- and the *next* press reads `press_at` from that
+same field. Two clicks at the same pixel with no movement between them
+therefore had the second one silently discarded: `press_at` was `None`, so the
+release had nothing to measure against and no click was ever reported. With a
+left click that is a selection nobody repeats, which is why it survived four
+milestones unnoticed. Right-click-to-attack is a gesture people *do* repeat on
+the same pixel, precisely when it seems not to have worked -- which is exactly
+when it would have gone on not working. Nothing needed the field cleared;
+`CursorMoved` fires whether or not a button is down.
+
+**Attack is offered on a rule that is deliberately not a hostility test**, and
+the distinction matters. A unit's faction arrives as `UNIT_FACTION`, but
+turning that into "hostile *to me*" needs `FactionTemplate.dbc`, which is not
+transcribed. Inventing the judgement here is the fabricated-number problem one
+layer up: a client that decides a guard is hostile does not display a wrong
+number, it attacks the guard. So `is_attack_candidate` rules out only what is
+never a fight on any reading -- yourself, a corpse, a bench, anything already
+dead -- and lets the server arbitrate the rest, which it does anyway and is the
+only party that actually knows. The cost is that right-clicking a friendly NPC
+sends a swing the server refuses. That is the honest failure; the alternative
+was an unprovoked attack.
+
+`FactionTemplate.dbc` is the follow-up, and it is the right shape of work for
+this project: a table whose meaning has to be confirmed against live data
+rather than transcribed, with a ready-made control group -- the guards and the
+innkeeper in Northshire against the wolves and kobolds outside it.
+
+Right-click also had to *start* a fight rather than toggle one, so
+`toggle_auto_attack` split into `start_auto_attack` and `stop_auto_attack`.
+Right-clicking the creature you are already fighting must not call the fight
+off, which is what a toggle bound to the same gesture would have done.
+
+### 4.6: things die, and a fight looks like a fight
+
+Reported from playing it, and the first two are one problem: **the player
+stands still while the fight happens**, and **mobs reach zero health and go on
+standing**. The animation system knew about exactly one input -- ground speed
+-- so a creature that stopped moving was standing, whether it had stopped
+because it was idle or because it was dead.
+
+**The architecture had a shape that made this awkward, and the shape was
+right.** Bone poses are shared: every instance in a `(display id, motion)`
+bucket is drawn from one buffer, which is what keeps ninety-five creatures
+affordable. That works for loops because everything standing is in step
+anyway. It breaks for a death, because two wolves die at different moments and
+cannot share a pose unless they are at the same point of the same cycle.
+
+The fix is to put **when the cycle started** in the key. Units that died
+together share a bucket and units that died a second apart do not, and the
+count of live buckets is bounded by how many things died in the last few
+seconds. The stamp is *absolute* rather than an age, which is the whole trick:
+an age changes every frame, so it would rebuild the bone buffer every frame and
+quietly turn the cache into a cost. There is a test pinning that specifically,
+because the wrong version would have looked perfect.
+
+**Four states now, not three.** `Dying` plays the fall from the moment it was
+seen; `Dead` is settled; `Attacking` plays a swing from the moment it landed;
+`Ready` is the guard-up stance that a fight is mostly *made of* -- a swing is
+an instant and a fight is a minute, so the swing animation alone would still
+have left the character at ease for nine tenths of it. Precedence is death,
+then the swing, then the guard, then speed; and a swing only interrupts
+standing, because a creature charging you swings as it runs and the swing
+played over a run reads as a stumble.
+
+#### The table already knew the fallbacks
+
+`AnimationData.dbc` has a `fallback` column, and it encodes exactly the chains
+this needed: `Dead` (6) falls back to `Death` (1), `Attack1H` (17) to
+`AttackUnarmed` (16), `Ready1H` (26) to `ReadyUnarmed` (25). Nothing was
+guessed; the ids were read out of the table.
+
+**But the table's fallbacks are not sufficient, and only the models say so.**
+`wow-cli m2 anims Creature\Wolf\Wolf.m2` lists `AttackUnarmed` and `Death` and
+**no ready stance at all**. So a wolf entering combat resolved to no sequence,
+which draws the bind pose -- stiff and T-posed, worse than the idle it
+replaced. Both combat stances now end their fallback list at plain `Stand`.
+That is this project's own rule about rendering coming back around: when a rule
+is about what a *model file* contains rather than what a table says, look at
+the model.
+
+#### And that fallback forced the clamping rule to be rewritten
+
+A cycle that plays once has to hold its last frame; a loop has to wrap. The
+obvious place to decide is the state that asked -- and it is wrong in both
+directions at once:
+
+- `Attacking` on a wolf falls back to `Stand`, and a Stand frozen at its final
+  frame is a statue.
+- `Dead` on that same wolf resolves to the *fall*, and looping a fall is a
+  creature dying over and over -- while carrying no start time to clamp
+  against, because a settled corpse's pose is the same however long ago it
+  died.
+
+So holding is a property of the **animation that resolved**, not of the motion
+that requested it. `plays_once` takes an id.
+
+#### One bug caught by a screenshot, which no test would have found
+
+The first version asked `is_dead_or_ghost()`. That is the right question for a
+health bar and the wrong one for a renderer: a released player is a *ghost*,
+which walks to its corpse on its own feet. Laying every ghost flat would have
+been a fine piece of logic and a nonsense picture. `is_corpse()` -- dead and
+not a ghost -- is the rendering question, and for creatures the two coincide,
+which is exactly why it took a player corpse run to notice.
+
+#### Verified by reading the renderer's own log
+
+The one-shot states each log the sequence they resolved to, and whether they
+resolved to anything -- because "playing the death animation" and "having a
+death animation to play" are different claims and only the second is checkable
+from inside. Against the local realm with corpses about:
+
+```text
+display 31048: Dead -> sequence 7 (animation id 1), 1 instance(s)
+display 49:    Dead -> sequence 7 (animation id 1), 1 instance(s)
+```
+
+Animation id 1 is `Death`, reached by falling back from `Dead` exactly as the
+table prescribes. And `wow-cli m2 anims Character\Human\Male\HumanMale.m2`
+independently lists sequence **7** as `Death`, 2000ms -- a dump of the file
+agreeing with what the renderer picked at runtime, which is the two-independent-
+derivations shape applied to a renderer rather than to a protocol.
+
+Still outstanding from the same report, and both larger: **weapons are not
+drawn** (needs the M2 attachment table, `foss-wow#25`/`#26`), and **loot and
+inventory do not exist** -- a new protocol surface and a new frame, not an
+animation problem.
+
+### 4.6 continued: making a creature look at you, in four goes
+
+The animation work above was confirmed at a window and left one complaint:
+*the mob did not turn to face the player*. Fixing it took four passes, and
+each one was wrong in an instructive way rather than merely incomplete. All
+four were found by a person watching a wolf, and none of them by a test that
+existed at the time.
+
+**1. The facing was being parsed and thrown away.** `SMSG_MONSTER_MOVE` has
+four facing modes and this client kept one:
+
+```rust
+monster_move_type::FACING_SPOT   => reader.skip(12)?,
+monster_move_type::FACING_TARGET => reader.skip(8)?,
+monster_move_type::FACING_ANGLE  => facing = Some(reader.f32()?),
+```
+
+`FACING_TARGET` is exactly how a creature in melee turns to face what it is
+hitting -- its body is the victim's guid. What makes this one nasty is that
+**the packet parsed perfectly the whole time**. A skip of the correct *length*
+keeps the rest of the packet in step, so the cursor discipline that catches
+every other layout error here -- running out of input, or having input left
+over -- cannot see a field that is correctly sized and discarded. It shows up
+only as behaviour, and only to somebody looking.
+
+The reason it was skipped is sound: a guid is not an angle until something
+knows where that unit is, and a parser has no world to ask. So `MoveFacing`
+carries it out intact and `WorldState::facing_of` resolves it.
+
+**2. That made the creature turn only when the player moved.** The server
+sends a facing packet when it decides a creature has turned, which is prompted
+by the victim moving -- so between packets the wolf held the heading it walked
+in on. A packet is a statement made once. `UNIT_FIELD_TARGET` is a replicated
+field saying who a unit is fighting for as long as it is fighting them, so the
+heading now comes from that first and tracks continuously, with the facing
+packet as the fallback for a creature looking at something it is not
+targeting.
+
+**3. Then it could not keep up with a player circling it.** Turning was eased
+at a fixed maximum rate, which looks correct in every individual frame. But
+angular speed is `v / r`, and a player orbiting at melee range exceeds any cap
+chosen to look unhurried -- at which point the error does not settle at
+"somewhat behind", it *grows without bound* and the creature ends up facing
+nowhere near its victim. Reported, precisely, across three wolves at three
+different circling speeds: one that worked because the player stood still, one
+that "couldn't update fast enough", and one that "did attempt to face the
+player". Closing a fixed *fraction* of the remaining error per second has no
+such mode: the lag is `omega * tau` for any `omega`, under ten degrees at any
+achievable orbit. The test drives a six-radian-per-second orbit -- faster than
+a player can run -- and asserts the worst lag stays small; the fixed-rate
+version fails it outright.
+
+**4. And then it aimed at the player's login spot.** The last one is the most
+embarrassing and the most useful. **The server never relays a client's own
+movement back**, so this client's entry for *itself* in replicated state is
+frozen at the login position forever. That is documented at length --
+in `live::drawable_entities`, the function that *draws* the player. Resolving
+"face this guid" through replicated state then walked straight into it from a
+function that *aims at* the player: the creature faced the login spot, which
+is right at first, drifts as the player walks, and eventually lets them stand
+behind a creature that is supposedly attacking them. Exactly the progression
+reported.
+
+The lesson is not "remember the trap" -- the trap *was* written down. It is
+that a surprising fact about the data belongs on the data, not on the first
+caller that tripped over it, because the second caller will not be reading
+that comment.
+
+`facing_of` now takes the caller's own guid and real position, since the
+caller is the only thing that knows it, and there is a test pinning a creature
+told to face a player whose replicated position says north while they have
+actually walked east.

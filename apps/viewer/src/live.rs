@@ -36,6 +36,23 @@ pub struct Entity {
     /// when it is standing. The renderer picks a stand, walk or run cycle from
     /// it -- see `crate::world::Motion`.
     pub speed: f32,
+    /// Whether this unit is lying dead, and so should be drawn face down.
+    /// Outranks `speed` when choosing a cycle: a creature killed mid-charge
+    /// keeps the charge's speed for a moment after it stops being able to use
+    /// it.
+    ///
+    /// A *ghost* is deliberately not "dead" for this purpose -- see
+    /// `world::state::Entity::is_corpse`. A released player runs back to their
+    /// body on their own feet.
+    pub dead: bool,
+    /// How long ago it was seen to die, when this client watched it happen.
+    /// `None` for a corpse that was already lying there -- see
+    /// `world::state::Entity::died_at`.
+    pub died_ms_ago: Option<u32>,
+    /// How long ago it last swung at something.
+    pub swung_ms_ago: Option<u32>,
+    /// Whether it is in a melee, on either side of it.
+    pub fighting: bool,
     /// The five character-creation numbers, for a *player*.
     ///
     /// `None` for every creature, and that is the whole distinction: a
@@ -93,6 +110,14 @@ pub struct LiveWorld {
     /// cannot be shared or rewound, so a fresh connection could not pick up
     /// where this one left off.
     pub connection: world::Connection,
+    /// The heading each entity is currently *drawn* at, as opposed to the one
+    /// the world says it should have.
+    ///
+    /// Kept because a facing arrives as a step change -- a creature acquires a
+    /// target and the correct heading becomes a different number between one
+    /// frame and the next -- and a model that jumps to it reads as a snap. See
+    /// [`LiveWorld::ease_facings`].
+    facings: std::collections::HashMap<u64, f32>,
 }
 
 /// What to connect to.
@@ -226,6 +251,7 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
         fold_failures: 0,
         reported_failures: std::collections::HashSet::new(),
         connection,
+        facings: std::collections::HashMap::new(),
     };
     live.note_failures(&burst_report);
     Ok(live)
@@ -338,6 +364,41 @@ fn hex_preview(body: &[u8], limit: usize) -> String {
 /// in `wow-cli` first -- a two-client test looked like chat never being
 /// delivered, when it had arrived in a drain whose report was thrown away.
 /// One dispatch table does not save a caller from ignoring what it produces.
+/// Answers a teleport the server is waiting on, and moves this client to where
+/// it was sent.
+///
+/// **Both halves are required and both fail silently.** Until the
+/// acknowledgement arrives the server holds the character at the old position
+/// *and discards every movement packet it sends*, so a viewer that ignores this
+/// walks around a world that has stopped listening. And a viewer that
+/// acknowledges without moving is now wrong about where it is by however far it
+/// was sent, which shows up as the camera somewhere the server disagrees with.
+///
+/// Returns whether anything was answered, so a caller can log it rather than
+/// wonder.
+pub fn answer_teleport(live: &mut LiveWorld) -> bool {
+    let Some(teleport) = live.state.pending_teleport.take() else {
+        return false;
+    };
+    // Only ever sent about us, but checked rather than assumed: acknowledging
+    // somebody else's teleport with our guid is a write, and a wrong write is
+    // read as some other valid request rather than refused.
+    if teleport.mover != live.guid {
+        return false;
+    }
+    if live
+        .connection
+        .acknowledge_teleport(teleport.mover, teleport.counter)
+        .is_err()
+    {
+        return false;
+    }
+    let at = teleport.info.position;
+    live.position = Vec3::new(at.x, at.y, at.z);
+    live.orientation = at.orientation;
+    true
+}
+
 pub fn replicate(
     state: &mut world::WorldState,
     packets: &[world::client::Packet],
@@ -353,7 +414,11 @@ pub fn replicate(
 /// a packet is folded in -- see [`replicate`]. Callers that draw from this
 /// (as opposed to describing it in text) are expected to throttle how often
 /// they call it; see the viewer's entity-rebuild timer.
-pub fn drawable_entities(state: &world::WorldState, own_guid: u64) -> Vec<Entity> {
+pub fn drawable_entities(
+    state: &world::WorldState,
+    own_guid: u64,
+    own_position: Vec3,
+) -> Vec<Entity> {
     use world::update;
 
     let now = std::time::Instant::now();
@@ -389,7 +454,30 @@ pub fn drawable_entities(state: &world::WorldState, own_guid: u64) -> Vec<Entity
             guid: entity.guid,
             display_id,
             position: Vec3::new(position.x, position.y, position.z),
-            orientation: position.orientation,
+            // Asked of the *world*, not of the entity, so a creature told to
+            // face a unit rather than an angle actually turns to it -- see
+            // `WorldState::facing_of`. Falls back to the entity's own answer,
+            // which is what it was before and is right for everything that is
+            // simply travelling.
+            orientation: state
+                .facing_of(
+                    entity.guid,
+                    now,
+                    // Where *we* actually are, which replicated state does not
+                    // know -- see `WorldState::facing_of`. Without this a
+                    // creature attacking the player faces the player's login
+                    // spot.
+                    Some((
+                        own_guid,
+                        world::Position {
+                            x: own_position.x,
+                            y: own_position.y,
+                            z: own_position.z,
+                            orientation: 0.0,
+                        },
+                    )),
+                )
+                .unwrap_or(position.orientation),
             // Scale is a float stored in a u32 field. A missing or zero scale
             // means "normal", not "invisible".
             scale: entity
@@ -402,10 +490,106 @@ pub fn drawable_entities(state: &world::WorldState, own_guid: u64) -> Vec<Entity
             // Zero when no move is in flight, which is what "standing" means
             // here -- see `world::state::Entity::move_speed`.
             speed: entity.move_speed(now).unwrap_or(0.0),
+            dead: entity.is_corpse(),
+            died_ms_ago: entity.dying_for(now).map(|d| d.as_millis() as u32),
+            swung_ms_ago: entity.swung_ago(now).map(|d| d.as_millis() as u32),
+            fighting: state.is_fighting(entity.guid),
             appearance: entity.appearance(),
         });
     }
     entities
+}
+
+/// How quickly a creature closes the gap between where it is drawn looking and
+/// where it should be, as an exponential time constant in seconds.
+///
+/// **Deliberately not a maximum turn rate**, which is what this was first and
+/// which fails in a way a player finds immediately. A fixed cap works only
+/// while the target's angular speed stays under it -- and angular speed is
+/// `v / r`, so a player running circles at melee range trivially exceeds any
+/// cap chosen to look unhurried. Past that point the error does not settle at
+/// something large, it *grows without bound*: the creature turns slower than
+/// the player orbits and ends up facing nowhere in particular. Reported from
+/// play as a wolf that "couldn't update fast enough" and then simply gave up
+/// pointing at anything.
+///
+/// Closing a fixed *fraction* of the remaining error each second has no such
+/// mode. A big turn -- acquiring a target -- covers most of its distance in
+/// about this long and reads as a fast turn rather than a snap, while
+/// continuous tracking settles at a lag of `omega * TURN_TAU` radians, which
+/// at a realistic orbit is under ten degrees and stays there however fast the
+/// player circles.
+///
+/// Chosen rather than measured, and stated as such: no table anywhere says how
+/// fast a creature's head turns.
+const TURN_TAU: f32 = 0.06;
+
+/// One step of the turn: `drawn` moved `closed` of the way to `wanted`, the
+/// short way round.
+///
+/// A free function so the behaviour can be tested without a live connection --
+/// which matters here, because the property that was got wrong is only visible
+/// over many steps and is invisible in any single one.
+fn eased_angle(drawn: f32, wanted: f32, closed: f32) -> f32 {
+    let mut delta = wanted - drawn;
+    while delta > std::f32::consts::PI {
+        delta -= std::f32::consts::TAU;
+    }
+    while delta < -std::f32::consts::PI {
+        delta += std::f32::consts::TAU;
+    }
+    (drawn + delta * closed).rem_euclid(std::f32::consts::TAU)
+}
+
+/// How much of the remaining turn is closed over `dt` seconds.
+fn turn_fraction(dt: f32) -> f32 {
+    1.0 - (-dt.clamp(0.0, 0.25) / TURN_TAU).exp()
+}
+
+impl LiveWorld {
+    /// Eases each entity's drawn heading toward the one the world reports.
+    ///
+    /// **The world's answer is a step change and a model must not be.** A
+    /// creature acquiring a target goes from "facing the way it walked in" to
+    /// "facing its victim" between one frame and the next, and applying that
+    /// directly is the snap this exists to remove. Positions do not need
+    /// this -- they arrive as paths with durations, already smooth -- which is
+    /// why only the heading is carried here.
+    ///
+    /// The turn takes the short way round, so a creature crossing north turns
+    /// a few degrees rather than most of a circle -- and closes a fraction of
+    /// the remaining error rather than moving at a fixed rate, for the reason
+    /// [`TURN_TAU`] gives at length.
+    ///
+    /// Entities that have gone are dropped, so this cannot grow for the life
+    /// of the session; one that is new adopts its reported heading immediately
+    /// rather than easing in from an arbitrary direction.
+    pub fn ease_facings(&mut self, entities: &mut [Entity], dt: f32) {
+        // Frame-rate independent: the fraction closed depends on how much time
+        // passed, not on how many frames did. A long frame catches up more, so
+        // a stutter does not leave every creature pointing the wrong way.
+        let closed = turn_fraction(dt);
+        for entity in entities.iter_mut() {
+            // The player's own body is driven by the keys, which already turn
+            // it smoothly; easing it again would make the character lag the
+            // camera that follows it.
+            if entity.guid == self.guid {
+                continue;
+            }
+            let wanted = entity.orientation;
+            let drawn = match self.facings.get(&entity.guid) {
+                Some(drawn) => eased_angle(*drawn, wanted, closed),
+                // Newly in view: face where it should, with nothing to ease
+                // from.
+                None => wanted,
+            };
+            self.facings.insert(entity.guid, drawn);
+            entity.orientation = drawn;
+        }
+        let live: std::collections::HashSet<u64> = entities.iter().map(|e| e.guid).collect();
+        // (The player's own guid is never inserted, so it is never retained.)
+        self.facings.retain(|guid, _| live.contains(guid));
+    }
 }
 
 /// The player's own body, drawn from where this client believes it is.
@@ -455,6 +639,17 @@ pub fn own_entity(
         kind: entity.object_type,
         level: entity.level(),
         speed,
+        // The player's own death is read from replicated state like anyone
+        // else's -- it is the one part of our own condition the server *does*
+        // tell us about, unlike our position.
+        dead: entity.is_corpse(),
+        died_ms_ago: entity
+            .dying_for(std::time::Instant::now())
+            .map(|d| d.as_millis() as u32),
+        swung_ms_ago: entity
+            .swung_ago(std::time::Instant::now())
+            .map(|d| d.as_millis() as u32),
+        fighting: state.is_fighting(own_guid),
         // Our own appearance is already resolved -- see `LiveWorld::look` --
         // and came from the character list rather than from these fields,
         // which is the source this project has confirmed. No reason to make
@@ -483,6 +678,100 @@ fn map_directory(chain: &mut Chain, map_id: u32) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A creature must not fall behind a player who circles it, however fast
+    /// they circle.**
+    ///
+    /// This is the property the first version got wrong, and it is invisible
+    /// in any single step. Easing at a fixed maximum turn rate looks correct
+    /// frame by frame and is fine while the target's angular speed stays under
+    /// the cap -- but angular speed is `v / r`, and a player orbiting at melee
+    /// range exceeds any cap chosen to look unhurried. Past that the error
+    /// does not settle at something large, it grows without bound, and the
+    /// creature ends up pointing nowhere near its victim. Reported from play,
+    /// three wolves running, as one that "couldn't update fast enough".
+    ///
+    /// Closing a fraction of the error instead bounds the lag at
+    /// `omega * TURN_TAU` whatever `omega` is, which is what this asserts --
+    /// at an orbit far faster than any player can actually run.
+    #[test]
+    fn a_turn_does_not_fall_behind_a_fast_orbit() {
+        let dt = 1.0 / 60.0;
+        let closed = turn_fraction(dt);
+        // Six radians a second: an orbit almost a full turn per second, well
+        // past anything a player achieves and well past any sane fixed cap.
+        let omega = 6.0f32;
+
+        let mut drawn = 0.0f32;
+        let mut wanted = 0.0f32;
+        let mut worst: f32 = 0.0;
+        for step in 0..600 {
+            wanted = (wanted + omega * dt).rem_euclid(std::f32::consts::TAU);
+            drawn = eased_angle(drawn, wanted, closed);
+            // Let it reach its steady state before measuring.
+            if step > 60 {
+                let mut lag = (wanted - drawn).abs();
+                if lag > std::f32::consts::PI {
+                    lag = std::f32::consts::TAU - lag;
+                }
+                worst = worst.max(lag);
+            }
+        }
+        // omega * TURN_TAU is 0.36 rad; allow a little for the discrete steps.
+        assert!(
+            worst < 0.5,
+            "fell {worst} rad behind a {omega} rad/s orbit; a fixed turn rate \
+             would have fallen behind without limit"
+        );
+    }
+
+    /// A big turn is mostly done quickly -- acquiring a target should read as
+    /// a fast turn, not as a slow swing nor as a snap.
+    #[test]
+    fn a_large_turn_completes_promptly_without_being_instant() {
+        let dt = 1.0 / 60.0;
+        let closed = turn_fraction(dt);
+        let wanted = std::f32::consts::PI;
+
+        let mut drawn = 0.0f32;
+        // One frame must not get there, or it is a snap.
+        drawn = eased_angle(drawn, wanted, closed);
+        assert!(
+            (wanted - drawn).abs() > 0.5,
+            "the whole turn happened in one frame"
+        );
+        // A quarter of a second must have all but finished it: a half turn is
+        // the worst case, and `PI * exp(-0.25 / TURN_TAU)` is about three
+        // degrees.
+        for _ in 1..15 {
+            drawn = eased_angle(drawn, wanted, closed);
+        }
+        assert!(
+            (wanted - drawn).abs() < 0.1,
+            "still {} rad short after 250ms",
+            (wanted - drawn).abs()
+        );
+    }
+
+    /// The turn goes the short way: a creature crossing north turns a few
+    /// degrees, not most of a circle.
+    #[test]
+    fn a_turn_across_north_goes_the_short_way() {
+        // From just below a full turn to just above zero: two headings a few
+        // degrees apart.
+        let drawn = std::f32::consts::TAU - 0.05;
+        let wanted = 0.05;
+        let stepped = eased_angle(drawn, wanted, 0.5);
+        // Halfway between them the short way is the wrap point itself.
+        let mut from_zero = stepped;
+        if from_zero > std::f32::consts::PI {
+            from_zero -= std::f32::consts::TAU;
+        }
+        assert!(
+            from_zero.abs() < 0.05,
+            "turned the long way round: landed at {stepped}"
+        );
+    }
 
     /// The assumption the whole join rests on: a position off the network is
     /// already in the space the renderer streams tiles in, with no conversion.

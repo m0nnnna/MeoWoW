@@ -13,10 +13,10 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | Data formats | MPQ, DBC, BLP, M2 (+animation), WMO, ADT/WDT — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
 | Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated *creatures* slide along their actual path, turn to face it, and play the model's own walk/stand cycles. **Other players do not** — see the known defect below |
-| Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, `F1` to rearrange, saved to `ui.toml` |
+| Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, a spellbook you arrange the bars from, `F1` to rearrange, saved to `ui.toml` |
 | World | Lighting and the day/night cycle come from `Light.dbc`'s curves and the realm's own clock: real sun, ambient and sky colour, dawn through midnight. Game objects — doors, benches, chests, ships — are drawn |
 | Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components; equipment *geometry* (sleeves, boot tops, weapons, shoulders) is not drawn yet, and other players' equipment needs their visible-item fields |
-| Game | **4.3 done**: spellbook, three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. Spell damage, threat and the corpse flow remain. Inventory and quests follow |
+| Game | **4.3 done**: three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. **A spellbook panel** (`P`) now lists what the character can do and puts it on a bar by click, auto-attack included -- see the note below on why the seeding filter had to reject it. Threat and the corpse *interface* remain (the corpse protocol is done). Inventory and quests follow |
 
 Roughly 57% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
@@ -33,10 +33,14 @@ is a function of our `Style` alone. See `docs/UI.md`.
 **The two halves have met, the viewer drives movement, and it draws the
 replicated world moving.** `wow-viewer --realm-host <host> --user <account>
 --character <name>` logs in, enters the world, and streams the map the server
-chose around the position it reported. Holding W/S walks the character forward
-or backward and A/D turns it, each sent as a real `MSG_MOVE_*` stream
-(`MoveStartForward`/`MoveHeartbeat`/`MoveStop`), and the camera follows behind
-rather than flying freely. Altitude follows the terrain — the keys drive the
+chose around the position it reported. W/S walk, A/D turn, **Q/E strafe, Space
+jumps, right-drag steers the character while left-drag swings the camera, the
+wheel zooms and Num Lock is autorun** — each sent as a real `MSG_MOVE_*` stream,
+with the opcode naming the axis that changed and the flags carrying the whole
+state. The camera follows behind rather than flying freely. **Left-click
+selects; right-click selects and attacks** — hostility is not yet known
+(`FactionTemplate.dbc` is untranscribed), so the client rules out only what is
+never a fight and lets the server refuse the rest. Altitude follows the terrain — the keys drive the
 two horizontal axes and Z is read back out of the height field the ground is
 drawn from, so the character walks over hills rather than into them. `LiveWorld` keeps a `world::WorldState` alongside
 the connection and folds every drained packet into it, so creatures slide along
@@ -344,6 +348,79 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   at three hundred pixels. The render was right and the *look* at it was wrong,
   which is the inverse of the usual failure here and just as expensive. Anything
   assembled in memory from a dozen files gets a dump command.
+- **A trap documented at one call site does not protect the next one.** That
+  the server never relays our own movement back — so replicated state holds
+  our *login* position forever — is written up at length in
+  `live::drawable_entities`, which is the function that **draws** the player.
+  It was then walked into immediately by a function that **aims at** the
+  player: resolving "face this guid" through replicated state made every
+  creature attack the spot the character logged in at, drifting further wrong
+  the further they walked, until the player could stand behind a creature
+  supposedly fighting them. Same fact, different consumer, and the comment was
+  in the wrong place to help. When a fact about the data is surprising enough
+  to document, put it on the *data* — an accessor or a type — not on the first
+  caller that tripped over it.
+- **A packet is a statement made once; a field is a statement that stays
+  true.** Creature facing was first driven off `SMSG_MONSTER_MOVE`'s facing
+  block, which the server sends only when it decides a creature has turned.
+  The result was a wolf that turned *only when the player moved*, because that
+  is what prompts the server to re-issue one. `UNIT_FIELD_TARGET` says who a
+  unit is fighting for as long as it is fighting them, so deriving the heading
+  from it tracks continuously and for free. When behaviour should be
+  continuous, prefer the replicated field over the event that last changed it.
+- **A rate limit and a lag are different failure modes, and only one of them
+  is bounded.** Easing creature turns at a fixed maximum rate looks right in
+  every single frame, and is fine while the target's angular speed stays under
+  the cap. Angular speed is `v / r`, so a player circling at melee range
+  exceeds any cap chosen to look unhurried — and past that point the error does
+  not settle at "somewhat behind", it grows without limit until the creature
+  faces nowhere near its victim. Closing a *fraction* of the remaining error
+  instead bounds the lag at `omega * tau` for any `omega` at all. Whenever a
+  smoothing constant is a maximum speed, ask what happens when the input
+  exceeds it.
+- **A fallback can invalidate the rule that was written beside it.** Combat
+  animations fall back to plain `Stand` on a model with no attack or ready
+  cycle — which a wolf genuinely lacks. That fallback then broke the
+  *clamping* rule sitting next to it: "plays once, so hold the last frame" was
+  keyed on the state that asked, and a Stand frozen at its final frame is a
+  statue. The same fallback broke it the other way too — `Dead` resolves to
+  the *fall* on those models, which must hold rather than loop, while carrying
+  no start time to clamp against. Holding had to become a property of the
+  animation that resolved rather than of the state that requested it. When a
+  fallback is added, re-ask every question that was answered in terms of the
+  thing being fallen back from.
+- **Copying a mechanism is the cheapest way to audit it.** Right-click needed
+  the same press/release distance test the left button had used since 4.1, so
+  it was written by mirroring it — and mirroring it surfaced a bug four
+  milestones old. The left button cleared `last_cursor` on release, and the
+  *next* press reads its own start position out of that same field, so a
+  second click at the same pixel was silently discarded. It survived because a
+  selection is not a gesture anyone repeats; right-click-to-attack is, and
+  exactly when it appears not to have worked. Reusing a mechanism in a second
+  place asks questions of it that the first place never did.
+- **A grep that finds the field names is not a grep that finds the
+  structure.** Reading AzerothCore for the jump block's field order turned up
+  `sinAngle, cosAngle, xyspeed, zspeed` in `MovementHandler.cpp` — a different
+  order from this project's `Falling`, and it looked exactly like a bug worth
+  fixing. It was a different packet. The canonical `MovementInfo` codec in
+  `WorldSession.cpp` reads `zspeed, sinAngle, cosAngle, xyspeed`, which is what
+  we already had. "Fixing" the correct one would have been silent, and the
+  source would have been blamed for it. When source makes a hypothesis cheap,
+  confirm you are reading the *definition* and not one of its users.
+- **A rule can be right and still exclude the one thing you need — and then
+  the test has to assert both halves.** 4.3 established that a spell earns a
+  bar slot by belonging to the character's own skill line, because every
+  internal effect (`Opening`, `Duel`, `Honorless Target`) sits on
+  `SkillLineAbility`'s generic line 183 with a class mask of zero. `Auto
+  Attack` sits on line 183 with a class mask of zero. So the mechanism that
+  correctly keeps the junk off a bar necessarily hid the one ability every
+  character uses, and the rule was not wrong — merely complete. Two fixes
+  present themselves and only one is right: widening the rule to admit line
+  183 readmits all the junk, where naming the single spell admits exactly what
+  was checked. The trap is in the *test*: asserting only that auto-attack is
+  admitted passes just as well under the wrong fix, so the check has to assert
+  the junk beside it is still refused. Whenever an exception is carved into a
+  filter, test the exception **and** the thing it is indistinguishable from.
 - **Validity is nearly free; *variation* is the discriminator.** Two update
   fields both resolved 100% to real `GameObjectDisplayInfo` rows, because the
   table is 39% dense and any small integer lands in it. One was the constant 33
