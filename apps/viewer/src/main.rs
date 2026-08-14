@@ -444,34 +444,24 @@ fn bind_pose(count: usize) -> Vec<[[f32; 4]; 4]> {
     vec![glam::Mat4::IDENTITY.to_cols_array_2d(); count]
 }
 
-/// How far behind the character the camera sits before the wheel moves it, and
-/// the range the wheel may move it through.
+/// How far behind the character the camera sits, and the range the wheel may
+/// move it through.
 ///
-/// The near end is deliberately not zero: a true first-person view would put
-/// the camera inside the character's own head geometry, which this client
-/// draws, and the result is a screenful of the inside of a face.
-const FOLLOW_DISTANCE: f32 = 9.0;
-const FOLLOW_NEAR: f32 = 2.5;
-const FOLLOW_FAR: f32 = 30.0;
+/// **Aliases of the ui crate's, not a second opinion.** The starting distance
+/// is a saved preference and the range is what the slider offers, so a copy
+/// here would be a value that agrees with the settings window until somebody
+/// edits one of them. The near end is deliberately not zero: a true
+/// first-person view would put the camera inside the character's own head
+/// geometry, which this client draws, and the result is a screenful of the
+/// inside of a face.
+const FOLLOW_NEAR: f32 = ui::camera::MIN_DISTANCE;
+const FOLLOW_FAR: f32 = ui::camera::MAX_DISTANCE;
 /// How high above the character's feet the camera *looks*.
 ///
 /// The point the view orbits around, not where the eye sits -- roughly chest
 /// height on a human, so the character fills the middle of the frame rather
 /// than hanging from the top of it.
 const FOLLOW_HEIGHT: f32 = 2.2;
-
-/// How much of a turn a drag across the whole window is worth.
-///
-/// **Per window rather than per pixel, which is the point.** The constant this
-/// replaces was 0.008 radians a pixel with a comment claiming "roughly half a
-/// turn across the window" -- and on a 1920-wide window it is two and a half
-/// *full* turns, five times what it says and worse on a bigger monitor. A
-/// hand-sized mouse movement threw the view most of the way round, which reads
-/// as a camera that will not sit still.
-///
-/// Half a turn across the width is what the comment always meant, and it makes
-/// the feel a property of the gesture rather than of the display.
-const CAMERA_TURN_PER_WINDOW: f32 = std::f32::consts::PI;
 
 /// How far the camera may be tilted above and below its subject.
 ///
@@ -643,7 +633,7 @@ fn live_camera(live: &live::LiveWorld, args: &Args) -> Camera {
         .map(f32::to_radians)
         .unwrap_or(live.orientation);
     let pitch = args.pitch.map(f32::to_radians).unwrap_or(-0.2);
-    let mut fly = orbit_around(live.position, yaw, pitch, FOLLOW_DISTANCE);
+    let mut fly = orbit_around(live.position, yaw, pitch, ui::Camera::default().start_distance());
     // Walking pace rather than the flying speed a survey wants: the point here
     // is to stand somewhere, not to cross a continent.
     fly.speed = 30.0;
@@ -699,17 +689,6 @@ fn pull_camera_out_of_the_ground(
         }
     }
     focus + span * allowed
-}
-
-/// Radians of turn per pixel of drag, for this window.
-///
-/// Both axes use the *width*, not each their own dimension. Deriving pitch from
-/// the height would make a diagonal drag curve on any window that is not
-/// square, because the same hand movement would mean different angles on the
-/// two axes -- which feels like the camera fighting the mouse.
-fn drag_speed(window: &winit::window::Window) -> f32 {
-    let width = window.inner_size().width.max(1) as f32;
-    CAMERA_TURN_PER_WINDOW / width
 }
 
 /// Places the eye on a sphere around a character, looking at them.
@@ -1842,7 +1821,17 @@ fn local_notice(text: String) -> ::world::ChatMessage {
 
 impl App {
     fn new(args: Args, chain: Chain) -> Self {
+        // Read before the window exists, so a layout that fails to parse is
+        // reported at startup rather than at the first frame -- and bound here
+        // rather than inline because the camera's starting distance is one of
+        // the settings it carries.
+        let hud = ui::Hud::load();
         Self {
+            // The saved preference, which the wheel then moves from. Kept as
+            // live state rather than read from the profile every frame: the
+            // wheel must not rewrite a saved setting on every scroll.
+            camera_distance: hud.profile.camera.start_distance(),
+            hud,
             args,
             chain,
             window: None,
@@ -1867,9 +1856,6 @@ impl App {
             last_undrawable_warned: 0,
             player_looks: std::collections::HashMap::new(),
             lighting: None,
-            // Read before the window exists, so a layout that fails to parse
-            // is reported at startup rather than at the first frame.
-            hud: ui::Hud::load(),
             target: None,
             press_at: None,
             right_press_at: None,
@@ -1878,7 +1864,6 @@ impl App {
             // the game this is modelled on starts.
             camera_pitch: -0.2,
             steering: false,
-            camera_distance: FOLLOW_DISTANCE,
             chat: Vec::new(),
             combat_text: Vec::new(),
             entity_flip: false,
@@ -2268,7 +2253,11 @@ impl ApplicationHandler for App {
                     // the character -- a character has no pitch to steer, but
                     // the view still has to keep them in the middle of it.
                     if let Some(prev) = self.last_cursor {
-                        let speed = drag_speed(&window);
+                        let speed = self
+                            .hud
+                            .profile
+                            .camera
+                            .radians_per_pixel(window.inner_size().width as f32);
                         let dx = -(now.0 - prev.0) as f32 * speed;
                         let dy = (now.1 - prev.1) as f32 * speed;
                         // Steering takes over the character's facing, so any
@@ -2285,8 +2274,9 @@ impl ApplicationHandler for App {
                             live.orientation =
                                 (live.orientation + dx).rem_euclid(std::f32::consts::TAU);
                         }
-                        self.camera_pitch = (self.camera_pitch - dy)
-                            .clamp(-FOLLOW_PITCH_LIMIT, FOLLOW_PITCH_LIMIT);
+                        self.camera_pitch = (self.camera_pitch
+                            - dy * self.hud.profile.camera.pitch_sign())
+                        .clamp(-FOLLOW_PITCH_LIMIT, FOLLOW_PITCH_LIMIT);
                     }
                     self.last_cursor = Some(now);
                     window.request_redraw();
@@ -2294,7 +2284,11 @@ impl ApplicationHandler for App {
                 }
                 if self.dragging {
                     if let Some(prev) = self.last_cursor {
-                        let speed = drag_speed(&window);
+                        let speed = self
+                            .hud
+                            .profile
+                            .camera
+                            .radians_per_pixel(window.inner_size().width as f32);
                         let (dx, dy) = (
                             -(now.0 - prev.0) as f32 * speed,
                             (now.1 - prev.1) as f32 * speed,
@@ -2323,8 +2317,9 @@ impl ApplicationHandler for App {
                         if following {
                             self.camera_yaw_offset =
                                 (self.camera_yaw_offset + dx).rem_euclid(std::f32::consts::TAU);
-                            self.camera_pitch = (self.camera_pitch - dy)
-                                .clamp(-FOLLOW_PITCH_LIMIT, FOLLOW_PITCH_LIMIT);
+                            self.camera_pitch = (self.camera_pitch
+                                - dy * self.hud.profile.camera.pitch_sign())
+                            .clamp(-FOLLOW_PITCH_LIMIT, FOLLOW_PITCH_LIMIT);
                         }
                     }
                 }
@@ -3872,7 +3867,7 @@ mod camera_tests {
 
         for &pitch in &[-FOLLOW_PITCH_LIMIT, -0.6, -0.2, 0.0, 0.4, FOLLOW_PITCH_LIMIT] {
             for &yaw in &[0.0, 1.1, 3.0, 5.5] {
-                for &distance in &[FOLLOW_NEAR, FOLLOW_DISTANCE, FOLLOW_FAR] {
+                for &distance in &[FOLLOW_NEAR, 9.0, FOLLOW_FAR] {
                     let fly = orbit_around(feet, yaw, pitch, distance);
                     let clip = fly.view_proj(16.0 / 9.0) * focus.extend(1.0);
                     assert!(
@@ -3905,10 +3900,10 @@ mod camera_tests {
         let focus = feet + glam::Vec3::Z * FOLLOW_HEIGHT;
         let mut heights = Vec::new();
         for &pitch in &[-0.8, -0.2, 0.0, 0.5] {
-            let fly = orbit_around(feet, 0.7, pitch, FOLLOW_DISTANCE);
+            let fly = orbit_around(feet, 0.7, pitch, 9.0);
             assert!(
-                (fly.position.distance(focus) - FOLLOW_DISTANCE).abs() < 1e-3,
-                "the eye is {} from its subject, not {FOLLOW_DISTANCE}",
+                (fly.position.distance(focus) - 9.0).abs() < 1e-3,
+                "the eye is {} from its subject, not 9",
                 fly.position.distance(focus)
             );
             heights.push(fly.position.z);
@@ -3966,7 +3961,7 @@ mod camera_tests {
     #[test]
     fn open_ground_does_not_move_the_camera() {
         let focus = glam::Vec3::new(0.0, 0.0, 100.0);
-        let wanted = focus + glam::Vec3::new(1.0, 0.0, 0.2).normalize() * FOLLOW_DISTANCE;
+        let wanted = focus + glam::Vec3::new(1.0, 0.0, 0.2).normalize() * 9.0;
         // Ground far below, and ground that is not loaded at all.
         for ground in [
             (|_x: f32, _y: f32| Some(0.0f32)) as fn(f32, f32) -> Option<f32>,
@@ -4000,22 +3995,22 @@ mod camera_tests {
         );
     }
 
-    /// Dragging across the window is a fixed fraction of a turn whatever the
-    /// window is, which is what stops the feel changing with the monitor.
+    /// The default turn rate is the modest half-turn the old comment claimed,
+    /// not the two and a half full turns the old fixed rate actually gave.
+    ///
+    /// The rate itself is the ui crate's now, and tested there; this pins the
+    /// number a new player gets before touching anything.
     #[test]
-    fn a_drag_across_the_window_is_the_same_turn_at_any_size() {
-        for width in [800.0f32, 1280.0, 1920.0, 3840.0] {
-            let speed = CAMERA_TURN_PER_WINDOW / width;
-            let across = speed * width;
-            assert!(
-                (across - CAMERA_TURN_PER_WINDOW).abs() < 1e-4,
-                "a full-width drag turned {across} at {width}px"
-            );
-        }
-        // And it really is the modest half-turn the comment claims, not the
-        // two and a half full turns the old fixed rate gave on a 1920 window.
-        assert!(CAMERA_TURN_PER_WINDOW <= std::f32::consts::PI + 1e-4);
-        assert!(0.008 * 1920.0 > 4.0 * CAMERA_TURN_PER_WINDOW);
+    fn the_default_camera_is_not_the_old_accidental_rate() {
+        let camera = ui::Camera::default();
+        let default_rate = camera.radians_per_pixel(1920.0);
+        assert!(
+            (default_rate * 1920.0 - std::f32::consts::PI).abs() < 1e-4,
+            "a full-width drag is no longer half a turn"
+        );
+        // The rate this replaced, which felt like a camera that would not sit
+        // still.
+        assert!(0.008 > default_rate * 4.0);
     }
 
     /// The pitch limit stops short of straight up and straight down, where an

@@ -2460,3 +2460,30 @@ A tile that has not streamed in yet counts as clear rather than as blocking.
 The other direction would yank the camera into the character whenever the world
 was catching up, which is the same failure direction the rest of the streaming
 code already chooses.
+
+#### And then the feel became a setting
+
+*"We should add a slider for the camera to tighten up and loosen up in the
+settings."* -- which is the right answer to the previous fix, because "tighter"
+is a preference and hard-coding a number only moves the argument.
+
+`ui.toml` gains a `[camera]` section and the `F1` window gains three controls:
+the turn a full-window drag is worth, the starting distance, and whether the
+vertical axis is inverted. They live in `crates/ui` because `Profile` is what
+gets written to disk, not because the camera is a frame -- stated in `docs/UI.md`
+so the next reader does not have to guess.
+
+The viewer's two constants went with it. `FOLLOW_NEAR` and `FOLLOW_FAR` are now
+aliases of the ui crate's exports rather than copies, because the wheel's range
+and the slider's range are the same claim, and two copies of a claim agree only
+until somebody edits one. The starting distance is seeded from the saved profile
+at construction and then owned by the wheel: reading it from the profile every
+frame would have been simpler and would have made every scroll rewrite a saved
+setting.
+
+`Camera::radians_per_pixel` clamps on every call rather than sanitising at load,
+which is the opposite of what `Style` does and deliberate. A style value is read
+once when a frame is drawn; this one is read from a hand-editable file and fed
+straight into a per-frame rate, where a zero freezes the camera and a negative
+inverts it. The guard belongs where it cannot be skipped by a caller that built
+the struct some other way.

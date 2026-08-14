@@ -327,6 +327,38 @@ Save button. Arranging a bar is not editing the layout: it happens mid-play
 with the edit window shut, and a spell that has to be dragged on again after
 every restart is worse than no spellbook at all.
 
+## The camera is a saved setting, not a constant
+
+`ui.toml` carries a `[camera]` section: how far a drag across the window turns
+the view (in degrees, so the number in the file is one a person can picture),
+how far back the camera starts, and whether the vertical axis is inverted. The
+edit window (`F1`) has sliders for all three.
+
+Camera preferences are not frames and this crate does not draw the camera, so
+they sit here for one reason: **`Profile` is the thing that gets written to
+disk**, and a setting a player changes is one they expect to still be there
+tomorrow. Putting them in the viewer would have meant a second config file.
+
+Two details are load-bearing:
+
+- **The turn rate is per *window*, not per pixel.** The viewer's own constant
+  used to be 0.008 radians a pixel, annotated "roughly half a turn across the
+  window" -- which on a 1920-wide window is two and a half *full* turns, and
+  worse on a larger monitor. Expressing it per window makes the feel a property
+  of the gesture rather than of the display, and makes the setting mean the
+  same thing on every machine.
+- **`radians_per_pixel` clamps every time it is asked**, rather than the value
+  being sanitised at load. `ui.toml` is meant to be hand-edited, so the number
+  is an input from outside like any other, and a zero would freeze the camera
+  while a negative would invert it in a way no setting says it should. Guarding
+  at the point of use means a caller that built the struct some other way
+  cannot skip it.
+
+The distance range is exported from here (`camera::MIN_DISTANCE` and
+`MAX_DISTANCE`) and the viewer's wheel clamps to those same two constants
+rather than its own copy -- otherwise the slider and the wheel would agree
+until somebody edited one of them.
+
 ## What is deliberately not here yet
 
 - **Per-element style overrides.** One `Style` serves every frame. A second

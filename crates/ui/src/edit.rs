@@ -141,6 +141,30 @@ pub(crate) fn window(
             colour_row(ui, "text", &mut style.text);
 
             ui.separator();
+            ui.label("Camera");
+            let camera = &mut profile.camera;
+            // Labelled by what it *does* rather than by its unit. "Half a turn
+            // across the window" is the honest description and means nothing to
+            // anybody; the number beside the slider says degrees for whoever
+            // wants it.
+            ui.add(
+                egui::Slider::new(
+                    &mut camera.turn_per_window,
+                    crate::camera::MIN_TURN_PER_WINDOW..=crate::camera::MAX_TURN_PER_WINDOW,
+                )
+                .text("mouse turn (deg per drag across)")
+                .logarithmic(true),
+            );
+            ui.add(
+                egui::Slider::new(
+                    &mut camera.distance,
+                    crate::camera::MIN_DISTANCE..=crate::camera::MAX_DISTANCE,
+                )
+                .text("distance"),
+            );
+            ui.checkbox(&mut camera.invert_pitch, "invert vertical");
+
+            ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
                     action = EditAction::Save;

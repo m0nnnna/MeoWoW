@@ -224,6 +224,11 @@ impl ActionBars {
 pub struct Profile {
     pub style: Style,
     pub bars: ActionBars,
+    /// How the camera behaves. Not a frame, and not drawn by this crate at
+    /// all -- it lives here because this profile is the one thing written to
+    /// `ui.toml`, and a setting the player changes is one they expect to still
+    /// be there tomorrow.
+    pub camera: crate::camera::Camera,
     elements: BTreeMap<ElementId, Element>,
 }
 
@@ -232,6 +237,7 @@ impl Default for Profile {
         Self {
             style: Style::default(),
             bars: ActionBars::default(),
+            camera: crate::camera::Camera::default(),
             elements: ElementId::ALL
                 .into_iter()
                 .map(|id| (id, id.default_element()))
@@ -247,6 +253,7 @@ impl Default for Profile {
 struct Stored {
     style: Style,
     bars: ActionBars,
+    camera: crate::camera::Camera,
     elements: BTreeMap<String, Element>,
 }
 
@@ -255,6 +262,7 @@ impl Default for Stored {
         Self {
             style: Style::default(),
             bars: ActionBars::default(),
+            camera: crate::camera::Camera::default(),
             elements: BTreeMap::new(),
         }
     }
@@ -297,6 +305,7 @@ impl Profile {
         let stored = Stored {
             style: self.style,
             bars: self.bars.clone(),
+            camera: self.camera,
             elements: self
                 .elements
                 .iter()
@@ -328,9 +337,15 @@ impl Profile {
             warnings.push("the action bars were not the expected shape and were resized".into());
         }
 
+        // Sanitised on the way *out* rather than here -- see
+        // `Camera::radians_per_pixel`, which clamps every time it is asked.
+        // A camera setting is read once a frame from a file a person can type
+        // into, so the guard belongs at the point of use, where it cannot be
+        // skipped by a caller that built the struct some other way.
         let mut profile = Profile {
             style,
             bars,
+            camera: stored.camera,
             elements: BTreeMap::new(),
         };
         for (key, mut element) in stored.elements {
@@ -417,6 +432,41 @@ mod tests {
         let text = profile.to_toml().unwrap();
         let (parsed, warnings) = Profile::from_toml(&text).unwrap();
         assert_eq!(parsed, profile);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Camera preferences survive a save and a reload.
+    ///
+    /// The whole reason they live in this profile rather than in the viewer is
+    /// that they are written to disk, so the round trip *is* the feature. A
+    /// field added to `Profile` and forgotten in `Stored` compiles, runs, and
+    /// silently resets every time the client restarts.
+    #[test]
+    fn camera_settings_round_trip() {
+        let mut profile = Profile::default();
+        profile.camera.turn_per_window = 320.0;
+        profile.camera.distance = 14.5;
+        profile.camera.invert_pitch = true;
+
+        let text = profile.to_toml().unwrap();
+        assert!(
+            text.contains("turn_per_window"),
+            "the camera was not written to the file at all:\n{text}"
+        );
+        let (parsed, warnings) = Profile::from_toml(&text).unwrap();
+        assert_eq!(parsed.camera, profile.camera);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// A file from before the camera existed still loads, and gets the
+    /// defaults rather than an error.
+    ///
+    /// Every `ui.toml` already on a disk somewhere is one of these.
+    #[test]
+    fn a_file_without_a_camera_section_still_loads() {
+        let (parsed, warnings) = Profile::from_toml("[style]\nfont_size = 18.0\n").unwrap();
+        assert_eq!(parsed.camera, crate::camera::Camera::default());
+        assert_eq!(parsed.style.font_size, 18.0);
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 

@@ -24,6 +24,7 @@
 //! - [`edit`] -- rearranging it all without leaving the world.
 //! - [`Hud`] -- what a caller actually holds.
 
+pub mod camera;
 pub mod edit;
 pub mod element;
 pub mod frames;
@@ -32,6 +33,7 @@ pub mod style;
 
 use std::path::PathBuf;
 
+pub use camera::Camera;
 pub use edit::{EditAction, EditState};
 pub use element::{Anchor, Element};
 pub use frames::chat::{ChatEntry, ChatKind};
