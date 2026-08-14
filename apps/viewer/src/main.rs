@@ -468,6 +468,34 @@ const LIVE_HEARTBEAT_EVERY: Duration = Duration::from_millis(100);
 /// run cycle. See `crate::world::Motion`.
 const LIVE_RUN_SPEED: f32 = 7.0;
 
+/// Units per second retreating. 3.3.5a backpedals at 4.5, deliberately slower
+/// than a run so that turning to flee costs something.
+///
+/// Hardcoded like [`LIVE_RUN_SPEED`] beside it, and for the same reason: the
+/// authoritative figures are in the movement block of the object-create packet,
+/// which carries nine speeds and which this client does not parse yet. Until it
+/// does, a character with a speed buff moves at the default here. Reading them
+/// off the wire is the right fix and is not this one.
+const LIVE_BACK_SPEED: f32 = 4.5;
+
+/// How fast the character is travelling for the keys currently held, **signed**
+/// so the renderer can tell retreating from advancing.
+///
+/// One function rather than a constant at each site, because the two uses have
+/// to agree: the number that moves the character and the number that chooses
+/// its animation. They did not, and the result was a character reversing at a
+/// full run with the forward run cycle playing.
+fn live_pace(moving: ::world::motion::Motion) -> f32 {
+    use ::world::motion::Axis;
+    match moving.longitudinal() {
+        // Backing up is the only direction with its own speed *and* its own
+        // cycle; strafing sideways uses the run.
+        Some(Axis::Negative) => -LIVE_BACK_SPEED,
+        _ if moving.is_moving() => LIVE_RUN_SPEED,
+        _ => 0.0,
+    }
+}
+
 /// Radians per second turned by the A/D keys. Not verified against a
 /// reference client -- see the facing note in `docs/RENDERING.md` -- but close
 /// enough that the character does not spin wildly or crawl.
@@ -2278,11 +2306,7 @@ impl App {
                     // The keys, not the wire: the server never relays our own
                     // movement back to us. Held means running -- there is no
                     // walk toggle here, and `LIVE_RUN_SPEED` is the run speed.
-                    let speed = if self.live_move.is_moving() {
-                        LIVE_RUN_SPEED
-                    } else {
-                        0.0
-                    };
+                    let speed = live_pace(self.live_move);
                     // F2. See `App::entity_flip`.
                     let flip = if self.entity_flip { std::f32::consts::PI } else { 0.0 };
                     // Borrowed as fields rather than through `&mut self`: `r`
@@ -2536,8 +2560,9 @@ impl App {
 
         let (dx, dy) = desired.direction(live.orientation);
         if (dx, dy) != (0.0, 0.0) {
-            live.position.x += dx * LIVE_RUN_SPEED * dt;
-            live.position.y += dy * LIVE_RUN_SPEED * dt;
+            let pace = live_pace(desired).abs();
+            live.position.x += dx * pace * dt;
+            live.position.y += dy * pace * dt;
         }
 
         // Stand on the ground under wherever those two axes put us.
@@ -3121,7 +3146,7 @@ impl App {
         // The speed only chooses an animation, which a click test does not care
         // about -- but the same list has to come out here as the renderer drew,
         // so it is passed the same way rather than left at a default.
-        let speed = if self.live_move.is_moving() { LIVE_RUN_SPEED } else { 0.0 };
+        let speed = live_pace(self.live_move);
         let entities = drawable_with_own(live, speed);
         Some(hud::pick(&ray, &entities, &|display_id| {
             world.entity_bounds(display_id)

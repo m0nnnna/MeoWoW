@@ -4138,6 +4138,27 @@ fn m2_attachments(chain: &mut Chain, path: &str, anim: Option<usize>) -> Result<
             }
         }
         let animated = model.animated_bones_with(&external);
+        // Whether each attachment's bone is *driven* in this sequence at all,
+        // as opposed to falling back to its bind orientation. The distinction
+        // matters: an attachment that reads as bind pose because its track
+        // holds no keys for this cycle looks identical to one deliberately
+        // authored that way, and only one of those is a bug.
+        println!("\n  bone tracks for each attachment:");
+        for a in &model.attachments() {
+            let Some(bone) = animated.get(a.bone as usize) else {
+                continue;
+            };
+            let keyed = bone.rotation.sequences.get(sequence).is_some_and(|k| !k.values.is_empty());
+            println!(
+                "    attachment {:>3}: bone {:>3}  rotation track: {} entries, global {:?}, \
+                 keys in this sequence: {}",
+                a.id,
+                a.bone,
+                bone.rotation.sequences.len(),
+                bone.rotation.global_sequence,
+                keyed,
+            );
+        }
         let name = sequences
             .get(sequence)
             .map(|s| format!("sequence {sequence} (animation id {})", s.id))

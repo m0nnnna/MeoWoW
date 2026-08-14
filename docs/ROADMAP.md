@@ -2250,3 +2250,63 @@ its subject cannot make that mistake.
   at.
 - Sheathing applies to the player only, because only the player has held
   geometry -- other players' weapons are still `foss-wow#23`.
+
+### 4.8 continued: a sword that flew off the back, and a sprint in reverse
+
+Both reported from one look, and only one of them was about weapons.
+
+#### The global-sequence bug, four milestones old
+
+The sword sat correctly on the back while the character stood and **swung out
+to point forward from his shoulder the moment he moved**. The obvious reading
+is that the sheath attachment was wrong. Measuring said something stranger: the
+attachment bone's orientation was 108 degrees in `Stand` and 8 degrees in
+`Walk`, and the same was true of the hip. A resting place cannot do that, and
+for a while the conclusion was that the whole identification was wrong -- the
+points chosen were, by measurement, the *least* stable of all thirty-nine.
+
+They were right all along and the renderer was lying. The bones that carry
+stowed weapons are authored on **global sequences**: one keyframe list on a
+timeline shared by every animation, rather than one list per sequence. And
+`Track::sample` indexed `sequences[sequence]` unconditionally, so a global
+track resolved only when the sequence index happened to be zero -- which is
+`Stand`. Every other cycle fell back to the bind orientation, silently.
+
+`Track::global_sequence` was parsed, and documented, and then ignored by the
+only function that could act on it. The field's own doc comment says it "runs
+on a shared global timer rather than the current sequence".
+
+This was never a weapon bug. It has been wrong since animation was written and
+affects every bone authored that way in every model; weapons are simply the
+first thing whose *position* made it visible, because a body bone snapping to
+bind pose in one cycle out of a hundred and fifty is not something anyone was
+going to notice.
+
+The fix reads a global track from its single entry. The timeline's true period
+lives in the model's `global_loops` array, which this reader still does not
+parse -- and for a track with one key, which is the overwhelming case and every
+case here, a constant samples the same at any time. A genuinely looping global
+track now runs on the current animation's clock rather than its own. Stated
+rather than hidden.
+
+The regression test asserts that the resting places *agree* across standing,
+walking and running rather than asserting what they agree on, with a tolerance
+loose enough for real torso sway (45 degrees) and far tighter than the failure
+(91).
+
+#### Retreating at a sprint
+
+`Motion::from_speed` took a magnitude, and the viewer handed it the run speed
+whenever any movement key was held. So backing up played the forward run cycle
+at 7.0 units per second: a character sprinting while facing the wrong way.
+
+The speed is now **signed**, which is the smallest thing that can carry the
+distinction, and negative resolves to `Walkbackwards` (row 13, whose own
+fallback column names `Walk`). A single `live_pace` decides both the number
+that moves the character and the number that picks its cycle, because those two
+disagreeing is exactly what produced the bug.
+
+The backpedal speed is 4.5, hardcoded beside the run speed and for the same
+reason: the authoritative figures are the nine speeds in the object-create
+movement block, which this client does not parse. A character with a speed buff
+still moves at the default. That is the real fix and it is not this one.

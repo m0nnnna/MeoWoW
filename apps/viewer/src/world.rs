@@ -1298,6 +1298,8 @@ fn sheath_key(sheathed: bool) -> u64 {
 const STAND_ANIMATION_ID: u16 = 0;
 const WALK_ANIMATION_ID: u16 = 4;
 const RUN_ANIMATION_ID: u16 = 5;
+/// `Walkbackwards`, whose own fallback in `AnimationData.dbc` is `Walk`.
+const WALK_BACK_ANIMATION_ID: u16 = 13;
 /// Falling over, and lying still afterwards. Two rows, not one, and the table
 /// says so itself: `Dead` (6) lists `Death` (1) as its *fallback*, which is
 /// exactly the relationship between them -- a model with no settled-corpse
@@ -1388,6 +1390,10 @@ pub enum Motion {
     Stand,
     Walk,
     Run,
+    /// Backing up. A cycle of its own rather than the walk played in reverse:
+    /// the model carries `Walkbackwards`, and a character reversing at a run
+    /// looks like a sprint performed facing the wrong way.
+    WalkBack,
     /// Toppling over, from the world-clock millisecond it began.
     Dying(u32),
     /// Settled: lying still, and no longer tied to when death happened.
@@ -1416,9 +1422,18 @@ impl Motion {
     /// the two moving cycles apart, and picking one for everything is wrong
     /// both ways round: a patrolling creature drawn running skates ahead of its
     /// own legs, and a charging one drawn walking is dragged along by them.
+    /// **The sign says which way.** A magnitude alone cannot tell walking
+    /// forward from backing up, and 3.3.5a has a whole animation for the
+    /// latter (`Walkbackwards`, row 13). Backing up at the run speed and
+    /// playing the run cycle is what this did before, and it reads as the
+    /// character sprinting while facing the wrong way -- reported from play as
+    /// exactly that. Negative is backwards; there is only one backwards cycle,
+    /// so its magnitude chooses nothing.
     pub fn from_speed(speed: f32) -> Self {
-        if speed <= 0.0 {
+        if speed == 0.0 {
             Motion::Stand
+        } else if speed < 0.0 {
+            Motion::WalkBack
         } else if speed < RUN_SPEED {
             Motion::Walk
         } else {
@@ -1482,7 +1497,10 @@ impl Motion {
 
     /// Whether this cycle is about a fight or a death, and so worth a log line.
     fn is_notable(self) -> bool {
-        !matches!(self, Motion::Stand | Motion::Walk | Motion::Run)
+        !matches!(
+            self,
+            Motion::Stand | Motion::Walk | Motion::Run | Motion::WalkBack
+        )
     }
 
     /// When a one-shot cycle began, on the caller's world clock.
@@ -1505,6 +1523,11 @@ impl Motion {
             Motion::Stand => &[STAND_ANIMATION_ID],
             Motion::Walk => &[WALK_ANIMATION_ID],
             Motion::Run => &[RUN_ANIMATION_ID, WALK_ANIMATION_ID],
+            // The fallback is the table's own (row 13 names row 4), and it is
+            // the right one: a model with no reverse cycle walking forwards
+            // while it retreats is odd, where standing still as it slides is
+            // the bug this whole family exists to avoid.
+            Motion::WalkBack => &[WALK_BACK_ANIMATION_ID, WALK_ANIMATION_ID],
             Motion::Dying(_) => &[DEATH_ANIMATION_ID],
             // Settled last: a model with no lying-still cycle holds the final
             // frame of the toppling one, which `update_animations` produces by
@@ -1642,6 +1665,36 @@ mod tests {
             (placed - Vec3::new(1000.0, -0.5, 2.0)).length() < 1e-4,
             "hand motion applied outside the placement: {placed}"
         );
+    }
+
+    /// Backing up is its own cycle, at any pace, and forward is unaffected.
+    ///
+    /// Reported from play: retreating ran the *forward run* animation at the
+    /// full run speed, so the character appeared to sprint while facing the
+    /// wrong way. The sign of the speed is what carries the direction, and the
+    /// magnitude chooses nothing once it is negative -- there is only one
+    /// backwards cycle.
+    #[test]
+    fn retreating_has_its_own_cycle_whatever_the_pace() {
+        assert_eq!(Motion::from_speed(-4.5), Motion::WalkBack);
+        assert_eq!(Motion::from_speed(-0.5), Motion::WalkBack);
+        assert_eq!(Motion::from_speed(-9.0), Motion::WalkBack);
+        // The forward answers must be untouched, which is the half that stops
+        // a sign bug from turning every walk into a retreat.
+        assert_eq!(Motion::from_speed(0.0), Motion::Stand);
+        assert_eq!(Motion::from_speed(2.5), Motion::Walk);
+        assert_eq!(Motion::from_speed(7.0), Motion::Run);
+    }
+
+    /// And the backwards cycle falls back to the forward walk, per the table.
+    #[test]
+    fn retreating_falls_back_to_walking() {
+        let ids = Motion::WalkBack.animation_ids();
+        assert_eq!(ids.first(), Some(&WALK_BACK_ANIMATION_ID));
+        assert_eq!(ids.last(), Some(&WALK_ANIMATION_ID));
+        // Not to standing: a model sliding backwards on the spot is the bug
+        // the travelling cycles exist to avoid.
+        assert!(!ids.contains(&STAND_ANIMATION_ID));
     }
 
     /// A drawn weapon holds the guard up on its own, without a fight.

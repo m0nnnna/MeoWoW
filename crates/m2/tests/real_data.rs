@@ -236,6 +236,70 @@ fn attachments_land_on_the_bones_they_name() {
     }
 }
 
+/// A bone on a global sequence holds its orientation in *every* animation.
+///
+/// The attachment points that carry stowed weapons are authored this way -- one
+/// keyframe list on a shared timeline rather than one per sequence -- and
+/// sampling them as `sequences[sequence]` finds data only when the sequence
+/// index happens to be zero. The symptom was precise and easy to misread: a
+/// sheathed sword sat correctly on the back while the character stood, and swung
+/// out to point forward from his shoulder the moment he walked, because the
+/// bone had silently fallen back to its bind orientation.
+///
+/// Asserted against the standing pose rather than against a constant: the point
+/// is that the cycles *agree*, not what they agree on.
+#[test]
+fn a_global_sequence_bone_keeps_its_pose_across_animations() {
+    let mut chain = require_data!();
+    let path = r"Character\Human\Male\HumanMale.m2";
+    let model = load(&mut chain, path);
+    let bones = model.animated_bones();
+
+    // The back and hip resting places, both `global_sequence` tracks.
+    let carried: Vec<m2::Attachment> = model
+        .attachments()
+        .into_iter()
+        .filter(|a| [26, 27, 32, 33].contains(&a.id))
+        .collect();
+    assert_eq!(carried.len(), 4, "{path}: the resting places moved");
+
+    // Stand, Walk, Run: the first three sequences of every character model.
+    let pose_at = |sequence: usize| m2::Model::pose_bones(&bones, sequence, 0);
+    let standing = pose_at(0);
+
+    for attachment in &carried {
+        let bone = attachment.bone as usize;
+        let track = &bones[bone].rotation;
+        assert!(
+            track.global_sequence.is_some(),
+            "attachment {} is no longer on a global sequence, so this test \
+             has stopped covering what it was written for",
+            attachment.id
+        );
+
+        // Where a weapon hung here would point, in each cycle.
+        let aim = |pose: &[glam::Mat4]| {
+            let m = pose[bone];
+            (m.transform_point3(glam::Vec3::X) - m.transform_point3(glam::Vec3::ZERO)).normalize()
+        };
+        let stood = aim(&standing);
+        for sequence in [1, 2] {
+            let moved = aim(&pose_at(sequence));
+            // Generous: the torso genuinely sways as it walks and runs, and
+            // the resting place sways with it. What this rules out is the
+            // ninety-degree snap back to bind pose.
+            let apart = stood.dot(moved).clamp(-1.0, 1.0).acos().to_degrees();
+            assert!(
+                apart < 45.0,
+                "attachment {} aims {apart:.0} degrees apart between standing \
+                 and sequence {sequence}: the global-sequence track is being \
+                 read as a per-sequence one",
+                attachment.id
+            );
+        }
+    }
+}
+
 /// The hands are a mirrored pair, and the right one is on -Y.
 ///
 /// This is the fact the renderer hangs a weapon on, and it is worth asserting

@@ -145,8 +145,29 @@ impl<T: Keyframe> Track<T> {
     ///
     /// Times before the first key clamp to it and times after the last clamp to
     /// that; callers wrap `time` to the sequence duration beforehand.
+    ///
+    /// **A global-sequence track is not indexed by the sequence.** It carries a
+    /// single keyframe list on a timeline of its own, shared by every
+    /// animation, and reading it as `sequences[sequence]` finds data only when
+    /// the sequence happens to be zero -- so the bone is posed correctly while
+    /// the model stands and snaps back to its bind orientation the moment it
+    /// walks. That is not hypothetical: it is how a sheathed sword came off a
+    /// character's back and pointed forward out of his shoulder as soon as he
+    /// moved, because the attachment bones that hold stowed weapons are
+    /// *exactly* the ones authored this way (`global Some(1)` for the hip,
+    /// `Some(2)` for the back, against `None` for the hands).
+    ///
+    /// The global timeline's own period lives in the model's `global_loops`
+    /// array, which this reader does not parse. That costs nothing for the
+    /// overwhelming case -- a global track with a single key is a *constant*,
+    /// and a constant samples the same at every time -- and leaves a genuinely
+    /// looping global track running on the current animation's clock instead of
+    /// its own. Stated rather than hidden: it is the remaining gap.
     pub fn sample(&self, sequence: usize, time: u32) -> Option<T> {
-        let keys = self.sequences.get(sequence)?;
+        let keys = match self.global_sequence {
+            Some(_) => self.sequences.first()?,
+            None => self.sequences.get(sequence)?,
+        };
         if keys.values.is_empty() {
             return None;
         }

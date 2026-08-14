@@ -440,6 +440,24 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   the hand would have put every weapon in the game in the wrong one, silently.
   When a column's name suggests an answer, find the rows where the name is
   unambiguous -- the pairs, the extremes -- and let those define it.
+- **A field can be parsed, documented, and then ignored by the one function
+  that had to act on it.** `Track::global_sequence` was read off the wire and
+  carried a doc comment saying it "runs on a shared global timer rather than
+  the current sequence" — and `sample` indexed `sequences[sequence]` anyway.
+  Global tracks hold one keyframe list, so they resolved only when the sequence
+  index happened to be zero, which is `Stand`; every other cycle silently fell
+  back to bind pose. Invisible for four milestones, because a body bone
+  snapping to bind in one cycle is nothing anyone would spot. It took a
+  *sheathed sword flying off a character's back* to make a bone's orientation
+  something you could see. When a struct field exists to change behaviour,
+  check that something reads it.
+- **When a measurement contradicts a conclusion you trust, suspect the
+  instrument.** The attachment points chosen for stowed weapons came back as
+  the *least* stable of all thirty-nine across animations — which looked like
+  proof the identification was wrong, and nearly caused it to be redone. The
+  identification was right; the sampler was broken. Two independent arguments
+  had already agreed on those points, and a third measurement disagreeing with
+  both is evidence about the third.
 - **When looking cannot settle it, find the thing that moves.** A greatsword
   slung across a back has two mirror images, and *both* look exactly like a
   greatsword slung across a back — the placement-rotation trap over again, and
