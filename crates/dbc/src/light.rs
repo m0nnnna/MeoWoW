@@ -13,7 +13,7 @@
 //! them, which is less than it is tempting to assume.
 
 use crate::schema::{
-    float_band_id, int_band_id, Light, LightFloatBand, LightIntBand, LightParams,
+    float_band_id, int_band_id, Light, LightFloatBand, LightIntBand, LightParams, LightRow,
     DAY_HALF_MINUTES, FLOAT_BANDS_PER_PARAMS, INT_BANDS_PER_PARAMS,
 };
 
@@ -130,24 +130,65 @@ impl Lighting {
     /// lights -- the nearest is 124,000 units away -- so the default is not an
     /// edge case, it is the common case.
     pub fn params_at(&self, map_id: u32, x: f32, y: f32) -> Option<(u32, f32)> {
-        let mut best: Option<(f32, u32)> = None;
-        let mut default: Option<u32> = None;
+        self.params_at_in(map_id, x, y, false).map(|(id, _, d)| (id, d))
+    }
+
+    /// The same, choosing between the clear and stormy sets of curves.
+    ///
+    /// Returns both, because a client does not switch between them -- it blends
+    /// by how hard the weather is coming down, and needs the two ends to
+    /// interpolate.
+    ///
+    /// **The storm column is the storm column, and the population statistic
+    /// nearly said otherwise.** Across 200 outdoor lights the stormy row is
+    /// darker only 55% of the time and pulls the fog *in* only 47% of the time,
+    /// which is a coin flip and looked like a refutation. It was the sloppy
+    /// version of the question: most positioned lights are decorative -- a
+    /// glowing crater, a haunted wood -- and their weather columns are authored
+    /// for effect. The row that matters is the one that actually lights a zone,
+    /// and asking about *that* is unambiguous. Map 0's default light names
+    /// clear params 12 and storm params 10, and row 10 is a flat neutral grey
+    /// (0.32, 0.33, 0.32) at **every hour of the day**, with fog ending at
+    /// 10,000 against clear's 18,000. No dawn orange, no midday white, no
+    /// sunset. Map 1's default names the same row 10.
+    pub fn params_at_in(
+        &self,
+        map_id: u32,
+        x: f32,
+        y: f32,
+        storm: bool,
+    ) -> Option<(u32, u32, f32)> {
+        let pick = |row: &LightRow| {
+            let clear = row.params_clear();
+            // A light with no stormy row of its own keeps its clear one, which
+            // is right rather than a gap: 337 of them share the two, and
+            // blending a row with itself is the identity.
+            let bad = if storm && row.params_storm() != 0 {
+                row.params_storm()
+            } else {
+                clear
+            };
+            (clear, bad)
+        };
+
+        let mut best: Option<(f32, (u32, u32))> = None;
+        let mut default: Option<(u32, u32)> = None;
         for row in self.lights.iter() {
             if row.map_id() != map_id {
                 continue;
             }
             if row.x() == 0.0 && row.y() == 0.0 && row.z() == 0.0 {
-                default = Some(row.params_clear());
+                default = Some(pick(&row));
                 continue;
             }
             let (dx, dy) = (row.x() - x, row.y() - y);
             let distance = (dx * dx + dy * dy).sqrt();
             if distance <= row.falloff_end() && best.is_none_or(|(d, _)| distance < d) {
-                best = Some((distance, row.params_clear()));
+                best = Some((distance, pick(&row)));
             }
         }
-        best.map(|(d, id)| (id, d))
-            .or_else(|| default.map(|id| (id, f32::INFINITY)))
+        best.map(|(d, (clear, bad))| (clear, bad, d))
+            .or_else(|| default.map(|(clear, bad)| (clear, bad, f32::INFINITY)))
     }
 
     /// The lighting at a position and a time of day.
@@ -156,7 +197,65 @@ impl Lighting {
     /// half-minutes; the conversion happens here so no caller has to remember
     /// which unit it is holding.
     pub fn sample(&self, map_id: u32, x: f32, y: f32, minute_of_day: u32) -> Option<Sample> {
-        let (params_id, _) = self.params_at(map_id, x, y)?;
+        self.sample_in(map_id, x, y, minute_of_day, 0.0)
+    }
+
+    /// The lighting at a position and a time, under weather.
+    ///
+    /// `storm` is how far towards the stormy curves to go, 0 to 1 -- the
+    /// intensity `SMSG_WEATHER` reports. Blended rather than switched because
+    /// the server eases weather in and out, and a client that jumped between
+    /// two sets of curves would turn the sky grey between one frame and the
+    /// next.
+    ///
+    /// Every field is interpolated, including the fog distances: a storm pulls
+    /// the horizon from 18,000 units to 10,000, and that is most of what makes
+    /// rain feel like rain.
+    pub fn sample_in(
+        &self,
+        map_id: u32,
+        x: f32,
+        y: f32,
+        minute_of_day: u32,
+        storm: f32,
+    ) -> Option<Sample> {
+        let storm = storm.clamp(0.0, 1.0);
+        let clear = self.sample_from(map_id, x, y, minute_of_day, false)?;
+        if storm <= 0.0 {
+            return Some(clear);
+        }
+        let stormy = self.sample_from(map_id, x, y, minute_of_day, true)?;
+        let mix = |a: f32, b: f32| a + (b - a) * storm;
+        let mix3 = |a: Colour, b: Colour| {
+            [
+                mix(a[0], b[0]),
+                mix(a[1], b[1]),
+                mix(a[2], b[2]),
+            ]
+        };
+        Some(Sample {
+            diffuse: mix3(clear.diffuse, stormy.diffuse),
+            ambient: mix3(clear.ambient, stormy.ambient),
+            fog: mix3(clear.fog, stormy.fog),
+            sky: mix3(clear.sky, stormy.sky),
+            fog_end: mix(clear.fog_end, stormy.fog_end),
+            fog_start: mix(clear.fog_start, stormy.fog_start),
+            // The row actually being blended towards, so a report can say which
+            // curves are in play rather than only where they came from.
+            params_id: if storm >= 0.5 { stormy.params_id } else { clear.params_id },
+        })
+    }
+
+    fn sample_from(
+        &self,
+        map_id: u32,
+        x: f32,
+        y: f32,
+        minute_of_day: u32,
+        storm: bool,
+    ) -> Option<Sample> {
+        let (clear_id, storm_id, _) = self.params_at_in(map_id, x, y, storm)?;
+        let params_id = if storm { storm_id } else { clear_id };
         let at = (minute_of_day * 2) % DAY_HALF_MINUTES;
         let fog_end = self
             .scalar(params_id, scalars::FOG_END, at)

@@ -2310,3 +2310,80 @@ The backpedal speed is 4.5, hardcoded beside the run speed and for the same
 reason: the authoritative figures are the nine speeds in the object-create
 movement block, which this client does not parse. A character with a speed buff
 still moves at the default. That is the real fix and it is not this one.
+
+### 4.9: weather
+
+Weather was genuinely absent -- three mentions in the whole tree, all comments
+saying it did not exist. The hook was already there: every `Light.dbc` row
+carries eight `LightParams` columns, one per weather condition, and the
+renderer had always taken the first.
+
+`SMSG_WEATHER` (0x2F4) is nine bytes: a `u32` state, an `f32` intensity, and a
+`u8` saying whether the change was abrupt. It arrives on entering a zone and
+whenever that zone's weather turns, so a client that ignores it stands in
+permanent sunshine. **Weather is a zone property the server owns** -- the exact
+opposite of the sheath state next door, which the client decides and the server
+merely republishes.
+
+The state numbers are sparse (2 is absent; 8 jumps to 22 to 41) and only the
+named ones are named. An unrecognised state is carried through with its raw
+number rather than guessed at, and is lit as clear weather, which is the
+conservative direction: ordinary daylight where it should be dim is
+unremarkable, the reverse looks broken.
+
+#### The storm column, and a statistic that nearly refuted it
+
+The schema calls column 9 the stormy one, which was a reading rather than a
+measurement -- and a wrong one would be invisible, since the renderer would
+pick a perfectly valid `LightParams` row that simply is not the weather it
+claims. So the question was asked as a property: **a storm must be dimmer,
+greyer and foggier than clear weather at the same place and hour.**
+
+Over 200 outdoor lights it came back flat. Storm was darker 55% of the time,
+greyer 54%, and pulled the fog *in* only 47% of the time -- a coin flip, and it
+read as a refutation.
+
+It was the sloppy version of the question. Most positioned lights are
+decorative -- a glowing crater, a haunted wood -- and their weather columns are
+authored for effect rather than for weather. The row that matters is the one
+that actually lights a zone, and asking about *that* is unambiguous: map 0's
+default light names clear params 12 and storm params 10, and **row 10 is a flat
+neutral 0.32/0.33/0.32 at every hour of the day**, with fog ending at 10,000
+against clear's 18,000. No dawn orange, no midday white, no sunset. Map 1's
+default names the same row 10. That is not a lighting preset that happens to
+look moody; it is a sky with the sun taken out of it.
+
+Same lesson as the `Spell.dbc` duration column, from the other end: a property
+test is only as good as the population you run it against, and 200 rows where
+the question is meaningless will bury two rows where it is decisive.
+
+#### Blended, not switched
+
+The two sets of curves are interpolated by the reported intensity rather than
+chosen between, because the server eases weather in and out and a client that
+switched would turn the sky grey between one frame and the next. Fog distances
+blend with the colours: the horizon coming in from 18,000 to 10,000 is most of
+what makes rain feel like rain, and it is the part a screenshot shows most
+clearly.
+
+#### Confirmed against the realm
+
+`.wchange 1 1` in Elwynn, then a screenshot: the sky goes from blue to grey,
+mean frame brightness drops from 90/101/25 to 71/75/17, and the abbey two
+hundred yards away goes hazy. The parse logged `weather: HeavyRain at 1.00`
+from the live packet.
+
+The test asserts the three properties separately and at the hour each is real
+-- **greyness is checked at dawn, not at noon**, because clear midday light is
+already a perfectly neutral 0.71/0.71/0.71 and nothing can be greyer than grey.
+The first version asserted it at noon and failed, which was the test being
+wrong rather than the data.
+
+#### What weather still is not
+
+- **There is no precipitation.** No rain, no snow, no sand: the weather changes
+  the light and nothing falls out of the sky. That needs a particle system this
+  renderer does not have, and it is the obvious next piece.
+- **There is no skybox**, weather or otherwise. `LightParams.light_skybox_id` is
+  read and unused; the sky is a cleared colour.
+- Weather sounds, and the `abrupt` flag, are parsed and ignored.

@@ -22,6 +22,7 @@ pub mod query;
 pub mod spell;
 pub mod state;
 pub mod update;
+pub mod weather;
 
 pub use chat::{ChatMessage, ChatType};
 pub use client::{Connection, DEFAULT_PORT};
@@ -36,6 +37,7 @@ pub use protocol::{
 };
 pub use state::{Cast, Replication, WorldState};
 pub use update::{Block, MonsterMove, ObjectType, Position};
+pub use weather::{Weather, WeatherChange};
 
 /// Names the playable races by id.
 ///

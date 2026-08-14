@@ -14,7 +14,7 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
 | Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated *creatures* slide along their actual path, turn to face it, and play the model's own walk/stand cycles. **Other players do not** — see the known defect below |
 | Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, a spellbook you arrange the bars from, `F1` to rearrange, saved to `ui.toml` |
-| World | Lighting and the day/night cycle come from `Light.dbc`'s curves and the realm's own clock: real sun, ambient and sky colour, dawn through midnight. Game objects — doors, benches, chests, ships — are drawn |
+| World | Lighting and the day/night cycle come from `Light.dbc`'s curves and the realm's own clock: real sun, ambient and sky colour, dawn through midnight. **Weather works**: `SMSG_WEATHER` picks the stormy set of curves and blends towards it by intensity, so rain greys the sky, dims the light and pulls the horizon in from 18,000 units to 10,000. Nothing *falls* yet — there is no particle system, and no skybox. Game objects — doors, benches, chests, ships — are drawn |
 | Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components. **The player's weapon is drawn**: the M2 attachment table parses, and a sword or shield hangs off the hand's animated bone and swings with it. Shoulders, helms and ranged weapons are not, and there is no sheathed state — see below. Other players' equipment still needs their visible-item fields |
 | Game | **4.3 done**: three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. **A spellbook panel** (`P`) now lists what the character can do and puts it on a bar by click, auto-attack included -- see the note below on why the seeding filter had to reject it. Threat and the corpse *interface* remain (the corpse protocol is done). Inventory and quests follow |
 
@@ -440,6 +440,21 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   the hand would have put every weapon in the game in the wrong one, silently.
   When a column's name suggests an answer, find the rows where the name is
   unambiguous -- the pairs, the extremes -- and let those define it.
+- **A property test is only as good as the population, and 200 irrelevant rows
+  will bury two decisive ones.** Asking whether `Light.dbc`'s storm column is
+  really the storm column across every outdoor light came back flat: darker 55%
+  of the time, foggier 47%, a coin flip that read as a refutation. Most
+  positioned lights are decorative — a glowing crater, a haunted wood — and
+  their weather columns are authored for effect. The row that *matters* is the
+  one that lights a zone, and there the answer is unambiguous: map 0's default
+  storm row is a flat neutral grey at every hour of the day with the fog
+  distance nearly halved. Before believing a flat result, check that the
+  population can answer the question.
+- **Assert a property at the point where it exists.** The same weather work
+  asserted that a storm is *greyer* than clear weather and failed — at noon,
+  where clear light is already a perfectly neutral 0.71/0.71/0.71 and nothing
+  can be greyer than grey. The property is real at dawn, where the sun has a
+  colour for the storm to take away. The test was wrong, not the data.
 - **A field can be parsed, documented, and then ignored by the one function
   that had to act on it.** `Track::global_sequence` was read off the wire and
   carried a doc comment saying it "runs on a shared global timer rather than

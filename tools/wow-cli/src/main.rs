@@ -90,6 +90,10 @@ enum Command {
         /// Game hour, 0 to 24.
         #[arg(long, default_value_t = 12.0)]
         hour: f32,
+        /// Instead of reporting one point, ask whether `Light.dbc`'s storm
+        /// column really is the stormy one, across every light on every map.
+        #[arg(long)]
+        weather_check: bool,
     },
     /// Log in to a realm's logon server and list its realms.
     ///
@@ -707,7 +711,19 @@ fn main() -> Result<()> {
         Command::Item(cmd) => item_cmd(&mut chain, cmd),
         Command::Wmo(cmd) => wmo_cmd(&mut chain, cmd),
         Command::Adt(cmd) => adt_cmd(&mut chain, cmd),
-        Command::Light { map, x, y, hour } => light::report(&mut chain, map, x, y, hour),
+        Command::Light {
+            map,
+            x,
+            y,
+            hour,
+            weather_check,
+        } => {
+            if weather_check {
+                light::weather_check(&mut chain, hour)
+            } else {
+                light::report(&mut chain, map, x, y, hour)
+            }
+        }
         // Handled before the archives are opened.
         Command::Auth { .. } | Command::World { .. } | Command::Moves { .. } => unreachable!(),
     }

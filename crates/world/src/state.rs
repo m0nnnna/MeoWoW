@@ -655,6 +655,8 @@ pub struct Stats {
 #[derive(Debug, Default)]
 pub struct Replication {
     pub object_updates: usize,
+    /// `SMSG_WEATHER`s folded this batch, whether or not they changed anything.
+    pub weather_changes: usize,
     pub monster_moves: usize,
     pub relayed_moves: usize,
     /// `SMSG_DEATH_RELEASE_LOC`s folded this batch, whether placing a marker or
@@ -745,6 +747,17 @@ pub struct WorldState {
     /// arrives, which is a real state -- a client that assumed noon would light
     /// the world wrongly for the first second of every session.
     pub game_time: Option<(crate::update::GameTime, std::time::Instant)>,
+    /// What the sky is doing, as the server last said.
+    ///
+    /// Stored rather than returned as an event, unlike chat: this is *state*.
+    /// It arrives once on entering a zone and then only when the weather turns,
+    /// so a caller that treated it as an event and dropped it would light the
+    /// world wrongly until the next change -- which may be twenty minutes away.
+    ///
+    /// Defaults to clear, which is both what a zone with no weather sends and
+    /// the safe direction: ordinary daylight where it should be dim is
+    /// unremarkable, the reverse looks broken.
+    pub weather: crate::weather::WeatherChange,
     /// Who each unit is currently swinging at, keyed by attacker.
     /// `SMSG_ATTACKSTART` inserts, `SMSG_ATTACKSTOP` removes.
     ///
@@ -1345,6 +1358,31 @@ impl WorldState {
                             };
                             report.failures.push((packet.opcode, error, payload));
                         }
+                    }
+                }
+                crate::opcode::server::WEATHER => {
+                    match crate::weather::parse(&packet.body) {
+                        Ok(change) => {
+                            // Worth a line at debug: weather is one of the few
+                            // things that changes how the whole world looks,
+                            // and "the zone went grey" with nothing in the log
+                            // is indistinguishable from a lighting bug.
+                            if change != self.weather {
+                                tracing::debug!(
+                                    "weather: {:?} at {:.2}{}",
+                                    change.weather,
+                                    change.intensity,
+                                    if change.abrupt { ", abruptly" } else { "" }
+                                );
+                            }
+                            report.weather_changes += 1;
+                            self.weather = change;
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
                     }
                 }
                 crate::opcode::server::LOGIN_SETTIMESPEED => {

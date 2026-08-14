@@ -157,3 +157,148 @@ pub fn report(chain: &mut Chain, map_id: u32, x: f32, y: f32, hour: f32) -> Resu
     }
     Ok(())
 }
+
+/// Asks whether `Light.dbc`'s third parameter column really is the stormy one.
+///
+/// **The column names in the schema are a reading, not a measurement**, and a
+/// wrong one here is invisible: the renderer would pick a perfectly valid
+/// `LightParams` row that simply is not the weather it claims. So the question
+/// is not "could column 9 be storm" but "is it *darker because* it is storm".
+///
+/// The property a storm must have is that its light is dimmer and greyer than
+/// clear weather at the same place and hour. That is checked across every light
+/// on every map at once, against the clear column as its own control -- and a
+/// column that is not weather at all has no reason to be systematically darker.
+pub fn weather_check(chain: &mut Chain, hour: f32) -> Result<()> {
+    let lighting = dbc::light::Lighting::load(|path| chain.read(path).ok())
+        .context("could not load the lighting tables")?;
+    let at = ((hour / 24.0) * DAY_HALF_MINUTES as f32) as u32 % DAY_HALF_MINUTES;
+
+    let luminance = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    // How far a colour is from grey, as the spread between its channels. Rain
+    // desaturates; a column that is merely a different *time* would not.
+    let saturation = |c: [f32; 3]| {
+        let max = c[0].max(c[1]).max(c[2]);
+        let min = c[0].min(c[1]).min(c[2]);
+        max - min
+    };
+
+    let (mut pairs, mut darker, mut greyer, mut identical) = (0usize, 0usize, 0usize, 0usize);
+    let (mut clear_sum, mut storm_sum) = (0.0f64, 0.0f64);
+    let (mut closer_fog, mut fog_pairs) = (0usize, 0usize);
+    let (mut clear_fog, mut storm_fog) = (0.0f64, 0.0f64);
+    for row in lighting.lights().iter() {
+        // **Outdoors only.** Weather happens on the two continents; a dungeon's
+        // eight columns are filled in because the row has eight columns, and
+        // including them buries the signal in rows where the question is
+        // meaningless. Maps 0 and 1 are Eastern Kingdoms and Kalimdor.
+        if row.map_id() != 0 && row.map_id() != 1 {
+            continue;
+        }
+        let (clear, storm) = (row.params_clear(), row.params_storm());
+        if clear == 0 || storm == 0 {
+            continue;
+        }
+        if clear == storm {
+            identical += 1;
+            continue;
+        }
+        let (Some(a), Some(b)) = (
+            lighting.colour(clear, dbc::light::bands::DIFFUSE, at),
+            lighting.colour(storm, dbc::light::bands::DIFFUSE, at),
+        ) else {
+            continue;
+        };
+        pairs += 1;
+        clear_sum += luminance(a) as f64;
+        storm_sum += luminance(b) as f64;
+        if luminance(b) < luminance(a) {
+            darker += 1;
+        }
+        if saturation(b) < saturation(a) {
+            greyer += 1;
+        }
+        // Fog is the sharpest of the three, and the most physical: you cannot
+        // see as far in the rain. A column that is not weather has no reason to
+        // pull the horizon in.
+        if let (Some(fa), Some(fb)) = (
+            lighting.scalar(clear, dbc::light::scalars::FOG_END, at),
+            lighting.scalar(storm, dbc::light::scalars::FOG_END, at),
+        ) {
+            fog_pairs += 1;
+            clear_fog += fa as f64;
+            storm_fog += fb as f64;
+            if fb < fa {
+                closer_fog += 1;
+            }
+        }
+    }
+
+    let pct = |n: usize| 100.0 * n as f32 / pairs.max(1) as f32;
+    println!("
+Light.dbc, clear column against storm column, at {hour:.0}:00");
+    println!("  {pairs} lights name a different row for each, {identical} name the same row");
+    println!("  storm is darker on {darker} of them ({:.1}%)", pct(darker));
+    println!("  storm is greyer on {greyer} of them ({:.1}%)", pct(greyer));
+    println!(
+        "  mean diffuse luminance: clear {:.3}, storm {:.3}",
+        clear_sum / pairs.max(1) as f64,
+        storm_sum / pairs.max(1) as f64
+    );
+    println!(
+        "  storm pulls the fog in on {closer_fog} of {fog_pairs} ({:.1}%)",
+        100.0 * closer_fog as f32 / fog_pairs.max(1) as f32
+    );
+    println!(
+        "  mean fog end: clear {:.0}, storm {:.0}",
+        clear_fog / fog_pairs.max(1) as f64,
+        storm_fog / fog_pairs.max(1) as f64
+    );
+    // The rows that actually matter. Northshire is covered by none of
+    // Azeroth's positioned lights -- the nearest is 124,000 units away -- so
+    // the map default is what lights the zone this client is usually standing
+    // in. A statistic over 200 special-purpose lights (a glowing crater, a
+    // haunted wood) says little about the one row the renderer will use.
+    for map_id in [0u32, 1] {
+        let Some(row) = lighting
+            .lights()
+            .iter()
+            .find(|r| r.map_id() == map_id && r.x() == 0.0 && r.y() == 0.0 && r.z() == 0.0)
+        else {
+            continue;
+        };
+        println!(
+            "
+  map {map_id} default light: clear params {}, storm params {}",
+            row.params_clear(),
+            row.params_storm()
+        );
+        println!(
+            "    {:>6}  {:>22}  {:>22}  {:>10}  {:>10}",
+            "hour", "clear diffuse", "storm diffuse", "clear fog", "storm fog"
+        );
+        for hour in [0.0f32, 6.0, 12.0, 18.0, 22.0] {
+            let t = ((hour / 24.0) * DAY_HALF_MINUTES as f32) as u32 % DAY_HALF_MINUTES;
+            let show = |id: u32| {
+                lighting
+                    .colour(id, dbc::light::bands::DIFFUSE, t)
+                    .map(|c| format!("{:.2} {:.2} {:.2}", c[0], c[1], c[2]))
+                    .unwrap_or_else(|| "-".into())
+            };
+            let fog = |id: u32| {
+                lighting
+                    .scalar(id, dbc::light::scalars::FOG_END, t)
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_else(|| "-".into())
+            };
+            println!(
+                "    {hour:>6.0}  {:>22}  {:>22}  {:>10}  {:>10}",
+                show(row.params_clear()),
+                show(row.params_storm()),
+                fog(row.params_clear()),
+                fog(row.params_storm()),
+            );
+        }
+    }
+    Ok(())
+}

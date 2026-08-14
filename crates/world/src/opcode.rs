@@ -142,6 +142,10 @@ pub mod server {
     pub const ADDON_INFO: u16 = 0x02EF;
     pub const CLIENTCACHE_VERSION: u16 = 0x04AB;
     pub const LOGIN_VERIFY_WORLD: u16 = 0x0236;
+
+    /// What the sky is doing: a state, an intensity, and whether it changed
+    /// abruptly. Sent on entering a zone and whenever the zone's weather turns.
+    pub const WEATHER: u16 = 0x02F4;
     pub const CHAR_CREATE: u16 = 0x003A;
     pub const CHAR_DELETE: u16 = 0x003C;
     /// Login refused after the character was chosen, unlike the auth-stage

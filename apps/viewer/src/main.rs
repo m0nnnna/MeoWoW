@@ -1596,7 +1596,15 @@ fn resolve_lighting(
         }
     };
     let minute_of_day = (hour * 60.0).rem_euclid(1440.0) as u32;
-    let sample = lighting.sample(live.map_id, at.x, at.y, minute_of_day)?;
+    // What the sky is doing, from the server. A zone with no weather reports
+    // clear and blends nothing, so this costs the common case a comparison.
+    let weather = live.state.weather;
+    let storm = if weather.weather.is_storm() {
+        weather.intensity
+    } else {
+        0.0
+    };
+    let sample = lighting.sample_in(live.map_id, at.x, at.y, minute_of_day, storm)?;
     Some((sample, hour))
 }
 

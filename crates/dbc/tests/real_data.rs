@@ -228,3 +228,123 @@ fn inference_finds_localized_blocks() {
         .all(|c| c.kind == ColumnKind::LocalePad));
     assert_eq!(columns[22].kind, ColumnKind::Int, "AreaTableID");
 }
+
+/// A storm dims the world, greys it, and pulls the horizon in.
+///
+/// The three properties together are what make the storm column the storm
+/// column, and each is checked against clear weather at the same place and hour
+/// rather than against a constant -- the claim is about the *relationship*, and
+/// the absolute numbers are Blizzard's business.
+///
+/// Northshire is the subject because it is where this client is usually
+/// standing, and because no positioned light covers it: it gets map 0's default
+/// row, which is the one that matters. That row names clear params 12 and storm
+/// params 10.
+#[test]
+fn a_storm_dims_greys_and_shortens_the_view() {
+    let mut chain = require_data!();
+    let lighting = dbc::light::Lighting::load(|path| chain.read(path).ok())
+        .expect("the lighting tables");
+
+    // Northshire, at noon, where the difference is largest.
+    let (map, x, y, minute) = (0u32, -8950.0f32, -132.5f32, 12 * 60);
+    let clear = lighting
+        .sample_in(map, x, y, minute, 0.0)
+        .expect("clear weather");
+    let storm = lighting
+        .sample_in(map, x, y, minute, 1.0)
+        .expect("stormy weather");
+
+    let luminance = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let spread = |c: [f32; 3]| {
+        c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])
+    };
+
+    assert!(
+        luminance(storm.diffuse) < luminance(clear.diffuse),
+        "a storm is not dimmer: clear {:?}, storm {:?}",
+        clear.diffuse,
+        storm.diffuse
+    );
+    // **Greyness is asserted at dawn, not at noon**, because at noon there is
+    // none to remove: clear midday light is already a perfectly neutral
+    // 0.71/0.71/0.71 and a storm cannot be greyer than grey. The sun's colour
+    // is what a storm takes away, so the test belongs at the hour the sun has
+    // a colour -- 06:00 clear is 1.00/0.79/0.30, a strong orange.
+    let dawn = 6 * 60;
+    let clear_dawn = lighting.sample_in(map, x, y, dawn, 0.0).expect("clear dawn");
+    let storm_dawn = lighting.sample_in(map, x, y, dawn, 1.0).expect("stormy dawn");
+    assert!(
+        spread(clear_dawn.diffuse) > 0.2,
+        "dawn is not warm enough to test greyness against: {:?}",
+        clear_dawn.diffuse
+    );
+    assert!(
+        spread(storm_dawn.diffuse) < spread(clear_dawn.diffuse) * 0.5,
+        "a storm does not grey out the dawn: clear {:?}, storm {:?}",
+        clear_dawn.diffuse,
+        storm_dawn.diffuse
+    );
+    assert!(
+        storm.fog_end < clear.fog_end,
+        "a storm does not pull the fog in: clear {}, storm {}",
+        clear.fog_end,
+        storm.fog_end
+    );
+    assert_ne!(
+        storm.params_id, clear.params_id,
+        "clear and stormy resolved to the same curves, so nothing was blended"
+    );
+}
+
+/// Zero intensity is exactly clear weather, and the blend is monotone.
+///
+/// The half that stops a sign or lerp error from passing: a client that eased
+/// the *wrong* way would still be dimmer at full storm, and asserting only the
+/// endpoints would not notice. Intensity is what the server eases in and out,
+/// so the midpoint has to sit between.
+#[test]
+fn weather_blends_from_clear_to_storm_in_order() {
+    let mut chain = require_data!();
+    let lighting = dbc::light::Lighting::load(|path| chain.read(path).ok())
+        .expect("the lighting tables");
+    let (map, x, y, minute) = (0u32, -8950.0f32, -132.5f32, 12 * 60);
+
+    let plain = lighting.sample(map, x, y, minute).expect("clear");
+    let none = lighting.sample_in(map, x, y, minute, 0.0).expect("clear");
+    assert_eq!(
+        plain, none,
+        "no weather must be identical to the unweathered sample"
+    );
+
+    let fog: Vec<f32> = [0.0f32, 0.25, 0.5, 0.75, 1.0]
+        .iter()
+        .map(|&t| {
+            lighting
+                .sample_in(map, x, y, minute, t)
+                .expect("a sample")
+                .fog_end
+        })
+        .collect();
+    for pair in fog.windows(2) {
+        assert!(
+            pair[1] <= pair[0],
+            "fog end went the wrong way across the blend: {fog:?}"
+        );
+    }
+    assert!(
+        fog[0] > fog[4],
+        "the blend did nothing at all: {fog:?}"
+    );
+
+    // Out-of-range intensities must clamp rather than extrapolate into
+    // colours neither table describes.
+    assert_eq!(
+        lighting.sample_in(map, x, y, minute, 5.0),
+        lighting.sample_in(map, x, y, minute, 1.0)
+    );
+    assert_eq!(
+        lighting.sample_in(map, x, y, minute, -2.0),
+        lighting.sample_in(map, x, y, minute, 0.0)
+    );
+}
