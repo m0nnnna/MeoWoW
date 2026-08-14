@@ -453,8 +453,19 @@ fn bind_pose(count: usize) -> Vec<[[f32; 4]; 4]> {
 const FOLLOW_DISTANCE: f32 = 9.0;
 const FOLLOW_NEAR: f32 = 2.5;
 const FOLLOW_FAR: f32 = 30.0;
-/// How high above the character's feet the camera sits.
-const FOLLOW_HEIGHT: f32 = 4.0;
+/// How high above the character's feet the camera *looks*.
+///
+/// The point the view orbits around, not where the eye sits -- roughly chest
+/// height on a human, so the character fills the middle of the frame rather
+/// than hanging from the top of it.
+const FOLLOW_HEIGHT: f32 = 2.2;
+
+/// How far the camera may be tilted above and below its subject.
+///
+/// Short of straight up and straight down, where an orbit degenerates: at
+/// exactly a quarter turn the view direction is parallel to the world's up
+/// axis and the horizon spins freely around it.
+const FOLLOW_PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.05;
 
 /// A tenth of a second between heartbeats, matching `Connection::walk`'s
 /// cadence -- roughly what a real client sends while moving.
@@ -614,28 +625,38 @@ fn initial_camera(scene: &Scene, args: &Args) -> Camera {
 /// eye height inside the body the view is filled by the inside of the player's
 /// own mesh, and nothing looks like it worked.
 fn live_camera(live: &live::LiveWorld, args: &Args) -> Camera {
-    const BEHIND: f32 = 9.0;
-    const ABOVE: f32 = 4.0;
-
     let yaw = args
         .yaw
         .map(f32::to_radians)
         .unwrap_or(live.orientation);
-    let mut fly = Fly {
-        position: live.position
-            - glam::Vec3::new(yaw.cos(), yaw.sin(), 0.0) * BEHIND
-            + glam::Vec3::Z * ABOVE,
-        yaw,
-        pitch: -0.15,
-        // Walking pace rather than the flying speed a survey wants: the point
-        // here is to stand somewhere, not to cross a continent.
-        speed: 30.0,
-        ..Default::default()
-    };
-    if let Some(pitch) = args.pitch {
-        fly.pitch = pitch.to_radians();
-    }
+    let pitch = args.pitch.map(f32::to_radians).unwrap_or(-0.2);
+    let mut fly = orbit_around(live.position, yaw, pitch, FOLLOW_DISTANCE);
+    // Walking pace rather than the flying speed a survey wants: the point here
+    // is to stand somewhere, not to cross a continent.
+    fly.speed = 30.0;
     Camera::Fly(fly)
+}
+
+/// Places the eye on a sphere around a character, looking at them.
+///
+/// **Shared by the screenshot placement and the per-frame follow on purpose.**
+/// They have to agree: a headless render exists to be evidence about what the
+/// window shows, and two copies of this arithmetic would make it evidence about
+/// itself. Same rule as unprojecting the picking ray from the matrix the scene
+/// was drawn with.
+fn orbit_around(feet: glam::Vec3, yaw: f32, pitch: f32, distance: f32) -> Fly {
+    let focus = feet + glam::Vec3::Z * FOLLOW_HEIGHT;
+    let (sp, cp) = pitch.sin_cos();
+    let (sy, cy) = yaw.sin_cos();
+    // The camera's own `forward()`, so the eye is placed by the formula the
+    // view matrix reads it back with.
+    let forward = glam::Vec3::new(cp * cy, cp * sy, sp);
+    Fly {
+        position: focus - forward * distance,
+        yaw,
+        pitch,
+        ..Default::default()
+    }
 }
 
 /// Places the camera over a streaming world's starting tile.
@@ -1449,6 +1470,14 @@ struct App {
     /// added to the character's own facing rather than replacing it. Only
     /// meaningful while following a live character.
     camera_yaw_offset: f32,
+    /// How far the camera is tilted above or below its subject, accumulated by
+    /// dragging.
+    ///
+    /// Owned here rather than written straight into the camera for the same
+    /// reason the yaw offset is: `drive_live_movement` rebuilds the camera from
+    /// the character every frame, so anything written directly is overwritten
+    /// before it is ever drawn.
+    camera_pitch: f32,
     /// Whether the *right* button is down, which steers the character rather
     /// than the camera.
     ///
@@ -1770,6 +1799,9 @@ impl App {
             press_at: None,
             right_press_at: None,
             camera_yaw_offset: 0.0,
+            // Slightly above the subject, looking gently down, which is where
+            // the game this is modelled on starts.
+            camera_pitch: -0.2,
             steering: false,
             camera_distance: FOLLOW_DISTANCE,
             chat: Vec::new(),
@@ -2157,8 +2189,9 @@ impl ApplicationHandler for App {
                     // separate handling: it is rebuilt from the character's
                     // facing every frame, so turning the body brings the view
                     // with it, which is exactly what a right drag should feel
-                    // like. Vertical movement still pitches the camera alone --
-                    // a character has no pitch to steer.
+                    // like. Vertical movement orbits the camera over and under
+                    // the character -- a character has no pitch to steer, but
+                    // the view still has to keep them in the middle of it.
                     if let Some(prev) = self.last_cursor {
                         const SPEED: f32 = 0.008;
                         let dx = -(now.0 - prev.0) as f32 * SPEED;
@@ -2177,9 +2210,8 @@ impl ApplicationHandler for App {
                             live.orientation =
                                 (live.orientation + dx).rem_euclid(std::f32::consts::TAU);
                         }
-                        if let Camera::Fly(c) = &mut self.camera {
-                            c.look(0.0, -dy);
-                        }
+                        self.camera_pitch = (self.camera_pitch - dy)
+                            .clamp(-FOLLOW_PITCH_LIMIT, FOLLOW_PITCH_LIMIT);
                     }
                     self.last_cursor = Some(now);
                     window.request_redraw();
@@ -2194,22 +2226,32 @@ impl ApplicationHandler for App {
                             -(now.0 - prev.0) as f32 * SPEED,
                             (now.1 - prev.1) as f32 * SPEED,
                         );
-                        // Standing in a live world, the camera's yaw is owned
-                        // by `drive_live_movement`, which rebuilds it from the
-                        // character's facing every frame. Writing yaw here too
+                        // Standing in a live world, **both** camera angles are
+                        // owned by `drive_live_movement`, which rebuilds them
+                        // from the character every frame. Writing either here
                         // would be overwritten before it was ever drawn, so
-                        // the drag accumulates an offset that function adds.
+                        // the drag accumulates offsets that function applies.
+                        //
+                        // Pitch used to be the exception, written straight into
+                        // the camera because the follow code left it alone --
+                        // and that is exactly what made dragging up and down
+                        // wrong. Tilting a camera that stays put swings its aim
+                        // off the character; orbiting it keeps them centred.
                         let following = self.live.is_some();
                         match &mut self.camera {
                             Camera::Orbit(c) => c.orbit(dx, dy),
-                            // Dragging turns the view, so the world follows the
-                            // cursor rather than moving against it.
-                            Camera::Fly(c) if following => c.look(0.0, -dy),
+                            // Following: the angles are applied by the follow
+                            // code, not here.
+                            Camera::Fly(_) if following => {}
+                            // Free-flying, there is no subject to orbit, so a
+                            // drag turns the view in place.
                             Camera::Fly(c) => c.look(dx, -dy),
                         }
                         if following {
                             self.camera_yaw_offset =
                                 (self.camera_yaw_offset + dx).rem_euclid(std::f32::consts::TAU);
+                            self.camera_pitch = (self.camera_pitch - dy)
+                                .clamp(-FOLLOW_PITCH_LIMIT, FOLLOW_PITCH_LIMIT);
                         }
                     }
                 }
@@ -2719,27 +2761,37 @@ impl App {
             self.last_heartbeat = Instant::now();
         }
 
-        // Same offset as the initial placement in `live_camera`, recomputed
-        // every frame so the camera tracks the character instead of flying
-        // free. Pitch is left alone so a mouse drag can still look up or down.
+        // **The camera orbits the character; it does not sit behind them and
+        // tilt.** Both angles are rebuilt here every frame, and the eye is
+        // placed on a sphere around a point at the character's chest, so
+        // whatever the pitch, the view still points at them.
+        //
+        // The first version placed the eye at a fixed height behind the
+        // character and left pitch to the mouse. Swinging left and right was
+        // then correct -- the eye really did travel around them -- while
+        // dragging up and down only re-aimed a camera that stayed put, so the
+        // character slid up and down the frame and out of it. Reported as the
+        // camera keeping the player centred one way and "they go everywhere"
+        // the other, which is exactly what half an orbit looks like.
         //
         // The yaw is *not* simply the character's orientation, though it was
-        // at first, and the difference matters more than it looks. Recomputing
-        // it here every frame is what makes the camera follow -- but a mouse
-        // drag also writes a yaw, and this overwrote it a millisecond later,
-        // so dragging sideways did nothing at all while dragging up and down
-        // worked. That reads as half a broken camera rather than as two things
-        // writing one field. The drag now accumulates into
-        // `camera_yaw_offset`, which is added here instead of competing with
-        // it: the camera swings around the character, and the character keeps
-        // facing wherever it was facing, which is what a left drag does in the
-        // game this is modelled on.
+        // at first. Recomputing it here is what makes the camera follow -- but
+        // a mouse drag also wrote a yaw, and this overwrote it a millisecond
+        // later, so dragging sideways did nothing at all. Both angles now
+        // accumulate as offsets the drag owns and this applies, rather than two
+        // places writing one field.
         if let Camera::Fly(fly) = &mut self.camera {
-            let yaw = live.orientation + self.camera_yaw_offset;
-            fly.position = live.position
-                - glam::Vec3::new(yaw.cos(), yaw.sin(), 0.0) * self.camera_distance
-                + glam::Vec3::Z * FOLLOW_HEIGHT;
-            fly.yaw = yaw;
+            let placed = orbit_around(
+                live.position,
+                live.orientation + self.camera_yaw_offset,
+                self.camera_pitch,
+                self.camera_distance,
+            );
+            // Only the placement, so the free-camera fields a screenshot or the
+            // overlay may have set are left alone.
+            fly.position = placed.position;
+            fly.yaw = placed.yaw;
+            fly.pitch = placed.pitch;
         }
     }
 
@@ -3709,5 +3761,88 @@ impl App {
                 .handle_platform_output(window, output.platform_output.clone());
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod camera_tests {
+    use super::*;
+
+    /// The character stays in the middle of the frame at every pitch.
+    ///
+    /// This is the whole of what a third-person camera has to do, and it is
+    /// what broke: the eye used to sit at a fixed height behind the character
+    /// while the mouse only re-aimed it, so swinging left and right kept them
+    /// centred -- the eye really did travel around them -- and dragging up and
+    /// down slid them off the top or bottom of the screen. Reported as the
+    /// camera being correct one way and "they go everywhere" the other.
+    ///
+    /// Checked by projecting the focus point through the very matrix the scene
+    /// is drawn with, rather than by re-deriving where the camera is pointing.
+    #[test]
+    fn the_subject_stays_centred_at_every_pitch() {
+        let feet = glam::Vec3::new(-8975.0, -227.0, 74.0);
+        let focus = feet + glam::Vec3::Z * FOLLOW_HEIGHT;
+
+        for &pitch in &[-FOLLOW_PITCH_LIMIT, -0.6, -0.2, 0.0, 0.4, FOLLOW_PITCH_LIMIT] {
+            for &yaw in &[0.0, 1.1, 3.0, 5.5] {
+                for &distance in &[FOLLOW_NEAR, FOLLOW_DISTANCE, FOLLOW_FAR] {
+                    let fly = orbit_around(feet, yaw, pitch, distance);
+                    let clip = fly.view_proj(16.0 / 9.0) * focus.extend(1.0);
+                    assert!(
+                        clip.w > 0.0,
+                        "the subject is behind the camera at pitch {pitch}, yaw {yaw}"
+                    );
+                    // Normalised device coordinates: the centre of the screen
+                    // is the origin, and the whole point is that the subject
+                    // sits there whatever the angle.
+                    let (nx, ny) = (clip.x / clip.w, clip.y / clip.w);
+                    assert!(
+                        nx.abs() < 1e-3 && ny.abs() < 1e-3,
+                        "at pitch {pitch}, yaw {yaw}, distance {distance} the subject \
+                         is at {nx:.3}, {ny:.3} rather than the centre"
+                    );
+                }
+            }
+        }
+    }
+
+    /// And the eye really is `distance` away, on the far side from where it
+    /// looks -- an orbit, not a camera that stays put and turns.
+    ///
+    /// The half that "stays centred" alone would not catch: a camera welded to
+    /// the subject's own position also keeps them dead centre, and shows the
+    /// inside of their head.
+    #[test]
+    fn the_eye_orbits_rather_than_pivoting_in_place() {
+        let feet = glam::Vec3::new(10.0, -20.0, 5.0);
+        let focus = feet + glam::Vec3::Z * FOLLOW_HEIGHT;
+        let mut heights = Vec::new();
+        for &pitch in &[-0.8, -0.2, 0.0, 0.5] {
+            let fly = orbit_around(feet, 0.7, pitch, FOLLOW_DISTANCE);
+            assert!(
+                (fly.position.distance(focus) - FOLLOW_DISTANCE).abs() < 1e-3,
+                "the eye is {} from its subject, not {FOLLOW_DISTANCE}",
+                fly.position.distance(focus)
+            );
+            heights.push(fly.position.z);
+        }
+        // Tilting down puts the eye *above* the subject, so the heights must
+        // fall as the pitch rises. A camera that only re-aimed would leave
+        // every one of them identical.
+        for pair in heights.windows(2) {
+            assert!(
+                pair[1] < pair[0],
+                "the eye did not move as the pitch changed: {heights:?}"
+            );
+        }
+    }
+
+    /// The pitch limit stops short of straight up and straight down, where an
+    /// orbit degenerates and the horizon spins.
+    #[test]
+    fn the_pitch_limit_avoids_the_poles() {
+        assert!(FOLLOW_PITCH_LIMIT < std::f32::consts::FRAC_PI_2);
+        assert!(FOLLOW_PITCH_LIMIT > 1.0, "the camera can barely tilt");
     }
 }

@@ -2387,3 +2387,40 @@ wrong rather than the data.
 - **There is no skybox**, weather or otherwise. `LightParams.light_skybox_id` is
   read and unused; the sky is a cleared colour.
 - Weather sounds, and the `abrupt` flag, are parsed and ignored.
+
+### 4.9 continued: the camera was half an orbit
+
+Reported after the weather work: swinging the camera left and right kept the
+character centred, and dragging up and down did not -- *"they go everywhere"*.
+
+The cause is in the shape of the two halves rather than in either one. The
+follow code placed the eye at a **fixed height behind** the character and
+recomputed that placement every frame from the character's heading, so a
+horizontal drag really did carry the eye around them. Pitch was deliberately
+left alone for the mouse to write, with a comment saying so -- and a camera
+that stays put and re-aims does not keep anything centred. It swings its aim
+off the subject, which is precisely what was seen.
+
+So one axis orbited and the other tilted, and the half that worked made the
+half that did not look like a tuning problem.
+
+The camera now places the eye on a sphere around a point at the character's
+chest, from both angles, every frame. `FOLLOW_HEIGHT` changed meaning with it:
+it used to be how high the *eye* sat and is now what the view orbits **around**,
+so it dropped from 4.0 to 2.2 -- chest height rather than head-and-a-half above
+the ground. Both drags feed the same two offsets; neither writes the camera
+directly any more, which was the earlier bug on the yaw axis reappearing on the
+pitch axis for the same reason: two places writing one field, and the one that
+runs later wins.
+
+`live_camera` and the per-frame follow now share one `orbit_around`, because a
+headless screenshot exists to be evidence about what the window shows and two
+copies of the arithmetic would make it evidence about itself -- the same rule
+that unprojects the picking ray from the matrix the scene was drawn with.
+
+The test projects the character's own focus point through the very view matrix
+the scene is drawn with and asserts it lands within a thousandth of the centre,
+across six pitches, four headings and three distances. A second test asserts
+the eye is genuinely `distance` away and *moves* as the pitch changes, which is
+the half the first would miss: a camera welded to the character's own position
+also keeps them dead centre, and shows the inside of their head.
