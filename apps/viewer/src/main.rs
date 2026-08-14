@@ -460,6 +460,19 @@ const FOLLOW_FAR: f32 = 30.0;
 /// than hanging from the top of it.
 const FOLLOW_HEIGHT: f32 = 2.2;
 
+/// How much of a turn a drag across the whole window is worth.
+///
+/// **Per window rather than per pixel, which is the point.** The constant this
+/// replaces was 0.008 radians a pixel with a comment claiming "roughly half a
+/// turn across the window" -- and on a 1920-wide window it is two and a half
+/// *full* turns, five times what it says and worse on a bigger monitor. A
+/// hand-sized mouse movement threw the view most of the way round, which reads
+/// as a camera that will not sit still.
+///
+/// Half a turn across the width is what the comment always meant, and it makes
+/// the feel a property of the gesture rather than of the display.
+const CAMERA_TURN_PER_WINDOW: f32 = std::f32::consts::PI;
+
 /// How far the camera may be tilted above and below its subject.
 ///
 /// Short of straight up and straight down, where an orbit degenerates: at
@@ -635,6 +648,68 @@ fn live_camera(live: &live::LiveWorld, args: &Args) -> Camera {
     // is to stand somewhere, not to cross a continent.
     fly.speed = 30.0;
     Camera::Fly(fly)
+}
+
+/// How far above the ground the camera is kept when it would otherwise sink
+/// into it.
+///
+/// Small: the point is to stop the view passing *through* the terrain, not to
+/// hold the camera at a respectful distance from it. Too large and looking up
+/// at a character standing on a slope shoves the eye out into the open.
+const CAMERA_GROUND_CLEARANCE: f32 = 0.5;
+
+/// Pulls the camera in until it is not underground.
+///
+/// **The eye moves along its own view ray, never sideways or upward.** Lifting
+/// it instead would keep the distance and break the framing -- the subject
+/// would slide off centre, which is the bug just fixed -- and pushing it
+/// sideways would swing the whole world. Shortening the distance is the one
+/// move that leaves the picture pointing exactly where it did, which is why it
+/// is what the game this models does.
+///
+/// Marched from the subject outwards rather than solved: the ground under a
+/// straight line is not a straight line, so a camera that only checked its
+/// destination would happily tunnel through a ridge between here and there and
+/// come out the far side looking through it.
+fn pull_camera_out_of_the_ground(
+    focus: glam::Vec3,
+    eye: glam::Vec3,
+    ground_at: impl Fn(f32, f32) -> Option<f32>,
+) -> glam::Vec3 {
+    const STEPS: usize = 12;
+    let span = eye - focus;
+    let mut allowed = 1.0f32;
+    for step in 1..=STEPS {
+        let t = step as f32 / STEPS as f32;
+        let at = focus + span * t;
+        let Some(ground) = ground_at(at.x, at.y) else {
+            // No terrain loaded there yet. Stopping short on a tile that has
+            // not streamed in would yank the camera into the character every
+            // time the world was still catching up, so an unknown height is
+            // treated as clear -- the same direction the rest of the streaming
+            // code fails in.
+            continue;
+        };
+        if at.z < ground + CAMERA_GROUND_CLEARANCE {
+            // Stop just before the offending sample rather than at it, so the
+            // eye ends up above the ground rather than exactly on the surface
+            // that rejected it.
+            allowed = ((step - 1) as f32 / STEPS as f32).max(0.0);
+            break;
+        }
+    }
+    focus + span * allowed
+}
+
+/// Radians of turn per pixel of drag, for this window.
+///
+/// Both axes use the *width*, not each their own dimension. Deriving pitch from
+/// the height would make a diagonal drag curve on any window that is not
+/// square, because the same hand movement would mean different angles on the
+/// two axes -- which feels like the camera fighting the mouse.
+fn drag_speed(window: &winit::window::Window) -> f32 {
+    let width = window.inner_size().width.max(1) as f32;
+    CAMERA_TURN_PER_WINDOW / width
 }
 
 /// Places the eye on a sphere around a character, looking at them.
@@ -2193,9 +2268,9 @@ impl ApplicationHandler for App {
                     // the character -- a character has no pitch to steer, but
                     // the view still has to keep them in the middle of it.
                     if let Some(prev) = self.last_cursor {
-                        const SPEED: f32 = 0.008;
-                        let dx = -(now.0 - prev.0) as f32 * SPEED;
-                        let dy = (now.1 - prev.1) as f32 * SPEED;
+                        let speed = drag_speed(&window);
+                        let dx = -(now.0 - prev.0) as f32 * speed;
+                        let dy = (now.1 - prev.1) as f32 * speed;
                         // Steering takes over the character's facing, so any
                         // swing a left drag had given the camera is folded
                         // away -- otherwise the view jumps by that offset the
@@ -2219,12 +2294,10 @@ impl ApplicationHandler for App {
                 }
                 if self.dragging {
                     if let Some(prev) = self.last_cursor {
-                        // Roughly half a turn across the window, which reads as
-                        // direct manipulation rather than a flick.
-                        const SPEED: f32 = 0.008;
+                        let speed = drag_speed(&window);
                         let (dx, dy) = (
-                            -(now.0 - prev.0) as f32 * SPEED,
-                            (now.1 - prev.1) as f32 * SPEED,
+                            -(now.0 - prev.0) as f32 * speed,
+                            (now.1 - prev.1) as f32 * speed,
                         );
                         // Standing in a live world, **both** camera angles are
                         // owned by `drive_live_movement`, which rebuilds them
@@ -2780,16 +2853,29 @@ impl App {
         // later, so dragging sideways did nothing at all. Both angles now
         // accumulate as offsets the drag owns and this applies, rather than two
         // places writing one field.
+        let placed = orbit_around(
+            live.position,
+            live.orientation + self.camera_yaw_offset,
+            self.camera_pitch,
+            self.camera_distance,
+        );
+        // Kept off the terrain. Sampled here, while the scene is still
+        // borrowed, because the camera is behind `&mut self` and the world
+        // behind the renderer -- and the alternative, cloning a height field
+        // per frame, would be absurd for twelve lookups.
+        let focus = live.position + glam::Vec3::Z * FOLLOW_HEIGHT;
+        let eye = match self.renderer.as_ref().and_then(|r| r.scene.as_ref()) {
+            Some(Scene::Streaming(world)) => pull_camera_out_of_the_ground(
+                focus,
+                placed.position,
+                |x, y| world.height_at(x, y),
+            ),
+            _ => placed.position,
+        };
         if let Camera::Fly(fly) = &mut self.camera {
-            let placed = orbit_around(
-                live.position,
-                live.orientation + self.camera_yaw_offset,
-                self.camera_pitch,
-                self.camera_distance,
-            );
             // Only the placement, so the free-camera fields a screenshot or the
             // overlay may have set are left alone.
-            fly.position = placed.position;
+            fly.position = eye;
             fly.yaw = placed.yaw;
             fly.pitch = placed.pitch;
         }
@@ -3836,6 +3922,100 @@ mod camera_tests {
                 "the eye did not move as the pitch changed: {heights:?}"
             );
         }
+    }
+
+    /// The camera stops at the ground instead of going through it, and it does
+    /// so by coming *in* rather than by rising.
+    ///
+    /// Rising would keep the distance and break the framing -- the subject
+    /// would slide off centre, which is the bug this camera was just fixed for.
+    /// So the test asserts the eye stays on the original ray, not merely that
+    /// it ended up above ground.
+    #[test]
+    fn the_camera_comes_in_rather_than_sinking_into_a_hill() {
+        let focus = glam::Vec3::new(0.0, 0.0, 10.0);
+        // Flat ground at z = 8, with the camera aimed down into it.
+        let ground = |_x: f32, _y: f32| Some(8.0f32);
+        let wanted = focus + glam::Vec3::new(0.0, 0.0, -1.0) * 9.0;
+        assert!(wanted.z < 8.0, "the test is not aiming underground");
+
+        let eye = pull_camera_out_of_the_ground(focus, wanted, ground);
+        assert!(
+            eye.z >= 8.0,
+            "the camera is still underground at {:.2}",
+            eye.z
+        );
+        // Still on the ray: the direction from the subject is unchanged, so
+        // the subject is still dead centre.
+        let before = (wanted - focus).normalize();
+        let after = (eye - focus).normalize();
+        assert!(
+            before.dot(after) > 0.999,
+            "the camera left its own ray: {before:?} became {after:?}"
+        );
+        assert!(
+            eye.distance(focus) < wanted.distance(focus),
+            "the camera did not come in at all"
+        );
+    }
+
+    /// Clear ground leaves the camera exactly where it asked to be.
+    ///
+    /// The half that stops a collision test from passing for a camera that
+    /// simply always sits close to its subject.
+    #[test]
+    fn open_ground_does_not_move_the_camera() {
+        let focus = glam::Vec3::new(0.0, 0.0, 100.0);
+        let wanted = focus + glam::Vec3::new(1.0, 0.0, 0.2).normalize() * FOLLOW_DISTANCE;
+        // Ground far below, and ground that is not loaded at all.
+        for ground in [
+            (|_x: f32, _y: f32| Some(0.0f32)) as fn(f32, f32) -> Option<f32>,
+            (|_x: f32, _y: f32| None) as fn(f32, f32) -> Option<f32>,
+        ] {
+            let eye = pull_camera_out_of_the_ground(focus, wanted, ground);
+            assert!(
+                eye.distance(wanted) < 1e-4,
+                "the camera was pulled in over open ground: {eye:?}"
+            );
+        }
+    }
+
+    /// A ridge *between* the subject and the camera stops it, not just the
+    /// ground beneath where it wanted to end up.
+    ///
+    /// A check that only tested the destination would tunnel straight through
+    /// the hill and come out the far side looking back through it.
+    #[test]
+    fn a_ridge_in_the_way_stops_the_camera() {
+        let focus = glam::Vec3::new(0.0, 0.0, 10.0);
+        // A wall halfway out: high ground between 4 and 6 units along +X.
+        let ground = |x: f32, _y: f32| Some(if (4.0..6.0).contains(&x) { 20.0 } else { 0.0 });
+        let wanted = focus + glam::Vec3::X * 10.0;
+
+        let eye = pull_camera_out_of_the_ground(focus, wanted, ground);
+        assert!(
+            eye.x < 4.0,
+            "the camera tunnelled through the ridge to {:.2}",
+            eye.x
+        );
+    }
+
+    /// Dragging across the window is a fixed fraction of a turn whatever the
+    /// window is, which is what stops the feel changing with the monitor.
+    #[test]
+    fn a_drag_across_the_window_is_the_same_turn_at_any_size() {
+        for width in [800.0f32, 1280.0, 1920.0, 3840.0] {
+            let speed = CAMERA_TURN_PER_WINDOW / width;
+            let across = speed * width;
+            assert!(
+                (across - CAMERA_TURN_PER_WINDOW).abs() < 1e-4,
+                "a full-width drag turned {across} at {width}px"
+            );
+        }
+        // And it really is the modest half-turn the comment claims, not the
+        // two and a half full turns the old fixed rate gave on a 1920 window.
+        assert!(CAMERA_TURN_PER_WINDOW <= std::f32::consts::PI + 1e-4);
+        assert!(0.008 * 1920.0 > 4.0 * CAMERA_TURN_PER_WINDOW);
     }
 
     /// The pitch limit stops short of straight up and straight down, where an

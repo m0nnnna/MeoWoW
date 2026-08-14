@@ -2424,3 +2424,39 @@ across six pitches, four headings and three distances. A second test asserts
 the eye is genuinely `distance` away and *moves* as the pitch changes, which is
 the half the first would miss: a camera welded to the character's own position
 also keeps them dead centre, and shows the inside of their head.
+
+#### And it was loose, and it went through the ground
+
+Two more from the same look: *"it needs to be tighter, right now it's pretty
+flowy"*, and the camera passed straight through the terrain.
+
+**The looseness was a constant that had drifted from its own comment.** The
+drag rate was `0.008` radians per pixel, annotated "roughly half a turn across
+the window". On a 1920-wide window that is 15.4 radians -- **two and a half
+full turns**, five times what it claimed, and worse on a larger monitor. A
+hand-sized movement threw the view most of the way round, which reads as a
+camera that will not sit still.
+
+It is now expressed as what the comment always meant: half a turn across the
+window *width*, whatever that width is. Both axes use the width rather than
+each their own dimension, so a diagonal drag does not curve on a non-square
+window.
+
+**The ground collision pulls the eye in along its own ray.** Lifting it instead
+would keep the distance and break the framing -- the subject would slide off
+centre, which is the bug fixed immediately before this -- and pushing it
+sideways would swing the world. Shortening the distance is the one move that
+leaves the picture pointing exactly where it was, and it is what the game this
+models does.
+
+The ray is marched from the subject outwards rather than solved at the
+destination, because the ground under a straight line is not a straight line: a
+camera that only checked where it wanted to end up would tunnel through a ridge
+in between and look back through it. There is a test for exactly that, and one
+for the opposite half -- open ground must leave the camera where it asked to
+be, or a collision check would pass for a camera that simply always sits close.
+
+A tile that has not streamed in yet counts as clear rather than as blocking.
+The other direction would yank the camera into the character whenever the world
+was catching up, which is the same failure direction the rest of the streaming
+code already chooses.
