@@ -48,6 +48,29 @@ target-dir = "C:/Users/you/.cargo-targets/open-wow-client"
 This is also substantially faster than writing gigabytes of intermediate
 artifacts over SMB.
 
+## Running against a local realm
+
+The viewer and `wow-cli world` need a running 3.3.5a-compatible server, not
+just game data. A disposable one runs entirely on this machine from
+`C:\azerothcore-wotlk`:
+
+```console
+docker compose up -d
+```
+
+Realm `AzerothCore` at `127.0.0.1` — auth `3724`, world `8085`, MySQL `3306`,
+SOAP `7878`. See `CLAUDE.md`'s "Local AzerothCore realm" section for accounts,
+GM commands, and two setup failures worth not re-diagnosing (a stale image
+expecting the wrong VMAP version, and a database missing its RBAC tables).
+
+```console
+cargo run -p wow-viewer -- --realm-host 127.0.0.1 --user OWC33 --character Testwolf
+```
+
+Prefer this over any shared remote realm when a test needs a specific game
+state — a death, a corpse, a particular NPC flag — since GM commands and SOAP
+both reach it without waiting on anyone else's session.
+
 ## Windows will not run a test binary named like an installer
 
 Windows applies an installer-detection heuristic to executable *filenames*: a

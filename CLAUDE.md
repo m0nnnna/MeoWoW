@@ -197,6 +197,42 @@ a bag from one held directly.
   in Northshire within view range of `Testwolf` — two clients in different
   starting zones cannot see each other and prove nothing.
 
+### Local AzerothCore realm (127.0.0.1)
+
+A second realm runs entirely on this machine, from `C:\azerothcore-wotlk`
+(`docker compose up -d`). **Prefer this over `wow1.nekos.farm` for anything
+needing a specific game state** — against the remote realm every death cost a
+five-minute fight and permanently consumed a character's state; locally a
+death and a resurrection are each one GM command, so the same scenario runs
+twenty times.
+
+- Auth `3724`, world `8085`, MySQL `3306`, SOAP `7878`. Realm `AzerothCore` at
+  `127.0.0.1`.
+- Accounts, all GM level 3: `OWC33`/`owc33` (`Testwolf`, `Facetest`),
+  `OWC34`/`owc34` (`Watcher`), `OWCADMIN`/`owcadmin`.
+- **Unlike `wow1.nekos.farm` above, these passwords are fine to commit.** The
+  server is local, disposable, and reachable only from this machine, which is
+  the opposite of the remote realm's rule two paragraphs up — a reader needs
+  to know which one applies before typing a password into a file.
+- **GM commands travel as ordinary chat.** `--say ".die"` works from our own
+  client for a GM account — `ChatHandler.cpp` parses any message starting
+  with `.`. `.die` additionally needs a target, hence `--select-self`.
+- **SOAP on `7878`** drives the server from a script with no game session at
+  all, for setup that should not depend on a client being logged in.
+- Reading the AzerothCore source in that tree is authorised, and rule 2 below
+  already permits it — source makes a hypothesis about a packet or a table
+  cheap to form, but observation still has to confirm it.
+- Two setup failures already cost time and are worth not re-diagnosing: a
+  stale cached `:master` image expecting `VMAP_4.7` against `VMAP_4.8` data
+  (fix: `docker compose pull`), and an old database missing the RBAC tables
+  (fix: a fresh volume — `AC_UPDATES_ENABLE_DATABASES=0` is baked into the
+  image on purpose, because `ac-db-import` owns migrations and the two must
+  not race).
+- A cold snapshot of the previous database lives at
+  `C:\azerothcore-wotlk\var\db-snapshot\ac-database-cold-2026-08-13.tar.gz`.
+  **Do not delete it** — the live database was deliberately recreated fresh
+  and that file is the only remaining copy of what was in it.
+
 ## Rules that matter
 
 1. **Never commit game assets** — not as fixtures, not as test data. Tests
