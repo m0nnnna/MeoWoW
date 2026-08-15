@@ -3102,3 +3102,65 @@ after `CMSG_LOOT`.
 
 What is left is interface rather than protocol: nothing sends any of this from
 the client, so there is no loot window yet.
+
+#### The loot window, and three bugs that only a person at a window could find
+
+The protocol was done; the interface took three live attempts, and each failure
+was a different shape. All three are worth recording because none of them would
+have shown up in a test written before the fact.
+
+**The corpse was released a frame after being asked for.** The release logic
+was "if replicated state holds no loot and we asked for some, release" — which
+is true on every frame between the request going out and the answer coming
+back. The window never appeared, and the log said `asked to loot` ten times,
+which reads exactly like a server ignoring the request. What it needed was to
+distinguish *asked* from *open*: they look identical from replicated state,
+since neither has any loot in it. Two states, and only the second may be
+released.
+
+**The window sensed hover, not clicks.** Frames opt into `Sense::click()` by
+appearing in one `matches!` in `Hud::show`, and a frame left out of it draws
+correctly, hit-tests correctly, and simply never reports a click — so the arm
+handling the click is dead code that looks alive. The symptom was a window that
+opened and did nothing. There is now a headless test that clicks a loot row and
+asserts what comes back, which fails if the frame ever drops out of that list.
+
+**And the camera kept the mouse after the button was up**, reported straight
+back: *"the camera should never capture the mouse if left or right click are
+NOT held down"*. The drag flags were cleared in the branch that handles a
+release — which sits *after* the check that hands the event to egui first and
+returns if egui consumed it. The loot window opens *on* a right-click and
+appears under the cursor, so it swallowed the very release that ends the
+gesture, and the flag stayed set for good.
+
+That one generalises past loot: **state mirroring a physical input has to be
+corrected from the input's end, not from the path that usually handles it.** The
+flags are now cleared before anything can consume the event, and on focus loss
+as well, since alt-tabbing with a button down never delivers a release at all.
+
+#### Taking loot needs the packets that say it is gone
+
+A fourth bug, and the one that took a survey rather than a fix. Taking an item
+worked on the server and the window went on showing it, because nothing parsed
+the messages that say a slot is gone. The corpse therefore never emptied, never
+closed, and was never released — a body left locked to this client for everyone
+else on the realm.
+
+Both were identified by content rather than by number:
+
+- `SMSG_LOOT_REMOVED` (`0x162`) — one byte, the loot slot. Taking slot `0`
+  produced a one-byte body holding `0`.
+- `SMSG_LOOT_CLEAR_MONEY` (`0x165`) — empty. A zero-length body is itself the
+  identification; nothing else arriving then carries no payload at all.
+
+Removal is **by slot, not by position**: the numbers do not close up when one
+goes, so the rows that remain keep the numbers the server still uses for them.
+
+Two others arrive and are deliberately not parsed: `0x163` carries the money
+amount, which `0x165` already covers, and `0x166` is the "you received an item"
+popup, which this client has no use for yet.
+
+Finding all of this needed the survey command fixed first: it released the
+corpse and *then* tried to take things off it, so the money moved and the item
+did not, and the printout said `0 new item(s)` as though the opcode were wrong.
+Anything acting on open loot has to happen before the release.

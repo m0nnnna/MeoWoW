@@ -211,6 +211,23 @@ pub mod server {
     /// acknowledgement of a release this client sent.
     pub const LOOT_RELEASE_RESPONSE: u16 = 0x0161;
 
+    /// One slot is gone from the open corpse. **One byte: the loot slot.**
+    ///
+    /// Without this a loot window keeps showing rows that have already been
+    /// taken, and -- because it never empties -- never closes, so the corpse
+    /// is never released. That was the symptom that found it.
+    ///
+    /// Identified by content rather than by its number: taking loot slot `0`
+    /// produced a one-byte body holding `0`.
+    pub const LOOT_REMOVED: u16 = 0x0162;
+
+    /// The money is gone from the open corpse. **Empty body** -- the corpse is
+    /// already known, and there is only one pile.
+    ///
+    /// A zero-length body is itself the identification here: nothing else
+    /// arriving at that moment carries no payload at all.
+    pub const LOOT_CLEAR_MONEY: u16 = 0x0165;
+
     /// What the sky is doing: a state, an intensity, and whether it changed
     /// abruptly. Sent on entering a zone and whenever the zone's weather turns.
     pub const WEATHER: u16 = 0x02F4;
@@ -392,6 +409,8 @@ pub fn describe(opcode: u16) -> String {
         server::LOGIN_VERIFY_WORLD => "SMSG_LOGIN_VERIFY_WORLD",
         server::LOOT_RESPONSE => "SMSG_LOOT_RESPONSE",
         server::LOOT_RELEASE_RESPONSE => "SMSG_LOOT_RELEASE_RESPONSE",
+        server::LOOT_REMOVED => "SMSG_LOOT_REMOVED",
+        server::LOOT_CLEAR_MONEY => "SMSG_LOOT_CLEAR_MONEY",
         server::CHAR_CREATE => "SMSG_CHAR_CREATE",
         server::CHAR_DELETE => "SMSG_CHAR_DELETE",
         server::CHARACTER_LOGIN_FAILED => "SMSG_CHARACTER_LOGIN_FAILED",

@@ -1755,8 +1755,37 @@ struct App {
     bags_open: bool,
     /// Whether the character panel is open.
     character_open: bool,
+    /// The corpse this client has asked about, and whether the answer arrived.
+    ///
+    /// **The two states have to be distinguished, and the first version did
+    /// not.** It kept only a guid and released the corpse whenever replicated
+    /// state held no loot -- which is true on every frame between asking and
+    /// being answered, so the release went out a frame after the request and
+    /// the window never appeared. The log said `asked to loot` ten times and
+    /// looked like a server that ignored the request.
+    ///
+    /// What this must *not* become is a second copy of "is the window open".
+    /// That is decided entirely by whether the server sent anything, and lives
+    /// in replicated state; this only records what we asked and whether we are
+    /// still waiting, which is a fact about this client alone.
+    looting: Option<Looting>,
     /// Held modifiers, which choose which bar a number key drives.
     modifiers: winit::keyboard::ModifiersState,
+}
+
+/// Where a loot request has got to.
+///
+/// Two states rather than one guid, because "asked" and "open" need opposite
+/// handling and look identical from replicated state alone -- neither has any
+/// loot in it. See [`App::looting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Looting {
+    /// Sent, and no answer yet. Releasing now would close a corpse that was
+    /// never opened, which is what the first version of this did every frame.
+    Asked(u64),
+    /// The server answered with something, so a window is showing. When it
+    /// stops showing, this is the corpse to release.
+    Open(u64),
 }
 
 /// How far the pointer may travel between press and release and still count as
@@ -2188,6 +2217,7 @@ impl App {
             items: items::Items::default(),
             bags_open: false,
             character_open: false,
+            looting: None,
             modifiers: Default::default(),
         }
     }
@@ -2362,6 +2392,47 @@ impl ApplicationHandler for App {
         let (Some(window), Some(r)) = (self.window.clone(), self.renderer.as_mut()) else {
             return;
         };
+        // **A button that is not held down must never leave the camera
+        // steering, whoever consumed the event.**
+        //
+        // The drag flags are set on press and cleared on release, and the
+        // clear used to live past the `consumed` check below -- so a release
+        // that egui claimed never reached it and the flag stayed set for good.
+        // That is not a rare race: the loot window opens *on* a right-click
+        // and appears under the cursor, so it swallows the very release that
+        // ends the gesture. The camera then turned with every mouse movement,
+        // with no button down and no way to stop it.
+        //
+        // Only the flags are cleared here. The click that a release also
+        // represents is still decided below, and only for events egui did not
+        // take -- otherwise clicking a window would also swing at whatever is
+        // behind it.
+        //
+        // The general rule, and it is worth keeping: state that mirrors a
+        // physical input has to be corrected from the input's *end*, not from
+        // the path that usually handles it.
+        match &event {
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button,
+                ..
+            } => match button {
+                MouseButton::Left => self.dragging = false,
+                MouseButton::Right => self.steering = false,
+                _ => {}
+            },
+            // Losing focus mid-drag is the other way a release never arrives:
+            // alt-tab away with a button down and the window is simply not
+            // told it came up again.
+            WindowEvent::Focused(false) => {
+                self.dragging = false;
+                self.steering = false;
+                self.press_at = None;
+                self.right_press_at = None;
+            }
+            _ => {}
+        }
+
         if r.egui_state.on_window_event(&window, &event).consumed {
             window.request_redraw();
             return;
@@ -3709,8 +3780,95 @@ impl App {
         if let Some(guid) = picked {
             if self.is_attack_candidate(guid) {
                 self.start_auto_attack();
+            } else if self.is_loot_candidate(guid) {
+                // **The same gesture, split by whether the thing is alive.**
+                // Right-click means "interact with that" everywhere it exists,
+                // and on a body that is looting rather than swinging. The two
+                // are mutually exclusive by construction --
+                // `is_attack_candidate` already rules out anything dead -- so
+                // this cannot both attack and loot.
+                self.open_loot(guid);
             }
         }
+    }
+
+    /// Whether right-clicking this thing should open its loot.
+    ///
+    /// The mirror of [`Self::is_attack_candidate`] and deliberately as narrow:
+    /// a dead unit, and not the player's own corpse. It makes no attempt to
+    /// know whether there is anything *on* the body, because the client cannot
+    /// know that until it asks -- and asking about an empty corpse is answered
+    /// with a release rather than an error, so the cost of being wrong is one
+    /// packet and no window.
+    fn is_loot_candidate(&self, guid: u64) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        if guid == live.guid {
+            return false;
+        }
+        let Some(entity) = live.state.get(guid) else {
+            return false;
+        };
+        matches!(entity.object_type, ::world::ObjectType::Unit) && entity.is_dead_or_ghost()
+    }
+
+    /// Asks what is on a corpse.
+    ///
+    /// The window that results is not opened here: it appears when the *server
+    /// answers*, because until then this client does not know whether there is
+    /// anything to show. An empty corpse is answered with a release, so the
+    /// window correctly never appears for one -- see `world::state::WorldState::loot`.
+    fn open_loot(&mut self, guid: u64) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.loot(guid) {
+            tracing::warn!("could not open loot: {e:#}");
+            return;
+        }
+        self.looting = Some(Looting::Asked(guid));
+        tracing::debug!("asked to loot {guid:#x}");
+    }
+
+    /// Takes one row of the open loot.
+    ///
+    /// `take` carries what to ask for rather than a position -- see
+    /// `ui::frames::loot`. A corpse whose earlier slots are gone still numbers
+    /// the rest from where they were, so asking by row would take the wrong
+    /// item, and nothing would report it.
+    fn take_loot(&mut self, take: ui::frames::Take) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let result = match take {
+            ui::frames::Take::Money => live.connection.loot_money(),
+            ui::frames::Take::Item(slot) => live.connection.loot_item(slot),
+        };
+        if let Err(e) = result {
+            tracing::warn!("could not take loot: {e:#}");
+        }
+    }
+
+    /// Closes the corpse, which is what unlocks it for anyone else.
+    ///
+    /// Sent on closing the window rather than left to the server: a corpse
+    /// stays locked to whoever opened it, so a client that opens loot and
+    /// wanders off leaves a body nobody can touch.
+    fn release_loot(&mut self) {
+        let Some(Looting::Open(guid)) = self.looting.take() else {
+            // Nothing to release, or a request still waiting for its answer.
+            // Releasing an unanswered request is the bug this enum exists to
+            // prevent -- see `App::looting`.
+            return;
+        };
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.loot_release(guid) {
+            tracing::warn!("could not release the corpse: {e:#}");
+        }
+        tracing::debug!("released {guid:#x}");
     }
 
     /// What is under the cursor, if the world is in a state to be asked.
@@ -4272,6 +4430,54 @@ impl App {
             Vec::new()
         };
 
+        // The loot window's rows, straight out of replicated state.
+        //
+        // **There is no "loot window is open" flag anywhere.** The window
+        // exists exactly while the server says a corpse is open, and the
+        // server closes an empty one for us -- so a flag here would be a
+        // second copy of that decision, and the two would disagree the moment
+        // a release arrived that this client did not send.
+        //
+        // Money is a row like any other, drawn first when there is some,
+        // because it is taken by a click the same way an item is. It is the
+        // one row whose identity is "money" rather than a slot number.
+        let loot: Vec<ui::frames::LootRow> = match self.live.as_ref().and_then(|l| l.state.loot.as_ref())
+        {
+            Some(loot) => {
+                let mut rows = Vec::with_capacity(loot.items.len() + 1);
+                if loot.money > 0 {
+                    let (g, s, c) = ::world::inventory::purse(loot.money);
+                    rows.push(ui::frames::LootRow {
+                        take: ui::frames::Take::Money,
+                        name: format!("{g}g {s}s {c}c"),
+                        count: 1,
+                        icon: None,
+                    });
+                }
+                for item in &loot.items {
+                    // The icon comes from the item's *entry*, the same route
+                    // the bags use, so a corpse and a bag draw the same thing
+                    // the same way. The response also carries a display id
+                    // directly, which would skip a table lookup -- and would
+                    // then be a second path to the same picture that could
+                    // drift from the first.
+                    let icon = self
+                        .items
+                        .icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, item.entry);
+                    rows.push(ui::frames::LootRow {
+                        // The server's slot, carried rather than derived. See
+                        // `ui::frames::loot`.
+                        take: ui::frames::Take::Item(item.slot),
+                        name: self.items.name(item.entry),
+                        count: item.count,
+                        icon,
+                    });
+                }
+                rows
+            }
+            None => Vec::new(),
+        };
+
         // Re-measured every frame against the clock for the same reason the
         // cooldown sweep is: the bar's fill has to move even though nothing
         // in replicated state changed between frames.
@@ -4311,6 +4517,9 @@ impl App {
                     bags: bags_open.then_some(bags.as_slice()),
                     copper,
                     character: character_open.then_some(character.as_slice()),
+                    // No flag: the window exists exactly while the server
+                    // says a corpse is open.
+                    loot: (!loot.is_empty()).then_some(loot.as_slice()),
                 },
             );
 
@@ -4382,8 +4591,8 @@ impl App {
                          jumps, Num Lock autoruns, Z draws or stows the weapon. \
                          P for the spellbook (click a spell then a slot; \
                          right-click a slot to clear it), B for the bags, \
-                         C for the character panel, F1 to rearrange the \
-                         interface"
+                         C for the character panel, right-click a body to \
+                         loot it, F1 to rearrange the interface"
                     });
                     if let Some(status) = &layout_status {
                         ui.weak(format!("interface: {status}"));
@@ -4401,6 +4610,34 @@ impl App {
         // A clicked slot casts, after the closure has released `self.hud`.
         if let Some((bar, slot)) = hud_response.activated {
             self.activate_slot(bar, slot);
+        }
+
+        // A clicked loot row takes it. `take` says what to ask for, not where
+        // it was on screen -- see `ui::frames::loot`.
+        if let Some(take) = hud_response.take_loot {
+            self.take_loot(take);
+        }
+
+        // **The corpse has to be released, and only a transition says when.**
+        //
+        // The server clears its own loot once the body is empty, so the window
+        // going away is the signal -- but "no loot yet" and "no loot any more"
+        // are the same thing to look at, and the first version of this could
+        // not tell them apart. It released a frame after asking, every time,
+        // and the window never appeared.
+        //
+        // So the answer arriving is what promotes `Asked` to `Open`, and only
+        // `Open` can be released. A client that never releases leaves the body
+        // locked to it for everyone else on the realm, which is why this is
+        // not simply left to the server.
+        let open = self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.state.loot.is_some());
+        match (self.looting, open) {
+            (Some(Looting::Asked(guid)), true) => self.looting = Some(Looting::Open(guid)),
+            (Some(Looting::Open(_)), false) => self.release_loot(),
+            _ => {}
         }
 
         // A bar that was rearranged is written straight back to `ui.toml`.

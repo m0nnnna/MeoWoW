@@ -18,6 +18,7 @@ pub mod bags;
 pub mod cast_bar;
 pub mod character;
 pub mod chat;
+pub mod loot;
 pub mod combat_text;
 pub mod marker;
 pub mod spellbook;
@@ -25,6 +26,7 @@ pub mod unit;
 
 pub use bags::{BagItem, BagSlot};
 pub use character::EquipSlot;
+pub use loot::{LootRow, Take};
 pub use cast_bar::CastBarView;
 pub use spellbook::SpellbookEntry;
 pub use unit::UnitView;

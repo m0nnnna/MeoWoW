@@ -737,6 +737,18 @@ pub struct WorldState {
     /// to `SMSG_SPELL_GO` with no bar ever worth showing, so removing an
     /// absent entry for one is a correct no-op, not a missed `SMSG_SPELL_START`.
     pub casts: HashMap<u64, Cast>,
+    /// The corpse currently open, if any.
+    ///
+    /// Held here rather than handed back from
+    /// [`WorldState::replicate`](WorldState::replicate) deliberately -- see
+    /// the note at that dispatch. Chat is returned and three callers dropped
+    /// it silently; a loot window that flickered open for one frame would be
+    /// the same failure wearing a different face.
+    ///
+    /// Cleared when the corpse is released, and never set for an empty one:
+    /// the server answers an empty corpse with a release rather than an empty
+    /// window, so storing it would leave a window nothing will clear.
+    pub loot: Option<crate::loot::Loot>,
     /// The realm's clock, from `SMSG_LOGIN_SETTIMESPEED` at login, together
     /// with when this client learned it.
     ///
@@ -811,6 +823,19 @@ impl WorldState {
 
     pub fn is_empty(&self) -> bool {
         self.entities.is_empty()
+    }
+
+    /// Closes the loot once nothing is left on the corpse.
+    ///
+    /// The server does not announce that a corpse is now empty -- it announces
+    /// each thing leaving it -- so emptiness is something this client has to
+    /// notice. It matters beyond tidiness: the window going away is what tells
+    /// the caller to send the release, and a corpse that is never released
+    /// stays locked to whoever opened it for everyone else on the realm.
+    fn close_loot_if_empty(&mut self) {
+        if self.loot.as_ref().is_some_and(|loot| loot.is_empty()) {
+            self.loot = None;
+        }
     }
 
     pub fn get(&self, guid: u64) -> Option<&Entity> {
@@ -1376,6 +1401,61 @@ impl WorldState {
                             report.failures.push((packet.opcode, error, payload));
                         }
                     }
+                }
+                // **Stored, not returned.** Chat is handed back from this
+                // function and three separate callers quietly dropped it,
+                // which showed up as chat never being delivered when it had
+                // arrived and been thrown away. Centralising the producer does
+                // not centralise the consumers, so anything a window needs to
+                // read lives in the state instead.
+                crate::opcode::server::LOOT_RESPONSE => {
+                    match crate::loot::parse_loot_response(&packet.body) {
+                        Ok(loot) => {
+                            // An empty corpse arrives as the short form and is
+                            // *not* worth opening a window for -- the server
+                            // closes it for us, so holding it would leave a
+                            // window nothing will ever clear.
+                            if loot.is_empty() {
+                                self.loot = None;
+                            } else {
+                                self.loot = Some(loot);
+                            }
+                        }
+                        Err(error) => {
+                            report.failures.push((
+                                packet.opcode,
+                                error,
+                                Ok(packet.body.clone()),
+                            ));
+                        }
+                    }
+                }
+                // The corpse was closed -- by us, or by the server because it
+                // was empty. Either way the window is over.
+                crate::opcode::server::LOOT_RELEASE_RESPONSE => {
+                    self.loot = None;
+                }
+                // **A slot was taken.** Without this the window keeps showing
+                // rows that are already in the bags and never empties, so it
+                // never closes and the corpse is never released -- which is
+                // exactly how this was found.
+                //
+                // Removed **by slot**, not by position: the slot numbers do
+                // not close up when one goes, so the remaining rows keep the
+                // numbers the server still uses for them.
+                crate::opcode::server::LOOT_REMOVED => {
+                    if let (Some(loot), Some(slot)) =
+                        (self.loot.as_mut(), packet.body.first().copied())
+                    {
+                        loot.items.retain(|item| item.slot != slot);
+                    }
+                    self.close_loot_if_empty();
+                }
+                crate::opcode::server::LOOT_CLEAR_MONEY => {
+                    if let Some(loot) = self.loot.as_mut() {
+                        loot.money = 0;
+                    }
+                    self.close_loot_if_empty();
                 }
                 crate::opcode::server::WEATHER => {
                     match crate::weather::parse(&packet.body) {
@@ -2049,6 +2129,137 @@ mod tests {
     /// here comes back `0` and the assertion fails, even though a healthy
     /// live-realm run would never exercise this path -- it only sends
     /// well-formed packets.
+    /// **Loot is stored, not returned**, and this is the check that says so.
+    ///
+    /// The rule it enforces is written at the dispatch: chat *is* returned
+    /// from `replicate`, and three separate callers dropped it silently, which
+    /// surfaced as chat never being delivered when it had arrived and been
+    /// thrown away. A loot window fed the same way would flicker open for one
+    /// frame. So this asserts the state holds it after the packet, which a
+    /// return value cannot promise.
+    #[test]
+    fn a_loot_response_lands_in_the_state_and_a_release_clears_it() {
+        let mut state = WorldState::new();
+        // The bytes a live realm sent: two copper and one item.
+        let body = vec![
+            0x42, 0xbf, 0x00, 0x67, 0x00, 0x00, 0x30, 0xf1, 0x01, 0x05, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x16, 0x08, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xd1, 0x18, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+        ];
+        state.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::LOOT_RESPONSE,
+                body,
+            }],
+            None,
+        );
+        let loot = state.loot.as_ref().expect("the corpse should be open");
+        assert_eq!(loot.money, 5);
+        assert_eq!(loot.items.len(), 1);
+        assert_eq!(loot.items[0].entry, 2070);
+
+        state.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::LOOT_RELEASE_RESPONSE,
+                body: vec![0x42, 0xbf, 0x00, 0x67, 0x00, 0x00, 0x30, 0xf1, 0x01],
+            }],
+            None,
+        );
+        assert!(state.loot.is_none(), "a release must close the window");
+    }
+
+    /// Taking everything empties the corpse and closes it.
+    ///
+    /// **This is the sequence that was missing**, and its absence had a
+    /// symptom two steps away: the window kept showing rows already in the
+    /// bags, never emptied, so it never closed, so the corpse was never
+    /// released and stayed locked to this client for everyone else.
+    ///
+    /// The removal is **by slot, not by position**. The two coincide here only
+    /// because the corpse starts full; taking slot `1` out of a two-item
+    /// corpse must leave slot `0` alone, which a `remove(index)` would get
+    /// backwards.
+    #[test]
+    fn taking_everything_empties_the_corpse_and_closes_it() {
+        let mut state = WorldState::new();
+        // Two copper and two items, at slots 0 and 1.
+        let mut body = vec![0x42, 0xbf, 0x00, 0x67, 0x00, 0x00, 0x30, 0xf1, 0x01];
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.push(2);
+        for (slot, entry) in [(0u8, 2070u32), (1, 1374)] {
+            body.push(slot);
+            body.extend_from_slice(&entry.to_le_bytes());
+            body.extend_from_slice(&1u32.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.push(4);
+        }
+        state.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::LOOT_RESPONSE,
+                body,
+            }],
+            None,
+        );
+        assert_eq!(state.loot.as_ref().unwrap().items.len(), 2);
+
+        // Take the *second* item. Slot 0 must survive untouched.
+        state.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::LOOT_REMOVED,
+                body: vec![1],
+            }],
+            None,
+        );
+        let loot = state.loot.as_ref().expect("still money and an item here");
+        assert_eq!(loot.items.len(), 1);
+        assert_eq!(loot.items[0].slot, 0, "the wrong slot was removed");
+        assert_eq!(loot.items[0].entry, 2070);
+
+        // Money next. Still not empty -- one item remains.
+        state.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::LOOT_CLEAR_MONEY,
+                body: Vec::new(),
+            }],
+            None,
+        );
+        let loot = state.loot.as_ref().expect("an item is still here");
+        assert_eq!(loot.money, 0);
+        assert_eq!(loot.items.len(), 1);
+
+        // And the last one closes it, with no release response needed.
+        state.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::LOOT_REMOVED,
+                body: vec![0],
+            }],
+            None,
+        );
+        assert!(
+            state.loot.is_none(),
+            "an emptied corpse must close itself -- the window going away is \
+             what makes the caller release it"
+        );
+    }
+
+    /// An empty corpse must not open a window at all. The server answers one
+    /// with a release rather than an empty response, so a window held for it
+    /// would be a window nothing ever clears.
+    #[test]
+    fn an_empty_corpse_opens_nothing() {
+        let mut state = WorldState::new();
+        state.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::LOOT_RESPONSE,
+                body: vec![0x8e, 0xb6, 0x00, 0x1b, 0x15, 0x00, 0x30, 0xf1, 0x00, 0x00],
+            }],
+            None,
+        );
+        assert!(state.loot.is_none());
+    }
+
     #[test]
     fn replicate_applies_good_packets_and_counts_bad_ones() {
         use crate::client::Packet;

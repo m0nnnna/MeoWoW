@@ -103,6 +103,13 @@ pub struct HudData<'a> {
     /// answer different questions, and a worn slot has a fixed identity where
     /// a bag square is only a position.
     pub character: Option<&'a [frames::EquipSlot]>,
+    /// What is on the corpse currently open, or `None` when none is.
+    ///
+    /// Unlike every other window here this one is not toggled by a key -- it
+    /// appears because the server answered a loot request and goes away when
+    /// the corpse is released. "Open" is therefore expressed entirely by
+    /// having something to draw, with no flag anywhere that could disagree.
+    pub loot: Option<&'a [frames::LootRow]>,
     /// The character's money in copper, drawn along the bottom of the bag
     /// window. Ignored when `bags` is `None`.
     pub copper: u32,
@@ -120,6 +127,11 @@ pub struct HudResponse {
     /// written -- and because a save on every frame of a drag would be a file
     /// write per frame.
     pub layout_changed: bool,
+    /// A loot row the user clicked, as *what to ask the server for* rather
+    /// than as a position. See [`frames::loot`]: a row index and a loot slot
+    /// are different numbers, and the difference is invisible until a corpse
+    /// has been partly looted.
+    pub take_loot: Option<frames::Take>,
 }
 
 /// The interface, ready to draw.
@@ -312,6 +324,7 @@ impl Hud {
             let spellbook_placeholder;
             let bags_placeholder;
             let character_placeholder;
+            let loot_placeholder;
             let content = match id {
                 ElementId::PlayerFrame | ElementId::TargetFrame => {
                     let live = if id == ElementId::PlayerFrame {
@@ -376,6 +389,14 @@ impl Hud {
                     }
                     None => continue,
                 },
+                ElementId::Loot => match data.loot {
+                    Some(rows) => Content::Loot(rows),
+                    None if editing => {
+                        loot_placeholder = frames::loot::placeholder();
+                        Content::Loot(&loot_placeholder)
+                    }
+                    None => continue,
+                },
                 _ => {
                     // An action bar. Unlike the other frames, an empty one
                     // still draws: the slots are where spells get *put*, so
@@ -405,6 +426,9 @@ impl Hud {
                 // empty window under it.
                 Content::Bags(slots) => frames::bags::size(slots.len(), &style, element.scale),
                 Content::Character(_) => frames::character::size(&style, element.scale),
+                // Sized to the corpse, so a one-item corpse does not open a
+                // window with empty lines in it.
+                Content::Loot(rows) => frames::loot::size(rows.len(), &style, element.scale),
             };
             let rect = element.rect(screen, size);
             self.occupied.push(rect);
@@ -463,9 +487,22 @@ impl Hud {
                 .show(ctx, |ui| {
                     let sense = if editing {
                         egui::Sense::drag()
-                    } else if matches!(content, Content::Bar { .. } | Content::Spellbook(_)) {
-                        // The two frames you interact with while playing, so
-                        // they sense clicks rather than only hover.
+                    } else if matches!(
+                        content,
+                        Content::Bar { .. } | Content::Spellbook(_) | Content::Loot(_)
+                    ) {
+                        // The frames you interact with while playing, so they
+                        // sense clicks rather than only hover.
+                        //
+                        // **This list is easy to forget and fails silently.**
+                        // A frame left out of it draws correctly, hit-tests
+                        // correctly, and simply never reports a click --
+                        // `response.clicked()` is never true, so the match arm
+                        // handling it is dead code that looks alive. The loot
+                        // window shipped that way for exactly one live test:
+                        // it opened, drew its rows, and did nothing when they
+                        // were clicked. Anything that reads `response.clicked()`
+                        // below must appear here.
                         egui::Sense::click()
                     } else {
                         // Still sensed, so `captures_pointer` knows the
@@ -521,6 +558,13 @@ impl Hud {
                             &painter,
                             response.rect,
                             slots,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Loot(rows) => frames::loot::draw(
+                            &painter,
+                            response.rect,
+                            rows,
                             &style,
                             element.scale,
                         ),
@@ -594,6 +638,29 @@ impl Hud {
                         {
                             if let Some(spell) = slots.get(slot).and_then(|s| s.spell.as_ref()) {
                                 frames::action_bar::hover_tooltip(&response, spell);
+                            }
+                        }
+                    }
+                }
+                (false, Content::Loot(rows)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            if let Some(row) = frames::loot::row_at(
+                                drawn_rect,
+                                rows.len(),
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                // **The row carries what to ask for; this
+                                // does not derive it.** A loot slot is the
+                                // server's index into that corpse, and a
+                                // corpse whose earlier slots are gone still
+                                // numbers the rest from where they were, so
+                                // reporting the row number would take the
+                                // wrong item -- silently, since nothing
+                                // acknowledges the request.
+                                response_out.take_loot = rows.get(row).map(|row| row.take);
                             }
                         }
                     }
@@ -705,6 +772,13 @@ impl Hud {
                             scale,
                         ),
                         ElementId::Character => frames::character::size(&style, scale),
+                        ElementId::Loot => frames::loot::size(
+                            data.loot
+                                .map(|rows| rows.len())
+                                .unwrap_or_else(|| frames::loot::placeholder().len()),
+                            &style,
+                            scale,
+                        ),
                         ElementId::PlayerFrame | ElementId::TargetFrame => {
                             let unit = if id == ElementId::PlayerFrame {
                                 data.player
@@ -762,6 +836,7 @@ enum Content<'a> {
     Spellbook(&'a [frames::SpellbookEntry]),
     Bags(&'a [frames::BagSlot]),
     Character(&'a [frames::EquipSlot]),
+    Loot(&'a [frames::LootRow]),
 }
 
 /// The outline and label that mark a frame as draggable.
@@ -1308,6 +1383,72 @@ mod tests {
         );
     }
 
+    /// **Clicking a loot row reports what to ask the server for.**
+    ///
+    /// This is the check for a failure that is completely silent: a frame left
+    /// out of the `Sense::click()` list draws correctly, hit-tests correctly,
+    /// and never reports a click, so the arm handling it is dead code that
+    /// looks alive. The loot window shipped that way and the symptom at the
+    /// window was "it opens, and clicking does nothing".
+    ///
+    /// It also pins the thing that would be wrong in a much worse way: the
+    /// row's *position* is not its loot slot. The second row here carries slot
+    /// 7, and a click on it has to report 7.
+    #[test]
+    fn clicking_a_loot_row_reports_its_slot_not_its_position() {
+        let rows = vec![
+            frames::LootRow {
+                take: frames::Take::Money,
+                name: "2c".into(),
+                count: 1,
+                icon: None,
+            },
+            // Earlier slots already taken; the server still calls this 7.
+            frames::LootRow {
+                take: frames::Take::Item(7),
+                name: "Frayed Shoes".into(),
+                count: 1,
+                icon: None,
+            },
+        ];
+        let data = HudData {
+            loot: Some(&rows),
+            ..Default::default()
+        };
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::Loot);
+        let rect = element.rect(
+            screen(),
+            frames::loot::size(rows.len(), &hud.profile.style, element.scale),
+        );
+        let centres: Vec<egui::Pos2> =
+            frames::loot::row_rects(rect, rows.len(), &hud.profile.style, element.scale)
+                .map(|row| row.center())
+                .collect();
+
+        let response = drive(
+            &mut hud,
+            &data,
+            &click_script(centres[1], egui::PointerButton::Primary),
+        );
+        assert_eq!(
+            response.take_loot,
+            Some(frames::Take::Item(7)),
+            "a click on row 1 must ask for loot slot 7"
+        );
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let response = drive(
+            &mut hud,
+            &data,
+            &click_script(centres[0], egui::PointerButton::Primary),
+        );
+        assert_eq!(response.take_loot, Some(frames::Take::Money));
+    }
+
     /// The same asymmetry for the bag window, and for the same reason.
     #[test]
     fn a_bag_window_appears_only_when_open_or_editing() {
@@ -1565,6 +1706,9 @@ mod tests {
                 frames::bags::size(frames::bags::placeholder().len(), &profile.style, scale)
             }
             ElementId::Character => frames::character::size(&profile.style, scale),
+            ElementId::Loot => {
+                frames::loot::size(frames::loot::placeholder().len(), &profile.style, scale)
+            }
             ElementId::PlayerFrame | ElementId::TargetFrame => {
                 frames::unit::size(&profile.style, scale, true)
             }

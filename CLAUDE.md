@@ -17,8 +17,8 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | World | Lighting and the day/night cycle come from `Light.dbc`'s curves and the realm's own clock. **The sky is a real gradient**: bands 2–6 are the sky from zenith to horizon, identified by the one hour that could refute it — at dawn the warm/cool crossing lands on the horizon side, once. Fog is *derived* from the horizon band rather than named, so distant terrain meets the sky it is drawn against. **The sun and the moon are drawn**: band 9 is the one band that stays bright while the sky goes black, so it is the disc rather than a light — cool white all night, warm at dawn — and one band serves both because only one is ever up. **Weather works and now falls**: `SMSG_WEATHER` blends towards the stormy curves *and* rain or snow comes down, as camera-relative billboards with no particle buffer at all, and a storm puts the sun out. Still no skybox (Elwynn names none), no clouds, no stars, no M2 emitters. Game objects — doors, benches, chests, ships — are drawn |
 | Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components. **The player's weapon is drawn**: the M2 attachment table parses, and a sword or shield hangs off the hand's animated bone and swings with it. Shoulders, helms and ranged weapons are not, and there is no sheathed state — see below. Other players' equipment still needs their visible-item fields |
 | Game | **4.3 done**: three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. **A spellbook panel** (`P`) now lists what the character can do and puts it on a bar by click, auto-attack included -- see the note below on why the seeding filter had to reject it. Threat and the corpse *interface* remain (the corpse protocol is done). Quests follow |
-| Loot | **Read, not yet taken.** `CMSG_LOOT` (`0x15D`) is confirmed by reply and `SMSG_LOOT_RESPONSE` parses, with the layout checked against a relationship the packet does not control -- each item carries an entry *and* a display id, and `Item.dbc` binds the two. **The short form is a second message wearing the same opcode**, told apart by length alone: an empty corpse is ten bytes where the full header is fourteen. `SMSG_LOOT_RELEASE_RESPONSE` also arrives *in answer to* `CMSG_LOOT` on an empty corpse. Nothing sends a loot request from the interface yet, and taking an item is unexercised |
-| Inventory | **4.13 done bar looting.** A **single combined bag window** (`B`) covering the backpack *and every equipped bag's contents* -- deliberately unlike the original's one frame per bag -- with real icons, stack counts and money; a separate **character panel** (`C`) with the nineteen worn slots, all nineteen named. The slot array, coinage, stack count, container capacity, container contents and the owner/contained pair were all measured against the live realm. `CMSG_AUTOEQUIP_ITEM` is confirmed *by effect*. Nothing can be moved from the interface yet; loot and corpse release are next |
+| Loot | **Works end to end.** Right-click a body to open it, click a row to take money or an item, and the corpse releases itself once empty -- a client that never releases leaves the body locked to it for everyone else. `CMSG_LOOT` `0x15D`, `CMSG_LOOT_MONEY` `0x15E`, `CMSG_AUTOSTORE_LOOT_ITEM` `0x108`, `SMSG_LOOT_RESPONSE` `0x160`, `SMSG_LOOT_REMOVED` `0x162`, `SMSG_LOOT_CLEAR_MONEY` `0x165` -- every one confirmed by content or by effect. A loot slot is the **server's** index and never a row position: the numbers do not close up when one is taken |
+| Inventory | **4.13 done bar looting.** A **single combined bag window** (`B`) covering the backpack *and every equipped bag's contents* -- deliberately unlike the original's one frame per bag -- with real icons, stack counts and money; a separate **character panel** (`C`) with the nineteen worn slots, all nineteen named. The slot array, coinage, stack count, container capacity, container contents and the owner/contained pair were all measured against the live realm. `CMSG_AUTOEQUIP_ITEM` is confirmed *by effect*. Nothing can be moved from the interface yet -- the equip write exists but no drag does |
 
 Roughly 60% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
@@ -684,6 +684,23 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   and a bag whose contents array we cannot find are the same bytes. Before
   concluding a structure does not exist, check whether the sample could have
   shown it.
+- **State mirroring a physical input must be corrected from the input's end,
+  not from the path that usually handles it.** The camera's drag flags were
+  cleared in the branch handling a mouse release -- which sits *after* the
+  check that offers the event to egui first and returns if egui consumed it.
+  The loot window opens *on* a right-click and appears under the cursor, so it
+  swallowed the very release that ends the gesture, and the camera then turned
+  with every mouse movement with no button held and no way to stop it. Not a
+  rare race: any frame that appears mid-gesture strands the flag. Clearing
+  happens before anything can consume the event now, and on focus loss too,
+  since alt-tabbing with a button down never delivers a release at all.
+- **A frame that never receives clicks looks exactly like one whose handler is
+  broken.** Frames opt into `Sense::click()` by appearing in one `matches!`,
+  and a frame left out of it draws correctly, hit-tests correctly, and never
+  reports a click -- so the arm handling that click is dead code that reads as
+  live. The loot window opened and did nothing. Anything that reads
+  `response.clicked()` has to appear in that list, and there is now a headless
+  test that clicks a row and asserts what comes back.
 - **A sample that cannot exhibit the thing you are looking for is not
   evidence.** Three attempts to capture a loot response came back empty and
   each looked like a protocol problem. A GM `.die` kill generates no loot at

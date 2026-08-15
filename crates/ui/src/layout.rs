@@ -42,10 +42,11 @@ pub enum ElementId {
     Spellbook,
     Bags,
     Character,
+    Loot,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 10] = [
+    pub const ALL: [ElementId; 11] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -56,6 +57,7 @@ impl ElementId {
         ElementId::Spellbook,
         ElementId::Bags,
         ElementId::Character,
+        ElementId::Loot,
     ];
 
     /// Which action bar this element is, if it is one.
@@ -81,6 +83,7 @@ impl ElementId {
             ElementId::Spellbook => "spellbook",
             ElementId::Bags => "bags",
             ElementId::Character => "character",
+            ElementId::Loot => "loot",
         }
     }
 
@@ -101,6 +104,7 @@ impl ElementId {
             ElementId::Spellbook => "Spellbook",
             ElementId::Bags => "Bags",
             ElementId::Character => "Character",
+            ElementId::Loot => "Loot",
         }
     }
 
@@ -187,6 +191,16 @@ impl ElementId {
             ElementId::Character => Element {
                 anchor: Anchor::Left,
                 offset: [24.0, 0.0],
+                ..Default::default()
+            },
+            // Near the middle, where the eye already is. Unlike every other
+            // window here this one is not opened by a keypress -- it appears
+            // because the player clicked a corpse -- so it has to be somewhere
+            // they are already looking rather than somewhere they have learned
+            // to check.
+            ElementId::Loot => Element {
+                anchor: Anchor::Center,
+                offset: [0.0, -40.0],
                 ..Default::default()
             },
         }

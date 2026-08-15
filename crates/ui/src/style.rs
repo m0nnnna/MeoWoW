@@ -211,6 +211,9 @@ pub struct Style {
     /// rather than a multiple of the slot size: the longest label
     /// ('Shoulders') sets it, and slot size is tuned for icons.
     pub character_label_width: f32,
+    /// How wide the loot window is. Its own dimension because loot rows hold
+    /// an item name and a count where a spellbook row holds a name and a rank.
+    pub loot_width: f32,
     pub spellbook_width: f32,
     pub spellbook_height: f32,
     pub spellbook_row: f32,
@@ -317,6 +320,7 @@ impl Default for Style {
             slot_binding: Color::rgba(230, 235, 245, 200),
 
             character_label_width: 62.0,
+            loot_width: 200.0,
             spellbook_width: 250.0,
             spellbook_height: 320.0,
             spellbook_row: 30.0,
@@ -396,6 +400,7 @@ impl Style {
         self.slot_gap = self.slot_gap.clamp(0.0, 40.0);
         self.cast_bar_width = self.cast_bar_width.clamp(60.0, 1200.0);
         self.character_label_width = self.character_label_width.clamp(0.0, 400.0);
+        self.loot_width = self.loot_width.clamp(100.0, 900.0);
         self.spellbook_width = self.spellbook_width.clamp(120.0, 1200.0);
         self.spellbook_height = self.spellbook_height.clamp(60.0, 1600.0);
         self.spellbook_row = self.spellbook_row.clamp(10.0, 200.0);

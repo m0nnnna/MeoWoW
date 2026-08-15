@@ -2367,11 +2367,47 @@ fn survey_loot(
             println!("  nothing moved -- which is what a wrong opcode looks like,");
             println!("  and also what a full bag looks like. Check the bags first.");
         }
+
+        // **What the server says when loot is taken**, which is a different
+        // question from whether it was taken. A window has to stop showing a
+        // row that is gone, and the only thing that can tell it is one of
+        // these -- so they get printed with their bodies for the same reason
+        // the open did.
+        println!("\nafter taking, every opcode with a body:");
+        let mut seen_after: std::collections::BTreeMap<u16, usize> = Default::default();
+        for packet in &after {
+            *seen_after.entry(packet.opcode).or_default() += 1;
+        }
+        for (opcode, count) in &seen_after {
+            println!(
+                "  {:<34} ({opcode:#06x}) x{count}",
+                world::opcode::describe(*opcode)
+            );
+        }
+        for packet in &after {
+            if NOISE.contains(&packet.opcode) {
+                continue;
+            }
+            println!(
+                "  {} ({:#06x}) {} bytes: {}",
+                world::opcode::describe(packet.opcode),
+                packet.opcode,
+                packet.body.len(),
+                hex_preview(&packet.body, 32)
+            );
+        }
     }
 
-    // Releasing matters even in a survey: a corpse stays locked to whoever
-    // opened it, so a run that opens loot and walks away leaves a body nobody
-    // else on the realm can touch.
+    // **Released last, and this order is the whole of it.** The first
+    // version of this released the corpse here and then went on to take
+    // things off it, which is a closed corpse: the money still moved, the
+    // item did not, and the printout said "0 new item(s)" as though the
+    // opcode were wrong. Anything that acts on the open loot has to happen
+    // before this.
+    //
+    // Releasing at all matters even in a survey: a corpse stays locked to
+    // whoever opened it, so a run that walks away leaves a body nobody else
+    // on the realm can touch.
     connection.loot_release(corpse)?;
     let after = connection.drain(std::time::Duration::from_millis(600), 64)?;
     println!("\nafter release, {} more packet(s):", after.len());
