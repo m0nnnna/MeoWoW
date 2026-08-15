@@ -297,6 +297,93 @@ fn a_storm_dims_greys_and_shortens_the_view() {
     );
 }
 
+/// The five sky bands really are a sky, ordered zenith to horizon.
+///
+/// **The decisive hour is dawn, and it is the only one that discriminates.**
+/// At noon or midnight almost any bright-to-dark reading of five bands looks
+/// like a plausible gradient, so agreeing with one proves little. At sunrise a
+/// sky is not a ramp: it is cool overhead and warm along the bottom, with the
+/// warm half crossing in at a definite height. That crossing has a *side*, and
+/// a side is something an ordering can get wrong.
+///
+/// It doubles as the byte-order check. Swapping red and blue negates every
+/// difference asserted here, which would put the sunrise directly overhead --
+/// so this failing means either the bands moved or `unpack` did.
+#[test]
+fn the_sky_bands_are_a_sky_and_the_horizon_is_the_last_one() {
+    let mut chain = require_data!();
+    let lighting = dbc::light::Lighting::load(|path| chain.read(path).ok())
+        .expect("the lighting tables");
+    // Northshire again: map 0's default row is what lights it, and a
+    // positioned decorative light would answer a different question.
+    let (map, x, y) = (0u32, -8950.0f32, -132.5f32);
+    let at = |hour: u32| lighting.sample(map, x, y, hour * 60).expect("a sample");
+
+    // Midnight: a night sky darkens all the way up, in every channel. The
+    // weakest of the three claims, and the cheapest to keep honest.
+    let night = at(0).sky;
+    for pair in night.windows(2) {
+        for c in 0..3 {
+            assert!(
+                pair[1][c] >= pair[0][c],
+                "the midnight sky is not darkest overhead: {night:?}"
+            );
+        }
+    }
+
+    // Noon: red climbs from zenith to horizon while the sky loses its colour,
+    // ending on an exactly neutral haze. Asserting the neutral *end* rather
+    // than a monotone spread is deliberate -- the spread rises between the
+    // first two bands, because the zenith at noon is nearly black and has
+    // little colour to lose yet.
+    let noon = at(12).sky;
+    let spread = |c: [f32; 3]| c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2]);
+    for pair in noon.windows(2) {
+        assert!(
+            pair[1][0] >= pair[0][0],
+            "midday red does not climb towards the horizon: {noon:?}"
+        );
+    }
+    assert!(
+        spread(noon[dbc::light::bands::HORIZON]) < 0.02,
+        "the midday horizon is not the neutral end: {:?}",
+        noon[dbc::light::bands::HORIZON]
+    );
+    assert!(
+        spread(noon[dbc::light::bands::ZENITH]) > spread(noon[dbc::light::bands::HORIZON]),
+        "the midday sky has no colour to lose: {noon:?}"
+    );
+
+    // And the one that could have come out either way. At both 06:00 and
+    // 18:00 the warm half must be the horizon half, and the crossing must
+    // happen once -- a sky that alternated warm and cool up its height would
+    // be five bands that are not a gradient at all.
+    for hour in [6u32, 18] {
+        let sky = at(hour).sky;
+        let warmth: Vec<f32> = sky.iter().map(|c| c[0] - c[2]).collect();
+        assert!(
+            warmth[dbc::light::bands::ZENITH] < 0.0,
+            "the {hour}:00 zenith is warm, so the sun is overhead at dawn: {warmth:?}"
+        );
+        assert!(
+            warmth[dbc::light::bands::HORIZON] > 0.1,
+            "the {hour}:00 horizon is not warm, so nothing is rising there: {warmth:?}"
+        );
+        let crossings = warmth
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count();
+        assert_eq!(
+            crossings, 1,
+            "the {hour}:00 sky changes temperature {crossings} times: {warmth:?}"
+        );
+    }
+
+    // Fog is the horizon, not a copy of it. If someone reintroduces a fog
+    // band this fails and sends them to `bands::HORIZON` for the argument.
+    assert_eq!(at(12).fog(), at(12).horizon());
+}
+
 /// Zero intensity is exactly clear weather, and the blend is monotone.
 ///
 /// The half that stops a sign or lerp error from passing: a client that eased

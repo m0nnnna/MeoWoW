@@ -115,6 +115,20 @@ struct Args {
     #[arg(long)]
     hour: Option<f32>,
 
+    /// Draw this weather instead of whatever the realm reports.
+    ///
+    /// Takes a raw `SMSG_WEATHER` state so the whole vocabulary is reachable
+    /// and the same parser decides what it means: 0 fine, 1 fog, 3/4/5 rain,
+    /// 6/7/8 snow. The same argument as `--hour` -- weather that can only be
+    /// looked at by starting a server and typing `.wchange` is weather nothing
+    /// headless can check, and this milestone's whole point is that it falls.
+    #[arg(long)]
+    weather: Option<u32>,
+
+    /// How hard the `--weather` state is coming down, 0 to 1.
+    #[arg(long, default_value_t = 1.0)]
+    weather_intensity: f32,
+
     /// Write the logged-in character's composed skin to this PNG.
     ///
     /// The skin is ten regions of one 512x512 atlas -- face, arms, hands,
@@ -745,6 +759,12 @@ fn draw_scene(
     blitter: &Blitter,
     meshes: &MeshRenderer,
     terrain_renderer: &TerrainRenderer,
+    // Only the streaming world has a sky: the model and texture views are not
+    // places, so there is no hour or position to resolve a gradient for. The
+    // same is true of the weather.
+    sky: &render::SkyRenderer,
+    precipitation: &render::PrecipitationRenderer,
+    falling: Option<Falling>,
     material_binds: &[wgpu::BindGroup],
     bones: Option<&BoneBuffer>,
     world_binds: &[Vec<wgpu::BindGroup>],
@@ -773,6 +793,9 @@ fn draw_scene(
             camera,
             meshes,
             terrain_renderer,
+            sky,
+            precipitation,
+            falling,
             bones,
             lighting,
         );
@@ -1010,11 +1033,19 @@ fn draw_streaming(
     camera: &Camera,
     meshes: &MeshRenderer,
     terrain_renderer: &TerrainRenderer,
+    sky: &render::SkyRenderer,
+    precipitation: &render::PrecipitationRenderer,
+    falling: Option<Falling>,
     bones: Option<&BoneBuffer>,
     lighting: Option<(dbc::light::Sample, f32)>,
 ) {
     let aspect = size.0 as f32 / size.1.max(1) as f32;
-    meshes.update_camera(gpu, &lit_uniform(camera, aspect, lighting));
+    meshes.update_camera(gpu, &lit_uniform(camera, aspect, sky, lighting));
+    // Built once here and handed to both the sky and the scene, rather than
+    // each asking the camera for its own: the sky's horizon has to sit exactly
+    // where the ground's does, and two derivations agree only until one of them
+    // is edited. Same reasoning as the picking ray.
+    let view_proj = camera.view_proj(aspect);
 
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("streaming world"),
@@ -1023,7 +1054,7 @@ fn draw_streaming(
             depth_slice: None,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(sky_colour(lighting.as_ref())),
+                load: wgpu::LoadOp::Clear(sky_colour(sky, lighting.as_ref())),
                 store: wgpu::StoreOp::Store,
             },
         })],
@@ -1039,6 +1070,17 @@ fn draw_streaming(
         timestamp_writes: None,
         occlusion_query_set: None,
     });
+
+    // First, and into the world's own pass so it shares the depth buffer:
+    // the sky writes no depth and refuses none, so everything below covers it
+    // and no second clear is needed.
+    sky.draw(
+        gpu,
+        &mut pass,
+        view_proj,
+        camera.eye(),
+        &sky_gradient(lighting.as_ref()),
+    );
 
     pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
     pass.set_pipeline(terrain_renderer.pipeline());
@@ -1090,6 +1132,23 @@ fn draw_streaming(
                 );
             }
         }
+    }
+
+    // Last, so it falls in front of everything solid -- and inside the same
+    // pass, so it can still be depth-tested against the world it is falling
+    // through rather than pasted over it.
+    if let Some(falling) = falling {
+        let shape = render::precipitation::Shape::for_kind(falling.kind);
+        precipitation.draw(
+            gpu,
+            &mut pass,
+            view_proj,
+            camera.eye(),
+            &shape,
+            drop_colour(sky, lighting.as_ref()),
+            falling.intensity,
+            falling.seconds,
+        );
     }
 }
 
@@ -1337,6 +1396,8 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     let blitter = Blitter::new(&gpu, format);
     let mut meshes = MeshRenderer::new(&gpu, format);
     let terrain_renderer = TerrainRenderer::new(&gpu, format, meshes.camera_layout());
+    let sky = render::SkyRenderer::new(&gpu, format);
+    let precipitation = render::PrecipitationRenderer::new(&gpu, format);
 
     let (mut scene, live) = build_scene(&gpu, &terrain_renderer, &mut meshes, chain, args)?;
     let camera = match (&scene, &live) {
@@ -1377,14 +1438,18 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
 
     // Read here rather than at startup: a texture or model view has no world to
     // light, and these are four tables worth of DBC.
-    let lighting = live
-        .is_some()
+    // A texture or model view has no world to light and skips four tables
+    // worth of DBC; a map with an hour asked for it does need them, connected
+    // or not.
+    let offline_map = offline_map_id(chain, args.map.as_deref());
+    let lighting = (live.is_some() || (offline_map.is_some() && args.hour.is_some()))
         .then(|| dbc::light::Lighting::load(|path| chain.read(path).ok()))
         .flatten();
     let camera_eye = match &camera {
         Camera::Fly(f) => f.position,
         Camera::Orbit(o) => o.eye(),
     };
+    let weather = frame_weather(live.as_ref(), args);
 
     let mut encoder = gpu
         .device
@@ -1402,11 +1467,24 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
         &blitter,
         &meshes,
         &terrain_renderer,
+        &sky,
+        &precipitation,
+        // A fixed clock, so two screenshots of the same weather are the same
+        // picture: a headless render exists to be compared against another
+        // one, and a wall clock would make every drop move between runs.
+        resolve_precipitation(weather, 4.0),
         &binds,
         bones.as_ref(),
         &world_binds,
         &identity,
-        resolve_lighting(lighting.as_ref(), live.as_ref(), args.hour, camera_eye),
+        resolve_lighting(
+            lighting.as_ref(),
+            live.as_ref(),
+            weather,
+            offline_map,
+            args.hour,
+            camera_eye,
+        ),
     );
     gpu.queue.submit([encoder.finish()]);
 
@@ -1447,6 +1525,8 @@ struct Renderer {
     blitter: Blitter,
     meshes: MeshRenderer,
     terrain_renderer: TerrainRenderer,
+    sky: render::SkyRenderer,
+    precipitation: render::PrecipitationRenderer,
     material_binds: Vec<wgpu::BindGroup>,
     world_binds: Vec<Vec<wgpu::BindGroup>>,
     identity: render::mesh::InstanceBuffer,
@@ -1468,6 +1548,8 @@ struct App {
     error: Option<String>,
     keys: KeyState,
     last_frame: Instant,
+    /// When the client started, which is the only clock the weather has.
+    started: Instant,
     frame_ms: f32,
     /// Selected sequence, or `None` for the bind pose.
     anim: Option<usize>,
@@ -1507,8 +1589,10 @@ struct App {
     /// two players who look alike share one entry, which is also exactly the
     /// key the renderer's model cache uses.
     player_looks: std::collections::HashMap<u64, Rc<character::Look>>,
-    /// The world's lighting tables, read once when a live world exists to light.
+    /// The world's lighting tables, read once when there is something to light.
     lighting: Option<dbc::light::Lighting>,
+    /// `--map`'s `Map.dbc` id, so `--hour` lights an offline world too.
+    offline_map: Option<u32>,
     /// The player's own interface: where every frame sits, what it looks like,
     /// and whether it is currently being rearranged.
     hud: ui::Hud,
@@ -1665,40 +1749,158 @@ fn drawable_with_own(live: &live::LiveWorld, speed: f32) -> Vec<live::Entity> {
 fn resolve_lighting(
     lighting: Option<&dbc::light::Lighting>,
     live: Option<&live::LiveWorld>,
+    // What the sky is doing. Resolved by `frame_weather` rather than read off
+    // `live` here, so the storm blend and the falling drops cannot come from
+    // different states -- see that function.
+    weather: ::world::WeatherChange,
+    // The map to light when there is no connection -- `--map`'s directory
+    // resolved through `Map.dbc`. See `offline_map_id`.
+    offline_map: Option<u32>,
     override_hour: Option<f32>,
     at: glam::Vec3,
 ) -> Option<(dbc::light::Sample, f32)> {
     let lighting = lighting?;
-    let live = live?;
-    let hour = match override_hour {
-        Some(hour) => hour,
-        None => {
-            let (time, learned) = live.state.game_time?;
-            let now = time.advanced(learned.elapsed());
-            now.minute_of_day() as f32 / 60.0
+    // **Without a realm there is still a map and an hour**, and `--hour`'s
+    // whole purpose is to look at a curve without waiting for it. It used to
+    // resolve nothing at all offline: the flag parsed, the help text promised,
+    // and an offline screenshot silently got the fallback gradient -- which is
+    // a perfectly plausible sky, so nothing announced that the tables had not
+    // been consulted. That cost a look at this milestone's first render.
+    let (map_id, storm, hour) = match live {
+        Some(live) => {
+            let hour = match override_hour {
+                Some(hour) => hour,
+                None => {
+                    let (time, learned) = live.state.game_time?;
+                    let now = time.advanced(learned.elapsed());
+                    now.minute_of_day() as f32 / 60.0
+                }
+            };
+            (live.map_id, storm_of(weather), hour)
         }
+        // Offline the hour has to be asked for: there is no clock to read, and
+        // defaulting to noon would light every model view as an outdoor scene.
+        None => (offline_map?, storm_of(weather), override_hour?),
     };
     let minute_of_day = (hour * 60.0).rem_euclid(1440.0) as u32;
-    // What the sky is doing, from the server. A zone with no weather reports
-    // clear and blends nothing, so this costs the common case a comparison.
-    let weather = live.state.weather;
-    let storm = if weather.weather.is_storm() {
-        weather.intensity
-    } else {
-        0.0
-    };
-    let sample = lighting.sample_in(live.map_id, at.x, at.y, minute_of_day, storm)?;
+    let sample = lighting.sample_in(map_id, at.x, at.y, minute_of_day, storm)?;
     Some((sample, hour))
 }
 
-/// What to clear the sky to: the world's own sky colour, or the fixed one.
+/// The `Map.dbc` id of the map directory `--map` named, if it named one.
 ///
-/// Worth doing even though this client draws no skybox. Without it a midnight
-/// scene is lit for night and framed by a daytime horizon, which reads as a bug
-/// in the lighting rather than as a missing feature.
-fn sky_colour(lighting: Option<&(dbc::light::Sample, f32)>) -> wgpu::Color {
-    let [r, g, b] = lighting.map_or([0.42, 0.55, 0.70], |(sample, _)| sample.sky);
+/// `Light.dbc` keys on the numeric id and the command line takes the folder
+/// name, which is the only place the two ever have to be connected.
+fn offline_map_id(chain: &mut Chain, directory: Option<&str>) -> Option<u32> {
+    let directory = directory?;
+    let bytes = chain.read(dbc::schema::Map::PATH).ok()?;
+    let maps = dbc::schema::Map::parse(&bytes).ok()?;
+    let id = maps
+        .iter()
+        .find(|row| row.directory().eq_ignore_ascii_case(directory))
+        .map(|row| row.id());
+    id
+}
+
+/// What to clear the sky to before the gradient is drawn over it.
+///
+/// **A safety net rather than the sky.** `SkyRenderer` covers every pixel of
+/// the frame, so in the ordinary case this colour is never seen; it exists so
+/// that a viewport the sky pass somehow misses reads as the horizon rather than
+/// as whatever the last frame left there.
+fn sky_colour(
+    sky: &render::SkyRenderer,
+    lighting: Option<&(dbc::light::Sample, f32)>,
+) -> wgpu::Color {
+    let horizon = lighting.map_or(
+        dbc::light::DEFAULT_SKY[dbc::light::bands::HORIZON],
+        |(sample, _)| sample.horizon(),
+    );
+    // Through the renderer's own conversion: a clear colour is written to the
+    // target by the same rules a shader's output is, so if one of the two needs
+    // undoing the encode then so does the other.
+    let [r, g, b] = sky.encode(horizon);
     wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }
+}
+
+/// What is coming down this frame, and how hard.
+#[derive(Clone, Copy, Debug)]
+struct Falling {
+    kind: render::precipitation::Kind,
+    /// 0 to 1, as `SMSG_WEATHER` reports it.
+    intensity: f32,
+    /// Seconds since the client started, which is the field's only clock.
+    seconds: f32,
+}
+
+/// How far towards the stormy curves a weather state takes the lighting.
+///
+/// A zone with no weather reports clear and blends nothing, so the common case
+/// costs one comparison.
+fn storm_of(weather: ::world::WeatherChange) -> f32 {
+    if weather.weather.is_storm() {
+        weather.intensity
+    } else {
+        0.0
+    }
+}
+
+/// The weather in force this frame: `--weather` if given, else the realm's.
+///
+/// **One function, because two consumers must agree.** The lighting blends
+/// towards the storm curves and the precipitation decides what falls, and a
+/// client that greyed the sky from the server while raining from the command
+/// line would be showing a state that exists nowhere. Same reasoning as
+/// unprojecting the picking ray from the matrix the scene was drawn with.
+fn frame_weather(live: Option<&live::LiveWorld>, args: &Args) -> ::world::WeatherChange {
+    if let Some(raw) = args.weather {
+        return ::world::WeatherChange {
+            weather: ::world::Weather::from_raw(raw),
+            intensity: args.weather_intensity.clamp(0.0, 1.0),
+            abrupt: true,
+        };
+    }
+    live.map(|live| live.state.weather).unwrap_or_default()
+}
+
+/// Whether anything is falling.
+///
+/// **Deliberately not `Weather::is_storm`.** That predicate exists to choose
+/// between two sets of light curves and counts fog as a storm, which is right
+/// for lighting and would rain on a misty morning here. See
+/// `world::Weather::precipitation`.
+fn resolve_precipitation(weather: ::world::WeatherChange, seconds: f32) -> Option<Falling> {
+    let kind = match weather.weather.precipitation() {
+        ::world::Precipitation::Rain => render::precipitation::Kind::Rain,
+        ::world::Precipitation::Snow => render::precipitation::Kind::Snow,
+        ::world::Precipitation::None => return None,
+    };
+    Some(Falling {
+        kind,
+        intensity: weather.intensity,
+        seconds,
+    })
+}
+
+/// What colour to draw a drop.
+///
+/// **Chosen, like everything else about a raindrop** -- `SMSG_WEATHER` sends a
+/// state and an intensity and says nothing about how the water looks. It is
+/// the horizon colour lightened towards white: taking the hour's own colour is
+/// what stops rain being a grey overlay pasted on a golden dusk, and lightening
+/// it is what keeps a streak visible against ground painted in that very
+/// colour by the fog.
+fn drop_colour(sky: &render::SkyRenderer, lighting: Option<&(dbc::light::Sample, f32)>) -> [f32; 3] {
+    let horizon = lighting.map_or(
+        dbc::light::DEFAULT_SKY[dbc::light::bands::HORIZON],
+        |(sample, _)| sample.horizon(),
+    );
+    sky.encode(horizon.map(|c| c + (1.0 - c) * 0.35))
+}
+
+/// The gradient to hand the sky pass: the world's own, or the fixed fallback.
+fn sky_gradient(lighting: Option<&(dbc::light::Sample, f32)>) -> render::sky::Gradient {
+    lighting.map_or(dbc::light::DEFAULT_SKY, |(sample, _)| sample.sky)
 }
 
 /// Where the sun is at a given hour, as a direction *towards* it.
@@ -1724,6 +1926,8 @@ fn sun_direction(hour: f32) -> glam::Vec3 {
 fn lit_uniform(
     camera: &Camera,
     aspect: f32,
+    // Only for its colour conversion -- see the fog term below.
+    sky: &render::SkyRenderer,
     lighting: Option<(dbc::light::Sample, f32)>,
 ) -> render::mesh::CameraUniform {
     let mut uniform = camera.uniform(aspect);
@@ -1733,9 +1937,34 @@ fn lit_uniform(
     let sun = sun_direction(hour);
     uniform.light = [sun.x, sun.y, sun.z, 0.0];
     // `w` carries "there is light data", which is what the shaders switch on.
-    uniform.sun = [sample.diffuse[0], sample.diffuse[1], sample.diffuse[2], 1.0];
-    uniform.ambient = [sample.ambient[0], sample.ambient[1], sample.ambient[2], 0.0];
-    uniform.fog = [sample.fog[0], sample.fog[1], sample.fog[2], 0.0];
+    // **The same undoing of the sRGB encode as the sky, and for a reason that
+    // can be derived rather than judged.** These two are a pure multiplier on
+    // a texel: `shade` computes `texel.rgb * (ambient + sun * ndl)`. The
+    // original client multiplied a texture *byte* by a light *byte* into an
+    // 8-bit framebuffer, so its result was `T * L / 255` in display units.
+    // Here the texture is decoded to linear on sample and the result is
+    // re-encoded on write, so matching that requires a factor of `(L/255)^2.2`
+    // -- which is exactly `to_linear`. Being faithful to the original and
+    // being physically right turn out to be the same answer, which is the only
+    // reason this is a change and not a preference.
+    //
+    // It was visible before it was derived: with the sky corrected and these
+    // two left raw, the world stayed bright under a dusk sky and the two read
+    // as disagreeing about the hour.
+    let sun = sky.encode(sample.diffuse);
+    let ambient = sky.encode(sample.ambient);
+    uniform.sun = [sun[0], sun[1], sun[2], 1.0];
+    uniform.ambient = [ambient[0], ambient[1], ambient[2], 0.0];
+    // The horizon, not a band of its own -- see `dbc::light::bands::HORIZON`.
+    // Distant terrain fades into the colour of the sky it meets, which is the
+    // one thing about fog that cannot be got wrong by construction -- provided
+    // both are written to the target in the same space. Fog is *mixed towards*
+    // rather than multiplied by, so at full distance the pixel is this colour
+    // exactly, and it needs the same undoing of the sRGB encode the sky does.
+    // Without it the far hills come out brighter than the sky they meet, which
+    // would look like the two disagreeing about the horizon.
+    let fog = sky.encode(sample.fog());
+    uniform.fog = [fog[0], fog[1], fog[2], 0.0];
     uniform.fog_range = [sample.fog_start, sample.fog_end, 0.0, 0.0];
     uniform
 }
@@ -1842,6 +2071,10 @@ impl App {
             last_cursor: None,
             error: None,
             last_frame: Instant::now(),
+            // The weather's own clock. Separate from `last_frame` because that
+            // one is reset every frame, and a falling drop needs a monotone
+            // total rather than a delta.
+            started: Instant::now(),
             frame_ms: 0.0,
             anim: None,
             anim_time_ms: 0,
@@ -1855,6 +2088,7 @@ impl App {
             last_ping: Instant::now(),
             last_undrawable_warned: 0,
             player_looks: std::collections::HashMap::new(),
+            offline_map: None,
             lighting: None,
             target: None,
             press_at: None,
@@ -1937,6 +2171,8 @@ impl ApplicationHandler for App {
         let blitter = Blitter::new(&gpu, format);
         let mut meshes = MeshRenderer::new(&gpu, format);
         let terrain_renderer = TerrainRenderer::new(&gpu, format, meshes.camera_layout());
+        let sky = render::SkyRenderer::new(&gpu, format);
+        let precipitation = render::PrecipitationRenderer::new(&gpu, format);
         let depth = DepthBuffer::new(&gpu, config.width, config.height);
 
         let scene = match build_scene(
@@ -1947,7 +2183,8 @@ impl ApplicationHandler for App {
             &self.args,
         ) {
             Ok((scene, live)) => {
-                if live.is_some() {
+                self.offline_map = offline_map_id(&mut self.chain, self.args.map.as_deref());
+                if live.is_some() || (self.offline_map.is_some() && self.args.hour.is_some()) {
                     // Start the movement and keepalive clocks from the moment
                     // the connection is actually ready to drive, not from
                     // whenever the window happened to be created.
@@ -2020,6 +2257,8 @@ impl ApplicationHandler for App {
             blitter,
             meshes,
             terrain_renderer,
+            sky,
+            precipitation,
             material_binds,
             world_binds,
             identity,
@@ -2549,9 +2788,12 @@ impl App {
             Camera::Fly(f) => f.position,
             Camera::Orbit(o) => o.eye(),
         };
+        let weather = frame_weather(self.live.as_ref(), &self.args);
         let lighting = resolve_lighting(
             self.lighting.as_ref(),
             self.live.as_ref(),
+            weather,
+            self.offline_map,
             self.args.hour,
             eye,
         );
@@ -2567,6 +2809,9 @@ impl App {
                 &r.blitter,
                 &r.meshes,
                 &r.terrain_renderer,
+                &r.sky,
+                &r.precipitation,
+                resolve_precipitation(weather, self.started.elapsed().as_secs_f32()),
                 &r.material_binds,
                 r.bones.as_ref(),
                 &r.world_binds,

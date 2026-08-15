@@ -37,7 +37,7 @@ pub use protocol::{
 };
 pub use state::{Cast, Replication, WorldState};
 pub use update::{Block, MonsterMove, ObjectType, Position};
-pub use weather::{Weather, WeatherChange};
+pub use weather::{Precipitation, Weather, WeatherChange};
 
 /// Names the playable races by id.
 ///

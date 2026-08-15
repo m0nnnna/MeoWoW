@@ -101,15 +101,30 @@ pub fn report(chain: &mut Chain, map_id: u32, x: f32, y: f32, hour: f32) -> Resu
   what the renderer will use:
     diffuse {}
     ambient {}
-    sky     {}
     fog     {} from {:.0} to {:.0}",
         describe_colour(sample.diffuse),
         describe_colour(sample.ambient),
-        describe_colour(sample.sky),
-        describe_colour(sample.fog),
+        describe_colour(sample.fog()),
         sample.fog_start,
         sample.fog_end
     );
+    // The sky is five colours, drawn as a gradient, so printing one of them
+    // would report a picture the renderer does not draw. Zenith first, and
+    // named at both ends, because which end is which is the whole claim -- see
+    // `dbc::light::bands::SKY`.
+    println!("    sky     zenith to horizon:");
+    for (index, colour) in sample.sky.iter().enumerate() {
+        let end = match index {
+            dbc::light::bands::ZENITH => "  <- zenith",
+            dbc::light::bands::HORIZON => "  <- horizon, and the fog colour",
+            _ => "",
+        };
+        println!(
+            "              band {} {}{end}",
+            dbc::light::bands::SKY[index],
+            describe_colour(*colour)
+        );
+    }
 
     // Every band, sampled now and across the day. This is what identifies a
     // band by what it does, which is the only thing that has identified one

@@ -883,17 +883,21 @@ a named module of constants rather than numbers scattered through the shader
 feed. One wrong index there does not fail -- it just makes the world the wrong
 colour.
 
-**The sky is cleared to the world's own colour too.** No skybox is drawn yet,
+**The sky was cleared to the world's own colour too.** No skybox is drawn yet,
 but without this a midnight scene is lit for night and framed by a daytime
 horizon, which reads as a bug in the lighting rather than as a missing feature.
-Dawn now comes up peach, noon pale blue, midnight dark blue.
+Dawn came up peach, noon pale blue, midnight dark blue. *Part three replaced
+that single colour with the gradient the table actually describes; the clear
+colour survives only as a safety net behind a pass that covers every pixel.*
 
 **Fog is wired and currently invisible**, which is worth saying rather than
 leaving to be discovered: the distance band reads 18,000 units on Azeroth and
 fog starts at a quarter of that, so nothing within kilometres of the camera is
 touched. The colour band it uses is unconfirmed. Both are left connected rather
 than disabled, so the day the distance turns out to mean something else, it
-shows up as fog appearing rather than as nothing happening.
+shows up as fog appearing rather than as nothing happening. *Weather made it
+visible -- a storm pulls the horizon to 10,000 -- and part three showed the
+colour band was not merely unconfirmed but wrong.*
 
 `--hour` overrides the realm's clock, because the curves are functions of the
 hour and waiting six real hours for dusk is not a debugging loop. `wow-cli
@@ -901,9 +905,177 @@ light` prints exactly what the renderer will use, resolved **through the same
 code** -- a verification tool that computed its own numbers would stop being
 evidence about the renderer the moment either drifted.
 
-Still to do: a skybox proper (`LightSkybox` names the models), weather, the
-several sky bands that layer into a gradient rather than one flat colour, and
-the interior lights that matter once a building has an inside.
+Still to do at the time: a skybox proper (`LightSkybox` names the models),
+weather, the several sky bands that layer into a gradient rather than one flat
+colour, and the interior lights that matter once a building has an inside.
+*Weather arrived next, then the gradient; the skybox turned out not to apply to
+the ordinary outdoor world at all, and interior lights are still open.*
+
+### Lighting, part three: the sky is five bands, and everything was too bright
+
+`Light.dbc` bands **2 to 6 are the sky, zenith first and horizon last**. That is
+measured rather than assumed, and it is the first band assignment here that no
+render had to arbitrate.
+
+At noon on Azeroth's default light the five read
+
+```
+2 (  0, 31, 73)   3 ( 58,162,207)   4 (153,220,245)   5 (175,218,224)   6 (180,180,180)
+```
+
+-- a deep blue overhead whitening into a grey haze, with red climbing across all
+five while the spread between the channels falls to *exactly* zero at the last
+one. At midnight they run (0,0,0) to (49,86,123), monotone in every channel.
+
+**Dawn is what makes it unarguable.** A sunrise is the one hour when a sky is
+not a simple ramp. At 06:00 red minus blue runs `-49, -60, +138, +191, +179`: it
+crosses zero exactly once, and the warm side is the horizon side. Sunset does
+the same. Nothing but a sky behaves that way, and it settles the byte order for
+good -- read red-first, the sunrise would be directly overhead.
+
+The tests assert the dawn crossing rather than the noon ramp, because at noon
+almost any bright-to-dark reading of five bands looks like a plausible gradient
+and agreeing with one proves nothing. The crossing has a *side*, and a side is
+something an ordering can get wrong. Same lesson as the storm column: ask the
+question that can come out either way.
+
+#### What that changed besides the sky
+
+**Fog was pointing at the zenith.** `bands::FOG` was band 2 -- black at
+midnight, deep navy at noon -- so distant ground faded into the colour of the
+sky directly overhead. That is refuted rather than merely unconfirmed, and the
+replacement is deliberately *not* another named band: fog is what the far
+distance resolves to, the far distance is the horizon, and band 6 is a measured
+statement of what colour the horizon is at this hour under this weather.
+Distant terrain now meets the sky it is drawn against by construction. Bands 7,
+11 and 13 all behave plausibly like a separate fog colour and none of them is
+named, because nothing has separated them from each other.
+
+**The diffuse light is the horizon band, and that is a borrowing rather than a
+coincidence.** The colour a low sun arrives in *is* the colour it has painted
+the horizon, so a band authored for one reads correctly as the other. What the
+table does not appear to contain is a sun that dims: bands 0 and 9 are the only
+two whose brightness barely moves across a whole day, and band 9's hue -- cool
+white at midnight, orange at dawn, warm white at noon -- is a sun and moon
+*disc*, whose contribution depends on where it is rather than what colour it
+is. Whether the direct light should be band 9 modulated by elevation is open,
+and only a render can answer it.
+
+#### The heights are chosen; only the order is measured
+
+Nothing in the data says how far up each band sits -- the original client keeps
+that in a dome mesh, not a table -- so the mapping from elevation to band is a
+choice, in the same class as the sun's arc, and is written down as one.
+
+Evenly spaced was the first attempt and a render refused it. At 22.5 degrees
+apart the two blue bands sit above 60 degrees, which a camera parked behind a
+character's shoulder never looks at, and midday Elwynn came back under a nearly
+white sky. The layers are now weighted towards the horizon (the square root of
+the elevation fraction, putting them at 0, 5.6, 22.5, 50.6 and 90 degrees),
+which is also the direction the physics goes: a view ray crosses more air the
+flatter it runs, so a sky changes fastest at the bottom and barely at all near
+the top.
+
+#### And a double encode that had been there all along
+
+**The band bytes are display values, and an sRGB target re-encodes what a
+shader writes to it.** `LightIntBand` stores bytes the original client pushed
+straight at an 8-bit framebuffer, so 49 meant 49 on screen. Handed to an sRGB
+target as-is, 49/255 is read as a *linear* 0.19 and encoded back up to 123.
+
+The error grows the darker the colour is, which is exactly why it survived:
+every daylight render looked fine, and the first thing that showed it was
+**midnight over Elwynn coming out a bright afternoon blue**. Undoing the encode
+makes the byte in the table the byte on the screen -- verified by sampling the
+render: at 19:00 the frame reads (94,106,143), (143,137,135), (173,139,111)
+against the table's (96,108,146), (149,141,133), (180,138,101).
+
+The same applied to the fog and to the diffuse and ambient terms, and the second
+of those was **not** obviously an arithmetic slip -- those multiply textures
+already decoded to linear on sample, so what space the factor belongs in is a
+real question. It was reported before it was derived: with the sky corrected and
+the lighting left raw, the world stayed bright under a dusk sky and the two read
+as disagreeing about the hour.
+
+The derivation settles it. `shade` computes `texel.rgb * (ambient + sun * ndl)`,
+a pure multiplier. The original client multiplied a texture *byte* by a light
+*byte* into an 8-bit framebuffer, giving `T * L / 255` in display units. Here
+the texture is decoded on sample and the result re-encoded on write, so matching
+that needs a factor of `(L/255)^2.2` -- which is `to_linear`. Being faithful to
+the original and being physically right turn out to be the same answer, which is
+the only reason this is a change rather than a preference.
+
+#### Drawing it
+
+One oversized triangle, no dome mesh, and the view ray per pixel unprojected
+from the very matrix the scene is drawn with -- the same rule the picking ray
+follows. A sky rebuilt from the camera's angles would agree with the scene only
+until somebody changed the projection, and the failure mode is a horizon sitting
+slightly off the ground it meets.
+
+It draws first, into the world's own pass, sharing the depth buffer: it writes
+no depth and refuses none, so everything solid covers it and no second clear is
+needed. Below the horizon the gradient holds rather than mirroring.
+
+There is still **no skybox**, and that is not an omission.
+`LightParams.light_skybox_id` is 0 on the row that lights Elwynn, and
+`LightSkybox.dbc`'s 124 rows are named things like `StratholmeSkybox` and
+`CavernsOfTimeSky` -- special places, not the ordinary outdoor world. Neither is
+there a sun or moon disc, a cloud layer, or stars.
+
+### Weather that falls
+
+Rain and snow, as a field of camera-relative billboards drawn over the world.
+
+**No vertex buffer, no instance buffer, and no CPU-side particle list.** A
+raindrop needs a position and a speed, both pure functions of its index, so the
+draw is `draw(0..6, 0..count)` and every drop hashes its own seed in the vertex
+shader. A CPU list would have to be uploaded every frame to move, and what was
+being uploaded would be entirely derivable from a counter.
+
+The field is a box that **follows the camera by wrapping**: each drop's offset
+from the eye is taken modulo the box, so walking forward brings drops round from
+behind and no drop is ever created or destroyed. Drops are indistinguishable, so
+the wrap is invisible.
+
+It is drawn last in the world pass, and it **tests depth without writing it**.
+Testing is what stops rain falling through the abbey wall; not writing is what
+lets thousands of unsorted drops blend without each occluding the next.
+
+Every number about a raindrop is chosen -- `SMSG_WEATHER` sends a state and an
+intensity and stops -- so they live in one `Shape` struct, and two of them exist
+only because a render demanded them:
+
+- **The near fade.** A drop is a fixed size in the world, so one an arm's length
+  from the eye covers a third of the screen. The first render was a field of
+  white bars. Near drops are also the ones a real eye cannot focus on, so
+  removing them is not a cheat.
+- **The slant.** Rain falling exactly along the world's up axis draws every
+  streak parallel to every other and to the edges of the window, and reads as a
+  picket fence.
+
+Snow is not rain drawn slowly. It needs `roundness` -- a falloff *along* its
+travel as well as across it -- because a raindrop's ends are hard (the streak is
+the exposure, not the drop) and a snowflake's are not. Without it snow rendered
+as tiny vertical bars.
+
+**What falls is a different question from what storms.** `Weather::is_storm`
+counts fog as a storm, which is right for choosing light curves -- the storm
+curves are what fog looks like -- and would rain on a misty morning here. Hence
+`Weather::precipitation`, with its own test asserting that fog storms and stays
+dry. Thunderstorms and the three sandstorms are deliberately dry: neither has
+been seen from a realm here, and a missing effect is visible and fixable where a
+wrong one just looks odd for ever.
+
+The clock is wrapped at ten minutes inside `draw` rather than trusted from the
+caller. A drop falls by `speed * seconds`, and an `f32` holding an hour of that
+has lost enough precision to quantise a drop below its own width -- so rain
+would slowly become a flickering grid on a client left running, which is a
+failure nobody would ever catch by looking. There is a test for the hour mark.
+
+`--weather <state>` overrides the realm's, for the same reason `--hour`
+overrides its clock. Weather that can only be looked at by starting a server and
+typing `.wchange` is weather nothing headless can check.
 
 ### Game objects
 

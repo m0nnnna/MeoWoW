@@ -14,11 +14,11 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
 | Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated *creatures* slide along their actual path, turn to face it, and play the model's own walk/stand cycles. **Other players do not** — see the known defect below |
 | Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, a spellbook you arrange the bars from, `F1` to rearrange, saved to `ui.toml` |
-| World | Lighting and the day/night cycle come from `Light.dbc`'s curves and the realm's own clock: real sun, ambient and sky colour, dawn through midnight. **Weather works**: `SMSG_WEATHER` picks the stormy set of curves and blends towards it by intensity, so rain greys the sky, dims the light and pulls the horizon in from 18,000 units to 10,000. Nothing *falls* yet — there is no particle system, and no skybox. Game objects — doors, benches, chests, ships — are drawn |
+| World | Lighting and the day/night cycle come from `Light.dbc`'s curves and the realm's own clock. **The sky is a real gradient**: bands 2–6 are the sky from zenith to horizon, identified by the one hour that could refute it — at dawn the warm/cool crossing lands on the horizon side, once. Fog is *derived* from the horizon band rather than named, so distant terrain meets the sky it is drawn against. **Weather works and now falls**: `SMSG_WEATHER` blends towards the stormy curves *and* rain or snow comes down, as camera-relative billboards with no particle buffer at all. Still no skybox (Elwynn names none), no sun disc, no clouds, no M2 emitters. Game objects — doors, benches, chests, ships — are drawn |
 | Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components. **The player's weapon is drawn**: the M2 attachment table parses, and a sword or shield hangs off the hand's animated bone and swings with it. Shoulders, helms and ranged weapons are not, and there is no sheathed state — see below. Other players' equipment still needs their visible-item fields |
 | Game | **4.3 done**: three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. **A spellbook panel** (`P`) now lists what the character can do and puts it on a bar by click, auto-attack included -- see the note below on why the seeding filter had to reject it. Threat and the corpse *interface* remain (the corpse protocol is done). Inventory and quests follow |
 
-Roughly 58% of the way to something a person could test by playing. See
+Roughly 60% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
 
 **Weapons are drawn, and they sheathe.** `Z` draws and stows, attacking draws
@@ -440,6 +440,45 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   the hand would have put every weapon in the game in the wrong one, silently.
   When a column's name suggests an answer, find the rows where the name is
   unambiguous -- the pairs, the extremes -- and let those define it.
+- **An error that scales with the value hides in the half of the range you
+  look at.** `Light.dbc`'s colour bands are *display* bytes and an sRGB render
+  target re-encodes whatever a shader writes to it, so every one of them was
+  brightened on the way to the screen — 49 arriving as 123. It had been true
+  since lighting existed and no daylight render ever showed it, because near
+  the top of the range the curve is nearly flat. What showed it was **midnight
+  over Elwynn coming out a bright afternoon blue**. When a transform's error
+  vanishes at one end, testing at that end proves nothing; go to the other.
+- **Correcting half of a matched pair is worse than correcting neither.** The
+  same double-encode applied to the sky, the fog and the diffuse light. The
+  sky's fix was unarguable — it is written straight to the target — and the
+  diffuse's was not, because it multiplies textures already decoded to linear,
+  so what space it belongs in is a real question rather than a slip. Fixing
+  only the certain half left the world bright under a dusk sky, and the report
+  that came back was not "the lighting is wrong" but *"the sky looks like
+  night even if it is bright"* — a complaint about the half that was correct.
+  The derivation then settled it and both answers agreed. If two values are
+  compared by eye, they must be converted together or not at all.
+- **Ask the hour that can refute you.** Five sky bands look like a plausible
+  gradient at noon under almost any ordering, so agreeing with one is nearly
+  free. At dawn a sky is not a ramp: the warm half arrives at a definite height
+  and the crossing has a *side*. That is what identified the bands, and it is
+  the same move as comparing `$d` descriptions against the rest rather than
+  asking whether a column contains valid ids. A test that cannot come out the
+  other way is not evidence.
+- **An instrument that fails quietly costs more than one that fails.**
+  `--hour` parsed, promised in its help text, and did nothing without a realm —
+  an offline screenshot silently got the fallback gradient, which is a
+  perfectly plausible sky. Several minutes went into studying a picture that
+  had never consulted the tables. A flag that cannot act should say so, not
+  render something believable.
+- **A green suite is a claim with a date on it.** `cargo test` was not green at
+  `HEAD` despite a handoff saying so: 4.8's global-sequence fix had invalidated
+  a test's premise ("a sequence index past the end has no keys anywhere" — a
+  global track has no sequence to be outside of). The behaviour was right and
+  the test was describing the old bug. Run it before believing it, and when a
+  fix invalidates a test, the rewrite has to assert **both** halves — that the
+  ordinary case still holds *and* that the exception genuinely differs — or it
+  passes just as well after a regression to the original bug.
 - **A property test is only as good as the population, and 200 irrelevant rows
   will bury two decisive ones.** Asking whether `Light.dbc`'s storm column is
   really the storm column across every outdoor light came back flat: darker 55%

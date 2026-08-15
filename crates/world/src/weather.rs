@@ -78,6 +78,43 @@ impl Weather {
     pub fn is_storm(self) -> bool {
         !matches!(self, Self::Fine | Self::Unknown(_))
     }
+
+    /// What actually falls out of the sky.
+    ///
+    /// **A different question from [`is_storm`], and the difference is the
+    /// point.** That one answers "which set of light curves", where fog counts
+    /// as a storm because the storm curves are exactly what fog looks like.
+    /// Nothing falls in fog, so reusing it here would rain indoors on a misty
+    /// morning -- the shape of trap this project keeps paying for, where a
+    /// predicate is right for the caller it was written for and quietly wrong
+    /// for the next one.
+    ///
+    /// Thunderstorms and the three sandstorms are deliberately dry. A
+    /// thunderstorm surely rains and a sandstorm surely blows something, but
+    /// neither has been seen from a realm here, and an effect that is missing
+    /// is visible and fixable where one that is wrong just looks odd for ever.
+    ///
+    /// [`is_storm`]: Weather::is_storm
+    pub fn precipitation(self) -> Precipitation {
+        match self {
+            Self::LightRain | Self::MediumRain | Self::HeavyRain | Self::BlackRain => {
+                Precipitation::Rain
+            }
+            Self::LightSnow | Self::MediumSnow | Self::HeavySnow | Self::BlackSnow => {
+                Precipitation::Snow
+            }
+            _ => Precipitation::None,
+        }
+    }
+}
+
+/// What a weather state drops, as far as a renderer is concerned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Precipitation {
+    #[default]
+    None,
+    Rain,
+    Snow,
 }
 
 /// A parsed `SMSG_WEATHER`.
@@ -164,6 +201,42 @@ mod tests {
             assert!(
                 !matches!(Weather::from_raw(raw), Weather::Unknown(_)),
                 "state {raw} should have a name"
+            );
+        }
+    }
+
+    /// Falling and storming are not the same predicate.
+    ///
+    /// **Fog is the whole reason this test exists.** It is a storm for
+    /// lighting -- the storm curves are what fog looks like -- and nothing
+    /// falls in it. A renderer that reached for `is_storm` would rain on a
+    /// misty morning, and would pass any test that only checked rain rains.
+    #[test]
+    fn fog_is_a_storm_and_still_drops_nothing() {
+        assert!(Weather::Fog.is_storm());
+        assert_eq!(Weather::Fog.precipitation(), Precipitation::None);
+
+        for raw in [3, 4, 5, 90] {
+            assert_eq!(
+                Weather::from_raw(raw).precipitation(),
+                Precipitation::Rain,
+                "state {raw} should rain"
+            );
+        }
+        for raw in [6, 7, 8, 106] {
+            assert_eq!(
+                Weather::from_raw(raw).precipitation(),
+                Precipitation::Snow,
+                "state {raw} should snow"
+            );
+        }
+        // Deliberately dry until a realm has been seen to send them -- see
+        // `Weather::precipitation`.
+        for raw in [0, 22, 41, 42, 86] {
+            assert_eq!(
+                Weather::from_raw(raw).precipitation(),
+                Precipitation::None,
+                "state {raw} has no confirmed precipitation"
             );
         }
     }

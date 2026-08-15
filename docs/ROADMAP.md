@@ -2487,3 +2487,135 @@ once when a frame is drawn; this one is read from a hand-editable file and fed
 straight into a per-frame rate, where a zero freezes the camera and a negative
 inverts it. The guard belongs where it cannot be skipped by a caller that built
 the struct some other way.
+
+### 4.10: the sky is five bands, and the world was too bright
+
+The sky was one flat colour cleared behind the world. `Light.dbc` describes it
+as five, and this is where they were identified and drawn.
+
+**Bands 2 to 6 are the sky, zenith first and horizon last**, and the
+identification is the point rather than the render. Noon and midnight both look
+like plausible gradients under almost any ordering of five bands, so agreeing
+with one proves nothing. **Dawn is the hour that discriminates**, because a
+sunrise is not a ramp: at 06:00 red minus blue runs `-49, -60, +138, +191, +179`
+across the five, crossing zero exactly once with the warm side at the horizon.
+Sunset does the same. That crossing has a *side*, and a side is something an
+ordering can get wrong -- which is the whole difference between a test that can
+fail and one that cannot. It also settles the byte order for good: read
+red-first, the sunrise would be directly overhead.
+
+The full write-up is in `docs/RENDERING.md` under "Lighting, part three". What
+came out of it that was not the sky:
+
+- **Fog was pointing at the zenith**, so distant ground faded into the colour of
+  the sky directly overhead -- black at midnight. Not unconfirmed; wrong. It is
+  now *derived* from the horizon band rather than named, so distant terrain
+  meets the sky it is drawn against by construction. Three bands remain
+  plausible as a separate fog colour and none is named, because nothing has
+  separated them.
+- **The diffuse light is the horizon band.** It stays, on the render evidence
+  that put it there, but as a documented borrowing rather than an open
+  question: the colour a low sun arrives in is the colour it painted the
+  horizon. Whether it should instead be band 9 -- the sun and moon *disc*,
+  whose brightness is flat across the day because its contribution depends on
+  elevation -- modulated by that elevation is now the open question.
+- **Everything was too bright, and had been since lighting existed.** The band
+  bytes are display values and an sRGB target re-encodes what a shader writes,
+  so 49 became 123. The error grows the darker the colour is, which is why every
+  daylight render looked right and the thing that finally showed it was midnight
+  over Elwynn arriving as a bright afternoon blue.
+
+That last one is the one worth remembering, because the fix for the *sky* was
+obvious and the fix for the *lighting* was not. The sky is written straight to
+the target, so there is one right answer. The diffuse and ambient multiply
+textures already decoded to linear, so what space they belong in is a genuine
+question -- and it took a report ("the sky looks like night even if it is
+bright") to notice that correcting one and not the other left the world and its
+sky disagreeing about the hour. The derivation then settled it: the original
+client multiplied a texture byte by a light byte into an 8-bit framebuffer, so
+matching it needs a factor of `(L/255)^2.2`, which is exactly the linearisation.
+Faithful and physically-right turned out to be the same answer.
+
+**The heights of the five bands are chosen, not measured**, and that is stated
+everywhere it matters. Nothing in the data says how far up each sits -- the
+original client keeps it in a dome mesh. Evenly spaced was tried first and a
+render refused it: the blue bands landed above 60 degrees, where a third-person
+camera never looks, and midday Elwynn came back nearly white.
+
+There is still no skybox, and that turns out not to be a gap for the outdoor
+world: `LightParams.light_skybox_id` is 0 on the row that lights Elwynn, and
+`LightSkybox.dbc`'s 124 rows are named things like `StratholmeSkybox`. No sun
+disc, no clouds, no stars.
+
+#### And two instruments that were not working
+
+Neither was the task, and both cost time before they were fixed.
+
+**`--hour` did nothing offline.** The flag parsed, the help text promised, and
+an offline screenshot silently got the fallback gradient -- which is a perfectly
+plausible sky, so nothing announced that the lighting tables had not been
+consulted at all. The first render of this milestone was studied before that
+landed. It now resolves `--map` through `Map.dbc` and lights a world with no
+realm behind it.
+
+**`cargo test` was not green at `HEAD`.** `unanimated_bones_pose_to_identity`
+had been failing since 4.8's global-sequence fix, which invalidated the test's
+premise: it asserted that a sequence index past the end has no keys anywhere,
+and a global track has no sequence to be outside of. The behaviour was right and
+the test was describing the old bug. Rewritten to assert *both* halves -- bones
+that inherit no global track pose to identity, bones that do must not -- and
+walking the parent chain rather than the bone, because a bone with no track of
+its own still inherits an ancestor's global scale. Asserting only the first half
+would have passed while quietly tolerating a regression to the original bug.
+
+### 4.10 continued: weather that falls
+
+Rain and snow, and the first particles this renderer has drawn.
+
+**No vertex buffer, no instance buffer, and no CPU-side particle list.** A
+raindrop needs a position and a speed, both pure functions of its index, so the
+draw is `draw(0..6, 0..count)` and every drop hashes its own seed in the vertex
+shader. The field is a box that follows the camera by *wrapping*: each drop's
+offset from the eye is taken modulo the box, so walking forward brings drops
+round from behind and nothing is ever created or destroyed.
+
+It draws last in the world pass and **tests depth without writing it** --
+testing is what keeps rain out of the abbey's interior, not writing is what lets
+thousands of unsorted drops blend without occluding each other.
+
+Two of the constants exist only because a render demanded them. **The near
+fade**: a drop is a fixed size in the world, so one an arm's length from the eye
+covers a third of the screen, and the first render was a field of white bars.
+**The slant**: rain falling exactly along the world's up axis draws every streak
+parallel to every other and to the window's edges, and reads as a picket fence.
+And snow needed a third, `roundness`, because a raindrop's ends are hard -- the
+streak is the exposure, not the drop -- and a snowflake's are not; without it,
+snow drew as tiny vertical bars.
+
+**What falls is a different question from what storms.** `Weather::is_storm`
+counts fog as a storm, which is right for choosing between two sets of light
+curves and would have rained on a misty morning here. This is the shape of trap
+this project keeps paying for -- a predicate that is right for the caller it was
+written for and quietly wrong for the next one -- so precipitation got its own
+accessor and its own test, which asserts that fog storms *and stays dry*.
+Thunderstorms and the three sandstorms are deliberately dry: neither has been
+seen from a realm here, and a missing effect is visible and fixable where a
+wrong one just looks odd for ever.
+
+`--weather <state>` overrides the realm's, for the same reason `--hour`
+overrides its clock, and it is what makes the effect checkable headlessly. The
+GPU tests render it against a black background and read the pixels back: it
+falls, it falls harder with intensity, it stops at zero, it moves between two
+times, and **an hour in it is still falling** -- that last because a drop falls
+by `speed * seconds` and an `f32` holding an hour of that has lost enough
+precision to quantise a drop below its own width, so rain would slowly become a
+flickering grid on a client left running. The clock is wrapped inside `draw`
+rather than trusted from the caller, the same reasoning that puts
+`Camera::radians_per_pixel`'s clamp where it cannot be skipped.
+
+What is still missing: M2 particle emitters -- torches, spell effects, a fire
+elemental. Those are per-model and per-bone, with emitter types, lifespans,
+gravity, and colour and alpha tracks over a particle's life, and the header
+offsets for them are recorded but the block is unparsed. This milestone is what
+gives them a billboard path to arrive into. There is also no splash where rain
+lands, no sound, and no lightning.

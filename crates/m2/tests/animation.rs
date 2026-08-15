@@ -193,16 +193,75 @@ fn bone_matrices_are_finite_and_bounded() {
 }
 
 /// A bone with no keys in a sequence must resolve to identity, so an
-/// unanimated model renders exactly as the unskinned renderer drew it.
+/// unanimated model renders exactly as the unskinned renderer drew it -- and a
+/// bone on a *global* sequence must not, because it has no sequence to be
+/// outside of.
+///
+/// **Both halves, because the second one broke the first.** This asserted
+/// plain identity for every bone until global tracks began resolving, on the
+/// premise that "a sequence index past the end has no keys anywhere". A global
+/// track holds one keyframe list on a timeline shared by every animation, so
+/// the premise stopped being true and BogBeast's bone 44 -- carrying a constant
+/// scale of 1.45 -- started failing a test that was describing the old bug.
+/// Asserting only identity-for-the-rest would pass again while quietly
+/// tolerating a regression back to that bug, so the global bones are asserted
+/// to be *different* from identity in the same breath.
 #[test]
-fn unanimated_bones_pose_to_identity() {
+fn unanimated_bones_pose_to_identity_unless_they_are_global() {
     let mut chain = require_data!();
     let (_, _, bones) = load(&mut chain, r"Creature\BogBeast\BogBeast.m2");
-    // Sequence index far past the end has no keys anywhere.
+    // Sequence index far past the end: nothing keyed per-sequence can answer.
     let pose = Model::pose_bones(&bones, 9999, 0);
+    let has_global_track = |b: &m2::AnimatedBone| {
+        b.translation.global_sequence.is_some()
+            || b.rotation.global_sequence.is_some()
+            || b.scale.global_sequence.is_some()
+    };
+    // **Up the parent chain, not just the bone.** A pose is composed with its
+    // parent's, so a bone with no track of its own still inherits an ancestor's
+    // global scale -- BogBeast's bone 62 carries a 1.5 it never asked for.
+    // Checking only the bone itself made this test fail on a model that was
+    // behaving exactly as it should.
+    let is_global = |mut index: usize| loop {
+        let Some(bone) = bones.get(index) else {
+            return false;
+        };
+        if has_global_track(bone) {
+            return true;
+        }
+        match usize::try_from(bone.bone.parent) {
+            Ok(parent) if parent != index => index = parent,
+            _ => return false,
+        }
+    };
+    let worst_of = |m: &glam::Mat4| {
+        (*m - glam::Mat4::IDENTITY)
+            .to_cols_array()
+            .iter()
+            .fold(0.0f32, |a, b| a.max(b.abs()))
+    };
+
+    let mut globals = 0;
     for (i, m) in pose.iter().enumerate() {
-        let diff = (*m - glam::Mat4::IDENTITY).to_cols_array();
-        let worst = diff.iter().fold(0.0f32, |a, b| a.max(b.abs()));
-        assert!(worst < 1e-5, "bone {i} is not identity: {m:?}");
+        if is_global(i) {
+            globals += 1;
+            continue;
+        }
+        assert!(
+            worst_of(m) < 1e-5,
+            "bone {i} inherits no global track and is not identity: {m:?}"
+        );
     }
+    // The model was chosen because it has them. If it stops having any, this
+    // test has quietly become the weaker one it used to be.
+    assert!(
+        globals > 0,
+        "BogBeast has no global-sequence bones, so this proves only half of it"
+    );
+    assert!(
+        pose.iter()
+            .enumerate()
+            .any(|(i, m)| is_global(i) && worst_of(m) > 1e-5),
+        "every global bone posed to identity, which is the bug this guards"
+    );
 }

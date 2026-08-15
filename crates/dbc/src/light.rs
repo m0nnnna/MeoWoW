@@ -8,9 +8,10 @@
 //! whether something is *correct*, and a liability when two things must *stay*
 //! consistent.
 //!
-//! **What the eighteen colour bands mean is not decided here.** They are read
-//! and handed out by index. See [`Bands`] for what has been established about
-//! them, which is less than it is tempting to assume.
+//! **What the eighteen colour bands mean is mostly not decided here.** They are
+//! read and handed out by index. See [`bands`] for what has been established
+//! about them, which is less than it is tempting to assume -- with one
+//! exception: five of them are the sky, and that one is settled.
 
 use crate::schema::{
     float_band_id, int_band_id, Light, LightFloatBand, LightIntBand, LightParams, LightRow,
@@ -19,6 +20,13 @@ use crate::schema::{
 
 /// A colour from a band, in 0..1 per channel.
 pub type Colour = [f32; 3];
+
+/// The sky, zenith first and horizon last -- see [`bands::SKY`].
+///
+/// Five colours rather than one because that is how the table says it: the
+/// world's sky is a stack of layers, and collapsing it to a single clear colour
+/// was this client's approximation, not the data's.
+pub type SkyGradient = [Colour; bands::SKY.len()];
 
 /// Which curve is which.
 ///
@@ -36,7 +44,8 @@ pub type Colour = [f32; 3];
 ///   day -- and shifts hue rather than intensity. It is *not* the direct light,
 ///   which a render settled: used as one, midday Elwynn had olive grass and an
 ///   orange road.
-/// - Bands 3, 4 and 5 track the sky, brightening into noon.
+/// - **Bands 2 to 6 are the sky, in order from zenith to horizon.** See
+///   [`SKY`]; this is the one band assignment here that is not a hypothesis.
 /// - Band 12 has a single key of black on Azeroth's default light: unused.
 ///
 /// Which of those is *diffuse* is the open question, and a wrong answer here
@@ -44,11 +53,79 @@ pub type Colour = [f32; 3];
 /// why the constants are named in one place and rendered rather than reasoned
 /// about. See `docs/RENDERING.md`.
 pub mod bands {
+    /// The sky, zenith first, horizon last.
+    ///
+    /// **Measured, and the measurement is not close.** At noon on Azeroth's
+    /// default light these five read
+    ///
+    /// ```text
+    /// 2 (  0, 31, 73)   3 ( 58,162,207)   4 (153,220,245)   5 (175,218,224)   6 (180,180,180)
+    /// ```
+    ///
+    /// -- a deep blue overhead whitening into a grey haze. Red climbs
+    /// monotonically across all five while the spread between the channels
+    /// falls away to *exactly* neutral at the last one: 73, 149, 92, 49, 0. At
+    /// midnight the same five run (0,0,0), (0,12,32), (0,40,78), (27,70,112),
+    /// (49,86,123) -- monotone in all three channels, black overhead and
+    /// faintly blue low down.
+    ///
+    /// **Dawn is what makes it unarguable**, because a sunrise is the one hour
+    /// when a sky is not a simple ramp. At 06:00 they read (35,74,84),
+    /// (68,140,128), (210,121,72), (255,171,64), (255,202,76): cool teal
+    /// overhead, then a warm band that arrives abruptly at index 2 and
+    /// brightens to yellow. Red minus blue runs -49, -60, +138, +191, +179 --
+    /// it crosses zero exactly once, and the warm side is the horizon side.
+    /// Sunset does the same thing. Nothing but a sky does that, and no other
+    /// ordering of these five puts the crossing anywhere sensible.
+    ///
+    /// It also settles the byte order for good, because swapping the channels
+    /// negates that difference: red-first, the sunrise would be directly
+    /// overhead and the zenith would be the neutral end at noon.
+    pub const SKY: [u32; 5] = [2, 3, 4, 5, 6];
+    /// Where the horizon sits in [`SKY`] and in a sampled [`super::Sample`]'s
+    /// gradient. Named because "the last one" is true of the array and not of
+    /// the idea.
+    ///
+    /// **The fog colour is derived from here, and there is no fog band.** Fog
+    /// used to point at band 2, which is now known to be the *zenith* -- black
+    /// at midnight, deep navy at noon -- so distant ground was fading into the
+    /// colour of the sky directly overhead. That is positively refuted rather
+    /// than merely unconfirmed, and the replacement is deliberately not another
+    /// guess: fog is what the far distance resolves to, the far distance is the
+    /// horizon, and this entry is a *measured* statement of what colour the
+    /// horizon is at this hour under this weather. Distant terrain now meets
+    /// the sky it is drawn against by construction, at every hour, instead of
+    /// meeting a band that has to be right.
+    ///
+    /// Bands 7, 11 and 13 all behave plausibly like a separate fog colour --
+    /// band 7 in particular tracks the sky's brightness while staying well
+    /// below it, which is what "distant mountains" would look like. Nothing has
+    /// separated them from each other, so none of them is named.
+    pub const HORIZON: usize = 4;
+    /// And the other end.
+    pub const ZENITH: usize = 0;
+
     /// The direct light. **Band 0 was the first guess and a render refused
     /// it**: it reads (255, 136, 0) at noon, and Elwynn came back with olive
     /// grass and an orange road. Band 6 is neutral grey (180, 180, 180) at
     /// noon and dim blue (49, 86, 123) at midnight, which is what a sun that
     /// becomes a moon looks like.
+    ///
+    /// **It is also the horizon end of [`SKY`], and that is now known.** The
+    /// two claims do not conflict so much as explain each other: the colour a
+    /// low sun arrives in *is* the colour it has painted the horizon, so a band
+    /// authored for one reads correctly as the other. It stays here on the
+    /// render's evidence rather than being renamed away, but it is no longer a
+    /// band whose meaning is open -- it is a band being borrowed.
+    ///
+    /// What the table does **not** appear to contain is a sun that dims. Bands
+    /// 0 and 9 are the two whose brightness barely moves across a whole day
+    /// (389/358/391/373 and 728/615/724/675 summed over the channels), and band
+    /// 9's hue -- cool white at midnight, orange at dawn, warm white at noon --
+    /// is a sun and moon *disc*, whose contribution to the ground depends on
+    /// where it is in the sky rather than on what colour it is. Whether the
+    /// direct light should be band 9 modulated by elevation instead is open,
+    /// and only a render can answer it.
     pub const DIFFUSE: u32 = 6;
     /// The ambient fill: dark blue (29, 60, 84) at midnight, blue-grey
     /// (104, 130, 154) by day. Paired with [`DIFFUSE`] it is the ordinary
@@ -56,21 +133,6 @@ pub mod bands {
     /// and the pair lands close to the fixed 0.38/0.62 placeholder this
     /// replaced, which is a useful sanity check rather than a coincidence.
     pub const AMBIENT: u32 = 1;
-    /// The colour to clear the sky to.
-    ///
-    /// Of the several bands that track the sky, this is the one that reads as
-    /// the bulk of it: pale blue (153, 220, 245) at noon, dark blue (0, 40, 78)
-    /// at midnight, orange through dawn. Not "the sky band" -- there are
-    /// several and they layer into a gradient this client does not draw -- but
-    /// the one that makes a flat clear colour look like the right sky.
-    pub const SKY: u32 = 4;
-    /// Fog colour. **Still unconfirmed, and currently invisible**: the fog
-    /// distance band reads 18,000 units on Azeroth and fog starts at a quarter
-    /// of that, so nothing within several kilometres of the camera is affected.
-    /// Left pointing at a plausible band rather than at nothing, because the
-    /// alternative -- disabling fog outright -- would hide the day the distance
-    /// band turns out to mean something else.
-    pub const FOG: u32 = 2;
 }
 
 /// Scalar curves, by index. Only the first has been identified with any
@@ -82,6 +144,17 @@ pub mod scalars {
     /// Believed to scale where fog begins, as a fraction of [`FOG_END`].
     pub const FOG_START_SCALER: u32 = 1;
 }
+
+/// The gradient a light with no sky bands gets: the flat blue this client used
+/// before it drew a gradient, darkened towards the zenith so that "no data"
+/// still reads as a sky rather than as a wall.
+pub const DEFAULT_SKY: SkyGradient = [
+    [0.20, 0.34, 0.60],
+    [0.28, 0.42, 0.65],
+    [0.36, 0.50, 0.68],
+    [0.42, 0.55, 0.70],
+    [0.52, 0.62, 0.72],
+];
 
 /// Every lighting table, read once.
 pub struct Lighting {
@@ -96,9 +169,8 @@ pub struct Lighting {
 pub struct Sample {
     pub diffuse: Colour,
     pub ambient: Colour,
-    pub fog: Colour,
-    /// What to clear the sky to.
-    pub sky: Colour,
+    /// The sky from zenith to horizon.
+    pub sky: SkyGradient,
     /// Distance at which fog is total, in world units.
     pub fog_end: f32,
     /// Where fog begins, in world units.
@@ -107,6 +179,25 @@ pub struct Sample {
     /// was chosen" and "this light looks like that" are indistinguishable
     /// without it.
     pub params_id: u32,
+}
+
+impl Sample {
+    /// The sky directly overhead.
+    pub fn zenith(&self) -> Colour {
+        self.sky[bands::ZENITH]
+    }
+
+    /// The sky at the horizon -- and therefore, see [`bands::HORIZON`], the
+    /// colour distant terrain fades into.
+    pub fn horizon(&self) -> Colour {
+        self.sky[bands::HORIZON]
+    }
+
+    /// What fog resolves to at its far end. Not a stored field: it *is* the
+    /// horizon, and a copy would be a second thing to keep in step.
+    pub fn fog(&self) -> Colour {
+        self.horizon()
+    }
 }
 
 impl Lighting {
@@ -233,11 +324,17 @@ impl Lighting {
                 mix(a[2], b[2]),
             ]
         };
+        let mut sky = clear.sky;
+        // Every layer separately: a storm flattens the gradient as well as
+        // greying it, and blending only one band would leave the sky's *shape*
+        // clear while its colour rained.
+        for (out, (a, b)) in sky.iter_mut().zip(clear.sky.iter().zip(stormy.sky.iter())) {
+            *out = mix3(*a, *b);
+        }
         Some(Sample {
             diffuse: mix3(clear.diffuse, stormy.diffuse),
             ambient: mix3(clear.ambient, stormy.ambient),
-            fog: mix3(clear.fog, stormy.fog),
-            sky: mix3(clear.sky, stormy.sky),
+            sky,
             fog_end: mix(clear.fog_end, stormy.fog_end),
             fog_start: mix(clear.fog_start, stormy.fog_start),
             // The row actually being blended towards, so a report can say which
@@ -260,15 +357,19 @@ impl Lighting {
         let fog_end = self
             .scalar(params_id, scalars::FOG_END, at)
             .unwrap_or(1000.0);
+        let mut sky = DEFAULT_SKY;
+        for (out, band) in sky.iter_mut().zip(bands::SKY) {
+            // A light with no sky band keeps the fixed gradient rather than
+            // going black -- and per layer, because a row could fill some and
+            // not others.
+            if let Some(colour) = self.colour(params_id, band, at) {
+                *out = colour;
+            }
+        }
         Some(Sample {
             diffuse: self.colour(params_id, bands::DIFFUSE, at).unwrap_or([1.0; 3]),
             ambient: self.colour(params_id, bands::AMBIENT, at).unwrap_or([0.35; 3]),
-            fog: self.colour(params_id, bands::FOG, at).unwrap_or([0.6, 0.7, 0.8]),
-            sky: self
-                .colour(params_id, bands::SKY, at)
-                // The old fixed clear colour, so a light with no sky band
-                // looks exactly as it did before rather than black.
-                .unwrap_or([0.42, 0.55, 0.70]),
+            sky,
             fog_end,
             // A scaler of 0.25 with a 18,000 end puts fog's start a quarter of
             // the way out. Guarded against a scaler of zero, which would put
@@ -396,6 +497,40 @@ mod tests {
         // whatever the packed words average to.
         let half = 0x0000ffu32.lerp(0xff0000, 0.5);
         assert_eq!(unpack(half).map(|c| (c * 255.0).round() as u32), [128, 0, 128]);
+    }
+
+    #[test]
+    fn the_sky_bands_are_five_consecutive_ones_ending_at_the_diffuse() {
+        // Three separate claims that have to stay true together, and each of
+        // which a future edit could break silently:
+        //
+        // - the gradient is contiguous, because a stack of sky layers with a
+        //   gap in it would be some other table's idea;
+        // - `HORIZON` and `ZENITH` index the ends of the array they name, which
+        //   is the kind of off-by-one that would tint the world upside down and
+        //   still render;
+        // - the diffuse light is the horizon band, which is a *borrowing* and
+        //   not a coincidence. If someone moves the diffuse to a band of its
+        //   own, this fails and points at the doc comment explaining why it
+        //   was ever shared.
+        assert!(bands::SKY.windows(2).all(|w| w[1] == w[0] + 1));
+        assert_eq!(bands::ZENITH, 0);
+        assert_eq!(bands::HORIZON, bands::SKY.len() - 1);
+        assert_eq!(bands::SKY[bands::HORIZON], bands::DIFFUSE);
+    }
+
+    #[test]
+    fn the_default_gradient_brightens_towards_the_horizon() {
+        // The fallback has to have the property the real data has, or a light
+        // with no sky bands would draw a gradient pointing the wrong way and
+        // look like a bug in the sampler rather than like missing data.
+        let value = |c: Colour| c[0] + c[1] + c[2];
+        for pair in DEFAULT_SKY.windows(2) {
+            assert!(
+                value(pair[1]) > value(pair[0]),
+                "the default sky must brighten from zenith to horizon: {pair:?}"
+            );
+        }
     }
 
     #[test]

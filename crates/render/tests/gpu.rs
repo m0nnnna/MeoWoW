@@ -361,3 +361,312 @@ fn skinning_moves_weighted_vertices_only() {
         "a fully weighted vertex must follow the bone off screen, got {weighted:?}"
     );
 }
+
+// --- the sky -------------------------------------------------------------
+//
+// The gradient's five colours are `Light.dbc`'s, and which end of the array is
+// the horizon was settled against the data in `dbc` -- see
+// `dbc::light::bands::SKY`. What is *not* settled there is whether the shader
+// then paints them the right way up, which is exactly the kind of off-by-one
+// that renders perfectly and tints the world upside down. These render pixels
+// and read them back, so they are evidence about the shader rather than about
+// a second copy of its arithmetic in Rust.
+
+/// Renders the sky alone and returns the frame.
+fn render_sky(
+    gpu: &Gpu,
+    forward: glam::Vec3,
+    up: glam::Vec3,
+    gradient: &render::sky::Gradient,
+    size: (u32, u32),
+) -> Vec<u8> {
+    let (w, h) = size;
+    let target = Offscreen::new(gpu, w, h, FORMAT);
+    let depth = DepthBuffer::new(gpu, w, h);
+    let sky = render::SkyRenderer::new(gpu, FORMAT);
+
+    let eye = glam::Vec3::ZERO;
+    let view = glam::camera::rh::view::look_to_mat4(eye, forward, up);
+    // A 90 degree vertical field of view, so the frame spans exactly 45
+    // degrees either side of where the camera points and the arithmetic in
+    // the assertions below is checkable by hand.
+    let proj = glam::camera::rh::proj::directx::perspective(
+        std::f32::consts::FRAC_PI_2,
+        w as f32 / h as f32,
+        0.1,
+        1000.0,
+    );
+
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    // Green, which appears in no gradient used here: a pixel
+                    // the sky failed to cover is then obvious rather than
+                    // passing as a dark band.
+                    load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            multiview_mask: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        sky.draw(gpu, &mut pass, proj * view, eye, gradient);
+    }
+    gpu.queue.submit([encoder.finish()]);
+    target.read_rgba(gpu).expect("readback")
+}
+
+fn pixel(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+    let o = ((y * width + x) * 4) as usize;
+    [pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]]
+}
+
+/// The zenith end of the array is drawn at the top of the sky, not the bottom.
+#[test]
+fn the_sky_gradient_is_painted_the_right_way_up() {
+    let gpu = require_gpu!();
+    let (w, h) = (32u32, 64u32);
+
+    // A ramp from red overhead to blue at the horizon. Every layer differs, so
+    // an ordering error cannot hide in two neighbours that happen to match.
+    let mut gradient = [[0.0f32; 3]; render::sky::LAYERS];
+    for (i, layer) in gradient.iter_mut().enumerate() {
+        let t = i as f32 / (render::sky::LAYERS - 1) as f32;
+        *layer = [1.0 - t, 0.0, t];
+    }
+
+    // Looking along +X, level. The frame then runs from 45 degrees up at the
+    // top row to 45 degrees down at the bottom.
+    let frame = render_sky(&gpu, glam::Vec3::X, glam::Vec3::Z, &gradient, (w, h));
+
+    let column: Vec<[u8; 4]> = (0..h).map(|y| pixel(&frame, w, w / 2, y)).collect();
+    assert!(
+        column.iter().all(|p| p[1] < 40),
+        "the sky did not cover the frame; some pixels are still the clear colour"
+    );
+    assert!(
+        column[0][0] > column[h as usize - 1][0] + 60,
+        "the top of the sky is not the red end: top {:?}, bottom {:?}",
+        column[0],
+        column[h as usize - 1]
+    );
+    // Monotone down the column, not merely different at the ends -- a shader
+    // that mirrored the gradient about the horizon would pass the check above.
+    // The lower half is all horizon-side, and holds rather than reversing.
+    for pair in column.windows(2) {
+        assert!(
+            pair[1][0] <= pair[0][0] + 2,
+            "red climbs going down the sky: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+/// Straight up is the first layer; below the horizon holds the last one.
+#[test]
+fn the_sky_holds_its_ends_at_the_zenith_and_underfoot() {
+    let gpu = require_gpu!();
+    let (w, h) = (32u32, 32u32);
+    // Five clearly separated greys, so the layer a pixel came from is legible
+    // from its value alone.
+    let gradient: render::sky::Gradient = [
+        [0.02, 0.02, 0.02],
+        [0.10, 0.10, 0.10],
+        [0.25, 0.25, 0.25],
+        [0.50, 0.50, 0.50],
+        [1.00, 1.00, 1.00],
+    ];
+
+    // Up is X here because the view's up vector cannot be parallel to the
+    // direction it looks along.
+    let above = render_sky(&gpu, glam::Vec3::Z, glam::Vec3::X, &gradient, (w, h));
+    let zenith = centre_pixel(&above, w, h);
+    assert!(
+        zenith[0] < 60,
+        "looking straight up did not give the darkest layer: {zenith:?}"
+    );
+
+    let below = render_sky(&gpu, -glam::Vec3::Z, glam::Vec3::X, &gradient, (w, h));
+    let underfoot = centre_pixel(&below, w, h);
+    assert!(
+        underfoot[0] > 240,
+        "below the horizon must hold the horizon colour rather than climbing \
+         back towards the zenith: {underfoot:?}"
+    );
+}
+
+// --- precipitation -------------------------------------------------------
+//
+// Rain that can only be seen by starting a server and typing `.wchange` is
+// rain nothing can check. These render it against a known background and read
+// the pixels back, which is what makes "it stopped falling" a test failure
+// rather than a thing somebody notices in a month.
+
+/// Renders precipitation over a flat background and returns the frame.
+fn render_weather(
+    gpu: &Gpu,
+    shape: &render::precipitation::Shape,
+    intensity: f32,
+    seconds: f32,
+    size: (u32, u32),
+) -> Vec<u8> {
+    let (w, h) = size;
+    let target = Offscreen::new(gpu, w, h, FORMAT);
+    let depth = DepthBuffer::new(gpu, w, h);
+    let weather = render::PrecipitationRenderer::new(gpu, FORMAT);
+
+    // Above the field's centre looking level, so drops fill the frame.
+    let eye = glam::Vec3::new(0.0, 0.0, 20.0);
+    let view = glam::camera::rh::view::look_to_mat4(eye, glam::Vec3::X, glam::Vec3::Z);
+    let proj = glam::camera::rh::proj::directx::perspective(
+        std::f32::consts::FRAC_PI_2,
+        w as f32 / h as f32,
+        0.1,
+        1000.0,
+    );
+
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            multiview_mask: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        // White on black, so "how much rain" is just how bright the frame is.
+        weather.draw(
+            gpu,
+            &mut pass,
+            proj * view,
+            eye,
+            shape,
+            [1.0, 1.0, 1.0],
+            intensity,
+            seconds,
+        );
+    }
+    gpu.queue.submit([encoder.finish()]);
+    target.read_rgba(gpu).expect("readback")
+}
+
+/// Mean brightness of a frame, 0 to 255.
+fn mean_value(pixels: &[u8]) -> f32 {
+    let sum: u64 = pixels.chunks_exact(4).map(|p| p[0] as u64).sum();
+    sum as f32 / (pixels.len() / 4) as f32
+}
+
+/// It falls, it falls harder when the intensity rises, and it stops.
+#[test]
+fn precipitation_scales_with_intensity_and_ceases_when_clear() {
+    let gpu = require_gpu!();
+    let (w, h) = (256u32, 256u32);
+    let rain = render::precipitation::Shape::RAIN;
+
+    let none = mean_value(&render_weather(&gpu, &rain, 0.0, 1.0, (w, h)));
+    assert_eq!(
+        none, 0.0,
+        "clear weather drew something: nothing must fall at intensity zero"
+    );
+
+    let light = mean_value(&render_weather(&gpu, &rain, 0.4, 1.0, (w, h)));
+    let heavy = mean_value(&render_weather(&gpu, &rain, 1.0, 1.0, (w, h)));
+    assert!(light > 0.0, "light rain drew nothing at all");
+    assert!(
+        heavy > light * 1.5,
+        "heavier rain is not heavier: light {light}, heavy {heavy}"
+    );
+}
+
+/// The field moves, and it is still there long after it started.
+///
+/// **The second half is the one worth having.** Drops fall by `speed * time`,
+/// and an `f32` holding an hour of that has lost enough precision to collapse
+/// the field into a grid -- a failure that needs a client left running to
+/// appear, which is to say one nobody would ever catch by looking. `draw`
+/// wraps the clock for exactly this reason; this is what says so.
+#[test]
+fn precipitation_moves_and_survives_a_long_session() {
+    let gpu = require_gpu!();
+    let (w, h) = (256u32, 256u32);
+    let rain = render::precipitation::Shape::RAIN;
+
+    let first = render_weather(&gpu, &rain, 1.0, 1.0, (w, h));
+    let later = render_weather(&gpu, &rain, 1.0, 1.15, (w, h));
+    let differing = first
+        .chunks_exact(4)
+        .zip(later.chunks_exact(4))
+        .filter(|(a, b)| a[0].abs_diff(b[0]) > 8)
+        .count();
+    assert!(
+        differing > (w * h) as usize / 200,
+        "the field is not moving: only {differing} pixels changed in 150ms"
+    );
+
+    // An hour in, and the same amount of rain is falling.
+    let fresh = mean_value(&first);
+    let old = mean_value(&render_weather(&gpu, &rain, 1.0, 3600.0, (w, h)));
+    assert!(
+        old > fresh * 0.6 && old < fresh * 1.6,
+        "an hour of rain thinned out or piled up: {fresh} then {old}"
+    );
+}
+
+/// Snow is not rain drawn slower: it is visibly a different thing.
+#[test]
+fn snow_is_shorter_and_rounder_than_rain() {
+    let gpu = require_gpu!();
+    let rain = render::precipitation::Shape::RAIN;
+    let snow = render::precipitation::Shape::SNOW;
+    assert!(
+        snow.length < rain.length && snow.fall_speed < rain.fall_speed,
+        "snow must be a slower, shorter thing than rain"
+    );
+    assert!(
+        snow.roundness > rain.roundness,
+        "snow needs a falloff along its travel or it draws as a tiny bar, \
+         which is what it looked like before `roundness` existed"
+    );
+
+    // And both actually draw, which the constants alone would not prove.
+    for (name, shape) in [("rain", &rain), ("snow", &snow)] {
+        let mean = mean_value(&render_weather(&gpu, shape, 1.0, 1.0, (256, 256)));
+        assert!(mean > 0.0, "{name} drew nothing");
+    }
+}
