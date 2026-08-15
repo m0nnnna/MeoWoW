@@ -636,6 +636,15 @@ impl Connection {
         self.send(ClientOpcode::LootMoney, &[])
     }
 
+    /// Takes one slot off the corpse currently open.
+    ///
+    /// `slot` is the server's own loot index -- [`crate::LootItem::slot`] --
+    /// and **not** a position in any list this client built. See
+    /// [`ClientOpcode::AutoStoreLootItem`].
+    pub fn loot_item(&mut self, slot: u8) -> Result<(), Error> {
+        self.send(ClientOpcode::AutoStoreLootItem, &[slot])
+    }
+
     /// Closes the loot window, releasing the corpse for anyone else.
     ///
     /// See [`ClientOpcode::LootRelease`]: skipping this leaves the body locked.

@@ -2313,6 +2313,62 @@ fn survey_loot(
         println!("  {:<34} ({opcode:#06x}) x{count}", world::opcode::describe(*opcode));
     }
 
+    // **Then take it, and prove it arrived by looking at the inventory.**
+    //
+    // Neither the money request nor the take-an-item request is acknowledged,
+    // so both are confirmed the same way the equip write was: by a
+    // consequence that could have failed to appear. Money shows up in
+    // `PLAYER_FIELD_COINAGE` and an item shows up in the player's own slot
+    // array, and both are read here before and after.
+    state.replicate(&batch, None);
+    let money_before = world::inventory::coinage(state, own_guid);
+    let held_before: std::collections::BTreeSet<u64> = world::inventory::held(state, own_guid)
+        .into_iter()
+        .map(|item| item.guid)
+        .collect();
+
+    let taken: Vec<u8> = batch
+        .iter()
+        .filter(|p| p.opcode == world::opcode::server::LOOT_RESPONSE)
+        .filter_map(|p| world::loot::parse_loot_response(&p.body).ok())
+        .flat_map(|loot| loot.items)
+        // The server's own slot index, not an index into this list. See
+        // `ClientOpcode::AutoStoreLootItem` for why that distinction bites.
+        .map(|item| item.slot)
+        .collect();
+
+    if money_before > 0 || !taken.is_empty() {
+        connection.loot_money()?;
+        for slot in &taken {
+            connection.loot_item(*slot)?;
+        }
+        let after = connection.drain(std::time::Duration::from_millis(1500), 128)?;
+        state.replicate(&after, None);
+
+        let money_after = world::inventory::coinage(state, own_guid);
+        let held_after: std::collections::BTreeSet<u64> = world::inventory::held(state, own_guid)
+            .into_iter()
+            .map(|item| item.guid)
+            .collect();
+        let gained: Vec<u64> = held_after.difference(&held_before).copied().collect();
+
+        println!(
+            "\ntook {} slot(s): money {money_before} -> {money_after}, {} new item(s) in the bags",
+            taken.len(),
+            gained.len()
+        );
+        for guid in &gained {
+            let entry = state
+                .get(*guid)
+                .and_then(|item| item.fields.get(world::update::fields::OBJECT_ENTRY));
+            println!("  {guid:#018x} entry {entry:?}");
+        }
+        if gained.is_empty() && money_after == money_before {
+            println!("  nothing moved -- which is what a wrong opcode looks like,");
+            println!("  and also what a full bag looks like. Check the bags first.");
+        }
+    }
+
     // Releasing matters even in a survey: a corpse stays locked to whoever
     // opened it, so a run that opens loot and walks away leaves a body nobody
     // else on the realm can touch.

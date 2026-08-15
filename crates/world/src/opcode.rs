@@ -87,6 +87,23 @@ pub enum ClientOpcode {
     /// filled in.
     AutoEquipItem = 0x010A,
 
+    /// Take one slot off the corpse currently open, letting the server choose
+    /// where it goes in the bags.
+    ///
+    /// Body is a single byte: the **loot slot**, which is the server's index
+    /// into that corpse's loot and comes from
+    /// [`LootItem::slot`](crate::LootItem). It is not a position in whatever
+    /// list a client happens to have built -- a corpse whose first slot has
+    /// already been taken still numbers the rest from where they were, so
+    /// re-indexing a filtered list would take the wrong item.
+    ///
+    /// Acts on the loot **currently open**, so it is only meaningful after
+    /// [`ClientOpcode::Loot`]. Nothing identifies the corpse in the body.
+    ///
+    /// Confirmed by effect, the same way the equip write was: the item leaves
+    /// the corpse and appears in the player's own slot array.
+    AutoStoreLootItem = 0x0108,
+
     /// Open the loot on a corpse.
     ///
     /// Body is the target's guid, unpacked -- eight bytes, not the packed

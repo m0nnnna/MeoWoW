@@ -3082,3 +3082,23 @@ of its own release request will be surprised.
 
 Still to do: nothing sends `CMSG_LOOT` from the interface, `CMSG_LOOT_MONEY`
 and the take-an-item request are unexercised, and corpse release is unwired.
+
+#### And taking it
+
+`CMSG_LOOT_MONEY` (`0x15E`) and `CMSG_AUTOSTORE_LOOT_ITEM` (`0x108`) both work.
+Neither is acknowledged, so both were confirmed the way the equip write was --
+by a consequence that could have failed to appear. Opening a corpse holding two
+copper and two items, then sending both requests, moved the money from 0 to 2
+in `PLAYER_FIELD_COINAGE` and put two new guids in the player's own slot array
+whose entries are exactly the two that were on the corpse.
+
+`CMSG_AUTOSTORE_LOOT_ITEM` carries one byte, and the byte is the **server's own
+loot slot index** rather than a position in whatever list a client has built.
+The distinction is not academic: a corpse whose first slot has already been
+taken still numbers the rest from where they were, so a client that filtered
+its list and re-indexed would ask for the wrong item. Both requests act on the
+loot *currently open* and name no corpse at all, so they are only meaningful
+after `CMSG_LOOT`.
+
+What is left is interface rather than protocol: nothing sends any of this from
+the client, so there is no loot window yet.
