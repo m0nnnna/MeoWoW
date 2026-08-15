@@ -2691,3 +2691,129 @@ sideways on the spot is the bug this whole family exists to avoid, so they fall
 back to the travelling cycles instead. Nearly unreachable either way: only the
 player supplies a lateral component, because a monster move gives a path and a
 duration and says nothing about how the body is turned relative to it.
+
+### 4.12: buildings are solid
+
+Reported from play, with the strongest evidence this project has: a character
+driven by this client walked through the wall of Northshire Abbey, and a
+*second* client watching drew it happening. So the server neither corrects nor
+objects, and collision is entirely this client's job. That is a measurement
+rather than an assumption, and it is written at the top of the new crate.
+
+The data turned out to be almost all in hand already:
+
+- **WMO groups already parsed `MOVT`, `MOVI` and `MOPY`**, including the 0xFF
+  material that marks a collision-only triangle. The loader *counted* those and
+  threw the indices away. Now kept -- and all triangles are kept, not only the
+  collision-only ones, because a wall you can see is as solid as one you cannot.
+  The invisible ones matter most: they are the barriers deliberately placed
+  across a doorway or under a stair.
+- **M2 headers already located the collision mesh** and dropped all three arrays
+  with `let _`. It is a genuinely separate and far coarser mesh -- tens of
+  triangles where the render mesh has thousands -- and that distinction is the
+  whole point: using the drawn geometry would make a tree's *foliage* solid.
+
+`crates/collision` is pure geometry: no MPQ, no DBC, no protocol, no GPU, so the
+whole of it is testable from a unit test with a hand-built box. Same reasoning as
+the `ui` crate depending on neither `world` nor `render`. Northshire's tile comes
+out at 62,756 solid triangles, indexed into an eight-unit grid so a query touches
+a few dozen.
+
+**Sliding falls out of resolving by push-out rather than by sweeping.** A swept
+test finds the first surface a path crosses and stops there, which is exact and
+sticks at a shallow angle. Pushing the destination back out of whatever it ended
+up inside keeps the component of the move along the wall and removes only the
+component into it.
+
+Two things the tests caught immediately, both written down because they are the
+same shape:
+
+- `slide`'s own doc comment conceded that push-out can tunnel through a thin
+  wall on a large step, and the test asserted "the one thing that must never
+  happen is ending up on the far side of a wall". It failed at once. A
+  Moller-Trumbore check on the *path* is now the final refusal, so the guarantee
+  is real rather than conditional on the caller taking small steps.
+- A floor test expected `None` under a box and got `Some(0.0)`. The test was
+  wrong about its own fixture: a closed box has a bottom, and that bottom is the
+  floor under the character's feet.
+
+The M2 parse is checked against something that does not come from the parser --
+each model's own declared collision box. That matters more than usual here,
+because collision geometry read at a wrong offset produces an invisible wall
+somewhere else, with no visual symptom at all until somebody walks into nothing.
+
+#### Stairs, and the fix that is a way of breaking walls
+
+Reported straight back: the abbey's steps and every small bump stopped the
+character dead. A stair riser is a vertical face, so it is a wall by every test
+in the crate and pushes the character off it -- while `floor_under` sat there
+ready to stand them on the tread they could not reach. Both halves worked; they
+could not reach each other.
+
+The fix lifts the bottom of the collision cylinder by a step height, so anything
+whose top is below the feet plus that height stops blocking horizontally and the
+ground query then lifts the character onto it. `step` is therefore exactly "how
+tall a thing may be and still be walked over" -- and raise it far enough and
+every wall in the game is a kerb. The test holds something on each side of that
+line: a 0.3 step is walked over, a 5.0 wall of identical footprint is not, and
+with the allowance set to zero the step blocks again, so it fails if the riser
+ever stops blocking for some reason other than the step.
+
+The same lift had to be applied to the path check's sample heights. It samples at
+ankle, middle and head, and an ankle sample finds every stair riser -- it would
+have refused the exact move the band above it had just allowed. The same bug one
+layer up, which is the recurring shape here.
+
+`STEP_HEIGHT` came down from 1.2 to 0.8 in the same pass. At a body height of 2.0
+the original was waist-high: it climbs stairs and also strolls over fences. One
+constant serves both `floor_under`'s reach and `slide`'s threshold, because two
+would let a character be stopped by a step it was simultaneously tall enough to
+stand on.
+
+#### And a camera welded to a discrete decision
+
+Standing is discrete -- the feet are on this triangle or that one -- so walking
+up steps moves Z in jumps of a riser, and where a floor meets the terrain the
+answer can flip between two values a hair apart on consecutive frames. Rigidly
+attached, the camera reproduced every one of those as a shake.
+
+The camera now eases *vertically* toward the character, closing a fraction of the
+remaining error per second rather than moving at a maximum rate -- the same trap
+the creature-turning code documents, where a rate cap looks right in every frame
+and then falls arbitrarily far behind. Only the vertical: smoothing the
+horizontal would trade a shake for a camera that trails a running character.
+
+**It treated a symptom, and the follow-up said so.** The next report was that the
+*character* stutters on stairs and the camera wobbles on flat ground too -- which
+is one cause with two faces, because the camera eases towards a height that is
+itself oscillating. Rather than guess a third time between the three candidate
+explanations (two surfaces alternating, a floor and the terrain trading places,
+or a horizontal move being refused and retried), there is now a debug line naming
+both candidate heights whenever the standing height changes with a building
+involved. Gated on a building because on a hillside the terrain answers
+differently every frame by design.
+
+#### Jumping had no animation at all
+
+Not collision, found beside it. `Motion` had no airborne state, so a character
+mid-flight resolved to Run or Stand. The models carry `Jump` and always did;
+nothing ever asked for it.
+
+Worth recording how nearly the id went in wrong. On the human male, `JumpStart`
+and `Fall` are **sequence indices** 15 and 17, while their `AnimationData` ids
+are 37 and 40. Reading the id off a model listing looks entirely plausible and
+lands on `HandsClosed`.
+
+#### What is still wrong
+
+Both known, both reported, neither fixed:
+
+- **Transitions cut rather than blend.** The jump animation appears the instant
+  the state changes, because nothing here interpolates between two cycles. That
+  is a general animation-system gap, not a jump one -- every state change in the
+  client snaps.
+- **The stair stutter is better and not gone.** The instrumentation above is in
+  place to find the rest of it.
+
+Nothing collides with creatures or other players: those are moved by the server
+and are a different feature from a solid world.

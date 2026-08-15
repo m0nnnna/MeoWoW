@@ -25,6 +25,15 @@ pub struct LoadedWmo {
     pub group_count: usize,
     /// Triangles skipped because they are collision geometry.
     pub collision_triangles: usize,
+    /// Everything solid, in model space.
+    ///
+    /// **Both the drawn triangles and the collision-only ones**, because a
+    /// wall you can see is as solid as one you cannot. The 0xFF material marks
+    /// the triangles that exist *only* to be collided with -- an invisible
+    /// barrier across a doorway, a ramp under a stair -- and they were being
+    /// counted and dropped. Keeping the drawn ones as well is what makes the
+    /// abbey's actual walls stop anybody.
+    pub collision: Vec<[[f32; 3]; 3]>,
     pub doodad_sets: Vec<String>,
     pub missing_textures: Vec<String>,
 }
@@ -99,6 +108,7 @@ pub fn load(
     let mut draws: Vec<Draw> = Vec::new();
     let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     let (mut group_count, mut collision_triangles) = (0usize, 0usize);
+    let mut collision: Vec<[[f32; 3]; 3]> = Vec::new();
 
     for gi in 0..root.header.group_count as usize {
         if only_group.is_some_and(|want| want != gi) {
@@ -138,6 +148,18 @@ pub fn load(
             .iter()
             .filter(|t| t.is_collision_only())
             .count();
+
+        // Straight off `MOVI`, not off the render batches: a batch list omits
+        // exactly the collision-only triangles, which are the ones most
+        // deliberately placed to stop somebody.
+        for triangle in group.indices.chunks_exact(3) {
+            let point = |i: u16| group.vertices.get(i as usize).copied();
+            if let (Some(a), Some(b), Some(c)) =
+                (point(triangle[0]), point(triangle[1]), point(triangle[2]))
+            {
+                collision.push([a, b, c]);
+            }
+        }
 
         for batch in &group.batches {
             let Some(batch_indices) = group.batch_indices(batch) else {
@@ -190,6 +212,7 @@ pub fn load(
         triangle_count,
         group_count,
         collision_triangles,
+        collision,
         doodad_sets: root
             .doodad_sets
             .iter()

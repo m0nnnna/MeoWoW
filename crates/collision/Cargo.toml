@@ -1,0 +1,12 @@
+[package]
+name = "collision"
+description = "Solid-world queries: what a character can walk through and what it stands on."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+glam.workspace = true
+tracing.workspace = true

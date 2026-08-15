@@ -265,3 +265,57 @@ fn unanimated_bones_pose_to_identity_unless_they_are_global() {
         "every global bone posed to identity, which is the bug this guards"
     );
 }
+
+/// Collision meshes parse, are far coarser than the drawn geometry, and sit
+/// inside the model's own declared collision box.
+///
+/// **The containment check is the one that matters.** Vertices read at a wrong
+/// offset parse perfectly and produce triangles somewhere else entirely, which
+/// as collision geometry means an invisible wall in the wrong place -- a defect
+/// with no visual at all until somebody walks into nothing. The model states
+/// its own collision box, so the triangles have a claim to be checked against
+/// that does not come from this parser.
+#[test]
+fn collision_meshes_are_coarse_and_inside_their_own_box() {
+    let mut chain = require_data!();
+    let mut with_collision = 0usize;
+    for path in MODELS.iter().chain(std::iter::once(
+        &r"World\Azeroth\Elwynn\PassiveDoodads\ElwynnFence\ElwynnFence01.m2",
+    )) {
+        let Ok(bytes) = chain.read(path) else { continue };
+        let Ok(model) = Model::parse(&bytes) else { continue };
+        let triangles = model.collision_triangles();
+        if triangles.is_empty() {
+            continue;
+        }
+        with_collision += 1;
+
+        // Coarser than what is drawn. A collision mesh the size of the render
+        // mesh would mean the wrong array had been read.
+        let drawn = model.vertices().len();
+        assert!(
+            triangles.len() * 3 < drawn.max(1),
+            "{path}: {} collision triangles against {drawn} drawn vertices --              that is not a collision mesh",
+            triangles.len()
+        );
+
+        let (min, max) = model.collision_box();
+        // A little slack: the box is authored, not computed, and a vertex may
+        // sit fractionally outside it.
+        let slack = 1.0;
+        for tri in &triangles {
+            for p in tri {
+                for axis in 0..3 {
+                    assert!(
+                        p[axis] >= min[axis] - slack && p[axis] <= max[axis] + slack,
+                        "{path}: collision vertex {p:?} is outside the model's own                          collision box {min:?}..{max:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        with_collision > 0,
+        "no model in the fixture set carries a collision mesh, so this proves nothing"
+    );
+}

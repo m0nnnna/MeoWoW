@@ -327,7 +327,7 @@ fn build_live_scene(
     if args.entities {
         let mut player_looks = std::collections::HashMap::new();
         let placements: Vec<world::EntityPlacement> =
-            drawable_with_own(&live, (0.0, 0.0))
+            drawable_with_own(&live, (0.0, 0.0), false)
                 .iter()
                 .map(|entity| {
                     // Same three sources as the windowed path -- see `redraw`.
@@ -347,7 +347,8 @@ fn build_live_scene(
                         orientation: entity.orientation,
                         scale: entity.scale,
                         speed: entity.speed,
-                        lateral: entity.lateral,
+                        turning: entity.turning,
+                        airborne: entity.airborne,
                         dead: entity.dead,
                         died_ms_ago: entity.died_ms_ago,
                         swung_ms_ago: entity.swung_ms_ago,
@@ -514,48 +515,67 @@ const LIVE_BACK_SPEED: f32 = 4.5;
 /// to agree: the number that moves the character and the number that chooses
 /// its animation. They did not, and the result was a character reversing at a
 /// full run with the forward run cycle playing.
-fn live_pace(moving: ::world::motion::Motion) -> (f32, f32) {
+fn live_pace(moving: ::world::motion::Motion) -> f32 {
     use ::world::motion::Axis;
-    let forward = match moving.longitudinal() {
+    match moving.longitudinal() {
         // Backing up is the only direction with its own speed *and* its own
         // cycle.
         Some(Axis::Negative) => -LIVE_BACK_SPEED,
-        Some(Axis::Positive) => LIVE_RUN_SPEED,
-        None => 0.0,
-    };
-    // **Reported separately rather than folded into the magnitude**, because
-    // the two answer different questions: how far the character travels this
-    // frame, and which cycle its legs should play. Strafing used to be
-    // indistinguishable from running forward here -- the comment above this
-    // function used to say "strafing sideways uses the run" -- and the
-    // character crab-walked with a full forward sprint on its legs.
-    //
-    // Positive is left, matching both `Axis::Positive` and `world::Side`.
-    let lateral = match moving.lateral() {
-        Some(Axis::Positive) => LIVE_RUN_SPEED,
-        Some(Axis::Negative) => -LIVE_RUN_SPEED,
-        None => 0.0,
-    };
-    (forward, lateral)
-}
-
-/// How fast the character actually travels, whatever combination of keys.
-///
-/// Derived from [`live_pace`] rather than computed beside it, because the
-/// number that moves the character and the number that chooses its animation
-/// have to agree -- they did not once, and a character reversed at a full run
-/// with the forward cycle playing. `Motion::direction` already returns a unit
-/// vector, so this is a magnitude and the diagonal is not faster.
-fn live_travel_speed(moving: ::world::motion::Motion) -> f32 {
-    let (forward, lateral) = live_pace(moving);
-    if forward < 0.0 {
-        // Backing up is the one direction with a speed of its own, and it
-        // keeps that speed even while also strafing.
-        -forward
-    } else {
-        forward.max(lateral.abs())
+        // **Strafing is folded in here on purpose**, and the comment that used
+        // to sit at this spot -- "strafing sideways uses the run" -- was right
+        // after all. Sidestepping was briefly given the `Shuffle` cycles and
+        // came straight back from play as the character shimmying, which is
+        // what those cycles are: they advance the character by 0.00 and
+        // `AnimationData` falls them back to Stand. A character travelling at
+        // the run speed plays the run, whichever way it is pointing.
+        _ if moving.is_moving() => LIVE_RUN_SPEED,
+        _ => 0.0,
     }
 }
+
+/// The rate the A/D keys are turning the character on the spot, signed, with
+/// left positive.
+///
+/// Only ever non-zero while the character is standing still: turning *while*
+/// travelling is already expressed by the run cycle and the heading it is drawn
+/// at, and a shuffle laid over a run is a stumble. See
+/// `world::Motion::from_pace` for what the shuffle is and what is still a
+/// hypothesis about it.
+fn live_turning(keys: KeyState, steering: bool, moving: ::world::motion::Motion) -> f32 {
+    if steering || moving.is_moving() {
+        return 0.0;
+    }
+    match (keys.left, keys.right) {
+        (true, false) => LIVE_TURN_RATE,
+        (false, true) => -LIVE_TURN_RATE,
+        _ => 0.0,
+    }
+}
+
+/// How wide the character is for collision, and how tall.
+///
+/// **Chosen.** The models declare a bounding box and it is the wrong shape to
+/// use: it wraps the drawn geometry including an outstretched arm and a
+/// weapon, where what has to fit through a doorway is the body. A little over
+/// half a unit across and two units tall is a person at this scale, and the
+/// abbey's doors are wide enough for it.
+const BODY_RADIUS: f32 = 0.55;
+const BODY_HEIGHT: f32 = 2.0;
+
+/// How high a surface can be and still be stepped onto rather than walked into.
+///
+/// **One constant for two uses on purpose**: it is how far up `floor_under`
+/// will look for something to stand on, *and* how tall an obstacle may be
+/// before `slide` treats it as a wall. Those are the same idea -- "can I get
+/// onto that" -- and two numbers would let a character be stopped by a step it
+/// was simultaneously tall enough to stand on.
+///
+/// It started at 1.2 and came down. At a body height of 2.0 that was
+/// waist-high, which climbs the abbey's stairs and also strolls over fences.
+/// A little under half the body is a knee, which is about what a person steps
+/// onto without thinking about it -- and it is the number to move, in one
+/// place, if stairs still catch or fences stop catching.
+const STEP_HEIGHT: f32 = 0.8;
 
 /// Radians per second turned by the A/D keys. Not verified against a
 /// reference client -- see the facing note in `docs/RENDERING.md` -- but close
@@ -1588,6 +1608,10 @@ struct App {
     error: Option<String>,
     keys: KeyState,
     last_frame: Instant,
+    /// The height the camera is currently orbiting around, easing towards the
+    /// character's own -- see [`App::camera_follow_z`]. `None` until the first
+    /// frame places it.
+    camera_z: Option<f32>,
     /// When the client started, which is the only clock the weather has.
     started: Instant,
     frame_ms: f32,
@@ -1766,7 +1790,11 @@ fn action_slot(code: KeyCode) -> Option<usize> {
 ///
 /// `pace` is the caller's own movement state -- forward and lateral speed --
 /// rather than anything read back from the server. See [`live::own_entity`].
-fn drawable_with_own(live: &live::LiveWorld, pace: (f32, f32)) -> Vec<live::Entity> {
+fn drawable_with_own(
+    live: &live::LiveWorld,
+    pace: (f32, f32),
+    airborne: bool,
+) -> Vec<live::Entity> {
     let mut entities = live::drawable_entities(&live.state, live.guid, live.position);
     if let Some(own) = live::own_entity(
         &live.state,
@@ -1775,6 +1803,7 @@ fn drawable_with_own(live: &live::LiveWorld, pace: (f32, f32)) -> Vec<live::Enti
         live.orientation,
         pace.0,
         pace.1,
+        airborne,
     ) {
         entities.push(own);
     }
@@ -2112,6 +2141,7 @@ impl App {
             last_cursor: None,
             error: None,
             last_frame: Instant::now(),
+            camera_z: None,
             // The weather's own clock. Separate from `last_frame` because that
             // one is reset every frame, and a falling drop needs a monotone
             // total rather than a delta.
@@ -2704,7 +2734,10 @@ impl App {
                     // The keys, not the wire: the server never relays our own
                     // movement back to us. Held means running -- there is no
                     // walk toggle here, and `LIVE_RUN_SPEED` is the run speed.
-                    let speed = live_pace(self.live_move);
+                    let pace = (
+                        live_pace(self.live_move),
+                        live_turning(self.keys, self.steering, self.live_move),
+                    );
                     // F2. See `App::entity_flip`.
                     let flip = if self.entity_flip { std::f32::consts::PI } else { 0.0 };
                     // Borrowed as fields rather than through `&mut self`: `r`
@@ -2716,7 +2749,7 @@ impl App {
                     // player's own body is excluded inside `ease_facings` --
                     // its heading comes from the keys and is already smooth,
                     // and easing it would make the camera lag the character.
-                    let mut drawn = drawable_with_own(live, speed);
+                    let mut drawn = drawable_with_own(live, pace, self.jump.is_some());
                     live.ease_facings(&mut drawn, self.frame_ms / 1000.0);
                     let placements: Vec<crate::world::EntityPlacement> =
                         drawn
@@ -2742,7 +2775,8 @@ impl App {
                                     orientation: entity.orientation + flip,
                                     scale: entity.scale,
                                     speed: entity.speed,
-                                    lateral: entity.lateral,
+                                    turning: entity.turning,
+                                    airborne: entity.airborne,
                                     dead: entity.dead,
                                     died_ms_ago: entity.died_ms_ago,
                                     swung_ms_ago: entity.swung_ms_ago,
@@ -2923,6 +2957,41 @@ impl App {
     /// standing on anything that is not terrain: a bridge or an upper floor is
     /// WMO geometry, which nothing here can be asked about. See the movement
     /// section of `docs/PROTOCOL.md`.
+    /// The height the camera orbits around, easing towards the character's.
+    ///
+    /// **A fraction of the remaining error per second, not a maximum rate.**
+    /// A rate cap looks right in every frame and then falls arbitrarily far
+    /// behind whenever the input moves faster than the cap -- the same trap
+    /// the creature turning code documents at length. Closing a fraction
+    /// bounds the lag at `speed * TAU` for any speed at all.
+    ///
+    /// Large jumps are taken whole rather than eased. A fall, a teleport or
+    /// the first frame after login are not stairs, and gliding the camera down
+    /// a cliff over a quarter of a second would look far stranger than the
+    /// snap it replaced.
+    ///
+    /// A free function taking the field rather than a method taking `&mut
+    /// self`: the caller already holds a mutable borrow of `self.live`, and
+    /// the borrow checker cannot see that two fields are disjoint through a
+    /// method call.
+    fn camera_follow_z(state: &mut Option<f32>, target: f32, dt: f32) -> f32 {
+        /// Seconds to close most of the gap. Short enough that the camera
+        /// still reads as attached to the character, long enough to swallow a
+        /// stair riser.
+        const TAU: f32 = 0.09;
+        /// Past this it is not a step, and easing it would be a slide.
+        const SNAP: f32 = 3.0;
+
+        let smoothed = match *state {
+            Some(z) if (target - z).abs() <= SNAP && dt > 0.0 => {
+                z + (target - z) * (1.0 - (-dt / TAU).exp())
+            }
+            _ => target,
+        };
+        *state = Some(smoothed);
+        smoothed
+    }
+
     fn drive_live_movement(&mut self) {
         use ::world::update::movement_flags;
         use ::world::{ClientOpcode, MovementInfo, Position};
@@ -2965,9 +3034,22 @@ impl App {
 
         let (dx, dy) = desired.direction(live.orientation);
         if (dx, dy) != (0.0, 0.0) {
-            let pace = live_travel_speed(desired);
-            live.position.x += dx * pace * dt;
-            live.position.y += dy * pace * dt;
+            let pace = live_pace(desired).abs();
+            let wanted = glam::Vec3::new(
+                live.position.x + dx * pace * dt,
+                live.position.y + dy * pace * dt,
+                live.position.z,
+            );
+            // **Buildings are solid, and nothing but this client says so.**
+            // A character driven through the abbey wall was drawn inside it by
+            // a second client watching, so the server neither corrects nor
+            // objects. See the `collision` crate.
+            live.position = match self.renderer.as_ref().and_then(|r| r.scene.as_ref()) {
+                Some(Scene::Streaming(world)) => {
+                    world.slide(live.position, wanted, BODY_RADIUS, BODY_HEIGHT, STEP_HEIGHT)
+                }
+                _ => wanted,
+            };
         }
 
         // Stand on the ground under wherever those two axes put us.
@@ -3000,8 +3082,46 @@ impl App {
         let mut landed: Option<u32> = None;
         if let Some(Scene::Streaming(world)) = self.renderer.as_ref().and_then(|r| r.scene.as_ref())
         {
-            if let Some(ground) = world.height_at(live.position.x, live.position.y) {
-                live.position.z = ground;
+            // A building's floor outranks the terrain under it, which is
+            // what makes an interior an interior. Searched downward from where
+            // the character already is plus a step, so a staircase is climbed
+            // and the roof overhead is not stood on -- see
+            // `collision::World::floor_under`.
+            //
+            // The terrain is still the fallback and still the common case:
+            // most of the world is open ground, and the height field answers
+            // for it far more cheaply than a triangle query ever could.
+            let ground = world.height_at(live.position.x, live.position.y);
+            let floor = world.floor_under(live.position, STEP_HEIGHT);
+            // The higher of the two, so a floor laid over ground holds the
+            // character up -- but only a floor at or below head height, which
+            // `floor_under` has already enforced.
+            let stand = match (ground, floor) {
+                (Some(g), Some(f)) => Some(g.max(f)),
+                (some, None) | (None, some) => some,
+            };
+            // **Logged because the alternative is guessing.** A character
+            // that judders going up steps has at least three candidate causes
+            // -- two surfaces alternating, a floor and the terrain trading
+            // places, or a horizontal move being refused and retried -- and
+            // they are indistinguishable from the outside. One line naming
+            // both candidate heights separates them in a single walk.
+            if let Some(z) = stand {
+                // Only where a building is involved. On a hillside the
+                // terrain answers differently every frame by design, and
+                // logging that would bury the case this exists for.
+                if floor.is_some() && (z - live.position.z).abs() > 0.001 {
+                    tracing::debug!(
+                        "stand {:.3} -> {:.3} (terrain {:?}, floor {:?}) at {:.1},{:.1}",
+                        live.position.z,
+                        z,
+                        ground.map(|g| (g * 1000.0).round() / 1000.0),
+                        floor.map(|f| (f * 1000.0).round() / 1000.0),
+                        live.position.x,
+                        live.position.y,
+                    );
+                }
+                live.position.z = z;
             }
         }
         if let Some(jump) = self.jump.as_mut() {
@@ -3135,8 +3255,21 @@ impl App {
         // later, so dragging sideways did nothing at all. Both angles now
         // accumulate as offsets the drag owns and this applies, rather than two
         // places writing one field.
+        // **The camera follows height with a lag, and the character does
+        // not.** Standing is a discrete decision -- the feet are on this
+        // triangle or that one -- so walking up the church steps moves Z in
+        // jumps of a riser, and crossing where a building's floor meets the
+        // terrain can flip between two answers a hair apart on consecutive
+        // frames. Rigidly attached, the camera reproduces every one of those
+        // as a shake, which is what was reported.
+        //
+        // Only the vertical is eased. Smoothing the horizontal too would make
+        // the camera trail behind a running character, trading a shake for a
+        // lag nobody asked for.
+        let follow_z = Self::camera_follow_z(&mut self.camera_z, live.position.z, dt);
+        let camera_at = glam::Vec3::new(live.position.x, live.position.y, follow_z);
         let placed = orbit_around(
-            live.position,
+            camera_at,
             live.orientation + self.camera_yaw_offset,
             self.camera_pitch,
             self.camera_distance,
@@ -3145,7 +3278,7 @@ impl App {
         // borrowed, because the camera is behind `&mut self` and the world
         // behind the renderer -- and the alternative, cloning a height field
         // per frame, would be absurd for twelve lookups.
-        let focus = live.position + glam::Vec3::Z * FOLLOW_HEIGHT;
+        let focus = camera_at + glam::Vec3::Z * FOLLOW_HEIGHT;
         let eye = match self.renderer.as_ref().and_then(|r| r.scene.as_ref()) {
             Some(Scene::Streaming(world)) => pull_camera_out_of_the_ground(
                 focus,
@@ -3574,8 +3707,14 @@ impl App {
         // The speed only chooses an animation, which a click test does not care
         // about -- but the same list has to come out here as the renderer drew,
         // so it is passed the same way rather than left at a default.
-        let speed = live_pace(self.live_move);
-        let entities = drawable_with_own(live, speed);
+        let entities = drawable_with_own(
+            live,
+            (
+                live_pace(self.live_move),
+                live_turning(self.keys, self.steering, self.live_move),
+            ),
+            self.jump.is_some(),
+        );
         Some(hud::pick(&ray, &entities, &|display_id| {
             world.entity_bounds(display_id)
         }))

@@ -493,6 +493,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "collision"
+version = "0.0.1"
+dependencies = [
+ "glam",
+ "tracing",
+]
+
+[[package]]
 name = "color"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3965,6 +3973,7 @@ dependencies = [
  "auth",
  "blp",
  "clap",
+ "collision",
  "dbc",
  "egui",
  "egui-wgpu",

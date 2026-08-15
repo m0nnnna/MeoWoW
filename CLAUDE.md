@@ -21,6 +21,15 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 Roughly 60% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
 
+**Buildings are solid.** Walls stop you, floors and stairs hold you up, and
+doodads with a collision mesh are obstacles rather than scenery — from the WMO
+triangles (including the invisible collision-only ones) and the M2 collision
+mesh, which is a separate and far coarser thing than the drawn geometry.
+Collision is entirely the client's job: a character walked through the abbey
+wall and a *second* client drew it happening, so nothing server-side corrects
+it. Known gaps: animation transitions cut rather than blend, and a residual
+stutter on stairs that is instrumented but not yet solved.
+
 **Weapons are drawn, and they sheathe.** `Z` draws and stows, attacking draws
 automatically, and a stowed weapon goes where `Item.dbc`'s `sheathe_type` says
 — a greatsword on the back, a one-hander at the hip. **The server never draws a
@@ -112,7 +121,8 @@ have was caught by reading the viewer's own log rather than by looking at it.
 - `crates/` — one library per concern: `chunk` (shared chunked container),
   `mpq`, `dbc`, `blp`, `m2`, `wmo`, `adt`, `render`, `auth`, `world`, `ui`
   (the player's interface; depends on neither `world` nor `render`, so it is
-  testable without a connection or a GPU)
+  testable without a connection or a GPU) and `collision` (solid-world
+  queries; pure geometry, so likewise testable with a hand-built box)
 - `tools/wow-cli` — inspection CLI. **Every format gets a dump command here
   before it is wired into the renderer**, and a `survey` command that parses the
   whole archive set. Those surveys have caught every systematic parser bug so

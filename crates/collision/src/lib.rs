@@ -1,0 +1,666 @@
+//! Solid-world queries: what a character can walk through, and what it stands
+//! on.
+//!
+//! **Collision is entirely the client's job here, and that is a measurement
+//! rather than an assumption.** A character driven by this client walked
+//! through the wall of Northshire Abbey and a *second* client, watching, drew
+//! it happening -- so nothing on the server corrected the position, and nothing
+//! will. The two-client rig said so; see `docs/ROADMAP.md`.
+//!
+//! Deliberately knows nothing about MPQ, DBC, the protocol or the GPU. It takes
+//! triangles in world space and answers two questions:
+//!
+//! - [`World::slide`], for moving horizontally without passing through a wall;
+//! - [`World::floor_under`], for what height to stand at.
+//!
+//! That makes the whole of it testable from a unit test with a hand-built box,
+//! which is the same reason the `ui` crate depends on neither `world` nor
+//! `render`.
+
+use glam::{Vec2, Vec3};
+
+/// How far a surface can lean before it stops being a floor and becomes a wall.
+///
+/// **Chosen, and it is the one number here a player would feel.** Nothing in
+/// the game's data states a slope limit. At 0.5 -- sixty degrees from vertical
+/// -- the abbey's steps and the hills around it are walkable while its walls
+/// are not, which is what the constant is for. A surface whose normal has less
+/// vertical component than this is climbed *around* rather than up.
+const FLOOR_NORMAL_Z: f32 = 0.5;
+
+/// A triangle in world space.
+///
+/// Stored as three points rather than a point and two edges because the
+/// queries want the points, and deriving edges is a subtraction where
+/// reconstructing points is not.
+#[derive(Clone, Copy, Debug)]
+pub struct Triangle {
+    pub a: Vec3,
+    pub b: Vec3,
+    pub c: Vec3,
+}
+
+impl Triangle {
+    pub fn new(a: Vec3, b: Vec3, c: Vec3) -> Self {
+        Self { a, b, c }
+    }
+
+    /// The unit normal, or `None` for a degenerate triangle.
+    ///
+    /// Degenerate triangles are real: a merged WMO carries some, and a zero
+    /// normal normalises to NaN, which then poisons every comparison it
+    /// reaches instead of failing.
+    pub fn normal(&self) -> Option<Vec3> {
+        let n = (self.b - self.a).cross(self.c - self.a);
+        (n.length_squared() > 1e-12).then(|| n.normalize())
+    }
+
+    /// Whether this surface is flat enough to stand on.
+    pub fn is_floor(&self) -> bool {
+        self.normal().is_some_and(|n| n.z.abs() >= FLOOR_NORMAL_Z)
+    }
+
+    fn min(&self) -> Vec3 {
+        self.a.min(self.b).min(self.c)
+    }
+
+    fn max(&self) -> Vec3 {
+        self.a.max(self.b).max(self.c)
+    }
+
+    /// Where a downward ray from `above` crosses this triangle, if it does.
+    ///
+    /// Returns the height, not a distance, because every caller wants "what Z
+    /// do I stand at" and converting back is an opportunity to get a sign
+    /// wrong.
+    pub fn floor_hit(&self, above: Vec2) -> Option<f32> {
+        let n = self.normal()?;
+        // A wall has no "height at this point" worth reporting: a vertical
+        // triangle is crossed by a downward ray at a grazing angle, and the
+        // answer is unstable and useless.
+        if n.z.abs() < FLOOR_NORMAL_Z {
+            return None;
+        }
+        // Barycentric containment in the XY projection. The triangle is not
+        // vertical, so the projection is non-degenerate.
+        let (a, b, c) = (self.a.truncate(), self.b.truncate(), self.c.truncate());
+        let v0 = b - a;
+        let v1 = c - a;
+        let v2 = above - a;
+        let denominator = v0.x * v1.y - v1.x * v0.y;
+        if denominator.abs() < 1e-9 {
+            return None;
+        }
+        let u = (v2.x * v1.y - v1.x * v2.y) / denominator;
+        let v = (v0.x * v2.y - v2.x * v0.y) / denominator;
+        // A small tolerance, so a point exactly on the seam between two
+        // triangles lands on one of them rather than falling between both.
+        const EDGE: f32 = -1e-4;
+        if u < EDGE || v < EDGE || u + v > 1.0 - EDGE {
+            return None;
+        }
+        Some(self.a.z + u * (self.b.z - self.a.z) + v * (self.c.z - self.a.z))
+    }
+
+    /// Whether the segment `from` -> `to` passes through this triangle.
+    ///
+    /// Moller-Trumbore, and it exists for one job: catching a step large
+    /// enough to end up on the far side of a wall without ever overlapping it.
+    /// The push-out resolver cannot see that case by construction, because it
+    /// only ever looks at where the move *ended*.
+    fn crossed_by(&self, from: Vec3, to: Vec3) -> bool {
+        let direction = to - from;
+        let edge1 = self.b - self.a;
+        let edge2 = self.c - self.a;
+        let h = direction.cross(edge2);
+        let determinant = edge1.dot(h);
+        // Parallel to the triangle: a grazing path along a wall, which is what
+        // sliding produces and must not be treated as a crossing.
+        if determinant.abs() < 1e-9 {
+            return false;
+        }
+        let inverse = 1.0 / determinant;
+        let s = from - self.a;
+        let u = inverse * s.dot(h);
+        if !(-1e-5..=1.0 + 1e-5).contains(&u) {
+            return false;
+        }
+        let q = s.cross(edge1);
+        let v = inverse * direction.dot(q);
+        if v < -1e-5 || u + v > 1.0 + 1e-5 {
+            return false;
+        }
+        let t = inverse * edge2.dot(q);
+        (0.0..=1.0).contains(&t)
+    }
+
+    /// The shortest distance from a vertical segment to this triangle, in the
+    /// horizontal plane only, and the direction to push away along.
+    ///
+    /// Horizontal because a character is a cylinder being pushed out of a
+    /// wall, and the push has to leave its height alone -- resolving in three
+    /// dimensions against a sloped wall would lift the character up it.
+    fn push_out(&self, at: Vec2, low: f32, high: f32, radius: f32) -> Option<Vec2> {
+        // Ignore anything entirely above or below the body. Without this a
+        // character standing on a floor is permanently being pushed sideways
+        // by the floor it is standing on.
+        if self.min().z > high || self.max().z < low {
+            return None;
+        }
+        // Floors do not block horizontal movement, whatever their extent.
+        if self.is_floor() {
+            return None;
+        }
+        let (a, b, c) = (self.a.truncate(), self.b.truncate(), self.c.truncate());
+        let closest = closest_point_on_triangle_2d(at, a, b, c);
+        let away = at - closest;
+        let distance = away.length();
+        if distance >= radius {
+            return None;
+        }
+        // Dead centre of a wall: push along the wall's own normal rather than
+        // a zero vector, which would normalise to NaN.
+        if distance < 1e-5 {
+            let n = self.normal()?;
+            let flat = Vec2::new(n.x, n.y);
+            let fallback = if flat.length_squared() > 1e-9 {
+                flat.normalize()
+            } else {
+                Vec2::X
+            };
+            return Some(fallback * radius);
+        }
+        Some(away / distance * (radius - distance))
+    }
+}
+
+/// Closest point to `p` on triangle `abc`, in two dimensions.
+fn closest_point_on_triangle_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> Vec2 {
+    if point_in_triangle_2d(p, a, b, c) {
+        return p;
+    }
+    let mut best = closest_point_on_segment(p, a, b);
+    let mut best_d = p.distance_squared(best);
+    for (s, e) in [(b, c), (c, a)] {
+        let q = closest_point_on_segment(p, s, e);
+        let d = p.distance_squared(q);
+        if d < best_d {
+            best = q;
+            best_d = d;
+        }
+    }
+    best
+}
+
+fn closest_point_on_segment(p: Vec2, a: Vec2, b: Vec2) -> Vec2 {
+    let ab = b - a;
+    let length_squared = ab.length_squared();
+    if length_squared < 1e-12 {
+        return a;
+    }
+    a + ab * ((p - a).dot(ab) / length_squared).clamp(0.0, 1.0)
+}
+
+fn point_in_triangle_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
+    let sign = |p: Vec2, q: Vec2, r: Vec2| (p.x - r.x) * (q.y - r.y) - (q.x - r.x) * (p.y - r.y);
+    let d1 = sign(p, a, b);
+    let d2 = sign(p, b, c);
+    let d3 = sign(p, c, a);
+    let negative = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let positive = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(negative && positive)
+}
+
+/// Edge of one cell of the lookup grid, in world units.
+///
+/// A terrain tile is 533 units and a building is tens, so this is sized to a
+/// building rather than to a tile: big enough that the abbey spans only a
+/// handful of cells, small enough that a query touches a few dozen triangles
+/// rather than a few thousand. Not tuned against a profile -- there has not
+/// been one -- so it is stated as the guess it is.
+const CELL: f32 = 8.0;
+
+/// Everything solid, indexed so a query looks at what is nearby.
+///
+/// Built once per streamed tile and thrown away with it: rebuilding is cheap
+/// beside reading the tile off disk, and a grid that outlived its tile would be
+/// a set of invisible walls where a building used to be.
+#[derive(Default)]
+pub struct World {
+    triangles: Vec<Triangle>,
+    /// Cell coordinate to the triangles overlapping it. A triangle spanning
+    /// several cells appears in each, which is what makes a lookup a lookup
+    /// rather than a search.
+    cells: std::collections::HashMap<(i32, i32), Vec<u32>>,
+}
+
+impl World {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.triangles.is_empty()
+    }
+
+    pub fn triangle_count(&self) -> usize {
+        self.triangles.len()
+    }
+
+    /// Adds a triangle, skipping degenerate ones.
+    pub fn add(&mut self, triangle: Triangle) {
+        if triangle.normal().is_none() {
+            return;
+        }
+        let index = self.triangles.len() as u32;
+        let (min, max) = (triangle.min(), triangle.max());
+        for x in cell_of(min.x)..=cell_of(max.x) {
+            for y in cell_of(min.y)..=cell_of(max.y) {
+                self.cells.entry((x, y)).or_default().push(index);
+            }
+        }
+        self.triangles.push(triangle);
+    }
+
+    /// Every triangle whose cell touches the given square, without repeats.
+    fn near(&self, centre: Vec2, radius: f32) -> Vec<u32> {
+        let mut found: Vec<u32> = Vec::new();
+        for x in cell_of(centre.x - radius)..=cell_of(centre.x + radius) {
+            for y in cell_of(centre.y - radius)..=cell_of(centre.y + radius) {
+                if let Some(cell) = self.cells.get(&(x, y)) {
+                    found.extend_from_slice(cell);
+                }
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
+    /// What height to stand at under `at`, searching downward from `from_z`.
+    ///
+    /// **Downward from a little above the character, not from the sky.** A
+    /// query that took the highest surface anywhere above the ground would
+    /// stand a character on the abbey's roof the moment they walked under it.
+    /// Starting from where they already are, plus a step, is what makes a
+    /// staircase climbable and a roof irrelevant.
+    ///
+    /// `None` when nothing solid is under the point at all, which is the
+    /// common case outdoors -- the caller falls back to the terrain height
+    /// field, which is a different and much cheaper structure.
+    pub fn floor_under(&self, at: Vec2, from_z: f32, step: f32) -> Option<f32> {
+        let ceiling = from_z + step;
+        let mut best: Option<f32> = None;
+        for index in self.near(at, 0.0) {
+            let triangle = self.triangles[index as usize];
+            let Some(z) = triangle.floor_hit(at) else {
+                continue;
+            };
+            if z > ceiling {
+                continue;
+            }
+            if best.is_none_or(|b| z > b) {
+                best = Some(z);
+            }
+        }
+        best
+    }
+
+    /// Moves a character from `from` towards `to`, sliding along anything
+    /// solid instead of passing through it.
+    ///
+    /// The character is a vertical cylinder: `radius` across, from its feet up
+    /// to `height`. Both are the caller's, because this crate has no opinion
+    /// about how big a night elf is.
+    ///
+    /// **Resolved by pushing out of overlaps rather than by sweeping.** A swept
+    /// test finds the first surface a path crosses and stops there, which is
+    /// exact and, at a wall met at a shallow angle, stops dead. Pushing the
+    /// destination back out of everything it ends up inside gives sliding for
+    /// free: the component of the move along the wall survives, and only the
+    /// component into it is removed. The cost is that a fast enough step could
+    /// pass clean through a thin wall in one frame, which is why the caller is
+    /// expected to keep steps small -- at the run speed and sixty frames a
+    /// second a step is a fifth of a unit against walls a unit thick.
+    ///
+    /// **`step` lifts the bottom of the cylinder, and that is what makes a
+    /// staircase climbable.** A stair riser is a vertical face, so it is a
+    /// wall by every test here and pushes the character back off it -- which
+    /// is exactly what was reported: the abbey's steps and every small bump
+    /// stopped anybody dead, while `floor_under` sat there ready to stand them
+    /// on the tread they could not reach. Ignoring anything whose top is below
+    /// the character's feet plus `step` lets them pass horizontally, and the
+    /// caller's ground query then lifts them onto it.
+    ///
+    /// So `step` is precisely "how tall a thing may be and still be walked
+    /// over". Too small and stairs block; too large and a fence is a kerb.
+    pub fn slide(&self, from: Vec3, to: Vec3, radius: f32, height: f32, step: f32) -> Vec3 {
+        if self.triangles.is_empty() {
+            return to;
+        }
+        let mut at = to;
+        // Two passes: the first push can leave the character inside a second
+        // wall, which is exactly what an inside corner is. More than two buys
+        // very little and costs a lookup each.
+        for _ in 0..2 {
+            let (low, high) = (at.z + step, at.z + height);
+            let mut correction = Vec2::ZERO;
+            for index in self.near(at.truncate(), radius) {
+                if let Some(push) =
+                    self.triangles[index as usize].push_out(at.truncate(), low, high, radius)
+                {
+                    // Largest push wins per pass rather than summing: two faces
+                    // of one wall both push the same way, and adding them
+                    // ejects the character twice as far as either asked for.
+                    if push.length_squared() > correction.length_squared() {
+                        correction = push;
+                    }
+                }
+            }
+            if correction == Vec2::ZERO {
+                break;
+            }
+            at.x += correction.x;
+            at.y += correction.y;
+        }
+
+        // **A last-resort refusal, and it is what makes the guarantee real.**
+        // Push-out only ever looks at where the move ended, so a step big
+        // enough to clear a wall entirely -- a teleport, a lag spike, a frame
+        // that took a tenth of a second -- lands on the far side having
+        // overlapped nothing. Testing the *path* catches that, where testing
+        // the destination cannot. Being left where you started is worse than
+        // sliding and far better than being outside the world.
+        if self.crosses_wall(from, at, height, step) || self.blocked(at, radius, height, step) {
+            // Unless the start was already inside something, in which case
+            // refusing would weld the character in place for ever.
+            if !self.blocked(from, radius, height, step) {
+                return from;
+            }
+        }
+        at
+    }
+
+    /// Whether a straight path from `from` to `to` passes through a wall.
+    ///
+    /// Sampled at the feet, the middle and the head rather than as a swept
+    /// cylinder: three segments catch anything a character-sized body could
+    /// pass through, and a proper sweep is a great deal of arithmetic for a
+    /// case that only arises when something has already gone wrong.
+    pub fn crosses_wall(&self, from: Vec3, to: Vec3, height: f32, step: f32) -> bool {
+        if self.triangles.is_empty() {
+            return false;
+        }
+        let span = (to.truncate() - from.truncate()).length();
+        let middle = (from.truncate() + to.truncate()) * 0.5;
+        let candidates = self.near(middle, span * 0.5 + CELL);
+        // Sampled from the step height upward, for the same reason the
+        // push-out band starts there: a sample at the ankles would find every
+        // stair riser and refuse the move that the band above it just allowed.
+        for offset in [step + 0.05, (step + height) * 0.5, height * 0.9] {
+            let lift = Vec3::new(0.0, 0.0, offset);
+            for &index in &candidates {
+                let triangle = self.triangles[index as usize];
+                if triangle.is_floor() {
+                    continue;
+                }
+                if triangle.crossed_by(from + lift, to + lift) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether a cylinder here overlaps anything solid.
+    pub fn blocked(&self, at: Vec3, radius: f32, height: f32, step: f32) -> bool {
+        let (low, high) = (at.z + step, at.z + height);
+        self.near(at.truncate(), radius).into_iter().any(|index| {
+            self.triangles[index as usize]
+                .push_out(at.truncate(), low, high, radius)
+                .is_some()
+        })
+    }
+}
+
+fn cell_of(v: f32) -> i32 {
+    (v / CELL).floor() as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An axis-aligned box, as twelve triangles, from `min` to `max`.
+    fn box_at(min: Vec3, max: Vec3) -> Vec<Triangle> {
+        let c = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
+        let (a, b) = (min, max);
+        let corners = [
+            c(a.x, a.y, a.z),
+            c(b.x, a.y, a.z),
+            c(b.x, b.y, a.z),
+            c(a.x, b.y, a.z),
+            c(a.x, a.y, b.z),
+            c(b.x, a.y, b.z),
+            c(b.x, b.y, b.z),
+            c(a.x, b.y, b.z),
+        ];
+        const FACES: [[usize; 4]; 6] = [
+            [0, 1, 2, 3], // bottom
+            [4, 5, 6, 7], // top
+            [0, 1, 5, 4],
+            [1, 2, 6, 5],
+            [2, 3, 7, 6],
+            [3, 0, 4, 7],
+        ];
+        FACES
+            .iter()
+            .flat_map(|f| {
+                [
+                    Triangle::new(corners[f[0]], corners[f[1]], corners[f[2]]),
+                    Triangle::new(corners[f[0]], corners[f[2]], corners[f[3]]),
+                ]
+            })
+            .collect()
+    }
+
+    fn world_with(triangles: Vec<Triangle>) -> World {
+        let mut world = World::new();
+        for t in triangles {
+            world.add(t);
+        }
+        world
+    }
+
+    /// The whole point: a character cannot end up on the far side of a wall.
+    #[test]
+    fn a_wall_cannot_be_walked_through() {
+        // A wall across the y axis at x = 0, two units thick.
+        let world = world_with(box_at(
+            Vec3::new(-1.0, -10.0, 0.0),
+            Vec3::new(1.0, 10.0, 5.0),
+        ));
+        let from = Vec3::new(-4.0, 0.0, 0.0);
+        let to = Vec3::new(-1.5, 0.0, 0.0);
+        let at = world.slide(from, to, 0.5, 2.0, 0.0);
+        assert!(
+            at.x < -1.4,
+            "walked into the wall: ended at {at:?}"
+        );
+        // And the far side stays unreachable even when aimed straight at it.
+        let through = world.slide(from, Vec3::new(4.0, 0.0, 0.0), 0.5, 2.0, 0.0);
+        assert!(
+            through.x < 0.0,
+            "walked clean through a two-unit wall to {through:?}"
+        );
+    }
+
+    /// Running at a wall on the diagonal carries you along it.
+    ///
+    /// The half that separates sliding from stopping: a hard stop would leave
+    /// the character where it started, with neither component of the move
+    /// surviving.
+    #[test]
+    fn a_diagonal_run_slides_along_the_wall() {
+        let world = world_with(box_at(
+            Vec3::new(-1.0, -20.0, 0.0),
+            Vec3::new(1.0, 20.0, 5.0),
+        ));
+        let from = Vec3::new(-2.0, 0.0, 0.0);
+        // Straight at the wall and along it in equal measure.
+        let to = Vec3::new(-1.0, 1.0, 0.0);
+        let at = world.slide(from, to, 0.5, 2.0, 0.0);
+        assert!(at.x < -1.4, "the wall was entered: {at:?}");
+        assert!(
+            at.y > 0.5,
+            "the move along the wall was thrown away with the move into it: {at:?}"
+        );
+    }
+
+    /// Open ground is left exactly alone.
+    ///
+    /// A collision system that quietly nudges a character in empty space is
+    /// worse than none: it shows up as drift nobody can attribute.
+    #[test]
+    fn nothing_solid_means_nothing_changes() {
+        let world = world_with(box_at(
+            Vec3::new(50.0, 50.0, 0.0),
+            Vec3::new(52.0, 52.0, 5.0),
+        ));
+        let to = Vec3::new(3.0, 4.0, 1.0);
+        assert_eq!(world.slide(Vec3::new(0.0, 0.0, 1.0), to, 0.5, 2.0, 0.0), to);
+        assert_eq!(World::new().slide(Vec3::ZERO, to, 0.5, 2.0, 0.0), to);
+    }
+
+    /// A floor is stood on, and a roof overhead is not.
+    #[test]
+    fn the_floor_under_you_is_the_one_you_are_standing_on() {
+        // A box from z 0 to 5: its lid at 5 is a roof, its base at 0 a floor.
+        let world = world_with(box_at(
+            Vec3::new(-5.0, -5.0, 0.0),
+            Vec3::new(5.0, 5.0, 5.0),
+        ));
+        let at = Vec2::ZERO;
+
+        // Standing inside on the base: the roof is above and must be ignored.
+        assert_eq!(world.floor_under(at, 0.0, 0.5), Some(0.0));
+        // Standing on the roof: it is what holds you up.
+        assert_eq!(world.floor_under(at, 5.0, 0.5), Some(5.0));
+        // Nothing under a point outside the box at all.
+        assert_eq!(world.floor_under(Vec2::new(50.0, 50.0), 0.0, 0.5), None);
+    }
+
+    /// A step up is climbed; a wall of the same shape is not.
+    ///
+    /// These are the same query with one number changed, which is the point:
+    /// `step` is what separates a stair from an obstacle, and it belongs to
+    /// the caller rather than to the geometry.
+    #[test]
+    fn a_step_is_climbed_and_a_ledge_is_not() {
+        let world = world_with(box_at(
+            Vec3::new(-5.0, -5.0, 0.0),
+            Vec3::new(5.0, 5.0, 1.0),
+        ));
+        let at = Vec2::ZERO;
+        // Standing at ground level with a generous step: the top is reachable.
+        assert_eq!(world.floor_under(at, 0.0, 1.5), Some(1.0));
+        // With a small step the top is out of reach, and what answers instead
+        // is the box's *underside* -- which is a floor too, and is the surface
+        // actually under the character's feet. An earlier version of this test
+        // expected `None` and was wrong about its own fixture: a closed box
+        // has a bottom.
+        assert_eq!(world.floor_under(at, 0.0, 0.2), Some(0.0));
+    }
+
+    /// A wall is not a floor and a floor is not a wall.
+    #[test]
+    fn surfaces_are_sorted_by_how_far_they_lean() {
+        let flat = Triangle::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        let wall = Triangle::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        );
+        assert!(flat.is_floor());
+        assert!(!wall.is_floor());
+        // A degenerate triangle answers "no" rather than producing a NaN that
+        // poisons every comparison downstream.
+        let sliver = Triangle::new(Vec3::ZERO, Vec3::X, Vec3::X * 2.0);
+        assert!(sliver.normal().is_none());
+        assert!(!sliver.is_floor());
+    }
+
+    /// A step is walked over; a wall of the same footprint is not.
+    ///
+    /// **Both halves in one test, because the fix for the first is a way of
+    /// failing the second.** Raising the collision band by the step height is
+    /// what lets a stair riser be climbed -- and raise it far enough and every
+    /// wall in the game becomes a kerb. The step height *is* the line between
+    /// "walked over" and "walked into", so the test has to hold something on
+    /// each side of it.
+    #[test]
+    fn a_low_step_is_walked_over_and_a_wall_is_not() {
+        const STEP: f32 = 0.7;
+        let low = world_with(box_at(
+            Vec3::new(-1.0, -10.0, 0.0),
+            Vec3::new(1.0, 10.0, 0.3),
+        ));
+        let tall = world_with(box_at(
+            Vec3::new(-1.0, -10.0, 0.0),
+            Vec3::new(1.0, 10.0, 5.0),
+        ));
+        let from = Vec3::new(-3.0, 0.0, 0.0);
+        let to = Vec3::new(-1.2, 0.0, 0.0);
+
+        // The riser is shorter than a step, so nothing stops the character
+        // reaching it. Standing *on* it is the caller's ground query, not this
+        // one -- see `floor_under`.
+        assert_eq!(
+            low.slide(from, to, 0.5, 2.0, STEP),
+            to,
+            "a step shorter than the step height blocked the move"
+        );
+        // The same footprint, taller than a character: still a wall.
+        let stopped = tall.slide(from, to, 0.5, 2.0, STEP);
+        assert!(
+            stopped.x < to.x - 0.1,
+            "a five-unit wall was stepped over: {stopped:?}"
+        );
+
+        // And with no step allowance at all, the riser blocks -- which is the
+        // behaviour that was reported, and is what the parameter exists to
+        // change rather than something it changed by accident.
+        let without = low.slide(from, to, 0.5, 2.0, 0.0);
+        assert!(
+            without.x < to.x - 0.1,
+            "the riser stopped blocking for some reason other than the step: {without:?}"
+        );
+    }
+
+    /// An inside corner ejects the character out of both walls, not one.
+    #[test]
+    fn an_inside_corner_does_not_trap_you_in_a_wall() {
+        let mut triangles = box_at(Vec3::new(-1.0, -20.0, 0.0), Vec3::new(1.0, 0.0, 5.0));
+        triangles.extend(box_at(
+            Vec3::new(-20.0, -1.0, 0.0),
+            Vec3::new(0.0, 1.0, 5.0),
+        ));
+        let world = world_with(triangles);
+        // Aimed into the corner where the two meet.
+        let at = world.slide(
+            Vec3::new(-4.0, 4.0, 0.0),
+            Vec3::new(-0.6, 0.6, 0.0),
+            0.6,
+            2.0,
+            0.0,
+        );
+        assert!(
+            !world.blocked(at, 0.6, 2.0, 0.0),
+            "ended up inside a wall at {at:?}"
+        );
+    }
+}

@@ -59,6 +59,11 @@ pub struct CachedModel {
     /// Held because the bind groups reference their views.
     #[allow(dead_code)]
     textures: Vec<UploadedTexture>,
+    /// Everything solid about this model, in its own space, ready to be
+    /// transformed by each placement -- see the `collision` crate. Empty for
+    /// the many models that are scenery: a tuft of grass has no collision mesh
+    /// and the original lets you walk through it too.
+    pub collision: Vec<[[f32; 3]; 3]>,
 }
 
 /// One model and the transforms it takes on a single tile.
@@ -112,6 +117,12 @@ pub struct Held {
 pub struct Tile {
     pub terrain: LoadedTerrain,
     pub groups: Vec<Group>,
+    /// Everything solid on this tile, in world space.
+    ///
+    /// Built with the tile and evicted with it. Rebuilding costs nothing
+    /// beside reading the tile off disk, and a set that outlived its tile
+    /// would be invisible walls where a building used to be.
+    solid: collision::World,
     /// Kept alongside the uploaded mesh so the ground can be *asked* about,
     /// not only drawn -- see [`World::height_at`]. The GPU copy cannot answer:
     /// reading a vertex buffer back per frame to find out how high the ground
@@ -230,10 +241,14 @@ pub struct EntityPlacement {
     /// simply *moving*, and drawing the walk cycle for both makes the charge
     /// look like the model is being dragged.
     pub speed: f32,
-    /// How fast it travels *across* its own facing, positive to the left, so a
-    /// sidestep can be told from a run -- see [`Motion::from_pace`]. Zero for
-    /// everything the server drives; only the player's keys supply one.
-    pub lateral: f32,
+    /// How fast it is turning on the spot, positive to the left -- see
+    /// [`Motion::from_pace`]. Zero for everything the server drives; nothing on
+    /// the wire says a creature is turning where it stands.
+    pub turning: f32,
+    /// Off the ground. False for everything the server drives: a creature's
+    /// movement arrives as a path along the surface, and `MOVEFLAG_FALLING` on
+    /// a relayed player is not read yet.
+    pub airborne: bool,
     /// Whether this unit has no health left, so it should be drawn down rather
     /// than standing. Outranks `speed`: a creature killed mid-charge still has
     /// the charge's speed attached to it.
@@ -574,10 +589,25 @@ impl World {
         }
 
         let mut built = Vec::new();
+        let mut solid = collision::World::new();
         for (path, transforms) in groups {
             let Some(model) = self.model(gpu, meshes, chain, &path) else {
                 continue;
             };
+            // Placed into world space here rather than kept in model space and
+            // transformed per query: a building is placed once and asked about
+            // sixty times a second, and the grid can only index what has a
+            // world position.
+            for transform in &transforms {
+                for triangle in &model.collision {
+                    let p = |v: [f32; 3]| transform.transform_point3(Vec3::from(v));
+                    solid.add(collision::Triangle::new(
+                        p(triangle[0]),
+                        p(triangle[1]),
+                        p(triangle[2]),
+                    ));
+                }
+            }
             meshes.prepare(gpu, model.draws.iter().map(|d| d.state));
             let raw: Vec<Instance> = transforms
                 .iter()
@@ -592,10 +622,17 @@ impl World {
             });
         }
 
+        tracing::debug!(
+            "tile {},{} is solid in {} triangles",
+            tile.0,
+            tile.1,
+            solid.triangle_count()
+        );
         Ok(Tile {
             terrain,
             groups: built,
             heights: TileHeights::new(&parsed.chunks),
+            solid,
         })
     }
 
@@ -615,6 +652,49 @@ impl World {
     pub fn height_at(&self, x: f32, y: f32) -> Option<f32> {
         let tile = tile_at(Vec3::new(x, y, 0.0));
         self.tiles.get(&tile)?.heights.height_at(x, y)
+    }
+
+    /// Where a character ends up moving from `from` towards `to`.
+    ///
+    /// **Consults the tiles the move touches, not just the one it starts on.**
+    /// A building straddling a tile boundary belongs to exactly one owner --
+    /// see `load_tile` -- so asking only the starting tile would let a
+    /// character walk through the half of the abbey that belongs to its
+    /// neighbour.
+    ///
+    /// Falls through untouched when nothing solid is resident, which is the
+    /// common case: most of a tile is open ground, and a query that found
+    /// nothing must not perturb the position by so much as a float.
+    pub fn slide(&self, from: Vec3, to: Vec3, radius: f32, height: f32, step: f32) -> Vec3 {
+        let mut at = to;
+        for tile in self.tiles_touching(from, to) {
+            if tile.solid.is_empty() {
+                continue;
+            }
+            at = tile.solid.slide(from, at, radius, height, step);
+        }
+        at
+    }
+
+    /// The height of any building floor under a point, or `None` for open
+    /// ground where the terrain height field is the answer.
+    pub fn floor_under(&self, at: Vec3, step: f32) -> Option<f32> {
+        let tile = self.tiles.get(&tile_at(at))?;
+        tile.solid
+            .floor_under(at.truncate(), at.z, step)
+    }
+
+    /// Every resident tile a straight move between two points could touch.
+    ///
+    /// A short move is one or two tiles; listing them rather than assuming the
+    /// start's is what makes a tile seam an implementation detail instead of a
+    /// hole in the world.
+    fn tiles_touching(&self, from: Vec3, to: Vec3) -> impl Iterator<Item = &Tile> {
+        let (a, b) = (tile_at(from), tile_at(to));
+        let xs = a.0.min(b.0)..=a.0.max(b.0);
+        let ys = a.1.min(b.1)..=a.1.max(b.1);
+        xs.flat_map(move |x| ys.clone().map(move |y| (x, y)))
+            .filter_map(|key| self.tiles.get(&key))
     }
 
     /// Loads a model, or returns the cached one. Failures are cached too.
@@ -651,21 +731,34 @@ impl World {
         path: &str,
         variations: &crate::model::Variations,
     ) -> Option<Rc<CachedModel>> {
+        // A named struct rather than the seven-element tuple this used to
+        // thread through: the two branches produce the same set of parts, and
+        // a tuple that long is a place for two of them to be swapped silently.
+        struct Built {
+            mesh: render::mesh::GpuMesh,
+            draws: Vec<Draw>,
+            textures: Vec<UploadedTexture>,
+            bones: Vec<m2::AnimatedBone>,
+            sequences: Vec<m2::Sequence>,
+            attachments: Vec<m2::Attachment>,
+            bounds: Option<(Vec3, Vec3)>,
+            collision: Vec<[[f32; 3]; 3]>,
+        }
+
         let lower = path.to_lowercase();
         let built = if lower.ends_with(".wmo") {
             // No skeleton to speak of, so nothing to animate and nothing to
             // hang off it.
             crate::world_object::load(gpu, chain, path, None)
-                .map(|w| {
-                    (
-                        w.mesh,
-                        w.draws,
-                        w.textures,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        None,
-                    )
+                .map(|w| Built {
+                    mesh: w.mesh,
+                    draws: w.draws,
+                    textures: w.textures,
+                    bones: Vec::new(),
+                    sequences: Vec::new(),
+                    attachments: Vec::new(),
+                    bounds: None,
+                    collision: w.collision,
                 })
                 .ok()
         } else {
@@ -684,37 +777,38 @@ impl World {
                             m.missing_textures.join(", ")
                         );
                     }
-                    (
-                        m.mesh,
-                        m.draws,
-                        m.textures,
-                        m.bones,
-                        m.sequences,
-                        m.attachments,
-                        Some((m.min, m.max)),
-                    )
+                    Built {
+                        mesh: m.mesh,
+                        draws: m.draws,
+                        textures: m.textures,
+                        bones: m.bones,
+                        sequences: m.sequences,
+                        attachments: m.attachments,
+                        bounds: Some((m.min, m.max)),
+                        collision: m.collision,
+                    }
                 })
                 .ok()
         };
 
-        built.map(
-            |(mesh, draws, textures, bones, sequences, attachments, bounds)| {
-                let binds = textures
-                    .iter()
-                    .map(|t| meshes.material_bind_group(gpu, &t.view))
-                    .collect();
-                Rc::new(CachedModel {
-                    mesh,
-                    draws,
-                    binds,
-                    bones,
-                    sequences,
-                    attachments,
-                    bounds,
-                    textures,
-                })
-            },
-        )
+        built.map(|b| {
+            let binds = b
+                .textures
+                .iter()
+                .map(|t| meshes.material_bind_group(gpu, &t.view))
+                .collect();
+            Rc::new(CachedModel {
+                mesh: b.mesh,
+                draws: b.draws,
+                binds,
+                bones: b.bones,
+                sequences: b.sequences,
+                attachments: b.attachments,
+                bounds: b.bounds,
+                textures: b.textures,
+                collision: b.collision,
+            })
+        })
     }
 
     pub fn tiles(&self) -> impl Iterator<Item = &Tile> {
@@ -792,7 +886,8 @@ impl World {
                     placement.display_id,
                     Motion::resolve(
                         placement.speed,
-                        placement.lateral,
+                        placement.turning,
+                        placement.airborne,
                         placement.dead,
                         placement.died_ms_ago,
                         placement.swung_ms_ago,
@@ -1198,6 +1293,11 @@ impl World {
                     // the one that has to carry the model's extent.
                     bounds: Some((loaded.min, loaded.max)),
                     textures: loaded.textures,
+                    // A replicated entity's own body is not scenery: creatures
+                    // and players are moved by the server, and colliding with
+                    // them is a different feature from colliding with the
+                    // world. Left empty rather than filled in unused.
+                    collision: Vec::new(),
                 })
             })
             .map_err(|e| tracing::debug!("display id {display_id}: {e}"))
@@ -1309,6 +1409,11 @@ const WALK_BACK_ANIMATION_ID: u16 = 13;
 /// remembered.
 const SHUFFLE_LEFT_ANIMATION_ID: u16 = 11;
 const SHUFFLE_RIGHT_ANIMATION_ID: u16 = 12;
+/// `AnimationData` rows 38 and 40. Read from the table: the *sequence* indices
+/// for these on the human male are 31 and 17, which is exactly the confusion
+/// that makes transcribing an id out of a model listing a mistake.
+const JUMP_ANIMATION_ID: u16 = 38;
+const FALL_ANIMATION_ID: u16 = 40;
 /// Falling over, and lying still afterwards. Two rows, not one, and the table
 /// says so itself: `Dead` (6) lists `Death` (1) as its *fallback*, which is
 /// exactly the relationship between them -- a model with no settled-corpse
@@ -1403,7 +1508,22 @@ pub enum Motion {
     /// the model carries `Walkbackwards`, and a character reversing at a run
     /// looks like a sprint performed facing the wrong way.
     WalkBack,
-    /// Sidestepping, and which way.
+    /// Off the ground.
+    ///
+    /// One state for the whole arc rather than the three the table offers.
+    /// `AnimationData` has `JumpStart` (37), `Jump` (38), `JumpEnd` (39) and
+    /// `Fall` (40), and sequencing them properly needs to know how far through
+    /// a jump is and whether it is still rising -- which the caller knows and
+    /// this enum, keyed for a cache, deliberately does not. `Jump` reads
+    /// correctly for the whole flight; the other three are the refinement, not
+    /// the feature.
+    Airborne,
+    /// Turning on the spot, and which way.
+    ///
+    /// **Not sidestepping.** That was the first reading and it was reported
+    /// back as the character shimmying while it strafed -- see
+    /// [`Motion::from_pace`], where the data that should have said so first is
+    /// written up.
     ///
     /// The models carry these -- `ShuffleLeft` and `ShuffleRight`, sequences 38
     /// and 39 on the human male, half a second each. They were nearly declared
@@ -1463,26 +1583,33 @@ impl Motion {
     /// character sprinting while facing the wrong way -- reported from play as
     /// exactly that. Negative is backwards; there is only one backwards cycle,
     /// so its magnitude chooses nothing.
-    /// The cycle a *velocity* calls for: how fast along the facing, and how
-    /// fast across it.
+    /// The cycle a movement calls for: how fast along the facing, and how fast
+    /// the character is turning on the spot.
     ///
-    /// **Travelling forwards or backwards outranks sidestepping**, which is
-    /// the whole of the diagonal rule. A character running forward while
-    /// strafing is running, and drawing it sidestepping would make a diagonal
-    /// sprint look like a crab. Only when there is no longitudinal component at
-    /// all does the sidestep cycle win -- which is exactly when a player is
-    /// holding `Q` or `E` on their own.
+    /// **Strafing is travelling, and travelling plays a travelling cycle.**
+    /// The first version of this gave a pure sidestep the `Shuffle` cycles and
+    /// it was reported straight back as the character *shimmying* -- which is
+    /// what those cycles are, and the data said so before the render did. Both
+    /// advance the character by 0.00, `AnimationData` sends both back to Stand
+    /// rather than to a travel cycle, and both run half a second. Three
+    /// separate statements that they are a standing-adjacent adjustment, played
+    /// while the character moved at seven units a second.
     ///
-    /// That precedence is a judgement about what the original client does
-    /// rather than something the data states, and it is the one line here worth
-    /// A/B-ing at a window if diagonal movement ever looks wrong again.
+    /// So a sidestep uses the run, exactly as running forward does, and the
+    /// caller folds it into `forward` -- there is nothing left for a lateral
+    /// term to decide. What the shuffle *is* for, on this reading, is turning
+    /// on the spot: `turning` is the signed rate the A and D keys apply, and it
+    /// only chooses a cycle when nothing else is happening.
     ///
-    /// `lateral` is signed, positive to the left -- see [`Side`]. Replicated
-    /// creatures pass zero, and that is an absence rather than a claim: a
-    /// monster move gives a path and a duration and says nothing about which
-    /// way the body is turned relative to it, so inventing a lateral component
-    /// for them would be inventing data.
-    pub fn from_pace(forward: f32, lateral: f32) -> Self {
+    /// **That last part is a hypothesis and the rest is not.** Speed 0.00 and a
+    /// Stand fallback say what the cycle is not; they do not say what it is.
+    /// A recording of the original client turning in place would settle it, and
+    /// it is the only claim here that needs one.
+    ///
+    /// `turning` is positive to the left, matching both `Axis::Positive` and
+    /// [`Side`]. Replicated creatures pass zero, and that is an absence rather
+    /// than a claim: nothing on the wire says a creature is turning in place.
+    pub fn from_pace(forward: f32, turning: f32) -> Self {
         if forward > 0.0 {
             return if forward < RUN_SPEED {
                 Motion::Walk
@@ -1493,9 +1620,9 @@ impl Motion {
         if forward < 0.0 {
             return Motion::WalkBack;
         }
-        if lateral > 0.0 {
+        if turning > 0.0 {
             Motion::Shuffle(Side::Left)
-        } else if lateral < 0.0 {
+        } else if turning < 0.0 {
             Motion::Shuffle(Side::Right)
         } else {
             Motion::Stand
@@ -1523,6 +1650,7 @@ impl Motion {
     pub fn resolve(
         speed: f32,
         lateral: f32,
+        airborne: bool,
         dead: bool,
         died_ms_ago: Option<u32>,
         swung_ms_ago: Option<u32>,
@@ -1537,6 +1665,12 @@ impl Motion {
                 }
                 _ => Motion::Dead,
             };
+        }
+        // **Below dead and above everything else.** A corpse does not jump,
+        // and a character mid-jump is not standing, walking or swinging
+        // whatever the keys say.
+        if airborne {
+            return Motion::Airborne;
         }
         let moving = Motion::from_pace(speed, lateral);
         if moving == Motion::Stand {
@@ -1566,6 +1700,7 @@ impl Motion {
                 | Motion::Run
                 | Motion::WalkBack
                 | Motion::Shuffle(_)
+                | Motion::Airborne
         )
     }
 
@@ -1594,17 +1729,23 @@ impl Motion {
             // while it retreats is odd, where standing still as it slides is
             // the bug this whole family exists to avoid.
             Motion::WalkBack => &[WALK_BACK_ANIMATION_ID, WALK_ANIMATION_ID],
-            // **Deliberately not the table's own fallback.** `AnimationData`
-            // sends both shuffles to row 0, Stand, and standing still while
-            // sliding sideways is the exact bug this whole family exists to
-            // avoid -- so they fall back to the travelling cycles instead.
-            // Nearly unreachable either way: only the player supplies a
-            // lateral component, and every character model carries both.
+            // **The table's own fallback, which was right and was overruled.**
+            // `AnimationData` sends both shuffles to row 0, Stand. That was
+            // read as a mistake and replaced with the travelling cycles, on
+            // the rule that a model sliding on the spot is worse than one
+            // standing -- but that rule is about a unit that is *going*
+            // somewhere, and a shuffle is a unit that is not. The table was
+            // describing what the cycle is, and the disagreement was the first
+            // sign that it had been given the wrong job.
+            // Falling back to the run rather than to standing: a character
+            // sailing through the air in its idle pose is the same failure as
+            // one sliding along the ground in it.
+            Motion::Airborne => &[JUMP_ANIMATION_ID, FALL_ANIMATION_ID, RUN_ANIMATION_ID],
             Motion::Shuffle(Side::Left) => {
-                &[SHUFFLE_LEFT_ANIMATION_ID, RUN_ANIMATION_ID, WALK_ANIMATION_ID]
+                &[SHUFFLE_LEFT_ANIMATION_ID, STAND_ANIMATION_ID]
             }
             Motion::Shuffle(Side::Right) => {
-                &[SHUFFLE_RIGHT_ANIMATION_ID, RUN_ANIMATION_ID, WALK_ANIMATION_ID]
+                &[SHUFFLE_RIGHT_ANIMATION_ID, STAND_ANIMATION_ID]
             }
             Motion::Dying(_) => &[DEATH_ANIMATION_ID],
             // Settled last: a model with no lying-still cycle holds the final
@@ -1764,42 +1905,35 @@ mod tests {
         assert_eq!(Motion::from_pace(7.0, 0.0), Motion::Run);
     }
 
-    /// Sidestepping has its own cycle; running diagonally does not.
+    /// Turning on the spot has its own cycle; travelling never does.
     ///
-    /// **Both halves, and the diagonal is the one that matters.** Making pure
-    /// strafing shuffle is easy and would also make a forward sprint with a
-    /// strafe key held draw as a sidestep, which is a worse picture than the
-    /// forward run it replaced -- and a test that only checked pure strafing
-    /// would pass for it.
+    /// **This test is the shape of the bug that produced it.** The shuffle was
+    /// first given to sidestepping, and a character strafing at the run speed
+    /// with a half-second in-place cycle on its legs was reported back as
+    /// shimmying. So the assertion that matters is the *negative* one: no
+    /// amount of travelling, in any direction, may select a shuffle.
     #[test]
-    fn sidestepping_has_a_cycle_and_a_diagonal_run_does_not() {
-        assert_eq!(Motion::from_pace(0.0, 7.0), Motion::Shuffle(Side::Left));
-        assert_eq!(Motion::from_pace(0.0, -7.0), Motion::Shuffle(Side::Right));
+    fn only_turning_on_the_spot_shuffles() {
+        assert_eq!(Motion::from_pace(0.0, 3.0), Motion::Shuffle(Side::Left));
+        assert_eq!(Motion::from_pace(0.0, -3.0), Motion::Shuffle(Side::Right));
 
-        // Travelling outranks sidestepping, in both directions.
-        assert_eq!(Motion::from_pace(7.0, 7.0), Motion::Run);
-        assert_eq!(Motion::from_pace(7.0, -7.0), Motion::Run);
-        assert_eq!(Motion::from_pace(2.5, 7.0), Motion::Walk);
-        assert_eq!(Motion::from_pace(-4.5, 7.0), Motion::WalkBack);
+        // Travelling outranks it, in every direction and even while turning.
+        assert_eq!(Motion::from_pace(7.0, 3.0), Motion::Run);
+        assert_eq!(Motion::from_pace(2.5, -3.0), Motion::Walk);
+        assert_eq!(Motion::from_pace(-4.5, 3.0), Motion::WalkBack);
 
-        // And standing still is still standing still.
+        // And standing still, turning at nothing, is standing still.
         assert_eq!(Motion::from_pace(0.0, 0.0), Motion::Stand);
     }
 
-    /// The sidestep cycles are the ids the table names, and they loop.
+    /// The shuffle cycles are the ids the table names, and they loop.
     #[test]
-    fn sidestepping_resolves_to_the_shuffle_cycles() {
+    fn turning_resolves_to_the_shuffle_cycles() {
         let left = Motion::Shuffle(Side::Left).animation_ids();
         let right = Motion::Shuffle(Side::Right).animation_ids();
         assert_eq!(left.first(), Some(&SHUFFLE_LEFT_ANIMATION_ID));
         assert_eq!(right.first(), Some(&SHUFFLE_RIGHT_ANIMATION_ID));
         assert_ne!(left.first(), right.first(), "both sides play one cycle");
-        // Deliberately not the table's fallback, which is Stand for both: a
-        // model sliding sideways on the spot is the bug this family avoids.
-        for ids in [left, right] {
-            assert!(!ids.contains(&STAND_ANIMATION_ID));
-            assert_eq!(ids.last(), Some(&WALK_ANIMATION_ID));
-        }
     }
 
     /// And the backwards cycle falls back to the forward walk, per the table.
@@ -1825,18 +1959,18 @@ mod tests {
     fn a_drawn_weapon_is_enough_to_hold_the_guard() {
         // Not fighting, standing still, weapon out.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, None, None, false, 4_000, Stance::TwoHand),
+            Motion::resolve(0.0, 0.0, false, false, None, None, false, 4_000, Stance::TwoHand),
             Motion::Ready(Stance::TwoHand),
         );
         // And with nothing drawn it still relaxes, which is the half that
         // stops this from simply making everyone stand guard forever.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, None, None, false, 4_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, false, None, None, false, 4_000, Stance::Unarmed),
             Motion::Stand,
         );
         // Moving still outranks it: a character runs, weapon or no weapon.
         assert_eq!(
-            Motion::resolve(7.0, 0.0, false, None, None, false, 4_000, Stance::TwoHand),
+            Motion::resolve(7.0, 0.0, false, false, None, None, false, 4_000, Stance::TwoHand),
             Motion::Run,
         );
     }
@@ -1895,7 +2029,7 @@ mod tests {
     #[test]
     fn death_outranks_a_stale_speed() {
         assert_eq!(
-            Motion::resolve(7.0, 0.0, true, None, None, false, 10_000, Stance::Unarmed),
+            Motion::resolve(7.0, 0.0, false, true, None, None, false, 10_000, Stance::Unarmed),
             Motion::Dead,
             "a corpse was drawn running"
         );
@@ -1907,10 +2041,10 @@ mod tests {
     #[test]
     fn only_a_death_we_watched_plays_the_fall() {
         assert_eq!(
-            Motion::resolve(0.0, 0.0, true, Some(200), None, false, 10_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, true, Some(200), None, false, 10_000, Stance::Unarmed),
             Motion::Dying(9_800)
         );
-        assert_eq!(Motion::resolve(0.0, 0.0, true, None, None, false, 10_000, Stance::Unarmed), Motion::Dead);
+        assert_eq!(Motion::resolve(0.0, 0.0, false, true, None, None, false, 10_000, Stance::Unarmed), Motion::Dead);
     }
 
     /// And it stops falling eventually, rather than holding a one-shot bucket
@@ -1918,7 +2052,7 @@ mod tests {
     #[test]
     fn a_fall_settles_once_it_has_had_time_to_finish() {
         assert_eq!(
-            Motion::resolve(0.0, 0.0, true, Some(ONE_SHOT_CEILING_MS + 1), None, false, 10_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, true, Some(ONE_SHOT_CEILING_MS + 1), None, false, 10_000, Stance::Unarmed),
             Motion::Dead
         );
     }
@@ -1933,15 +2067,15 @@ mod tests {
     /// play correctly and the cost would be invisible.
     #[test]
     fn a_one_shot_keeps_its_bucket_as_the_clock_advances() {
-        let first = Motion::resolve(0.0, 0.0, true, Some(100), None, false, 5_000, Stance::Unarmed);
+        let first = Motion::resolve(0.0, 0.0, false, true, Some(100), None, false, 5_000, Stance::Unarmed);
         // A second later: the death is a second older and the clock a second
         // further on, which is the same death.
-        let later = Motion::resolve(0.0, 0.0, true, Some(1_100), None, false, 6_000, Stance::Unarmed);
+        let later = Motion::resolve(0.0, 0.0, false, true, Some(1_100), None, false, 6_000, Stance::Unarmed);
         assert_eq!(first, later, "the bucket moved with the clock");
 
         // Two deaths a second apart must *not* share, or one pops to the
         // other's frame.
-        let other = Motion::resolve(0.0, 0.0, true, Some(100), None, false, 6_000, Stance::Unarmed);
+        let other = Motion::resolve(0.0, 0.0, false, true, Some(100), None, false, 6_000, Stance::Unarmed);
         assert_ne!(first, other);
     }
 
@@ -1960,10 +2094,10 @@ mod tests {
     fn a_one_shot_bucket_survives_drift_between_two_clock_reads() {
         // The same swing, seen over eight frames, with the two clock readings
         // drifting a few milliseconds apart each time as they really do.
-        let reference = Motion::resolve(0.0, 0.0, false, None, Some(40), true, 8_000, Stance::Unarmed);
+        let reference = Motion::resolve(0.0, 0.0, false, false, None, Some(40), true, 8_000, Stance::Unarmed);
         for frame in 0..8u32 {
             let drift = frame * 3;
-            let seen = Motion::resolve(0.0, 0.0,
+            let seen = Motion::resolve(0.0, 0.0, false,
                 false,
                 None,
                 Some(40 + frame * 16),
@@ -1999,7 +2133,7 @@ mod tests {
             "a fighter would be frozen on its follow-through between swings"
         );
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, None, Some(ATTACK_CEILING_MS + 1), true, 9_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, false, None, Some(ATTACK_CEILING_MS + 1), true, 9_000, Stance::Unarmed),
             Motion::Ready(Stance::Unarmed)
         );
     }
@@ -2010,13 +2144,13 @@ mod tests {
     #[test]
     fn a_swing_interrupts_standing_but_not_running() {
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, None, Some(50), true, 4_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, false, None, Some(50), true, 4_000, Stance::Unarmed),
             Motion::Attacking(3_900, Stance::Unarmed)
         );
-        assert_eq!(Motion::resolve(7.0, 0.0, false, None, Some(50), true, 4_000, Stance::Unarmed), Motion::Run);
+        assert_eq!(Motion::resolve(7.0, 0.0, false, false, None, Some(50), true, 4_000, Stance::Unarmed), Motion::Run);
         // And an old swing has stopped mattering.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, None, Some(ONE_SHOT_CEILING_MS + 1), false, 4_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, false, None, Some(ONE_SHOT_CEILING_MS + 1), false, 4_000, Stance::Unarmed),
             Motion::Stand
         );
     }
@@ -2032,22 +2166,22 @@ mod tests {
     #[test]
     fn a_fighter_between_swings_keeps_its_guard_up() {
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, None, None, true, 4_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, false, None, None, true, 4_000, Stance::Unarmed),
             Motion::Ready(Stance::Unarmed)
         );
         // Out of the fight, it relaxes.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, None, None, false, 4_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, false, None, None, false, 4_000, Stance::Unarmed),
             Motion::Stand
         );
         // A swing still beats the guard, and running still beats both.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, None, Some(50), true, 4_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, false, None, Some(50), true, 4_000, Stance::Unarmed),
             Motion::Attacking(3_900, Stance::Unarmed)
         );
-        assert_eq!(Motion::resolve(7.0, 0.0, false, None, None, true, 4_000, Stance::Unarmed), Motion::Run);
+        assert_eq!(Motion::resolve(7.0, 0.0, false, false, None, None, true, 4_000, Stance::Unarmed), Motion::Run);
         // And a corpse is not "in a fight" whatever the map still says.
-        assert_eq!(Motion::resolve(0.0, 0.0, true, None, None, true, 4_000, Stance::Unarmed), Motion::Dead);
+        assert_eq!(Motion::resolve(0.0, 0.0, false, true, None, None, true, 4_000, Stance::Unarmed), Motion::Dead);
     }
 
     /// Which cycles hold their last frame is a property of the *animation*,

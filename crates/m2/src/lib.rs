@@ -125,6 +125,12 @@ struct Header {
     bounding_sphere_radius: f32,
     collision_box: [f32; 6],
     collision_sphere_radius: f32,
+    /// The *collision* mesh, a far coarser thing than the drawn geometry --
+    /// tens of triangles where the render mesh has thousands. Parsed because a
+    /// fence a character walks through is not a fence; see the `collision`
+    /// crate.
+    collision_indices: Array,
+    collision_positions: Array,
     attachments: Array,
 }
 
@@ -341,8 +347,11 @@ impl Model {
         }
         h.collision_sphere_radius = r.f32();
 
-        let _collision_indices = r.array();
-        let _collision_positions = r.array();
+        h.collision_indices = r.array();
+        h.collision_positions = r.array();
+        // Read and dropped: the collision queries derive a face normal from
+        // the three points, which cannot disagree with the winding the way a
+        // stored one can.
         let _collision_normals = r.array();
         h.attachments = r.array();
         r.skip_floats(0);
@@ -764,6 +773,41 @@ impl Model {
                     position: [f(8), f(12), f(16)],
                 }
             })
+            .collect()
+    }
+
+    /// The collision mesh, as triangles in model space.
+    ///
+    /// Empty for the great many models that carry none -- a torch, a bush, a
+    /// tuft of grass -- which is a real answer rather than a failure: those
+    /// are things the original lets a character walk through too.
+    ///
+    /// **Its own mesh, not the drawn one.** A tree's render geometry is
+    /// thousands of triangles of leaves; its collision is a handful around the
+    /// trunk. Using the drawn mesh would be both far slower and wrong, because
+    /// it would make the foliage solid.
+    pub fn collision_triangles(&self) -> Vec<[[f32; 3]; 3]> {
+        let (Ok(indices), Ok(positions)) = (
+            self.slice("collision indices", self.header.collision_indices, 2),
+            self.slice("collision positions", self.header.collision_positions, 12),
+        ) else {
+            return Vec::new();
+        };
+        let point = |i: usize| -> Option<[f32; 3]> {
+            let o = i.checked_mul(12)?;
+            let raw = positions.get(o..o + 12)?;
+            let f = |k: usize| f32::from_le_bytes(raw[k..k + 4].try_into().unwrap());
+            Some([f(0), f(4), f(8)])
+        };
+        indices
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]) as usize)
+            .collect::<Vec<_>>()
+            .chunks_exact(3)
+            // An index past the end of the position array is dropped rather
+            // than clamped: a triangle built from the wrong vertex is an
+            // invisible wall in the wrong place, which is worse than a gap.
+            .filter_map(|t| Some([point(t[0])?, point(t[1])?, point(t[2])?]))
             .collect()
     }
 

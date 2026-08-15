@@ -43,6 +43,10 @@ pub struct LoadedModel {
     pub triangle_count: usize,
     /// Textures that could not be resolved, for the overlay to report.
     pub missing_textures: Vec<String>,
+    /// The model's own collision mesh, in model space -- a far coarser thing
+    /// than the drawn geometry, and empty for anything meant to be walked
+    /// through. See `m2::Model::collision_triangles`.
+    pub collision: Vec<[[f32; 3]; 3]>,
 }
 
 /// Texture names supplied from outside the model, as `CreatureDisplayInfo`
@@ -368,6 +372,7 @@ pub fn load_dressed(
         bones,
         sequences,
         attachments: model.attachments(),
+        collision: model.collision_triangles(),
         sequence_names,
         min,
         max,
