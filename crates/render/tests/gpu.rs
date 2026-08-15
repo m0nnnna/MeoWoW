@@ -13,14 +13,31 @@ use render::Gpu;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-fn gpu() -> Option<Gpu> {
-    match Gpu::block(None) {
+/// One device for the whole binary, created once.
+///
+/// **These tests deadlocked when each made its own.** The harness runs them on
+/// separate threads, so eleven `Gpu::block` calls raced to enumerate adapters
+/// and create DX12 devices at once; the run hung with thirty-seven threads and
+/// six seconds of CPU between them, indefinitely. Single-threaded the same
+/// eleven finish in under six seconds.
+///
+/// It is a *race*, which is the part that matters: it does not always hang, so
+/// a green run is no evidence the next one will be. That is why this is fixed
+/// rather than papered over with `RUST_TEST_THREADS=1` -- a workaround in an
+/// environment variable is one nobody applies on the run that matters.
+///
+/// Sharing is safe and is what a real application does anyway: wgpu's device
+/// and queue are `Send + Sync`, and every test here only reads from them.
+fn gpu() -> Option<&'static Gpu> {
+    static GPU: std::sync::OnceLock<Option<Gpu>> = std::sync::OnceLock::new();
+    GPU.get_or_init(|| match Gpu::block(None) {
         Ok(gpu) => Some(gpu),
         Err(e) => {
             eprintln!("skipping: no GPU adapter ({e})");
             None
         }
-    }
+    })
+    .as_ref()
 }
 
 macro_rules! require_gpu {

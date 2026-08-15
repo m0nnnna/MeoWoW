@@ -3262,3 +3262,131 @@ and ignored -- this loops where the original pauses between tracks. Other
 players' weapons make no sound, because their equipment arrives as visible-item
 fields this client does not read. Spell sounds, footsteps and interface clicks
 are all untouched.
+
+### 4.15: NPCs answer
+
+The first send of the NPC-interaction milestone, and the first reply. Greeting
+an NPC produces a menu, and every field of it is parsed and confirmed.
+
+**This milestone is a protocol one, not a format one, and that changes the
+method.** Everything through 4.14 lived in DBC tables that ship with the client,
+so the technique was: transcribe a table, then find a property the data must
+have and check it. Gossip text, menu options, vendor stock and quest text are in
+the *server's* world database and arrive only when asked for. Nothing on disk
+can be consulted. What replaces it is the other half of this project's toolkit --
+send, watch, and confirm by effect -- plus, on a test realm, the fact that the
+world database is *readable* and is a source the client is never sent. That
+makes it the same class of evidence as `Item.dbc` pairing a loot entry with its
+display id, and it is what every claim below rests on.
+
+#### Why gossip went first
+
+`CMSG_GOSSIP_HELLO` is **answered**, which is the cheapest confirmation
+available here. Nothing acknowledges an opcode as such, and a wrong outgoing
+number is read as some other valid request rather than refused -- so
+`CMSG_AUTOEQUIP_ITEM` had to be confirmed by watching a guid move between two
+fields, and `CMSG_ATTACKSWING` by varying the range and seeing refusals turn
+into swings. A reply arriving at all says the number was understood. `0x017B`
+was right on the first send, and `0x017D` came back carrying a menu.
+
+#### The layout, and three packets that had to disagree
+
+```
+u64 npc guid
+u32 menu id
+u32 greeting text id
+u32 option count
+  u32 index, u8 icon, u8 coded, u32 money, cstring message, cstring box message
+u32 quest count
+  u32 quest id, u32 icon, i32 level, u32 flags, u8 repeatable, cstring title
+```
+
+One packet cannot establish this and it is worth saying why: most of a gossip
+menu is zeroes, so almost any reading of the two variable blocks survives a
+single sample. Three NPCs were greeted, chosen so that the counts differ:
+
+| greeted | bytes | shape |
+|---|---|---|
+| Innkeeper Farley (295) | 136 | menu 1291, **3 options**, 0 quests |
+| Marshal McBride (197) | 24 | menu 4048, 0 options, 0 quests |
+| Deputy Willem (823) | 57 | menu 57020, 0 options, **1 quest** |
+
+A layout with the quest block in the wrong place parses Farley's packet
+perfectly, because Farley offers no quests. It takes Willem's to break it. All
+three consume their bodies exactly.
+
+Every field then agreed with the world database independently: the menu ids are
+`creature_template.gossip_menu_id` for each of the three NPCs, 1291's greeting
+text id is 820 in `gossip_menu`, Farley's three options match
+`gossip_menu_option` in text *and* icon, and quest 783 arrived with title
+`A Threat Within`, level 1 and flags 524296 -- the last being the load-bearing
+one, since a title could conceivably be matched by luck at a nearby offset and
+524296 could not.
+
+#### The option index is the server's id, and a filtered menu proved it
+
+`gossip_menu_option` has **four** rows for menu 1291. Three arrived. The missing
+one is `Trick or Treat!`, a Hallowe'en seasonal line the server filters out --
+and the three that came carried indices 1, 2 and 3, with **0 absent**. The
+numbering does not close up.
+
+So an option index is the server's own id and never a row position, exactly like
+a loot slot. A client that replied with a row number would ask for the wrong
+thing, and would do it only when talking to an NPC whose menu happens to be
+conditional -- a bug that hides until it is expensive. It has its own test.
+
+#### An empty quest list from a questgiver, which was correct
+
+Greeting Marshal McBride -- npcflag 3, a questgiver -- returned zero quests,
+first with a level-5 character and then with one that had never taken a quest at
+all. That looks exactly like the quest block being in the wrong place.
+
+It was right. Every quest McBride starts is gated behind `A Threat Within`, and
+somebody else gives that one out. The population could not exhibit the thing
+being looked for, which is this project's most frequently repaid lesson --
+the same shape as three empty loot responses from creatures that roll nothing,
+and as `Light.dbc`'s storm column coming back a coin flip across 200 decorative
+lights. Deputy Willem starts 783 with no prerequisite, and one greeting produced
+the quest block.
+
+#### What the instrument refuses to do
+
+`wow-cli world --gossip [entry]` picks its target by `UNIT_NPC_FLAGS` rather
+than by proximity, walks into range, prints the flags before sending, and
+**refuses to send from out of reach**. That last part is the design: a greeting
+that produces nothing is equally what a wrong opcode, an NPC with no gossip bit,
+and an NPC across the field look like -- three investigations behind one
+printout. Keeping them apart cost `--loot` three runs, and the lesson was
+applied rather than re-learned.
+
+It also takes an optional creature entry, because `.npc add` puts every spawn at
+the caller's feet and "the nearest talker" then picks arbitrarily between them --
+and comparing what *different* NPCs answer is the whole method for naming the
+flag bits.
+
+#### The flag bits are still not named
+
+`UNIT_NPC_FLAGS` reads 3 on both questgivers and 66179 on the innkeeper. 66179
+is `0x10283`, so five bits are set, and the two samples together are consistent
+with `0x1` being gossip and `0x2` questgiver -- which is a hypothesis, not a
+finding, and neither is written down as a name yet. They will be confirmed the
+way the loot and equip writes were: send the request a bit is supposed to gate
+and see whether it is answered. Farley carries `0x80` and offers
+`I want to browse your goods.`; a vendor request that he answers and McBride
+refuses is what would name it.
+
+#### What is not done
+
+Nothing can be *chosen* yet -- `CMSG_GOSSIP_SELECT_OPTION` is unsent, so the
+menu is readable and not clickable. The greeting text id resolves to nothing,
+because `npc_text` is a server table with its own query. Vendors, buying,
+selling and the whole quest flow past the one-line summary all remain, in that
+order: the vendor list is checkable against `Item.dbc` the way the loot response
+was, and quests are last because they have the most fields and the least
+external check.
+
+The three NPCs spawned for this are deliberately left standing at `Testwolf`'s
+login spot on the local realm. An innkeeper, a questgiver whose chain is gated
+and a questgiver whose is not, all within greeting range, is the fixture the
+rest of this milestone needs -- and building one by changing the *character* or
+the *cast* rather than the technique is what closed both of 4.13's gaps.

@@ -193,6 +193,36 @@ impl Entity {
         (index < crate::update::fields::POWER_COUNT).then_some(index)
     }
 
+    /// What this unit will do if you talk to it: gossip, hand out quests, sell
+    /// things, train, repair. Zero means it will do none of them.
+    ///
+    /// **The individual bits are deliberately not interpreted here**, and
+    /// [`Entity::will_talk`] is the only question this client asks of the value
+    /// so far. See [`crate::update::fields::UNIT_NPC_FLAGS`]: the *field* is
+    /// identified against the server's own `creature_template.npcflag`, which
+    /// is a strong check, but one sample carrying five set bits cannot say
+    /// which bit means "vendor". Naming them from memory is the mistake
+    /// `describe_cast_failure` exists to refuse, and they are checkable by
+    /// behaviour instead -- send the request and see whether it is answered.
+    ///
+    /// Returned as `Option` rather than defaulting to zero because the two are
+    /// genuinely different: an ordinary creature carries this field *set to
+    /// zero*, while a unit whose fields have not replicated yet carries no
+    /// field at all. Only the first is a statement that it will not talk.
+    pub fn npc_flags(&self) -> Option<u32> {
+        self.fields.get(crate::update::fields::UNIT_NPC_FLAGS)
+    }
+
+    /// Whether this unit offers anything to interact with at all.
+    ///
+    /// The gate for every NPC-interaction request, and it is a test for "any
+    /// bit set" rather than for a particular one on purpose: which bit gates
+    /// which request is exactly what is not yet established, and a client that
+    /// asks a unit with no flags at all is asking a wolf to sell it something.
+    pub fn will_talk(&self) -> bool {
+        self.npc_flags().is_some_and(|flags| flags != 0)
+    }
+
     /// What this unit has targeted, if anything. Zero means nothing, and is
     /// reported as `None` rather than as a guid no object will ever have.
     pub fn target(&self) -> Option<u64> {

@@ -8,6 +8,15 @@ Client only — no server, no bundled assets.
 Phases 1, 2 and 3 are complete: every data format reads, the world renders and
 streams, and the protocol reaches a live realm. Phase 4 has started.
 
+**4.15 has begun and it changes the method.** NPC interaction — gossip, quests,
+shops — is a *protocol* milestone, not a format one: quest text, menu options
+and vendor stock live in the server's world database and reach the client only
+when asked for, so "transcribe a table and check a property it must have" mostly
+does not apply. Send, watch, confirm by effect. On a test realm the world
+database *is* readable and is a source the client is never sent, which makes it
+the same class of evidence as `Item.dbc`, and it is what every gossip field was
+checked against.
+
 | | State |
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation), WMO, ADT/WDT — all done |
@@ -19,6 +28,7 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | Game | **4.3 done**: three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. **A spellbook panel** (`P`) now lists what the character can do and puts it on a bar by click, auto-attack included -- see the note below on why the seeding filter had to reject it. Threat and the corpse *interface* remain (the corpse protocol is done). Quests follow |
 | Loot | **Works end to end.** Right-click a body to open it, click a row to take money or an item, and the corpse releases itself once empty -- a client that never releases leaves the body locked to it for everyone else. `CMSG_LOOT` `0x15D`, `CMSG_LOOT_MONEY` `0x15E`, `CMSG_AUTOSTORE_LOOT_ITEM` `0x108`, `SMSG_LOOT_RESPONSE` `0x160`, `SMSG_LOOT_REMOVED` `0x162`, `SMSG_LOOT_CLEAR_MONEY` `0x165` -- every one confirmed by content or by effect. A loot slot is the **server's** index and never a row position: the numbers do not close up when one is taken |
 | Sound | **4.14 done.** Zone music and ambience by area and hour, creature attack/wound/death/aggro voices, and weapon impacts -- all from the tables. `SoundEntries`' layout is checked by its filenames resolving in the archive (93%); the zone tables by their ids landing on a sound of the **right type** (99.1%), which validity alone cannot show. `CreatureSoundData`'s 38 columns identified themselves through the *names* of the sounds they reach. No distance attenuation, no crossfade, no spell or footstep sounds |
+| NPCs | **4.15 started: they answer.** `CMSG_GOSSIP_HELLO` `0x017B` → `SMSG_GOSSIP_MESSAGE` `0x017D`, parsed whole — menu id, greeting text id, a list of clickable options and a list of quests offered. Confirmed on **three** NPCs picked so the two counts differ (3 options/0 quests, 0/0, 0 options/1 quest), because one sample is nearly all zeroes and any reading survives it. Every field then agreed with the server's own database independently: menu ids equal `creature_template.gossip_menu_id`, the options match `gossip_menu_option` in text *and* icon, quest 783 came with title `A Threat Within`, level 1 and flags 524296. **An option index is the server's id, never a row position** — menu 1291 has four rows and three arrived, numbered 1,2,3 with 0 filtered out and the numbering *not* closed up, exactly like a loot slot. Nothing can be *chosen* yet, the `UNIT_NPC_FLAGS` bits are still unnamed, and vendors and quests are next |
 | Inventory | **4.13 done bar looting.** A **single combined bag window** (`B`) covering the backpack *and every equipped bag's contents* -- deliberately unlike the original's one frame per bag -- with real icons, stack counts and money; a separate **character panel** (`C`) with the nineteen worn slots, all nineteen named. The slot array, coinage, stack count, container capacity, container contents and the owner/contained pair were all measured against the live realm. `CMSG_AUTOEQUIP_ITEM` is confirmed *by effect*. Nothing can be moved from the interface yet -- the equip write exists but no drag does |
 
 Roughly 60% of the way to something a person could test by playing. See
@@ -163,6 +173,13 @@ a bag from one held directly.
   file is committed. Ask the user, and pass the password via `WOW_PASSWORD`
   rather than an argument. A wrong password and a missing account are hard to
   tell apart, so guessing wastes real time.
+- **Three NPCs are deliberately left standing at `Testwolf`'s login spot** on
+  the local realm: an Innkeeper Farley (entry 295, npcflag 66179), a Marshal
+  McBride (197, flag 3) whose quest chain is gated behind a prerequisite, and a
+  Deputy Willem (823, flag 3) whose is not. That combination is what made the
+  gossip packet's two variable blocks separable — one NPC with options and no
+  quests, one with neither, one with a quest and no options — and it is the
+  fixture the rest of 4.15 reads from. `.npc add <entry>` rebuilds it.
 - Two accounts exist so that **two clients can be online at once**, which is the
   only way to test anything about one player observing another — relayed
   movement, entity replication. A single account cannot prove any of it.
@@ -504,6 +521,21 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   fix invalidates a test, the rewrite has to assert **both** halves — that the
   ordinary case still holds *and* that the exception genuinely differs — or it
   passes just as well after a regression to the original bug.
+- **And the suite can fail without any test failing.** The sequel, one
+  milestone later, and it cost sixteen minutes before it was even recognised as
+  a hang. `cargo test --release` stalled at `HEAD` on a tree whose handoff again
+  said it was green: the eleven GPU tests each built their own `wgpu` device,
+  the harness runs them on separate threads, and eleven concurrent DX12 device
+  creations deadlocked — thirty-seven threads with six seconds of CPU between
+  them, indefinitely. Single-threaded the same eleven pass in under six seconds.
+  A shared `OnceLock` device fixed it *and* made them eight times faster. Two
+  things worth keeping: it is a **race**, so the previous green run was luck
+  rather than evidence — and the tempting fix, `RUST_TEST_THREADS=1`, is a
+  workaround living in an environment variable, which is precisely where nobody
+  applies it on the run that matters. When a test needs a process-wide
+  resource, build it once for the binary. Also: a hang is not a slow run, and
+  the tell is CPU time — six seconds across thirty-seven threads in sixteen
+  minutes is a deadlock, not work.
 - **A property test is only as good as the population, and 200 irrelevant rows
   will bury two decisive ones.** Asking whether `Light.dbc`'s storm column is
   really the storm column across every outdoor light came back flat: darker 55%
@@ -745,6 +777,24 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   about the actor, not about the thing being asked for, so when a request keeps
   being declined, ask who is allowed to make it. Creating a test character is
   cheap and was not tried for far too long.
+- **One sample of a variable-length packet is nearly free; a sample where the
+  *counts differ* is the evidence.** `SMSG_GOSSIP_MESSAGE` carries two
+  variable-length blocks back to back, and most of a real menu is zeroes — so a
+  reading with the quest block in the wrong place parses an innkeeper's
+  three-option, no-quest packet perfectly. What breaks it is a questgiver whose
+  packet has no options and one quest. Three NPCs were greeted specifically so
+  the two counts would disagree, and the test asserts *both* shapes rather than
+  either. The same move as testing an exception beside the thing it is
+  indistinguishable from, and as asking the one hour that could refute the sky.
+- **A filtered list is the cheapest proof that an index is an id.** Menu 1291
+  has four options in the database and three arrived — the missing one is a
+  seasonal line the server declines to send — and the three carried indices 1,
+  2 and 3, with the numbering *not* closing up. That single observation
+  converts "the index is probably the server's own id" from a guess into a
+  finding, and the failure it prevents is nasty: a client that replied with a
+  row position would work at every NPC except the conditional ones. Whenever a
+  list arrives with per-item indices, look for a sample where something was
+  filtered out.
 - **Two fields holding the same constant cannot be told apart, and the fix is
   a sample where they differ.** `ITEM_FIELD_OWNER` and `ITEM_FIELD_CONTAINED`
   are both the player's guid on every item a starting character carries — `1`

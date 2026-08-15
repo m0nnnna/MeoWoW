@@ -264,6 +264,30 @@ enum Command {
         /// dropped is the one packet that could have answered the question.
         #[arg(long)]
         loot: bool,
+        /// Greet the nearest NPC that carries any `UNIT_NPC_FLAGS` bit, and
+        /// print every byte that comes back.
+        ///
+        /// **A survey, and the first send of the NPC-interaction work.**
+        /// Nothing gossip-related is parsed by this client; this exists to
+        /// produce the packet that makes parsing it possible. Pair it with
+        /// `--say ".npc add 295"` to put an Innkeeper Farley within reach --
+        /// he carries gossip, quest, vendor and innkeeper bits at once, so a
+        /// single greeting exercises more of the reply than a plain
+        /// questgiver does.
+        ///
+        /// Refuses to send at range rather than trying anyway, because a
+        /// silence is the one answer that means nothing: a wrong opcode, an
+        /// NPC with no gossip, and an NPC across the field are indistinguishable
+        /// from each other. That distinction cost three runs on `--loot`.
+        ///
+        /// Takes an optional **creature entry** to prefer -- `--gossip 197` for
+        /// Marshal McBride -- because the interesting comparison is between
+        /// *different* NPCs and `.npc add` puts every spawn at the caller's
+        /// feet, where "the nearest one" picks arbitrarily between them. Entry
+        /// rather than name so it needs no `--names` round trip, and it is what
+        /// `creature_template` is keyed by anyway.
+        #[arg(long, num_args = 0..=1, default_missing_value = "0")]
+        gossip: Option<u32>,
         /// After entering, find which update field carries the character's
         /// appearance by searching for the answer the character list gives.
         ///
@@ -678,6 +702,7 @@ fn main() -> Result<()> {
             items,
             equip,
             loot,
+            gossip,
             target,
             own_fields,
             until_death,
@@ -713,6 +738,8 @@ fn main() -> Result<()> {
                 items: *items,
                 equip,
                 loot: *loot,
+                gossip: *gossip,
+
                 target: target.as_deref(),
                 own_fields: *own_fields,
                 until_death: *until_death,
@@ -868,6 +895,7 @@ struct WorldRequest<'a> {
     items: bool,
     equip: &'a [u16],
     loot: bool,
+    gossip: Option<u32>,
     target: Option<&'a str>,
     own_fields: bool,
     until_death: bool,
@@ -928,6 +956,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         items,
         equip,
         loot,
+        gossip,
         target,
         own_fields,
         until_death,
@@ -1658,6 +1687,14 @@ cast {spell_id} at {} (attempt {attempt})",
 
         if loot {
             survey_loot(&mut connection, &mut state, character.guid, here)?;
+        }
+
+        if let Some(entry) = gossip {
+            // Zero is `--gossip` with no value: no preference, take the
+            // nearest. A real creature entry is never 0, so the two cannot be
+            // confused.
+            let prefer = (entry != 0).then_some(entry);
+            survey_gossip(&mut connection, &mut state, character.guid, &mut here, prefer)?;
         }
 
         if unit_fields {
@@ -2484,6 +2521,337 @@ fn survey_loot(
 
     state.replicate(&batch, None);
     Ok(())
+}
+
+/// Greets the nearest NPC that will talk, and reports everything that arrives.
+///
+/// **A survey, and deliberately parses nothing.** Nothing in `crates/world`
+/// understands a gossip packet yet, and this is how that stops being true: the
+/// reply is printed as an opcode and its bytes, in full. Printing a length
+/// instead is how this project once saw and lost the one packet that could
+/// have settled `SMSG_ATTACKERSTATEUPDATE`.
+///
+/// **The reason gossip is the right request to attempt first** is that it is
+/// *answered*. Nothing acknowledges an opcode as such, and an outgoing number
+/// that is wrong is read as some other valid request rather than refused -- so
+/// `CMSG_AUTOEQUIP_ITEM` had to be confirmed by watching a field move. A reply
+/// arriving here at all says the number was understood, and a reply that
+/// parses says the layout was right too.
+///
+/// **The whole design of this command is about keeping the silences apart.**
+/// A greeting that produces nothing is equally what a wrong opcode, a unit
+/// with no gossip bit, and a unit out of range look like -- three different
+/// investigations behind one printout, which is the shape that cost `--loot`
+/// three runs. So the target is chosen by [`Entity::will_talk`] rather than by
+/// proximity, its flags are printed before the send, the approach walk is
+/// reported, and a target still out of reach is refused *loudly* instead of
+/// being greeted anyway.
+fn survey_gossip(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    // Taken by reference and **written back**, unlike `survey_loot`'s copy.
+    // This function walks, and the fact that replicated state holds our login
+    // position forever has now been rediscovered by three separate callers --
+    // so the walked position is threaded through rather than looked up, and
+    // handing the next caller a stale one would just re-arm the same trap.
+    here: &mut world::Position,
+    // Which creature entry to greet, or `None` for whichever talker is
+    // nearest. `.npc add` spawns everything at the caller's feet, so a run
+    // that has put two NPCs down has no meaningful "nearest" -- and comparing
+    // what *different* NPCs answer is the whole method for naming the flag
+    // bits, since nothing else can distinguish them.
+    prefer: Option<u32>,
+) -> Result<()> {
+    // How close the server wants a client to be before it will talk. Not
+    // measured -- it is a server-side constant this client cannot observe --
+    // so it is used only to decide whether sending is *worth* it, never to
+    // explain a refusal. Slightly under the usual 5 so that a creature drifting
+    // a step while the walk finishes does not put us over.
+    const TALK_REACH: f32 = 4.0;
+    const RUN_SPEED: f32 = 7.0;
+    // Same reason as `--attack`'s: an NPC that wanders is not where the walk
+    // aimed by the time the walk ends.
+    const APPROACHES: usize = 3;
+
+    // Every unit that will talk, not the nearest unit of any kind. Choosing by
+    // proximity is what makes a silence ambiguous: the nearest thing to a
+    // starting character is usually a wolf, and a wolf has nothing to say.
+    let mut talkers: Vec<(u64, u32, u32, f32)> = state
+        .iter()
+        .filter(|entity| entity.guid != own_guid)
+        .filter(|entity| is_a_legal_test_target(entity))
+        .filter(|entity| entity.will_talk())
+        .filter_map(|entity| {
+            let there = entity.position?;
+            let d = ((there.x - here.x).powi(2) + (there.y - here.y).powi(2)).sqrt();
+            let entry = entity
+                .fields
+                .get(world::update::fields::OBJECT_ENTRY)
+                .unwrap_or(0);
+            Some((entity.guid, entry, entity.npc_flags().unwrap_or(0), d))
+        })
+        .collect();
+    talkers.sort_by(|a, b| a.3.total_cmp(&b.3));
+
+    println!(
+        "\n{} replicated unit(s) with any UNIT_NPC_FLAGS bit set:",
+        talkers.len()
+    );
+    for (guid, entry, flags, distance) in &talkers {
+        println!(
+            "  {guid:#018x}  entry {entry:>6}  flags {flags:>10} ({flags:#x})  {distance:>6.1} units"
+        );
+    }
+    if talkers.is_empty() {
+        println!("  none. Every unit in range reads UNIT_NPC_FLAGS as 0, which is");
+        println!("  what a field of wolves looks like -- it is not a replication");
+        println!("  failure. Put one within reach: --say \".npc add 295\" spawns an");
+        println!("  Innkeeper Farley, whose npcflag is 66179.");
+        return Ok(());
+    }
+
+    // A requested entry that is not there is refused rather than silently
+    // falling back to the nearest: greeting the wrong NPC and reading its
+    // answer as the requested one's is precisely how a flag bit would get
+    // named wrongly, and the printout would look completely normal.
+    let Some(&(mut chosen, ..)) = (match prefer {
+        Some(wanted) => talkers.iter().find(|(_, entry, _, _)| *entry == wanted),
+        None => talkers.first(),
+    }) else {
+        println!("\nno replicated talker has entry {:?}.", prefer);
+        println!("Spawn one: --say \".npc add {}\"", prefer.unwrap_or(0));
+        return Ok(());
+    };
+
+    // Walk to it. The distance is re-measured each time round rather than
+    // assumed from the first reading, and the *nearest talker* is re-chosen
+    // with it -- an NPC that has wandered off is not the one to keep chasing.
+    //
+    // `None` rather than a sentinel distance: an NPC that leaves replicated
+    // state mid-approach is a different outcome from one that is merely too
+    // far, and giving it a very large number would report it as "3.4e38 units
+    // away", which is a printout that explains nothing.
+    let mut distance = None;
+    for attempt in 0..APPROACHES {
+        let Some(there) = state.get(chosen).and_then(|entity| entity.position) else {
+            break;
+        };
+        let d = ((there.x - here.x).powi(2) + (there.y - here.y).powi(2)).sqrt();
+        distance = Some(d);
+        if d <= TALK_REACH {
+            break;
+        }
+        let heading = (there.y - here.y).atan2(there.x - here.x);
+        let close = d - TALK_REACH;
+        println!(
+            "\n  approach {}: closing {close:.1} units on {chosen:#x}",
+            attempt + 1
+        );
+        let (arrived, _) = connection.walk(own_guid, *here, heading, close, RUN_SPEED)?;
+        *here = arrived;
+        here.orientation = heading;
+        let batch = connection.drain(std::time::Duration::from_millis(400), 128)?;
+        state.replicate(&batch, None);
+        // Re-pick, in case something closer will talk now that we have moved --
+        // but **only when no entry was asked for**. Re-picking under a
+        // preference would quietly greet a different creature than the one
+        // named, and the printout would look entirely normal while attributing
+        // one NPC's answer to another.
+        if prefer.is_none() {
+            if let Some((nearer, nearer_d)) = nearest_talker_from(state, own_guid, *here) {
+                if nearer_d + 1.0 < d {
+                    chosen = nearer;
+                }
+            }
+        }
+    }
+
+    let Some(distance) = distance.filter(|d| *d <= TALK_REACH) else {
+        // Refused loudly rather than attempted. A greeting sent from here
+        // would be declined for range, and that decline is a silence -- which
+        // is indistinguishable from the opcode being wrong. Better to send
+        // nothing than to collect an answer that cannot be interpreted.
+        match distance {
+            Some(d) => {
+                println!("\n{chosen:#018x} is still {d:.1} units away after {APPROACHES} approach(es),");
+                println!("past the {TALK_REACH:.0}-unit reach. Not sending: a refusal at this range");
+                println!("would be indistinguishable from an opcode the server ignored.");
+            }
+            None => {
+                println!("\n{chosen:#018x} left replicated state during the approach --");
+                println!("despawned, or moved out of visibility. Nothing was sent.");
+            }
+        }
+        return Ok(());
+    };
+
+    // **Re-read the entry and the flags from whoever is actually about to be
+    // greeted**, rather than carrying the pair captured at selection time. The
+    // approach loop may have switched targets, and a printout that labelled
+    // one NPC's answer with another NPC's entry would look completely normal
+    // while attributing a menu to the wrong creature -- which is the single
+    // way this command could produce a confidently wrong flag-bit finding.
+    let (entry, flags) = match state.get(chosen) {
+        Some(npc) => (
+            npc.fields
+                .get(world::update::fields::OBJECT_ENTRY)
+                .unwrap_or(0),
+            npc.npc_flags().unwrap_or(0),
+        ),
+        None => (0, 0),
+    };
+
+    // Selected first, for the same reason `--attack` does it: the server
+    // decides what a request may act on, and it decides that about the
+    // selected target. It is also what a real client does on a click.
+    connection.set_selection(chosen)?;
+    println!(
+        "\ngreeting {chosen:#018x} entry {entry} at {distance:.1} units, npcflag {flags} ({flags:#x})"
+    );
+    connection.gossip_hello(chosen)?;
+
+    // Give the server time to answer before concluding it ignored us. A packet
+    // sent immediately before a disconnect is often never processed at all,
+    // and that has been mistaken for a wrong opcode here before.
+    let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+
+    let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+    for packet in &batch {
+        *seen.entry(packet.opcode).or_default() += 1;
+    }
+
+    // The same noise list `survey_loot` uses. Nothing is hidden -- the
+    // histogram below lists every opcode that arrived, and only the bodies of
+    // the constant traffic are filtered out so the answer is not buried.
+    const NOISE: [u16; 6] = [0x00DD, 0x00A9, 0x01F6, 0x0390, 0x0085, 0x0086];
+    println!("\nbodies of everything unexpected:");
+    let mut shown = 0;
+    for packet in &batch {
+        if NOISE.contains(&packet.opcode) {
+            continue;
+        }
+        println!(
+            "  {} ({:#06x}), {} bytes",
+            world::opcode::describe(packet.opcode),
+            packet.opcode,
+            packet.body.len()
+        );
+        // Generously long. A gossip menu is text and several options, so a
+        // preview cut to 128 bytes would show the header and hide every
+        // option -- and the options are the part nothing else can supply.
+        println!("    {}", hex_preview(&packet.body, 512));
+        shown += 1;
+        if shown >= 24 {
+            println!("  ... stopping after {shown}");
+            break;
+        }
+    }
+    if shown == 0 {
+        println!("  none -- nothing but the usual traffic came back.");
+        println!("  Three things look exactly like this and want opposite");
+        println!("  investigations: the opcode was not understood, this NPC's");
+        println!("  flags do not include whatever bit gates a greeting, or the");
+        println!("  server declined for a reason it does not report. The flags");
+        println!("  above are the first thing to check against creature_template.");
+    }
+
+    // Now that the layout is known, say what the NPC actually offered -- while
+    // still printing the raw bytes above, because the moment this stops
+    // dumping bodies is the moment the next unknown shape becomes invisible.
+    for packet in &batch {
+        if packet.opcode != world::opcode::server::GOSSIP_MESSAGE {
+            continue;
+        }
+        match world::gossip::parse_gossip_message(&packet.body) {
+            Ok(menu) => {
+                println!(
+                    "\nmenu {} (greeting text {}), {} option(s), {} quest(s):",
+                    menu.menu_id,
+                    menu.text_id,
+                    menu.options.len(),
+                    menu.quests.len()
+                );
+                for option in &menu.options {
+                    // The index is printed first and labelled, because it is
+                    // the number a reply has to carry and it is *not* the row
+                    // position -- a filtered menu leaves holes in it.
+                    println!(
+                        "  option {:>2} (icon {}, coded {}, {} copper): {:?}{}",
+                        option.index,
+                        option.icon,
+                        option.coded,
+                        option.money,
+                        option.message,
+                        if option.box_message.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  box {:?}", option.box_message)
+                        }
+                    );
+                }
+                for quest in &menu.quests {
+                    println!(
+                        "  quest {:>6} (icon {}, level {}, flags {:#x}, repeatable {}): {:?}",
+                        quest.quest_id,
+                        quest.icon,
+                        quest.level,
+                        quest.flags,
+                        quest.repeatable,
+                        quest.title
+                    );
+                }
+                if menu.is_empty() {
+                    println!("  nothing but greeting text -- a real reply, not an empty one.");
+                }
+                // The check worth making every run, and it needs the database
+                // rather than the packet: these numbers are the server's own
+                // and are what identified the header in the first place.
+                println!(
+                    "  cross-check: SELECT gossip_menu_id FROM creature_template WHERE entry={entry};"
+                );
+                println!("               SELECT TextID FROM gossip_menu WHERE MenuID={};", menu.menu_id);
+            }
+            // Printed rather than swallowed: an unparseable menu is the single
+            // most interesting thing this command can produce.
+            Err(error) => println!("\nSMSG_GOSSIP_MESSAGE did not parse: {error}"),
+        }
+    }
+
+    println!("\nevery opcode seen:");
+    for (opcode, count) in &seen {
+        println!(
+            "  {:<34} ({opcode:#06x}) x{count}",
+            world::opcode::describe(*opcode)
+        );
+    }
+
+    state.replicate(&batch, None);
+    Ok(())
+}
+
+/// The nearest unit that will talk, measured from where the character actually
+/// is.
+///
+/// Split out from [`survey_gossip`] because the approach loop re-asks it after
+/// every step: a walk changes the answer, and reusing the first one is how
+/// `--attack` used to swing at where a creature had been.
+fn nearest_talker_from(
+    state: &world::WorldState,
+    own_guid: u64,
+    own: world::Position,
+) -> Option<(u64, f32)> {
+    state
+        .iter()
+        .filter(|entity| entity.guid != own_guid)
+        .filter(|entity| is_a_legal_test_target(entity))
+        .filter(|entity| entity.will_talk())
+        .filter_map(|entity| {
+            let at = entity.position?;
+            let distance = ((at.x - own.x).powi(2) + (at.y - own.y).powi(2)).sqrt();
+            Some((entity.guid, distance))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
 }
 
 /// Wears an item and reports what moved, which is what confirms the opcode.

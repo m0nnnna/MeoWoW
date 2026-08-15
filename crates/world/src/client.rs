@@ -652,6 +652,15 @@ impl Connection {
         self.send(ClientOpcode::LootRelease, &target.to_le_bytes())
     }
 
+    /// Greets an NPC, asking for whatever menu it has.
+    ///
+    /// The guid goes out **unpacked**, like [`Connection::loot`]'s. See
+    /// [`ClientOpcode::GossipHello`] for why this is the first NPC request to
+    /// attempt and what a silence would and would not prove.
+    pub fn gossip_hello(&mut self, target: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::GossipHello, &target.to_le_bytes())
+    }
+
     /// Acknowledges a teleport within the current map.
     ///
     /// **The server will not finish the move until this arrives, and will

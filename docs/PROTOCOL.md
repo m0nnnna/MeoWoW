@@ -710,3 +710,67 @@ that is worth doing before the next capture of this shape.
 dropped, which is exactly the failure recorded for `SMSG_ATTACKERSTATEUPDATE`:
 the one packet that could answer the question, seen and lost. A spell's reply --
 the damage log, the threat update -- lands in that drain and nowhere else.
+
+## Talking to an NPC
+
+`CMSG_GOSSIP_HELLO` (`0x017B`) carries the NPC's guid **unpacked** -- eight
+plain bytes, like `CMSG_LOOT` -- and `SMSG_GOSSIP_MESSAGE` (`0x017D`) answers
+with the menu.
+
+**This is where the evidence changes shape.** Everything up to here could be
+checked against a table shipped with the client. Gossip text, menu options and
+quest titles are in the *server's* world database and reach the client only in
+this packet, so there is no `Item.dbc` to pair a field against. What stands in
+for it on a test realm is that the world database is readable, and is a source
+the client is never sent -- which is the same class of evidence, and is what
+every field below was confirmed with.
+
+```
+u64 npc guid
+u32 menu id            creature_template.gossip_menu_id
+u32 greeting text id   gossip_menu.TextID -- resolved by a query, not by us
+u32 option count
+  u32 index            gossip_menu_option.OptionID -- see below
+  u8  icon
+  u8  coded            whether choosing it opens a text box
+  u32 money            copper the option costs
+  cstring message      the line the player reads
+  cstring box message  the confirmation text, when there is one
+u32 quest count
+  u32 quest id         quest_template.ID
+  u32 icon             available, taken, or ready to hand in
+  i32 level            signed: -1 means "scales to the player"
+  u32 flags            quest_template.Flags
+  u8  repeatable
+  cstring title        quest_template.LogTitle
+```
+
+Confirmed on three NPCs chosen so the two counts differ -- Innkeeper Farley (3
+options, 0 quests, 136 bytes), Marshal McBride (0 and 0, 24 bytes) and Deputy
+Willem (0 options, 1 quest, 57 bytes). One sample proves very little here: most
+of a gossip menu is zeroes, and a reading with the quest block in the wrong
+place parses Farley's packet perfectly, because Farley offers no quests.
+
+### An option index is the server's id, not a row number
+
+Menu 1291 has four rows in `gossip_menu_option`. Three arrived, carrying indices
+**1, 2 and 3** -- the server filtered out option 0, a Hallowe'en seasonal line,
+and did not close the numbering up.
+
+So a reply must carry the index the server sent, never a position in whatever
+list the client built. Identical to `SMSG_LOOT_RESPONSE`'s loot slots, and with
+the same failure mode: a client that renumbers works fine everywhere except at
+NPCs whose menus are conditional.
+
+### An empty quest list is a statement
+
+Greeting a questgiver and getting zero quests looks exactly like the quest block
+being misplaced. It was correct: McBride's whole chain is gated behind `A Threat
+Within`, which Deputy Willem gives out. Before concluding a block is wrong,
+check that the character asking could have exhibited it.
+
+### Not sent yet
+
+`CMSG_GOSSIP_SELECT_OPTION`, so the menu can be read and not clicked. The
+greeting text id resolves to nothing without the `npc_text` query. Vendor lists,
+buying, selling and the quest flow past this one-line summary are all untouched.

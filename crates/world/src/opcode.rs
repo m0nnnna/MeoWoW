@@ -179,6 +179,22 @@ pub enum ClientOpcode {
     /// when the limit is 39: the ghost had never actually left the body.
     MoveTeleportAck = 0x00C7,
 
+    /// Open a conversation with an NPC: the greeting that produces a menu.
+    ///
+    /// Body is the target's guid, **unpacked** -- eight plain bytes, the same
+    /// shape as [`ClientOpcode::Loot`] and for the same reason.
+    ///
+    /// **Unconfirmed until something answers it**, and deliberately the first
+    /// NPC request attempted for exactly that reason: gossip is *answered*,
+    /// where the equip write had to be confirmed by watching a field move. A
+    /// reply arriving at all says the number was understood. A silence says
+    /// nothing on its own -- it is equally what a wrong opcode, a unit with no
+    /// gossip bit, and a unit out of range all look like -- so
+    /// `wow-cli world --gossip` refuses to send at range and reports the
+    /// target's [`UNIT_NPC_FLAGS`](crate::update::fields::UNIT_NPC_FLAGS)
+    /// alongside whatever comes back, to keep those three apart.
+    GossipHello = 0x017B,
+
     /// Ask the server where this character's body is. Empty request; the
     /// reply shares the opcode.
     ///
@@ -227,6 +243,15 @@ pub mod server {
     /// A zero-length body is itself the identification here: nothing else
     /// arriving at that moment carries no payload at all.
     pub const LOOT_CLEAR_MONEY: u16 = 0x0165;
+
+    /// What an NPC says when greeted: a menu of text, options and quests. See
+    /// [`crate::gossip`] for the layout and how every field of it was checked
+    /// against the server's own database.
+    ///
+    /// **Identified by content**, like [`LOOT_REMOVED`]: greeting an Innkeeper
+    /// Farley produced a body carrying his menu id, his three menu options and
+    /// their icons, all of which the database independently agrees with.
+    pub const GOSSIP_MESSAGE: u16 = 0x017D;
 
     /// What the sky is doing: a state, an intensity, and whether it changed
     /// abruptly. Sent on entering a zone and whenever the zone's weather turns.
@@ -411,6 +436,7 @@ pub fn describe(opcode: u16) -> String {
         server::LOOT_RELEASE_RESPONSE => "SMSG_LOOT_RELEASE_RESPONSE",
         server::LOOT_REMOVED => "SMSG_LOOT_REMOVED",
         server::LOOT_CLEAR_MONEY => "SMSG_LOOT_CLEAR_MONEY",
+        server::GOSSIP_MESSAGE => "SMSG_GOSSIP_MESSAGE",
         server::CHAR_CREATE => "SMSG_CHAR_CREATE",
         server::CHAR_DELETE => "SMSG_CHAR_DELETE",
         server::CHARACTER_LOGIN_FAILED => "SMSG_CHARACTER_LOGIN_FAILED",
