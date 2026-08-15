@@ -2817,3 +2817,122 @@ Both known, both reported, neither fixed:
 
 Nothing collides with creatures or other players: those are moved by the server
 and are a different feature from a solid world.
+
+### 4.13: what the character is carrying
+
+Bags, a character panel, and the first write this client makes that *moves*
+something. Loot and corpse release are deliberately not here -- they are the
+last item on the list and they start with a survey, not with code.
+
+The design was specified up front and is a deliberate departure: **all bags
+combine into one window**, where the original client gives each bag its own
+frame. That is not a simplification. A character with four bags has five
+draggable windows to arrange in the original, and this interface is already
+customisable -- so the thing separate frames buy you, putting them where you
+like, is provided by moving the one window. The character panel *is* separate,
+because it answers a different question and there is nothing to combine.
+
+#### Five fields, and only one of them was hard
+
+Four of the five fell out of the technique this project already had: change
+something on a live realm, diff the player's own field block, keep what moved.
+`PLAYER_FIELD_INV_SLOT_HEAD` is `0x0144` with two fields per slot;
+`PLAYER_FIELD_COINAGE` is `0x0492`; a container's capacity is `0x40`.
+
+The base of the slot array is worth recording as a *shape* rather than a number,
+because a near-miss is not blank. Read two fields early and the array still
+yields perfectly plausible guids -- they are the high word of one guid beside
+the low word of the next. So the check was not "does this produce guids" but
+"does it put them where something else says they should be": with this base, a
+starting human warrior's four items land on slots 3, 6, 7 and 15, which is
+shirt, legs, feet and main hand. The identification predicts which four slots
+are occupied, and that is a claim it could have failed.
+
+**The stack count is the one that needed the other rule.** An item object
+carries eight fields and *three* of them hold the constant 1 on every item a
+starting character owns, so "contains a plausible stack size" costs nothing and
+proves nothing -- the same trap as a column of small integers landing inside a
+130-row table. What settled it was asking for numbers nobody holds by accident.
+`.additem 2589 3`, `.additem 2592 5` and `.additem 4306 17` produced items
+reading 3, 5 and 17 in field `0x0E` and 1 everywhere else, with every other
+field constant across all three. Two values could be a coincidence between
+neighbouring columns; a field that follows an arbitrary number we chose, three
+times, is reporting that number.
+
+#### The equip write, and why it could be confirmed at all
+
+`CMSG_AUTOEQUIP_ITEM` is `0x010A`, and nothing acknowledges it. That is the
+`CMSG_ATTACKSWING` situation again: an outgoing number that is wrong is not
+refused, it is read as some *other* valid request, and the silence is identical
+either way.
+
+What makes this one checkable is that a correct send has a loud consequence. The
+item's guid leaves its slot in `PLAYER_FIELD_INV_SLOT_HEAD` and reappears at an
+equipment index, and both halves arrive in the next object update. So the
+instrument snapshots the whole slot array, sends, waits, and prints every slot
+whose occupant changed. Twelve items moved; a wrong opcode moves nothing.
+
+The *auto* form was chosen over one naming a destination, and that choice paid
+twice. It is the simplest possible write -- two bytes, a bag and a slot -- and
+the server's choice of destination is a fact about the item that this client
+would otherwise have to guess at.
+
+#### Eighteen slots named, and the nineteenth left alone
+
+Wearing one item of each kind and recording where it landed named slots 0-16 and
+18. Two of those overlap the starting-gear prediction and agree with it: boots
+arrived at slot 7 and a sword at slot 15, which that earlier and entirely
+unrelated reasoning had already called Feet and Main Hand. Independent
+derivations agreeing is the evidence; either alone is not.
+
+**Slot 17 is unnamed, and the test asserts that it is.** It is the single gap in
+an otherwise contiguous run of nineteen, which makes "it must be ranged"
+overwhelmingly tempting -- and every ranged item tried came back refused,
+because the character doing the testing is a warrior with no proficiency for a
+bow, a rifle or a fishing pole. "Presumably" is not a measurement, and a slot
+label is exactly the kind of wrong answer that never fails loudly: it draws a
+helm in the boots square and reads as a rendering bug. A hunter would settle it
+in one run.
+
+#### An instrument that could not tell "ignored" from "refused"
+
+The first equip sweep reported three failures as `nothing moved`, which is two
+completely different findings wearing one sentence: an opcode the server never
+understood, and a correct opcode it deliberately declined. The fix is the one
+this project keeps relearning -- print every opcode that arrived, decoded or
+not. With that in place the two remaining failures each showed a single `0x0112`
+and the twelve successes showed none, which says the send was understood and the
+answer was no.
+
+#### A bag's contents are still unaddressable, and that is a measurement too
+
+A container announces its capacity the moment it is replicated, including one
+merely sitting in the backpack. It carries no field naming what is *inside* it
+-- which is consistent rather than surprising, because every bag observed was
+empty, a create block omits zero fields, and an empty slot is a zero. An empty
+bag and a bag whose contents array we cannot find look identical.
+
+Getting a non-empty equipped bag turned out to be the obstacle, and not for
+protocol reasons. `.additem` places a bag in the backpack and never in a bag
+slot. Editing `character_inventory` directly does not survive: the server's
+loader declines a hand-placed bag and relocates it *and its contents* into the
+backpack, which the wire then reports faithfully. Three runs showed the database
+and the wire disagreeing in exactly that way, with the database unchanged
+afterwards -- because a session that ends by closing the socket never saves, and
+that is also why `.additem` alone had appeared not to persist. `.save` is now
+part of the exchange, and `--say` is repeatable so it can be.
+
+So the bag window shows the backpack's sixteen slots and says so. The legitimate
+route to an equipped bag is a client asking for it, which is another write, and
+moving items between slots is its own feature.
+
+#### What is still wrong
+
+- **Nothing can be moved yet.** The equip write exists and is confirmed, but the
+  interface does not send it -- clicking a bag slot does nothing. Dragging
+  between slots needs the swap request as well.
+- **Items have no names.** `Item.dbc` does not carry them; they come from the
+  server, and this client does not speak the item query yet. A slot shows its
+  icon and its entry, which is honest and checkable, rather than an invented
+  name.
+- **Slot 17, and a bag's contents**, both above.

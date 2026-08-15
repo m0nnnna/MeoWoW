@@ -10,6 +10,7 @@
 
 mod character;
 mod hud;
+mod items;
 mod live;
 mod model;
 mod scene;
@@ -1747,6 +1748,13 @@ struct App {
     /// `ui.toml`: where the book sits is a layout decision worth saving, and
     /// whether it happened to be open when the client last closed is not.
     spellbook_open: bool,
+    /// Item icons, loaded from the archives if there are any.
+    items: items::Items,
+    /// Whether the bag window is open, on the same reasoning as
+    /// `spellbook_open`.
+    bags_open: bool,
+    /// Whether the character panel is open.
+    character_open: bool,
     /// Held modifiers, which choose which bar a number key drives.
     modifiers: winit::keyboard::ModifiersState,
 }
@@ -2177,6 +2185,9 @@ impl App {
             spells: spells::Spellbook::default(),
             bars_seeded: false,
             spellbook_open: false,
+            items: items::Items::default(),
+            bags_open: false,
+            character_open: false,
             modifiers: Default::default(),
         }
     }
@@ -2496,6 +2507,21 @@ impl ApplicationHandler for App {
                             // nothing that was already spoken for.
                             KeyCode::KeyP => {
                                 self.spellbook_open = !self.spellbook_open;
+                                window.request_redraw();
+                                return;
+                            }
+                            // `B` for the bags, as 3.3.5a binds it. One window
+                            // rather than the original's one-per-bag, so this
+                            // is a single toggle rather than the original's
+                            // separate keys for each bag.
+                            KeyCode::KeyB => {
+                                self.bags_open = !self.bags_open;
+                                window.request_redraw();
+                                return;
+                            }
+                            // `C` for the character panel, as 3.3.5a binds it.
+                            KeyCode::KeyC => {
+                                self.character_open = !self.character_open;
                                 window.request_redraw();
                                 return;
                             }
@@ -3600,6 +3626,12 @@ impl App {
             return;
         }
         self.spells = spells::Spellbook::load(&mut self.chain, &known);
+        // Loaded alongside the spellbook rather than the first time the bag
+        // window opens. Both read large tables, and doing it here puts the
+        // cost in the one place that already pays it -- opening a window
+        // mid-fight and stalling a frame on `Item.dbc` would be a hitch a
+        // player could feel and could not explain.
+        self.items = items::Items::load(&mut self.chain);
         self.seed_action_bars();
     }
 
@@ -4126,6 +4158,103 @@ impl App {
             Vec::new()
         };
 
+        // The bag window, built only while it is open, and rebuilt every frame
+        // for the same reasons the spellbook is.
+        //
+        // **The grid is the backpack's sixteen slots, filled by slot index
+        // rather than by packing the items in order.** An item in slot 25 is
+        // drawn in the third square whether or not slots 23 and 24 hold
+        // anything -- a bag that reshuffled itself as things were used would
+        // make every slot's position meaningless, and the server's slot
+        // numbers are the only stable identity a square has.
+        //
+        // Bags equipped in slots 19-22 are deliberately not shown. Their
+        // contents are addressed by a mechanism this client has not been able
+        // to observe -- see `::world::inventory::carried` for what was tried and
+        // why it stopped there. Drawing the bags themselves as though they
+        // were their contents would be worse than leaving them out.
+        let bags: Vec<ui::frames::BagSlot> = if self.bags_open {
+            let mut slots = vec![ui::frames::BagSlot::default(); ::world::inventory::BACKPACK_COUNT as usize];
+            if let Some(live) = self.live.as_ref() {
+                let carried = ::world::inventory::carried(&live.state, live.guid);
+                for held in carried {
+                    let index = (held.slot.index() - ::world::inventory::BACKPACK_FIRST) as usize;
+                    let Some(square) = slots.get_mut(index) else {
+                        continue;
+                    };
+                    // An occupied slot whose item object never arrived still
+                    // draws as occupied. `carried` keeps that distinction; a
+                    // window that dropped it would show a replication gap as
+                    // an empty bag.
+                    let entry = held.entry.unwrap_or(0);
+                    let icon = (entry != 0).then(|| {
+                        self.items
+                            .icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, entry)
+                    });
+                    *square = ui::frames::BagSlot {
+                        item: Some(ui::frames::BagItem {
+                            entry,
+                            name: self.items.name(entry),
+                            count: held.count,
+                            icon: icon.flatten(),
+                        }),
+                    };
+                }
+            }
+            slots
+        } else {
+            Vec::new()
+        };
+        let copper = self
+            .live
+            .as_ref()
+            .map(|live| ::world::inventory::coinage(&live.state, live.guid))
+            .unwrap_or(0);
+
+        // The character panel: the nineteen worn slots, always all nineteen.
+        //
+        // Unlike the bag grid this is indexed by *identity* -- slot 7 is the
+        // feet whether or not anything is on them -- so an empty slot is still
+        // drawn, and its name comes from `InventorySlot::label`, which returns
+        // `None` for the one slot this client could not measure. That `None`
+        // becomes an empty label and an unnamed square, which is the honest
+        // rendering of "we do not know what this is for".
+        let character: Vec<ui::frames::EquipSlot> = if self.character_open {
+            let worn = self
+                .live
+                .as_ref()
+                .map(|live| ::world::inventory::equipped(&live.state, live.guid))
+                .unwrap_or_default();
+            (0..::world::inventory::EQUIPPED_COUNT)
+                .map(|index| {
+                    let slot = ::world::inventory::InventorySlot::new(index);
+                    let held = worn[index as usize];
+                    let item = held.map(|held| {
+                        let entry = held.entry.unwrap_or(0);
+                        let icon = (entry != 0).then(|| {
+                            self.items
+                                .icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, entry)
+                        });
+                        ui::frames::BagItem {
+                            entry,
+                            name: self.items.name(entry),
+                            count: held.count,
+                            icon: icon.flatten(),
+                        }
+                    });
+                    ui::frames::EquipSlot {
+                        label: slot
+                            .and_then(|slot| slot.label())
+                            .unwrap_or_default()
+                            .to_string(),
+                        item,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Re-measured every frame against the clock for the same reason the
         // cooldown sweep is: the bar's fill has to move even though nothing
         // in replicated state changed between frames.
@@ -4140,6 +4269,8 @@ impl App {
 
         let mut hud_response = ui::HudResponse::default();
         let spellbook_open = self.spellbook_open;
+        let bags_open = self.bags_open;
+        let character_open = self.character_open;
         let interface = &mut self.hud;
         let editing = interface.edit.active;
         let layout_status = interface.status.clone();
@@ -4160,6 +4291,9 @@ impl App {
                     // book and a closed one are different things, and the
                     // interface draws the first and hides the second.
                     spellbook: spellbook_open.then_some(spellbook.as_slice()),
+                    bags: bags_open.then_some(bags.as_slice()),
+                    copper,
+                    character: character_open.then_some(character.as_slice()),
                 },
             );
 
@@ -4230,7 +4364,8 @@ impl App {
                          right-drag to steer, wheel to zoom, Q/E strafe, space \
                          jumps, Num Lock autoruns, Z draws or stows the weapon. \
                          P for the spellbook (click a spell then a slot; \
-                         right-click a slot to clear it), F1 to rearrange the \
+                         right-click a slot to clear it), B for the bags, \
+                         C for the character panel, F1 to rearrange the \
                          interface"
                     });
                     if let Some(status) = &layout_status {

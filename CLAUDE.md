@@ -16,7 +16,8 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, a spellbook you arrange the bars from, `F1` to rearrange, saved to `ui.toml` |
 | World | Lighting and the day/night cycle come from `Light.dbc`'s curves and the realm's own clock. **The sky is a real gradient**: bands 2–6 are the sky from zenith to horizon, identified by the one hour that could refute it — at dawn the warm/cool crossing lands on the horizon side, once. Fog is *derived* from the horizon band rather than named, so distant terrain meets the sky it is drawn against. **The sun and the moon are drawn**: band 9 is the one band that stays bright while the sky goes black, so it is the disc rather than a light — cool white all night, warm at dawn — and one band serves both because only one is ever up. **Weather works and now falls**: `SMSG_WEATHER` blends towards the stormy curves *and* rain or snow comes down, as camera-relative billboards with no particle buffer at all, and a storm puts the sun out. Still no skybox (Elwynn names none), no clouds, no stars, no M2 emitters. Game objects — doors, benches, chests, ships — are drawn |
 | Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components. **The player's weapon is drawn**: the M2 attachment table parses, and a sword or shield hangs off the hand's animated bone and swings with it. Shoulders, helms and ranged weapons are not, and there is no sheathed state — see below. Other players' equipment still needs their visible-item fields |
-| Game | **4.3 done**: three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. **A spellbook panel** (`P`) now lists what the character can do and puts it on a bar by click, auto-attack included -- see the note below on why the seeding filter had to reject it. Threat and the corpse *interface* remain (the corpse protocol is done). Inventory and quests follow |
+| Game | **4.3 done**: three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. **A spellbook panel** (`P`) now lists what the character can do and puts it on a bar by click, auto-attack included -- see the note below on why the seeding filter had to reject it. Threat and the corpse *interface* remain (the corpse protocol is done). Quests follow |
+| Inventory | **4.13 done bar looting.** A **single combined bag window** (`B`) over the backpack's sixteen slots -- deliberately unlike the original's one frame per bag -- with real icons, stack counts and money; a separate **character panel** (`C`) with the nineteen worn slots. The slot array, coinage, stack count and container capacity were all measured against the live realm. `CMSG_AUTOEQUIP_ITEM` is confirmed *by effect* and eighteen of the nineteen equipment slots are named by watching where the server put things. **Slot 17 is deliberately unnamed** and a bag's *contents* are still unaddressable -- see below. Nothing can be moved from the interface yet; loot and corpse release are next |
 
 Roughly 60% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
@@ -117,6 +118,18 @@ assertion, and received chat logged as well as drawn), and the one bug 4.2 did
 have was caught by reading the viewer's own log rather than by looking at it.
 
 ## Orientation
+
+**Eighteen equipment slots are named and the nineteenth is not.** Wearing one
+item of each kind and recording where the *server* put it named slots 0–16 and
+18, and two of those (feet, main hand) independently agree with the
+starting-gear prediction that identified the slot array's base. Slot 17 is the
+single gap in an otherwise contiguous run, which makes "it must be ranged"
+extremely tempting — and every ranged item tried came back refused, because the
+test character is a warrior. A test asserts the silence, so filling it in from
+memory means deleting an assertion that says not to. A hunter would settle it in
+one run. Likewise **a bag's contents cannot yet be addressed**: `.additem` never
+places a bag in a bag slot, and hand-editing the database does not survive the
+server's own loader, so no non-empty equipped bag has ever been observed.
 
 - `crates/` — one library per concern: `chunk` (shared chunked container),
   `mpq`, `dbc`, `blp`, `m2`, `wmo`, `adt`, `render`, `auth`, `world`, `ui`
@@ -627,6 +640,30 @@ Worth reading before debugging anything, because the same shapes keep recurring.
 - **An odd-looking render is often the camera.** A gnoll looked scrambled and a
   building looked misplaced; both were framing, not geometry. Render canonical
   angles before doubting the parser.
+- **"Nothing happened" is two findings wearing one sentence.** An equip sweep
+  reported three items as `nothing moved`, which conflates an opcode the server
+  never understood with a correct opcode it deliberately declined -- opposite
+  investigations, identical printout. Printing every opcode that arrived,
+  decoded or not, separated them in one run: the failures each carried a single
+  `0x0112` and the twelve successes carried none. This is the same move that
+  turned three failed attempts at chat into a one-run answer, and it keeps
+  being the cheapest instrument in the box.
+- **When the wire and the database disagree, the wire is the client's
+  business.** A bag hand-placed into an equipped slot by editing
+  `character_inventory` came back on the wire sitting in the backpack, and the
+  database still said otherwise afterwards. Both statements were true: the
+  server's loader silently relocates a bag it declines to equip, and a session
+  that ends by closing the socket never saves, so nothing wrote the correction
+  back. Time went into "why is my edit being reverted" when the answer was that
+  it never took. A test fixture built behind the server's back is not a
+  fixture; and `.additem` needs `.save` for the same reason.
+- **The absence of a field and the absence of a feature look identical.** A
+  container announces its capacity but carries nothing naming its contents --
+  which proves nothing either way, because every bag observed was empty, a
+  create block omits zero fields, and an empty slot *is* a zero. An empty bag
+  and a bag whose contents array we cannot find are the same bytes. Before
+  concluding a structure does not exist, check whether the sample could have
+  shown it.
 
 ## Traps already hit
 

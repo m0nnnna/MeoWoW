@@ -88,6 +88,24 @@ pub struct HudData<'a> {
     /// draw rather than by a flag: the caller already decides when the book is
     /// open, and a second copy of that decision here could disagree with it.
     pub spellbook: Option<&'a [frames::SpellbookEntry]>,
+    /// What the character is carrying, or `None` when the bag window is shut.
+    /// Closed is expressed by having nothing to draw, exactly as it is for the
+    /// spellbook and the cast bar.
+    ///
+    /// One flat list covering every slot the window shows, because this client
+    /// draws **one** window rather than one per bag -- see [`frames::bags`].
+    /// The caller decides which slots that is; this crate lays out however
+    /// many it is given.
+    pub bags: Option<&'a [frames::BagSlot]>,
+    /// The nineteen worn slots, or `None` when the character panel is shut.
+    ///
+    /// A separate window from the bags rather than a section of it: the two
+    /// answer different questions, and a worn slot has a fixed identity where
+    /// a bag square is only a position.
+    pub character: Option<&'a [frames::EquipSlot]>,
+    /// The character's money in copper, drawn along the bottom of the bag
+    /// window. Ignored when `bags` is `None`.
+    pub copper: u32,
 }
 
 /// What the user did to the interface this frame.
@@ -292,6 +310,8 @@ impl Hud {
             let cast_bar_placeholder;
             let bar_placeholder;
             let spellbook_placeholder;
+            let bags_placeholder;
+            let character_placeholder;
             let content = match id {
                 ElementId::PlayerFrame | ElementId::TargetFrame => {
                     let live = if id == ElementId::PlayerFrame {
@@ -338,6 +358,24 @@ impl Hud {
                     }
                     None => continue,
                 },
+                // Same rule as the spellbook: absent when shut, drawn in edit
+                // mode so it can be positioned without a character logged in.
+                ElementId::Bags => match data.bags {
+                    Some(slots) => Content::Bags(slots),
+                    None if editing => {
+                        bags_placeholder = frames::bags::placeholder();
+                        Content::Bags(&bags_placeholder)
+                    }
+                    None => continue,
+                },
+                ElementId::Character => match data.character {
+                    Some(slots) => Content::Character(slots),
+                    None if editing => {
+                        character_placeholder = frames::character::placeholder();
+                        Content::Character(&character_placeholder)
+                    }
+                    None => continue,
+                },
                 _ => {
                     // An action bar. Unlike the other frames, an empty one
                     // still draws: the slots are where spells get *put*, so
@@ -361,6 +399,12 @@ impl Hud {
                 Content::Bar { .. } => frames::action_bar::size(&style, element.scale),
                 Content::CastBar(_) => frames::cast_bar::size(&style, element.scale),
                 Content::Spellbook(_) => frames::spellbook::size(&style, element.scale),
+                // The only frame whose size depends on its contents: a
+                // character with bags carries more than one without, and a
+                // fixed height would either clip the grid or leave a band of
+                // empty window under it.
+                Content::Bags(slots) => frames::bags::size(slots.len(), &style, element.scale),
+                Content::Character(_) => frames::character::size(&style, element.scale),
             };
             let rect = element.rect(screen, size);
             self.occupied.push(rect);
@@ -462,6 +506,21 @@ impl Hud {
                             entries,
                             scroll,
                             held,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Bags(slots) => frames::bags::draw(
+                            &painter,
+                            response.rect,
+                            slots,
+                            data.copper,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Character(slots) => frames::character::draw(
+                            &painter,
+                            response.rect,
+                            slots,
                             &style,
                             element.scale,
                         ),
@@ -633,6 +692,19 @@ impl Hud {
                             frames::action_bar::size(&style, scale)
                         }
                         ElementId::Spellbook => frames::spellbook::size(&style, scale),
+                        // Measured from what is actually being carried when
+                        // there is anything, and from the placeholder's
+                        // sixteen otherwise -- the same source the drawing
+                        // loop used, so re-anchoring cannot move a frame it
+                        // measured differently from how it painted it.
+                        ElementId::Bags => frames::bags::size(
+                            data.bags
+                                .map(|slots| slots.len())
+                                .unwrap_or_else(|| frames::bags::placeholder().len()),
+                            &style,
+                            scale,
+                        ),
+                        ElementId::Character => frames::character::size(&style, scale),
                         ElementId::PlayerFrame | ElementId::TargetFrame => {
                             let unit = if id == ElementId::PlayerFrame {
                                 data.player
@@ -688,6 +760,8 @@ enum Content<'a> {
     },
     CastBar(&'a frames::CastBarView),
     Spellbook(&'a [frames::SpellbookEntry]),
+    Bags(&'a [frames::BagSlot]),
+    Character(&'a [frames::EquipSlot]),
 }
 
 /// The outline and label that mark a frame as draggable.
@@ -1234,6 +1308,98 @@ mod tests {
         );
     }
 
+    /// The same asymmetry for the bag window, and for the same reason.
+    #[test]
+    fn a_bag_window_appears_only_when_open_or_editing() {
+        let mut quiet = Hud::default();
+        hide_bars(&mut quiet);
+        assert!(
+            painted(&mut quiet, &HudData::default()).is_empty(),
+            "a bag window was painted with the bags closed"
+        );
+
+        let slots = frames::bags::placeholder();
+        let mut open = Hud::default();
+        hide_bars(&mut open);
+        assert!(
+            !painted(
+                &mut open,
+                &HudData {
+                    bags: Some(&slots),
+                    ..Default::default()
+                }
+            )
+            .is_empty(),
+            "an open bag window painted nothing"
+        );
+    }
+
+    /// **The check that a live-only bug is converted into a headless one.**
+    ///
+    /// Everything about the bag window that a person at a window would notice
+    /// is a *number rendered as text*: the stack count in a slot's corner, the
+    /// used-of-total in the header, and the money along the bottom. None of
+    /// those is visible to a geometry assertion -- a window can paint the
+    /// right rectangles in the right places while showing the wrong quantity
+    /// of everything -- and all three read out of fields this milestone
+    /// measured rather than transcribed, which is exactly the class of value
+    /// this project's notes say is believed when wrong.
+    ///
+    /// So this asserts the text. The money is the number `.modify money`
+    /// actually set on the live realm, so a regression in the split shows up
+    /// as the same discrepancy a person would have reported.
+    #[test]
+    fn the_bag_window_says_what_it_is_carrying() {
+        let mut slots = vec![frames::BagSlot::default(); 16];
+        slots[0] = frames::BagSlot {
+            item: Some(frames::BagItem {
+                entry: 2589,
+                name: "Linen Cloth".into(),
+                count: 3,
+                icon: None,
+            }),
+        };
+        slots[1] = frames::BagSlot {
+            item: Some(frames::BagItem {
+                entry: 6948,
+                name: "Hearthstone".into(),
+                // A stack of one draws no number at all -- see `BagItem::count`.
+                count: 1,
+                icon: None,
+            }),
+        };
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let text = painted_text(&shapes(
+            &mut hud,
+            &HudData {
+                bags: Some(&slots),
+                copper: 123_456,
+                ..Default::default()
+            },
+            None,
+        ));
+
+        assert!(text.contains(&"Bags".to_string()), "no title in {text:?}");
+        assert!(
+            text.contains(&"2/16".to_string()),
+            "the window did not say how full it is: {text:?}"
+        );
+        assert!(
+            text.contains(&"3".to_string()),
+            "the stack of three lost its count: {text:?}"
+        );
+        assert!(
+            text.contains(&"12g 34s 56c".to_string()),
+            "the money was not drawn, or was split wrongly: {text:?}"
+        );
+        assert!(
+            !text.contains(&"1".to_string()),
+            "a stack of one drew a count it should have left off: {text:?}"
+        );
+    }
+
     /// The whole assignment gesture, end to end: click a spell, click a slot,
     /// and the layout holds it.
     ///
@@ -1395,6 +1561,10 @@ mod tests {
                 frames::action_bar::size(&profile.style, scale)
             }
             ElementId::Spellbook => frames::spellbook::size(&profile.style, scale),
+            ElementId::Bags => {
+                frames::bags::size(frames::bags::placeholder().len(), &profile.style, scale)
+            }
+            ElementId::Character => frames::character::size(&profile.style, scale),
             ElementId::PlayerFrame | ElementId::TargetFrame => {
                 frames::unit::size(&profile.style, scale, true)
             }

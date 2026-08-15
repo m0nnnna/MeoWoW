@@ -207,6 +207,10 @@ pub struct Style {
     /// Its own row height rather than the action bar's `slot_size`: the two
     /// are independently tunable, and a book of bar-sized icons would show
     /// four spells at a time.
+    /// Room beside a character-panel slot for its name. Its own dimension
+    /// rather than a multiple of the slot size: the longest label
+    /// ('Shoulders') sets it, and slot size is tuned for icons.
+    pub character_label_width: f32,
     pub spellbook_width: f32,
     pub spellbook_height: f32,
     pub spellbook_row: f32,
@@ -312,6 +316,7 @@ impl Default for Style {
             slot_empty_border: Color::rgba(120, 130, 150, 70),
             slot_binding: Color::rgba(230, 235, 245, 200),
 
+            character_label_width: 62.0,
             spellbook_width: 250.0,
             spellbook_height: 320.0,
             spellbook_row: 30.0,
@@ -390,6 +395,7 @@ impl Style {
         self.slot_size = self.slot_size.clamp(12.0, 200.0);
         self.slot_gap = self.slot_gap.clamp(0.0, 40.0);
         self.cast_bar_width = self.cast_bar_width.clamp(60.0, 1200.0);
+        self.character_label_width = self.character_label_width.clamp(0.0, 400.0);
         self.spellbook_width = self.spellbook_width.clamp(120.0, 1200.0);
         self.spellbook_height = self.spellbook_height.clamp(60.0, 1600.0);
         self.spellbook_row = self.spellbook_row.clamp(10.0, 200.0);

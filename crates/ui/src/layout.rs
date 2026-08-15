@@ -40,10 +40,12 @@ pub enum ElementId {
     ActionBar2,
     ActionBar3,
     Spellbook,
+    Bags,
+    Character,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 8] = [
+    pub const ALL: [ElementId; 10] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -52,6 +54,8 @@ impl ElementId {
         ElementId::ActionBar2,
         ElementId::ActionBar3,
         ElementId::Spellbook,
+        ElementId::Bags,
+        ElementId::Character,
     ];
 
     /// Which action bar this element is, if it is one.
@@ -75,6 +79,8 @@ impl ElementId {
             ElementId::ActionBar2 => "action-bar-2",
             ElementId::ActionBar3 => "action-bar-3",
             ElementId::Spellbook => "spellbook",
+            ElementId::Bags => "bags",
+            ElementId::Character => "character",
         }
     }
 
@@ -93,6 +99,8 @@ impl ElementId {
             ElementId::ActionBar2 => "Action bar (Shift)",
             ElementId::ActionBar3 => "Action bar (Ctrl)",
             ElementId::Spellbook => "Spellbook",
+            ElementId::Bags => "Bags",
+            ElementId::Character => "Character",
         }
     }
 
@@ -160,6 +168,25 @@ impl ElementId {
             ElementId::Spellbook => Element {
                 anchor: Anchor::Right,
                 offset: [-24.0, 0.0],
+                ..Default::default()
+            },
+            // Bottom right, the one corner the default layout leaves free, and
+            // the corner a bag window has traditionally occupied. Deliberately
+            // not beside the spellbook: both are opened by a keypress and a
+            // player may well have both open, so overlapping defaults would
+            // make the first thing anyone does with this window be moving it.
+            ElementId::Bags => Element {
+                anchor: Anchor::BottomRight,
+                offset: [-24.0, -16.0],
+                ..Default::default()
+            },
+            // Left of centre, clear of the bag window it is most often opened
+            // beside: comparing a worn item against one in the bags is the
+            // whole reason both would be on screen at once, so overlapping
+            // defaults would defeat the pairing.
+            ElementId::Character => Element {
+                anchor: Anchor::Left,
+                offset: [24.0, 0.0],
                 ..Default::default()
             },
         }

@@ -222,6 +222,34 @@ enum Command {
         /// object rather than for some of them.
         #[arg(long)]
         objects: bool,
+        /// After entering, print every replicated item, with its fields, beside
+        /// the character's own inventory slot array.
+        ///
+        /// The two halves are printed together deliberately. A list of item
+        /// objects alone says what is held but not *where*, and a slot array
+        /// alone is a column of guids with nothing to resolve them against --
+        /// each is half of the same question. Printed side by side, the slot
+        /// array's identification predicts which guids appear and where, which
+        /// is the check that separated it from a plausible-looking neighbour.
+        ///
+        /// This is also the instrument for the fields that are still unknown:
+        /// add a stack of 3 and a stack of 5 (`--say ".additem 2589 3"`) and
+        /// diff one run's item fields against another's. A field that tracks
+        /// the count is the stack count; a field that reads 3 in both is not.
+        #[arg(long)]
+        items: bool,
+        /// Wear the item in this inventory slot, and report where it went.
+        ///
+        /// **The instrument that confirms `CMSG_AUTOEQUIP_ITEM`.** Nothing
+        /// acknowledges the send, so this prints the whole slot array before
+        /// and after and names every guid that moved. A wrong opcode moves
+        /// nothing, which is a different printout rather than a similar one.
+        ///
+        /// The server chooses the destination, and its choice is the useful
+        /// half: it names which equipment index an item of that kind belongs
+        /// in, which is how the slot vocabulary is filled in without guessing.
+        #[arg(long)]
+        equip: Vec<u16>,
         /// After entering, find which update field carries the character's
         /// appearance by searching for the answer the character list gives.
         ///
@@ -313,8 +341,14 @@ enum Command {
         names: bool,
         /// After entering, say this out loud. Received chat is printed by
         /// `--stay`, so two clients prove the round trip.
+        ///
+        /// **Repeatable, and it has to be.** Chat is also how this rig issues
+        /// GM commands, and the useful ones come in pairs: `.additem` followed
+        /// by `.save` is one exchange, not two runs, because an item added in
+        /// a session that ends by closing the socket is never written to the
+        /// database. Each line is sent in the order given.
         #[arg(long)]
-        say: Option<String>,
+        say: Vec<String>,
         /// Yell rather than say. `/say` carries about 25 yards, which two
         /// characters in the same starting zone can easily exceed; a yell
         /// crosses the zone.
@@ -616,6 +650,8 @@ fn main() -> Result<()> {
             stay,
             units,
             objects,
+            items,
+            equip,
             target,
             own_fields,
             until_death,
@@ -647,6 +683,8 @@ fn main() -> Result<()> {
                 stay: *stay,
                 units: *units,
                 objects: *objects,
+                items: *items,
+                equip,
                 target: target.as_deref(),
                 own_fields: *own_fields,
                 until_death: *until_death,
@@ -659,7 +697,7 @@ fn main() -> Result<()> {
                 sheath: *sheath,
                 capture: capture.as_deref(),
                 names: *names,
-                say: say.as_deref(),
+                say,
                 yell: *yell,
                 whisper: whisper.as_deref(),
                 spells: *spells,
@@ -797,6 +835,8 @@ struct WorldRequest<'a> {
     stay: u64,
     units: Option<usize>,
     objects: bool,
+    items: bool,
+    equip: &'a [u16],
     target: Option<&'a str>,
     own_fields: bool,
     until_death: bool,
@@ -809,7 +849,7 @@ struct WorldRequest<'a> {
     sheath: Option<u32>,
     capture: Option<&'a std::path::Path>,
     names: bool,
-    say: Option<&'a str>,
+    say: &'a [String],
     yell: bool,
     whisper: Option<&'a str>,
     spells: bool,
@@ -853,6 +893,8 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         stay,
         units,
         objects,
+        items,
+        equip,
         target,
         own_fields,
         until_death,
@@ -1342,7 +1384,7 @@ nothing replicated matches {wanted:?}"),
             resolve_names(&mut connection, &mut state, 2)?;
         }
 
-        if let Some(text) = say {
+        for text in say {
             // The character's own language, not Universal -- see
             // `chat::language_for_race`. Read from replicated state rather
             // than from the character list so it comes from the same place the
@@ -1564,6 +1606,14 @@ cast {spell_id} at {} (attempt {attempt})",
 
         if objects {
             report_game_objects(&state);
+        }
+
+        for slot in equip {
+            equip_and_report(&mut connection, &mut state, character.guid, *slot)?;
+        }
+
+        if items {
+            report_items(&state, character.guid);
         }
 
         if appearance {
@@ -1965,6 +2015,240 @@ fn report_game_objects(state: &world::WorldState) {
     if objects.is_empty() {
         println!("  none in range -- stand somewhere with a door, a chest or a corpse");
     }
+}
+
+/// Dumps every replicated item beside the character's own slot array.
+///
+/// **The point is the pairing.** Either half alone is unfalsifiable: a list of
+/// item objects says what is held but not where, and a column of slot guids has
+/// nothing to resolve against. Printed together, the slot array's identified
+/// base *predicts* which guids appear and at which indices, and a wrong base
+/// shows up immediately as guids that belong to no object -- where a wrong base
+/// read on its own would return plausible-looking numbers made of two halves of
+/// neighbouring guids.
+///
+/// It is also the instrument for the fields still unknown. `ITEM_FIELD_STACK_COUNT`
+/// has not been located: the technique is to add a stack of 3 and a stack of 5
+/// and diff two runs' item fields, keeping the field that reads 3 in one and 5
+/// in the other. A field holding 3 in both is a coincidence of magnitude, which
+/// is the trap this project's notes call "validity is nearly free; variation is
+/// the discriminator". So every field of every item is printed raw, with no
+/// interpretation applied whatsoever.
+fn report_items(state: &world::WorldState, own_guid: u64) {
+    use world::inventory::{self, SlotKind};
+
+    let held = inventory::held(state, own_guid);
+    let copper = inventory::coinage(state, own_guid);
+    let (gold, silver, copper_only) = inventory::purse(copper);
+
+    println!(
+        "\ninventory slot array (base {:#06x}), {} of {} slots occupied:",
+        world::update::fields::PLAYER_FIELD_INV_SLOT_HEAD,
+        held.len(),
+        inventory::SLOT_COUNT,
+    );
+    for item in &held {
+        let region = match item.slot.kind() {
+            SlotKind::Equipped => "equipped",
+            SlotKind::Bag => "bag",
+            SlotKind::Backpack => "backpack",
+        };
+        let label = item.slot.label().unwrap_or("-");
+        // An occupied slot whose object never arrived is called out rather
+        // than printed as a blank: it is a real and different state, and
+        // silently showing nothing would make a replication gap look like an
+        // empty bag.
+        let entry = match item.entry {
+            Some(entry) => format!("entry {entry}"),
+            None => "OBJECT NOT REPLICATED".into(),
+        };
+        println!(
+            "  slot {:>2} ({region:>8}, {label:>9}) field {:#06x}  guid {:#018x}  {entry}",
+            item.slot.index(),
+            item.slot.field(),
+            item.guid,
+        );
+    }
+    if held.is_empty() {
+        println!("  none -- the slot array read empty, which for a character");
+        println!("  wearing anything at all means the base is wrong");
+    }
+
+    println!("\nmoney: {copper} copper ({gold}g {silver}s {copper_only}c)");
+
+    // Every item object, including any the slot array does not mention -- a
+    // bag's *contents* may well arrive as objects the player's own array never
+    // names, and that difference is exactly what has to be visible to work out
+    // how containers address what is inside them.
+    let items: Vec<&world::state::Entity> = state
+        .iter()
+        .filter(|entity| {
+            matches!(
+                entity.object_type,
+                world::ObjectType::Item | world::ObjectType::Container
+            )
+        })
+        .collect();
+    let in_slots: std::collections::BTreeSet<u64> = held.iter().map(|item| item.guid).collect();
+
+    println!("\n{} replicated item object(s):", items.len());
+    for entity in &items {
+        let slot = held.iter().find(|item| item.guid == entity.guid);
+        let placement = match slot {
+            Some(item) => format!("slot {}", item.slot.index()),
+            // The interesting case. Something is holding this and it is not
+            // one of the thirty-nine slots on the player.
+            None => "NOT IN THE PLAYER'S SLOT ARRAY".into(),
+        };
+        println!(
+            "  {:#018x}  {:?}  {placement}",
+            entity.guid, entity.object_type
+        );
+        for (index, value) in entity.fields.iter() {
+            println!("    {index:#06x} = {value:#010x} ({value})");
+        }
+    }
+
+    let missing = in_slots.len() - items.iter().filter(|e| in_slots.contains(&e.guid)).count();
+    if missing > 0 {
+        println!("\n{missing} slot(s) name a guid with no object -- see above");
+    }
+    if items.is_empty() {
+        println!("  none -- items are replicated in the login burst, so an");
+        println!("  empty list here means the burst was cut short, not that");
+        println!("  the character is carrying nothing");
+    }
+
+    // The unknowns, restated at the point of use so a run of this command is
+    // self-describing. Nothing below is implemented and nothing should be
+    // guessed from a table.
+    println!("\nstill unidentified, and to be measured rather than transcribed:");
+    println!("  ITEM_FIELD_STACK_COUNT -- diff a stack of 3 against a stack of 5");
+    println!("  how a container addresses its contents -- see any item above");
+    println!("  marked NOT IN THE PLAYER'S SLOT ARRAY");
+}
+
+/// Wears an item and reports what moved, which is what confirms the opcode.
+///
+/// **The whole point is the diff.** `CMSG_AUTOEQUIP_ITEM` is acknowledged by
+/// nothing, and this project has already paid for the lesson that a wrong
+/// outgoing opcode is not refused -- it is read as some other valid request,
+/// and the silence looks identical either way. What separates them is that a
+/// *correct* send has a loud consequence: one guid leaves one field of the
+/// player's own object and appears at another. So this snapshots the slot
+/// array, sends, waits, and prints every slot whose occupant changed.
+///
+/// Nothing here interprets the destination. Which equipment index the server
+/// picked is the *answer* being collected, not something to be checked against
+/// a table we do not have -- see `world::inventory::InventorySlot::label`.
+fn equip_and_report(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    slot: u16,
+) -> Result<()> {
+    use world::inventory::{self, InventorySlot};
+
+    let Some(source) = InventorySlot::new(slot) else {
+        println!(
+            "\nslot {slot} is past the end of the array ({} slots)",
+            inventory::SLOT_COUNT
+        );
+        return Ok(());
+    };
+
+    let before: std::collections::BTreeMap<u16, u64> = inventory::held(state, own_guid)
+        .into_iter()
+        .map(|item| (item.slot.index(), item.guid))
+        .collect();
+
+    let Some(&moving) = before.get(&slot) else {
+        // Worth refusing loudly. Sending an equip for an empty slot is
+        // ignored by the server, and "nothing moved" would then be
+        // indistinguishable from a wrong opcode -- which is precisely the
+        // confusion this command exists to avoid.
+        println!("\nslot {slot} is empty; nothing to equip, and a run against an");
+        println!("empty slot cannot tell a working opcode from a broken one");
+        return Ok(());
+    };
+    println!("\nequipping {moving:#018x} from slot {slot}");
+
+    connection.equip_item(source)?;
+
+    // Give the server time to act before concluding it ignored us -- a send
+    // immediately before a read is often never processed, and that failure is
+    // indistinguishable from having sent the wrong thing.
+    let batch = connection.drain(std::time::Duration::from_millis(1200), 128)?;
+    state.replicate(&batch, None);
+
+    let after: std::collections::BTreeMap<u16, u64> = inventory::held(state, own_guid)
+        .into_iter()
+        .map(|item| (item.slot.index(), item.guid))
+        .collect();
+
+    let mut moved = Vec::new();
+    for index in 0..inventory::SLOT_COUNT {
+        let (was, now) = (before.get(&index), after.get(&index));
+        if was != now {
+            moved.push((index, was.copied(), now.copied()));
+        }
+    }
+
+    if moved.is_empty() {
+        // **Nothing moved is two completely different findings**, and printing
+        // only "nothing moved" makes them look like one: a wrong opcode the
+        // server ignored, and a correct opcode the server deliberately
+        // refused. What separates them is whether anything came back at all --
+        // a refusal is a packet. So this prints every opcode that arrived,
+        // decoded or not, which is the move that turned three failed attempts
+        // at chat into a one-run answer.
+        println!("\nnothing moved. Two different things look like this: an opcode");
+        println!("the server ignored, and a refusal it sent back. What arrived:");
+        let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+        for packet in &batch {
+            *seen.entry(packet.opcode).or_default() += 1;
+        }
+        for (opcode, count) in &seen {
+            println!("    {:<34} x{count}", world::opcode::describe(*opcode));
+        }
+        if seen.is_empty() {
+            println!("    nothing at all");
+        }
+        return Ok(());
+    }
+
+    println!("\n{} slot(s) changed:", moved.len());
+    for (index, was, now) in &moved {
+        let describe = |guid: &Option<u64>| match guid {
+            Some(guid) => format!("{guid:#018x}"),
+            None => "empty".into(),
+        };
+        let here = InventorySlot::new(*index).unwrap();
+        println!(
+            "  slot {index:>2} ({:>8}, {:>9}): {} -> {}",
+            match here.kind() {
+                inventory::SlotKind::Equipped => "equipped",
+                inventory::SlotKind::Bag => "bag",
+                inventory::SlotKind::Backpack => "backpack",
+            },
+            here.label().unwrap_or("-"),
+            describe(was),
+            describe(now),
+        );
+    }
+
+    // The identification this run is actually for: where the server decided
+    // the item belongs. Printed on its own line because it is the output worth
+    // copying into `InventorySlot::label`.
+    if let Some((index, _, _)) = moved
+        .iter()
+        .find(|(_, _, now)| *now == Some(moving))
+    {
+        println!("\n{moving:#018x} now sits at equipment slot {index}");
+        println!("-- that is what this item's inventory type equips to");
+    }
+
+    Ok(())
 }
 
 /// Finds which update field carries a player's appearance, by searching for an

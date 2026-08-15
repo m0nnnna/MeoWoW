@@ -597,6 +597,30 @@ impl Connection {
         )
     }
 
+    /// Wears the item in a slot of the character's own inventory array.
+    ///
+    /// The server chooses which equipment slot it goes to, refuses politely if
+    /// the item cannot be worn, and swaps if that slot is occupied -- so a
+    /// caller needs to know only where the item *is*, not where it belongs.
+    ///
+    /// See [`ClientOpcode::AutoEquipItem`] for how the opcode was confirmed:
+    /// nothing acknowledges the send, but the item's guid visibly moves
+    /// between two fields of the player's own object, which is a result that
+    /// could have failed to appear.
+    pub fn equip_item(&mut self, slot: crate::inventory::InventorySlot) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::AutoEquipItem,
+            // The source *bag*, then the source slot. A slot from
+            // `InventorySlot` is always an index into the player's own array,
+            // which is exactly what `OWN_SLOT_ARRAY` says -- the type makes
+            // the pairing unable to drift.
+            &[
+                crate::inventory::OWN_SLOT_ARRAY,
+                slot.index() as u8,
+            ],
+        )
+    }
+
     /// Acknowledges a teleport within the current map.
     ///
     /// **The server will not finish the move until this arrives, and will

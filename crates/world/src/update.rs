@@ -1111,6 +1111,91 @@ pub mod fields {
     pub const PLAYER_GHOST: u16 = 0x96;
     /// The bit of [`PLAYER_GHOST`] that was observed, and the only one.
     pub const PLAYER_GHOST_BIT: u32 = 0x10;
+
+    /// `PLAYER_FIELD_INV_SLOT_HEAD`: the base of the character's inventory
+    /// slot array. **Two fields per slot** -- a 64-bit item guid, low word
+    /// first -- so slot *n* lives at `INV_SLOT_HEAD + 2n`.
+    ///
+    /// The slot *ranges* are laid out in [`InventorySlot`](crate::inventory::InventorySlot);
+    /// what matters here is that this base was measured rather than
+    /// transcribed, and measured twice by different arguments.
+    ///
+    /// **The stride came from adding items one at a time.** `.additem` on the
+    /// live realm put a guid at `0x0174`; a second `.additem` put one at
+    /// `0x0176`. Two consecutive backpack slots two fields apart is the stride
+    /// and the guid width in one observation, and neither could be inferred
+    /// from a single item.
+    ///
+    /// **The base came from a prediction, not from a plausible reading.** Any
+    /// base within a few fields of the truth reads the slot array *slightly*
+    /// misaligned, and a misaligned read is not blank -- it returns the high
+    /// word of one guid beside the low word of the next, which still looks
+    /// like a populated inventory. So the check was not "does this produce
+    /// guids" but "does it put the guids where something *else* says they
+    /// should be": with this base, a starting human warrior's four item guids
+    /// land on slots 3, 6, 7 and 15, which is shirt, legs, feet and main hand.
+    /// That is exactly what an AzerothCore human warrior begins wearing, and
+    /// it is a claim the identification could have failed.
+    ///
+    /// Item guids carry a high word of [`ITEM_GUID_HIGH`], which is how one is
+    /// recognised at a glance in a field dump.
+    pub const PLAYER_FIELD_INV_SLOT_HEAD: u16 = 0x0144;
+
+    /// How many update fields one inventory slot occupies: a guid is 64 bits
+    /// and a field is 32.
+    pub const INV_SLOT_STRIDE: u16 = 2;
+
+    /// The high word every item guid carries.
+    ///
+    /// Not load-bearing -- the slot array already says which guids are items
+    /// and where they sit -- but it is what makes an item recognisable in a
+    /// raw field dump, which is how all of this was found.
+    pub const ITEM_GUID_HIGH: u32 = 0x4000_0000;
+
+    /// `PLAYER_FIELD_COINAGE`, in **copper**. Gold and silver are presentation:
+    /// 100 copper to a silver, 100 silver to a gold, and the wire knows only
+    /// the one number.
+    ///
+    /// `.modify money 123456` produced exactly `0x0001e240` here -- which is
+    /// 123456 -- and changed no other field in the object. A single field
+    /// moving to a value we chose is a stronger statement than a field merely
+    /// holding a plausible amount of money, because we picked a number no
+    /// other field would coincidentally hold.
+    pub const PLAYER_FIELD_COINAGE: u16 = 0x0492;
+
+    /// `ITEM_FIELD_STACK_COUNT`: how many are in this stack.
+    ///
+    /// Measured by **variation**, which is the only thing that could separate
+    /// it. An item object carries eight fields and most of them are small
+    /// integers, so "contains a plausible stack size" is nearly free -- three
+    /// of the eight hold the constant 1 on every item in the bags, and any of
+    /// them would look like a stack count on a character carrying only single
+    /// items.
+    ///
+    /// What settled it was asking for counts nobody would hold by accident.
+    /// `.additem 2589 3`, `.additem 2592 5` and `.additem 4306 17` produced
+    /// items reading 3, 5 and 17 in this field and 1 everywhere else, while
+    /// every other field stayed constant across all three. The 17 is the part
+    /// that matters: two values could be coincidence between neighbouring
+    /// columns, but a field that tracks an arbitrary number we chose, three
+    /// times, is reporting that number.
+    ///
+    /// Absent means one, not zero -- a sparse field set omits zeros and there
+    /// is no such thing as a stack of none.
+    pub const ITEM_FIELD_STACK_COUNT: u16 = 0x0E;
+
+    /// `CONTAINER_FIELD_NUM_SLOTS`: how many slots this bag has.
+    ///
+    /// Confirmed the same way, against the server's own `item_template`: a
+    /// Small Red Pouch (entry 805, `ContainerSlots` 6) reads 6 here and a Blue
+    /// Leather Bag (entry 856, `ContainerSlots` 8) reads 8, in the same field
+    /// of two objects that are otherwise identical. Checking one bag would
+    /// have proved only that the field contains a number of about the right
+    /// size.
+    ///
+    /// Set only on [`ObjectType::Container`](crate::ObjectType) objects, which
+    /// also carry type mask 7 where a plain item carries 3.
+    pub const CONTAINER_FIELD_NUM_SLOTS: u16 = 0x40;
 }
 
 #[cfg(test)]

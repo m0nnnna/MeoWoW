@@ -63,6 +63,30 @@ pub enum ClientOpcode {
     /// in turn moves that byte to the matching value and back.
     SetSheathed = 0x01E0,
 
+    /// Wear the item in a given inventory slot, letting the server choose
+    /// which equipment slot it belongs in.
+    ///
+    /// **Confirmed by effect, not by transcription.** Nothing acknowledges
+    /// this, and an outgoing number that is wrong is read as some *other*
+    /// valid request rather than refused -- the trap `CMSG_ATTACKSWING`
+    /// documents. What makes it checkable is that the result is loud: the
+    /// item's guid leaves its slot in `PLAYER_FIELD_INV_SLOT_HEAD` and
+    /// reappears at an equipment index, and both halves arrive in the next
+    /// object update. Sending this and watching a specific guid move between
+    /// two specific fields is a statement that could have failed.
+    ///
+    /// The body is two bytes: the source bag, then the source slot.
+    /// [`crate::inventory::OWN_SLOT_ARRAY`] is the bag value meaning "not in a
+    /// bag, this is an index into the player's own array".
+    ///
+    /// Deliberately the *auto* form rather than one naming a destination. The
+    /// server picking the slot is what makes this useful twice over: it is the
+    /// simplest possible write, and its choice is a fact about the item that
+    /// this client would otherwise have to guess at -- which is how the
+    /// equipment slot vocabulary beyond the four originally confirmed was
+    /// filled in.
+    AutoEquipItem = 0x010A,
+
     /// Release the spirit: give up the body and become a ghost at the nearest
     /// graveyard. Carries one byte the server reads and discards.
     ///
