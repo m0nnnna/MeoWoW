@@ -66,6 +66,9 @@ enum Command {
     /// Inspect items: what an equipped thing looks like and what it hangs off.
     #[command(subcommand)]
     Item(ItemCommand),
+    /// Inspect sounds: what the client can play, and where its files are.
+    #[command(subcommand)]
+    Sound(SoundCommand),
     /// Inspect world objects: buildings, dungeons, bridges.
     #[command(subcommand)]
     Wmo(WmoCommand),
@@ -760,6 +763,7 @@ fn main() -> Result<()> {
         Command::Blp(cmd) => blp_cmd(&mut chain, cmd),
         Command::M2(cmd) => m2_cmd(&mut chain, cmd),
         Command::Item(cmd) => item_cmd(&mut chain, cmd),
+        Command::Sound(cmd) => sound_cmd(&mut chain, &cmd),
         Command::Wmo(cmd) => wmo_cmd(&mut chain, cmd),
         Command::Adt(cmd) => adt_cmd(&mut chain, cmd),
         Command::Light {
@@ -4286,6 +4290,223 @@ fn m2_cmd(chain: &mut Chain, cmd: M2Command) -> Result<()> {
     }
 }
 
+/// Inspect sounds: what the client can play, and whether the files are there.
+#[derive(Subcommand)]
+enum SoundCommand {
+    /// List sound entries, optionally filtered by name.
+    List {
+        /// Case-insensitive substring to match against the entry's name.
+        filter: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
+    /// Resolve every sound's files against the archives and report coverage.
+    ///
+    /// **This is the check that transcribed `SoundEntries` at all.** The
+    /// column layout was read off the file's own shape -- ten string columns
+    /// of decreasing density, then ten small-integer columns with the same
+    /// decreasing density -- and that pattern fits several wrong alignments
+    /// just as well. What it cannot fit is the strings naming *files that
+    /// exist*: a one-column slip produces paths the archive has never heard
+    /// of, where a dump of the same wrong columns looks entirely plausible.
+    ///
+    /// Resolved **by path**, not by looking in `(listfile)`. An MPQ resolves
+    /// by hash, so a file missing from the listfile still reads perfectly --
+    /// a coverage check built on `ls` once concluded a whole feature was
+    /// impossible.
+    Survey {
+        /// Stop after this many entries.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Report what each `sound_type` value actually contains.
+    ///
+    /// The type column runs 1-53 and this client names none of them. Naming
+    /// them from memory is the mistake `describe_cast_failure` exists to
+    /// refuse, so this asks the data instead: for each value, how many entries
+    /// carry it and which folders their files live in. A value whose every
+    /// entry sits under `Sound\Music` is the music type, and that is a
+    /// measurement rather than a recollection.
+    Types,
+    /// Extract a sound's files to disk so they can actually be listened to.
+    ///
+    /// The audio equivalent of `blp export`: a format that has only ever been
+    /// parsed is a format nobody has checked. A composed thing needs a way to
+    /// be seen -- or here, heard -- as itself.
+    Export {
+        /// The `SoundEntries` id.
+        id: u32,
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+}
+
+fn sound_cmd(chain: &mut Chain, cmd: &SoundCommand) -> Result<()> {
+    use dbc::schema::SoundEntries;
+
+    let bytes = chain
+        .read(SoundEntries::PATH)
+        .with_context(|| format!("reading {}", SoundEntries::PATH))?;
+    let table = SoundEntries::parse(&bytes)?;
+
+    match cmd {
+        SoundCommand::List { filter, limit } => {
+            let wanted = filter.as_ref().map(|f| f.to_lowercase());
+            let mut shown = 0;
+            let mut matched = 0;
+            for row in table.iter() {
+                if let Some(wanted) = &wanted {
+                    if !row.name().to_lowercase().contains(wanted.as_str()) {
+                        continue;
+                    }
+                }
+                matched += 1;
+                if shown >= *limit {
+                    continue;
+                }
+                shown += 1;
+                println!(
+                    "  {:>6}  type {:>2}  vol {:.2}  {} .. {}  {}",
+                    row.id(),
+                    row.sound_type(),
+                    row.volume(),
+                    row.min_distance(),
+                    row.distance_cutoff(),
+                    row.name()
+                );
+                for path in row.paths() {
+                    println!("           {path}");
+                }
+            }
+            println!("\n{matched} matched of {} entries", table.len());
+        }
+
+        SoundCommand::Survey { limit } => {
+            let mut entries = 0usize;
+            let mut files = 0usize;
+            let mut missing = 0usize;
+            let mut no_files = 0usize;
+            // Kept so a failure is reportable rather than merely counted: a
+            // survey that says "3% missing" and cannot say which is a survey
+            // nobody can act on.
+            let mut examples: Vec<String> = Vec::new();
+
+            for row in table.iter() {
+                if limit.is_some_and(|l| entries >= l) {
+                    break;
+                }
+                entries += 1;
+                let paths = row.paths();
+                if paths.is_empty() {
+                    no_files += 1;
+                    continue;
+                }
+                for path in paths {
+                    files += 1;
+                    if chain.read(&path).is_err() {
+                        missing += 1;
+                        if examples.len() < 12 {
+                            examples.push(format!("{} ({})", path, row.name()));
+                        }
+                    }
+                }
+            }
+
+            let found = files - missing;
+            println!("\n{entries} entries surveyed, {files} file references:");
+            println!(
+                "  {found} resolved ({:.1}%), {missing} missing",
+                if files == 0 {
+                    0.0
+                } else {
+                    found as f64 * 100.0 / files as f64
+                }
+            );
+            println!("  {no_files} entries name no file at all");
+
+            if !examples.is_empty() {
+                println!("\nfirst few that did not resolve:");
+                for example in &examples {
+                    println!("  {example}");
+                }
+            }
+
+            // The whole point of the number. A wrong column alignment does not
+            // resolve a little worse -- it resolves essentially not at all.
+            println!(
+                "\nA correct column layout resolves nearly everything. Anything\n\
+                 like a uniform failure means the file and directory columns are\n\
+                 not where this schema says they are."
+            );
+        }
+
+        SoundCommand::Types => {
+            use std::collections::BTreeMap;
+            // For each type: how many entries, and which top-level folders
+            // their files sit in. The folder is the evidence -- a type whose
+            // entries all live under `Sound\Music` is the music type.
+            let mut by_type: BTreeMap<u32, (usize, BTreeMap<String, usize>)> = BTreeMap::new();
+            for row in table.iter() {
+                let entry = by_type.entry(row.sound_type()).or_default();
+                entry.0 += 1;
+                let directory = row.directory();
+                // Two levels is enough to separate Music from Ambience from
+                // Creature without drowning in per-zone folders.
+                let head: String = directory
+                    .split('\\')
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join("\\");
+                if !head.is_empty() {
+                    *entry.1.entry(head).or_default() += 1;
+                }
+            }
+
+            println!("\n{} sound types:", by_type.len());
+            for (kind, (count, folders)) in &by_type {
+                let mut top: Vec<(&String, &usize)> = folders.iter().collect();
+                top.sort_by(|a, b| b.1.cmp(a.1));
+                let summary: Vec<String> = top
+                    .iter()
+                    .take(3)
+                    .map(|(folder, n)| format!("{folder} x{n}"))
+                    .collect();
+                println!("  type {kind:>2}: {count:>5} entries   {}", summary.join(", "));
+            }
+        }
+
+        SoundCommand::Export { id, out } => {
+            let row = table
+                .iter()
+                .find(|row| row.id() == *id)
+                .with_context(|| format!("no sound entry {id}"))?;
+            let paths = row.paths();
+            if paths.is_empty() {
+                println!("sound {id} ({}) names no files", row.name());
+                return Ok(());
+            }
+            println!("sound {id}: {} ({} file(s))", row.name(), paths.len());
+            let directory = out.clone().unwrap_or_else(|| PathBuf::from("."));
+            std::fs::create_dir_all(&directory)?;
+            for path in &paths {
+                let bytes = match chain.read(path) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        println!("  {path}: {error}");
+                        continue;
+                    }
+                };
+                let name = path.rsplit('\\').next().unwrap_or("sound.bin");
+                let target = directory.join(name);
+                std::fs::write(&target, &bytes)?;
+                println!("  {} bytes -> {}", bytes.len(), target.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn item_cmd(chain: &mut Chain, cmd: ItemCommand) -> Result<()> {
     match cmd {
         ItemCommand::Display { display_id } => item_display(chain, display_id),
@@ -5815,7 +6036,8 @@ fn dbc_rows(chain: &mut Chain, table: &str, limit: usize, ids: &[u32]) -> Result
         LightParams,
         LightIntBand,
         LightFloatBand,
-        GameObjectDisplayInfo
+        GameObjectDisplayInfo,
+        SoundEntries
     )
     // `CharacterFacialHairStyles` is deliberately absent: it has no id column
     // at all -- race, gender and variation are its key -- so it cannot satisfy
@@ -5873,6 +6095,7 @@ fn dbc_check(chain: &mut Chain) -> Result<()> {
         LightIntBand,
         LightFloatBand,
         GameObjectDisplayInfo,
+        SoundEntries,
     );
     println!();
     if failures == 0 {

@@ -877,6 +877,154 @@ macro_rules! impl_table_info {
     };
 }
 
+dbc_table! {
+    /// Every sound the client can play: what it is called, where its files
+    /// live, and how loud and how far it carries.
+    ///
+    /// The central sound table. Nothing else here names a file -- `ZoneMusic`,
+    /// `SoundAmbience` and the rest all point *at* this by id, so this is the
+    /// one that has to be right.
+    ///
+    /// **A sound is a set of files, not one file.** Ten name columns and ten
+    /// weights sit side by side: a footstep or a sword hit picks one at random
+    /// each time it plays, which is what stops a fight sounding like a metronome.
+    /// Most entries fill only the first one or two. The names are bare
+    /// filenames and [`SoundEntriesRow::directory`] holds the folder they sit
+    /// in, so a playable path is the two joined.
+    ///
+    /// **Transcribed against a check the data cannot fake.** Column indices
+    /// here were read off the file's own shape -- ten consecutive string
+    /// columns of decreasing density, then ten small-integer columns with the
+    /// same decreasing density -- and that pattern alone would also fit
+    /// several wrong alignments. What settles it is that the strings must name
+    /// *files that exist*: joining column 23 to columns 3-12 has to produce
+    /// paths the archive can resolve, and it does for essentially every entry.
+    /// A one-column slip breaks that immediately, where a plausible-looking
+    /// dump would not. See `wow-cli sound survey`.
+    SoundEntries, SoundEntriesRow,
+    path = r"DBFilesClient\SoundEntries.dbc", fields = 30, {
+        0 id: u32,
+        /// What kind of sound this is -- music, an ambience loop, a spell, a
+        /// footstep. Values run 1-53 in this build.
+        ///
+        /// See [`SoundType`], which names the three values whose contents
+        /// are unambiguous and passes everything else through as a number.
+        1 sound_type: u32,
+        /// A human-readable label, always set. Useful for finding a sound by
+        /// eye and worthless for playing one.
+        2 name: str,
+        /// The folder the files sit in, relative to the archive root, e.g.
+        /// `Sound\Ambience\ZoneSpecific`. Joined to a filename from
+        /// [`SoundEntriesRow::files`] to make a path that resolves.
+        23 directory: str,
+        /// 0.01 to 1.0 across the table.
+        24 volume: f32,
+        25 flags: u32,
+        /// Below this distance the sound plays at full volume.
+        26 min_distance: f32,
+        /// Past this distance it is not audible at all. 1 to 1000.
+        27 distance_cutoff: f32,
+        28 eax_definition: u32,
+        29 advanced_id: u32,
+    }
+}
+
+/// The [`SoundEntriesRow::sound_type`] values this client acts on.
+///
+/// **Measured, not remembered.** The column runs 1-53 across 26 distinct
+/// values in this build, and naming them from memory is the mistake
+/// `describe_cast_failure` exists to refuse: a wrong label for a category does
+/// not fail, it quietly misexplains what a sound is for.
+///
+/// So the question asked was not "which number is music" but "what do the
+/// entries carrying each number actually contain" -- `wow-cli sound types`
+/// tallies, for every value, which folders its entries' files sit in. Only the
+/// values where that answer is overwhelming are named here:
+///
+/// | value | entries | where their files live |
+/// |---|---|---|
+/// | 28 | 632 | 629 under `Sound\Music` |
+/// | 50 | 273 | 273 under `Sound\Ambience` |
+/// | 10 | 6380 | 6153 under `Sound\Creature` |
+///
+/// Everything else is passed through as a number. Type 1, for instance, is
+/// 69% `Sound\Spells` and 10% `Sound\Creature`, which is not clean enough to
+/// put a name on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundType {
+    /// Zone and city music.
+    Music,
+    /// Looping zone ambience.
+    Ambience,
+    /// Creature vocalisations.
+    Creature,
+    /// Anything this client has not confirmed, as the raw column value.
+    Other(u32),
+}
+
+impl SoundType {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            10 => Self::Creature,
+            28 => Self::Music,
+            50 => Self::Ambience,
+            other => Self::Other(other),
+        }
+    }
+}
+
+impl SoundEntriesRow<'_> {
+    /// The first string column holding a filename.
+    const FILE_BASE: usize = 3;
+    /// The first column holding a weight, one per file.
+    const WEIGHT_BASE: usize = 13;
+    /// How many of each there are.
+    pub const VARIATIONS: usize = 10;
+
+    /// The filenames this sound may play, with the empty slots dropped.
+    ///
+    /// Bare names -- join with [`SoundEntriesRow::directory`] for something
+    /// that resolves. Most sounds have one or two; a few have all ten.
+    pub fn files(&self) -> impl Iterator<Item = &str> {
+        let row = self.raw();
+        (0..Self::VARIATIONS)
+            .map(move |i| row.string(Self::FILE_BASE + i))
+            .filter(|name| !name.is_empty())
+    }
+
+    /// How likely each file is, in the same order as [`SoundEntriesRow::files`].
+    ///
+    /// **Not normalised, and deliberately not interpreted as a percentage.**
+    /// The values run 0-40 with no obvious total, so what they are relative to
+    /// has not been established -- a caller wanting one of several files
+    /// should weight by these rather than assume they sum to anything.
+    pub fn weights(&self) -> impl Iterator<Item = u32> + '_ {
+        let row = self.raw();
+        (0..Self::VARIATIONS)
+            .filter(move |i| !row.string(Self::FILE_BASE + i).is_empty())
+            .map(move |i| row.u32(Self::WEIGHT_BASE + i))
+    }
+
+    /// Full archive paths for every file this sound may play.
+    ///
+    /// The join is a backslash because that is what the archive uses; see
+    /// `mpq`'s note on path normalisation. Returns owned strings because the
+    /// join has to allocate anyway.
+    pub fn paths(&self) -> Vec<String> {
+        let directory = self.directory().trim_end_matches('\\');
+        self.files()
+            .map(|name| {
+                if directory.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{directory}\\{name}")
+                }
+            })
+            .collect()
+    }
+}
+
+
 impl_table_info!(
     Map,
     AreaTable,
