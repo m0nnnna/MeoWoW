@@ -4585,6 +4585,35 @@ fn m2_info(chain: &mut Chain, path: &str, lod: u32, limit: usize) -> Result<()> 
             if skin.batches().len() > limit {
                 println!("      ... {} more", skin.batches().len() - limit);
             }
+
+            // Every geoset with **where it is on the body**, which is the
+            // question a batch list cannot answer. "Which id covers the back
+            // of the neck" is not derivable from an id and a triangle count,
+            // and guessing at it from the group number is how a geoset rule
+            // gets four attempts. The submesh carries its own centre, so this
+            // costs nothing to print and turns "something is missing at the
+            // shoulders" into a lookup.
+            //
+            // Z is up and X is forward, so a *negative* X is behind the
+            // character: that column alone separates a chest piece from the
+            // thing between the shoulder blades.
+            println!("\n    geosets, by group (centre in model space, x fwd / y left / z up):");
+            let mut ids: Vec<&m2::skin::Submesh> = skin.submeshes().iter().collect();
+            ids.sort_by_key(|s| (s.id / 100, s.id % 100));
+            let mut last_group = u16::MAX;
+            for sub in ids {
+                let group = sub.id / 100;
+                if group != last_group {
+                    println!("      -- group {group}");
+                    last_group = group;
+                }
+                let [x, y, z] = sub.center;
+                println!(
+                    "      id {:>5}  {:>5} tris  centre {x:>7.2} {y:>7.2} {z:>7.2}",
+                    sub.id,
+                    sub.triangle_count(),
+                );
+            }
         }
         Err(e) => println!("\n  {skin_path}: {e}"),
     }

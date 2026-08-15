@@ -905,6 +905,23 @@ impl WorldState {
     ) -> Option<f32> {
         let entity = self.get(guid)?;
         let here = entity.interpolated_position(now)?;
+        // **A corpse does not turn.** `UNIT_FIELD_TARGET` is what a unit *is
+        // fighting*, and nothing clears it when the unit dies -- so a dead
+        // wolf went on tracking its killer, rotating on the ground to follow
+        // them round in a circle. Reported from play in exactly those words.
+        //
+        // This is the same shape as every other trap in this file: the rule
+        // above is right for the case it was written for, a creature in a
+        // melee, and says nothing about when to stop applying. Deriving a
+        // heading continuously means it keeps being derived after there is
+        // anything left to derive it for.
+        //
+        // `is_corpse` rather than `is_dead_or_ghost`, because a ghost is on
+        // its feet and running for its body, and should turn like anything
+        // else that walks. Same line the drawing code already draws.
+        if entity.is_corpse() {
+            return Some(here.orientation);
+        }
         // A creature still running at you is drawn facing the way it is
         // running, which is where you are anyway. Turning it separately while
         // it travels would fight the path's own facing.
@@ -2654,6 +2671,72 @@ mod tests {
         assert!(
             real.abs() < 1e-4,
             "faced {real} -- still aiming at the replicated login position"
+        );
+    }
+
+    /// A corpse stops tracking; a living creature does not.
+    ///
+    /// `UNIT_FIELD_TARGET` says who a unit is fighting and nothing clears it
+    /// when the unit dies, so a dead wolf went on resolving a heading at its
+    /// killer -- rotating on the ground to follow them round in a circle.
+    /// Reported from play in those words.
+    ///
+    /// **Both halves, and the living half is the one that makes it a test.**
+    /// Freezing every heading would fix the corpse and silently undo the
+    /// continuous tracking that a creature in a melee exists to do, and a test
+    /// that only checked the corpse would pass for that too.
+    #[test]
+    fn a_corpse_holds_its_heading_and_a_living_creature_does_not() {
+        use crate::update::fields::{UNIT_HEALTH, UNIT_MAX_HEALTH, UNIT_TARGET};
+        let now = std::time::Instant::now();
+
+        // A wolf at the origin, targeting the player, alive and well.
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            7,
+            ObjectType::Unit,
+            Some(at(0.0, 0.0)),
+            &[
+                (UNIT_TARGET, 9),
+                (UNIT_TARGET + 1, 0),
+                (UNIT_HEALTH, 42),
+                (UNIT_MAX_HEALTH, 42),
+            ],
+        )]);
+        world.apply(&[create(9, ObjectType::Player, Some(at(0.0, 50.0)), &[])]);
+
+        // Alive, it turns to wherever the player has walked to.
+        let north = world.facing_of(7, now, Some((9, at(0.0, 50.0)))).unwrap();
+        let east = world.facing_of(7, now, Some((9, at(50.0, 0.0)))).unwrap();
+        assert!(
+            (north - std::f32::consts::FRAC_PI_2).abs() < 1e-4 && east.abs() < 1e-4,
+            "a living creature must track its target: {north} then {east}"
+        );
+
+        // Now kill it. Health zero against a known maximum is what `is_corpse`
+        // reads, and the target field deliberately stays exactly as it was --
+        // which is the whole point, because the server leaves it there too.
+        world.apply(&[create(
+            7,
+            ObjectType::Unit,
+            Some(at(0.0, 0.0)),
+            &[(UNIT_HEALTH, 0), (UNIT_MAX_HEALTH, 42)],
+        )]);
+        assert!(
+            world.get(7).is_some_and(|e| e.is_corpse()),
+            "the fixture did not actually die, so the rest proves nothing"
+        );
+        assert_eq!(
+            world.get(7).and_then(|e| e.target()),
+            Some(9),
+            "the corpse lost its target, so this would pass for the wrong reason"
+        );
+
+        let dead_north = world.facing_of(7, now, Some((9, at(0.0, 50.0)))).unwrap();
+        let dead_east = world.facing_of(7, now, Some((9, at(50.0, 0.0)))).unwrap();
+        assert_eq!(
+            dead_north, dead_east,
+            "a corpse turned to follow the player: {dead_north} then {dead_east}"
         );
     }
 

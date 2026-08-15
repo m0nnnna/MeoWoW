@@ -159,17 +159,18 @@ impl Look {
     /// The "and nothing else" was learned from a screenshot. The first version
     /// let groups it did not manage pass through, on the reasoning that a
     /// client should not silently drop geometry it has not learned about --
-    /// and the character rendered wearing a large white sheet. That was geoset
-    /// 1501, the cape: equipment geometry, drawn because it exists in the
-    /// model, for a cloak the character does not own. Every group above three
-    /// is equipment of some kind, and this client does not read equipment yet,
-    /// so drawing any of it is drawing gear nobody is wearing.
+    /// and the character rendered wearing a large white sheet. Every group
+    /// above three is equipment of some kind, and drawing it is drawing gear
+    /// nobody is wearing.
     ///
     /// The failure mode is now the safe direction. Too little geometry looks
     /// like a character missing a hat; too much looks like a bug, and did.
     pub fn shows(&self, id: u32) -> bool {
         // Geoset zero is the body itself, which is not a choice.
         if id == 0 || self.geosets.contains(&id) {
+            return true;
+        }
+        if id == NECK_PATCH {
             return true;
         }
         let (group, variant) = (id / 100, id % 100);
@@ -184,9 +185,34 @@ impl Look {
         // hands and feet nearby, which is what the screenshot showed. The
         // higher variants are the actual gear and stay off until this client
         // reads equipment.
-        !HIDDEN_WITHOUT_EQUIPMENT.contains(&group) && variant == 1
+        variant == 1
     }
 }
+
+/// The scrap of *body* that closes the back of the neck.
+///
+/// **It is not a cloak, and calling it one put a hole in every character in the
+/// game.** The white sheet that made the first version of [`Look::shows`] hide
+/// the whole of group 15 was real, but it was 1502 and up; 1501 was standing
+/// next to the culprit and got hidden with it. Twenty triangles then stopped being
+/// drawn on every character, leaving a rectangle of daylight between the
+/// shoulder blades -- reported from play as "the back of the neck is missing
+/// for everyone", and invisible until somebody looked at a character from
+/// behind.
+///
+/// What separates them is a property of the *file* rather than a judgement
+/// about the picture, which is why it is worth writing down: on both the human
+/// male and the human female, 1501 is drawn with **material 0 and texture slot
+/// 1, the body skin**, exactly like every other piece of bare body -- while
+/// 1502 to 1506 use a different material and texture slot 2, the object skin
+/// that a cape is painted with. They are not variants of one thing. Their
+/// positions agree: 1501 is twenty triangles at the base of the neck (z 1.72 on
+/// the male), and the cloaks are four times the size and hang from z 1.33.
+///
+/// So it is exempt even from the `decided_groups` rule above: a character
+/// wearing a cloak still has a neck. If a cloak ever turns out to carry its own
+/// collar, this is where the two would z-fight.
+const NECK_PATCH: u32 = 1501;
 
 /// Which geoset group a slot switches on, and which of an item's three
 /// `geoset_group` columns selects the variant within it.
@@ -402,15 +428,12 @@ const NPC_ITEM_SLOTS: [u8; 11] = [
 /// is equipment -- see [`Look::shows`].
 const MANAGED_GROUPS: [u32; 4] = [0, 1, 2, 3];
 
-/// Equipment groups with no bare-body variant at all, so variant one is a
-/// garment rather than a body part.
-///
-/// Group 15 is here because showing its variant one put the character in a
-/// large white sheet -- see [`Look::shows`]. Kept as a list rather than a rule
-/// because it is an observation about what these groups contain, and the next
-/// group that turns out to behave this way should be added by looking, not by
-/// reasoning from this one.
-const HIDDEN_WITHOUT_EQUIPMENT: [u32; 1] = [15];
+// There was a `HIDDEN_WITHOUT_EQUIPMENT` list here, holding group 15 alone, on
+// the reading that the group had no bare-body variant. It had one -- see
+// [`NECK_PATCH`] -- and the list existed to describe a single misidentified
+// geoset. Deleted rather than emptied: a list with no members invites the next
+// reader to add one by reasoning instead of by looking, which is how it got
+// its first member.
 
 /// A cache key for an appearance *and* what it is wearing.
 ///
@@ -571,12 +594,10 @@ pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[(u32, u
             equipped = worn;
             decided = groups;
         }
-        // Section type 0 is the base skin, indexed by skin colour. The face,
-        // facial hair and underwear are separate *layers* meant to be composed
-        // onto this one; composing them needs a texture blit this client does
-        // not do yet, so the base skin is used alone and the character has a
-        // blank face. Stated rather than hidden: it is the visible limit of
-        // this feature.
+        // Section type 0 is the base skin, indexed by skin colour -- the same
+        // lookup `compose` starts from above. Kept here too, separately, only
+        // as the path `Look::body` documents: what to fall back to if `skin`
+        // is `None` because composition itself failed to run.
         body = find(sections, look.race, look.gender, 0, 0, look.skin);
     }
 
@@ -1549,9 +1570,38 @@ mod tests {
         for id in [802, 803] {
             assert!(!look.shows(id), "group 8 has no bare variant to fall back to");
         }
-        // And group 15 has no bare variant at all: its variant one is the
-        // white sheet.
-        assert!(!look.shows(1501));
+        // And group 15's variant one is **body**, not the white sheet. See
+        // `NECK_PATCH`: on both human models 1501 is twenty triangles drawn
+        // with the body skin at the base of the neck, while 1502 upward use
+        // the cape texture and are four times the size. Hiding the group
+        // wholesale to be rid of the sheet took the neck with it, and left a
+        // rectangle of daylight between the shoulder blades of every
+        // character in the world.
+        //
+        // Both halves asserted together on purpose: showing the patch is
+        // worthless if it readmits the cloaks, and that is precisely the fix
+        // that would look like it worked.
+        assert!(look.shows(1501), "the neck patch is body geometry");
+        for id in [1502, 1503, 1504, 1505, 1506] {
+            assert!(!look.shows(id), "geoset {id} is a cloak nobody owns");
+        }
+    }
+
+    /// A character wearing a cloak still has a neck.
+    ///
+    /// The exemption that the `decided_groups` rule would otherwise remove: a
+    /// back item decides group 15, and "only what it names" would hide the
+    /// body patch again for exactly the characters that have gear.
+    #[test]
+    fn a_cloak_does_not_take_the_neck_with_it() {
+        let look = Look {
+            geosets: vec![0, 1503],
+            decided_groups: vec![15],
+            ..Default::default()
+        };
+        assert!(look.shows(1503), "the cloak it is actually wearing");
+        assert!(look.shows(1501), "and still a neck under it");
+        assert!(!look.shows(1502), "but not a cloak it does not own");
     }
 
     /// The body is geoset zero of group zero, and a bald character is the
