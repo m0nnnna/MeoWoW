@@ -657,6 +657,25 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   back. Time went into "why is my edit being reverted" when the answer was that
   it never took. A test fixture built behind the server's back is not a
   fixture; and `.additem` needs `.save` for the same reason.
+- **A substring filter in a test rig will eventually match a person.**
+  `--target Wolf` matched `Testwolf` -- a character belonging to the person
+  running the test, logged in on the other account at that moment -- and the
+  `.die` behind it killed them. Nothing malfunctioned: the selection registered
+  correctly, on exactly what was asked for. This is the mirror of the
+  documented `.die`-falls-back-to-self trap and is worse, because it looks like
+  it worked. It cannot be fixed by choosing better search words, since a
+  creature's name being a substring of somebody's character name is *how people
+  name characters*. The selection helpers now refuse players outright, which is
+  also just correct: everything they exist to find is something to walk to,
+  swing at, or loot.
+- **The same trap in a new caller, for the third time.** That replicated state
+  holds our *login* position forever is documented on the data and in two
+  previous incident write-ups -- and a new loot command still measured a
+  corpse's distance from it, reported 15 units, and refused a request that
+  would have worked at 1.8. Anything downstream of a walk must be handed the
+  walked position, not look one up. When a fact keeps being rediscovered,
+  making it a *parameter* beats documenting it again: a caller cannot forget to
+  pass an argument.
 - **The absence of a field and the absence of a feature look identical.** A
   container announces its capacity but carries nothing naming its contents --
   which proves nothing either way, because every bag observed was empty, a

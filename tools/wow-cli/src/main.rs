@@ -250,6 +250,17 @@ enum Command {
         /// in, which is how the slot vocabulary is filled in without guessing.
         #[arg(long)]
         equip: Vec<u16>,
+        /// Open the loot on the nearest dead unit and print every byte that
+        /// comes back.
+        ///
+        /// **A survey, not a feature.** Nothing loot-related is parsed by this
+        /// client, and the point of this flag is to stop that being true:
+        /// pair it with `--select --target <name> --say ".die"` to make a
+        /// corpse, and it reports every opcode that arrives with its body in
+        /// full. Bodies rather than lengths, because a packet that is seen and
+        /// dropped is the one packet that could have answered the question.
+        #[arg(long)]
+        loot: bool,
         /// After entering, find which update field carries the character's
         /// appearance by searching for the answer the character list gives.
         ///
@@ -652,6 +663,7 @@ fn main() -> Result<()> {
             objects,
             items,
             equip,
+            loot,
             target,
             own_fields,
             until_death,
@@ -685,6 +697,7 @@ fn main() -> Result<()> {
                 objects: *objects,
                 items: *items,
                 equip,
+                loot: *loot,
                 target: target.as_deref(),
                 own_fields: *own_fields,
                 until_death: *until_death,
@@ -837,6 +850,7 @@ struct WorldRequest<'a> {
     objects: bool,
     items: bool,
     equip: &'a [u16],
+    loot: bool,
     target: Option<&'a str>,
     own_fields: bool,
     until_death: bool,
@@ -895,6 +909,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         objects,
         items,
         equip,
+        loot,
         target,
         own_fields,
         until_death,
@@ -1271,6 +1286,23 @@ nothing replicated matches {wanted:?}"),
             );
         }
 
+        // **Where this character actually is**, as opposed to where replicated
+        // state believes it is.
+        //
+        // These are not the same and the difference grows with every step. The
+        // server never relays a client's own movement back, so our entry in
+        // `WorldState` holds the *login* position forever -- a fact documented
+        // on `Entity::position` and walked into again here. `--attack` closes
+        // to melee and `--loot` then measured the corpse's distance from the
+        // login spot, reported 15 units, and refused a request that would have
+        // succeeded. Anything downstream of a walk has to measure from this.
+        let mut here = world::Position {
+            x: position.x,
+            y: position.y,
+            z: position.z,
+            orientation: position.orientation,
+        };
+
         if attack {
             // Walk into melee range and turn to face the target before
             // swinging. The first attempt skipped both, and the server
@@ -1285,12 +1317,6 @@ nothing replicated matches {wanted:?}"),
             // rather than assumed.
             const APPROACHES: usize = 4;
 
-            let mut here = world::Position {
-                x: position.x,
-                y: position.y,
-                z: position.z,
-                orientation: position.orientation,
-            };
             let mut chosen = None;
             for attempt in 0..APPROACHES {
                 let Some((guid, distance)) = nearest_unit_from(&state, character.guid, here) else {
@@ -1612,6 +1638,10 @@ cast {spell_id} at {} (attempt {attempt})",
             equip_and_report(&mut connection, &mut state, character.guid, *slot)?;
         }
 
+        if loot {
+            survey_loot(&mut connection, &mut state, character.guid, here)?;
+        }
+
         if items {
             report_items(&state, character.guid);
         }
@@ -1905,6 +1935,28 @@ fn nearest_unit(state: &world::WorldState, own_guid: u64) -> Option<(u64, f32)> 
 /// position. Measuring from it after a walk reports distances to somewhere we
 /// left, which showed up as an attack command that closed the right number of
 /// units and still arrived out of range.
+/// Whether this entity is something a test run may act on.
+///
+/// **Other players are excluded, and this cost a real incident to learn.** The
+/// name filters here are substring matches, and `--target Wolf` matched
+/// `Testwolf` -- a character belonging to the person running the test, logged
+/// in on the other account at the time. The run then selected that player and
+/// the `.die` sent behind it killed them. Nothing malfunctioned: the selection
+/// registered correctly, on exactly what was asked for.
+///
+/// The documented trap next door is that `.die` falls back to *self* when a
+/// selection has not registered. This is its mirror and is worse, because it
+/// looks like it worked. A substring of a creature's name is very often a
+/// substring of somebody's character name -- that is how players name
+/// characters -- so the filter cannot be made safe by choosing better words.
+///
+/// Excluding players is also just correct for what these helpers are for:
+/// every one of them exists to find something to walk to, swing at, or loot,
+/// and none of those should ever land on another person's character.
+fn is_a_legal_test_target(entity: &world::state::Entity) -> bool {
+    !matches!(entity.object_type, world::ObjectType::Player)
+}
+
 fn nearest_unit_from(
     state: &world::WorldState,
     own_guid: u64,
@@ -1913,6 +1965,7 @@ fn nearest_unit_from(
     state
         .iter()
         .filter(|entity| entity.guid != own_guid)
+        .filter(|entity| is_a_legal_test_target(entity))
         .filter_map(|entity| {
             let at = entity.position?;
             let distance = ((at.x - own.x).powi(2) + (at.y - own.y).powi(2) + (at.z - own.z).powi(2))
@@ -2126,6 +2179,135 @@ fn report_items(state: &world::WorldState, own_guid: u64) {
     println!("  ITEM_FIELD_STACK_COUNT -- diff a stack of 3 against a stack of 5");
     println!("  how a container addresses its contents -- see any item above");
     println!("  marked NOT IN THE PLAYER'S SLOT ARRAY");
+}
+
+/// Opens the loot on the nearest dead unit and reports everything that arrives.
+///
+/// **This is a survey and deliberately parses nothing.** Nothing in
+/// `crates/world` understands a loot packet yet, and the way that stops being
+/// true is by looking at real ones -- so every reply is printed as its opcode
+/// and its bytes, in full. Printing a length instead is how this project once
+/// saw and lost the single packet that could have settled
+/// `SMSG_ATTACKERSTATEUPDATE`.
+///
+/// The confirmation this run provides is stronger than the equip write's,
+/// because loot is *answered*. A reply arriving at all says the opcode was
+/// understood; the equip write had to be confirmed by watching a field move,
+/// since nothing acknowledged it.
+fn survey_loot(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    // Where the character has actually walked to. **Not** read out of
+    // replicated state, which holds the login position forever -- see the
+    // declaration of `here` in `world_login`. Taking it as a parameter rather
+    // than looking it up is the point: a lookup is what got this wrong.
+    here: world::Position,
+) -> Result<()> {
+    // A corpse to open. Deliberately "a unit at zero health" rather than a
+    // `Corpse` object: a corpse object is what a *player* leaves behind after
+    // releasing, and a creature you have just killed is still a unit. Looking
+    // for the wrong one finds nothing in a field full of bodies.
+    // Loot has a range, and a corpse across the field is not a corpse you can
+    // open. The first run of this opened something 37 units away and came back
+    // with no reply at all -- which reads as a wrong opcode and was nothing of
+    // the kind. A distance check turns that into a refusal this tool can
+    // explain rather than a silence it cannot.
+    const LOOT_REACH: f32 = 5.0;
+
+    let mut dead: Vec<(u64, f32)> = state
+        .iter()
+        .filter(|entity| entity.guid != own_guid)
+        // See `is_a_legal_test_target`. A dead *player* is somebody's corpse.
+        .filter(|entity| is_a_legal_test_target(entity))
+        .filter(|entity| entity.health() == Some(0))
+        .filter_map(|entity| {
+            let there = entity.position?;
+            let d = ((there.x - here.x).powi(2) + (there.y - here.y).powi(2)).sqrt();
+            Some((entity.guid, d))
+        })
+        .collect();
+    dead.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+    let Some(&(corpse, distance)) = dead.first() else {
+        println!("\nno dead creature anywhere in replicated state.");
+        println!("Make one first: --select --target <name> --attack --say \".die\"");
+        return Ok(());
+    };
+    if distance > LOOT_REACH {
+        // Refused loudly rather than attempted, because the failure would be
+        // silent and would look exactly like a wrong opcode.
+        println!("\nnearest corpse {corpse:#018x} is {distance:.1} units away, past");
+        println!("the {LOOT_REACH:.0}-unit reach. Not sending: a refusal at this range");
+        println!("would be indistinguishable from an opcode the server ignored.");
+        println!("Add --attack so the run closes to melee before killing.");
+        return Ok(());
+    }
+    println!("\n{} dead creature(s); opening {corpse:#018x} at {distance:.1}", dead.len());
+
+    connection.loot(corpse)?;
+    // Give the server time to answer before concluding it ignored us.
+    let batch = connection.drain(std::time::Duration::from_millis(1500), 128)?;
+
+    let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+    for packet in &batch {
+        *seen.entry(packet.opcode).or_default() += 1;
+    }
+
+    // The interesting packets are the ones this client has never seen. Movement
+    // and time-sync arrive constantly and would bury the answer, so they are
+    // summarised rather than dumped -- but nothing is *hidden*: the histogram
+    // below lists everything, and only the bodies are filtered.
+    const NOISE: [u16; 6] = [0x00DD, 0x00A9, 0x01F6, 0x0390, 0x0085, 0x0086];
+    println!("\nbodies of everything unexpected:");
+    let mut shown = 0;
+    for packet in &batch {
+        if NOISE.contains(&packet.opcode) {
+            continue;
+        }
+        println!(
+            "  {} ({:#06x}), {} bytes",
+            world::opcode::describe(packet.opcode),
+            packet.opcode,
+            packet.body.len()
+        );
+        println!("    {}", hex_preview(&packet.body, 128));
+        shown += 1;
+        if shown >= 24 {
+            println!("  ... stopping after {shown}");
+            break;
+        }
+    }
+    if shown == 0 {
+        println!("  none -- nothing but the usual traffic came back");
+    }
+
+    println!("\nevery opcode seen:");
+    for (opcode, count) in &seen {
+        println!("  {:<34} ({opcode:#06x}) x{count}", world::opcode::describe(*opcode));
+    }
+
+    // Releasing matters even in a survey: a corpse stays locked to whoever
+    // opened it, so a run that opens loot and walks away leaves a body nobody
+    // else on the realm can touch.
+    connection.loot_release(corpse)?;
+    let after = connection.drain(std::time::Duration::from_millis(600), 64)?;
+    println!("\nafter release, {} more packet(s):", after.len());
+    for packet in &after {
+        if NOISE.contains(&packet.opcode) {
+            continue;
+        }
+        println!(
+            "  {} ({:#06x}) {} bytes: {}",
+            world::opcode::describe(packet.opcode),
+            packet.opcode,
+            packet.body.len(),
+            hex_preview(&packet.body, 64)
+        );
+    }
+
+    state.replicate(&batch, None);
+    Ok(())
 }
 
 /// Wears an item and reports what moved, which is what confirms the opcode.
@@ -2705,6 +2887,9 @@ fn nearest_ordered_from(
     let mut rows: Vec<(f32, &world::state::Entity)> = state
         .iter()
         .filter(|entity| entity.guid != own_guid)
+        // See `is_a_legal_test_target`: a substring name filter will match
+        // another person's character sooner or later, and did.
+        .filter(|entity| is_a_legal_test_target(entity))
         .filter_map(|entity| {
             let at = entity.position?;
             let distance = ((at.x - own.x).powi(2) + (at.y - own.y).powi(2) + (at.z - own.z).powi(2))

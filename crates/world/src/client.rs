@@ -621,6 +621,28 @@ impl Connection {
         )
     }
 
+    /// Opens the loot on a corpse.
+    ///
+    /// The guid goes out **unpacked** -- eight plain bytes. Worth stating,
+    /// because most guids on this wire are packed and using the packed form
+    /// here would produce a shorter body that the server reads as a different
+    /// message entirely.
+    pub fn loot(&mut self, target: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::Loot, &target.to_le_bytes())
+    }
+
+    /// Takes the money off the corpse currently open.
+    pub fn loot_money(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::LootMoney, &[])
+    }
+
+    /// Closes the loot window, releasing the corpse for anyone else.
+    ///
+    /// See [`ClientOpcode::LootRelease`]: skipping this leaves the body locked.
+    pub fn loot_release(&mut self, target: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::LootRelease, &target.to_le_bytes())
+    }
+
     /// Acknowledges a teleport within the current map.
     ///
     /// **The server will not finish the move until this arrives, and will

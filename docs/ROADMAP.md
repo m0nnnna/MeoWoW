@@ -2936,3 +2936,39 @@ moving items between slots is its own feature.
   icon and its entry, which is honest and checkable, rather than an invented
   name.
 - **Slot 17, and a bag's contents**, both above.
+
+#### The loot survey, and what it does and does not establish
+
+Started, not finished. Recorded here so the next attempt begins from measured
+facts rather than repeating the run.
+
+**Confirmed against the realm:**
+
+- `CMSG_LOOT` is `0x15D`, body an *unpacked* eight-byte guid. Confirmed by
+  reply -- which makes it far cheaper to establish than the equip write, where
+  nothing acknowledges the send and a field had to be watched instead.
+- `SMSG_LOOT_RELEASE_RESPONSE` is `0x161`: nine bytes, a guid and one byte.
+  Notably it arrives *in answer to* `CMSG_LOOT` when a corpse has nothing on
+  it -- the server closes the window rather than sending an empty one.
+- `SMSG_LOOT_RESPONSE` is `0x160`, seen at ten bytes for an empty corpse: guid,
+  a type byte, and one more.
+
+**Not established:** the shape of a loot response that actually carries items,
+which is the only shape worth writing a parser against. A GM `.die` kill
+generates no loot at all, and the corpses reached with `.damage` came back
+empty too, so no populated response has been captured yet. Nothing in
+`crates/world` parses loot, and nothing should until one is.
+
+Two instrument faults were found on the way and both are fixed, because each
+would have made a future run's silence unreadable:
+
+- The corpse's distance was measured from replicated state, which holds this
+  client's *login* position forever. It reported fifteen units and refused a
+  request that succeeded at 1.8 once the walked position was passed in. Third
+  time this fact has been rediscovered by a new caller; it is a parameter now
+  rather than another comment.
+- A `nothing came back` printout could not distinguish an ignored opcode from a
+  refusal. It now prints every opcode and body that arrived.
+
+Still open: `--select --target <name>` and `--attack` choose their targets by
+different rules, so a run can select one creature and walk to another.

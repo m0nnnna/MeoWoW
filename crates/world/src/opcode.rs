@@ -87,6 +87,24 @@ pub enum ClientOpcode {
     /// filled in.
     AutoEquipItem = 0x010A,
 
+    /// Open the loot on a corpse.
+    ///
+    /// Body is the target's guid, unpacked -- eight bytes, not the packed
+    /// form. Unlike most sends here this one is *answered*, which makes it far
+    /// cheaper to confirm than the equip write: a reply arriving at all says
+    /// the request was understood, and a reply that parses says the layout was
+    /// right too.
+    Loot = 0x015D,
+    /// Take the money off a corpse already opened by [`ClientOpcode::Loot`].
+    /// Empty body -- the server knows which corpse is open.
+    LootMoney = 0x015E,
+    /// Close the loot window, which is what releases the corpse.
+    ///
+    /// **Not optional.** A corpse stays locked to the looter until this
+    /// arrives, so a client that opens loot and never releases it leaves
+    /// bodies nobody else can touch.
+    LootRelease = 0x015F,
+
     /// Release the spirit: give up the body and become a ghost at the nearest
     /// graveyard. Carries one byte the server reads and discards.
     ///
