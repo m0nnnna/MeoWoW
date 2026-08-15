@@ -711,6 +711,65 @@ dropped, which is exactly the failure recorded for `SMSG_ATTACKERSTATEUPDATE`:
 the one packet that could answer the question, seen and lost. A spell's reply --
 the damage log, the threat update -- lands in that drain and nowhere else.
 
+## Death, release and the corpse run
+
+Three states, not two: alive, dead-where-you-fell (no corpse *object* exists
+yet), and ghost-at-the-graveyard (released, with a corpse object now
+somewhere in the world to run back to). `docs/ROADMAP.md`'s 4.4 section has
+the narrative and the three bugs that shaped it; this is the shape of the
+messages themselves.
+
+| message | direction | body |
+|---|---|---|
+| `CMSG_REPOP_REQUEST` `0x015A` | out | one byte, read and discarded server-side |
+| `MSG_MOVE_TELEPORT_ACK` `0x00C7` | both | in: `{packed guid, u32 counter, MovementInfo}`; out: `{packed guid, u32 counter (echoed), u32 tick}` |
+| `MSG_CORPSE_QUERY` `0x0216` | both | out: empty; in: `{u8 0}` (no corpse) or `{u8 1, i32 map, f32 x, f32 y, f32 z, i32 corpseMap, u32 unknown}` |
+| `CMSG_RECLAIM_CORPSE` `0x01D2` | out | corpse guid, **unpacked** -- eight plain bytes, unlike almost every other guid this protocol sends |
+| `SMSG_DEATH_RELEASE_LOC` `0x0378` | in | `{u32 map, f32 x, f32 y, f32 z}`; map `0xFFFFFFFF` means "clear the marker", not a destination |
+| `SMSG_CORPSE_RECLAIM_DELAY` `0x0269` | in | `u32` milliseconds |
+
+Parsers live in `crates/world/src/death.rs`; the writes are
+`Connection::release_spirit`, `Connection::reclaim_corpse`,
+`Connection::query_corpse` and `Connection::acknowledge_teleport` in
+`crates/world/src/client.rs`.
+
+**Both writes refuse in total silence -- seven separate conditions between
+them, none of which says which.** `wow-cli world --release` and `--reclaim`
+therefore report a before-and-after of the things that must change
+(`PLAYER_FLAGS`' ghost bit, health, the corpse object appearing) rather than
+trusting an ack that never comes.
+
+**An unacknowledged teleport makes the server discard every movement packet
+from that client until it arrives.** A release moves the ghost to the
+graveyard server-side and then waits for `MSG_MOVE_TELEPORT_ACK` before
+believing the client noticed. Skip it and the ghost never leaves the corpse
+as far as the server is concerned: a range check against the reclaim then
+passes at nought yards no matter how far away the client actually walked,
+which is exactly the bug that let a reclaim succeed from 58 yards when the
+server's own limit is 39. The same obligation applies to any teleport, not
+only a release -- a client that ignores it freezes server-side while its own
+camera keeps walking around locally.
+
+**The reclaim delay stacks rather than being a constant.** Observed at 30s on
+a first death, 60s on the second, 120s on the third. Code that hardcoded
+thirty seconds would have worked exactly once per character -- precisely as
+often as it would have been tested.
+
+**A graveyard accumulates more than one corpse-shaped object, and picking by
+owner guid picks wrong.** Corpse objects include the bones of bodies already
+reclaimed, and bones carry the same owner guid as the current body -- one run
+saw nine corpse-shaped objects at a graveyard, five of them belonging to the
+same character. `MSG_CORPSE_QUERY` is the only way to know which one is
+current; the replicated objects then contribute only the guid, chosen as
+whichever is nearest the query's answer.
+
+**The graveyard needs no `WorldSafeLocs.dbc`.** `SMSG_DEATH_RELEASE_LOC`
+carries the map and position the server already chose. The obvious design --
+look up the nearest row and walk there -- would put a table lookup on the
+critical path of a feature that needs none; the table (now transcribed) is
+wanted only to put a *name* on a place the packet already gives coordinates
+for.
+
 ## Talking to an NPC
 
 `CMSG_GOSSIP_HELLO` (`0x017B`) carries the NPC's guid **unpacked** -- eight
