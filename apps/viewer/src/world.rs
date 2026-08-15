@@ -222,7 +222,7 @@ pub struct EntityPlacement {
     pub scale: f32,
     /// How fast this specific instance is travelling, in world units per
     /// second; zero when it is standing. Chooses which cycle its bucket plays
-    /// -- see [`Motion::from_speed`].
+    /// -- see [`Motion::from_pace`].
     ///
     /// A speed rather than the "is it moving" flag this used to be, because
     /// the two cycles a moving creature can play are told apart by nothing
@@ -230,6 +230,10 @@ pub struct EntityPlacement {
     /// simply *moving*, and drawing the walk cycle for both makes the charge
     /// look like the model is being dragged.
     pub speed: f32,
+    /// How fast it travels *across* its own facing, positive to the left, so a
+    /// sidestep can be told from a run -- see [`Motion::from_pace`]. Zero for
+    /// everything the server drives; only the player's keys supply one.
+    pub lateral: f32,
     /// Whether this unit has no health left, so it should be drawn down rather
     /// than standing. Outranks `speed`: a creature killed mid-charge still has
     /// the charge's speed attached to it.
@@ -788,6 +792,7 @@ impl World {
                     placement.display_id,
                     Motion::resolve(
                         placement.speed,
+                        placement.lateral,
                         placement.dead,
                         placement.died_ms_ago,
                         placement.swung_ms_ago,
@@ -1300,6 +1305,10 @@ const WALK_ANIMATION_ID: u16 = 4;
 const RUN_ANIMATION_ID: u16 = 5;
 /// `Walkbackwards`, whose own fallback in `AnimationData.dbc` is `Walk`.
 const WALK_BACK_ANIMATION_ID: u16 = 13;
+/// `AnimationData.dbc` rows 11 and 12, read from the table rather than
+/// remembered.
+const SHUFFLE_LEFT_ANIMATION_ID: u16 = 11;
+const SHUFFLE_RIGHT_ANIMATION_ID: u16 = 12;
 /// Falling over, and lying still afterwards. Two rows, not one, and the table
 /// says so itself: `Dead` (6) lists `Death` (1) as its *fallback*, which is
 /// exactly the relationship between them -- a model with no settled-corpse
@@ -1394,6 +1403,19 @@ pub enum Motion {
     /// the model carries `Walkbackwards`, and a character reversing at a run
     /// looks like a sprint performed facing the wrong way.
     WalkBack,
+    /// Sidestepping, and which way.
+    ///
+    /// The models carry these -- `ShuffleLeft` and `ShuffleRight`, sequences 38
+    /// and 39 on the human male, half a second each. They were nearly declared
+    /// absent: `m2 anims` defaults to thirty of a hundred and fifty-six
+    /// sequences, and the first search for them came back empty from a list
+    /// that stopped at index 29. A truncated listing answers a different
+    /// question from the one asked.
+    ///
+    /// Both cycles advance the character by 0.00, which is right rather than
+    /// suspicious: they are stepping motions played *in place* while the
+    /// movement system does the travelling, exactly like `Walkbackwards`.
+    Shuffle(Side),
     /// Toppling over, from the world-clock millisecond it began.
     Dying(u32),
     /// Settled: lying still, and no longer tied to when death happened.
@@ -1404,6 +1426,18 @@ pub enum Motion {
     /// weapon is drawn, not only during a fight -- a character standing in
     /// town with a greatsword in hand still grips it with both hands.
     Ready(Stance),
+}
+
+/// Which way a character is sidestepping.
+///
+/// Positive lateral is *left*, matching `world::motion::Motion::lateral`, whose
+/// `Axis::Positive` is `strafe_left`. Stated because the two enums live in
+/// different crates and a sign convention agreed by accident is one that gets
+/// broken by accident.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Side {
+    Left,
+    Right,
 }
 
 /// Where a walk becomes a run, in world units per second.
@@ -1429,15 +1463,42 @@ impl Motion {
     /// character sprinting while facing the wrong way -- reported from play as
     /// exactly that. Negative is backwards; there is only one backwards cycle,
     /// so its magnitude chooses nothing.
-    pub fn from_speed(speed: f32) -> Self {
-        if speed == 0.0 {
-            Motion::Stand
-        } else if speed < 0.0 {
-            Motion::WalkBack
-        } else if speed < RUN_SPEED {
-            Motion::Walk
+    /// The cycle a *velocity* calls for: how fast along the facing, and how
+    /// fast across it.
+    ///
+    /// **Travelling forwards or backwards outranks sidestepping**, which is
+    /// the whole of the diagonal rule. A character running forward while
+    /// strafing is running, and drawing it sidestepping would make a diagonal
+    /// sprint look like a crab. Only when there is no longitudinal component at
+    /// all does the sidestep cycle win -- which is exactly when a player is
+    /// holding `Q` or `E` on their own.
+    ///
+    /// That precedence is a judgement about what the original client does
+    /// rather than something the data states, and it is the one line here worth
+    /// A/B-ing at a window if diagonal movement ever looks wrong again.
+    ///
+    /// `lateral` is signed, positive to the left -- see [`Side`]. Replicated
+    /// creatures pass zero, and that is an absence rather than a claim: a
+    /// monster move gives a path and a duration and says nothing about which
+    /// way the body is turned relative to it, so inventing a lateral component
+    /// for them would be inventing data.
+    pub fn from_pace(forward: f32, lateral: f32) -> Self {
+        if forward > 0.0 {
+            return if forward < RUN_SPEED {
+                Motion::Walk
+            } else {
+                Motion::Run
+            };
+        }
+        if forward < 0.0 {
+            return Motion::WalkBack;
+        }
+        if lateral > 0.0 {
+            Motion::Shuffle(Side::Left)
+        } else if lateral < 0.0 {
+            Motion::Shuffle(Side::Right)
         } else {
-            Motion::Run
+            Motion::Stand
         }
     }
 
@@ -1461,6 +1522,7 @@ impl Motion {
     /// `update_animations` reads.
     pub fn resolve(
         speed: f32,
+        lateral: f32,
         dead: bool,
         died_ms_ago: Option<u32>,
         swung_ms_ago: Option<u32>,
@@ -1476,7 +1538,7 @@ impl Motion {
                 _ => Motion::Dead,
             };
         }
-        let moving = Motion::from_speed(speed);
+        let moving = Motion::from_pace(speed, lateral);
         if moving == Motion::Stand {
             if let Some(age) = swung_ms_ago {
                 if age < ATTACK_CEILING_MS {
@@ -1499,7 +1561,11 @@ impl Motion {
     fn is_notable(self) -> bool {
         !matches!(
             self,
-            Motion::Stand | Motion::Walk | Motion::Run | Motion::WalkBack
+            Motion::Stand
+                | Motion::Walk
+                | Motion::Run
+                | Motion::WalkBack
+                | Motion::Shuffle(_)
         )
     }
 
@@ -1528,6 +1594,18 @@ impl Motion {
             // while it retreats is odd, where standing still as it slides is
             // the bug this whole family exists to avoid.
             Motion::WalkBack => &[WALK_BACK_ANIMATION_ID, WALK_ANIMATION_ID],
+            // **Deliberately not the table's own fallback.** `AnimationData`
+            // sends both shuffles to row 0, Stand, and standing still while
+            // sliding sideways is the exact bug this whole family exists to
+            // avoid -- so they fall back to the travelling cycles instead.
+            // Nearly unreachable either way: only the player supplies a
+            // lateral component, and every character model carries both.
+            Motion::Shuffle(Side::Left) => {
+                &[SHUFFLE_LEFT_ANIMATION_ID, RUN_ANIMATION_ID, WALK_ANIMATION_ID]
+            }
+            Motion::Shuffle(Side::Right) => {
+                &[SHUFFLE_RIGHT_ANIMATION_ID, RUN_ANIMATION_ID, WALK_ANIMATION_ID]
+            }
             Motion::Dying(_) => &[DEATH_ANIMATION_ID],
             // Settled last: a model with no lying-still cycle holds the final
             // frame of the toppling one, which `update_animations` produces by
@@ -1676,14 +1754,52 @@ mod tests {
     /// backwards cycle.
     #[test]
     fn retreating_has_its_own_cycle_whatever_the_pace() {
-        assert_eq!(Motion::from_speed(-4.5), Motion::WalkBack);
-        assert_eq!(Motion::from_speed(-0.5), Motion::WalkBack);
-        assert_eq!(Motion::from_speed(-9.0), Motion::WalkBack);
+        assert_eq!(Motion::from_pace(-4.5, 0.0), Motion::WalkBack);
+        assert_eq!(Motion::from_pace(-0.5, 0.0), Motion::WalkBack);
+        assert_eq!(Motion::from_pace(-9.0, 0.0), Motion::WalkBack);
         // The forward answers must be untouched, which is the half that stops
         // a sign bug from turning every walk into a retreat.
-        assert_eq!(Motion::from_speed(0.0), Motion::Stand);
-        assert_eq!(Motion::from_speed(2.5), Motion::Walk);
-        assert_eq!(Motion::from_speed(7.0), Motion::Run);
+        assert_eq!(Motion::from_pace(0.0, 0.0), Motion::Stand);
+        assert_eq!(Motion::from_pace(2.5, 0.0), Motion::Walk);
+        assert_eq!(Motion::from_pace(7.0, 0.0), Motion::Run);
+    }
+
+    /// Sidestepping has its own cycle; running diagonally does not.
+    ///
+    /// **Both halves, and the diagonal is the one that matters.** Making pure
+    /// strafing shuffle is easy and would also make a forward sprint with a
+    /// strafe key held draw as a sidestep, which is a worse picture than the
+    /// forward run it replaced -- and a test that only checked pure strafing
+    /// would pass for it.
+    #[test]
+    fn sidestepping_has_a_cycle_and_a_diagonal_run_does_not() {
+        assert_eq!(Motion::from_pace(0.0, 7.0), Motion::Shuffle(Side::Left));
+        assert_eq!(Motion::from_pace(0.0, -7.0), Motion::Shuffle(Side::Right));
+
+        // Travelling outranks sidestepping, in both directions.
+        assert_eq!(Motion::from_pace(7.0, 7.0), Motion::Run);
+        assert_eq!(Motion::from_pace(7.0, -7.0), Motion::Run);
+        assert_eq!(Motion::from_pace(2.5, 7.0), Motion::Walk);
+        assert_eq!(Motion::from_pace(-4.5, 7.0), Motion::WalkBack);
+
+        // And standing still is still standing still.
+        assert_eq!(Motion::from_pace(0.0, 0.0), Motion::Stand);
+    }
+
+    /// The sidestep cycles are the ids the table names, and they loop.
+    #[test]
+    fn sidestepping_resolves_to_the_shuffle_cycles() {
+        let left = Motion::Shuffle(Side::Left).animation_ids();
+        let right = Motion::Shuffle(Side::Right).animation_ids();
+        assert_eq!(left.first(), Some(&SHUFFLE_LEFT_ANIMATION_ID));
+        assert_eq!(right.first(), Some(&SHUFFLE_RIGHT_ANIMATION_ID));
+        assert_ne!(left.first(), right.first(), "both sides play one cycle");
+        // Deliberately not the table's fallback, which is Stand for both: a
+        // model sliding sideways on the spot is the bug this family avoids.
+        for ids in [left, right] {
+            assert!(!ids.contains(&STAND_ANIMATION_ID));
+            assert_eq!(ids.last(), Some(&WALK_ANIMATION_ID));
+        }
     }
 
     /// And the backwards cycle falls back to the forward walk, per the table.
@@ -1709,18 +1825,18 @@ mod tests {
     fn a_drawn_weapon_is_enough_to_hold_the_guard() {
         // Not fighting, standing still, weapon out.
         assert_eq!(
-            Motion::resolve(0.0, false, None, None, false, 4_000, Stance::TwoHand),
+            Motion::resolve(0.0, 0.0, false, None, None, false, 4_000, Stance::TwoHand),
             Motion::Ready(Stance::TwoHand),
         );
         // And with nothing drawn it still relaxes, which is the half that
         // stops this from simply making everyone stand guard forever.
         assert_eq!(
-            Motion::resolve(0.0, false, None, None, false, 4_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, None, None, false, 4_000, Stance::Unarmed),
             Motion::Stand,
         );
         // Moving still outranks it: a character runs, weapon or no weapon.
         assert_eq!(
-            Motion::resolve(7.0, false, None, None, false, 4_000, Stance::TwoHand),
+            Motion::resolve(7.0, 0.0, false, None, None, false, 4_000, Stance::TwoHand),
             Motion::Run,
         );
     }
@@ -1779,7 +1895,7 @@ mod tests {
     #[test]
     fn death_outranks_a_stale_speed() {
         assert_eq!(
-            Motion::resolve(7.0, true, None, None, false, 10_000, Stance::Unarmed),
+            Motion::resolve(7.0, 0.0, true, None, None, false, 10_000, Stance::Unarmed),
             Motion::Dead,
             "a corpse was drawn running"
         );
@@ -1791,10 +1907,10 @@ mod tests {
     #[test]
     fn only_a_death_we_watched_plays_the_fall() {
         assert_eq!(
-            Motion::resolve(0.0, true, Some(200), None, false, 10_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, true, Some(200), None, false, 10_000, Stance::Unarmed),
             Motion::Dying(9_800)
         );
-        assert_eq!(Motion::resolve(0.0, true, None, None, false, 10_000, Stance::Unarmed), Motion::Dead);
+        assert_eq!(Motion::resolve(0.0, 0.0, true, None, None, false, 10_000, Stance::Unarmed), Motion::Dead);
     }
 
     /// And it stops falling eventually, rather than holding a one-shot bucket
@@ -1802,7 +1918,7 @@ mod tests {
     #[test]
     fn a_fall_settles_once_it_has_had_time_to_finish() {
         assert_eq!(
-            Motion::resolve(0.0, true, Some(ONE_SHOT_CEILING_MS + 1), None, false, 10_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, true, Some(ONE_SHOT_CEILING_MS + 1), None, false, 10_000, Stance::Unarmed),
             Motion::Dead
         );
     }
@@ -1817,15 +1933,15 @@ mod tests {
     /// play correctly and the cost would be invisible.
     #[test]
     fn a_one_shot_keeps_its_bucket_as_the_clock_advances() {
-        let first = Motion::resolve(0.0, true, Some(100), None, false, 5_000, Stance::Unarmed);
+        let first = Motion::resolve(0.0, 0.0, true, Some(100), None, false, 5_000, Stance::Unarmed);
         // A second later: the death is a second older and the clock a second
         // further on, which is the same death.
-        let later = Motion::resolve(0.0, true, Some(1_100), None, false, 6_000, Stance::Unarmed);
+        let later = Motion::resolve(0.0, 0.0, true, Some(1_100), None, false, 6_000, Stance::Unarmed);
         assert_eq!(first, later, "the bucket moved with the clock");
 
         // Two deaths a second apart must *not* share, or one pops to the
         // other's frame.
-        let other = Motion::resolve(0.0, true, Some(100), None, false, 6_000, Stance::Unarmed);
+        let other = Motion::resolve(0.0, 0.0, true, Some(100), None, false, 6_000, Stance::Unarmed);
         assert_ne!(first, other);
     }
 
@@ -1844,11 +1960,10 @@ mod tests {
     fn a_one_shot_bucket_survives_drift_between_two_clock_reads() {
         // The same swing, seen over eight frames, with the two clock readings
         // drifting a few milliseconds apart each time as they really do.
-        let reference = Motion::resolve(0.0, false, None, Some(40), true, 8_000, Stance::Unarmed);
+        let reference = Motion::resolve(0.0, 0.0, false, None, Some(40), true, 8_000, Stance::Unarmed);
         for frame in 0..8u32 {
             let drift = frame * 3;
-            let seen = Motion::resolve(
-                0.0,
+            let seen = Motion::resolve(0.0, 0.0,
                 false,
                 None,
                 Some(40 + frame * 16),
@@ -1884,7 +1999,7 @@ mod tests {
             "a fighter would be frozen on its follow-through between swings"
         );
         assert_eq!(
-            Motion::resolve(0.0, false, None, Some(ATTACK_CEILING_MS + 1), true, 9_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, None, Some(ATTACK_CEILING_MS + 1), true, 9_000, Stance::Unarmed),
             Motion::Ready(Stance::Unarmed)
         );
     }
@@ -1895,13 +2010,13 @@ mod tests {
     #[test]
     fn a_swing_interrupts_standing_but_not_running() {
         assert_eq!(
-            Motion::resolve(0.0, false, None, Some(50), true, 4_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, None, Some(50), true, 4_000, Stance::Unarmed),
             Motion::Attacking(3_900, Stance::Unarmed)
         );
-        assert_eq!(Motion::resolve(7.0, false, None, Some(50), true, 4_000, Stance::Unarmed), Motion::Run);
+        assert_eq!(Motion::resolve(7.0, 0.0, false, None, Some(50), true, 4_000, Stance::Unarmed), Motion::Run);
         // And an old swing has stopped mattering.
         assert_eq!(
-            Motion::resolve(0.0, false, None, Some(ONE_SHOT_CEILING_MS + 1), false, 4_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, None, Some(ONE_SHOT_CEILING_MS + 1), false, 4_000, Stance::Unarmed),
             Motion::Stand
         );
     }
@@ -1917,22 +2032,22 @@ mod tests {
     #[test]
     fn a_fighter_between_swings_keeps_its_guard_up() {
         assert_eq!(
-            Motion::resolve(0.0, false, None, None, true, 4_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, None, None, true, 4_000, Stance::Unarmed),
             Motion::Ready(Stance::Unarmed)
         );
         // Out of the fight, it relaxes.
         assert_eq!(
-            Motion::resolve(0.0, false, None, None, false, 4_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, None, None, false, 4_000, Stance::Unarmed),
             Motion::Stand
         );
         // A swing still beats the guard, and running still beats both.
         assert_eq!(
-            Motion::resolve(0.0, false, None, Some(50), true, 4_000, Stance::Unarmed),
+            Motion::resolve(0.0, 0.0, false, None, Some(50), true, 4_000, Stance::Unarmed),
             Motion::Attacking(3_900, Stance::Unarmed)
         );
-        assert_eq!(Motion::resolve(7.0, false, None, None, true, 4_000, Stance::Unarmed), Motion::Run);
+        assert_eq!(Motion::resolve(7.0, 0.0, false, None, None, true, 4_000, Stance::Unarmed), Motion::Run);
         // And a corpse is not "in a fight" whatever the map still says.
-        assert_eq!(Motion::resolve(0.0, true, None, None, true, 4_000, Stance::Unarmed), Motion::Dead);
+        assert_eq!(Motion::resolve(0.0, 0.0, true, None, None, true, 4_000, Stance::Unarmed), Motion::Dead);
     }
 
     /// Which cycles hold their last frame is a property of the *animation*,
@@ -2157,14 +2272,14 @@ mod tests {
     /// The three cycles, and where the boundaries between them are.
     #[test]
     fn speed_chooses_the_cycle() {
-        assert_eq!(Motion::from_speed(0.0), Motion::Stand);
+        assert_eq!(Motion::from_pace(0.0, 0.0), Motion::Stand);
         // 3.3.5a's own default ground speeds.
-        assert_eq!(Motion::from_speed(2.5), Motion::Walk, "the walk speed");
-        assert_eq!(Motion::from_speed(4.5), Motion::Walk, "backing up");
-        assert_eq!(Motion::from_speed(7.0), Motion::Run, "the run speed");
+        assert_eq!(Motion::from_pace(2.5, 0.0), Motion::Walk, "the walk speed");
+        assert_eq!(Motion::from_pace(4.5, 0.0), Motion::Walk, "backing up");
+        assert_eq!(Motion::from_pace(7.0, 0.0), Motion::Run, "the run speed");
         // A creature crawling is still walking, not standing: standing is
         // reserved for no move in flight at all, so a slow patrol animates.
-        assert_eq!(Motion::from_speed(0.2), Motion::Walk);
+        assert_eq!(Motion::from_pace(0.2, 0.0), Motion::Walk);
     }
 
     /// Height must not affect which tile a position is on.

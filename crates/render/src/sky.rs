@@ -64,6 +64,10 @@ struct Params {
     /// is cheaper than discovering it as a colour that reads the next band's
     /// red channel.
     layers: [[f32; 4]; LAYERS],
+    /// Unit direction towards the sun or moon, with how visible it is in `w`.
+    body: [f32; 4],
+    /// Its colour, from `Light.dbc` band 9.
+    body_colour: [f32; 4],
 }
 
 const SHADER: &str = r#"
@@ -73,7 +77,18 @@ struct Params {
     inverse_view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     layers: array<vec4<f32>, LAYERS>,
+    body: vec4<f32>,
+    body_colour: vec4<f32>,
 };
+
+// How big the sun is, as the cosine of its angular radius, and how far its
+// glow reaches. **Chosen.** The real sun subtends half a degree; every game
+// ever made draws it larger and the original is no exception. A degree and a
+// half of disc with a wide soft falloff is what reads as a sun rather than as
+// a headlight.
+const DISC_COS: f32 = 0.99966;   // ~1.5 degrees
+const DISC_EDGE: f32 = 0.99930;  // ~2.1 degrees, for a soft rim
+const GLOW_POWER: f32 = 220.0;
 
 @group(0) @binding(0) var<uniform> params: Params;
 
@@ -128,11 +143,34 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let f = (1.0 - u) * f32(LAYERS - 1u);
     let lower = u32(floor(f));
     let upper = min(lower + 1u, LAYERS - 1u);
-    let colour = mix(
+    var colour = mix(
         params.layers[lower].rgb,
         params.layers[upper].rgb,
         f - floor(f),
     );
+
+    // The sun, or the moon -- one band serves both, because only one of them
+    // is ever up. See `dbc::light::bands::DISC`.
+    //
+    // Added to the sky rather than blended over it: a disc and its glow are
+    // light *arriving*, so they brighten what is behind them instead of
+    // replacing it. That is also what makes a storm dim them for free, since
+    // `body.w` carries how much of the sky is not overcast.
+    let facing = dot(dir, params.body.xyz);
+    if (params.body.w > 0.0 && facing > 0.0) {
+        // **Fading in from the horizon is what makes the handover smooth.**
+        // The caller draws whichever of the two is up, so the direction
+        // handed here jumps to the opposite side of the sky the instant the
+        // sun sets. Without a fade that is a disc teleporting across the
+        // horizon; with one, the sun dims out as it goes down and the moon
+        // comes up dim on the other side, and the crossing is invisible
+        // because both are at zero when it happens.
+        let risen = smoothstep(0.0, 0.12, params.body.xyz.z);
+        let strength = params.body.w * risen;
+        let glow = pow(facing, GLOW_POWER);
+        let disc = smoothstep(DISC_EDGE, DISC_COS, facing);
+        colour += params.body_colour.rgb * (glow * 0.45 + disc) * strength;
+    }
     return vec4<f32>(colour, 1.0);
 }
 "#;
@@ -248,6 +286,7 @@ impl SkyRenderer {
     /// `view_proj` must be the matrix the rest of the pass is drawn with -- it
     /// is inverted here rather than rebuilt, so passing anything else makes the
     /// horizon disagree with the ground.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
         gpu: &Gpu,
@@ -255,6 +294,13 @@ impl SkyRenderer {
         view_proj: glam::Mat4,
         eye: glam::Vec3,
         gradient: &Gradient,
+        // Direction *towards* the sun. The moon is drawn at the opposite end
+        // of the same arc once this points below the horizon.
+        sun: glam::Vec3,
+        // The disc's colour, `Light.dbc` band 9.
+        disc: [f32; 3],
+        // How much of it gets through: 1 in clear weather, 0 under a storm.
+        visibility: f32,
     ) {
         // Converted per layer here rather than per pixel in the shader, so the
         // blend between two layers happens in linear light -- which is what
@@ -264,6 +310,11 @@ impl SkyRenderer {
             let [r, g, b] = self.encode(*colour);
             *out = [r, g, b, 1.0];
         }
+        // Whichever of the two is above the horizon. `sun` is an arc that goes
+        // below at night, and the moon is simply the other end of it -- which
+        // is why one colour band serves both.
+        let body = if sun.z >= 0.0 { sun } else { -sun };
+        let [br, bg, bb] = self.encode(disc);
         gpu.queue.write_buffer(
             &self.params,
             0,
@@ -271,6 +322,8 @@ impl SkyRenderer {
                 inverse_view_proj: view_proj.inverse().to_cols_array_2d(),
                 eye: [eye.x, eye.y, eye.z, 1.0],
                 layers,
+                body: [body.x, body.y, body.z, visibility.clamp(0.0, 1.0)],
+                body_colour: [br, bg, bb, 1.0],
             }),
         );
 

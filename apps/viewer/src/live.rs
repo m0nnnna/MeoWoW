@@ -36,6 +36,14 @@ pub struct Entity {
     /// when it is standing. The renderer picks a stand, walk or run cycle from
     /// it -- see `crate::world::Motion`.
     pub speed: f32,
+    /// How fast the unit is travelling *across* its own facing, positive to
+    /// the left, for choosing a sidestep cycle -- see `world::Motion::from_pace`.
+    ///
+    /// Zero for everyone but the player, and that is an absence rather than a
+    /// claim. A `SMSG_MONSTER_MOVE` gives a path and a duration and says
+    /// nothing about how the body is turned relative to it; the player is the
+    /// one unit whose keys this client is holding.
+    pub lateral: f32,
     /// Whether this unit is lying dead, and so should be drawn face down.
     /// Outranks `speed` when choosing a cycle: a creature killed mid-charge
     /// keeps the charge's speed for a moment after it stops being able to use
@@ -499,6 +507,7 @@ pub fn drawable_entities(
             // Zero when no move is in flight, which is what "standing" means
             // here -- see `world::state::Entity::move_speed`.
             speed: entity.move_speed(now).unwrap_or(0.0),
+            lateral: 0.0,
             dead: entity.is_corpse(),
             died_ms_ago: entity.dying_for(now).map(|d| d.as_millis() as u32),
             swung_ms_ago: entity.swung_ago(now).map(|d| d.as_millis() as u32),
@@ -623,6 +632,7 @@ pub fn own_entity(
     position: Vec3,
     orientation: f32,
     speed: f32,
+    lateral: f32,
 ) -> Option<Entity> {
     use world::update;
 
@@ -651,6 +661,7 @@ pub fn own_entity(
         kind: entity.object_type,
         level: entity.level(),
         speed,
+        lateral,
         // The player's own death is read from replicated state like anyone
         // else's -- it is the one part of our own condition the server *does*
         // tell us about, unlike our position.

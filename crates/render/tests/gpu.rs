@@ -427,7 +427,18 @@ fn render_sky(
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        sky.draw(gpu, &mut pass, proj * view, eye, gradient);
+        // No sun: these tests are about the gradient, and a disc added on top
+        // of it would be a second thing changing the pixels they measure.
+        sky.draw(
+            gpu,
+            &mut pass,
+            proj * view,
+            eye,
+            gradient,
+            glam::Vec3::Z,
+            [0.0; 3],
+            0.0,
+        );
     }
     gpu.queue.submit([encoder.finish()]);
     target.read_rgba(gpu).expect("readback")
@@ -669,4 +680,220 @@ fn snow_is_shorter_and_rounder_than_rain() {
         let mean = mean_value(&render_weather(&gpu, shape, 1.0, 1.0, (256, 256)));
         assert!(mean > 0.0, "{name} drew nothing");
     }
+}
+
+/// The sun is drawn where the sun is, and a storm puts it out.
+///
+/// **The "somewhere else" half is what makes it a test.** A shader that
+/// brightened the whole sky by the disc colour would pass a check that only
+/// looked at the centre of the frame, and would look like a sun in exactly one
+/// screenshot.
+#[test]
+fn the_sun_is_drawn_where_the_sun_is() {
+    let gpu = require_gpu!();
+    let (w, h) = (64u32, 64u32);
+    // A black sky, so anything bright in the frame is the disc.
+    let gradient: render::sky::Gradient = [[0.0; 3]; render::sky::LAYERS];
+
+    let render_with = |sun: glam::Vec3, visibility: f32| -> Vec<u8> {
+        let target = Offscreen::new(&gpu, w, h, FORMAT);
+        let depth = DepthBuffer::new(&gpu, w, h);
+        let sky = render::SkyRenderer::new(&gpu, FORMAT);
+        let eye = glam::Vec3::ZERO;
+        // Looking straight along +X at the horizon, with the sun placed on
+        // that same axis but well above it.
+        let view = glam::camera::rh::view::look_to_mat4(eye, glam::Vec3::X, glam::Vec3::Z);
+        let proj = glam::camera::rh::proj::directx::perspective(
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            0.1,
+            1000.0,
+        );
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                multiview_mask: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            sky.draw(
+                &gpu,
+                &mut pass,
+                proj * view,
+                eye,
+                &gradient,
+                sun.normalize(),
+                [1.0, 1.0, 1.0],
+                visibility,
+            );
+        }
+        gpu.queue.submit([encoder.finish()]);
+        target.read_rgba(&gpu).expect("readback")
+    };
+
+    // Sun dead ahead and a little above the horizon: it lands above centre.
+    let ahead = glam::Vec3::new(1.0, 0.0, 0.30);
+    let frame = render_with(ahead, 1.0);
+    let brightest = frame
+        .chunks_exact(4)
+        .enumerate()
+        .max_by_key(|(_, p)| p[0])
+        .expect("a pixel");
+    assert!(
+        brightest.1[0] > 200,
+        "no disc was drawn at all: brightest pixel {:?}",
+        brightest.1
+    );
+    let (x, y) = ((brightest.0 as u32) % w, (brightest.0 as u32) / w);
+    assert!(
+        x.abs_diff(w / 2) < 4,
+        "the sun is not on the axis it was placed on: column {x} of {w}"
+    );
+    assert!(y < h / 2, "the sun was placed above the horizon, drawn at row {y}");
+
+    // And it is a *disc*, not a wash: the corners stay black.
+    let corner = pixel(&frame, w, 1, h - 2);
+    assert!(
+        corner[0] < 30,
+        "the whole sky brightened rather than a disc being drawn: {corner:?}"
+    );
+
+    // Behind the camera it is not drawn at all.
+    let behind = render_with(glam::Vec3::new(-1.0, 0.0, 0.30), 1.0);
+    assert!(
+        behind.chunks_exact(4).all(|p| p[0] < 30),
+        "a sun behind the camera was drawn in front of it"
+    );
+
+    // A storm puts it out.
+    let overcast = render_with(ahead, 0.0);
+    assert!(
+        overcast.chunks_exact(4).all(|p| p[0] < 30),
+        "the sun burned through a full storm"
+    );
+}
+
+/// A setting sun fades out, and the moon comes up on the other side.
+///
+/// **The handover is the point.** One `Light.dbc` band serves the sun and the
+/// moon because only one is ever up, so the direction handed to the shader
+/// jumps to the opposite side of the sky the instant the sun sets. Without a
+/// fade at the horizon that is a disc teleporting; the test that catches it has
+/// to look at the sky *behind* the camera as well as in front.
+#[test]
+fn a_setting_sun_hands_over_to_the_moon() {
+    let gpu = require_gpu!();
+    let gradient: render::sky::Gradient = [[0.0; 3]; render::sky::LAYERS];
+    let (w, h) = (48u32, 48u32);
+
+    // How bright the sky gets when the camera looks along `at`, for a sun in
+    // direction `sun`.
+    let brightest = |sun: glam::Vec3, at: glam::Vec3| -> u8 {
+        let target = Offscreen::new(&gpu, w, h, FORMAT);
+        let depth = DepthBuffer::new(&gpu, w, h);
+        let sky = render::SkyRenderer::new(&gpu, FORMAT);
+        let eye = glam::Vec3::ZERO;
+        let view = glam::camera::rh::view::look_to_mat4(eye, at.normalize(), glam::Vec3::Z);
+        let proj = glam::camera::rh::proj::directx::perspective(
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            0.1,
+            1000.0,
+        );
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                multiview_mask: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            sky.draw(
+                &gpu,
+                &mut pass,
+                proj * view,
+                eye,
+                &gradient,
+                sun.normalize(),
+                [1.0, 1.0, 1.0],
+                1.0,
+            );
+        }
+        gpu.queue.submit([encoder.finish()]);
+        let frame = target.read_rgba(&gpu).expect("readback");
+        frame.chunks_exact(4).map(|p| p[0]).max().unwrap_or(0)
+    };
+
+    let east = glam::Vec3::new(1.0, 0.0, 0.0);
+    let west = glam::Vec3::new(-1.0, 0.0, 0.0);
+
+    // High in the east: bright there, nothing behind.
+    let high = glam::Vec3::new(1.0, 0.0, 0.6);
+    assert!(brightest(high, east) > 200, "a risen sun was not drawn");
+    assert!(brightest(high, west) < 30, "the sun was also drawn behind us");
+
+    // Sinking towards the horizon: dimmer, and still in the east.
+    let low = glam::Vec3::new(1.0, 0.0, 0.05);
+    let sinking = brightest(low, east);
+    assert!(
+        sinking < brightest(high, east),
+        "a sun near the horizon is not dimmer than one overhead: {sinking}"
+    );
+
+    // At the horizon exactly, it is out -- which is what lets the moon take
+    // over without either of them jumping.
+    assert!(
+        brightest(east, east) < 30 && brightest(east, west) < 30,
+        "a sun sitting exactly on the horizon is still lit"
+    );
+
+    // Below it, the body is up on the *other* side: that is the moon.
+    let night = glam::Vec3::new(1.0, 0.0, -0.6);
+    assert!(
+        brightest(night, west) > 200,
+        "the moon is not up when the sun is down"
+    );
+    assert!(
+        brightest(night, east) < 30,
+        "the set sun is still being drawn where it set"
+    );
 }

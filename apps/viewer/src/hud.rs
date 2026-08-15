@@ -355,6 +355,7 @@ mod tests {
             kind: ::world::ObjectType::Unit,
             level: Some(1),
             speed: 0.0,
+            lateral: 0.0,
             dead: false,
             died_ms_ago: None,
             swung_ms_ago: None,

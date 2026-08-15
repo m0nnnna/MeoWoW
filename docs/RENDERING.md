@@ -1020,8 +1020,48 @@ needed. Below the horizon the gradient holds rather than mirroring.
 There is still **no skybox**, and that is not an omission.
 `LightParams.light_skybox_id` is 0 on the row that lights Elwynn, and
 `LightSkybox.dbc`'s 124 rows are named things like `StratholmeSkybox` and
-`CavernsOfTimeSky` -- special places, not the ordinary outdoor world. Neither is
-there a sun or moon disc, a cloud layer, or stars.
+`CavernsOfTimeSky` -- special places, not the ordinary outdoor world.
+
+#### The sun, and the moon, are one band
+
+Reported as the sky looking *empty*: the gradient was right and there was
+nothing in it.
+
+**Band 9 is the disc, identified by the property only it has.** It is the
+brightest band at every hour and its brightness barely moves across a whole day
+-- 728, 615, 724, 675 summed over the channels at midnight, dawn, noon and dusk,
+where the next brightest is 389 and every band that *lights* the world drops to
+a fraction of itself at night. A curve that stays bright while the sky goes
+black is not lighting anything; it is a thing you look at.
+
+Its hue then says which thing. Cool white (232, 241, 255) right through the
+night, warm (255, 210, 150) at sunrise, warm white (255, 247, 222) at noon: a
+moon that becomes a sun. One band serves both because only one of them is ever
+up, so the client draws a single disc at `sun_direction` and flips it to the
+opposite end of the same arc once the sun has set.
+
+**The handover is the part with a bug in it.** Flipping means the direction the
+shader is given jumps clean across the sky the instant the sun sets, which is a
+disc teleporting. The fade at the horizon is what fixes it: the sun dims out as
+it goes down and the moon comes up dim on the other side, and because both are
+at zero when they cross, nothing is seen to move. The test looks *behind* the
+camera as well as in front, which is the only way to catch it.
+
+The glow is derived from band 9 rather than named. Band 10 behaves plausibly
+like a halo -- dim blue at midnight, orange at dawn -- but nothing separates it
+from bands 11 and 13, and a halo is the disc's own light scattered, so fading
+the disc's colour is derivation instead of a guess. Same reasoning as the fog.
+
+The disc is *added* to the sky rather than blended over it, because a disc and
+its glow are light arriving. That also makes a storm dim them for free: the term
+carries the weather's own intensity, so the sun does not burn through an
+overcast sky.
+
+Its angular size is chosen. The real sun subtends half a degree and every game
+ever made draws it larger; a degree and a half with a wide soft falloff is what
+reads as a sun rather than as a headlight.
+
+Still absent: clouds, stars, and any second body. Weather draws no lightning.
 
 ### Weather that falls
 

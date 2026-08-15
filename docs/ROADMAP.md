@@ -2619,3 +2619,75 @@ gravity, and colour and alpha tracks over a particle's life, and the header
 offsets for them are recorded but the block is unparsed. This milestone is what
 gives them a billboard path to arrive into. There is also no splash where rain
 lands, no sound, and no lightning.
+
+### 4.11: a sun to look at, and legs that sidestep
+
+Two small reports from play, and both turned out to have a measurement problem
+in front of the fix.
+
+#### The sky was empty
+
+The gradient was right and there was nothing in it. **Band 9 is the sun and the
+moon**, identified by the one property no other band has: it is the brightest
+band at *every* hour and its brightness barely moves across a whole day -- 728,
+615, 724, 675 summed over the channels at midnight, dawn, noon and dusk, against
+389 for the next brightest, while every band that lights the world drops to a
+fraction of itself at night. A curve that stays bright while the sky goes black
+is not lighting anything; it is a thing you look at.
+
+The hue then says which thing it is: cool white (232, 241, 255) right through
+the night, warm (255, 210, 150) at sunrise, warm white (255, 247, 222) at noon.
+A moon that becomes a sun. One band serves both because only one is ever up.
+
+**The handover is where the bug was.** Drawing "whichever body is up" means the
+direction handed to the shader jumps clean across the sky the instant the sun
+sets, and a disc that teleports is worse than no disc. Fading at the horizon
+fixes it -- the sun dims out as it goes down, the moon comes up dim on the other
+side, and both are at zero when they cross. The first version of the fade was
+written against the *unflipped* direction and was therefore dead code, which the
+test caught by measuring a "setting" sun and getting a hard zero: the sun had
+already become the moon and was behind the camera. The test now looks behind the
+camera as well as in front, which is the only way to see the handover at all.
+
+The glow around it is derived from band 9 rather than named. Band 10 behaves
+plausibly like a halo, and so do 11 and 13; nothing separates them, and a halo
+is the disc's own light scattered, so fading the disc's colour is derivation
+instead of a guess. The same reasoning that gave fog the horizon band.
+
+Clouds, stars and lightning are still absent.
+
+#### Strafing ran forwards
+
+`Motion::from_speed` took a signed scalar, so a character sidestepping was
+indistinguishable from one running forward and drew a full forward sprint while
+crab-walking. The comment above `live_pace` said so in as many words -- "strafing
+sideways uses the run" -- which is the useful kind of admission: the gap was
+recorded at the point it was made, and finding it was a grep rather than an
+investigation.
+
+It is now `Motion::from_pace(forward, lateral)`, and **travelling outranks
+sidestepping**. Running diagonally plays the run; only a pure strafe gets the
+shuffle. That precedence is a judgement about the original client rather than
+something the data states, and it is flagged as the one line to A/B at a window
+if diagonal movement ever looks wrong again. The test asserts both halves,
+because making pure strafing shuffle is easy and would also make a diagonal
+sprint draw as a sidestep -- a worse picture than the one it replaced, and one
+a test that only checked pure strafing would pass for.
+
+**The cycles were nearly declared absent.** `ShuffleLeft` and `ShuffleRight` are
+`AnimationData` rows 11 and 12 and sequences 38 and 39 on the human male, and the
+first search for them came back empty -- from `m2 anims`, which defaults to
+listing thirty of a hundred and fifty-six. A truncated listing answers a
+different question from the one asked, and the conclusion drawn from it was that
+no character model had a sidestep at all and the existing behaviour was correct.
+It is the same shape as the `wow-cli ls` check that once said 0.1% of the baked
+NPC textures shipped.
+
+Both cycles advance the character by 0.00, which is right rather than suspicious:
+they are stepping motions played in place while the movement system does the
+travelling, exactly like `Walkbackwards`. Their fallback deviates from
+`AnimationData`'s own column, which sends both to Stand -- a model sliding
+sideways on the spot is the bug this whole family exists to avoid, so they fall
+back to the travelling cycles instead. Nearly unreachable either way: only the
+player supplies a lateral component, because a monster move gives a path and a
+duration and says nothing about how the body is turned relative to it.

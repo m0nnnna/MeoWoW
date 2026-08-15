@@ -82,6 +82,29 @@ pub mod bands {
     /// negates that difference: red-first, the sunrise would be directly
     /// overhead and the zenith would be the neutral end at noon.
     pub const SKY: [u32; 5] = [2, 3, 4, 5, 6];
+    /// The sun, and the moon: one band for whichever is up.
+    ///
+    /// **Identified by the property that only it has.** Band 9 is the
+    /// brightest band at *every* hour, and its brightness barely moves across
+    /// a whole day -- 728, 615, 724, 675 summed over the channels at midnight,
+    /// dawn, noon and dusk, where the next brightest is 389 and every band
+    /// that lights the world drops to a fraction of itself at night. A curve
+    /// that stays bright while the sky goes black is not lighting anything; it
+    /// is a thing you look at.
+    ///
+    /// Its hue then says which thing. Cool white (232, 241, 255) right through
+    /// the night, warm (255, 210, 150) at sunrise, warm white (255, 247, 222)
+    /// at noon: a moon that becomes a sun. One band serves both because only
+    /// one of them is ever up, which is also why this client draws a single
+    /// disc and puts it wherever `sun_direction` says -- flipped to the
+    /// opposite side of the sky once the sun has set.
+    ///
+    /// **The glow around it is derived from this band rather than named.**
+    /// Band 10 behaves plausibly like a halo -- dim blue at midnight, orange
+    /// at dawn -- but nothing has separated it from bands 11 and 13, and a
+    /// halo is the disc's own light scattered, so taking the disc's colour and
+    /// fading it is derivation instead of a guess. Same reasoning as the fog.
+    pub const DISC: u32 = 9;
     /// Where the horizon sits in [`SKY`] and in a sampled [`super::Sample`]'s
     /// gradient. Named because "the last one" is true of the array and not of
     /// the idea.
@@ -171,6 +194,8 @@ pub struct Sample {
     pub ambient: Colour,
     /// The sky from zenith to horizon.
     pub sky: SkyGradient,
+    /// The sun or moon, whichever is up -- see [`bands::DISC`].
+    pub disc: Colour,
     /// Distance at which fog is total, in world units.
     pub fog_end: f32,
     /// Where fog begins, in world units.
@@ -334,6 +359,7 @@ impl Lighting {
         Some(Sample {
             diffuse: mix3(clear.diffuse, stormy.diffuse),
             ambient: mix3(clear.ambient, stormy.ambient),
+            disc: mix3(clear.disc, stormy.disc),
             sky,
             fog_end: mix(clear.fog_end, stormy.fog_end),
             fog_start: mix(clear.fog_start, stormy.fog_start),
@@ -369,6 +395,7 @@ impl Lighting {
         Some(Sample {
             diffuse: self.colour(params_id, bands::DIFFUSE, at).unwrap_or([1.0; 3]),
             ambient: self.colour(params_id, bands::AMBIENT, at).unwrap_or([0.35; 3]),
+            disc: self.colour(params_id, bands::DISC, at).unwrap_or([1.0; 3]),
             sky,
             fog_end,
             // A scaler of 0.25 with a 18,000 end puts fog's start a quarter of

@@ -327,7 +327,7 @@ fn build_live_scene(
     if args.entities {
         let mut player_looks = std::collections::HashMap::new();
         let placements: Vec<world::EntityPlacement> =
-            drawable_with_own(&live, 0.0)
+            drawable_with_own(&live, (0.0, 0.0))
                 .iter()
                 .map(|entity| {
                     // Same three sources as the windowed path -- see `redraw`.
@@ -347,6 +347,7 @@ fn build_live_scene(
                         orientation: entity.orientation,
                         scale: entity.scale,
                         speed: entity.speed,
+                        lateral: entity.lateral,
                         dead: entity.dead,
                         died_ms_ago: entity.died_ms_ago,
                         swung_ms_ago: entity.swung_ms_ago,
@@ -513,14 +514,46 @@ const LIVE_BACK_SPEED: f32 = 4.5;
 /// to agree: the number that moves the character and the number that chooses
 /// its animation. They did not, and the result was a character reversing at a
 /// full run with the forward run cycle playing.
-fn live_pace(moving: ::world::motion::Motion) -> f32 {
+fn live_pace(moving: ::world::motion::Motion) -> (f32, f32) {
     use ::world::motion::Axis;
-    match moving.longitudinal() {
+    let forward = match moving.longitudinal() {
         // Backing up is the only direction with its own speed *and* its own
-        // cycle; strafing sideways uses the run.
+        // cycle.
         Some(Axis::Negative) => -LIVE_BACK_SPEED,
-        _ if moving.is_moving() => LIVE_RUN_SPEED,
-        _ => 0.0,
+        Some(Axis::Positive) => LIVE_RUN_SPEED,
+        None => 0.0,
+    };
+    // **Reported separately rather than folded into the magnitude**, because
+    // the two answer different questions: how far the character travels this
+    // frame, and which cycle its legs should play. Strafing used to be
+    // indistinguishable from running forward here -- the comment above this
+    // function used to say "strafing sideways uses the run" -- and the
+    // character crab-walked with a full forward sprint on its legs.
+    //
+    // Positive is left, matching both `Axis::Positive` and `world::Side`.
+    let lateral = match moving.lateral() {
+        Some(Axis::Positive) => LIVE_RUN_SPEED,
+        Some(Axis::Negative) => -LIVE_RUN_SPEED,
+        None => 0.0,
+    };
+    (forward, lateral)
+}
+
+/// How fast the character actually travels, whatever combination of keys.
+///
+/// Derived from [`live_pace`] rather than computed beside it, because the
+/// number that moves the character and the number that chooses its animation
+/// have to agree -- they did not once, and a character reversed at a full run
+/// with the forward cycle playing. `Motion::direction` already returns a unit
+/// vector, so this is a magnitude and the diagonal is not faster.
+fn live_travel_speed(moving: ::world::motion::Motion) -> f32 {
+    let (forward, lateral) = live_pace(moving);
+    if forward < 0.0 {
+        // Backing up is the one direction with a speed of its own, and it
+        // keeps that speed even while also strafing.
+        -forward
+    } else {
+        forward.max(lateral.abs())
     }
 }
 
@@ -1080,6 +1113,13 @@ fn draw_streaming(
         view_proj,
         camera.eye(),
         &sky_gradient(lighting.as_ref()),
+        // The same arc the world is lit by, so the shadows and the disc agree
+        // about where the sun is -- one function, not two copies of an angle.
+        lighting.map_or(glam::Vec3::Z, |(_, hour)| sun_direction(hour)),
+        sky.encode(lighting.map_or([1.0; 3], |(sample, _)| sample.disc)),
+        // A storm hides the sun. `Light.dbc` has nothing to say about this,
+        // but the alternative is a sun burning through an overcast sky.
+        1.0 - falling.map_or(0.0, |f| f.intensity),
     );
 
     pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
@@ -1724,16 +1764,17 @@ fn action_slot(code: KeyCode) -> Option<usize> {
 /// the picking ray already follows by unprojecting the matrix the scene was
 /// drawn with.
 ///
-/// `speed` is the caller's own movement state rather than anything read back
-/// from the server -- see [`live::own_entity`].
-fn drawable_with_own(live: &live::LiveWorld, speed: f32) -> Vec<live::Entity> {
+/// `pace` is the caller's own movement state -- forward and lateral speed --
+/// rather than anything read back from the server. See [`live::own_entity`].
+fn drawable_with_own(live: &live::LiveWorld, pace: (f32, f32)) -> Vec<live::Entity> {
     let mut entities = live::drawable_entities(&live.state, live.guid, live.position);
     if let Some(own) = live::own_entity(
         &live.state,
         live.guid,
         live.position,
         live.orientation,
-        speed,
+        pace.0,
+        pace.1,
     ) {
         entities.push(own);
     }
@@ -2701,6 +2742,7 @@ impl App {
                                     orientation: entity.orientation + flip,
                                     scale: entity.scale,
                                     speed: entity.speed,
+                                    lateral: entity.lateral,
                                     dead: entity.dead,
                                     died_ms_ago: entity.died_ms_ago,
                                     swung_ms_ago: entity.swung_ms_ago,
@@ -2923,7 +2965,7 @@ impl App {
 
         let (dx, dy) = desired.direction(live.orientation);
         if (dx, dy) != (0.0, 0.0) {
-            let pace = live_pace(desired).abs();
+            let pace = live_travel_speed(desired);
             live.position.x += dx * pace * dt;
             live.position.y += dy * pace * dt;
         }
