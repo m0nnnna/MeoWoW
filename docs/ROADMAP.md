@@ -3034,3 +3034,51 @@ in bag-slot order, every square filled by its slot index rather than by packing
 items in. The bags themselves are not drawn as squares -- a bag is a container
 rather than a thing you carry, and drawing it beside its own contents would show
 the same items twice.
+
+#### And the loot response, once the population could answer
+
+`SMSG_LOOT_RESPONSE` parses. What had been blocking it was never the protocol:
+three earlier attempts came back with the *empty* form, and an empty response
+says almost nothing about where an item list lives.
+
+The mistake was hoping. A GM `.die` kill generates no loot at all, and an
+ordinary low-level creature killed with `.damage` usually rolls nothing, so
+every run was sampling a population that could not exhibit the thing being
+looked for -- the same error as believing a flat property-test result without
+checking the rows could answer the question. `creature_loot_template` names a
+handful of creatures with a 100% entry, and `.npc add 103` put one within
+reach. It dropped on the first try.
+
+The layout:
+
+```
+u64  guid            u8   loot type        u32  money, in copper
+u8   item count
+  per item: u8 loot slot, u32 entry, u32 count, u32 display id,
+            u32 random property, u32 random suffix, u8 slot type
+```
+
+**Confirmed by a relationship the packet does not control.** Each item block
+carries an entry *and* a display id, and those are bound together by
+`Item.dbc`, which the server never sends. The first capture held entry 2070 and
+display 6353; `Item.dbc` and the server's own `item_template` independently
+agree that item 2070 -- Darnassian Bleu -- has display 6353. A second run
+dropped entry 1374 with display 16659, which pairs the same way. Shift the item
+block by one byte and that agreement breaks, where a length check would still
+pass.
+
+**The short form is a second message wearing the same opcode**, and the two are
+told apart by length alone -- there is no discriminator in the body. An empty
+corpse is ten bytes: guid, loot type, one status byte, and nothing else, where
+the full form's header alone is fourteen. That matters twice over: reading the
+money and count fields anyway would invent four bytes the server never sent,
+and refusing the packet would turn the commonest case into a parse error. The
+status byte is returned raw, since only `0` has been seen.
+
+Also worth recording: `SMSG_LOOT_RELEASE_RESPONSE` arrives **in answer to
+`CMSG_LOOT`** when a corpse is empty. The server closes the window rather than
+sending an empty one, so a client that treats it purely as an acknowledgement
+of its own release request will be surprised.
+
+Still to do: nothing sends `CMSG_LOOT` from the interface, `CMSG_LOOT_MONEY`
+and the take-an-item request are unexercised, and corpse release is unwired.

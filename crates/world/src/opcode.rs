@@ -185,6 +185,15 @@ pub mod server {
     pub const CLIENTCACHE_VERSION: u16 = 0x04AB;
     pub const LOGIN_VERIFY_WORLD: u16 = 0x0236;
 
+    /// What is on a corpse, in answer to `CMSG_LOOT`. See [`crate::loot`] for
+    /// the layout and how it was confirmed.
+    pub const LOOT_RESPONSE: u16 = 0x0160;
+    /// Which corpse was closed. **Also arrives in answer to `CMSG_LOOT`** when
+    /// the corpse is empty: the server closes the window rather than sending
+    /// an empty one, which is worth knowing before treating it as an
+    /// acknowledgement of a release this client sent.
+    pub const LOOT_RELEASE_RESPONSE: u16 = 0x0161;
+
     /// What the sky is doing: a state, an intensity, and whether it changed
     /// abruptly. Sent on entering a zone and whenever the zone's weather turns.
     pub const WEATHER: u16 = 0x02F4;
@@ -364,6 +373,8 @@ pub fn describe(opcode: u16) -> String {
         server::ADDON_INFO => "SMSG_ADDON_INFO",
         server::CLIENTCACHE_VERSION => "SMSG_CLIENTCACHE_VERSION",
         server::LOGIN_VERIFY_WORLD => "SMSG_LOGIN_VERIFY_WORLD",
+        server::LOOT_RESPONSE => "SMSG_LOOT_RESPONSE",
+        server::LOOT_RELEASE_RESPONSE => "SMSG_LOOT_RELEASE_RESPONSE",
         server::CHAR_CREATE => "SMSG_CHAR_CREATE",
         server::CHAR_DELETE => "SMSG_CHAR_DELETE",
         server::CHARACTER_LOGIN_FAILED => "SMSG_CHARACTER_LOGIN_FAILED",

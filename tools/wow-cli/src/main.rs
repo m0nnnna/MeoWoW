@@ -2282,6 +2282,32 @@ fn survey_loot(
         println!("  none -- nothing but the usual traffic came back");
     }
 
+    // Now that the layout is known, say what the corpse actually holds --
+    // while still printing the raw bytes above, because the moment this stops
+    // dumping bodies is the moment the next unknown shape becomes invisible.
+    for packet in &batch {
+        if packet.opcode != world::opcode::server::LOOT_RESPONSE {
+            continue;
+        }
+        match world::loot::parse_loot_response(&packet.body) {
+            Ok(loot) if loot.error.is_some() => {
+                println!("\nthe corpse is empty (short form, status {:?})", loot.error);
+            }
+            Ok(loot) => {
+                println!("\n{} copper and {} item(s):", loot.money, loot.items.len());
+                for item in &loot.items {
+                    println!(
+                        "  loot slot {:>2}: entry {} x{} (display {}, slot type {})",
+                        item.slot, item.entry, item.count, item.display_id, item.slot_type
+                    );
+                }
+            }
+            // Printed rather than swallowed: an unparseable response is the
+            // single most interesting thing this command can produce.
+            Err(error) => println!("\nSMSG_LOOT_RESPONSE did not parse: {error}"),
+        }
+    }
+
     println!("\nevery opcode seen:");
     for (opcode, count) in &seen {
         println!("  {:<34} ({opcode:#06x}) x{count}", world::opcode::describe(*opcode));
