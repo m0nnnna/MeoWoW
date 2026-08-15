@@ -4328,6 +4328,17 @@ enum SoundCommand {
     /// entry sits under `Sound\Music` is the music type, and that is a
     /// measurement rather than a recollection.
     Types,
+    /// Check that every zone's music and ambience ids point where they should.
+    ///
+    /// **Validity is nearly free; the *type* is the discriminator.**
+    /// `SoundEntries` ids run 3-18019 over 12,941 rows, so any small integer
+    /// in that range lands on a real row and a wrong column would look
+    /// perfectly valid. What a wrong column cannot do is land on a row of the
+    /// *right kind*: a music id has to resolve to a music entry and an
+    /// ambience id to an ambience entry, and those types were themselves
+    /// measured rather than assumed. Same reasoning that separated
+    /// `Spell.dbc`'s duration column from its plausible neighbours.
+    Zones,
     /// Extract a sound's files to disk so they can actually be listened to.
     ///
     /// The audio equivalent of `blp export`: a format that has only ever been
@@ -4473,6 +4484,90 @@ fn sound_cmd(chain: &mut Chain, cmd: &SoundCommand) -> Result<()> {
                     .collect();
                 println!("  type {kind:>2}: {count:>5} entries   {}", summary.join(", "));
             }
+        }
+
+        SoundCommand::Zones => {
+            use dbc::schema::{AreaTable, SoundAmbience, SoundType, ZoneMusic};
+
+            let by_id: std::collections::HashMap<u32, u32> =
+                table.iter().map(|row| (row.id(), row.sound_type())).collect();
+
+            // `(label, id)` pairs to check, and the type each must resolve to.
+            let mut checks: Vec<(&str, u32, SoundType)> = Vec::new();
+
+            let music_bytes = chain.read(ZoneMusic::PATH)?;
+            let music = ZoneMusic::parse(&music_bytes)?;
+            for row in music.iter() {
+                for id in [row.day_sound(), row.night_sound()] {
+                    if id != 0 {
+                        checks.push(("ZoneMusic", id, SoundType::Music));
+                    }
+                }
+            }
+
+            let ambience_bytes = chain.read(SoundAmbience::PATH)?;
+            let ambience = SoundAmbience::parse(&ambience_bytes)?;
+            for row in ambience.iter() {
+                for id in [row.day_sound(), row.night_sound()] {
+                    if id != 0 {
+                        checks.push(("SoundAmbience", id, SoundType::Ambience));
+                    }
+                }
+            }
+
+            let mut unknown = 0usize;
+            let mut wrong_type = 0usize;
+            let mut examples: Vec<String> = Vec::new();
+            for (source, id, expected) in &checks {
+                match by_id.get(id) {
+                    None => {
+                        unknown += 1;
+                        if examples.len() < 10 {
+                            examples.push(format!("{source} {id}: no such sound entry"));
+                        }
+                    }
+                    Some(raw) => {
+                        let actual = SoundType::from_raw(*raw);
+                        if actual != *expected {
+                            wrong_type += 1;
+                            if examples.len() < 10 {
+                                examples.push(format!(
+                                    "{source} {id}: type {raw} ({actual:?}), expected {expected:?}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let good = checks.len() - unknown - wrong_type;
+            println!("
+{} zone sound references checked:", checks.len());
+            println!(
+                "  {good} resolve to a sound of the right type ({:.1}%)",
+                if checks.is_empty() {
+                    0.0
+                } else {
+                    good as f64 * 100.0 / checks.len() as f64
+                }
+            );
+            println!("  {unknown} name no sound entry at all");
+            println!("  {wrong_type} resolve to a sound of the wrong type");
+            for example in &examples {
+                println!("    {example}");
+            }
+
+            // And how many zones actually reach any of this, which is the
+            // number that says whether wiring it up is worth anything.
+            let area_bytes = chain.read(AreaTable::PATH)?;
+            let areas = AreaTable::parse(&area_bytes)?;
+            let with_music = areas.iter().filter(|a| a.zone_music() != 0).count();
+            let with_ambience = areas.iter().filter(|a| a.ambience_id() != 0).count();
+            println!(
+                "
+{} areas: {with_music} name zone music, {with_ambience} name ambience",
+                areas.len()
+            );
         }
 
         SoundCommand::Export { id, out } => {

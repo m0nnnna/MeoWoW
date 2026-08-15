@@ -158,6 +158,14 @@ struct ChunkHeights {
     position: [f32; 3],
     holes: u16,
     heights: Vec<f32>,
+    /// Which `AreaTable` row this chunk belongs to, and so which music and
+    /// ambience the player standing on it should hear.
+    ///
+    /// Stored per *chunk* rather than per tile because it genuinely varies
+    /// within one: a tile is a third of a mile square and Elwynn's tiles carry
+    /// Goldshire, the abbey and open forest at once. Keying sound off the tile
+    /// would change the music a third of a mile from where the zone does.
+    area_id: u32,
 }
 
 impl TileHeights {
@@ -188,6 +196,7 @@ impl TileHeights {
                 position: chunk.position,
                 holes: chunk.holes,
                 heights: chunk.heights.clone(),
+                area_id: chunk.area_id,
             });
         }
 
@@ -209,6 +218,22 @@ impl TileHeights {
         let cy = (((self.origin.1 - y) / adt::CHUNK_SIZE).floor() as i64).clamp(0, side - 1);
         let chunk = self.chunks.get((cy * side + cx) as usize)?.as_ref()?;
         adt::height_in_chunk(chunk.position, &chunk.heights, chunk.holes, x, y)
+    }
+
+    /// Which area a position sits in, or `None` off this tile.
+    ///
+    /// Deliberately shares `height_at`'s indexing rather than repeating it.
+    /// That arithmetic is the subject of a long comment about the stored
+    /// chunk indices tracking the *other* axis, and two copies of it would
+    /// agree right up until someone fixed one of them.
+    fn area_at(&self, x: f32, y: f32) -> Option<u32> {
+        let side = adt::CHUNKS_PER_TILE as i64;
+        let cx = (((self.origin.0 - x) / adt::CHUNK_SIZE).floor() as i64).clamp(0, side - 1);
+        let cy = (((self.origin.1 - y) / adt::CHUNK_SIZE).floor() as i64).clamp(0, side - 1);
+        let chunk = self.chunks.get((cy * side + cx) as usize)?.as_ref()?;
+        // Zero means the chunk names no area, which is a real answer and not
+        // a missing one -- plenty of open water and unfinished terrain does.
+        (chunk.area_id != 0).then_some(chunk.area_id)
     }
 }
 
@@ -652,6 +677,17 @@ impl World {
     pub fn height_at(&self, x: f32, y: f32) -> Option<f32> {
         let tile = tile_at(Vec3::new(x, y, 0.0));
         self.tiles.get(&tile)?.heights.height_at(x, y)
+    }
+
+    /// Which `AreaTable` area a position sits in, if its tile is resident.
+    ///
+    /// `None` while the tile is still streaming in, which a caller must not
+    /// confuse with "nowhere": the answer arrives a moment later, and treating
+    /// the gap as a zone change would stop the music every time the player
+    /// crossed a tile boundary ahead of the loader.
+    pub fn area_at(&self, x: f32, y: f32) -> Option<u32> {
+        let tile = tile_at(Vec3::new(x, y, 0.0));
+        self.tiles.get(&tile)?.heights.area_at(x, y)
     }
 
     /// Where a character ends up moving from `from` towards `to`.

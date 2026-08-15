@@ -929,6 +929,64 @@ dbc_table! {
     }
 }
 
+dbc_table! {
+    /// Which music a zone plays, and how long it stays quiet between tracks.
+    ///
+    /// Reached from [`AreaTable`]'s `zone_music`. Names no file itself -- the
+    /// two id columns point at [`SoundEntries`], which is where the paths
+    /// live.
+    ///
+    /// **Day and night are separate tracks, and that is what identifies the
+    /// pair.** Two adjacent columns of sound ids could just as easily be one
+    /// value duplicated, or a track and a fallback. `Zone-Forest` has 2523 in
+    /// both and says nothing; `Zone-EvilForest` has 2524 and 2534, and
+    /// `Zone-Jungle` has 5494 and 2535. A column that differs from its
+    /// neighbour on some rows and not others is two things, not one written
+    /// twice.
+    ///
+    /// Verified beyond mere validity: every id here resolves to a
+    /// [`SoundEntries`] row **of the music type**, which a wrong column would
+    /// not manage -- see `wow-cli sound zones`.
+    ZoneMusic, ZoneMusicRow, path = r"DBFilesClient\ZoneMusic.dbc", fields = 8, {
+        0 id: u32,
+        /// A label like `Zone-Forest`. Never played, useful for finding a row.
+        1 name: str,
+        /// Milliseconds of silence between tracks. Min before max: column 3
+        /// reaches 1,800,000 where column 2 stops at 300,000, and a minimum
+        /// cannot exceed its own maximum.
+        ///
+        /// **Not used yet.** This client plays a zone's track on a loop rather
+        /// than pausing between plays, so these are transcribed and ignored.
+        2 silence_min_day: u32,
+        3 silence_max_day: u32,
+        4 silence_min_night: u32,
+        5 silence_max_night: u32,
+        /// [`SoundEntries`] id played during the day.
+        6 day_sound: u32,
+        /// [`SoundEntries`] id played at night. Often the same as the day
+        /// track; sometimes deliberately not.
+        7 night_sound: u32,
+    }
+}
+
+dbc_table! {
+    /// The looping background of a zone -- birdsong, wind, water.
+    ///
+    /// Reached from [`AreaTable`]'s `ambience_id`, and the smallest table
+    /// here: an id and two [`SoundEntries`] ids, for day and night.
+    ///
+    /// Every one of the 412 ids across this table resolves to a
+    /// [`SoundEntries`] row of the ambience type, which is a far stronger
+    /// statement than the ids merely being in range -- see
+    /// `wow-cli sound zones`.
+    SoundAmbience, SoundAmbienceRow,
+    path = r"DBFilesClient\SoundAmbience.dbc", fields = 3, {
+        0 id: u32,
+        1 day_sound: u32,
+        2 night_sound: u32,
+    }
+}
+
 /// The [`SoundEntriesRow::sound_type`] values this client acts on.
 ///
 /// **Measured, not remembered.** The column runs 1-53 across 26 distinct

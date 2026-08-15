@@ -14,6 +14,7 @@ mod items;
 mod live;
 mod model;
 mod scene;
+mod sound;
 mod spells;
 mod spelltext;
 mod terrain;
@@ -107,6 +108,15 @@ struct Args {
     #[arg(long)]
     screenshot: Option<PathBuf>,
 
+    /// Music volume, 0 to 1. Zero switches zone music off entirely.
+    ///
+    /// Separate from ambience because they are genuinely different things to
+    /// want: plenty of people play with the music off and the birdsong on.
+    #[arg(long, default_value_t = 0.35)]
+    music_volume: f32,
+    /// Ambience volume, 0 to 1. Zero switches it off.
+    #[arg(long, default_value_t = 0.6)]
+    ambience_volume: f32,
     /// Light the world as if it were this game hour, 0 to 24.
     ///
     /// Overrides the realm's own clock, which is otherwise where the hour comes
@@ -1750,6 +1760,22 @@ struct App {
     spellbook_open: bool,
     /// Item icons, loaded from the archives if there are any.
     items: items::Items,
+    /// The sound tables, and the two channels that play them.
+    ///
+    /// The output stream is held for its whole life on purpose: dropping it
+    /// stops every sound, which is the sort of bug that presents as "audio
+    /// works for one frame". `None` when no audio device could be opened at
+    /// all, which is a perfectly ordinary state on a machine with no sound
+    /// card and must not stop the client.
+    /// The last area the player was known to be in.
+    ///
+    /// Kept because `area_at` answers `None` while a tile streams in, and a
+    /// zone change is not the same event as a tile not being loaded yet.
+    area: Option<u32>,
+    sounds: sound::Sounds,
+    audio: Option<rodio::OutputStream>,
+    music: sound::Channel,
+    ambience: sound::Channel,
     /// Whether the bag window is open, on the same reasoning as
     /// `spellbook_open`.
     bags_open: bool,
@@ -2215,6 +2241,20 @@ impl App {
             bars_seeded: false,
             spellbook_open: false,
             items: items::Items::default(),
+            area: None,
+            sounds: sound::Sounds::default(),
+            // Opened once, here, rather than on the first sound: enumerating
+            // devices takes long enough to be a visible hitch, and doing it
+            // mid-play would put that hitch on a zone boundary.
+            audio: match rodio::OutputStreamBuilder::open_default_stream() {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    tracing::warn!("no audio device, the client will be silent: {error}");
+                    None
+                }
+            },
+            music: sound::Channel::new(),
+            ambience: sound::Channel::new(),
             bags_open: false,
             character_open: false,
             looting: None,
@@ -2794,6 +2834,11 @@ impl App {
             self.anim_time_ms = self.anim_time_ms.wrapping_add(step);
         }
         let (anim, anim_time) = (self.anim, self.anim_time_ms);
+
+        // **Before the renderer is borrowed**, because this needs the archive
+        // chain and the scene at the same time and the draw below holds the
+        // renderer for its whole body.
+        self.update_sound();
 
         let Some(r) = self.renderer.as_mut() else {
             return;
@@ -3674,6 +3719,98 @@ impl App {
         ) && !entity.is_dead_or_ghost()
     }
 
+    /// Starts, stops or leaves alone the zone's music and ambience.
+    ///
+    /// Called every frame and cheap when nothing has changed -- each channel
+    /// remembers what it is playing and returns immediately when asked for the
+    /// same thing, which is the only reason calling it at the frame rate is
+    /// sane.
+    ///
+    /// **A missing area is not silence.** `area_at` returns `None` while the
+    /// tile under the player is still streaming in, and treating that as "no
+    /// zone" would cut the music every time the player outran the loader. The
+    /// last known area is kept and used until a real one replaces it.
+    fn update_sound(&mut self) {
+        if self.audio.is_none() {
+            return;
+        }
+        // Where the character actually is. Read from the live session rather
+        // than from replicated state, which holds the login position forever
+        // -- the trap this project has now walked into from three separate
+        // callers.
+        let Some(at) = self.live.as_ref().map(|live| live.position) else {
+            return;
+        };
+
+        let area = match self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.scene.as_ref())
+            .and_then(|scene| match scene {
+                Scene::Streaming(world) => world.area_at(at.x, at.y),
+                _ => None,
+            }) {
+            Some(area) => {
+                self.area = Some(area);
+                area
+            }
+            None => match self.area {
+                Some(area) => area,
+                None => return,
+            },
+        };
+
+        // Without a clock, treat it as day. An offline view has no realm time
+        // and picking night for it would be an odd default.
+        let hour = self.live.as_ref().and_then(|live| {
+            let (time, learned) = live.state.game_time?;
+            Some(time.advanced(learned.elapsed()).minute_of_day() as f32 / 60.0)
+        });
+        let when = sound::TimeOfDay::at_hour(hour.unwrap_or(12.0));
+        let (music, ambience) = self
+            .sounds
+            .zone(area)
+            .map(|zone| zone.for_time(when))
+            .unwrap_or((None, None));
+
+        // One roll per call is fine: a channel only consults it when it is
+        // actually starting something, which is rare.
+        let roll = self.last_frame.elapsed().subsec_nanos() as f32 / 1_000_000_000.0;
+        // **Logged when it changes, not every frame.** A zone's music is the
+        // sort of thing that is either obviously working or obviously not, and
+        // "obviously" needs an ear -- so this leaves a trail that says what it
+        // decided, which is readable without one. That has caught more in this
+        // project than looking has.
+        if (self.music.playing(), self.ambience.playing()) != (music, ambience) {
+            tracing::debug!(
+                "area {area} at {when:?}: music {:?} -> {music:?}, ambience {:?} -> {ambience:?}",
+                self.music.playing(),
+                self.ambience.playing(),
+            );
+        }
+
+        let Some(audio) = self.audio.as_ref() else {
+            return;
+        };
+        let mixer = audio.mixer();
+        self.music.play(
+            mixer,
+            &self.sounds,
+            &mut self.chain,
+            music,
+            self.args.music_volume,
+            roll,
+        );
+        self.ambience.play(
+            mixer,
+            &self.sounds,
+            &mut self.chain,
+            ambience,
+            self.args.ambience_volume,
+            roll,
+        );
+    }
+
     /// Reads names and icons for whatever the character knows, once.
     ///
     /// Separate from `pump_live_connection` rather than tucked inside it: that
@@ -3703,6 +3840,7 @@ impl App {
         // mid-fight and stalling a frame on `Item.dbc` would be a hitch a
         // player could feel and could not explain.
         self.items = items::Items::load(&mut self.chain);
+        self.sounds = sound::Sounds::load(&mut self.chain);
         self.seed_action_bars();
     }
 

@@ -33,3 +33,4 @@ adt = { version = "0.0.1", path = "../../crates/adt" }
 auth = { version = "0.0.1", path = "../../crates/auth" }
 world = { version = "0.0.1", path = "../../crates/world" }
 ui = { version = "0.0.1", path = "../../crates/ui" }
+rodio = { version = "0.21.1", default-features = false, features = ["mp3", "playback", "symphonia-mp3", "symphonia-wav", "wav"] }
