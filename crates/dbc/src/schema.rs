@@ -987,6 +987,90 @@ dbc_table! {
     }
 }
 
+dbc_table! {
+    /// A creature's voice: what it says when it attacks, is hurt, or dies.
+    ///
+    /// Reached from `CreatureDisplayInfo`'s `sound_id`. Thirty-eight columns
+    /// of `SoundEntries` ids with nothing in the file saying which is which,
+    /// and every one of them holds ids from the same range -- so validity
+    /// separates none of them and a wrong column plays a footstep for a death.
+    ///
+    /// **The columns identified themselves through the names of the sounds
+    /// they point at.** `SoundEntries` carries a human label per sound and
+    /// those labels are systematic, so a column whose entries are called
+    /// `WolfDeath`, `BearDeath` and `KoboldDeath` is the death column. That is
+    /// a measurement, and `wow-cli sound creatures` is the instrument -- it
+    /// tallies the trailing word of every name each column reaches.
+    ///
+    /// Only the five that came back overwhelming are named:
+    ///
+    /// | field | rows set | name tail | also |
+    /// |---|---|---|---|
+    /// | 1 | 818 | `Attack` x787 | 816 are creature-typed sounds |
+    /// | 3 | 836 | `Wound` x826 | 836 |
+    /// | 4 | 818 | `Crit`/`Critical` x749 | 818 |
+    /// | 6 | 659 | `Death` x634 | 658 |
+    /// | 10 | 575 | `Aggro` x459 | 575 |
+    ///
+    /// The rest stay unnamed. Several are obvious guesses -- field 13 is 351
+    /// `Aggro` and field 33 is 15 `Birth` -- and a guess is what this refuses.
+    ///
+    /// Field 0 is the id, and it is worth saying why that needed proving too:
+    /// it is set on all 1,306 rows and 935 of those "resolve" to a real sound,
+    /// which looks like a populated sound column until you notice only 102 of
+    /// them are creature sounds. Ids overlapping a table's id range is a
+    /// coincidence of magnitude, not a reference.
+    CreatureSoundData, CreatureSoundDataRow,
+    path = r"DBFilesClient\CreatureSoundData.dbc", fields = 38, {
+        0  id: u32,
+        /// Played when the creature swings.
+        1  attack: u32,
+        /// Played when the creature is hit.
+        3  wound: u32,
+        /// Played when the creature is hit hard.
+        4  wound_critical: u32,
+        /// Played when it falls over.
+        6  death: u32,
+        /// Played when it notices you.
+        10 aggro: u32,
+    }
+}
+
+dbc_table! {
+    /// What a weapon sounds like when it lands.
+    ///
+    /// Thirty rows, one per weapon subclass, and each names ten sound ids for
+    /// the ten things a weapon can hit -- then ten more for the critical
+    /// versions of the same.
+    ///
+    /// **The columns named themselves, the same way `CreatureSoundData`'s
+    /// did.** Row 1 is subclass 0 and its first three ids resolve to sounds
+    /// called `Axe1H_ArmorFlesh`, `Axe1H_ArmorChain` and `Axe1H_ArmorPlate`;
+    /// the second block's first is `Axe1H_ArmorFleshCritical`. That is the
+    /// layout stated by the data rather than recalled: flesh, chain and plate
+    /// in order, and the second block mirroring the first.
+    ///
+    /// Only flesh is transcribed. Chain and plate need the *target's* armour,
+    /// which this client does not know -- and the remaining seven columns
+    /// (shield impacts, parries, wood, stone) are events it does not model
+    /// either. Naming columns nothing can use would be transcribing for its
+    /// own sake; they are recorded in the doc above and left in the file.
+    ///
+    /// Field 1 is the subclass from [`Item`]: a two-handed sword is subclass 8
+    /// and lands on the row whose field 1 is 8.
+    WeaponImpactSounds, WeaponImpactSoundsRow,
+    path = r"DBFilesClient\WeaponImpactSounds.dbc", fields = 23, {
+        0  id: u32,
+        /// [`Item`]'s `subclass_id` for weapons.
+        1  weapon_subclass: u32,
+        /// Hitting an unarmoured target -- which is every creature, as far as
+        /// this client can tell.
+        3  flesh: u32,
+        /// The same, on a critical.
+        13 flesh_critical: u32,
+    }
+}
+
 /// The [`SoundEntriesRow::sound_type`] values this client acts on.
 ///
 /// **Measured, not remembered.** The column runs 1-53 across 26 distinct

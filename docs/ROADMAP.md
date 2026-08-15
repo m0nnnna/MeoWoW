@@ -3164,3 +3164,101 @@ Finding all of this needed the survey command fixed first: it released the
 corpse and *then* tried to take things off it, so the money moved and the item
 did not, and the printout said `0 new item(s)` as though the opcode were wrong.
 Anything acting on open loot has to happen before the release.
+
+### 4.14: sound
+
+The client makes a noise. Zone music, ambience, creature voices and weapon
+impacts, all driven by the tables rather than by anything hardcoded.
+
+`SoundEntries` is the table everything points at -- 12,941 rows, ten filenames
+and ten weights apiece, because a sound is a *set* of files and a footstep or a
+sword hit picks one at random each time. Its column layout was read off the
+file's own shape and then checked against something the data cannot fake: the
+strings have to name **files that exist**. 93% of file references resolve, and
+the 7% that miss are clustered in character voice lines rather than scattered,
+which is a different finding and visible as one. A one-column slip resolves
+essentially nothing.
+
+The type column was measured rather than remembered. It runs 1-53 over 26
+values, and instead of writing down which number means music, `sound types`
+tallies which folders each value's entries live in: type 28 is 629 of 632 under
+`Sound\Music`, type 50 is 273 of 273 under `Sound\Ambience`, type 10 is 6,153 of
+6,380 under `Sound\Creature`. Only those three are named. Type 1 is 69%
+`Sound\Spells` and not clean enough to put a name on.
+
+#### The zone chain, and a check stronger than validity
+
+Position to ADT chunk to `AreaTable` to `ZoneMusic` or `SoundAmbience` to
+`SoundEntries` to a file. Every link but the last already existed.
+
+`ZoneMusic` ids run into a table of 12,941 rows spanning ids 3-18019, so any
+small integer lands on a real row -- validity separates nothing. What a wrong
+column cannot do is land on a row of the right *kind*: **99.1% of 1,144 zone
+sound references resolve to a sound whose type matches what named it**, and
+those types were themselves measured. The ten that miss are five dangling ids
+counted twice, in Blizzard's own data.
+
+Day and night being two columns rather than one written twice is measured the
+same way. `Zone-Forest` has 2523 in both and proves nothing; `Zone-EvilForest`
+has 2524 and 2534. A column that differs from its neighbour on some rows and not
+others is two things.
+
+Area is stored per *chunk*, not per tile. A tile is a third of a mile square and
+Elwynn's carry Goldshire, the abbey and open forest at once, so keying off the
+tile would change the music a third of a mile from where the zone does. A tile
+still streaming in answers `None`, and that is held rather than treated as
+silence -- otherwise the music cuts every time the player outruns the loader.
+
+#### Creature voices, and a column that was an override
+
+`CreatureSoundData` is 38 columns of sound ids with nothing saying which is the
+death cry. They identified themselves through the *names* of the sounds they
+reach: a column whose entries are called `WolfDeath`, `BearDeath` and
+`KoboldDeath` is the death column. Five came back overwhelming -- attack
+(`Attack` x787 of 818), wound (`Wound` x826 of 836), critical wound
+(`Crit`/`Critical` x749), death (`Death` x634) and aggro (`Aggro` x459) -- and
+the rest stay unnamed.
+
+Field 0 needed proving too, and is the nice one: it is set on all 1,306 rows and
+935 of those "resolve" to a real sound, which looks like a populated sound
+column until you notice only 102 of them are *creature* sounds. It is the id.
+Ids overlapping a table's id range is a coincidence of magnitude, not a
+reference.
+
+**Then combat was silent, and the log said why.** `CreatureDisplayInfo`'s
+`sound_id` is an *override*, and most creatures do not use it: the Diseased
+Young Wolf's display carries zero, while its **model** carries 43, which is the
+row holding a wolf's growls. Reading only the display found voices for 1,205
+displays of 24,262 -- and every creature anyone fights in a starting zone was in
+the silent majority, which presented as the feature simply not working. Falling
+back to the model took it to 24,220.
+
+#### Weapon impacts, and a sound that arrived before the sword
+
+`WeaponImpactSounds` is thirty rows, one per weapon subclass, each naming ten
+sounds for the ten things a weapon can hit and ten more for the criticals. The
+columns named themselves again: row 1's first three ids are `Axe1H_ArmorFlesh`,
+`Axe1H_ArmorChain` and `Axe1H_ArmorPlate`, and the second block's first is
+`Axe1H_ArmorFleshCritical`.
+
+Only flesh is transcribed. Chain and plate need the target's armour, which this
+client cannot see, and guessing between them is exactly what it refuses to do.
+
+The last problem was timing, and it came back from the window as *"the audio
+plays -> sword makes contact"*. The server reports a swing when it **resolves**
+it and the client only then *starts* the attack animation, so an impact played
+on arrival lands before the blade. The right number is the time from the
+animation's first frame to the frame the weapon connects -- which is in the
+model's own timed events, and this client parses none of them. So it is a
+constant found the only way available: adjustable in play with `[` and `]`, and
+dialled in by a person watching a sword. **625ms.** It stays adjustable because
+that is what it is.
+
+#### What sound is not
+
+No distance attenuation, no volume curve beyond a flat multiply, no crossfade
+between zones, and `ZoneMusic`'s four silence-interval columns are transcribed
+and ignored -- this loops where the original pauses between tracks. Other
+players' weapons make no sound, because their equipment arrives as visible-item
+fields this client does not read. Spell sounds, footsteps and interface clicks
+are all untouched.

@@ -21,7 +21,10 @@
 
 use std::io::Cursor;
 
-use dbc::schema::{AreaTable, SoundAmbience, SoundEntries, SoundType, ZoneMusic};
+use dbc::schema::{
+    AreaTable, CreatureDisplayInfo, CreatureModelData, CreatureSoundData, Item, SoundAmbience,
+    SoundEntries, SoundType, WeaponImpactSounds, ZoneMusic,
+};
 use mpq::Chain;
 
 /// Which of a zone's two tracks to use.
@@ -133,6 +136,54 @@ impl Entry {
 pub struct Sounds {
     entries: std::collections::HashMap<u32, Entry>,
     zones: std::collections::HashMap<u32, ZoneSound>,
+    /// Creature display id to the sounds it makes.
+    ///
+    /// Keyed by *display* id rather than by creature entry because that is
+    /// what a replicated unit carries and what the renderer already resolves
+    /// -- one lookup, and no second identity to keep in step.
+    creatures: std::collections::HashMap<u32, CreatureVoice>,
+    /// Item entry to its weapon subclass, for the weapons that have one.
+    ///
+    /// Only weapons are kept -- `Item.dbc` has 46,096 rows and a subclass
+    /// means something different in every class, so storing all of them would
+    /// be storing a number whose meaning depends on a column not stored
+    /// beside it.
+    weapon_subclass: std::collections::HashMap<u32, u32>,
+    /// Weapon subclass to its `(flesh, flesh_critical)` impact sounds.
+    impacts: std::collections::HashMap<u32, (u32, u32)>,
+}
+
+/// What one kind of creature sounds like.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CreatureVoice {
+    pub attack: Option<u32>,
+    pub wound: Option<u32>,
+    pub wound_critical: Option<u32>,
+    pub death: Option<u32>,
+    pub aggro: Option<u32>,
+}
+
+/// Which of a creature's sounds to play.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Voice {
+    Attack,
+    Wound,
+    Death,
+    Aggro,
+}
+
+impl CreatureVoice {
+    pub fn get(&self, which: Voice) -> Option<u32> {
+        match which {
+            Voice::Attack => self.attack,
+            // Falls back to the ordinary wound sound, because plenty of
+            // creatures set one and not the other and silence would read as a
+            // missing feature rather than as missing data.
+            Voice::Wound => self.wound.or(self.wound_critical),
+            Voice::Death => self.death,
+            Voice::Aggro => self.aggro,
+        }
+    }
 }
 
 impl Sounds {
@@ -205,13 +256,113 @@ impl Sounds {
             }
         }
 
+        // Creature voices, keyed by display id: CreatureDisplayInfo names a
+        // CreatureSoundData row, and that row names the individual sounds.
+        let voices: std::collections::HashMap<u32, CreatureVoice> = chain
+            .read(CreatureSoundData::PATH)
+            .ok()
+            .and_then(|bytes| CreatureSoundData::parse(&bytes).ok())
+            .map(|t| {
+                t.iter()
+                    .map(|row| {
+                        let some = |id: u32| (id != 0).then_some(id);
+                        (
+                            row.id(),
+                            CreatureVoice {
+                                attack: some(row.attack()),
+                                wound: some(row.wound()),
+                                wound_critical: some(row.wound_critical()),
+                                death: some(row.death()),
+                                aggro: some(row.aggro()),
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // **A display's own sound id is an override, and most creatures do not
+        // use it.** The Diseased Young Wolf's display carries `sound_id: 0`
+        // and would have been silent; its *model* carries 43, which is the
+        // row that actually holds a wolf's growls. Reading only the display
+        // found a voice for 1,205 displays of 24,262, and every creature
+        // anyone fights in a starting zone was in the silent majority -- which
+        // presented as combat sounds simply not working.
+        //
+        // So: the display's id when it has one, the model's otherwise.
+        let model_sounds: std::collections::HashMap<u32, u32> = chain
+            .read(CreatureModelData::PATH)
+            .ok()
+            .and_then(|bytes| CreatureModelData::parse(&bytes).ok())
+            .map(|t| t.iter().map(|row| (row.id(), row.sound_id())).collect())
+            .unwrap_or_default();
+
+        if let Some(displays) = chain
+            .read(CreatureDisplayInfo::PATH)
+            .ok()
+            .and_then(|bytes| CreatureDisplayInfo::parse(&bytes).ok())
+        {
+            for display in displays.iter() {
+                let sound_id = match display.sound_id() {
+                    0 => model_sounds.get(&display.model_id()).copied().unwrap_or(0),
+                    own => own,
+                };
+                if let Some(voice) = voices.get(&sound_id) {
+                    sounds.creatures.insert(display.id(), *voice);
+                }
+            }
+        }
+
+        // Weapon impacts. `Item`'s class 2 is a weapon, and its subclass then
+        // selects a `WeaponImpactSounds` row.
+        const WEAPON_CLASS: u32 = 2;
+        if let Some(items) = chain
+            .read(Item::PATH)
+            .ok()
+            .and_then(|bytes| Item::parse(&bytes).ok())
+        {
+            for row in items.iter() {
+                if row.class_id() == WEAPON_CLASS {
+                    sounds.weapon_subclass.insert(row.id(), row.subclass_id());
+                }
+            }
+        }
+        sounds.impacts = chain
+            .read(WeaponImpactSounds::PATH)
+            .ok()
+            .and_then(|bytes| WeaponImpactSounds::parse(&bytes).ok())
+            .map(|t| {
+                t.iter()
+                    .map(|row| (row.weapon_subclass(), (row.flesh(), row.flesh_critical())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         tracing::info!(
-            "sound tables loaded in {:?}: {} entries, {} areas with sound",
+            "sound tables loaded in {:?}: {} entries, {} areas with sound, {} creature voices",
             started.elapsed(),
             sounds.entries.len(),
-            sounds.zones.len()
+            sounds.zones.len(),
+            sounds.creatures.len()
         );
         sounds
+    }
+
+    /// What a creature with this display id sounds like.
+    pub fn creature(&self, display_id: u32) -> Option<CreatureVoice> {
+        self.creatures.get(&display_id).copied()
+    }
+
+    /// The sound an item makes when it lands on something unarmoured.
+    ///
+    /// **Flesh, always.** Chain and plate have their own columns and picking
+    /// between them needs the target's armour, which this client cannot see --
+    /// so rather than guess, it plays the one that is right for a creature and
+    /// wrong for nothing it currently fights.
+    pub fn weapon_impact(&self, item_entry: u32, critical: bool) -> Option<u32> {
+        let subclass = self.weapon_subclass.get(&item_entry)?;
+        let (flesh, flesh_critical) = self.impacts.get(subclass)?;
+        let id = if critical { *flesh_critical } else { *flesh };
+        (id != 0).then_some(id)
     }
 
     /// What an area sounds like. `None` for an area naming nothing, which is
@@ -326,6 +477,122 @@ impl Channel {
 impl Default for Channel {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Plays one-off sounds -- a swing, a wound, a death cry.
+///
+/// Separate from [`Channel`] because the questions are opposite. A channel
+/// holds *one* looping sound and must not restart it; this fires many
+/// overlapping short ones and must not stop them. Two creatures dying at once
+/// is two sounds, not the second replacing the first.
+#[derive(Default)]
+pub struct Effects {
+    /// Sinks still playing, drained as they finish.
+    ///
+    /// **Kept, and that is not optional**: dropping a rodio sink stops it, so
+    /// a fire-and-forget effect that is not held is silent. It has to be
+    /// retained until it has actually finished, which is what `sweep` is for.
+    playing: Vec<rodio::Sink>,
+    refused: std::collections::HashSet<u32>,
+    /// Sounds waiting for their moment, and when that moment is.
+    ///
+    /// **A hit sound has to land with the blade, not with the packet.** The
+    /// server tells the client about a swing when it resolves it, and the
+    /// client then *starts* the attack animation -- so playing the impact on
+    /// arrival puts the clang before the sword arrives, which is exactly how
+    /// it was reported: "the audio plays -> sword makes contact".
+    ///
+    /// The delay is a property of the animation rather than of the sound, so
+    /// it is supplied by the caller and this only keeps the clock.
+    delayed: Vec<(std::time::Instant, u32, f32)>,
+}
+
+impl Effects {
+    /// How many sounds are in flight, after forgetting the finished ones.
+    ///
+    /// Called every frame. Without it the vector grows for the whole session
+    /// -- one entry per sound ever played -- which is a slow leak rather than
+    /// a loud one, and those are the ones that survive.
+    pub fn sweep(&mut self) -> usize {
+        self.playing.retain(|sink| !sink.empty());
+        self.playing.len()
+    }
+
+    /// Queues a sound to play once `delay` has passed.
+    pub fn play_after(&mut self, delay: std::time::Duration, id: u32, volume: f32) {
+        self.delayed
+            .push((std::time::Instant::now() + delay, id, volume));
+    }
+
+    /// Fires anything whose moment has come.
+    ///
+    /// Called once a frame. Frame-rate granularity is the limit on how
+    /// accurately this can place a sound, which at 60fps is 16ms -- well under
+    /// what anyone can hear against a sword swing.
+    pub fn tick(
+        &mut self,
+        mixer: &rodio::mixer::Mixer,
+        sounds: &Sounds,
+        chain: &mut Chain,
+        roll: f32,
+    ) {
+        let now = std::time::Instant::now();
+        let mut due = Vec::new();
+        self.delayed.retain(|(at, id, volume)| {
+            if *at <= now {
+                due.push((*id, *volume));
+                false
+            } else {
+                true
+            }
+        });
+        for (id, volume) in due {
+            self.play(mixer, sounds, chain, id, volume, roll);
+        }
+    }
+
+    /// Fires a sound once, if it can be loaded.
+    pub fn play(
+        &mut self,
+        mixer: &rodio::mixer::Mixer,
+        sounds: &Sounds,
+        chain: &mut Chain,
+        id: u32,
+        volume: f32,
+        roll: f32,
+    ) {
+        // A ceiling on simultaneous effects. A pack of creatures dying
+        // together should not be able to queue an unbounded number of sinks,
+        // and past a handful it is noise rather than detail anyway.
+        const AT_ONCE: usize = 16;
+        if self.refused.contains(&id) || self.sweep() >= AT_ONCE {
+            return;
+        }
+        let Some(entry) = sounds.entry(id) else {
+            self.refused.insert(id);
+            return;
+        };
+        let Some(path) = entry.pick(roll) else {
+            self.refused.insert(id);
+            return;
+        };
+        let Ok(bytes) = chain.read(path) else {
+            self.refused.insert(id);
+            return;
+        };
+        match rodio::Decoder::new(Cursor::new(bytes)) {
+            Ok(source) => {
+                let sink = rodio::Sink::connect_new(mixer);
+                sink.set_volume(volume * entry.volume);
+                sink.append(source);
+                self.playing.push(sink);
+            }
+            Err(error) => {
+                tracing::debug!("{path} would not decode: {error}");
+                self.refused.insert(id);
+            }
+        }
     }
 }
 

@@ -117,6 +117,26 @@ struct Args {
     /// Ambience volume, 0 to 1. Zero switches it off.
     #[arg(long, default_value_t = 0.6)]
     ambience_volume: f32,
+    /// Combat sound volume, 0 to 1.
+    #[arg(long, default_value_t = 0.8)]
+    effects_volume: f32,
+    /// How long after a swing is reported its impact sound plays, in
+    /// milliseconds.
+    ///
+    /// **625ms, found by ear against the animation** -- which is the only
+    /// thing that could have told us. The server reports a swing when it
+    /// resolves it and the client only then *starts* the attack animation, so
+    /// an impact played on arrival lands before the blade does. That is how it
+    /// was reported: "the audio plays -> sword makes contact".
+    ///
+    /// The honest number is the time from the animation's first frame to the
+    /// frame the weapon connects, and reading that out of the model is a
+    /// separate piece of work -- M2 animations carry timed events and this
+    /// client parses none of them. Until it does, this is a constant found by
+    /// a person watching a sword and pressing a key, and it stays adjustable
+    /// in play for exactly that reason.
+    #[arg(long, default_value_t = 625)]
+    impact_delay_ms: u64,
     /// Light the world as if it were this game hour, 0 to 24.
     ///
     /// Overrides the realm's own clock, which is otherwise where the hour comes
@@ -1773,6 +1793,33 @@ struct App {
     /// zone change is not the same event as a tile not being loaded yet.
     area: Option<u32>,
     sounds: sound::Sounds,
+    /// One-shot combat sounds, and the ids waiting to be fired.
+    ///
+    /// Queued rather than played where they are noticed, because the swing
+    /// loop holds `self.live` borrowed and playing needs the archive chain.
+    /// Drained once per frame in `update_sound`.
+    effects: sound::Effects,
+    /// `(sound id, is an impact)`. Impacts are held back to land with the
+    /// blade; voices fire at once -- a creature's yelp is its *reaction* and
+    /// the packet is already the moment it reacted.
+    pending_sounds: Vec<(u32, bool)>,
+    /// How long an impact sound waits, in milliseconds.
+    ///
+    /// Runtime state rather than a fixed argument because the right value is
+    /// found *by ear against the animation* and nothing else can tell you it
+    /// -- so it is adjustable in play with `[` and `]`, which turns several
+    /// rebuild-and-relaunch cycles into one session. Seeded from
+    /// `--impact-delay-ms`.
+    impact_delay_ms: u64,
+    /// Who was already attacking last frame.
+    ///
+    /// **Derived from the replicated map rather than from an event**, which is
+    /// the pattern this project's notes recommend: `SMSG_ATTACKSTART` is a
+    /// statement made once and its count is all that survives folding, where
+    /// `WorldState::attacking` says who is fighting whom for as long as it is
+    /// true. A guid that is in it now and was not before has just noticed
+    /// somebody.
+    attackers: std::collections::HashSet<u64>,
     audio: Option<rodio::OutputStream>,
     music: sound::Channel,
     ambience: sound::Channel,
@@ -1813,6 +1860,13 @@ enum Looting {
     /// stops showing, this is the corpse to release.
     Open(u64),
 }
+
+/// The equipment slot a weapon swings from.
+///
+/// Named rather than written as `15` at the call site: the slot vocabulary was
+/// measured against a live realm and the number means nothing without that.
+/// See `world::inventory::InventorySlot::label`.
+const MAIN_HAND_SLOT: usize = 15;
 
 /// How far the pointer may travel between press and release and still count as
 /// a click rather than as a look.
@@ -2183,6 +2237,8 @@ fn local_notice(text: String) -> ::world::ChatMessage {
 
 impl App {
     fn new(args: Args, chain: Chain) -> Self {
+        // Read before `args` is moved into the struct below.
+        let impact_delay_ms = args.impact_delay_ms;
         // Read before the window exists, so a layout that fails to parse is
         // reported at startup rather than at the first frame -- and bound here
         // rather than inline because the camera's starting distance is one of
@@ -2243,6 +2299,10 @@ impl App {
             items: items::Items::default(),
             area: None,
             sounds: sound::Sounds::default(),
+            effects: sound::Effects::default(),
+            pending_sounds: Vec::new(),
+            impact_delay_ms,
+            attackers: std::collections::HashSet::new(),
             // Opened once, here, rather than on the first sound: enumerating
             // devices takes long enough to be a visible hitch, and doing it
             // mid-play would put that hitch on a zone boundary.
@@ -2627,6 +2687,22 @@ impl ApplicationHandler for App {
                             // separate keys for each bag.
                             KeyCode::KeyB => {
                                 self.bags_open = !self.bags_open;
+                                window.request_redraw();
+                                return;
+                            }
+                            // `[` and `]` tune the impact delay by ear. See
+                            // `App::impact_delay_ms` -- the number can only be
+                            // found against the animation, so it is found in
+                            // play rather than guessed between restarts.
+                            KeyCode::BracketLeft | KeyCode::BracketRight => {
+                                let step: i64 =
+                                    if code == KeyCode::BracketRight { 50 } else { -50 };
+                                self.impact_delay_ms =
+                                    (self.impact_delay_ms as i64 + step).clamp(0, 3000) as u64;
+                                let text =
+                                    format!("impact delay {}ms", self.impact_delay_ms);
+                                tracing::info!("{text}");
+                                self.chat.push(Line::Chat(local_notice(text)));
                                 window.request_redraw();
                                 return;
                             }
@@ -3793,6 +3869,45 @@ impl App {
             return;
         };
         let mixer = audio.mixer();
+
+        // Combat sounds queued since the last frame. Swept every frame either
+        // way -- a finished sink that is never dropped is a slow leak, which
+        // is the kind that survives.
+        self.effects.sweep();
+        let volume = self.args.effects_volume;
+
+        // A creature that has just started attacking someone. Compared against
+        // last frame's set rather than driven by the packet, so it survives
+        // the fold that reduces `SMSG_ATTACKSTART` to a counter.
+        if let Some(live) = self.live.as_ref() {
+            let now: std::collections::HashSet<u64> =
+                live.state.attacking.keys().copied().collect();
+            for guid in now.difference(&self.attackers) {
+                if let Some(id) = live
+                    .state
+                    .get(*guid)
+                    .and_then(|entity| entity.display_id())
+                    .and_then(|display| self.sounds.creature(display))
+                    .and_then(|voice| voice.get(sound::Voice::Aggro))
+                {
+                    self.pending_sounds.push((id, false));
+                }
+            }
+            self.attackers = now;
+        }
+        for (id, impact) in std::mem::take(&mut self.pending_sounds) {
+            if impact {
+                // Held back so the clang lands with the blade rather than with
+                // the packet -- see `Effects::delayed`.
+                self.effects
+                    .play_after(Duration::from_millis(self.impact_delay_ms), id, volume);
+            } else {
+                self.effects
+                    .play(mixer, &self.sounds, &mut self.chain, id, volume, roll);
+            }
+        }
+        self.effects
+            .tick(mixer, &self.sounds, &mut self.chain, roll);
         self.music.play(
             mixer,
             &self.sounds,
@@ -4156,6 +4271,70 @@ impl App {
                             kind,
                             spawned: Instant::now(),
                         });
+                    }
+                    // The victim's voice, not the attacker's: a sword
+                    // hitting a wolf is the wolf's yelp. A miss makes no
+                    // sound at all, which is what the original does and what
+                    // stops a whiffing fight sounding identical to a landing
+                    // one.
+                    // What the attacker's blow sounds like. A creature has a
+                    // voice; a player has a *weapon*, and the two come from
+                    // completely different tables.
+                    //
+                    // Only our own weapon is known. Another player's equipment
+                    // arrives as visible-item fields this client does not read
+                    // yet, so their swings fall back to nothing rather than to
+                    // a guessed sword.
+                    let weapon = (swing.attacker == live.guid)
+                        .then(|| {
+                            ::world::inventory::equipped(&live.state, live.guid)
+                                [MAIN_HAND_SLOT]
+                                .and_then(|item| item.entry)
+                        })
+                        .flatten()
+                        .and_then(|entry| {
+                            self.sounds.weapon_impact(entry, swing.critical())
+                        });
+                    match weapon {
+                        Some(id) if !swing.missed() => {
+                            self.pending_sounds.push((id, true))
+                        }
+                        _ => {
+                            if let Some(id) = live
+                                .state
+                                .get(swing.attacker)
+                                .and_then(|entity| entity.display_id())
+                                .and_then(|display| self.sounds.creature(display))
+                                .and_then(|voice| voice.get(sound::Voice::Attack))
+                            {
+                                // A creature's swing is a vocal effort, not an
+                                // impact -- it happens as the blow starts.
+                                self.pending_sounds.push((id, false));
+                            }
+                        }
+                    }
+                    if !swing.missed() {
+                        let voice = live
+                            .state
+                            .get(swing.victim)
+                            .and_then(|entity| entity.display_id())
+                            .and_then(|display| self.sounds.creature(display));
+                        if let Some(voice) = voice {
+                            // `overkill` is non-zero only on a killing blow --
+                            // the field that identified itself by reading 0
+                            // for fourteen swings and 7 for the fifteenth.
+                            let which = if swing.overkill > 0 {
+                                sound::Voice::Death
+                            } else {
+                                sound::Voice::Wound
+                            };
+                            // The victim's cry is a reaction to being hit,
+                            // so it belongs at the moment of contact too.
+                            if let Some(id) = voice.get(which) {
+                                self.pending_sounds.push((id, true));
+                            }
+ 
+                        }
                     }
                     self.chat.push(Line::Swing(swing.clone()));
                 }

@@ -18,6 +18,7 @@ streams, and the protocol reaches a live realm. Phase 4 has started.
 | Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components. **The player's weapon is drawn**: the M2 attachment table parses, and a sword or shield hangs off the hand's animated bone and swings with it. Shoulders, helms and ranged weapons are not, and there is no sheathed state — see below. Other players' equipment still needs their visible-item fields |
 | Game | **4.3 done**: three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. **A spellbook panel** (`P`) now lists what the character can do and puts it on a bar by click, auto-attack included -- see the note below on why the seeding filter had to reject it. Threat and the corpse *interface* remain (the corpse protocol is done). Quests follow |
 | Loot | **Works end to end.** Right-click a body to open it, click a row to take money or an item, and the corpse releases itself once empty -- a client that never releases leaves the body locked to it for everyone else. `CMSG_LOOT` `0x15D`, `CMSG_LOOT_MONEY` `0x15E`, `CMSG_AUTOSTORE_LOOT_ITEM` `0x108`, `SMSG_LOOT_RESPONSE` `0x160`, `SMSG_LOOT_REMOVED` `0x162`, `SMSG_LOOT_CLEAR_MONEY` `0x165` -- every one confirmed by content or by effect. A loot slot is the **server's** index and never a row position: the numbers do not close up when one is taken |
+| Sound | **4.14 done.** Zone music and ambience by area and hour, creature attack/wound/death/aggro voices, and weapon impacts -- all from the tables. `SoundEntries`' layout is checked by its filenames resolving in the archive (93%); the zone tables by their ids landing on a sound of the **right type** (99.1%), which validity alone cannot show. `CreatureSoundData`'s 38 columns identified themselves through the *names* of the sounds they reach. No distance attenuation, no crossfade, no spell or footstep sounds |
 | Inventory | **4.13 done bar looting.** A **single combined bag window** (`B`) covering the backpack *and every equipped bag's contents* -- deliberately unlike the original's one frame per bag -- with real icons, stack counts and money; a separate **character panel** (`C`) with the nineteen worn slots, all nineteen named. The slot array, coinage, stack count, container capacity, container contents and the owner/contained pair were all measured against the live realm. `CMSG_AUTOEQUIP_ITEM` is confirmed *by effect*. Nothing can be moved from the interface yet -- the equip write exists but no drag does |
 
 Roughly 60% of the way to something a person could test by playing. See
@@ -701,6 +702,27 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   live. The loot window opened and did nothing. Anything that reads
   `response.clicked()` has to appear in that list, and there is now a headless
   test that clicks a row and asserts what comes back.
+- **A column that is an override is not the column most rows use.** Combat was
+  silent because `CreatureDisplayInfo.sound_id` was read as *the* creature's
+  sound, and it is an override that most displays leave at zero -- the real one
+  lives on the **model**. It found voices for 1,205 displays of 24,262, and
+  every creature in a starting zone was in the silent majority, so the feature
+  looked broken rather than partial. Falling back to the model took it to
+  24,220. When a lookup works for a minority, check whether the field is a
+  default or an exception.
+- **Names are data too, and they identify columns nothing else can.**
+  `CreatureSoundData` is 38 columns of sound ids with nothing saying which is
+  the death cry, and every one holds ids from the same range -- so validity
+  separates none of them. But `SoundEntries` carries a *label* per sound, and a
+  column whose entries are called `WolfDeath`, `BearDeath` and `KoboldDeath` is
+  the death column. The same move named `WeaponImpactSounds`' flesh, chain and
+  plate columns. Where a table points at labelled rows, read the labels.
+- **A field that is set on every row and resolves most of the time can still be
+  the id.** `CreatureSoundData`'s column 0 is set on all 1,306 rows and 935 of
+  those land on a real sound, which reads as a well-populated sound column --
+  until you notice only 102 of them are *creature* sounds where every genuine
+  column is near 100%. Ids overlapping a table's id range is a coincidence of
+  magnitude.
 - **A sample that cannot exhibit the thing you are looking for is not
   evidence.** Three attempts to capture a loot response came back empty and
   each looked like a protocol problem. A GM `.die` kill generates no loot at

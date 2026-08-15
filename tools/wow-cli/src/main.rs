@@ -4339,6 +4339,26 @@ enum SoundCommand {
     /// measured rather than assumed. Same reasoning that separated
     /// `Spell.dbc`'s duration column from its plausible neighbours.
     Zones,
+    /// Work out what each column of `CreatureSoundData` is for, by reading the
+    /// names of the sounds it points at.
+    ///
+    /// **The identification problem, and the instrument for it.** That table
+    /// is 38 columns of sound ids with nothing saying which is the death cry
+    /// and which is the footstep. Every column holds ids in the same range, so
+    /// validity separates none of them -- and naming them from memory is the
+    /// mistake this project keeps refusing.
+    ///
+    /// `SoundEntries` carries a human label per sound, though, and those
+    /// labels are systematic: a column whose entries are called `WolfDeath`,
+    /// `BearDeath` and `KoboldDeath` is the death column, and that is a
+    /// measurement. This tallies the most common words in each column's names
+    /// and prints them, so the answer is read off the data rather than
+    /// recalled.
+    Creatures {
+        /// Only consider this many rows.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Extract a sound's files to disk so they can actually be listened to.
     ///
     /// The audio equivalent of `blp export`: a format that has only ever been
@@ -4570,6 +4590,76 @@ fn sound_cmd(chain: &mut Chain, cmd: &SoundCommand) -> Result<()> {
             );
         }
 
+        SoundCommand::Creatures { limit } => {
+            use std::collections::BTreeMap;
+
+            let names: std::collections::HashMap<u32, (String, u32)> = table
+                .iter()
+                .map(|row| (row.id(), (row.name().to_string(), row.sound_type())))
+                .collect();
+
+            let raw = chain.read(r"DBFilesClient\CreatureSoundData.dbc")?;
+            let sounds = dbc::Dbc::parse(&raw)?;
+            println!(
+                "
+CreatureSoundData: {} rows x {} fields",
+                sounds.len(),
+                sounds.fields()
+            );
+
+            // For each column: how many rows set it, how many of those resolve
+            // to a sound at all, how many resolve to a *creature* sound, and
+            // the words that keep appearing in their names.
+            for field in 0..sounds.fields() as usize {
+                let mut set = 0usize;
+                let mut resolved = 0usize;
+                let mut creature_typed = 0usize;
+                let mut words: BTreeMap<String, usize> = BTreeMap::new();
+
+                for (index, row) in sounds.rows().enumerate() {
+                    if limit.is_some_and(|l| index >= l) {
+                        break;
+                    }
+                    let id = row.u32(field);
+                    if id == 0 {
+                        continue;
+                    }
+                    set += 1;
+                    let Some((name, kind)) = names.get(&id) else {
+                        continue;
+                    };
+                    resolved += 1;
+                    if dbc::schema::SoundType::from_raw(*kind)
+                        == dbc::schema::SoundType::Creature
+                    {
+                        creature_typed += 1;
+                    }
+                    // Split a name like `WolfDeath` on its capitals and keep
+                    // the trailing word -- that is the part that describes the
+                    // *event* rather than the creature.
+                    if let Some(word) = split_camel_tail(name) {
+                        *words.entry(word).or_default() += 1;
+                    }
+                }
+
+                if set == 0 {
+                    println!("  field {field:>2}: never set");
+                    continue;
+                }
+                let mut top: Vec<(&String, &usize)> = words.iter().collect();
+                top.sort_by(|a, b| b.1.cmp(a.1));
+                let summary: Vec<String> = top
+                    .iter()
+                    .take(3)
+                    .map(|(word, n)| format!("{word} x{n}"))
+                    .collect();
+                println!(
+                    "  field {field:>2}: {set:>4} set, {resolved:>4} resolve, {creature_typed:>4} are creature sounds   {}",
+                    summary.join(", ")
+                );
+            }
+        }
+
         SoundCommand::Export { id, out } => {
             let row = table
                 .iter()
@@ -4600,6 +4690,22 @@ fn sound_cmd(chain: &mut Chain, cmd: &SoundCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The trailing capitalised word of a name like `WolfDeath` -> `Death`.
+///
+/// The event half of a sound's label. Splitting on capitals is crude and does
+/// not need to be better: this is a tally used to *read* what a column
+/// contains, not something any behaviour depends on.
+fn split_camel_tail(name: &str) -> Option<String> {
+    let mut start = 0;
+    for (index, ch) in name.char_indices() {
+        if ch.is_ascii_uppercase() {
+            start = index;
+        }
+    }
+    let tail = name.get(start..)?.trim_end_matches(|c: char| c.is_ascii_digit());
+    (!tail.is_empty()).then(|| tail.to_string())
 }
 
 fn item_cmd(chain: &mut Chain, cmd: ItemCommand) -> Result<()> {
