@@ -273,6 +273,16 @@ enum Command {
         /// wrong face.
         #[arg(long)]
         appearance: bool,
+        /// After entering, print every replicated *unit* with its entry, its
+        /// name and every field it has set.
+        ///
+        /// The `--own-fields` of other people's units, and the instrument the
+        /// NPC-interaction work starts from: which field marks a creature as a
+        /// questgiver or a vendor is a number nobody should write down from
+        /// memory, and the server's own `creature_template.npcflag` is an
+        /// independent answer to check a candidate against.
+        #[arg(long)]
+        unit_fields: bool,
         /// Print every field set on this character's own object, for diffing
         /// one state against another -- alive against dead, say.
         #[arg(long)]
@@ -664,6 +674,7 @@ fn main() -> Result<()> {
             stay,
             units,
             objects,
+            unit_fields,
             items,
             equip,
             loot,
@@ -698,6 +709,7 @@ fn main() -> Result<()> {
                 stay: *stay,
                 units: *units,
                 objects: *objects,
+                unit_fields: *unit_fields,
                 items: *items,
                 equip,
                 loot: *loot,
@@ -852,6 +864,7 @@ struct WorldRequest<'a> {
     stay: u64,
     units: Option<usize>,
     objects: bool,
+    unit_fields: bool,
     items: bool,
     equip: &'a [u16],
     loot: bool,
@@ -911,6 +924,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         stay,
         units,
         objects,
+        unit_fields,
         items,
         equip,
         loot,
@@ -1646,6 +1660,10 @@ cast {spell_id} at {} (attempt {attempt})",
             survey_loot(&mut connection, &mut state, character.guid, here)?;
         }
 
+        if unit_fields {
+            report_unit_fields(&state, character.guid);
+        }
+
         if items {
             report_items(&state, character.guid);
         }
@@ -2091,6 +2109,42 @@ fn report_game_objects(state: &world::WorldState) {
 /// is the trap this project's notes call "validity is nearly free; variation is
 /// the discriminator". So every field of every item is printed raw, with no
 /// interpretation applied whatsoever.
+/// Dumps every replicated unit's fields, for identifying the ones nothing
+/// reads yet.
+///
+/// **The point is that a candidate field can be checked against an answer from
+/// outside the packet.** `creature_template.npcflag` in the server's own
+/// database says which creatures are questgivers, vendors and innkeepers, and
+/// it is not something the client is told directly -- so a field whose value
+/// equals that number, for several creatures with several different values, is
+/// identified rather than guessed. Innkeeper Farley is 66179 and a wolf is 0.
+fn report_unit_fields(state: &world::WorldState, own_guid: u64) {
+    let units: Vec<&world::state::Entity> = state
+        .iter()
+        .filter(|entity| entity.guid != own_guid)
+        .filter(|entity| entity.object_type == world::ObjectType::Unit)
+        .collect();
+
+    println!("
+{} replicated unit(s):", units.len());
+    for entity in &units {
+        let entry = entity
+            .fields
+            .get(world::update::fields::OBJECT_ENTRY)
+            .unwrap_or(0);
+        // The entry, not the name: it is what `creature_template` is keyed
+        // by, and cross-referencing against that table is the whole point.
+        println!("
+  {:#018x}  entry {entry}", entity.guid);
+        let fields: Vec<String> = entity
+            .fields
+            .iter()
+            .map(|(index, value)| format!("{index:#x}={value}"))
+            .collect();
+        println!("    {}", fields.join(" "));
+    }
+}
+
 fn report_items(state: &world::WorldState, own_guid: u64) {
     use world::inventory::{self, SlotKind};
 

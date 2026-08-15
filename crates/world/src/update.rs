@@ -1163,6 +1163,34 @@ pub mod fields {
     /// other field would coincidentally hold.
     pub const PLAYER_FIELD_COINAGE: u16 = 0x0492;
 
+    /// `UNIT_NPC_FLAGS`: what this creature will do if you talk to it --
+    /// gossip, hand out quests, sell things, train, repair.
+    ///
+    /// **The gate for the whole NPC-interaction feature**, and confirmed
+    /// against a source the client is never given. The server's own
+    /// `creature_template.npcflag` is a number in its database that is not
+    /// sent to a client as such, so a field carrying exactly that value is
+    /// identified rather than guessed.
+    ///
+    /// Of seventy replicated units around Northshire, this field reads `0` on
+    /// all sixty-nine creatures the database gives no flags -- wolves, kobolds,
+    /// a rabbit, a deer -- and reads exactly **66179** on an Innkeeper Farley
+    /// spawned in among them, which is precisely his `npcflag`. An arbitrary
+    /// five-digit number matching on the one unit that should have it, with
+    /// every other unit at zero, is not a coincidence of magnitude.
+    ///
+    /// Worth noting the field is *present and zero* on ordinary creatures
+    /// rather than absent, which makes the discriminator unambiguous: this is
+    /// one of the fields a create block sends regardless.
+    ///
+    /// **The individual bits are deliberately not named.** 66179 is
+    /// `0x10283`, so at least five are set, and which bit means "vendor"
+    /// rather than "innkeeper" cannot be read off one sample. They are also
+    /// checkable by *behaviour* -- whether a gossip request to a unit carrying
+    /// a given bit is answered -- which is a stronger test than any table
+    /// lookup and is how the equip and loot writes were confirmed.
+    pub const UNIT_NPC_FLAGS: u16 = 0x52;
+
     /// `ITEM_FIELD_STACK_COUNT`: how many are in this stack.
     ///
     /// Measured by **variation**, which is the only thing that could separate
