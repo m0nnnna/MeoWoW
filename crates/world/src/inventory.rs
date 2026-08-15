@@ -10,13 +10,23 @@
 //! query per slot, and it would be thirty-nine round trips to learn something
 //! the client was told at login.
 //!
-//! **The slot vocabulary below is measured, and the measured part stops where
-//! the comments say it stops.** Four equipment slots were confirmed against a
-//! live realm by prediction (see [`update::fields::PLAYER_FIELD_INV_SLOT_HEAD`]);
-//! the rest of the equipment names are *not* yet confirmed and are deliberately
-//! absent rather than guessed. A wrong name for a slot never fails loudly -- it
-//! draws a helm in the boots square and looks like a rendering bug -- which is
-//! the same trap `describe_cast_failure` is built around.
+//! **Every slot name below was measured, and none was transcribed.** A wrong
+//! name for a slot never fails loudly -- it draws a helm in the boots square
+//! and looks like a rendering bug -- which is the same trap
+//! `describe_cast_failure` is built around. Three independent routes produced
+//! them and they agree where they overlap: a prediction about what a starting
+//! warrior wears (which is what identified the array's base, see
+//! [`update::fields::PLAYER_FIELD_INV_SLOT_HEAD`]), letting the server choose
+//! a destination via `CMSG_AUTOEQUIP_ITEM` and recording it, and reading a
+//! hunter's starting gun out of `SMSG_CHAR_ENUM`.
+//!
+//! Two gaps that were deliberately left open in the first pass are now closed,
+//! and both closed the same way: **by changing the character rather than the
+//! technique.** Slot 17 could not be filled by a warrior because a warrior is
+//! refused every ranged weapon, and a bag's contents could not be read because
+//! no bag this project had seen was ever non-empty. A dwarf hunter is created
+//! wearing a gun *and* an ammo pouch with shot in it, which answered both in a
+//! single login. A refusal is a fact about the character, not about the slot.
 //!
 //! [`update::fields::PLAYER_FIELD_INV_SLOT_HEAD`]: crate::update::fields::PLAYER_FIELD_INV_SLOT_HEAD
 //! [`ObjectType::Item`]: crate::ObjectType
@@ -137,13 +147,22 @@ impl InventorySlot {
     /// Hand by completely unrelated reasoning. Two derivations agreeing is
     /// evidence in a way that either alone is not.
     ///
-    /// **Slot 17 is unnamed because it could not be measured.** It is
-    /// presumably the ranged slot -- it is the one gap in an otherwise
-    /// contiguous run -- but every ranged item tried (a bow, a rifle, a
-    /// fishing pole) came back refused with a single `0x0112`, because the
-    /// character doing the testing is a warrior. "Presumably" is not a
-    /// measurement, and an inferred name is exactly the kind that gets
-    /// believed. A hunter would settle it in one run.
+    /// **Slot 17 was the one gap, and a hunter settled it in one run -- which
+    /// is exactly what the note left here predicted.** Every ranged item
+    /// offered to a warrior came back refused with a single `0x0112`, so the
+    /// obvious inference ("it must be ranged") stayed uninferred rather than
+    /// being written down on the strength of it being the only slot left.
+    ///
+    /// A dwarf hunter is created wearing an Old Blunderbuss, and it lands
+    /// here. Two independent structures agree: `SMSG_CHAR_ENUM` reports the
+    /// character wearing inventory type 26 at index 17, and the update-field
+    /// slot array puts that item's guid at this slot. Those are parsed by
+    /// completely separate code, which is the difference between a measurement
+    /// and a plausible guess.
+    ///
+    /// Worth keeping as a method note: when a slot could not be filled, the
+    /// answer was not a better item but a different *character*. A refusal is
+    /// a fact about the character, not about the slot.
     pub fn label(self) -> Option<&'static str> {
         match self.0 {
             0 => Some("Head"),
@@ -163,7 +182,7 @@ impl InventorySlot {
             14 => Some("Back"),
             15 => Some("Main Hand"),
             16 => Some("Off Hand"),
-            // 17: see the doc comment. Measured as refused, not as absent.
+            17 => Some("Ranged"),
             18 => Some("Tabard"),
             _ => None,
         }
@@ -198,46 +217,145 @@ pub struct HeldItem {
     pub capacity: Option<u32>,
 }
 
-/// The slots a bag window can actually draw: the backpack, and nothing inside
-/// an equipped bag.
+/// Where an item is sitting, for something that may be inside a bag.
 ///
-/// **What a bag's contents are addressed by is not yet known, which is why
-/// this function exists rather than callers filtering [`held`] themselves.**
+/// The backpack and a bag's interior are different address spaces -- backpack
+/// slot 2 and "slot 2 of the pouch worn in bag slot 1" are both real and
+/// different -- so a window drawing them together has to keep them apart. A
+/// bare index could not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Where {
+    /// One of the player's own thirty-nine slots.
+    Own(InventorySlot),
+    /// Inside an equipped bag: which bag slot it hangs off, and which slot of
+    /// that bag it occupies.
+    InBag { bag: InventorySlot, slot: u16 },
+}
+
+/// One carried item and where it lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Carried {
+    pub at: Where,
+    pub item: HeldItem,
+}
+
+/// Everything the character is carrying that a bag window should draw: the
+/// backpack's sixteen slots, then the contents of each equipped bag.
 ///
-/// This is a gap with a reason, recorded so the next attempt does not start
-/// where this one did. Everything above was measured against the live realm;
-/// this could not be, and the obstacle was not the protocol.
+/// Worn equipment is excluded -- that is the character panel's job.
 ///
-/// A container replicates as an ordinary object carrying
-/// [`fields::CONTAINER_FIELD_NUM_SLOTS`], so a bag announces its capacity the
-/// moment it is replicated -- including one merely sitting in the backpack.
-/// What it does *not* carry is any field naming its contents, and that is
-/// consistent rather than surprising: the bags observed were empty, an
-/// object-create block omits zero fields entirely, and an empty slot is a
-/// zero. So an empty bag and a bag whose contents array we cannot find look
-/// exactly the same, which means the array can only be located from a bag with
-/// something in it.
+/// **A bag's contents were the last deliberate gap in this module, and closing
+/// it needed a fixture rather than a technique.** Every bag this project had
+/// seen was empty, and an empty bag is byte-identical to a bag whose contents
+/// array we cannot find: a create block omits zero fields, and an empty slot
+/// is a zero. `.additem` never puts a bag in a bag slot, and hand-editing
+/// `character_inventory` does not survive the server's own loader -- it
+/// relocates a hand-placed bag and its contents into the backpack, and the
+/// wire reports that faithfully while the database still says otherwise.
 ///
-/// Getting one proved to be the hard part. `.additem` places a bag in the
-/// backpack, never in a bag slot, and moving it there by editing
-/// `character_inventory` directly does not survive: the server's own loader
-/// declines a hand-placed bag and relocates it and its contents into the
-/// backpack, which is what the wire then reports. Three runs confirmed the
-/// wire and the database disagreeing in exactly that way, with the database
-/// unchanged afterwards because the session ended by closing the socket.
-///
-/// **The wire is what this client must believe, and the wire said no bags were
-/// equipped** -- so nothing here is guessing at a layout it could not see. The
-/// legitimate way to equip a bag is for a client to ask, which is a *write*,
-/// and writing a format is the riskier direction: a wrong outgoing request is
-/// accepted as some other valid one and misbehaves somewhere else. Moving
-/// items between slots is its own feature and belongs with that write, not
-/// ahead of it.
-pub fn carried(state: &WorldState, player_guid: u64) -> Vec<HeldItem> {
-    held(state, player_guid)
+/// What worked was changing the *character* rather than the technique: a dwarf
+/// hunter is created with an ammo pouch already equipped and shot already in
+/// it, which is a populated container the server built itself. See
+/// [`fields::CONTAINER_FIELD_SLOT_1`].
+pub fn carried(state: &WorldState, player_guid: u64) -> Vec<Carried> {
+    let mut out: Vec<Carried> = held(state, player_guid)
         .into_iter()
         .filter(|item| item.slot.kind() == SlotKind::Backpack)
+        .map(|item| Carried {
+            at: Where::Own(item.slot),
+            item,
+        })
+        .collect();
+
+    // Then each equipped bag, in bag-slot order, so the window's layout is a
+    // function of where the bags are worn rather than of hash-map order.
+    for bag in bags(state, player_guid).into_iter().flatten() {
+        for (slot, item) in bag_contents(state, bag).into_iter().enumerate() {
+            let Some(item) = item else { continue };
+            out.push(Carried {
+                at: Where::InBag {
+                    bag: bag.slot,
+                    slot: slot as u16,
+                },
+                item,
+            });
+        }
+    }
+    out
+}
+
+/// What is inside one equipped bag, one entry per slot it has.
+///
+/// Empty slots come back as `None` rather than being skipped, because a bag's
+/// capacity is what a window draws and a missing entry would close the gap and
+/// shift everything after it.
+///
+/// An empty list for anything that is not a container, which is the honest
+/// answer rather than an error: asking what is inside a sword has no contents
+/// rather than being a failure.
+pub fn bag_contents(state: &WorldState, bag: HeldItem) -> Vec<Option<HeldItem>> {
+    let Some(capacity) = bag.capacity else {
+        return Vec::new();
+    };
+    let Some(container) = state.get(bag.guid) else {
+        return Vec::new();
+    };
+
+    (0..capacity)
+        .map(|index| {
+            let at = fields::CONTAINER_FIELD_SLOT_1 + (index as u16) * fields::INV_SLOT_STRIDE;
+            let guid = match container.fields.get_u64(at) {
+                Some(0) | None => return None,
+                Some(guid) => guid,
+            };
+            // A contained item is replicated as its own object exactly like
+            // one held directly -- it is simply absent from the player's slot
+            // array, which is what makes `ITEM_FIELD_CONTAINED` necessary to
+            // tell the two cases apart at all.
+            let object = state
+                .get(guid)
+                .filter(|item| matches!(item.object_type, ObjectType::Item | ObjectType::Container));
+            Some(HeldItem {
+                // A contained item has no slot in the *player's* array, so
+                // this reports the bag it hangs off rather than inventing an
+                // index into an array it is not in. Its real position is the
+                // (bag, slot) pair `carried` pairs it with.
+                slot: bag.slot,
+                guid,
+                entry: object.and_then(|item| item.fields.get(fields::OBJECT_ENTRY)),
+                count: object
+                    .and_then(|item| item.fields.get(fields::ITEM_FIELD_STACK_COUNT))
+                    .unwrap_or(1),
+                capacity: object
+                    .filter(|item| item.object_type == ObjectType::Container)
+                    .and_then(|item| item.fields.get(fields::CONTAINER_FIELD_NUM_SLOTS)),
+            })
+        })
         .collect()
+}
+
+/// What an item is inside: the player for something held directly, a bag for
+/// something in a bag.
+///
+/// See [`fields::ITEM_FIELD_CONTAINED`] -- this and the owner field hold the
+/// same value on every item a starting character carries, and come apart only
+/// when something is in a bag.
+pub fn container_of(state: &WorldState, item_guid: u64) -> Option<u64> {
+    state
+        .get(item_guid)?
+        .fields
+        .get_u64(fields::ITEM_FIELD_CONTAINED)
+        .filter(|guid| *guid != 0)
+}
+
+/// How many slots the character has to put things in, counting equipped bags.
+pub fn capacity(state: &WorldState, player_guid: u64) -> u32 {
+    BACKPACK_COUNT as u32
+        + bags(state, player_guid)
+            .into_iter()
+            .flatten()
+            .filter_map(|bag| bag.capacity)
+            .sum::<u32>()
 }
 
 /// The four bag slots, whether or not they hold anything.
@@ -468,31 +586,27 @@ mod tests {
         }
     }
 
-    /// Only measured slots are named, and **the silence is asserted as
-    /// firmly as the names**.
+    /// All nineteen worn slots are named, and nothing else is.
     ///
-    /// Slot 17 is the whole point of this test. It is the single gap in an
-    /// otherwise contiguous run of eighteen, which makes "it must be ranged"
-    /// overwhelmingly tempting and still not a measurement -- every ranged
-    /// item tried came back refused because the test character is a warrior.
-    /// A later session that fills it in from memory has to delete an assertion
-    /// that exists to say no.
+    /// This assertion used to say the opposite about slot 17 -- that it was
+    /// unmeasured and must stay unnamed. That was correct while every ranged
+    /// item offered to a warrior came back refused, and it stopped being
+    /// correct when a hunter was created wearing a gun. The rewrite is the
+    /// point: the old test existed to stop slot 17 being filled in *by
+    /// inference*, and it was retired by a measurement rather than by someone
+    /// deciding the guess was probably fine.
     #[test]
-    fn only_measured_slots_are_labelled() {
+    fn every_worn_slot_is_named_and_nothing_else_is() {
         let named: Vec<u16> = InventorySlot::all()
             .filter(|slot| slot.label().is_some())
             .map(|slot| slot.index())
             .collect();
-        assert_eq!(
-            named,
-            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18],
-            "slot 17 is unmeasured; see InventorySlot::label"
-        );
+        assert_eq!(named, (0..EQUIPPED_COUNT).collect::<Vec<_>>());
 
         assert_eq!(
             InventorySlot::new(17).unwrap().label(),
-            None,
-            "slot 17 was named without being measured"
+            Some("Ranged"),
+            "settled by a dwarf hunter's starting blunderbuss"
         );
 
         // Nothing outside the equipped region has a name: a backpack square
@@ -560,7 +674,7 @@ mod tests {
             (26, 0x4000_0000_0000_0021, 4306, 17),
         ]);
 
-        let counts: Vec<u32> = carried(&state, player).iter().map(|i| i.count).collect();
+        let counts: Vec<u32> = carried(&state, player).iter().map(|c| c.item.count).collect();
         assert_eq!(counts, vec![1, 3, 5, 17]);
 
         // A stack of one is written as the field being absent, because a
@@ -574,7 +688,7 @@ mod tests {
             ),
             create(0x0A, TYPE_ITEM, &[(fields::OBJECT_ENTRY, 6948)]),
         ]);
-        assert_eq!(carried(&state, 1)[0].count, 1);
+        assert_eq!(carried(&state, 1)[0].item.count, 1);
     }
 
     /// A bag reports its capacity and an ordinary item reports none. The
@@ -669,13 +783,124 @@ mod tests {
 
         let carried = carried(&state, player);
         assert_eq!(carried.len(), 2);
-        assert!(carried.iter().all(|i| i.slot.kind() == SlotKind::Backpack));
+        assert!(carried.iter().all(|c| matches!(c.at, Where::Own(s) if s.kind() == SlotKind::Backpack)));
 
         // Nothing counted twice, nothing lost.
         let total = equipped.iter().flatten().count()
             + bags.iter().flatten().count()
             + carried.len();
         assert_eq!(total, held(&state, player).len());
+    }
+
+    /// A bag's contents, built from the fixture that actually settled it: a
+    /// dwarf hunter's ammo pouch in bag slot 19, holding three stacks.
+    ///
+    /// The guids and counts are the ones the live realm produced. The third
+    /// stack matters most -- one contained item would locate the array's base
+    /// and say nothing about its stride, and it was adding two more that
+    /// showed guids at `0x44` and `0x46`.
+    #[test]
+    fn a_bags_contents_are_read_at_stride_two() {
+        const POUCH: u64 = 0x4000_0000_0000_0043;
+        let contents = [
+            (0x4000_0000_0000_0047u64, 2516u32, 200u32),
+            (0x4000_0000_0000_004A, 3465, 7),
+            (0x4000_0000_0000_004B, 4960, 9),
+        ];
+
+        let mut state = WorldState::new();
+        let bag_field = InventorySlot::new(19).unwrap().field();
+
+        let mut container_fields = vec![
+            (fields::OBJECT_ENTRY, 2102),
+            (fields::CONTAINER_FIELD_NUM_SLOTS, 6),
+        ];
+        let mut blocks = Vec::new();
+        for (index, (guid, entry, count)) in contents.iter().enumerate() {
+            let at = fields::CONTAINER_FIELD_SLOT_1 + (index as u16) * fields::INV_SLOT_STRIDE;
+            container_fields.push((at, *guid as u32));
+            container_fields.push((at + 1, (*guid >> 32) as u32));
+            blocks.push(create(
+                *guid,
+                TYPE_ITEM,
+                &[
+                    (fields::OBJECT_ENTRY, *entry),
+                    (fields::ITEM_FIELD_STACK_COUNT, *count),
+                    // Contained by the pouch, not by the player. This is the
+                    // field that separates the two cases at all.
+                    (fields::ITEM_FIELD_CONTAINED, POUCH as u32),
+                    (fields::ITEM_FIELD_CONTAINED + 1, (POUCH >> 32) as u32),
+                ],
+            ));
+        }
+
+        state.apply(&[
+            create(
+                4,
+                TYPE_PLAYER,
+                &[(bag_field, POUCH as u32), (bag_field + 1, (POUCH >> 32) as u32)],
+            ),
+            create(POUCH, TYPE_CONTAINER, &container_fields),
+        ]);
+        state.apply(&blocks);
+
+        let bag = bags(&state, 4)[0].expect("a bag in slot 19");
+        assert_eq!(bag.capacity, Some(6));
+
+        let inside = bag_contents(&state, bag);
+        assert_eq!(inside.len(), 6, "one entry per slot the bag has");
+        for (index, (guid, entry, count)) in contents.iter().enumerate() {
+            let held = inside[index].expect("occupied");
+            assert_eq!(held.guid, *guid);
+            assert_eq!(held.entry, Some(*entry));
+            assert_eq!(held.count, *count);
+        }
+        // Empty slots stay as holes rather than closing up, or everything
+        // after a gap would shift a square to the left.
+        assert!(inside[3..].iter().all(|slot| slot.is_none()));
+
+        // The contained items are absent from the player's own slot array --
+        // which is exactly why the containment field is needed.
+        let own: Vec<u64> = held(&state, 4).into_iter().map(|i| i.guid).collect();
+        assert_eq!(own, vec![POUCH], "only the bag itself is in the player's array");
+        for (guid, _, _) in &contents {
+            assert_eq!(container_of(&state, *guid), Some(POUCH));
+        }
+
+        // And the window's view stitches the two together.
+        let carried = carried(&state, 4);
+        assert_eq!(carried.len(), 3, "the backpack is empty; all three are in the bag");
+        assert_eq!(
+            carried[0].at,
+            Where::InBag {
+                bag: InventorySlot::new(19).unwrap(),
+                slot: 0
+            }
+        );
+        assert_eq!(capacity(&state, 4), BACKPACK_COUNT as u32 + 6);
+    }
+
+    /// An item held directly reports the *player* as its container, and that
+    /// is the whole reason the owner and containment fields cannot be told
+    /// apart without a bag: on a character with no bags they are the same
+    /// number on every item.
+    #[test]
+    fn a_directly_held_item_is_contained_by_the_player() {
+        let mut state = WorldState::new();
+        let at = InventorySlot::new(24).unwrap().field();
+        state.apply(&[
+            create(4, TYPE_PLAYER, &[(at, 0x1F), (at + 1, 0x4000_0000)]),
+            create(
+                0x4000_0000_0000_001F,
+                TYPE_ITEM,
+                &[
+                    (fields::OBJECT_ENTRY, 2589),
+                    (fields::ITEM_FIELD_OWNER, 4),
+                    (fields::ITEM_FIELD_CONTAINED, 4),
+                ],
+            ),
+        ]);
+        assert_eq!(container_of(&state, 0x4000_0000_0000_001F), Some(4));
     }
 
     #[test]

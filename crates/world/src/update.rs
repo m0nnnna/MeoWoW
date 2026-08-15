@@ -1196,6 +1196,56 @@ pub mod fields {
     /// Set only on [`ObjectType::Container`](crate::ObjectType) objects, which
     /// also carry type mask 7 where a plain item carries 3.
     pub const CONTAINER_FIELD_NUM_SLOTS: u16 = 0x40;
+
+    /// `CONTAINER_FIELD_SLOT_1`: the base of a bag's own contents array.
+    ///
+    /// Same shape as the player's inventory array -- a 64-bit guid per slot,
+    /// low word first -- so slot *n* of a bag is at `SLOT_1 + 2n`.
+    ///
+    /// **This was the last deliberate gap in the inventory work, and it closed
+    /// the moment a bag with something in it existed.** The obstacle was never
+    /// the protocol. Every bag this project had seen was empty, an
+    /// object-create block omits zero fields, and an empty slot is a zero --
+    /// so an empty bag and a bag whose contents array we could not find were
+    /// the same bytes. `.additem` never places a bag in a bag slot and
+    /// hand-editing the database does not survive the server's loader, so no
+    /// populated container had ever been observed.
+    ///
+    /// A **dwarf hunter starts with an ammo pouch already equipped and shot
+    /// already in it**, which is a legitimate fixture the server built itself.
+    /// Creating one produced a container carrying `0x42` immediately, and
+    /// adding two more stacks put guids at `0x44` and `0x46` -- three pairs,
+    /// stride two, each resolving to an item object that the *player's* slot
+    /// array does not mention. That is confirmation by variation rather than
+    /// by one lucky reading.
+    pub const CONTAINER_FIELD_SLOT_1: u16 = 0x42;
+
+    /// `ITEM_FIELD_OWNER`: whose item this is, as a guid pair. Always the
+    /// player, wherever the item is sitting.
+    ///
+    /// See [`ITEM_FIELD_CONTAINED`] for why these two are documented together:
+    /// separately, neither can be identified at all.
+    pub const ITEM_FIELD_OWNER: u16 = 0x06;
+
+    /// `ITEM_FIELD_CONTAINED`: what this item is *inside*, as a guid pair --
+    /// the player for something held directly, the bag for something in a bag.
+    ///
+    /// **These two fields are indistinguishable until an item sits inside a
+    /// bag, and that is exactly what identified them.** On every item a
+    /// starting character owns they hold the same value: the player's own guid
+    /// (`1` on one test character, `4` on another, each matching that
+    /// character's guid). Two fields holding one constant tell you nothing
+    /// about which is which, and a guess would have been believed.
+    ///
+    /// A hunter's ammo pouch separates them in one reading. Of ten items, the
+    /// seven held directly have both fields equal to the player, and the three
+    /// inside the pouch have this one holding the *pouch's* guid while
+    /// [`ITEM_FIELD_OWNER`] still holds the player's. The field that changes
+    /// when the containment changes is the containment field; the one that
+    /// does not is the owner. Same reasoning as the storm column and the game
+    /// object display id -- ask which candidate *varies the way the thing it
+    /// names varies*.
+    pub const ITEM_FIELD_CONTAINED: u16 = 0x08;
 }
 
 #[cfg(test)]

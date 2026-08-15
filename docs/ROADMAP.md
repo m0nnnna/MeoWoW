@@ -2972,3 +2972,65 @@ would have made a future run's silence unreadable:
 
 Still open: `--select --target <name>` and `--attack` choose their targets by
 different rules, so a run can select one creature and walk to another.
+
+### 4.13 continued: both deliberate gaps closed, by changing the character
+
+Two things were left explicitly unmeasured at the end of 4.13, each with a test
+or a comment asserting the silence. Both closed in a single login, and the way
+they closed is more useful than either answer.
+
+**They were being treated as protocol problems and they were not.** Equipment
+slot 17 could not be named because every ranged weapon offered to the test
+character came back refused with a single `0x0112` -- a bow, a rifle, a fishing
+pole. A bag's contents could not be located because no non-empty bag had ever
+been seen: `.additem` never places a bag in a bag slot, and a bag placed there
+by editing `character_inventory` is relocated into the backpack by the server's
+own loader. The response to both was to look for better items and cleverer
+fixtures, and neither moved.
+
+A **dwarf hunter is created wearing an Old Blunderbuss and a Small Ammo Pouch
+with two hundred Light Shot already in it.** That is a fixture the server builds
+itself, and one `--create` answered both questions. The generalisation is worth
+keeping: a refusal is a fact about the *actor*, not about the thing being asked
+for, so when a request keeps being declined the question is who is allowed to
+make it. Creating a character costs one command and was not tried for far too
+long.
+
+#### Slot 17 is Ranged, and two structures say so
+
+The blunderbuss lands at index 17, and two unrelated parsers agree: the
+character list reports the character wearing inventory type 26 at index 17, and
+the update-field slot array puts that item's guid at slot 17. Those share no
+code. The test that asserted slot 17 must stay unnamed has been rewritten to
+assert it is `Ranged` -- retired by a measurement rather than by someone
+deciding the inference was probably fine, which is the only acceptable way for
+that particular assertion to die.
+
+#### A bag's contents, and a field pair that could not be told apart
+
+`CONTAINER_FIELD_SLOT_1` is `0x42`: guid pairs at stride two, the same shape as
+the player's own slot array. One contained item locates the base and says
+nothing about the stride, so two more stacks went into the pouch and produced
+guids at `0x44` and `0x46`.
+
+The better find was next to it. `ITEM_FIELD_OWNER` (`0x06`) and
+`ITEM_FIELD_CONTAINED` (`0x08`) hold **the same value on every item a starting
+character carries** -- the player's own guid, `1` on one test character and `4`
+on another, each matching that character. Two fields holding one correct-looking
+constant confirm either reading equally well, which is to say neither. The
+hunter's pouch separates them in a single dump: of ten items, the seven held
+directly have both fields equal to the player, and the three inside the pouch
+have `0x08` holding the *pouch's* guid while `0x06` still holds the player's.
+The field that changes when the containment changes is the containment field.
+
+That also explains why a contained item is invisible to the player's slot array
+and needs the containment field at all: it is replicated as an ordinary item
+object that no slot in the player's own array mentions.
+
+#### What the window does now
+
+The bag grid is the backpack's sixteen squares followed by each equipped bag's,
+in bag-slot order, every square filled by its slot index rather than by packing
+items in. The bags themselves are not drawn as squares -- a bag is a container
+rather than a thing you carry, and drawing it beside its own contents would show
+the same items twice.

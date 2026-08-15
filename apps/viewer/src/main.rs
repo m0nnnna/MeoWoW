@@ -4161,24 +4161,41 @@ impl App {
         // The bag window, built only while it is open, and rebuilt every frame
         // for the same reasons the spellbook is.
         //
-        // **The grid is the backpack's sixteen slots, filled by slot index
-        // rather than by packing the items in order.** An item in slot 25 is
-        // drawn in the third square whether or not slots 23 and 24 hold
-        // anything -- a bag that reshuffled itself as things were used would
-        // make every slot's position meaningless, and the server's slot
-        // numbers are the only stable identity a square has.
+        // **The grid is the backpack's sixteen slots followed by each equipped
+        // bag's, and every square is filled by its slot index rather than by
+        // packing the items in order.** An item in backpack slot 25 is drawn in
+        // the third square whether or not 23 and 24 hold anything: a bag that
+        // reshuffled itself as things were used would make every position
+        // meaningless, and the server's slot numbers are the only stable
+        // identity a square has.
         //
-        // Bags equipped in slots 19-22 are deliberately not shown. Their
-        // contents are addressed by a mechanism this client has not been able
-        // to observe -- see `::world::inventory::carried` for what was tried and
-        // why it stopped there. Drawing the bags themselves as though they
-        // were their contents would be worse than leaving them out.
+        // The bags themselves (worn in slots 19-22) are not drawn as squares.
+        // A bag is a container rather than a thing you carry, and drawing it
+        // beside its own contents would show the same six items twice.
         let bags: Vec<ui::frames::BagSlot> = if self.bags_open {
-            let mut slots = vec![ui::frames::BagSlot::default(); ::world::inventory::BACKPACK_COUNT as usize];
+            use ::world::inventory::{self as inv, Where};
+
+            let mut slots = vec![ui::frames::BagSlot::default(); inv::BACKPACK_COUNT as usize];
             if let Some(live) = self.live.as_ref() {
-                let carried = ::world::inventory::carried(&live.state, live.guid);
-                for held in carried {
-                    let index = (held.slot.index() - ::world::inventory::BACKPACK_FIRST) as usize;
+                // Where each equipped bag's run of squares begins, in bag-slot
+                // order. Built before the fill so a bag's contents can be
+                // placed *by index* rather than appended -- an empty slot in
+                // the middle of a bag has to stay empty.
+                let mut base = std::collections::HashMap::new();
+                for bag in inv::bags(&live.state, live.guid).into_iter().flatten() {
+                    let Some(capacity) = bag.capacity else { continue };
+                    base.insert(bag.slot.index(), slots.len());
+                    slots.resize(slots.len() + capacity as usize, ui::frames::BagSlot::default());
+                }
+
+                for carried in inv::carried(&live.state, live.guid) {
+                    let index = match carried.at {
+                        Where::Own(slot) => (slot.index() - inv::BACKPACK_FIRST) as usize,
+                        Where::InBag { bag, slot } => match base.get(&bag.index()) {
+                            Some(base) => base + slot as usize,
+                            None => continue,
+                        },
+                    };
                     let Some(square) = slots.get_mut(index) else {
                         continue;
                     };
@@ -4186,7 +4203,7 @@ impl App {
                     // draws as occupied. `carried` keeps that distinction; a
                     // window that dropped it would show a replication gap as
                     // an empty bag.
-                    let entry = held.entry.unwrap_or(0);
+                    let entry = carried.item.entry.unwrap_or(0);
                     let icon = (entry != 0).then(|| {
                         self.items
                             .icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, entry)
@@ -4195,7 +4212,7 @@ impl App {
                         item: Some(ui::frames::BagItem {
                             entry,
                             name: self.items.name(entry),
-                            count: held.count,
+                            count: carried.item.count,
                             icon: icon.flatten(),
                         }),
                     };
