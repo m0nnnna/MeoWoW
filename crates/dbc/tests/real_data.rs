@@ -6,6 +6,7 @@
 use dbc::infer::{infer, ColumnKind};
 use dbc::schema::{
     AreaTable, CreatureDisplayInfo, CreatureModelData, Map, Spell, SpellDuration, SpellRadius,
+    WorldSafeLocs,
 };
 use dbc::Dbc;
 use mpq::Chain;
@@ -114,6 +115,53 @@ fn map_columns_land_on_the_right_values() {
     let northrend = maps.iter().find(|m| m.id() == 571).expect("Northrend");
     assert_eq!(northrend.directory(), "Northrend");
     assert_eq!(northrend.expansion_id(), 2);
+}
+
+/// `map_id` was identified by a gap, not a hit rate: `Map.dbc` is small and
+/// dense (135 rows spanning ids 0-724), so a column of small integers lands
+/// on it fairly often by chance alone. The candidate column has to clear a
+/// control by a wide margin, not merely score high in isolation.
+#[test]
+fn world_safe_locs_map_column_beats_a_control_by_a_wide_margin() {
+    let mut chain = require_data!();
+    let maps = Map::parse(&chain.read(Map::PATH).unwrap()).unwrap();
+    let locs = WorldSafeLocs::parse(&chain.read(WorldSafeLocs::PATH).unwrap()).unwrap();
+
+    let map_ids: std::collections::HashSet<u32> = maps.iter().map(|m| m.id()).collect();
+
+    let candidate_hits = locs.iter().filter(|l| map_ids.contains(&l.map_id())).count();
+    // Control: the graveyard's own id, read as if it were a map id. It
+    // shares no relationship with Map.dbc at all.
+    let control_hits = locs.iter().filter(|l| map_ids.contains(&l.id())).count();
+
+    assert_eq!(
+        candidate_hits,
+        locs.len(),
+        "every graveyard's map_id should resolve to a real Map.dbc row"
+    );
+    assert!(
+        control_hits * 2 < candidate_hits,
+        "control ({control_hits}) should be nowhere near the candidate ({candidate_hits}) \
+         or the check proves nothing"
+    );
+}
+
+#[test]
+fn world_safe_locs_columns_land_on_the_right_values() {
+    let mut chain = require_data!();
+    let locs = WorldSafeLocs::parse(&chain.read(WorldSafeLocs::PATH).unwrap()).unwrap();
+
+    let stormwind = locs.iter().find(|l| l.id() == 1).expect("graveyard 1");
+    assert_eq!(stormwind.map_id(), 0, "Stormwind's graveyard is on Eastern Kingdoms");
+    assert_eq!(stormwind.name(), "Stormwind");
+    assert!((stormwind.x() - -9115.0).abs() < 1.0);
+    assert!((stormwind.z() - 96.0).abs() < 1.0);
+
+    // Blizzard's own placeholder row: named "Reuse" and never actually used,
+    // which is why its coordinates are all zero rather than a parse bug.
+    let reuse = locs.iter().find(|l| l.id() == 1036).expect("graveyard 1036");
+    assert_eq!(reuse.name(), "Reuse");
+    assert_eq!((reuse.x(), reuse.y(), reuse.z()), (0.0, 0.0, 0.0));
 }
 
 #[test]

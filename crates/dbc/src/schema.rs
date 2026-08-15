@@ -839,6 +839,41 @@ dbc_table! {
     }
 }
 
+dbc_table! {
+    /// Where a released ghost reappears, keyed by the graveyard id a
+    /// `SMSG_DEATH_RELEASE_LOC` names.
+    ///
+    /// The server picks the graveyard and sends its position directly, so
+    /// nothing in the death flow needs to *resolve* one -- this table exists
+    /// so a graveyard id in a packet or a log can be turned into a place a
+    /// person recognises.
+    ///
+    /// Columns identified by their own shape, then checked against two
+    /// derivations sharing no code with each other or with this table:
+    /// `map_id` lands on a real `Map.dbc` row for **100%** of 685 rows,
+    /// where a control column (the graveyard's own id, read as if it were a
+    /// map id) hits only 5% -- `Map.dbc` is small and dense, so validity
+    /// alone proves little and the gap between candidate and control is the
+    /// argument. And the Stormwind and Redridge graveyards' `z` land within
+    /// 2.2 and 0.001 units of the ground `wow-cli adt height` computes at
+    /// the same `x`/`y` from the terrain files, independently of this table.
+    ///
+    /// One row (id 1036) has `x = y = z = 0.0` and is named `"Reuse"` in the
+    /// data itself -- a genuine Blizzard placeholder, not a parse bug; the
+    /// same shape as `SpellDuration`'s nonsense duration on id 2.
+    WorldSafeLocs, WorldSafeLocsRow, path = r"DBFilesClient\WorldSafeLocs.dbc", fields = 22, {
+        0 id: u32,
+        /// `Map.dbc` row this graveyard sits on.
+        1 map_id: u32,
+        2 x: f32,
+        3 y: f32,
+        4 z: f32,
+        /// Player-facing description, e.g. `"Redridge Mountains"` or
+        /// `"Duskwood, Darkshire"` -- not always the graveyard's own name.
+        5 name: loc,
+    }
+}
+
 /// Loads a table from anything that can hand back file bytes.
 ///
 /// Kept generic so the caller decides where data comes from -- an MPQ chain in
@@ -1175,7 +1210,8 @@ impl_table_info!(
     AnimationData,
     Spell,
     SpellIcon,
-    SkillLineAbility
+    SkillLineAbility,
+    WorldSafeLocs
 );
 
 /// Marker so the unused-import lint does not fire on the re-exports the macro

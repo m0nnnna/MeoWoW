@@ -633,8 +633,13 @@ enum DbcCommand {
     },
     /// Dump rows through a transcribed schema.
     Rows {
-        /// One of: Map, AreaTable, CreatureDisplayInfo, CreatureModelData,
-        /// AnimationData, Spell, SpellIcon.
+        /// One of: Map, AreaTable, CreatureDisplayInfo,
+        /// CreatureDisplayInfoExtra, CreatureModelData, AnimationData,
+        /// Spell, SpellIcon, SkillLineAbility, SpellDuration, SpellRadius,
+        /// CharSections, CharHairGeosets, Item, ItemDisplayInfo, Light,
+        /// LightParams, LightIntBand, LightFloatBand,
+        /// GameObjectDisplayInfo, SoundEntries, WorldSafeLocs. Run `dbc
+        /// check` for the current, authoritative list.
         table: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -6660,7 +6665,8 @@ fn dbc_rows(chain: &mut Chain, table: &str, limit: usize, ids: &[u32]) -> Result
         LightIntBand,
         LightFloatBand,
         GameObjectDisplayInfo,
-        SoundEntries
+        SoundEntries,
+        WorldSafeLocs
     )
     // `CharacterFacialHairStyles` is deliberately absent: it has no id column
     // at all -- race, gender and variation are its key -- so it cannot satisfy
@@ -6719,6 +6725,7 @@ fn dbc_check(chain: &mut Chain) -> Result<()> {
         LightFloatBand,
         GameObjectDisplayInfo,
         SoundEntries,
+        WorldSafeLocs,
     );
     println!();
     if failures == 0 {
