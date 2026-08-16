@@ -374,6 +374,18 @@ enum Command {
         /// `PLAYER_BYTES` and the visible-item block.
         #[arg(long)]
         quest_accept: Option<u32>,
+        /// Hand this quest in to the NPC `--quest` greeted.
+        ///
+        /// The other end of `--quest-accept`, and it goes to a **different
+        /// creature** for most quests -- the ender rather than the starter.
+        /// Offers the quest, reads the reward screen, takes reward index 0.
+        ///
+        /// Judged by the quest log emptying, never by a packet: the first of
+        /// the two sends is answered and the second is not, and the reply that
+        /// looks like a refusal on this flow is not one (see
+        /// `--quest-accept`'s note on `0x018F`).
+        #[arg(long)]
+        quest_turnin: Option<u32>,
         /// Ask where the objectives of every quest in the log are.
         ///
         /// The check the whole native-tracker plan rests on: WotLK shipped its
@@ -841,6 +853,7 @@ fn main() -> Result<()> {
             sell_back,
             quest,
             quest_accept,
+            quest_turnin,
             quest_poi,
             quest_info,
             target,
@@ -889,6 +902,7 @@ fn main() -> Result<()> {
                 sell_back: *sell_back,
                 quest: *quest,
                 quest_accept: *quest_accept,
+                quest_turnin: *quest_turnin,
                 quest_poi: *quest_poi,
                 quest_info,
 
@@ -1060,6 +1074,7 @@ struct WorldRequest<'a> {
     sell_back: bool,
     quest: Option<u32>,
     quest_accept: Option<u32>,
+    quest_turnin: Option<u32>,
     quest_poi: bool,
     quest_info: &'a [u32],
     target: Option<&'a str>,
@@ -1156,6 +1171,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         sell_back,
         quest,
         quest_accept,
+        quest_turnin,
         quest_poi,
         quest_info,
         target,
@@ -1984,6 +2000,7 @@ cast {spell_id} at {} (attempt {attempt})",
                 &mut here,
                 prefer,
                 quest_accept,
+                quest_turnin,
             )?;
         }
 
@@ -3042,6 +3059,7 @@ fn survey_quests(
     here: &mut world::Position,
     prefer: Option<u32>,
     accept: Option<u32>,
+    turn_in: Option<u32>,
 ) -> Result<()> {
     let Some(npc) = approach_talker(connection, state, own_guid, here, prefer)? else {
         return Ok(());
@@ -3052,15 +3070,57 @@ fn survey_quests(
         "\ngreeting questgiver {:#018x} entry {} at {:.1} units, npcflag {} ({:#x})",
         npc.guid, npc.entry, npc.distance, npc.flags, npc.flags
     );
+    // **Before the greeting, not after it.** Greeting a questgiver can itself
+    // put a quest in the log -- see [`accept_one_quest`] -- so a log read after
+    // the hello cannot tell "the character already had it" from "this run just
+    // caused it", and those want opposite next steps.
+    let log_at_entry = quest_log_ids(state, own_guid);
+
     connection.questgiver_hello(npc.guid)?;
     let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
     state.replicate(&batch, None);
 
     dump_unexpected(&batch, "after CMSG_QUESTGIVER_HELLO");
 
-    let Some(wanted) = accept else {
-        return Ok(());
-    };
+    if let Some(wanted) = accept {
+        accept_one_quest(connection, state, own_guid, &npc, wanted, &log_at_entry)?;
+    }
+    if let Some(wanted) = turn_in {
+        turn_in_one_quest(connection, state, own_guid, &npc, wanted)?;
+    }
+    Ok(())
+}
+
+/// Reads one quest's scroll and takes it, reporting which of our own fields
+/// moved.
+///
+/// Split out of [`survey_quests`] when the turn-in half was added: both halves
+/// need the same greeting first, and a second copy of the approach-and-greet
+/// would have drifted from this one.
+///
+/// **Asking for a quest's scroll can accept it.** A quest carrying
+/// `QUEST_FLAGS_AUTO_ACCEPT` is added to the log by the server when
+/// `CMSG_QUESTGIVER_QUERY_QUEST` arrives, before this function has sent
+/// anything at all -- so on such a quest the accept that follows is a no-op
+/// against a log that already holds it, and every effect this measures by has
+/// already happened. Only 179 of 9,464 quests on the development realm are
+/// like that, which is precisely why it is worth reporting rather than
+/// stumbling into: it is rare enough to look like a bug and common enough to
+/// hit the starting-zone chain, which is what a first end-to-end test uses.
+///
+/// `log_at_entry` is therefore read *before the greeting* and passed in. With
+/// it, "the character already held this quest" and "this run's own scroll
+/// request took it" are separable, and they want opposite next steps -- the
+/// first is fixed by clearing the quest, the second is not fixable at all and
+/// means choosing a different quest.
+fn accept_one_quest(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    npc: &Talker,
+    wanted: u32,
+    log_at_entry: &[u32],
+) -> Result<()> {
 
     // Ask for the scroll before accepting, in that order, because that is the
     // order a real client uses and the server checks the NPC actually offers
@@ -3089,7 +3149,8 @@ fn survey_quests(
     let before = own_fields_snapshot(state, own_guid);
     let log_before = quest_log_ids(state, own_guid);
     println!("\nsnapshotted {} set fields before accepting", before.len());
-    println!("quest log before: {log_before:?}");
+    println!("quest log at login:      {log_at_entry:?}");
+    println!("quest log after the scroll: {log_before:?}");
 
     println!("accepting quest {wanted}");
     connection.accept_quest(npc.guid, wanted)?;
@@ -3129,9 +3190,24 @@ fn survey_quests(
             println!("   accept took even though this run did not catch the field");
             println!("   update in its own drain.");
         }
+        // **Two ways to already hold it, and only one of them is your fault.**
+        // Telling a caller to clear a quest that this very run's scroll
+        // request will re-accept sends them round the same loop forever, which
+        // is the "nothing happened is two findings wearing one sentence" trap
+        // wearing a third hat.
+        None if log_after.contains(&wanted) && !log_at_entry.contains(&wanted) => {
+            println!("\n-- quest {wanted} entered the log during THIS run, but before the");
+            println!("   accept was sent -- it was not there at login and was there by");
+            println!("   the time the scroll came back. That is an auto-accept quest:");
+            println!("   the server adds it on CMSG_QUESTGIVER_QUERY_QUEST, so the");
+            println!("   accept had nothing left to do and this run does not test it.");
+            println!("   Clearing the quest will NOT help; pick a quest whose");
+            println!("   quest_template.Flags lacks 0x80000 and whose");
+            println!("   quest_template_addon.SpecialFlags lacks 0x4.");
+        }
         None if log_after.contains(&wanted) => {
-            println!("\n-- quest {wanted} was ALREADY in the log before this ran, so");
-            println!("   nothing here tests the accept. Clear it first:");
+            println!("\n-- quest {wanted} was ALREADY in the log at login, so nothing here");
+            println!("   tests the accept. Clear it first:");
             println!("   --say \".quest remove {wanted}\"");
         }
         None if changed.is_empty() => {
@@ -3163,6 +3239,121 @@ fn survey_quests(
         println!("\nnote: 0x018F arrived carrying {reason}. This is NOT a verdict on");
         println!("      the accept -- it shows up even when the quest was taken.");
         println!("      Judge the accept by the log above, not by this packet.");
+    }
+
+    Ok(())
+}
+
+/// Hands a finished quest in: offer it, read the reward screen, take the
+/// reward.
+///
+/// **Two sends, and neither of them is acknowledged as such.** The pair had
+/// existed in `client.rs` unfired since the milestone opened, which is exactly
+/// the situation this project's notes say is expensive: a write nothing
+/// acknowledges fails identically whether the opcode is wrong, the body is
+/// wrong, or the request was declined.
+///
+/// What makes it tractable is that the *first* of the two talks back.
+/// `CMSG_QUESTGIVER_COMPLETE_QUEST` is answered -- with the reward screen if
+/// the quest is finished, and with the still-wanted list if it is not -- so it
+/// bounds the silent second send the same way `CMSG_LIST_INVENTORY` bounded
+/// `CMSG_BUY_ITEM`. Which of those two replies arrives is itself the
+/// diagnosis, and they are reported as different outcomes rather than as one
+/// "no reward screen".
+///
+/// The verdict is by effect and never by a packet: **the quest leaves
+/// `PLAYER_QUEST_LOG`**, which is a field this project measured rather than
+/// transcribed. A turn-in that produced every expected packet and left the
+/// quest in the log did not happen.
+fn turn_in_one_quest(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    npc: &Talker,
+    wanted: u32,
+) -> Result<()> {
+    let log_before = quest_log_ids(state, own_guid);
+    println!("\nquest log before turning in: {log_before:?}");
+    if !log_before.contains(&wanted) {
+        println!("\n-- quest {wanted} is NOT in the log, so this run cannot test a");
+        println!("   turn-in: an untaken quest is refused for a reason that has");
+        println!("   nothing to do with whether the two sends are right. Accept it");
+        println!("   first (--quest <starter> --quest-accept {wanted}).");
+        return Ok(());
+    }
+
+    // The reward screen is asked for by offering the quest, and the offer is
+    // sent to *this* NPC -- which has to be the quest's ender rather than its
+    // starter. The two are different creatures for most quests, and sending it
+    // to the starter is refused in silence.
+    println!("\noffering quest {wanted} to entry {} for completion", npc.entry);
+    connection.complete_quest(npc.guid, wanted)?;
+    let offered = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+    state.replicate(&offered, None);
+    dump_unexpected(&offered, "after CMSG_QUESTGIVER_COMPLETE_QUEST");
+
+    let reward_screen = offered
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::QUESTGIVER_OFFER_REWARD);
+    let still_wants = offered
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::QUESTGIVER_REQUEST_ITEMS);
+
+    match (reward_screen, still_wants) {
+        (Some(reply), _) => println!(
+            "\nSMSG_QUESTGIVER_OFFER_REWARD, {} bytes -- the quest is finished and\n\
+             the server is showing what it pays.",
+            reply.body.len()
+        ),
+        (None, Some(reply)) => {
+            println!(
+                "\nSMSG_QUESTGIVER_REQUEST_ITEMS, {} bytes -- the send was understood",
+                reply.body.len()
+            );
+            println!("and the quest's objectives are simply not done yet. That is a");
+            println!("statement about the character, not about the opcode.");
+            return Ok(());
+        }
+        (None, None) => {
+            println!("\nneither reward screen nor wanted-list came back. Both replies");
+            println!("are ordinary answers to this send, so a silence is about the");
+            println!("opcode, the body, or this NPC not being the quest's ender --");
+            println!("and the bodies above are what separates those.");
+            return Ok(());
+        }
+    }
+
+    // `0` is not a guess here. Quest 783 has no `RewardChoiceItemID1` at all,
+    // so there is exactly one thing the index could mean and no ambiguity to
+    // resolve. A quest that *does* offer a choice needs this measured against
+    // which item actually arrives, which is a different run.
+    println!("\ntaking reward index 0");
+    connection.choose_quest_reward(npc.guid, wanted, 0)?;
+    let finished = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+    state.replicate(&finished, None);
+    dump_unexpected(&finished, "after CMSG_QUESTGIVER_CHOOSE_REWARD");
+
+    if let Some(reply) = finished
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::QUESTGIVER_QUEST_COMPLETE)
+    {
+        println!(
+            "\nSMSG_QUESTGIVER_QUEST_COMPLETE, {} bytes",
+            reply.body.len()
+        );
+    }
+
+    let log_after = quest_log_ids(state, own_guid);
+    println!("quest log after turning in:  {log_after:?}");
+
+    if log_after.contains(&wanted) {
+        println!("\n-- quest {wanted} is STILL in the log. Whatever packets arrived,");
+        println!("   the turn-in did not take: the log is the effect this is judged");
+        println!("   by, and it did not move.");
+    } else {
+        println!("\n-- quest {wanted} has left the log, which is the turn-in confirmed");
+        println!("   by effect. The log is a field this client measured, and no");
+        println!("   packet had to be believed for this line to be true.");
     }
 
     Ok(())

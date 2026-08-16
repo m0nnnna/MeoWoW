@@ -3682,3 +3682,103 @@ nobody can check is worse than a blank.
 See `docs/REUSE-POLICY.md`'s addon section: reference copies live in the
 gitignored `addons-to-port/`, are read rather than vendored, and each one's
 licence gets checked and recorded before any port begins rather than during.
+
+### 4.16: a quest taken, finished and paid for
+
+The end-to-end run this milestone was waiting for: a character created from
+nothing, a quest in its log, the quest handed in, and the reward collected.
+Quest **783 "A Threat Within"** was chosen for it because nothing in the middle
+could fail for a reason unrelated to the protocol — no kills, no items to
+collect, and `RewardChoiceItemID1 = 0`, so the reward index is unambiguously
+`0`.
+
+**The turn-in is two sends and only the first of them talks back.**
+`CMSG_QUESTGIVER_COMPLETE_QUEST` (`0x018A`) is `{u64 npc, u32 quest}` and is
+answered; `CMSG_QUESTGIVER_CHOOSE_REWARD` (`0x018E`) is
+`{u64 npc, u32 quest, u32 reward}` and is not. Both had existed in `client.rs`
+since the milestone opened and neither had ever been fired, which is exactly
+the situation this project's notes say costs the most: a write nothing
+acknowledges fails identically whether the opcode is wrong, the body is wrong,
+or the request was declined.
+
+What made it cheap was that the answered half comes *first*, so it bounds the
+silent half the way `CMSG_LIST_INVENTORY` bounded `CMSG_BUY_ITEM` in 4.15.
+Offering the quest to Marshal McBride produced **`SMSG_QUESTGIVER_OFFER_REWARD`
+(`0x018D`), 525 bytes**, carrying the quest's real completion text — so the
+opcode, the body and the choice of NPC were all right before the second send
+was attempted at all.
+
+**Which of two replies arrives is itself the diagnosis**, and the probe reports
+them as different outcomes rather than as one "no reward screen":
+`SMSG_QUESTGIVER_REQUEST_ITEMS` (`0x018B`) means the send was understood and
+the quest is simply not finished, which is a statement about the character;
+silence means the opcode, the body, or an NPC that does not end this quest.
+
+#### Confirmed by an effect nobody had to interpret
+
+`CMSG_QUESTGIVER_CHOOSE_REWARD` went out with index `0` and
+`SMSG_QUESTGIVER_QUEST_COMPLETE` (`0x0191`, 24 bytes) came back — but the
+verdict rests on none of that. **The quest log went from `[783]` to `[7]`**,
+read out of `PLAYER_QUEST_LOG`, a field this project measured rather than
+transcribed. 783 left, and quest **7 "Kobold Camp Cleanup"** — McBride's next
+quest, whose `PrevQuestID` is 783 — appeared in its place because the server
+advances an auto-accept follow-up when a reward is taken. A misread of any of
+those packets could not have produced a chain step.
+
+The realm's own database agrees independently: `character_queststatus_rewarded`
+holds 783 for the character, and its `xp` moved from 0 to 40.
+
+#### The trap the run walked into: a scroll request that accepts
+
+The same run showed the accept step doing nothing at all — 0 fields changed,
+and the log already held 783 before `CMSG_QUESTGIVER_ACCEPT_QUEST` was sent.
+The reason is not a bug and not a stale character:
+
+**A quest carrying `QUEST_FLAGS_AUTO_ACCEPT` (`0x80000`) is added to the log by
+the server when `CMSG_QUESTGIVER_QUERY_QUEST` arrives.** Asking to *read* the
+scroll takes the quest. Quest 783's flags are `524296 = 0x80008`, and the flag
+also arrives indirectly — `quest_template_addon.SpecialFlags & 0x4` is ORed
+into it at load time, which is how the whole Northshire chain acquires it.
+
+So the accept had never actually been proven. It had been *observed working*
+only on 783, where the query alone accounts for every effect, and the quest-log
+field's identification survives only because three further ids were added by
+`.quest add` and landed at a constant stride.
+
+**Proving it needed a quest the flag does not touch.** Only **179 of 9,464**
+quests on this realm auto-accept — rare enough to look like a bug, common
+enough to cover the starting zone a first end-to-end test naturally reaches
+for. Quest **333 "Harlan Needs a Resupply"** has `Flags = 0` and
+`SpecialFlags = 0`; its questgiver was spawned at the character's feet with
+`.npc add 1427`. The scroll came back (`SMSG_QUESTGIVER_QUEST_DETAILS`, 695
+bytes) and the log was **unchanged**. The accept then put `333` into field
+`0x00a3` — `PLAYER_QUEST_LOG + 1 * QUEST_LOG_STRIDE`, the second slot, exactly
+where the measured base and stride say the second quest goes.
+
+That is `CMSG_QUESTGIVER_ACCEPT_QUEST` confirmed for the first time, and it is
+confirmed by a number nothing else in a player object has a reason to hold.
+
+#### The instrument was giving the wrong advice, and that is the durable fix
+
+`--quest-accept` reported "quest 783 was ALREADY in the log, clear it first" —
+sound-looking advice that sends the reader round the same loop forever, because
+the very next run's scroll request re-accepts it. Two different situations, one
+sentence: the same shape as an equip sweep reporting `nothing moved` for both
+an unknown opcode and a deliberate refusal.
+
+Separating them costs one extra read. The quest log is now sampled **before the
+greeting** as well as after the scroll, so "the character already held this"
+and "this run's own scroll request took it" are distinguishable — and they want
+opposite next steps, since clearing the quest fixes the first and cannot fix
+the second at all.
+
+#### What is still missing
+
+Nothing is drawn. `SMSG_QUESTGIVER_QUEST_DETAILS` (695 bytes),
+`SMSG_QUESTGIVER_OFFER_REWARD` (525 bytes) and `SMSG_QUEST_QUERY_RESPONSE`
+arrive whole and are reported as lengths, not parsed — and
+`SMSG_QUEST_QUERY_RESPONSE` is the one the map and the tracker are built on.
+The per-realm cache, in which a missing answer must be *unknown* rather than
+*nothing*, is unwritten. A quest offering an actual choice of reward has not
+been turned in, so index `0` is confirmed only where there was nothing to
+choose.
