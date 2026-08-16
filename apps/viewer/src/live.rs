@@ -80,6 +80,11 @@ pub struct Entity {
     /// says about its sheath, so the round trip is the confirmation rather
     /// than a thing to work around.
     pub sheathed: bool,
+    /// How long ago this unit's sheath state was seen to change, if it was
+    /// seen to -- the same shape as `died_ms_ago`, for the same reason: a
+    /// unit that entered view already stowed must not play the transition
+    /// for a change nobody watched happen.
+    pub sheath_changed_ms_ago: Option<u32>,
 }
 
 /// Where the player is and what can be seen from there.
@@ -517,6 +522,9 @@ pub fn drawable_entities(
             fighting: state.is_fighting(entity.guid),
             appearance: entity.appearance(),
             sheathed: !entity.sheath().drawn(),
+            sheath_changed_ms_ago: entity
+                .sheath_changed_ago(now)
+                .map(|d| d.as_millis() as u32),
         });
     }
     entities
@@ -687,6 +695,9 @@ pub fn own_entity(
         // position: the server does echo this one back -- see
         // `world::state::Entity::sheath`.
         sheathed: !entity.sheath().drawn(),
+        sheath_changed_ms_ago: entity
+            .sheath_changed_ago(std::time::Instant::now())
+            .map(|d| d.as_millis() as u32),
     })
 }
 

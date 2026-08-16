@@ -389,6 +389,7 @@ mod tests {
             fighting: false,
             appearance: None,
             sheathed: true,
+            sheath_changed_ms_ago: None,
         }
     }
 
@@ -567,6 +568,7 @@ mod tests {
             died_at: None,
             last_swing: None,
             updates: 0,
+            sheath_changed_at: None,
         };
         let view = unit_view(&entity, "Creature".into());
         assert_eq!(view.health, 0);

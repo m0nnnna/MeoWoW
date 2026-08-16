@@ -84,6 +84,17 @@ pub struct Entity {
     pub last_swing: Option<std::time::Instant>,
     /// How many updates of any kind have touched this object.
     pub updates: usize,
+    /// When this unit's sheath state was *seen to change*, as opposed to
+    /// merely being whatever it currently is.
+    ///
+    /// The same distinction `died_at` draws, for the same reason: a create
+    /// block that already shows a stowed weapon is not evidence that a draw
+    /// or stow just happened, and playing the transition animation for it
+    /// would be a character re-sheathing a sword it walked into view already
+    /// carrying on its back. Set only on the transition and cleared by
+    /// nothing -- unlike death there is no equivalent of a resurrection that
+    /// should un-happen it.
+    pub sheath_changed_at: Option<std::time::Instant>,
 }
 
 /// Where the facing of a path in flight comes from.
@@ -337,6 +348,24 @@ impl Entity {
     /// How long ago this unit last swung, if it has.
     pub fn swung_ago(&self, now: std::time::Instant) -> Option<std::time::Duration> {
         self.last_swing
+            .map(|at| now.saturating_duration_since(at))
+    }
+
+    /// Records a crossing of the drawn/stowed line, given what was true
+    /// before the fields were merged. The same shape as
+    /// [`Self::note_death_transition`], with one difference: there is no
+    /// resurrection-equivalent event that should clear the mark, so this
+    /// only ever sets it.
+    fn note_sheath_transition(&mut self, was_drawn: bool) {
+        if was_drawn != self.sheath().drawn() {
+            self.sheath_changed_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// How long ago this unit's sheath state was seen to change, if it was
+    /// seen to.
+    pub fn sheath_changed_ago(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.sheath_changed_at
             .map(|at| now.saturating_duration_since(at))
     }
 
@@ -1086,8 +1115,10 @@ impl WorldState {
             existing.updates += 1;
             existing.object_type = object_type;
             let was_dead = existing.is_dead_or_ghost();
+            let was_drawn = existing.sheath().drawn();
             existing.fields.merge(fields);
             existing.note_death_transition(was_dead);
+            existing.note_sheath_transition(was_drawn);
             if movement.position.is_some() {
                 existing.position = movement.position;
                 existing.clear_predicted_move();
@@ -1119,6 +1150,11 @@ impl WorldState {
                 died_at: None,
                 last_swing: None,
                 updates: 1,
+                // Also deliberately `None`: a create block that already shows
+                // a stowed weapon is not a draw or a stow just happening, and
+                // playing the transition for it would re-sheathe a sword the
+                // unit walked into view already carrying.
+                sheath_changed_at: None,
             },
         );
     }
@@ -1138,8 +1174,10 @@ impl WorldState {
         // ordinary field update with no packet of its own, so the only way to
         // notice it is to watch the value change.
         let was_dead = entity.is_dead_or_ghost();
+        let was_drawn = entity.sheath().drawn();
         entity.fields.merge(fields);
         entity.note_death_transition(was_dead);
+        entity.note_sheath_transition(was_drawn);
     }
 
     fn update_movement(

@@ -388,6 +388,7 @@ fn build_live_scene(
                         look,
                         look_key,
                         sheathed: entity.sheathed,
+                        sheath_changed_ms_ago: entity.sheath_changed_ms_ago,
                     }
                 })
                 .collect();
@@ -3016,6 +3017,7 @@ impl App {
                                     look,
                                     look_key,
                                     sheathed: entity.sheathed,
+                                    sheath_changed_ms_ago: entity.sheath_changed_ms_ago,
                                 }
                             })
                             .collect();
