@@ -29,7 +29,7 @@ checked against.
 | Loot | **Works end to end.** Right-click a body to open it, click a row to take money or an item, and the corpse releases itself once empty -- a client that never releases leaves the body locked to it for everyone else. `CMSG_LOOT` `0x15D`, `CMSG_LOOT_MONEY` `0x15E`, `CMSG_AUTOSTORE_LOOT_ITEM` `0x108`, `SMSG_LOOT_RESPONSE` `0x160`, `SMSG_LOOT_REMOVED` `0x162`, `SMSG_LOOT_CLEAR_MONEY` `0x165` -- every one confirmed by content or by effect. A loot slot is the **server's** index and never a row position: the numbers do not close up when one is taken |
 | Sound | **4.14 done.** Zone music and ambience by area and hour, creature attack/wound/death/aggro voices, and weapon impacts -- all from the tables. `SoundEntries`' layout is checked by its filenames resolving in the archive (93%); the zone tables by their ids landing on a sound of the **right type** (99.1%), which validity alone cannot show. `CreatureSoundData`'s 38 columns identified themselves through the *names* of the sounds they reach. No distance attenuation, no crossfade, no spell or footstep sounds |
 | NPCs | **4.15 started: they answer.** `CMSG_GOSSIP_HELLO` `0x017B` → `SMSG_GOSSIP_MESSAGE` `0x017D`, parsed whole — menu id, greeting text id, a list of clickable options and a list of quests offered. Confirmed on **three** NPCs picked so the two counts differ (3 options/0 quests, 0/0, 0 options/1 quest), because one sample is nearly all zeroes and any reading survives it. Every field then agreed with the server's own database independently: menu ids equal `creature_template.gossip_menu_id`, the options match `gossip_menu_option` in text *and* icon, quest 783 came with title `A Threat Within`, level 1 and flags 524296. **An option index is the server's id, never a row position** — menu 1291 has four rows and three arrived, numbered 1,2,3 with 0 filtered out and the numbering *not* closed up, exactly like a loot slot. Nothing can be *chosen* yet, the `UNIT_NPC_FLAGS` bits are still unnamed, and vendors and quests are next |
-| Inventory | **4.13 done bar looting; a bag square can now be picked up.** A **single combined bag window** (`B`) covering the backpack *and every equipped bag's contents* -- deliberately unlike the original's one frame per bag -- with real icons, stack counts and money; a separate **character panel** (`C`) with the nineteen worn slots, all nineteen named. The slot array, coinage, stack count, container capacity, container contents and the owner/contained pair were all measured against the live realm. Right-click **auto-equips** a backpack item, sending the already-confirmed `CMSG_AUTOEQUIP_ITEM`. Left-click picks a square up and drops it on another -- the same gesture the spellbook uses -- but the drop does not yet send anything: `foss-wow#55` tried a candidate slot-swap opcode against a live realm from two different characters, real item against real item and real item against an empty slot, and got back an identical, state-independent refusal every time, which reads as the wrong opcode or body rather than a legal decline. See `SwapItemCandidate`'s doc comment in `crates/world/src/opcode.rs` for the raw bytes. |
+| Inventory | **4.13 done bar looting; a bag square can now be picked up.** A **single combined bag window** (`B`) covering the backpack *and every equipped bag's contents* -- deliberately unlike the original's one frame per bag -- with real icons, stack counts and money; a separate **character panel** (`C`) with the nineteen worn slots, all nineteen named. The slot array, coinage, stack count, container capacity, container contents and the owner/contained pair were all measured against the live realm. Right-click **auto-equips** a backpack item, sending the already-confirmed `CMSG_AUTOEQUIP_ITEM`. Left-click picks a square up and drops it on another -- the same gesture the spellbook uses -- but the drop does not yet send anything, and `HudResponse::move_item` is currently read by nobody. `foss-wow#55` is **not** blocked on finding the right opcode, contrary to the first reading: `0x010B` with a `{dst_bag, dst_slot, src_bag, src_slot}` body is understood and *declined*. The refusal names a real item guid -- the one the leading `(bag, slot)` pair points at, and reversing the slots reverses which guid comes back -- so the body parses. It is also **not** state-independent: two occupied slots get the refusal, a real item against an empty destination gets silence. What is unknown is what result code **59** means. See `SwapItemCandidate`'s doc comment in `crates/world/src/opcode.rs`. |
 
 Roughly 60% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
@@ -710,6 +710,27 @@ Worth reading before debugging anything, because the same shapes keep recurring.
 - **An odd-looking render is often the camera.** A gnoll looked scrambled and a
   building looked misplaced; both were framing, not geometry. Render canonical
   angles before doubting the parser.
+- **A refusal that resolves a guid is proof the body parsed.** The strongest
+  evidence in a rejection is usually not the rejection — it is whatever the
+  server had to *understand* in order to produce it. `foss-wow#55` was written
+  off as "the wrong opcode or body shape" because a slot swap kept being
+  refused; but the refusal is eighteen bytes carrying a **real item guid**, and
+  reversing the two slots in the request reverses which guid comes back. A
+  server that could not parse the body could not have resolved bytes 0 and 1 to
+  an item, let alone tracked the argument order. The opcode and the body were
+  right the whole time and the open question was the status code. Before
+  concluding a send is malformed, ask what the reply proves the far end already
+  worked out.
+- **"It fails identically under every condition" is a claim to re-run, not to
+  build on.** The same ticket rested on the failure being state-independent —
+  the argument being that a real handler would treat an empty destination
+  differently from an occupied one, so identical behaviour meant no handler.
+  The premise did not reproduce: two occupied slots get the refusal and an
+  empty destination gets **silence**. The conclusion was sound reasoning from
+  an observation that was wrong, which is the expensive combination, because
+  the reasoning is what gets scrutinised and the observation is what gets
+  believed. A negative result that closes off a line of work earns one
+  reproduction before it is written down.
 - **"Nothing happened" is two findings wearing one sentence.** An equip sweep
   reported three items as `nothing moved`, which conflates an opcode the server
   never understood with a correct opcode it deliberately declined -- opposite

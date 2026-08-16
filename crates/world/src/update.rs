@@ -1063,9 +1063,19 @@ pub mod fields {
     /// one `base + slot * 2`, with `base = 0x11b`, and the fit was checked
     /// against every unambiguous point rather than picked from the first two
     /// -- the same run-of-consecutive-fields shape that confirmed
-    /// `PLAYER_FIELD_INV_SLOT_HEAD`, and this block sits immediately before
-    /// it (`0x11b + 2*19 = 0x141`, one field short of `0x144`), which is a
-    /// fact nothing in the search assumed and did not have to come out true.
+    /// `PLAYER_FIELD_INV_SLOT_HEAD`, and this block ends just before it
+    /// (`0x11b + 2*19 = 0x141`, three fields short of `0x144`) -- a fact
+    /// nothing in the search assumed and one that did not have to come out
+    /// true.
+    ///
+    /// **That last part is corroboration and not proof, and the gap is why.**
+    /// Three unread fields sit between the two blocks, so "immediately
+    /// before" would be overstating it: a base three fields further along
+    /// would be just as adjacent and is ruled out by the *measurement*, not
+    /// by the neighbourhood. The load-bearing evidence is the fit across
+    /// every unambiguous slot on two characters, and it reproduces on demand
+    /// -- `--visible-items` re-derives the base rather than asserting it, so
+    /// running it is a check and not a restatement.
     pub const PLAYER_VISIBLE_ITEM_ENTRY_HEAD: u16 = 0x11b;
     /// How many update fields one visible-item slot occupies. The second
     /// field of the pair was never resolved -- likely an enchantment id --
