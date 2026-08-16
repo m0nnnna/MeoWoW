@@ -1857,6 +1857,12 @@ struct App {
     /// When each outstanding quest query was sent, so one that is never
     /// answered can be given up on rather than counted as pending forever.
     quest_asked_at: std::collections::HashMap<u32, std::time::Instant>,
+    /// The questgiver currently being talked to, or `None`.
+    ///
+    /// **Existence is the flag**, as it is for the loot window: this is set
+    /// when a greeting is sent and cleared when the player closes it or walks
+    /// out of range, and there is no separate boolean that could disagree.
+    questgiver: Option<Questgiver>,
     /// When the quest cache was last written.
     ///
     /// **Saving only on a clean exit is not enough**, and the failure is
@@ -2277,6 +2283,61 @@ enum Line {
 /// capture has confirmed what it means, and a number this client cannot
 /// explain has no business on screen at all, let alone under a guessed label
 /// like "blocked".
+/// The NPC currently being talked to, and what it has said.
+///
+/// **Holds ids and not text.** Every string this produces on screen comes from
+/// the quest cache -- answers to `CMSG_QUEST_QUERY`, verified against the
+/// realm's own tables -- so there is one copy of a quest's title in this
+/// client rather than two that could disagree. See
+/// `world::quest::parse_questgiver_details` for why the questgiver's own text
+/// packets are read for their quest id and nothing else.
+struct Questgiver {
+    npc: u64,
+    /// Resolved at greeting time rather than per frame: an NPC's name cannot
+    /// change while you are talking to it.
+    name: String,
+    /// What the greeting said this NPC has, in the order it said it.
+    offered: Vec<u32>,
+    /// The one quest whose text is on screen, if the player has picked one or
+    /// the server volunteered it.
+    showing: Option<u32>,
+}
+
+impl Questgiver {
+    /// Files what a greeting produced.
+    ///
+    /// **An empty menu is a real answer**, and the commonest one: an NPC with
+    /// nothing for this character sends a gossip message with no options and
+    /// no quests. The window stays open saying so rather than vanishing, which
+    /// would be indistinguishable from a click that never registered.
+    ///
+    /// A method on this rather than on `App` so it borrows one field: the
+    /// pump holds the connection mutably for its whole length, and a `&mut
+    /// self` on the app would collide with it.
+    fn note_gossip(&mut self, gossip: &::world::Gossip) {
+        // Ignore an answer from an NPC other than the one being talked to --
+        // two greetings can be in flight if the player clicks twice, and the
+        // later window must not be filled by the earlier reply.
+        if gossip.npc != self.npc {
+            return;
+        }
+        self.offered = gossip.quests.iter().map(|quest| quest.quest_id).collect();
+        // One quest and nothing else to choose between: show it straight away
+        // rather than making the player click a list of one.
+        if self.offered.len() == 1 {
+            self.showing = self.offered.first().copied();
+        }
+    }
+
+    /// The server put one quest's scroll on screen without being asked.
+    fn note_quest_offered(&mut self, quest: u32) {
+        if !self.offered.contains(&quest) {
+            self.offered.push(quest);
+        }
+        self.showing = Some(quest);
+    }
+}
+
 struct PendingCombatText {
     world_pos: glam::Vec3,
     text: String,
@@ -2390,6 +2451,7 @@ impl App {
             quest_cache_path: None,
             quest_asked_at: std::collections::HashMap::new(),
             quest_saved_at: Instant::now(),
+            questgiver: None,
             looting: None,
             own_corpse_query_sent: false,
             modifiers: Default::default(),
@@ -4127,7 +4189,15 @@ impl App {
         };
         self.set_target(picked);
         if let Some(guid) = picked {
-            if self.is_attack_candidate(guid) {
+            if self.is_talk_candidate(guid) {
+                // **Before the attack branch, and that is a fix as much as a
+                // feature.** Right-clicking a questgiver used to send a swing
+                // the server refused -- `is_attack_candidate` rules out only
+                // what is never a fight, and an innkeeper is not on that list.
+                // `will_talk` is a replicated field rather than a guess, so
+                // this is the one case that can be decided locally.
+                self.greet(guid);
+            } else if self.is_attack_candidate(guid) {
                 self.start_auto_attack();
             } else if self.is_loot_candidate(guid) {
                 // **The same gesture, split by whether the thing is alive.**
@@ -4139,6 +4209,242 @@ impl App {
                 self.open_loot(guid);
             }
         }
+    }
+
+    /// What the questgiver window should be showing, or `None` when no
+    /// conversation is open.
+    ///
+    /// **Rebuilt every frame from the cache and the log rather than kept.**
+    /// Both can change under it -- an answer arrives, a quest is accepted --
+    /// and a retained copy would show a stale Accept button on a quest already
+    /// taken, which sends a request the server refuses for a reason the player
+    /// cannot see.
+    fn questgiver_view(&self) -> Option<ui::QuestgiverView> {
+        let questgiver = self.questgiver.as_ref()?;
+        let log: Vec<u32> = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.get(live.guid))
+            .map(|player| player.quest_log_ids())
+            .unwrap_or_default();
+
+        let Some(showing) = questgiver.showing else {
+            // No single quest chosen: list what there is. An empty list is
+            // drawn as an empty list, which is what an NPC with nothing to
+            // offer this character genuinely has.
+            return Some(ui::QuestgiverView::List {
+                npc: questgiver.name.clone(),
+                quests: questgiver
+                    .offered
+                    .iter()
+                    .map(|id| {
+                        let (title, level) = match self.quests.answer(*id) {
+                            ::world::Answer::Known(quest) => {
+                                (quest.title.clone(), quest.level)
+                            }
+                            _ => (format!("Quest {id}"), 0),
+                        };
+                        ui::QuestgiverRow {
+                            id: *id,
+                            title,
+                            level,
+                            turn_in: log.contains(id),
+                        }
+                    })
+                    .collect(),
+            });
+        };
+
+        let in_log = log.contains(&showing);
+        let complete = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.get(live.guid))
+            .and_then(|player| player.quest_is_complete(showing))
+            .unwrap_or(false);
+
+        let ::world::Answer::Known(quest) = self.quests.answer(showing) else {
+            // **Named and not described.** The window says what it is waiting
+            // for rather than offering Accept over a blank body, which would
+            // ask the player to agree to something nobody read to them.
+            return Some(ui::QuestgiverView::Quest {
+                id: showing,
+                title: format!("Quest {showing}"),
+                body: String::new(),
+                objectives: Vec::new(),
+                rewards: Vec::new(),
+                action: ui::QuestgiverAction::Waiting,
+            });
+        };
+
+        let action = match (in_log, complete) {
+            (false, _) => ui::QuestgiverAction::Accept,
+            (true, true) => ui::QuestgiverAction::Complete,
+            (true, false) => ui::QuestgiverAction::Unfinished,
+        };
+        // Handing in shows what the quest says when finished; taking it shows
+        // what the questgiver says. Falling back to the other rather than to a
+        // blank, because plenty of quests leave one of the two empty.
+        let body = if in_log && !quest.completed_text.is_empty() {
+            quest.completed_text.clone()
+        } else if !quest.details.is_empty() {
+            quest.details.clone()
+        } else {
+            quest.objectives_text.clone()
+        };
+
+        Some(ui::QuestgiverView::Quest {
+            id: showing,
+            title: quest.title.clone(),
+            body,
+            objectives: if quest.objectives_text.is_empty() {
+                Vec::new()
+            } else {
+                vec![quest.objectives_text.clone()]
+            },
+            // **Ids, not names.** Item names need `CMSG_ITEM_QUERY_SINGLE`,
+            // which this client does not send yet (`foss-wow#56`), and a made
+            // up name would be a fabricated string on a reward screen. An id
+            // is checkable; a guess is not.
+            rewards: quest
+                .reward_items
+                .iter()
+                .map(|reward| format!("item {} x{}", reward.item, reward.count))
+                .chain(
+                    (quest.money > 0).then(|| format!("{} copper", quest.money)),
+                )
+                .collect(),
+            action,
+        })
+    }
+
+    /// Asks the questgiver for one quest's scroll, and the server for its
+    /// text.
+    ///
+    /// Two different requests to two different ends, and both are needed:
+    /// `CMSG_QUESTGIVER_QUERY_QUEST` is what makes the *accept* legal, and
+    /// `CMSG_QUEST_QUERY` is what fills the window. Asking only the second
+    /// would draw a quest that could not then be taken.
+    fn ask_for_quest_scroll(&mut self, quest: u32) {
+        let asking = self.quests.take_unknown(&[quest], 1);
+        let Some(questgiver) = self.questgiver.as_ref() else {
+            return;
+        };
+        let npc = questgiver.npc;
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.query_quest(npc, quest) {
+            tracing::warn!("asking for quest {quest}'s scroll failed: {e:#}");
+        }
+        for quest in asking {
+            if let Err(e) = live.connection.query_quest_info(quest) {
+                tracing::warn!("asking what quest {quest} is failed: {e:#}");
+                self.quests.give_up(quest);
+            } else {
+                self.quest_asked_at.insert(quest, Instant::now());
+            }
+        }
+    }
+
+    /// Presses the window's one button: take the quest, or hand it in.
+    ///
+    /// **Which of the two it is comes from the same place the button's label
+    /// did**, rather than from a flag stored when the window opened. A copy
+    /// would go stale exactly when it matters -- between the frame that drew
+    /// `Accept` and the click that pressed it, the quest may already be in the
+    /// log.
+    fn act_on_quest(&mut self, quest: u32) {
+        let Some(view) = self.questgiver_view() else {
+            return;
+        };
+        let ui::QuestgiverView::Quest { action, .. } = view else {
+            return;
+        };
+        let Some(npc) = self.questgiver.as_ref().map(|giver| giver.npc) else {
+            return;
+        };
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let sent = match action {
+            ui::QuestgiverAction::Accept => live.connection.accept_quest(npc, quest),
+            // `0` is the reward index. **Correct only where there is nothing
+            // to choose**: a quest offering alternatives needs the player to
+            // pick one, and this window has no way to say which yet -- so a
+            // quest with choices would hand over the first, which is a wrong
+            // answer rather than a missing feature.
+            ui::QuestgiverAction::Complete => live.connection.complete_quest(npc, quest),
+            // No button was drawn, so this cannot be reached by clicking one.
+            ui::QuestgiverAction::Unfinished | ui::QuestgiverAction::Waiting => return,
+        };
+        if let Err(e) = sent {
+            tracing::warn!("acting on quest {quest} failed: {e:#}");
+            return;
+        }
+        // **The reward is taken as a second send, unconditionally.** The
+        // server answers `CMSG_QUESTGIVER_COMPLETE_QUEST` with a reward screen
+        // *or* with a still-wanted list, and it refuses the choose-reward that
+        // follows in the second case -- which is exactly the right outcome,
+        // and cheaper than a state machine that waits a frame to find out.
+        if matches!(action, ui::QuestgiverAction::Complete) {
+            if let Err(e) = live.connection.choose_quest_reward(npc, quest, 0) {
+                tracing::warn!("taking quest {quest}'s reward failed: {e:#}");
+            }
+        }
+        // Closed either way: the log is what says whether it worked, and a
+        // window left open showing a stale Accept is worse than none.
+        self.questgiver = None;
+    }
+
+    /// Whether right-clicking this thing should start a conversation.
+    ///
+    /// **The one interaction test this client can make locally**, because
+    /// `UNIT_NPC_FLAGS` is replicated and non-zero means the unit offers
+    /// *something* -- gossip, quests, a shop, an inn. Which of those it is
+    /// stays the server's business; this only decides that talking is worth
+    /// attempting, and a dead one is not.
+    fn is_talk_candidate(&self, guid: u64) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        if guid == live.guid {
+            return false;
+        }
+        live.state
+            .get(guid)
+            .is_some_and(|entity| entity.will_talk() && !entity.is_dead_or_ghost())
+    }
+
+    /// Greets an NPC and opens the window its answer will fill.
+    ///
+    /// The window appears *empty* rather than not at all, unlike the loot
+    /// window: a greeting is always answered by something, and a window that
+    /// only appeared once the reply arrived would make a slow realm look like
+    /// a click that did not register.
+    fn greet(&mut self, guid: u64) {
+        let name = self
+            .live
+            .as_ref()
+            .and_then(|live| {
+                live.state
+                    .get(guid)
+                    .map(|entity| hud::unit_name(&live.state, entity))
+            })
+            .unwrap_or_else(|| format!("Creature {guid:#x}"));
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.gossip_hello(guid) {
+            tracing::warn!("greeting {guid:#x} failed: {e:#}");
+            return;
+        }
+        self.questgiver = Some(Questgiver {
+            npc: guid,
+            name,
+            offered: Vec::new(),
+            showing: None,
+        });
     }
 
     /// Whether right-clicking this thing should open its loot.
@@ -4380,6 +4686,11 @@ impl App {
         // Senders of chat received this pump who are not in replicated state,
         // so their names can be asked for below.
         let mut unknown_speakers: Vec<u64> = Vec::new();
+        // Greetings and volunteered scrolls, collected here and applied below
+        // the `live` borrow -- the same shape `unknown_speakers` uses, and for
+        // the same reason: filing them touches `self` as a whole.
+        let mut greetings: Vec<::world::Gossip> = Vec::new();
+        let mut offered: Vec<u32> = Vec::new();
         match live.connection.drain(Duration::from_millis(1), 64) {
             // Every batch has to go through all the kinds of change replicate
             // handles -- object updates, relayed movement, monster moves,
@@ -4564,6 +4875,49 @@ impl App {
                 // depend on an object that may not exist (the quest is not an
                 // object at all), and `replicate` deliberately dispatches only
                 // things that describe the world.
+                // What an NPC said when greeted. Read off the batch for the
+                // same reason quest descriptions are: this is an answer to a
+                // question *this client* asked, not a description of the
+                // world, and `replicate` deliberately dispatches only the
+                // latter.
+                for packet in &packets {
+                    match packet.opcode {
+                        ::world::opcode::server::GOSSIP_MESSAGE => {
+                            match ::world::gossip::parse_gossip_message(&packet.body) {
+                                Ok(gossip) => greetings.push(gossip),
+                                Err(error) => {
+                                    tracing::warn!("a gossip message would not parse: {error}")
+                                }
+                            }
+                        }
+                        // The server volunteering one quest's scroll, which is
+                        // what a questgiver with exactly one thing to offer
+                        // sends instead of a menu.
+                        ::world::opcode::server::QUESTGIVER_QUEST_DETAILS => {
+                            match ::world::quest::parse_questgiver_details(&packet.body) {
+                                Ok(details) => offered.push(details.quest),
+                                Err(error) => {
+                                    tracing::warn!("quest details would not parse: {error}")
+                                }
+                            }
+                        }
+                        // The reward screen. Its body is not read: the quest
+                        // it is about is the one already on screen, and its
+                        // text and rewards are in the cache. What matters is
+                        // that it *arrived*, which is the server saying the
+                        // hand-in is legal.
+                        ::world::opcode::server::QUESTGIVER_OFFER_REWARD => {
+                            tracing::debug!("the reward screen is open");
+                        }
+                        // The opposite answer to the same request: understood,
+                        // and the quest is not finished. A statement about the
+                        // character rather than about the send.
+                        ::world::opcode::server::QUESTGIVER_REQUEST_ITEMS => {
+                            tracing::debug!("that quest is not finished yet");
+                        }
+                        _ => {}
+                    }
+                }
                 for packet in &packets {
                     if packet.opcode != ::world::opcode::server::QUEST_QUERY_RESPONSE {
                         continue;
@@ -4597,6 +4951,15 @@ impl App {
                 }
             }
             Err(e) => tracing::warn!("draining the live connection failed: {e:#}"),
+        }
+
+        if let Some(questgiver) = self.questgiver.as_mut() {
+            for gossip in &greetings {
+                questgiver.note_gossip(gossip);
+            }
+            for quest in offered {
+                questgiver.note_quest_offered(quest);
+            }
         }
 
         // A scrollback nobody trims is a leak with a user interface.
@@ -5191,6 +5554,8 @@ impl App {
             Vec::new()
         };
 
+        let questgiver_view = self.questgiver_view();
+
         let mut hud_response = ui::HudResponse::default();
         let spellbook_open = self.spellbook_open;
         let bags_open = self.bags_open;
@@ -5226,6 +5591,9 @@ impl App {
                     // things and the interface draws the first.
                     quest_log: quest_log_open.then_some(quest_log.as_slice()),
                     selected_quest,
+                    // Existence is the flag, like the loot window: the window
+                    // is on screen exactly while a conversation is open.
+                    questgiver: questgiver_view.as_ref(),
                     // No flag: the window exists exactly while the server
                     // says a corpse is open.
                     loot: (!loot.is_empty()).then_some(loot.as_slice()),
@@ -5382,6 +5750,23 @@ impl App {
             // Clicking the highlighted row clears it, so there is a way back
             // to "nothing selected" without closing the window.
             self.selected_quest = (self.selected_quest != Some(quest)).then_some(quest);
+        }
+
+        if let Some(quest) = hud_response.questgiver.picked {
+            if let Some(questgiver) = self.questgiver.as_mut() {
+                questgiver.showing = Some(quest);
+            }
+            // Ask for the scroll as a real client does, in that order: the
+            // server checks at each step that this NPC actually offers the
+            // quest, and skipping straight to the accept would work or not for
+            // reasons nothing here could tell apart.
+            self.ask_for_quest_scroll(quest);
+        }
+        if let Some(quest) = hud_response.questgiver.acted {
+            self.act_on_quest(quest);
+        }
+        if hud_response.questgiver.closed {
+            self.questgiver = None;
         }
 
         if hud_response.layout_changed {

@@ -225,6 +225,11 @@ pub struct Style {
     /// an objective line are longer than a spell name and a rank -- reusing
     /// the spellbook's width would make every objective ellipsise.
     pub quest_log_width: f32,
+    /// How wide the questgiver window is. Wider than the quest log because it
+    /// holds a questgiver's *spoken* text -- paragraphs rather than one line
+    /// -- and the wrap is computed from this, so it is the number that decides
+    /// how the text falls.
+    pub questgiver_width: f32,
     /// The objective line under a quest's title, and the colour a row uses
     /// when it is describing the *client's* state rather than the quest's --
     /// still waiting for an answer, or never given one. Dimmer than the title
@@ -364,6 +369,7 @@ impl Default for Style {
             spellbook_selected: Color::rgba(240, 190, 70, 90),
 
             quest_log_width: 320.0,
+            questgiver_width: 420.0,
             quest_dim: Color::rgba(170, 178, 195, 210),
 
             cast_bar_width: 260.0,
@@ -451,6 +457,7 @@ impl Style {
         self.spellbook_height = self.spellbook_height.clamp(60.0, 1600.0);
         self.spellbook_row = self.spellbook_row.clamp(10.0, 200.0);
         self.quest_log_width = self.quest_log_width.clamp(120.0, 1400.0);
+        self.questgiver_width = self.questgiver_width.clamp(160.0, 1600.0);
         self.chat_width = self.chat_width.clamp(120.0, 2000.0);
         self.chat_height = self.chat_height.clamp(40.0, 1200.0);
         self.chat_scrollback = self.chat_scrollback.clamp(10, 10_000);

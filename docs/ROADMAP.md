@@ -3895,3 +3895,64 @@ read `1`. Putting quest 38 — which wants twelve items the character does not
 have — beside 783 gave `0` against `1` with all three remaining fields zero on
 both, which names the column and nothing more. Only bit zero is read, because
 that is the only bit anything here has seen move.
+
+### 4.16 continued: quests can be taken and handed in from the window
+
+Right-click a questgiver, read what it says, press Accept. Walk to the ender,
+right-click, press Complete Quest. That is the loop, and it runs inside the
+viewer rather than through the CLI.
+
+**Right-clicking a talker greets it, and that is a fix as much as a feature.**
+`is_attack_candidate` rules out only what is *never* a fight — yourself, a
+corpse, a bench — and lets the server arbitrate the rest, which was the right
+call when hostility could not be judged locally. But an innkeeper is not on that
+list, so right-clicking one used to send a swing the server refused, in silence.
+`UNIT_NPC_FLAGS` is replicated and non-zero means "this unit offers something",
+so this is the one interaction test the client *can* make locally, and it now
+runs before the attack branch.
+
+#### The window shows the cache's text, not the questgiver's
+
+`SMSG_QUESTGIVER_QUEST_DETAILS` (`0x0188`) and `SMSG_QUESTGIVER_OFFER_REWARD`
+(`0x018D`) carry the quest's title, text, objectives and rewards — the same
+content `SMSG_QUEST_QUERY_RESPONSE` carries, in a different layout. Parsing them
+a second time would give this client two independently-derived copies of the
+same strings, and two copies drift. So the details packet is read for **twenty
+bytes** — the NPC guid and the quest id — and the rest is taken and discarded
+deliberately rather than left unread, and the reward packet is not parsed at all:
+its *arrival* is the server saying the hand-in is legal, which is the one thing
+the query cannot say.
+
+The offset was confirmed on two captures that disagree in both fields: quest 333
+from Harlan Bagley and quest 783 from Deputy Willem, id at byte 16 in each.
+
+**`SMSG_QUESTGIVER_QUEST_LIST` (`0x0185`) is still unparsed, and deliberately.**
+Nothing has captured one. It is what a questgiver with no gossip menu and two or
+more available quests sends; the two candidates tried both declined to offer
+anything to a level-one human (a skill requirement in one case, a consumed chain
+in the other). Every NPC in the fixture has a gossip menu, and
+`SMSG_GOSSIP_MESSAGE`'s quest block — parsed since 4.15 — is what actually
+arrives. A layout nobody has captured does not get written down.
+
+#### What the window refuses to do
+
+**No Accept button over a body nobody has read.** A quest whose description has
+not arrived draws `Asking the server what this quest is...` and no button, which
+is a fourth state beside Accept, Complete and Unfinished. The alternative is
+asking the player to agree to something blank.
+
+**No invented reward names.** Item names need `CMSG_ITEM_QUERY_SINGLE`, which
+this client does not send yet, so a reward line reads `item 2224 x1`. An id is
+checkable; a plausible-looking name would not be, and this project treats a
+number nobody can check as worse than a blank.
+
+**No reward choice.** `choose_quest_reward` goes out with index `0`, which is
+correct only where there is nothing to choose. A quest offering alternatives
+would hand over the first — a wrong answer rather than a missing feature — and
+that is recorded here rather than hidden.
+
+**The button's meaning is recomputed, not remembered.** Which of Accept and
+Complete a press means comes from the same function that drew the label, on the
+frame the click lands. A flag stored when the window opened would go stale
+exactly when it matters: between the frame that drew `Accept` and the click that
+pressed it, the quest may already be in the log.

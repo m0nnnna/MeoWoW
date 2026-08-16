@@ -44,11 +44,12 @@ pub enum ElementId {
     Character,
     Loot,
     QuestLog,
+    Questgiver,
     ReleasePrompt,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 13] = [
+    pub const ALL: [ElementId; 14] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -61,6 +62,7 @@ impl ElementId {
         ElementId::Character,
         ElementId::Loot,
         ElementId::QuestLog,
+        ElementId::Questgiver,
         ElementId::ReleasePrompt,
     ];
 
@@ -89,6 +91,7 @@ impl ElementId {
             ElementId::Character => "character",
             ElementId::Loot => "loot",
             ElementId::QuestLog => "quest-log",
+            ElementId::Questgiver => "questgiver",
             ElementId::ReleasePrompt => "release-prompt",
         }
     }
@@ -112,6 +115,7 @@ impl ElementId {
             ElementId::Character => "Character",
             ElementId::Loot => "Loot",
             ElementId::QuestLog => "Quest log",
+            ElementId::Questgiver => "Questgiver",
             ElementId::ReleasePrompt => "Release-spirit prompt",
         }
     }
@@ -227,6 +231,18 @@ impl ElementId {
             ElementId::QuestLog => Element {
                 anchor: Anchor::TopRight,
                 offset: [-24.0, 24.0],
+                ..Default::default()
+            },
+            // Top centre. It appears because the player clicked an NPC
+            // rather than because they pressed a key, so it has to be near
+            // where they are already looking -- but it is also the tallest
+            // window here, holding paragraphs of spoken text, and centring it
+            // put it straight through the loot window's default spot. Anchored
+            // to the top edge it grows downward into empty screen instead of
+            // outward into everything.
+            ElementId::Questgiver => Element {
+                anchor: Anchor::Top,
+                offset: [0.0, 16.0],
                 ..Default::default()
             },
         }

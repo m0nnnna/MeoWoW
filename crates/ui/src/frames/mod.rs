@@ -23,6 +23,7 @@ pub mod combat_text;
 pub mod marker;
 pub mod release;
 pub mod quest_log;
+pub mod questgiver;
 pub mod spellbook;
 pub mod unit;
 
@@ -32,5 +33,6 @@ pub use loot::{LootRow, Take};
 pub use cast_bar::CastBarView;
 pub use release::ReleasePromptView;
 pub use quest_log::{QuestDetail, QuestLogEntry};
+pub use questgiver::{QuestgiverAction, QuestgiverClick, QuestgiverRow, QuestgiverView};
 pub use spellbook::SpellbookEntry;
 pub use unit::UnitView;

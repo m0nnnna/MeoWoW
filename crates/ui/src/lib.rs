@@ -38,7 +38,10 @@ pub use edit::{EditAction, EditState};
 pub use element::{Anchor, Element};
 pub use frames::chat::{ChatEntry, ChatKind};
 pub use frames::combat_text::{CombatTextKind, FloatingText};
-pub use frames::{CastBarView, QuestDetail, QuestLogEntry, SpellbookEntry, UnitView};
+pub use frames::{
+    CastBarView, QuestDetail, QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
+    QuestgiverView, SpellbookEntry, UnitView,
+};
 pub use layout::{default_path, ElementId, Profile};
 pub use style::{Color, PowerType, Style};
 
@@ -131,6 +134,10 @@ pub struct HudData<'a> {
     pub quest_log: Option<&'a [frames::QuestLogEntry]>,
     /// Which quest is highlighted in the log, if any.
     pub selected_quest: Option<u32>,
+    /// The open conversation with a questgiver, or `None`. Existence is the
+    /// flag, as it is for the loot window: the caller already decides when a
+    /// conversation is open and a second copy here could disagree.
+    pub questgiver: Option<&'a frames::QuestgiverView>,
     /// The character's money in copper, drawn along the bottom of the bag
     /// window. Ignored when `bags` is `None`.
     pub copper: u32,
@@ -173,6 +180,8 @@ pub struct HudResponse {
     /// loot slot: a row number means nothing outside the list this crate was
     /// handed, and the list is rebuilt whenever the log changes.
     pub selected_quest: Option<u32>,
+    /// What was pressed in the questgiver window.
+    pub questgiver: frames::QuestgiverClick,
 }
 
 /// What the cursor is currently carrying, picked up from either window that
@@ -396,6 +405,7 @@ impl Hud {
             let character_placeholder;
             let loot_placeholder;
             let quest_log_placeholder;
+            let questgiver_placeholder;
             let release_prompt_placeholder;
             let content = match id {
                 ElementId::PlayerFrame | ElementId::TargetFrame => {
@@ -477,6 +487,14 @@ impl Hud {
                     }
                     None => continue,
                 },
+                ElementId::Questgiver => match data.questgiver {
+                    Some(view) => Content::Questgiver(view),
+                    None if editing => {
+                        questgiver_placeholder = frames::questgiver::placeholder();
+                        Content::Questgiver(&questgiver_placeholder)
+                    }
+                    None => continue,
+                },
                 // Absent while alive or already a ghost, on the same reasoning
                 // as the loot window: existence is the flag, and drawn in
                 // edit mode so it can be positioned without dying first.
@@ -524,6 +542,12 @@ impl Hud {
                 // a panel with twenty-four blank lines.
                 Content::QuestLog(entries) => {
                     frames::quest_log::size(entries, &style, element.scale)
+                }
+                // Sized to the quest's text, which runs to paragraphs -- a
+                // fixed height would clip the longest ones, and they are the
+                // ones worth reading.
+                Content::Questgiver(view) => {
+                    frames::questgiver::size(view, &style, element.scale)
                 }
                 Content::ReleasePrompt(_) => frames::release::size(&style, element.scale),
             };
@@ -596,6 +620,7 @@ impl Hud {
                             | Content::Spellbook(_)
                             | Content::Loot(_)
                             | Content::QuestLog(_)
+                            | Content::Questgiver(_)
                             | Content::ReleasePrompt(_)
                             | Content::Bags(_)
                     ) {
@@ -681,6 +706,13 @@ impl Hud {
                             response.rect,
                             entries,
                             data.selected_quest,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Questgiver(view) => frames::questgiver::draw(
+                            &painter,
+                            response.rect,
+                            view,
                             &style,
                             element.scale,
                         ),
@@ -790,6 +822,22 @@ impl Hud {
                                 // acknowledges the request.
                                 response_out.take_loot = rows.get(row).map(|row| row.take);
                             }
+                        }
+                    }
+                }
+                (false, Content::Questgiver(view)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            // One call answers rows and buttons both, so the
+                            // drawing and the hit test cannot disagree about
+                            // which the window is currently showing.
+                            response_out.questgiver = frames::questgiver::click_at(
+                                drawn_rect,
+                                view,
+                                &style,
+                                element.scale,
+                                pointer,
+                            );
                         }
                     }
                 }
@@ -988,6 +1036,7 @@ impl Hud {
             // re-anchoring cannot measure a frame differently from how it was
             // painted.
             let edit_quest_log = frames::quest_log::placeholder();
+            let edit_questgiver = frames::questgiver::placeholder();
             let sizes: Vec<(ElementId, egui::Vec2)> = ElementId::ALL
                 .into_iter()
                 .map(|id| {
@@ -1019,6 +1068,11 @@ impl Hud {
                                 scale,
                             )
                         }
+                        ElementId::Questgiver => frames::questgiver::size(
+                            data.questgiver.unwrap_or(&edit_questgiver),
+                            &style,
+                            scale,
+                        ),
                         ElementId::Loot => frames::loot::size(
                             data.loot
                                 .map(|rows| rows.len())
@@ -1086,6 +1140,7 @@ enum Content<'a> {
     Character(&'a [frames::EquipSlot]),
     Loot(&'a [frames::LootRow]),
     QuestLog(&'a [frames::QuestLogEntry]),
+    Questgiver(&'a frames::QuestgiverView),
     ReleasePrompt(&'a frames::ReleasePromptView),
 }
 
@@ -1868,6 +1923,82 @@ mod tests {
         );
     }
 
+    /// **Accept and Close sit side by side in the questgiver window**, so a
+    /// hit test that disagreed with the drawing would decline quests the
+    /// player meant to take. Driven through the real event loop, which is also
+    /// what proves the frame is in the `Sense::click()` list at all.
+    #[test]
+    fn pressing_accept_reports_the_quest_and_pressing_close_does_not() {
+        let view = frames::QuestgiverView::Quest {
+            id: 783,
+            title: "A Threat Within".into(),
+            body: "Speak with Marshal McBride.".into(),
+            objectives: Vec::new(),
+            rewards: Vec::new(),
+            action: frames::QuestgiverAction::Accept,
+        };
+        let data = HudData {
+            questgiver: Some(&view),
+            ..Default::default()
+        };
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::Questgiver);
+        let rect = element.rect(
+            screen(),
+            frames::questgiver::size(&view, &hud.profile.style, element.scale),
+        );
+        let (accept, close) =
+            frames::questgiver::button_rects(rect, &hud.profile.style, element.scale);
+
+        let response = drive(
+            &mut hud,
+            &data,
+            &click_script(accept.center(), egui::PointerButton::Primary),
+        );
+        assert_eq!(response.questgiver.acted, Some(783));
+        assert!(!response.questgiver.closed, "Accept must not also close");
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let response = drive(
+            &mut hud,
+            &data,
+            &click_script(close.center(), egui::PointerButton::Primary),
+        );
+        assert!(response.questgiver.closed);
+        assert_eq!(response.questgiver.acted, None, "Close must not accept");
+    }
+
+    /// The window draws the quest's own text, not a placeholder -- a rectangle
+    /// is painted identically whether the words inside it are right or absent.
+    #[test]
+    fn the_questgiver_window_paints_the_quest_it_was_given() {
+        let view = frames::QuestgiverView::Quest {
+            id: 783,
+            title: "A Threat Within".into(),
+            body: "Speak with Marshal McBride.".into(),
+            objectives: Vec::new(),
+            rewards: Vec::new(),
+            action: frames::QuestgiverAction::Accept,
+        };
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let text = painted_text(&shapes(
+            &mut hud,
+            &HudData {
+                questgiver: Some(&view),
+                ..Default::default()
+            },
+            None,
+        ))
+        .join(" | ");
+        assert!(text.contains("A Threat Within"), "{text}");
+        assert!(text.contains("Marshal McBride"), "{text}");
+        assert!(text.contains("Accept"), "{text}");
+    }
+
     /// The same silent-failure shape as the loot-row test above, for the
     /// release prompt: a frame missing from the `Sense::click()` list draws
     /// and hit-tests fine and simply never reports a click.
@@ -2271,6 +2402,9 @@ mod tests {
             ElementId::Character => frames::character::size(&profile.style, scale),
             ElementId::QuestLog => {
                 frames::quest_log::size(&frames::quest_log::placeholder(), &profile.style, scale)
+            }
+            ElementId::Questgiver => {
+                frames::questgiver::size(&frames::questgiver::placeholder(), &profile.style, scale)
             }
             ElementId::Loot => {
                 frames::loot::size(frames::loot::placeholder().len(), &profile.style, scale)

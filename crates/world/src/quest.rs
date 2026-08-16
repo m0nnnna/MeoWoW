@@ -400,6 +400,44 @@ pub fn parse_quest_query(body: &[u8]) -> Result<QuestInfo, Error> {
 }
 
 #[cfg(test)]
+mod details_tests {
+    use super::*;
+
+    /// Both captures, head only: quest 783 from Deputy Willem and quest 333
+    /// from Harlan Bagley. **Two, because one would not distinguish offset 16
+    /// from any other place a small integer happens to sit** -- and these two
+    /// disagree in both the guid and the quest.
+    #[test]
+    fn the_quest_id_sits_at_the_measured_offset() {
+        let willem = [
+            0x8f, 0x2f, 0x01, 0x37, 0x03, 0x00, 0x30, 0xf1, // npc guid
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // unconfirmed, zero
+            0x0f, 0x03, 0x00, 0x00, // quest 783
+            b'A', 0x00, // the title begins; the rest is taken, not read
+        ];
+        let parsed = parse_questgiver_details(&willem).unwrap();
+        assert_eq!(parsed.quest, 783);
+        assert_eq!(parsed.npc, 0xf130_0003_3701_2f8f);
+
+        let harlan = [
+            0x0b, 0x30, 0x01, 0x93, 0x05, 0x00, 0x30, 0xf1, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x4d, 0x01, 0x00, 0x00, // quest 333
+        ];
+        let parsed = parse_questgiver_details(&harlan).unwrap();
+        assert_eq!(parsed.quest, 333);
+        assert_ne!(parsed.npc, 0xf130_0003_3701_2f8f, "a different NPC");
+    }
+
+    /// A body too short to hold the head is an error rather than a quest id
+    /// read out of whatever followed.
+    #[test]
+    fn a_short_body_is_an_error() {
+        assert!(parse_questgiver_details(&[0u8; 19]).is_err());
+    }
+}
+
+#[cfg(test)]
 mod query_tests {
     use super::*;
 
@@ -699,6 +737,46 @@ mod query_tests {
         body.push(0);
         assert!(parse_quest_query(&body).is_err());
     }
+}
+
+/// Which quest a questgiver is showing, out of
+/// `SMSG_QUESTGIVER_QUEST_DETAILS`.
+///
+/// **Deliberately reads the first twenty bytes and nothing else.** Everything
+/// after them is the quest's title, text, objectives and rewards -- the same
+/// content `SMSG_QUEST_QUERY_RESPONSE` carries, in a different layout. Parsing
+/// it a second time would give this client two independently-derived copies of
+/// the same strings, and two copies drift: the rule that says derive from the
+/// same source when two things must agree exactly. The query's answer is
+/// already cached per realm and already verified against 9,464 quests, so this
+/// packet is used for the one thing the query cannot say -- *which* quest the
+/// NPC just put on screen.
+///
+/// The layout of the part that is read was confirmed on two captures with
+/// different quests and different NPCs: quest 333 from Harlan Bagley and quest
+/// 783 from Deputy Willem, both with the id at offset 16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuestgiverDetails {
+    pub npc: u64,
+    pub quest: u32,
+}
+
+/// Parses the head of `SMSG_QUESTGIVER_QUEST_DETAILS`.
+pub fn parse_questgiver_details(body: &[u8]) -> Result<QuestgiverDetails, Error> {
+    let mut r = Reader::new(body, "SMSG_QUESTGIVER_QUEST_DETAILS");
+    let npc = r.u64()?;
+    // Zero on both captures. The server sends a second guid here -- the
+    // *originator* of the quest, which differs from the questgiver only for
+    // quests started by an item -- and naming it on two zeroes would be
+    // transcribing rather than measuring.
+    let _unconfirmed = r.u64()?;
+    let quest = r.u32()?;
+    // **Taken rather than ignored.** A parser that left a tail unread would
+    // still pass `finish`, and would be making no claim at all about how much
+    // of the packet it understood. See `Reader::rest`.
+    let _ = r.rest();
+    r.finish()?;
+    Ok(QuestgiverDetails { npc, quest })
 }
 
 /// One marker area for a quest objective -- a polygon on the world map.
