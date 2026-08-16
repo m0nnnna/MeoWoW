@@ -3782,3 +3782,116 @@ The per-realm cache, in which a missing answer must be *unknown* rather than
 *nothing*, is unwritten. A quest offering an actual choice of reward has not
 been turned in, so index `0` is confirmed only where there was nothing to
 choose.
+
+### 4.16 continued: what a quest actually is, and a log to read it in
+
+`SMSG_QUEST_QUERY_RESPONSE` (`0x005D`) parses. It is the packet the whole
+feature rests on, because unlike a questgiver's scroll it answers for **any**
+quest id with no NPC in front of the player and no entry in the log — which is
+exactly what a tracker and a map need, and exactly why this client does not
+have to ship anybody's database.
+
+#### Measured, then confirmed, in that order
+
+The body is a **260-byte fixed head, five strings, and then two more arrays** —
+so nothing past byte 260 sits at a fixed offset and the whole thing has to be
+read through a cursor.
+
+The layout was worked out from eight captures chosen so that every array count
+disagrees between them, because a quest with empty arrays parses perfectly
+under several wrong readings:
+
+| quest | what it can refute |
+|---|---|
+| 783 *A Threat Within* | every array empty — the control |
+| 152 *The Coast Isn't Clear* | four **creature** objectives, seven each |
+| 38 *Westfall Stew* | four item objectives **and** four reward items |
+| 18 *Brotherhood of Thieves* | five reward **choices** |
+| 498 *The Rescue* | **game object** targets, item drops, objective texts |
+| 61 *Shipment to Stormwind* | a non-zero inline point of interest |
+| 31 *Aquatic Form* | a start item |
+| 28 *Trial of the Lake* | an item drop with **no creature to kill** |
+
+Every non-zero value in every one of them is a value in the realm's own
+`quest_template`, which no client is ever sent. Only after that did reading
+AzerothCore's `Quest::InitializeQueryData` confirm the same order — and it
+supplied two facts the captures could not have, both of which are now handled.
+
+#### Two things the wire does that a table does not
+
+**A game object target arrives with the top bit set.** The server stores it as
+a *negative* creature id and sends `|id| | 0x80000000`. Reading it as an `i32`
+and negating — which is the obvious thing, since that is what the table holds —
+gives a perfectly valid *creature* id pointing at something else entirely.
+Quest 498 is the fixture: its two objectives are game objects 1721 and 1722, and
+the test asserts both that those read as game objects **and** that quest 152's
+four creature targets do not.
+
+**`Flags` arrives with only its low sixteen bits.** The server sends
+`Flags & 0xFFFF`, so `QUEST_FLAGS_AUTO_ACCEPT` (`0x80000`) cannot travel: quest
+783 arrives here as `8` where the realm's table says `524296`. That was measured
+before it was explained, and it matters — a client that tested this field to
+decide whether an accept is needed would wait forever for a quest the server had
+already taken on its behalf.
+
+#### The sweep, which is the evidence that matters
+
+Eight hand-picked captures show a layout is *possible*. Asking the realm about
+**every quest id from 1 to 26,034** shows it is right:
+
+```
+9464 answered, 9464 parsed whole
+  100.0% -- bodies from 381 to 1438 bytes
+```
+
+A body that ends anywhere but its last byte is an error here, so that is the
+reading confirmed across the whole table rather than across the quests somebody
+chose to look at. Same instrument as `dbc check` and `m2 survey`, and the same
+reason for it.
+
+**The first version of that sweep took twenty minutes and had not finished.**
+It drained with a 4,096-packet bound and no clock, against a zone that emits a
+monster move fourteen times a second and is therefore *never* quiet — so every
+block collected four thousand packets of background traffic to find two hundred
+answers. That is the login-burst bug written up two milestones ago, walked into
+again by the next loop that had a limit and no deadline. It now has a wall-clock
+budget per block *and* prints progress, because a silent twenty-minute run is
+indistinguishable from a hung one.
+
+#### A cache that knows the difference between empty and unknown
+
+`world::quest_cache` keeps what the server has said, keyed by realm. Two
+decisions carry the weight:
+
+**It holds packet bodies, not parsed structs.** A cache of parsed structs
+freezes a *parse*; a cache of bodies freezes an *observation*. When the parser
+learns to read a field it currently skips, every already-cached quest gains it
+with no version stamp and no migration — where a struct cache would have to be
+discarded, or worse, read back with the new field silently defaulted, which is a
+fabricated number.
+
+**A missing answer is `unknown`, never `nothing`.** There is deliberately no
+`get() -> Option<&QuestInfo>`, because `None` would mean both "still waiting"
+and "genuinely empty" and every call site would have to remember which. The
+three states reach the screen intact: a quest still being asked about draws
+`asking the server...`, one the realm would not describe draws `no answer from
+the realm`, and neither is the same as a quest with no objectives. An id asked
+about and never answered is **not** written to disk, because "there is no such
+quest" and "the reply was lost" are indistinguishable and only one of them is
+permanent.
+
+#### The log itself
+
+`L` opens it. Titles, levels and objective lines come off the wire and out of
+the cache; nothing is looked up in a shipped table.
+
+**Whether a quest is finished is read from the log's own state field**, which
+had to be measured rather than assumed — every field of a log entry holds a
+small integer, so validity separates none of them. The first two attempts at a
+sample could not have answered the question: quest 783 has no objectives and so
+is complete the instant it is taken, and quest 333's `StartItem` *is* its own
+`RequiredItemId1`, so accepting it hands you the item and completes it too. Both
+read `1`. Putting quest 38 — which wants twelve items the character does not
+have — beside 783 gave `0` against `1` with all three remaining fields zero on
+both, which names the column and nothing more. Only bit zero is read, because
+that is the only bit anything here has seen move.

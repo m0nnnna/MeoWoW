@@ -38,7 +38,7 @@ pub use edit::{EditAction, EditState};
 pub use element::{Anchor, Element};
 pub use frames::chat::{ChatEntry, ChatKind};
 pub use frames::combat_text::{CombatTextKind, FloatingText};
-pub use frames::{CastBarView, SpellbookEntry, UnitView};
+pub use frames::{CastBarView, QuestDetail, QuestLogEntry, SpellbookEntry, UnitView};
 pub use layout::{default_path, ElementId, Profile};
 pub use style::{Color, PowerType, Style};
 
@@ -120,6 +120,17 @@ pub struct HudData<'a> {
     /// the corpse is released. "Open" is therefore expressed entirely by
     /// having something to draw, with no flag anywhere that could disagree.
     pub loot: Option<&'a [frames::LootRow]>,
+    /// The quest log, or `None` when the panel is shut. Existence is the flag,
+    /// as it is for the spellbook and the bag window.
+    ///
+    /// The caller resolves each quest's title and objective out of its own
+    /// cache; this crate knows nothing about `CMSG_QUEST_QUERY` and never
+    /// decides that a quest has no objectives -- see
+    /// [`frames::quest_log::QuestDetail`], which makes "not answered yet" a
+    /// state a row can be in rather than an empty string.
+    pub quest_log: Option<&'a [frames::QuestLogEntry]>,
+    /// Which quest is highlighted in the log, if any.
+    pub selected_quest: Option<u32>,
     /// The character's money in copper, drawn along the bottom of the bag
     /// window. Ignored when `bags` is `None`.
     pub copper: u32,
@@ -157,6 +168,11 @@ pub struct HudResponse {
     /// auto-equip whatever is in it. Same row-position caveat as
     /// [`Self::move_item`].
     pub auto_equip: Option<usize>,
+    /// A quest log row was clicked, reported as the **quest id** rather than
+    /// as the row's position. Same reasoning as [`Self::take_loot`] carrying a
+    /// loot slot: a row number means nothing outside the list this crate was
+    /// handed, and the list is rebuilt whenever the log changes.
+    pub selected_quest: Option<u32>,
 }
 
 /// What the cursor is currently carrying, picked up from either window that
@@ -379,6 +395,7 @@ impl Hud {
             let bags_placeholder;
             let character_placeholder;
             let loot_placeholder;
+            let quest_log_placeholder;
             let release_prompt_placeholder;
             let content = match id {
                 ElementId::PlayerFrame | ElementId::TargetFrame => {
@@ -452,6 +469,14 @@ impl Hud {
                     }
                     None => continue,
                 },
+                ElementId::QuestLog => match data.quest_log {
+                    Some(entries) => Content::QuestLog(entries),
+                    None if editing => {
+                        quest_log_placeholder = frames::quest_log::placeholder();
+                        Content::QuestLog(&quest_log_placeholder)
+                    }
+                    None => continue,
+                },
                 // Absent while alive or already a ghost, on the same reasoning
                 // as the loot window: existence is the flag, and drawn in
                 // edit mode so it can be positioned without dying first.
@@ -495,6 +520,11 @@ impl Hud {
                 // Sized to the corpse, so a one-item corpse does not open a
                 // window with empty lines in it.
                 Content::Loot(rows) => frames::loot::size(rows.len(), &style, element.scale),
+                // Sized to the log, so a character on one quest does not open
+                // a panel with twenty-four blank lines.
+                Content::QuestLog(entries) => {
+                    frames::quest_log::size(entries, &style, element.scale)
+                }
                 Content::ReleasePrompt(_) => frames::release::size(&style, element.scale),
             };
             let rect = element.rect(screen, size);
@@ -565,6 +595,7 @@ impl Hud {
                         Content::Bar { .. }
                             | Content::Spellbook(_)
                             | Content::Loot(_)
+                            | Content::QuestLog(_)
                             | Content::ReleasePrompt(_)
                             | Content::Bags(_)
                     ) {
@@ -642,6 +673,14 @@ impl Hud {
                             &painter,
                             response.rect,
                             rows,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::QuestLog(entries) => frames::quest_log::draw(
+                            &painter,
+                            response.rect,
+                            entries,
+                            data.selected_quest,
                             &style,
                             element.scale,
                         ),
@@ -750,6 +789,26 @@ impl Hud {
                                 // wrong item -- silently, since nothing
                                 // acknowledges the request.
                                 response_out.take_loot = rows.get(row).map(|row| row.take);
+                            }
+                        }
+                    }
+                }
+                (false, Content::QuestLog(entries)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            if let Some(row) = frames::quest_log::entry_at(
+                                drawn_rect,
+                                entries,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                // The quest **id**, not the row. The list is
+                                // rebuilt whenever the log changes, so a
+                                // position is meaningless by the time the
+                                // caller reads it.
+                                response_out.selected_quest =
+                                    entries.get(row).map(|entry| entry.id);
                             }
                         }
                     }
@@ -925,6 +984,10 @@ impl Hud {
             // demand: the window holds the profile mutably while it runs, so a
             // closure that read sizes out of the profile could not also be
             // handed to it.
+            // Same source the drawing loop used for its own placeholder, so
+            // re-anchoring cannot measure a frame differently from how it was
+            // painted.
+            let edit_quest_log = frames::quest_log::placeholder();
             let sizes: Vec<(ElementId, egui::Vec2)> = ElementId::ALL
                 .into_iter()
                 .map(|id| {
@@ -949,6 +1012,13 @@ impl Hud {
                             scale,
                         ),
                         ElementId::Character => frames::character::size(&style, scale),
+                        ElementId::QuestLog => {
+                            frames::quest_log::size(
+                                data.quest_log.unwrap_or(&edit_quest_log),
+                                &style,
+                                scale,
+                            )
+                        }
                         ElementId::Loot => frames::loot::size(
                             data.loot
                                 .map(|rows| rows.len())
@@ -1015,6 +1085,7 @@ enum Content<'a> {
     Bags(&'a [frames::BagSlot]),
     Character(&'a [frames::EquipSlot]),
     Loot(&'a [frames::LootRow]),
+    QuestLog(&'a [frames::QuestLogEntry]),
     ReleasePrompt(&'a frames::ReleasePromptView),
 }
 
@@ -1636,6 +1707,167 @@ mod tests {
         assert_eq!(response.take_loot, Some(frames::Take::Money));
     }
 
+    fn log_entries() -> Vec<frames::QuestLogEntry> {
+        vec![
+            frames::QuestLogEntry {
+                id: 783,
+                detail: frames::QuestDetail::Known {
+                    title: "A Threat Within".into(),
+                    objective: "Speak with Marshal McBride.".into(),
+                    level: 1,
+                },
+                complete: true,
+            },
+            frames::QuestLogEntry {
+                id: 38,
+                detail: frames::QuestDetail::Waiting,
+                complete: false,
+            },
+        ]
+    }
+
+    /// The quest log is drawn when it is open and not otherwise -- the same
+    /// existence-is-the-flag rule the spellbook and bag window follow.
+    #[test]
+    fn a_quest_log_appears_only_when_open_or_editing() {
+        let entries = log_entries();
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        assert!(
+            painted(&mut hud, &HudData::default()).is_empty(),
+            "a shut log must draw nothing"
+        );
+
+        let data = HudData {
+            quest_log: Some(&entries),
+            ..Default::default()
+        };
+        assert!(
+            !painted(&mut hud, &data).is_empty(),
+            "an open log must draw"
+        );
+
+        // And it can be positioned before the character has any quests.
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        hud.toggle_edit();
+        assert!(!painted(&mut hud, &HudData::default()).is_empty());
+    }
+
+    /// **The text a player would read, asserted from the painted shapes.**
+    /// Every earlier frame here was checked only by its rectangle, and a
+    /// rectangle is drawn identically whether the row inside it says the right
+    /// thing or nothing at all.
+    #[test]
+    fn the_quest_log_paints_what_it_was_given() {
+        let entries = log_entries();
+        let data = HudData {
+            quest_log: Some(&entries),
+            ..Default::default()
+        };
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let text = painted_text(&shapes(&mut hud, &data, None));
+        let all = text.join(" | ");
+        assert!(all.contains("A Threat Within"), "{all}");
+        assert!(all.contains("Speak with Marshal McBride."), "{all}");
+        // The finished quest says so, and the unfinished one does not -- the
+        // half that would pass anyway if every row claimed to be complete.
+        assert!(all.contains("(Complete)"), "{all}");
+        // A quest still being asked about names its own id, so a player can
+        // report a row that never resolves.
+        assert!(all.contains("38"), "{all}");
+    }
+
+    /// **A quest waiting for its description must not look like one with no
+    /// objectives.** This is the whole reason the cache has three states
+    /// rather than an `Option`, and it is asserted where a player would see
+    /// it: in the painted text.
+    #[test]
+    fn a_waiting_quest_does_not_paint_as_an_empty_one() {
+        let waiting = vec![frames::QuestLogEntry {
+            id: 38,
+            detail: frames::QuestDetail::Waiting,
+            complete: false,
+        }];
+        let empty = vec![frames::QuestLogEntry {
+            id: 38,
+            detail: frames::QuestDetail::Known {
+                title: "Westfall Stew".into(),
+                objective: String::new(),
+                level: 13,
+            },
+            complete: false,
+        }];
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let waiting_text = painted_text(&shapes(
+            &mut hud,
+            &HudData {
+                quest_log: Some(&waiting),
+                ..Default::default()
+            },
+            None,
+        ))
+        .join(" | ");
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let empty_text = painted_text(&shapes(
+            &mut hud,
+            &HudData {
+                quest_log: Some(&empty),
+                ..Default::default()
+            },
+            None,
+        ))
+        .join(" | ");
+        assert_ne!(
+            waiting_text, empty_text,
+            "waiting and empty must be distinguishable on screen"
+        );
+        assert!(empty_text.contains("Westfall Stew"), "{empty_text}");
+    }
+
+    /// Clicking a row reports the **quest id**, not the row's position -- and
+    /// the row clicked here is the second one, so a bug that always reported
+    /// the first would fail.
+    ///
+    /// Same silent-failure shape as the loot window: a frame left out of the
+    /// `Sense::click()` list draws and hit-tests fine and never reports a
+    /// click, so the arm handling it is dead code that reads as live.
+    #[test]
+    fn clicking_a_quest_row_reports_its_id() {
+        let entries = log_entries();
+        let data = HudData {
+            quest_log: Some(&entries),
+            ..Default::default()
+        };
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::QuestLog);
+        let rect = element.rect(
+            screen(),
+            frames::quest_log::size(&entries, &hud.profile.style, element.scale),
+        );
+        let centres: Vec<egui::Pos2> =
+            frames::quest_log::entry_rects(rect, &entries, &hud.profile.style, element.scale)
+                .into_iter()
+                .map(|row| row.center())
+                .collect();
+
+        let response = drive(
+            &mut hud,
+            &data,
+            &click_script(centres[1], egui::PointerButton::Primary),
+        );
+        assert_eq!(
+            response.selected_quest,
+            Some(38),
+            "clicking the second row must report quest 38, not row 1"
+        );
+    }
+
     /// The same silent-failure shape as the loot-row test above, for the
     /// release prompt: a frame missing from the `Sense::click()` list draws
     /// and hit-tests fine and simply never reports a click.
@@ -2037,6 +2269,9 @@ mod tests {
                 frames::bags::size(frames::bags::placeholder().len(), &profile.style, scale)
             }
             ElementId::Character => frames::character::size(&profile.style, scale),
+            ElementId::QuestLog => {
+                frames::quest_log::size(&frames::quest_log::placeholder(), &profile.style, scale)
+            }
             ElementId::Loot => {
                 frames::loot::size(frames::loot::placeholder().len(), &profile.style, scale)
             }

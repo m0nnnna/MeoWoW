@@ -1067,11 +1067,28 @@ pub mod fields {
 
     /// How many update fields one quest log entry occupies.
     ///
-    /// Only the first -- the quest id -- is read by this client. The other
-    /// four carry state, objective counters and a timer, and are deliberately
-    /// **not** named: which is which has not been measured, and a wrong name
-    /// on a counter would misreport progress rather than fail.
+    /// Two of the five are now named -- the id and [`QUEST_LOG_STATE`]. The
+    /// remaining three carry objective counters and a timer in some order, and
+    /// are deliberately **not** named: which is which has not been measured,
+    /// and a wrong name on a counter would misreport progress rather than
+    /// fail.
     pub const QUEST_LOG_STRIDE: u16 = 5;
+
+    /// Offset within a quest-log entry of the field that says whether the
+    /// quest is finished.
+    ///
+    /// **Measured against two quests in known and opposite states**, which is
+    /// the only way this could be settled: every field of an entry holds a
+    /// small integer, so "contains a plausible value" separates none of them.
+    /// A character holding quest 783 -- which has no objectives at all and is
+    /// therefore complete the moment it is taken -- and quest 38 -- which
+    /// wants twelve items the character does not have -- read `1` and `0` here
+    /// respectively, with all three remaining fields zero on both.
+    ///
+    /// That names the column and nothing more. See
+    /// [`crate::state::Entity::quest_is_complete`] for why only one bit of it
+    /// is read.
+    pub const QUEST_LOG_STATE: u16 = 1;
 
     /// How many quests the log holds. Its product with the stride is what
     /// makes the block end exactly where the visible-item block starts.

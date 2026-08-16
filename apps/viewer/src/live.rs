@@ -95,6 +95,14 @@ pub struct Entity {
 /// Where the player is and what can be seen from there.
 pub struct LiveWorld {
     pub character: String,
+    /// The realm's own name, as the logon server gave it.
+    ///
+    /// Carried out of [`connect`] rather than re-derived, because it names the
+    /// quest cache on disk and two realms must never share one -- the whole
+    /// point of asking the server about quests rather than shipping a database
+    /// is being right on a realm with custom content, which one shared file
+    /// would undo.
+    pub realm: String,
     /// The character's own guid, needed as the mover in every movement packet
     /// this client sends.
     pub guid: u64,
@@ -267,6 +275,7 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
     let (map_directory, map_name) = map_directory(chain, landed.map)?;
     let mut live = LiveWorld {
         character: character.name.clone(),
+        realm: realm.name.clone(),
         guid: character.guid,
         map_id: landed.map,
         map_directory,

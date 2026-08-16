@@ -386,6 +386,25 @@ enum Command {
         /// `--quest-accept`'s note on `0x018F`).
         #[arg(long)]
         quest_turnin: Option<u32>,
+        /// Dump every field of every occupied quest-log slot.
+        ///
+        /// **A measurement, not a display.** Only the first field of a slot
+        /// has been identified; run this against a character whose quests are
+        /// in a state you chose -- one finished, one not -- and whichever
+        /// field differs the way completion differs is the completion field.
+        #[arg(long)]
+        quest_log: bool,
+        /// Ask what *every* quest id up to this one is, and report how many
+        /// answers parse whole.
+        ///
+        /// **The regression net for this packet.** A variable-length body with
+        /// two array blocks after five strings is the class where a wrong
+        /// reading parses one quest perfectly and desynchronises on the next,
+        /// and a handful of hand-picked samples cannot show that. A systematic
+        /// error shows up here as one large bucket rather than as scattered
+        /// noise -- the same reason `dbc check` and `m2 survey` exist.
+        #[arg(long)]
+        quest_sweep: Option<u32>,
         /// Ask where the objectives of every quest in the log are.
         ///
         /// The check the whole native-tracker plan rests on: WotLK shipped its
@@ -854,6 +873,8 @@ fn main() -> Result<()> {
             quest,
             quest_accept,
             quest_turnin,
+            quest_sweep,
+            quest_log,
             quest_poi,
             quest_info,
             target,
@@ -903,6 +924,8 @@ fn main() -> Result<()> {
                 quest: *quest,
                 quest_accept: *quest_accept,
                 quest_turnin: *quest_turnin,
+                quest_sweep: *quest_sweep,
+                quest_log: *quest_log,
                 quest_poi: *quest_poi,
                 quest_info,
 
@@ -1075,6 +1098,8 @@ struct WorldRequest<'a> {
     quest: Option<u32>,
     quest_accept: Option<u32>,
     quest_turnin: Option<u32>,
+    quest_sweep: Option<u32>,
+    quest_log: bool,
     quest_poi: bool,
     quest_info: &'a [u32],
     target: Option<&'a str>,
@@ -1172,6 +1197,8 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         quest,
         quest_accept,
         quest_turnin,
+        quest_sweep,
+        quest_log,
         quest_poi,
         quest_info,
         target,
@@ -1950,10 +1977,6 @@ cast {spell_id} at {} (attempt {attempt})",
             )?;
         }
 
-        if let (Some(capture), Some(path)) = (capture, capture_path) {
-            capture.finish(path)?;
-        }
-
         if let Some(limit) = units {
             report_units(&state, character.guid, limit);
         }
@@ -2001,6 +2024,7 @@ cast {spell_id} at {} (attempt {attempt})",
                 prefer,
                 quest_accept,
                 quest_turnin,
+                capture.as_mut(),
             )?;
         }
 
@@ -2009,7 +2033,15 @@ cast {spell_id} at {} (attempt {attempt})",
         }
 
         for quest in quest_info {
-            survey_quest_info(&mut connection, *quest)?;
+            survey_quest_info(&mut connection, *quest, capture.as_mut())?;
+        }
+
+        if let Some(highest) = quest_sweep {
+            sweep_quests(&mut connection, highest)?;
+        }
+
+        if quest_log {
+            report_quest_log(&state, character.guid);
         }
 
         if unit_fields {
@@ -2030,6 +2062,15 @@ cast {spell_id} at {} (attempt {attempt})",
 
         if own_fields {
             report_own_fields(&state, character.guid, "after");
+        }
+
+        // **Last, after every survey.** This used to sit halfway up the
+        // function, which silently made the capture file a record of the login
+        // burst and nothing else: any survey below it recorded into a writer
+        // that had already been flushed and reported. The quest surveys are
+        // below it and are exactly the ones whose packets are worth keeping.
+        if let (Some(capture), Some(path)) = (capture, capture_path) {
+            capture.finish(path)?;
         }
     }
     Ok(())
@@ -2968,28 +3009,257 @@ fn survey_loot(
     Ok(())
 }
 
+/// Asks the server about every quest id up to `highest` and reports how many
+/// answers the parser consumed whole.
+///
+/// **Requests go out in blocks and replies are collected in bulk**, because
+/// one query per drain would take four hours over nine thousand quests. The
+/// server answers each independently and the reply carries its own quest id,
+/// so nothing depends on the order they come back in.
+///
+/// A missing answer is *not* counted as a failure: an id with no quest behind
+/// it is simply never answered, and the table is sparse. What is counted is
+/// the split between answers that parsed and answers that did not -- the only
+/// two outcomes that say anything about the reading.
+fn sweep_quests(connection: &mut world::Connection, highest: u32) -> Result<()> {
+    // Big enough that the round trips amortise, small enough that the server's
+    // send buffer is not asked to hold nine thousand replies at once.
+    const BLOCK: u32 = 200;
+    // **A wall clock, because a packet count is not one.** The first version of
+    // this drained with a 4,096-packet bound and no clock, against a zone that
+    // emits a monster move fourteen times a second and is *never* quiet -- so
+    // every block collected four thousand packets of background traffic to
+    // find two hundred answers, and a seven-minute sweep had not finished
+    // after twenty. Exactly the bug written up for the login burst, walked
+    // into again by the next loop that had a limit and no deadline.
+    const BLOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+    // Short, so a block that has all its answers moves on immediately instead
+    // of sitting out the budget.
+    const SIP: std::time::Duration = std::time::Duration::from_millis(120);
+
+    println!("
+asking about every quest from 1 to {highest}");
+    let started = std::time::Instant::now();
+    let mut answered = 0usize;
+    let mut parsed = 0usize;
+    let mut failures: Vec<(u32, String)> = Vec::new();
+    let mut lengths = (u32::MAX, 0u32);
+
+    let mut id = 1;
+    while id <= highest {
+        let end = (id + BLOCK).min(highest + 1);
+        let asked = (end - id) as usize;
+        for quest in id..end {
+            connection.query_quest_info(quest)?;
+        }
+
+        let deadline = std::time::Instant::now() + BLOCK_BUDGET;
+        let mut in_block = 0usize;
+        while in_block < asked && std::time::Instant::now() < deadline {
+            let batch = connection.drain(SIP, 512)?;
+            if batch.is_empty() {
+                continue;
+            }
+            for packet in &batch {
+                if packet.opcode != world::opcode::server::QUEST_QUERY_RESPONSE {
+                    continue;
+                }
+                in_block += 1;
+                answered += 1;
+                lengths.0 = lengths.0.min(packet.body.len() as u32);
+                lengths.1 = lengths.1.max(packet.body.len() as u32);
+                match world::quest::parse_quest_query(&packet.body) {
+                    Ok(_) => parsed += 1,
+                    Err(error) => {
+                        let quest = packet
+                            .body
+                            .get(..4)
+                            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                            .unwrap_or(0);
+                        if failures.len() < 20 {
+                            failures.push((quest, error.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // **Progress, because a silent twenty-minute run is indistinguishable
+        // from a hung one.** That is how the first version of this wasted
+        // twenty minutes before anyone could tell it was stuck.
+        println!(
+            "  {:>6}..{:<6} {in_block:>4} answered   {parsed}/{answered} parsed   {:.0}s elapsed",
+            id,
+            end - 1,
+            started.elapsed().as_secs_f32()
+        );
+        id = end;
+    }
+
+    println!("
+{answered} answered, {parsed} parsed whole");
+    if answered > 0 {
+        println!(
+            "  {:.1}% -- bodies from {} to {} bytes",
+            100.0 * parsed as f64 / answered as f64,
+            lengths.0,
+            lengths.1
+        );
+    }
+    if failures.is_empty() {
+        println!("  no failures. A body that ends anywhere but its last byte is an");
+        println!("  error here, so this is the layout confirmed across the table and");
+        println!("  not merely across the quests somebody chose to look at.");
+    } else {
+        println!("
+{} failure(s), first {} shown:", failures.len(), failures.len());
+        for (quest, error) in &failures {
+            println!("  quest {quest}: {error}");
+        }
+    }
+    Ok(())
+}
+
+/// Dumps the quest log's raw slots.
+///
+/// Prints all five fields of each occupied slot under headings that say what
+/// is known and what is not, rather than under four guessed names. A wrong
+/// name on a counter would misreport progress rather than fail, which is the
+/// class of mistake this project pays most for.
+fn report_quest_log(state: &world::WorldState, own_guid: u64) {
+    let Some(player) = state.get(own_guid) else {
+        println!("
+no replicated player object to read a quest log from");
+        return;
+    };
+    let slots = player.quest_log_slots();
+    println!("
+quest log: {} occupied slot(s)", slots.len());
+    println!("  {:>6}  {:>10} {:>10} {:>10} {:>10}", "quest", "+1", "+2", "+3", "+4");
+    for (id, rest) in &slots {
+        println!(
+            "  {id:>6}  {:>10} {:>10} {:>10} {:>10}",
+            rest[0], rest[1], rest[2], rest[3]
+        );
+    }
+    if !slots.is_empty() {
+        println!("
+  Only the quest id is identified. The four columns are printed");
+        println!("  unnamed on purpose -- run this against a character with one quest");
+        println!("  finished and one not, and the column that differs the way");
+        println!("  completion differs is the one worth naming.");
+    }
+}
+
+/// Prints a parsed quest the way a quest log would show it.
+///
+/// **Every line here is a field that was checked against the realm's own
+/// `quest_template`**, and the fields that were not -- the faction
+/// requirements, the reward-faction override array, the point's `option` --
+/// are not printed at all rather than printed under a guessed name. A wrong
+/// name on a number nobody can check is this project's most expensive kind of
+/// mistake.
+fn print_quest_info(q: &world::QuestInfo) {
+    println!("  [{}] {}", q.id, q.title);
+    println!("  level {} (min {}), sort {}", q.level, q.min_level, q.sort);
+    if !q.objectives_text.is_empty() {
+        println!("  objective: {}", q.objectives_text);
+    }
+    for objective in &q.objectives {
+        let what = match objective.target {
+            Some(world::ObjectiveTarget::Creature(id)) => format!("creature {id}"),
+            Some(world::ObjectiveTarget::GameObject(id)) => format!("game object {id}"),
+            None => "nothing to kill".to_string(),
+        };
+        let drop = if objective.item_drop != 0 {
+            format!(", drops item {}", objective.item_drop)
+        } else {
+            String::new()
+        };
+        let text = if objective.text.is_empty() {
+            String::new()
+        } else {
+            format!(" -- {}", objective.text)
+        };
+        println!("    x{} {what}{drop}{text}", objective.count);
+    }
+    for item in &q.item_objectives {
+        println!("    x{} item {}", item.count, item.item);
+    }
+    if q.money != 0 {
+        println!("  reward: {} copper", q.money);
+    }
+    for reward in &q.reward_items {
+        println!("  reward: item {} x{}", reward.item, reward.count);
+    }
+    for choice in &q.reward_choices {
+        println!("  choice: item {} x{}", choice.item, choice.count);
+    }
+    for (faction, value) in &q.reward_factions {
+        println!("  faction {faction}: QuestFactionReward row {value}");
+    }
+    if q.next_quest != 0 {
+        println!("  next in chain: {}", q.next_quest);
+    }
+    if q.start_item != 0 {
+        println!("  starts you holding item {}", q.start_item);
+    }
+    if let Some(point) = q.point {
+        println!("  point: map {} at {:.1}, {:.1}", point.map, point.x, point.y);
+    }
+    // **The flag field's low half only.** Printing it as "flags" without this
+    // note invites the next reader to test 0x80000 against it, which can never
+    // be set. See `QuestInfo::flags`.
+    println!("  flags {:#x} (low 16 bits only -- auto-accept cannot appear)", q.flags);
+}
+
 /// Asks what one quest is, and dumps the answer.
 ///
 /// **Needs no NPC and no quest log**, which is the whole point: a tracker has
 /// to describe quests the player is not standing in front of, and a map has to
 /// label a pin for a quest that has not been taken. This is the request that
 /// makes both possible without shipping a database.
-fn survey_quest_info(connection: &mut world::Connection, quest: u32) -> Result<()> {
+fn survey_quest_info(
+    connection: &mut world::Connection,
+    quest: u32,
+    // **A packet printed truncated is a packet seen and lost.** This body runs
+    // to hundreds of bytes and `dump_unexpected` stops at 640 characters of
+    // hex, which is a fifth of it. The capture file is what the layout gets
+    // worked out from, so the survey that produces the packet has to feed it.
+    mut capture: Option<&mut Capture>,
+) -> Result<()> {
     println!("
 asking what quest {quest} is");
     connection.query_quest_info(quest)?;
     let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+    if let Some(capture) = capture.as_mut() {
+        capture.record(&batch)?;
+    }
     dump_unexpected(&batch, &format!("after CMSG_QUEST_QUERY for {quest}"));
 
     match batch
         .iter()
         .find(|p| p.opcode == world::opcode::server::QUEST_QUERY_RESPONSE)
     {
-        Some(reply) => println!(
-            "
+        Some(reply) => {
+            println!(
+                "
 SMSG_QUEST_QUERY_RESPONSE for {quest}, {} bytes",
-            reply.body.len()
-        ),
+                reply.body.len()
+            );
+            match world::quest::parse_quest_query(&reply.body) {
+                Ok(info) => print_quest_info(&info),
+                // **Loud, and with the bytes.** A body this size that a cursor
+                // refuses is the single most informative packet this command
+                // can produce, and printing only the error would throw it
+                // away -- which is how `SMSG_ATTACKERSTATEUPDATE` was once
+                // seen and lost.
+                Err(error) => {
+                    println!("  PARSE FAILED: {error}");
+                    println!("  {}", hex_preview(&reply.body, 4096));
+                }
+            }
+        }
         None => {
             println!("
 no answer. A quest query needs no NPC and no log entry, so");
@@ -3060,6 +3330,7 @@ fn survey_quests(
     prefer: Option<u32>,
     accept: Option<u32>,
     turn_in: Option<u32>,
+    mut capture: Option<&mut Capture>,
 ) -> Result<()> {
     let Some(npc) = approach_talker(connection, state, own_guid, here, prefer)? else {
         return Ok(());
@@ -3079,14 +3350,25 @@ fn survey_quests(
     connection.questgiver_hello(npc.guid)?;
     let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
     state.replicate(&batch, None);
+    if let Some(capture) = capture.as_mut() {
+        capture.record(&batch)?;
+    }
 
     dump_unexpected(&batch, "after CMSG_QUESTGIVER_HELLO");
 
     if let Some(wanted) = accept {
-        accept_one_quest(connection, state, own_guid, &npc, wanted, &log_at_entry)?;
+        accept_one_quest(
+            connection,
+            state,
+            own_guid,
+            &npc,
+            wanted,
+            &log_at_entry,
+            capture.as_deref_mut(),
+        )?;
     }
     if let Some(wanted) = turn_in {
-        turn_in_one_quest(connection, state, own_guid, &npc, wanted)?;
+        turn_in_one_quest(connection, state, own_guid, &npc, wanted, capture)?;
     }
     Ok(())
 }
@@ -3120,6 +3402,7 @@ fn accept_one_quest(
     npc: &Talker,
     wanted: u32,
     log_at_entry: &[u32],
+    mut capture: Option<&mut Capture>,
 ) -> Result<()> {
 
     // Ask for the scroll before accepting, in that order, because that is the
@@ -3130,6 +3413,9 @@ fn accept_one_quest(
     connection.query_quest(npc.guid, wanted)?;
     let details = connection.drain(std::time::Duration::from_millis(2000), 128)?;
     state.replicate(&details, None);
+    if let Some(capture) = capture.as_mut() {
+        capture.record(&details)?;
+    }
     dump_unexpected(&details, "after CMSG_QUESTGIVER_QUERY_QUEST");
 
     // **Snapshot every field of our own object, not a quest log we cannot yet
@@ -3271,6 +3557,7 @@ fn turn_in_one_quest(
     own_guid: u64,
     npc: &Talker,
     wanted: u32,
+    mut capture: Option<&mut Capture>,
 ) -> Result<()> {
     let log_before = quest_log_ids(state, own_guid);
     println!("\nquest log before turning in: {log_before:?}");
@@ -3290,6 +3577,9 @@ fn turn_in_one_quest(
     connection.complete_quest(npc.guid, wanted)?;
     let offered = connection.drain(std::time::Duration::from_millis(2000), 128)?;
     state.replicate(&offered, None);
+    if let Some(capture) = capture.as_mut() {
+        capture.record(&offered)?;
+    }
     dump_unexpected(&offered, "after CMSG_QUESTGIVER_COMPLETE_QUEST");
 
     let reward_screen = offered
@@ -3331,6 +3621,9 @@ fn turn_in_one_quest(
     connection.choose_quest_reward(npc.guid, wanted, 0)?;
     let finished = connection.drain(std::time::Duration::from_millis(2000), 128)?;
     state.replicate(&finished, None);
+    if let Some(capture) = capture.as_mut() {
+        capture.record(&finished)?;
+    }
     dump_unexpected(&finished, "after CMSG_QUESTGIVER_CHOOSE_REWARD");
 
     if let Some(reply) = finished

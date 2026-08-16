@@ -124,7 +124,12 @@ impl<'a> Reader<'a> {
         Self { data, at: 0, what }
     }
 
-    fn take(&mut self, need: usize) -> Result<&'a [u8], Error> {
+    /// Takes exactly `need` bytes, or fails.
+    ///
+    /// Public so that anything with a length-prefixed body of its own -- the
+    /// quest cache file, for one -- gets the same running-out-of-input check
+    /// the packet parsers do, rather than a hand-rolled slice that panics.
+    pub fn take(&mut self, need: usize) -> Result<&'a [u8], Error> {
         if self.at + need > self.data.len() {
             return Err(Error::Truncated {
                 what: self.what,

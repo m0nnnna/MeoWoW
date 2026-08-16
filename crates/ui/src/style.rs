@@ -221,6 +221,16 @@ pub struct Style {
     /// Behind the spell currently picked up, waiting to be put on a bar.
     pub spellbook_selected: Color,
 
+    /// How wide the quest log is. Its own dimension because a quest title and
+    /// an objective line are longer than a spell name and a rank -- reusing
+    /// the spellbook's width would make every objective ellipsise.
+    pub quest_log_width: f32,
+    /// The objective line under a quest's title, and the colour a row uses
+    /// when it is describing the *client's* state rather than the quest's --
+    /// still waiting for an answer, or never given one. Dimmer than the title
+    /// on purpose: those rows are not content and should not read as content.
+    pub quest_dim: Color,
+
     /// Width of the cast bar at scale 1.0. Reuses `bar_height` for its
     /// thickness -- a cast bar is one bar, the same shape as a health bar
     /// turned wide, and does not need a dimension of its own for that.
@@ -353,6 +363,9 @@ impl Default for Style {
             spellbook_background: Color::rgba(16, 18, 24, 235),
             spellbook_selected: Color::rgba(240, 190, 70, 90),
 
+            quest_log_width: 320.0,
+            quest_dim: Color::rgba(170, 178, 195, 210),
+
             cast_bar_width: 260.0,
             casting: Color::rgb(220, 170, 60),
 
@@ -437,6 +450,7 @@ impl Style {
         self.spellbook_width = self.spellbook_width.clamp(120.0, 1200.0);
         self.spellbook_height = self.spellbook_height.clamp(60.0, 1600.0);
         self.spellbook_row = self.spellbook_row.clamp(10.0, 200.0);
+        self.quest_log_width = self.quest_log_width.clamp(120.0, 1400.0);
         self.chat_width = self.chat_width.clamp(120.0, 2000.0);
         self.chat_height = self.chat_height.clamp(40.0, 1200.0);
         self.chat_scrollback = self.chat_scrollback.clamp(10, 10_000);

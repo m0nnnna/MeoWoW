@@ -22,6 +22,7 @@ pub mod names;
 pub mod opcode;
 pub mod protocol;
 pub mod quest;
+pub mod quest_cache;
 pub mod query;
 pub mod spell;
 pub mod state;
@@ -33,7 +34,11 @@ pub use chat::{ChatMessage, ChatType};
 pub use client::{Connection, DEFAULT_PORT};
 pub use crypt::HeaderCrypt;
 pub use gossip::{Gossip, GossipOption, GossipQuest};
-pub use quest::{QuestPoi, QuestPoiSet};
+pub use quest::{
+    ObjectiveTarget, QuestInfo, QuestItemObjective, QuestObjective, QuestPoi, QuestPoiSet,
+    QuestPoint, QuestRewardItem,
+};
+pub use quest_cache::{Answer, QuestCache};
 pub use vendor::{VendorItem, VendorList};
 pub use inventory::{Carried, HeldItem, InventorySlot, SlotKind, Where};
 pub use loot::{Loot, LootItem};

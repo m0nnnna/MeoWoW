@@ -43,11 +43,12 @@ pub enum ElementId {
     Bags,
     Character,
     Loot,
+    QuestLog,
     ReleasePrompt,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 12] = [
+    pub const ALL: [ElementId; 13] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -59,6 +60,7 @@ impl ElementId {
         ElementId::Bags,
         ElementId::Character,
         ElementId::Loot,
+        ElementId::QuestLog,
         ElementId::ReleasePrompt,
     ];
 
@@ -86,6 +88,7 @@ impl ElementId {
             ElementId::Bags => "bags",
             ElementId::Character => "character",
             ElementId::Loot => "loot",
+            ElementId::QuestLog => "quest-log",
             ElementId::ReleasePrompt => "release-prompt",
         }
     }
@@ -108,6 +111,7 @@ impl ElementId {
             ElementId::Bags => "Bags",
             ElementId::Character => "Character",
             ElementId::Loot => "Loot",
+            ElementId::QuestLog => "Quest log",
             ElementId::ReleasePrompt => "Release-spirit prompt",
         }
     }
@@ -214,6 +218,15 @@ impl ElementId {
             ElementId::ReleasePrompt => Element {
                 anchor: Anchor::Center,
                 offset: [0.0, 60.0],
+                ..Default::default()
+            },
+            // Top right, the one edge nothing else claims -- the spellbook is
+            // centred on the right edge and the bags sit in the corner below
+            // it. A quest log is read *while* moving rather than stopped, so
+            // it wants a corner and not the middle of the view.
+            ElementId::QuestLog => Element {
+                anchor: Anchor::TopRight,
+                offset: [-24.0, 24.0],
                 ..Default::default()
             },
         }
@@ -529,20 +542,22 @@ mod tests {
     /// quietly dropped.
     #[test]
     fn an_unknown_element_is_reported_and_skipped() {
-        // `quest-log` rather than `spellbook`: this test's example has to be an
-        // element that genuinely does not exist, and the spellbook -- which
-        // was that example until it was built -- is now one of the known keys.
+        // **A key chosen so it can never become real.** This test has been
+        // broken twice by its own example getting built: it used `spellbook`
+        // until the spellbook existed, then `quest-log` until the quest log
+        // did. Naming a planned feature guarantees a third time, so the
+        // example is now a key nothing will ever claim.
         let text = r#"
             [elements.player-frame]
             offset = [10.0, 10.0]
 
-            [elements.quest-log]
+            [elements.no-such-element]
             offset = [0.0, 0.0]
         "#;
         let (profile, warnings) = Profile::from_toml(text).unwrap();
         assert_eq!(profile.get(ElementId::PlayerFrame).offset, [10.0, 10.0]);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("quest-log"), "{warnings:?}");
+        assert!(warnings[0].contains("no-such-element"), "{warnings:?}");
     }
 
     /// An element the file never mentions falls back to where it belongs,

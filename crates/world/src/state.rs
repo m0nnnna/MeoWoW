@@ -250,6 +250,58 @@ impl Entity {
     /// original interface lists a quest log in, and a caller wanting them
     /// sorted can sort them, where a caller wanting the server's order could
     /// not recover it.
+    /// Every field of every occupied quest-log slot, for working out what the
+    /// four unnamed ones mean.
+    ///
+    /// **An instrument, not a feature.** Only the first field of a slot -- the
+    /// quest id -- has been measured; the other four carry state, objective
+    /// counters and a timer in some order nobody here has established. This
+    /// hands them over unnamed so a run against a character in a known state
+    /// can name them, which is the same move that found the base and stride in
+    /// the first place. Nothing should read the tuple's fields by position
+    /// until one of them has been identified.
+    pub fn quest_log_slots(&self) -> Vec<(u32, [u32; 4])> {
+        use crate::update::fields;
+        (0..fields::QUEST_LOG_SLOTS)
+            .filter_map(|slot| {
+                let base = fields::PLAYER_QUEST_LOG + slot * fields::QUEST_LOG_STRIDE;
+                let id = self.fields.get(base)?;
+                if id == 0 {
+                    return None;
+                }
+                let mut rest = [0u32; 4];
+                for (offset, value) in rest.iter_mut().enumerate() {
+                    *value = self.fields.get(base + 1 + offset as u16).unwrap_or(0);
+                }
+                Some((id, rest))
+            })
+            .collect()
+    }
+
+    /// Whether one quest in this player's log has every objective done.
+    ///
+    /// **Only bit zero is read, and that is the honest limit of what was
+    /// measured.** The field holds `1` for a quest observed complete and `0`
+    /// for one observed unfinished, and nothing here has ever seen it hold
+    /// anything else -- so a reading that tested the whole field for equality
+    /// with `1` would be making a claim about values that have never arrived.
+    /// Masking the one bit that has been seen to move degrades better if the
+    /// rest of the field turns out to carry a failed flag or a counter.
+    ///
+    /// `None` when the quest is not in the log at all, which is different from
+    /// "in the log and unfinished" and wants a different thing on screen.
+    pub fn quest_is_complete(&self, quest: u32) -> Option<bool> {
+        use crate::update::fields;
+        (0..fields::QUEST_LOG_SLOTS).find_map(|slot| {
+            let base = fields::PLAYER_QUEST_LOG + slot * fields::QUEST_LOG_STRIDE;
+            (self.fields.get(base)? == quest).then(|| {
+                self.fields
+                    .get(base + fields::QUEST_LOG_STATE)
+                    .is_some_and(|state| state & 1 != 0)
+            })
+        })
+    }
+
     pub fn quest_log_ids(&self) -> Vec<u32> {
         use crate::update::fields;
         (0..fields::QUEST_LOG_SLOTS)
@@ -3724,6 +3776,46 @@ mod tests {
             fields::PLAYER_QUEST_LOG + 3 * fields::QUEST_LOG_STRIDE,
             0xad,
             "base and stride must still describe the measured offsets"
+        );
+    }
+
+    /// **The completion field, measured against two quests in opposite
+    /// states.** These are the exact numbers a live character produced:
+    /// quest 783, which has no objectives and so is complete the moment it is
+    /// taken, and quest 38, which wants twelve items the character did not
+    /// have.
+    ///
+    /// The test asserts **both** halves. Checking only that 783 reads complete
+    /// would pass just as well if every quest did, which is the same trap as
+    /// testing an exception without the thing it is indistinguishable from.
+    #[test]
+    fn a_finished_quest_is_told_from_an_unfinished_one() {
+        use crate::update::fields;
+
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            9,
+            ObjectType::Player,
+            Some(at(0.0, 0.0)),
+            &[
+                (0x9e, 783),
+                (0x9f, 1), // 783 was complete
+                (0xa3, 38),
+                (0xa4, 0), // 38 was not
+            ],
+        )]);
+
+        let player = world.get(9).unwrap();
+        assert_eq!(player.quest_is_complete(783), Some(true));
+        assert_eq!(player.quest_is_complete(38), Some(false));
+        // A quest that is not in the log at all is a third answer, not a
+        // false one: nothing on screen should say "unfinished" about a quest
+        // the character has never taken.
+        assert_eq!(player.quest_is_complete(16), None);
+        assert_eq!(
+            fields::PLAYER_QUEST_LOG + fields::QUEST_LOG_STATE,
+            0x9f,
+            "the state field must still sit where it was measured"
         );
     }
 

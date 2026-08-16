@@ -1839,6 +1839,33 @@ struct App {
     bags_open: bool,
     /// Whether the character panel is open.
     character_open: bool,
+    /// Whether the quest log is open.
+    quest_log_open: bool,
+    /// Which quest the log has highlighted, if any. Interface state, so it
+    /// lives here rather than in the layout file.
+    selected_quest: Option<u32>,
+    /// What the server has said about which quests, kept between sessions.
+    ///
+    /// **Held even when the log is shut**, because the log's contents are what
+    /// tell us which ids to ask about, and closing a window is not a reason to
+    /// forget answers already paid for.
+    quests: ::world::QuestCache,
+    /// Where that cache is written. `None` when no configuration directory
+    /// could be found, in which case the cache still works for the session and
+    /// simply is not persisted -- the same trade the layout file makes.
+    quest_cache_path: Option<std::path::PathBuf>,
+    /// When each outstanding quest query was sent, so one that is never
+    /// answered can be given up on rather than counted as pending forever.
+    quest_asked_at: std::collections::HashMap<u32, std::time::Instant>,
+    /// When the quest cache was last written.
+    ///
+    /// **Saving only on a clean exit is not enough**, and the failure is
+    /// silent: a crash, an alt-F4 the window manager does not deliver, or a
+    /// kill from a terminal all lose every answer the session paid for, and
+    /// the next launch simply asks again with nothing to say it ever knew.
+    /// A periodic write costs one file per half minute of *new* discoveries
+    /// and nothing at all once a realm's quests are known.
+    quest_saved_at: Instant,
     /// The corpse this client has asked about, and whether the answer arrived.
     ///
     /// **The two states have to be distinguished, and the first version did
@@ -2357,6 +2384,12 @@ impl App {
             ambience: sound::Channel::new(),
             bags_open: false,
             character_open: false,
+            quest_log_open: false,
+            selected_quest: None,
+            quests: ::world::QuestCache::new(),
+            quest_cache_path: None,
+            quest_asked_at: std::collections::HashMap::new(),
+            quest_saved_at: Instant::now(),
             looting: None,
             own_corpse_query_sent: false,
             modifiers: Default::default(),
@@ -2580,7 +2613,15 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // **Written on the way out, not every time a quest arrives.**
+                // A save per answer would be a file write per packet during
+                // the burst after login; a save here costs one write for a
+                // whole session. The trade is that a crash loses the
+                // session's discoveries, which costs only re-asking.
+                self.save_quest_cache();
+                event_loop.exit()
+            }
             WindowEvent::Resized(size) => {
                 r.config.width = size.width.max(1);
                 r.config.height = size.height.max(1);
@@ -2750,6 +2791,12 @@ impl ApplicationHandler for App {
                             // `C` for the character panel, as 3.3.5a binds it.
                             KeyCode::KeyC => {
                                 self.character_open = !self.character_open;
+                                window.request_redraw();
+                                return;
+                            }
+                            // `L` for the quest log, as 3.3.5a binds it.
+                            KeyCode::KeyL => {
+                                self.quest_log_open = !self.quest_log_open;
                                 window.request_redraw();
                                 return;
                             }
@@ -4254,7 +4301,79 @@ impl App {
     /// requests keep getting answered, and pings no faster than
     /// `world::client::PING_INTERVAL` -- pinging faster is punished harder
     /// than not pinging at all.
+    /// Reads this realm's quest cache, and remembers where to write it back.
+    ///
+    /// **Failing to load is not failing to run.** A cache is an optimisation:
+    /// without it every quest is simply asked for again. So a missing config
+    /// directory or an unreadable file is logged and the client carries on
+    /// with an empty one -- the same trade `Hud::load` makes for the layout,
+    /// and for the same reason.
+    fn load_quest_cache(&mut self, realm: &str) {
+        let base = ui::default_path()
+            .ok()
+            .and_then(|path| path.parent().map(PathBuf::from));
+        let Some(base) = base else {
+            tracing::info!("no configuration directory -- quests will not be cached to disk");
+            // Left as `None`, so this is retried rather than treated as done.
+            return;
+        };
+        let path = ::world::QuestCache::path_for(&base, realm);
+        match ::world::QuestCache::load(&path) {
+            Ok(cache) => {
+                tracing::info!(
+                    "{} quest(s) already known for realm {realm:?} ({})",
+                    cache.len(),
+                    path.display()
+                );
+                self.quests = cache;
+            }
+            // Loud: silently starting empty would throw the player's cache
+            // away every launch and nobody would ever notice.
+            Err(error) => tracing::warn!("could not read {}: {error}", path.display()),
+        }
+        self.quest_cache_path = Some(path);
+    }
+
+    /// Writes the quest cache, if anything was learned.
+    ///
+    /// Guarded on `is_dirty` so a session that discovered nothing does not
+    /// rewrite a file that is already correct.
+    fn save_quest_cache(&mut self) {
+        if !self.quests.is_dirty() {
+            return;
+        }
+        let Some(path) = self.quest_cache_path.clone() else {
+            return;
+        };
+        match self.quests.save(&path) {
+            Ok(()) => tracing::info!("{} quest(s) cached to {}", self.quests.len(), path.display()),
+            Err(error) => tracing::warn!("could not write {}: {error}", path.display()),
+        }
+    }
+
     fn pump_live_connection(&mut self) {
+        // **Loaded here rather than at construction**, because the file is
+        // named after the realm and the realm is not known until a connection
+        // exists. Guarded by the path being unset rather than by a flag, so
+        // there is nothing that could disagree about whether it has happened.
+        if self.quest_cache_path.is_none() {
+            if let Some(realm) = self.live.as_ref().map(|live| live.realm.clone()) {
+                self.load_quest_cache(&realm);
+            }
+        }
+        // **Before the borrow of `live` below**, which is what makes this the
+        // top of the function rather than somewhere more obvious: saving takes
+        // `&mut self` and the pump holds `live` mutably for its whole length.
+        //
+        // Long enough that a burst of answers after login produces one write
+        // rather than twenty, short enough that a crash loses little. Cheap
+        // when nothing was learned -- `save_quest_cache` returns immediately
+        // unless the cache is dirty.
+        const QUEST_SAVE_INTERVAL: Duration = Duration::from_secs(30);
+        if self.quest_saved_at.elapsed() >= QUEST_SAVE_INTERVAL {
+            self.quest_saved_at = Instant::now();
+            self.save_quest_cache();
+        }
         let Some(live) = self.live.as_mut() else {
             return;
         };
@@ -4438,6 +4557,30 @@ impl App {
                     }
                     self.chat.push(Line::SpellHit(hit.clone()));
                 }
+                // **Read straight off the batch rather than through
+                // `WorldState`.** A quest description is not replicated state
+                // -- it is an answer to a question this client asked, and it
+                // arrives once. Folding it into the world would make the cache
+                // depend on an object that may not exist (the quest is not an
+                // object at all), and `replicate` deliberately dispatches only
+                // things that describe the world.
+                for packet in &packets {
+                    if packet.opcode != ::world::opcode::server::QUEST_QUERY_RESPONSE {
+                        continue;
+                    }
+                    match self.quests.insert(&packet.body) {
+                        Ok(id) => {
+                            self.quest_asked_at.remove(&id);
+                            tracing::debug!("quest {id} described by the server");
+                        }
+                        // Loud, and it does not stop the pump. A body this
+                        // client cannot read is a parser problem worth seeing;
+                        // dropping the whole frame over it would be worse.
+                        Err(error) => {
+                            tracing::warn!("a quest description would not parse: {error}")
+                        }
+                    }
+                }
                 for message in &report.chat {
                     if message.sender != 0 && message.sender_name.is_none() {
                         unknown_speakers.push(message.sender);
@@ -4480,6 +4623,53 @@ impl App {
                 break;
             }
         }
+        // Quests, a few per frame, exactly as names are asked for above and
+        // for the same reasons: the cache refuses to ask twice, so calling
+        // this every frame is safe, and the cap is only about not firing
+        // twenty-five packets in the frame after login. That burst is not
+        // hypothetical -- a drain with a packet bound and no clock cost this
+        // project thirty-seven seconds before its first frame once already.
+        const QUESTS_PER_FRAME: usize = 4;
+        // Long enough that a slow realm is not written off, short enough that
+        // a genuinely unanswered id stops being drawn as "asking..." forever.
+        const QUEST_ANSWER_WINDOW: Duration = Duration::from_secs(10);
+
+        let log: Vec<u32> = live
+            .state
+            .get(live.guid)
+            .map(|player| player.quest_log_ids())
+            .unwrap_or_default();
+        for quest in self.quests.take_unknown(&log, QUESTS_PER_FRAME) {
+            match live.connection.query_quest_info(quest) {
+                Ok(()) => {
+                    self.quest_asked_at.insert(quest, Instant::now());
+                }
+                Err(e) => {
+                    tracing::warn!("asking about quest {quest} failed: {e:#}");
+                    // Put it back, or it stays pending forever having never
+                    // actually been sent -- the cache marked it in flight on
+                    // the promise that the caller would send it.
+                    self.quests.give_up(quest);
+                    break;
+                }
+            }
+        }
+        // **A question with no answer has to stop being a question.** Without
+        // this the log would draw "asking the server..." for the rest of the
+        // session, which is the state that looks like a hang rather than like
+        // a realm that would not say.
+        let stale: Vec<u32> = self
+            .quest_asked_at
+            .iter()
+            .filter(|(_, asked)| asked.elapsed() > QUEST_ANSWER_WINDOW)
+            .map(|(quest, _)| *quest)
+            .collect();
+        for quest in stale {
+            self.quest_asked_at.remove(&quest);
+            self.quests.give_up(quest);
+            tracing::info!("quest {quest} was never described by the realm");
+        }
+
         if self.last_ping.elapsed() >= ::world::client::PING_INTERVAL {
             // Fire and forget: waiting for the pong would block the render
             // thread for a round trip. The drain above collects it.
@@ -4957,10 +5147,56 @@ impl App {
             })
         });
 
+        // **Built from the cache's three-state answer, not from an `Option`.**
+        // A quest still being asked about and a quest with no objectives look
+        // identical if the two are flattened, and the wrong one of those is
+        // silent -- so the distinction is carried all the way from
+        // `QuestCache::answer` to the row that gets drawn. See
+        // `world::quest_cache`, and `ui::frames::quest_log::QuestDetail`.
+        let quest_log: Vec<ui::QuestLogEntry> = if self.quest_log_open {
+            self.live
+                .as_ref()
+                .and_then(|live| live.state.get(live.guid))
+                .map(|player| player.quest_log_ids())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| ui::QuestLogEntry {
+                    id,
+                    // Off the log's own state field, not inferred from the
+                    // objectives: the client cannot count what a drop is
+                    // worth, and the server has already decided.
+                    complete: self
+                        .live
+                        .as_ref()
+                        .and_then(|live| live.state.get(live.guid))
+                        .and_then(|player| player.quest_is_complete(id))
+                        .unwrap_or(false),
+                    detail: match self.quests.answer(id) {
+                        ::world::Answer::Known(quest) => ui::QuestDetail::Known {
+                            title: quest.title.clone(),
+                            objective: quest.objectives_text.clone(),
+                            level: quest.level,
+                        },
+                        // Never asked and asked-but-waiting are both "the
+                        // answer is coming" as far as a player is concerned;
+                        // the first becomes the second within a frame or two.
+                        ::world::Answer::Unknown | ::world::Answer::Pending => {
+                            ui::QuestDetail::Waiting
+                        }
+                        ::world::Answer::Unanswered => ui::QuestDetail::Unanswered,
+                    },
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let mut hud_response = ui::HudResponse::default();
         let spellbook_open = self.spellbook_open;
         let bags_open = self.bags_open;
         let character_open = self.character_open;
+        let quest_log_open = self.quest_log_open;
+        let selected_quest = self.selected_quest;
         let interface = &mut self.hud;
         let editing = interface.edit.active;
         let layout_status = interface.status.clone();
@@ -4985,6 +5221,11 @@ impl App {
                     bags: bags_open.then_some(bags.as_slice()),
                     copper,
                     character: character_open.then_some(character.as_slice()),
+                    // `None` when shut rather than an empty list, like the
+                    // spellbook: an empty log and a closed one are different
+                    // things and the interface draws the first.
+                    quest_log: quest_log_open.then_some(quest_log.as_slice()),
+                    selected_quest,
                     // No flag: the window exists exactly while the server
                     // says a corpse is open.
                     loot: (!loot.is_empty()).then_some(loot.as_slice()),
@@ -5135,6 +5376,14 @@ impl App {
         // again after every restart is worse than no spellbook at all. The
         // write is atomic (see `Profile::save`), and only happens on the frame
         // an assignment actually landed.
+        // A row click just highlights: the log is a list, and picking one is
+        // how a later milestone will say which quest the map should pin.
+        if let Some(quest) = hud_response.selected_quest {
+            // Clicking the highlighted row clears it, so there is a way back
+            // to "nothing selected" without closing the window.
+            self.selected_quest = (self.selected_quest != Some(quest)).then_some(quest);
+        }
+
         if hud_response.layout_changed {
             self.hud.save();
         }
