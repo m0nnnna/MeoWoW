@@ -16,24 +16,73 @@
 //! is indistinguishable from a correct one, gets believed, and is wrong about
 //! how much damage an ability does.
 //!
-//! What is deliberately *not* resolved, with the count of uses across the
-//! 31,780 non-empty descriptions in build 12340:
+//! What is deliberately *not* resolved:
 //!
-//! - `${$m1+0.15*$SPH}` arithmetic (1,731) -- needs the caster's spell power
-//!   and attack power, which the tooltip has no access to here.
-//! - `$<mult>` variables (191) -- a further table, `SpellDescriptionVariables`.
-//! - `$?s12345[a][b]` conditionals (58), `$gmale:female;` (96) and
-//!   `$lsingular:plural;` (53) -- these need the player, not the spell.
+//! - `${$m1+0.15*$SPH}` arithmetic -- needs the caster's spell power and
+//!   attack power, which the tooltip has no access to here.
+//! - `$<mult>` variables -- a further table, `SpellDescriptionVariables`.
+//! - `$?s12345[a][b]` conditionals, `$gmale:female;` and `$lsingular:plural;`
+//!   -- these need the player, not the spell.
 //! - `$h` proc chance, `$n` charges, `$x` chain targets, `$i` max targets,
-//!   `$u` stacks, `$o` total-over-time: no column for any of them has been
-//!   confirmed, so none of them is guessed at.
+//!   `$u` stacks, `$o` total-over-time, and several rarer letters besides:
+//!   no column for any of them has been confirmed, so none of them is
+//!   guessed at.
 //!
-//! Worth stating why `$m`/`$M` *is* implemented despite only 182 of its 1,296
-//! uses sitting outside a `${...}` expression: the columns behind it fell out
-//! of confirming `$s`, so it cost one array lookup. The other 1,114 uses stay
-//! unresolved regardless, because the brace expression around them does.
+//! **Frequency counts deliberately do not live in this comment.** An earlier
+//! version of it hand-counted uses per construct, and running [`scan`] for
+//! real turned up letters that count had never named at all and put its
+//! `$l` estimate off by nearly seven times -- a stale number in a doc
+//! comment is exactly the "confidently wrong" failure this file's own
+//! design rule exists to avoid, one level up. `wow-cli spell tokens` reads
+//! the real counts off whichever build's data is loaded, which a comment
+//! cannot do once a new patch changes them.
+//!
+//! Worth stating why `$m`/`$M` *is* implemented despite most of their uses
+//! sitting inside a `${...}` expression this file already refuses: the
+//! columns behind it fell out of confirming `$s`, so resolving the ones
+//! outside braces cost one array lookup. The ones inside stay unresolved
+//! regardless, because the brace expression around them does.
 
 use std::collections::HashMap;
+
+/// Reads one spell's numbers, resolving the two effect columns that are
+/// stored as an index into another table rather than as a value.
+///
+/// An index that names no row resolves to nothing rather than to zero, so a
+/// token backed by missing data stays visible instead of claiming "0 sec".
+/// Shared between the viewer's tooltip loader and `wow-cli spell tokens`,
+/// which both need the exact same mapping -- a second copy here is exactly
+/// the "two scanners for one grammar" risk this module's own doc comment
+/// warns about, just one level removed from token parsing.
+pub fn values_from_row(
+    row: &crate::schema::SpellRow<'_>,
+    durations: &HashMap<u32, i32>,
+    radii: &HashMap<u32, f32>,
+) -> Values {
+    Values {
+        base: [
+            row.effect_base_points(),
+            row.effect_base_points_2(),
+            row.effect_base_points_3(),
+        ],
+        die_sides: [
+            row.effect_die_sides(),
+            row.effect_die_sides_2(),
+            row.effect_die_sides_3(),
+        ],
+        radius: [
+            radii.get(&row.effect_radius_index()).copied().unwrap_or(0.0),
+            radii.get(&row.effect_radius_index_2()).copied().unwrap_or(0.0),
+            radii.get(&row.effect_radius_index_3()).copied().unwrap_or(0.0),
+        ],
+        period: [
+            row.effect_aura_period(),
+            row.effect_aura_period_2(),
+            row.effect_aura_period_3(),
+        ],
+        duration_ms: durations.get(&row.duration_index()).copied().unwrap_or(0),
+    }
+}
 
 /// The numbers one spell's description can refer to.
 ///
@@ -117,6 +166,130 @@ pub fn referenced_spells(text: &str, out: &mut std::collections::HashSet<u32>) {
             out.insert(id);
         }
     }
+}
+
+/// One `$`-construct found in a description, for counting rather than for
+/// display -- see [`scan`] and `wow-cli spell tokens`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenHit {
+    /// A grouping key such as `"$s"`, `"$d"`, `"${...}"`, `"$?[a][b]"` --
+    /// never the exact text, so `$s1` and `$s2` land in the same row of a
+    /// frequency table instead of two.
+    pub bucket: String,
+    /// The construct's own source text for this one occurrence, e.g. `$s1`
+    /// or `${$m1+0.15*$SPH}`. Exact when [`parse`] recognised the construct;
+    /// a best-effort sample otherwise, since nothing here then knows where
+    /// the construct actually ends -- see [`scan`]'s doc comment.
+    pub raw: String,
+    /// Whether `substitute` would print something other than this text
+    /// verbatim. Never decided by re-deriving the grammar: this is `true`
+    /// exactly when the real [`parse`] returned a replacement that differs
+    /// from the source, so it cannot disagree with what a tooltip actually
+    /// shows.
+    pub resolved: bool,
+}
+
+/// Every `$`-construct in `text`, in the order they appear -- a reporting
+/// tool, not a second implementation of [`substitute`].
+///
+/// The resolved/unresolved half of each [`TokenHit`] comes from calling the
+/// identical [`parse`] that [`substitute`] calls on the identical bytes, so
+/// it cannot drift from what a tooltip actually does -- the risk
+/// [`referenced_spells`]'s doc comment already names for a smaller case.
+/// What this function adds on top is purely cosmetic: a human-readable
+/// `bucket` label and, for a construct [`parse`] does not recognise at all,
+/// a best-effort guess at where it ends (nothing authoritative exists for
+/// that case, because [`parse`] itself does not know). A wrong guess there
+/// misgroups one row of a frequency table; it can never misinform a player,
+/// which is the bar the rest of this file holds itself to.
+pub fn scan(text: &str, spell: u32, values: &HashMap<u32, Values>) -> Vec<TokenHit> {
+    let bytes = text.as_bytes();
+    let mut hits = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        // A literal `$$` is an escape, not a token -- excluded so it does
+        // not inflate a count of things that were never a construct at all.
+        if bytes.get(i + 1) == Some(&b'$') {
+            i += 2;
+            continue;
+        }
+        match parse(text, i, spell, values) {
+            Some((replacement, next)) => {
+                let raw = &text[i..next];
+                hits.push(TokenHit {
+                    bucket: bucket_of(raw),
+                    resolved: replacement != raw,
+                    raw: raw.to_string(),
+                });
+                i = next;
+            }
+            None => {
+                let end = sample_boundary(text, i);
+                let raw = &text[i..end];
+                hits.push(TokenHit {
+                    bucket: bucket_of(raw),
+                    raw: raw.to_string(),
+                    resolved: false,
+                });
+                // Advancing past only the `$` itself, never past the guessed
+                // sample, is what keeps this safe without a real boundary:
+                // whatever character follows a `$` this file does not
+                // recognise is, by definition, not itself a fresh `$`, so
+                // the outer loop's plain-text scan naturally skips the rest
+                // of the construct without this function having to know
+                // where it ends.
+                i += 1;
+            }
+        }
+    }
+    hits
+}
+
+/// A grouping key for a `$`-construct's *kind*, discarding the index and any
+/// spell id it names. Used only for display -- see [`TokenHit::bucket`].
+fn bucket_of(raw: &str) -> String {
+    let rest = raw.strip_prefix('$').unwrap_or(raw);
+    // `$6788d` and `$12345s1` are cross-spell references -- the same kind of
+    // token as `$d` and `$s1`, just borrowing another row's numbers, so the
+    // leading digits are not part of the bucket.
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    match rest[digits..].chars().next() {
+        Some('{') => "${...}".to_string(),
+        Some('?') => "$?[a][b]".to_string(),
+        Some('<') => "$<mult>".to_string(),
+        Some('/') => "$/n;...".to_string(),
+        Some('*') => "$*n;...".to_string(),
+        Some(c) => format!("${c}"),
+        None => "$".to_string(),
+    }
+}
+
+/// A best-effort end for a construct [`parse`] refused, purely so [`scan`]
+/// has *something* readable to show as an example -- never authoritative,
+/// since a construct this file does not recognise has no boundary this file
+/// can actually know. Cuts at the first of: whitespace or the sentence
+/// running out (a bare unconfirmed letter like `$h` has no closing
+/// punctuation at all), `;` (closes a scaled or gendered/pluralised token),
+/// `]` (a conditional's second bracket) or `>` (a `$<mult>` variable) --
+/// whichever comes first, and never past a fixed cap so one malformed
+/// description cannot make one sample swallow the rest of the table's worth
+/// of text.
+fn sample_boundary(text: &str, at: usize) -> usize {
+    const MAX_SAMPLE: usize = 24;
+    let rest = &text[at + 1..];
+    let cut = match rest.find(|c: char| c == ';' || c == ']' || c == '>' || c == '$' || c.is_whitespace()) {
+        // `;`, `]` and `>` close the construct, so the sample includes them.
+        // Whitespace and `$` only *stop* the search -- they belong to
+        // whatever comes next, not to this token.
+        Some(p) if matches!(rest.as_bytes()[p], b';' | b']' | b'>') => p + 1,
+        Some(p) => p,
+        None => rest.len(),
+    };
+    at + 1 + cut.min(rest.len()).min(MAX_SAMPLE)
 }
 
 /// Reads one construct starting at `at`, which is known to be a `$`.
@@ -445,5 +618,76 @@ mod tests {
     #[test]
     fn a_line_break_token_becomes_one() {
         assert_eq!(substitute("first$bsecond", 78, &book()), "first\nsecond");
+    }
+
+    /// `scan` and `substitute` must agree on which tokens resolve, or the
+    /// report `scan` exists to build would describe a client that does not
+    /// exist. Every case here has a matching assertion above through
+    /// `substitute` directly.
+    #[test]
+    fn scan_agrees_with_substitute_about_what_resolves() {
+        let hits = scan("A strong attack that increases melee damage by $s1.", 78, &book());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].bucket, "$s");
+        assert_eq!(hits[0].raw, "$s1");
+        assert!(hits[0].resolved);
+
+        let hits = scan("Lasts $d.", 78, &book());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].bucket, "$d");
+        assert!(!hits[0].resolved, "spell 78 has no duration to resolve $d from");
+    }
+
+    /// A brace expression is *recognised* -- `parse` returns `Some` for it,
+    /// copying it through whole -- but that is not the same claim as
+    /// resolved, and `scan` must not conflate the two the way a check of
+    /// "did `parse` return `Some`" alone would.
+    #[test]
+    fn a_brace_expression_is_a_structural_bucket_and_not_resolved() {
+        let hits = scan("causing ${$m1+0.15*$SPH} damage", 78, &book());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].bucket, "${...}");
+        assert_eq!(hits[0].raw, "${$m1+0.15*$SPH}");
+        assert!(!hits[0].resolved);
+    }
+
+    /// The three structural forms the ticket asks to be counted separately
+    /// from plain tokens each land in their own bucket.
+    #[test]
+    fn structural_forms_bucket_separately() {
+        assert_eq!(bucket_of("${$m1}"), "${...}");
+        assert_eq!(bucket_of("$?s12345[a][b]"), "$?[a][b]");
+        assert_eq!(bucket_of("$gHe:She;"), "$g");
+        assert_eq!(bucket_of("$lsecond:seconds;"), "$l");
+        assert_eq!(bucket_of("$<mult>"), "$<mult>");
+    }
+
+    /// A cross-spell reference buckets on the token it borrows, not on the
+    /// id it names -- `$6788d` and `$12345s1` are the same *kind* of thing
+    /// as `$d` and `$s1`, and a report that gave every id its own row would
+    /// be thousands of rows of noise instead of one useful one.
+    #[test]
+    fn a_cross_spell_reference_buckets_on_its_token_not_its_id() {
+        assert_eq!(bucket_of("$6788d"), "$d");
+        assert_eq!(bucket_of("$12345s1"), "$s");
+    }
+
+    /// An unconfirmed bare letter has no closing punctuation at all, so the
+    /// sample must stop at the next whitespace rather than swallowing the
+    /// rest of the sentence.
+    #[test]
+    fn an_unconfirmed_letter_samples_only_the_token() {
+        let hits = scan("restores $u charges over time", 78, &book());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].bucket, "$u");
+        assert_eq!(hits[0].raw, "$u");
+        assert!(!hits[0].resolved);
+    }
+
+    /// `$$` is a literal-dollar escape, not a construct, and must not appear
+    /// in a token frequency report at all.
+    #[test]
+    fn a_literal_dollar_is_not_a_scanned_token() {
+        assert!(scan("costs $$5", 78, &book()).is_empty());
     }
 }

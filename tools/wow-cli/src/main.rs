@@ -69,6 +69,9 @@ enum Command {
     /// Inspect sounds: what the client can play, and where its files are.
     #[command(subcommand)]
     Sound(SoundCommand),
+    /// Inspect spell description templates.
+    #[command(subcommand)]
+    Spell(SpellCommand),
     /// Inspect world objects: buildings, dungeons, bridges.
     #[command(subcommand)]
     Wmo(WmoCommand),
@@ -808,6 +811,7 @@ fn main() -> Result<()> {
         Command::M2(cmd) => m2_cmd(&mut chain, cmd),
         Command::Item(cmd) => item_cmd(&mut chain, cmd),
         Command::Sound(cmd) => sound_cmd(&mut chain, &cmd),
+        Command::Spell(cmd) => spell_cmd(&mut chain, &cmd),
         Command::Wmo(cmd) => wmo_cmd(&mut chain, cmd),
         Command::Adt(cmd) => adt_cmd(&mut chain, cmd),
         Command::Light {
@@ -5113,6 +5117,115 @@ CreatureSoundData: {} rows x {} fields",
                 std::fs::write(&target, &bytes)?;
                 println!("  {} bytes -> {}", bytes.len(), target.display());
             }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(clap::Subcommand)]
+enum SpellCommand {
+    /// Tally every `$`-introduced token across every description, split
+    /// into resolved and passed-through, so the next column hunt has a
+    /// priority order instead of a guess.
+    ///
+    /// **A counting job, deliberately.** This does not resolve a single new
+    /// token or identify a single new column -- see `dbc::spelltext`'s doc
+    /// comment for why guessing at a column is the most dangerous work in
+    /// this repo. What comes back is only frequencies and one example spell
+    /// id per bucket, read straight off `dbc::spelltext::scan`, which shares
+    /// its resolved/unresolved judgement with the real substituter rather
+    /// than re-deriving the grammar.
+    Tokens {
+        /// Show only buckets with at least this many occurrences.
+        #[arg(long, default_value_t = 1)]
+        min_count: usize,
+    },
+}
+
+fn spell_cmd(chain: &mut Chain, cmd: &SpellCommand) -> Result<()> {
+    use dbc::schema::{Spell, SpellDuration, SpellRadius};
+    use dbc::spelltext;
+    use std::collections::HashMap;
+
+    match cmd {
+        SpellCommand::Tokens { min_count } => {
+            let spells = Spell::parse(&chain.read(Spell::PATH)?)?;
+            let durations: HashMap<u32, i32> = SpellDuration::parse(&chain.read(SpellDuration::PATH)?)?
+                .iter()
+                .map(|row| (row.id(), row.duration()))
+                .collect();
+            let radii: HashMap<u32, f32> = SpellRadius::parse(&chain.read(SpellRadius::PATH)?)?
+                .iter()
+                .map(|row| (row.id(), row.radius()))
+                .collect();
+
+            // Every spell's numbers, scoped to the whole table rather than to
+            // one character's known spells -- a description can name a
+            // *different* spell's row (`$6788d`), and `wow-cli` has no
+            // character to scope against in the first place.
+            let values: HashMap<u32, spelltext::Values> = spells
+                .iter()
+                .map(|row| (row.id(), spelltext::values_from_row(&row, &durations, &radii)))
+                .collect();
+
+            struct Bucket {
+                occurrences: usize,
+                resolved: usize,
+                example_spell: u32,
+                example_raw: String,
+            }
+            let mut buckets: std::collections::BTreeMap<String, Bucket> = std::collections::BTreeMap::new();
+            let mut described = 0usize;
+            for row in spells.iter() {
+                let description = row.description();
+                if description.is_empty() {
+                    continue;
+                }
+                described += 1;
+                for hit in spelltext::scan(description, row.id(), &values) {
+                    let bucket = buckets.entry(hit.bucket.clone()).or_insert_with(|| Bucket {
+                        occurrences: 0,
+                        resolved: 0,
+                        example_spell: row.id(),
+                        example_raw: hit.raw.clone(),
+                    });
+                    bucket.occurrences += 1;
+                    if hit.resolved {
+                        bucket.resolved += 1;
+                    }
+                }
+            }
+
+            let mut rows: Vec<(&String, &Bucket)> =
+                buckets.iter().filter(|(_, b)| b.occurrences >= *min_count).collect();
+            rows.sort_by(|a, b| b.1.occurrences.cmp(&a.1.occurrences));
+
+            println!(
+                "{described} non-empty descriptions of {} spells in Spell.dbc\n",
+                spells.len()
+            );
+            println!(
+                "{:<12} {:>10} {:>10} {:>8}  {:>8}  example",
+                "token", "count", "resolved", "pass", "spell"
+            );
+            let mut total = 0usize;
+            let mut total_resolved = 0usize;
+            for (bucket, b) in &rows {
+                let pass = b.occurrences - b.resolved;
+                total += b.occurrences;
+                total_resolved += b.resolved;
+                println!(
+                    "{:<12} {:>10} {:>10} {:>8}  {:>8}  {}",
+                    bucket, b.occurrences, b.resolved, pass, b.example_spell, b.example_raw
+                );
+            }
+            println!(
+                "\n{total} total occurrences across {} buckets, {total_resolved} resolved ({:.1}%), {} passed through",
+                rows.len(),
+                total_resolved as f64 * 100.0 / total.max(1) as f64,
+                total - total_resolved
+            );
         }
     }
 

@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use mpq::Chain;
 use render::Gpu;
 
-use crate::spelltext::{self, Values};
+use dbc::spelltext::{self, Values};
 
 /// Everything known about one spell.
 #[derive(Debug, Clone)]
@@ -34,36 +34,15 @@ pub struct SpellInfo {
 
 /// Reads one spell's numbers, resolving the two that are stored as an index.
 ///
-/// An index that names no row resolves to nothing rather than to zero, so a
-/// token backed by missing data stays visible instead of claiming "0 sec".
+/// A thin wrapper over [`dbc::spelltext::values_from_row`] -- see that
+/// function's doc comment for why the mapping lives there rather than here:
+/// `wow-cli spell tokens` needs the exact same one.
 fn values_of(
     row: &dbc::schema::SpellRow<'_>,
     durations: &HashMap<u32, i32>,
     radii: &HashMap<u32, f32>,
 ) -> Values {
-    Values {
-        base: [
-            row.effect_base_points(),
-            row.effect_base_points_2(),
-            row.effect_base_points_3(),
-        ],
-        die_sides: [
-            row.effect_die_sides(),
-            row.effect_die_sides_2(),
-            row.effect_die_sides_3(),
-        ],
-        radius: [
-            radii.get(&row.effect_radius_index()).copied().unwrap_or(0.0),
-            radii.get(&row.effect_radius_index_2()).copied().unwrap_or(0.0),
-            radii.get(&row.effect_radius_index_3()).copied().unwrap_or(0.0),
-        ],
-        period: [
-            row.effect_aura_period(),
-            row.effect_aura_period_2(),
-            row.effect_aura_period_3(),
-        ],
-        duration_ms: durations.get(&row.duration_index()).copied().unwrap_or(0),
-    }
+    dbc::spelltext::values_from_row(row, durations, radii)
 }
 
 /// `SPELL_ATTR0_PASSIVE`.
@@ -110,7 +89,7 @@ pub struct Spellbook {
     class_masks: HashMap<u32, u32>,
     /// The numbers each description's tokens stand in for. Keyed more widely
     /// than [`Self::known`], because a description may refer to a spell the
-    /// character does not know -- see [`spelltext::referenced_spells`].
+    /// character does not know -- see [`dbc::spelltext::referenced_spells`].
     values: HashMap<u32, Values>,
     /// Whether a game installation was available at all.
     pub have_data: bool,
@@ -294,7 +273,7 @@ impl Spellbook {
     /// `Spell.dbc` stores descriptions as *templates* -- `78` is "A strong
     /// attack that increases melee damage by $s1" -- and this fills in the
     /// tokens whose meaning was confirmed against the data, leaving the rest
-    /// visible. [`crate::spelltext`] says which are which and why.
+    /// visible. [`dbc::spelltext`] says which are which and why.
     ///
     /// Anything unresolved is left visible on purpose rather than stripped:
     /// this project's rule

@@ -16,7 +16,6 @@ mod model;
 mod scene;
 mod sound;
 mod spells;
-mod spelltext;
 mod terrain;
 mod world;
 mod world_object;

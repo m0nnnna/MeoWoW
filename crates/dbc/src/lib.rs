@@ -26,6 +26,7 @@
 pub mod infer;
 pub mod light;
 pub mod schema;
+pub mod spelltext;
 
 use std::fmt;
 
