@@ -388,6 +388,49 @@ own position from `-8939.3, -197.5` to `-8919.4, -199.5` -- **+19.9 in x and
 something a forward walk cannot produce at any heading, so the direction is
 right and not merely plausible.
 
+### Six more confirmed, nine that cannot be reached yet
+
+`world::opcode::server::MOVE_RELAYED` lists 24 opcodes; the above accounts for
+nine. `foss-wow#37` went after the other fifteen with the same two-client rig,
+now against `Testwolf` and a revived `Watcher` teleported to stand beside him
+on the local realm (`.go xyz`), watching with `wow-cli world --enter Watcher
+--stay 240 --capture`.
+
+Six had never been sent by this client at all -- nothing before this ticket
+could turn on the spot or toggle run/walk, since `world::motion::Motion` only
+ever modelled the two translation axes. `client.rs` gained `turn_in_place` and
+`set_run_mode`, the same start/heartbeat/stop and single-packet shapes
+`travel`/`set_facing` already used, reachable as `wow-cli world --turn
+<left|right>` and `--run-mode <run|walk>`. One capture, both new commands plus
+`--jump`, gave `wow-cli moves` this:
+
+```text
+opcode   packets movement  extra refused handled  movers
+0x00bb       1       1      0      0     yes  1
+0x00bc       1       1      0      0     yes  1
+0x00bd       1       1      0      0     yes  1
+0x00be       2       2      0      0     yes  1
+0x00c2       1       1      0      0     yes  1
+0x00c3       1       1      0      0     yes  1
+0x00c9       1       1      0      0     yes  1
+```
+
+`0x00bb` `MSG_MOVE_JUMP`, `0x00bc`/`0x00bd`/`0x00be` `START_TURN_LEFT`/
+`RIGHT`/`STOP_TURN`, `0x00c2`/`0x00c3` `SET_RUN_MODE`/`WALK_MODE`, and
+`0x00c9` `FALL_LAND` along for the ride from `--jump` -- every one 100%
+movement, 0 bytes left over, exactly one mover, the same bar the original five
+cleared.
+
+**The remaining nine were not driven, and the reason is a fact about this
+client rather than about the opcodes.** `START_PITCH_UP`, `START_PITCH_DOWN`,
+`STOP_PITCH` and `SET_PITCH` only arise while swimming or flying; `START_SWIM`
+and `STOP_SWIM` need water; `START_ASCEND`, `STOP_ASCEND` and `START_DESCEND`
+need a flying mount. This client has no swim state, no mount, and no pitch
+field on any packet it sends -- so reaching them is new capability, not
+another capture. A level-one human warrior standing on dry land cannot
+produce any of the nine, and `MOVE_RELAYED`'s own doc comment says so
+plainly rather than leaving the gap to look like an oversight.
+
 ## Nothing acknowledges movement
 
 There is no reply. A rejected move produces no error; the server simply keeps

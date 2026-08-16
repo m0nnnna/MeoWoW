@@ -161,6 +161,18 @@ pub enum ClientOpcode {
     MoveStartStrafeRight = 0x00B9,
     MoveStopStrafe = 0x00BA,
     MoveJump = 0x00BB,
+    /// Turning on the spot, the same shape as strafing: a separate axis with
+    /// its own start and stop, confirmed by driving each one against the
+    /// local realm and capturing what a second client sees relayed --
+    /// `foss-wow#37`.
+    MoveStartTurnLeft = 0x00BC,
+    MoveStartTurnRight = 0x00BD,
+    MoveStopTurn = 0x00BE,
+    /// Toggling between a walk and a run. Carries `MovementInfo::flags`'
+    /// `WALKING` bit rather than naming a speed -- the server already knows
+    /// this character's walk and run speeds from its own state.
+    MoveSetRunMode = 0x00C2,
+    MoveSetWalkMode = 0x00C3,
     /// The end of a jump or a fall. Carries the total time spent in the air in
     /// `MovementInfo::fall_time`, which is what fall damage is computed from --
     /// so a client that jumps and never lands is one the server believes is
@@ -299,6 +311,30 @@ pub mod server {
     /// confirmed by observation are `START_BACKWARD`, `START_STRAFE_LEFT`,
     /// `START_STRAFE_RIGHT`, `STOP_STRAFE` and `SET_FACING`, plus `FALL_LAND`
     /// in an earlier run and the three already handled.
+    ///
+    /// **`foss-wow#37` closed six more of the fifteen that were left**, driven
+    /// against a local realm rather than merely observed: `JUMP`,
+    /// `START_TURN_LEFT`, `START_TURN_RIGHT`, `STOP_TURN`, `SET_RUN_MODE` and
+    /// `SET_WALK_MODE`, each captured by a second client and each scoring the
+    /// same 100%/0-refused/one-mover result the original five did --
+    /// `wow-cli world --turn <left|right>` and `--run-mode <run|walk>` are the
+    /// tools that sent them, and `crates/world/src/client.rs`'s
+    /// `turn_in_place`/`set_run_mode` are what building them required, since
+    /// nothing before this ticket could send a turn or a run/walk toggle at
+    /// all -- `crates/world/src/motion.rs`'s `Motion` only ever modelled the
+    /// two translation axes.
+    ///
+    /// **The other nine stay unconfirmed, and deliberately so rather than
+    /// silently.** `START_PITCH_UP`, `START_PITCH_DOWN`, `STOP_PITCH` and
+    /// `SET_PITCH` need swimming or flight to produce at all; `START_SWIM`
+    /// and `STOP_SWIM` need water; `START_ASCEND`, `STOP_ASCEND` and
+    /// `START_DESCEND` need a flying mount. None of those states exist
+    /// anywhere in this client yet -- not the terrain-height-vs-water-level
+    /// check a swim needs, not a mount, not a pitch field on any outgoing
+    /// packet -- so driving them is new client capability, not a test. A
+    /// level-one human warrior standing on dry land cannot reach any of the
+    /// nine, which is the outcome the ticket that closed the other six
+    /// explicitly allowed for.
     ///
     /// The discriminator worth keeping is that `MSG_` travels in both
     /// directions and `CMSG_` does not: `CMSG_MOVE_FALL_RESET`,

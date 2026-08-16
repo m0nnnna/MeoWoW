@@ -495,6 +495,95 @@ impl Connection {
         self.send_movement(ClientOpcode::MoveSetFacing, mover, &info)
     }
 
+    /// Turns continuously on the spot for a short burst, the way holding `A`
+    /// or `D` with no forward key does, and reports what came back.
+    ///
+    /// The same shape as [`Self::travel`]'s start/heartbeat/stop, but turning
+    /// rather than translating: `MoveStartTurnLeft`/`Right`, a few heartbeats
+    /// with the orientation advancing between them, then `MoveStopTurn`. This
+    /// exists to confirm those three relayed opcodes against a real realm --
+    /// see `foss-wow#37` -- the same way [`Self::travel`] originally confirmed
+    /// strafing.
+    pub fn turn_in_place(
+        &mut self,
+        mover: u64,
+        at: crate::update::Position,
+        clockwise: bool,
+        duration: Duration,
+        radians_per_sec: f32,
+    ) -> Result<Vec<Packet>, Error> {
+        use crate::movement::MovementInfo;
+
+        const STEP: Duration = Duration::from_millis(100);
+        let steps = (duration.as_secs_f32() / STEP.as_secs_f32()).ceil().max(1.0) as u32;
+        let rate = if clockwise { -radians_per_sec } else { radians_per_sec };
+
+        let start = MovementInfo {
+            time: self.tick(),
+            position: at,
+            ..MovementInfo::default()
+        };
+        let start_opcode = if clockwise {
+            ClientOpcode::MoveStartTurnRight
+        } else {
+            ClientOpcode::MoveStartTurnLeft
+        };
+        self.send_movement(start_opcode, mover, &start)?;
+
+        let mut seen = Vec::new();
+        let mut heading = at.orientation;
+        for _ in 0..steps {
+            std::thread::sleep(STEP);
+            heading += rate * STEP.as_secs_f32();
+            let beat = MovementInfo {
+                time: self.tick(),
+                position: crate::update::Position { orientation: heading, ..at },
+                ..MovementInfo::default()
+            };
+            self.send_movement(ClientOpcode::MoveHeartbeat, mover, &beat)?;
+            seen.extend(self.drain(Duration::from_millis(1), 64)?);
+        }
+
+        let stop = MovementInfo {
+            time: self.tick(),
+            position: crate::update::Position { orientation: heading, ..at },
+            ..MovementInfo::default()
+        };
+        self.send_movement(ClientOpcode::MoveStopTurn, mover, &stop)?;
+        seen.extend(self.drain(Duration::from_millis(300), 128)?);
+        Ok(seen)
+    }
+
+    /// Switches between running and walking, confirming
+    /// `MoveSetRunMode`/`MoveSetWalkMode` -- see `foss-wow#37`.
+    ///
+    /// A single statement rather than a held key: 3.3.5a has no walk key,
+    /// only a toggle (bound to `\`` by default), so there is no "while held"
+    /// state to model the way [`crate::motion::Motion`] models the movement
+    /// keys.
+    pub fn set_run_mode(
+        &mut self,
+        mover: u64,
+        at: crate::update::Position,
+        walking: bool,
+    ) -> Result<(), Error> {
+        use crate::movement::MovementInfo;
+        use crate::update::movement_flags;
+
+        let info = MovementInfo {
+            flags: if walking { movement_flags::WALKING } else { 0 },
+            time: self.tick(),
+            position: at,
+            ..MovementInfo::default()
+        };
+        let opcode = if walking {
+            ClientOpcode::MoveSetWalkMode
+        } else {
+            ClientOpcode::MoveSetRunMode
+        };
+        self.send_movement(opcode, mover, &info)
+    }
+
     /// Tells the server what this client has selected.
     ///
     /// A bare guid, unpacked -- `CMSG_SET_SELECTION` predates the packed-guid

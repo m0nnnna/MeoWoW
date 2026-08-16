@@ -202,6 +202,20 @@ enum Command {
         /// Turn on the spot to this heading, in degrees, without walking.
         #[arg(long)]
         face: Option<f32>,
+        /// After entering, turn continuously on the spot for two seconds,
+        /// the way holding `A` or `D` alone does.
+        ///
+        /// Confirms `MoveStartTurnLeft`/`Right`/`MoveStopTurn` -- three of
+        /// the fifteen relayed movement opcodes `foss-wow#37` set out to
+        /// drive, and the only ones this client had no way to send at all
+        /// before this ticket.
+        #[arg(long)]
+        turn: Option<Turn>,
+        /// After entering, toggle between running and walking.
+        ///
+        /// Confirms `MoveSetRunMode`/`MoveSetWalkMode`.
+        #[arg(long)]
+        run_mode: Option<RunMode>,
         /// After entering, hold the connection open this many seconds,
         /// answering keepalives. Proves the session survives rather than being
         /// dropped a minute in.
@@ -704,6 +718,8 @@ fn main() -> Result<()> {
             strafe,
             jump,
             face,
+            turn,
+            run_mode,
             stay,
             units,
             objects,
@@ -740,6 +756,8 @@ fn main() -> Result<()> {
                 strafe: *strafe,
                 jump: *jump,
                 face: *face,
+                turn: *turn,
+                run_mode: *run_mode,
                 stay: *stay,
                 units: *units,
                 objects: *objects,
@@ -898,6 +916,8 @@ struct WorldRequest<'a> {
     strafe: Option<Strafe>,
     jump: bool,
     face: Option<f32>,
+    turn: Option<Turn>,
+    run_mode: Option<RunMode>,
     stay: u64,
     units: Option<usize>,
     objects: bool,
@@ -935,6 +955,18 @@ enum Strafe {
     Right,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Turn {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum RunMode {
+    Run,
+    Walk,
+}
+
 /// Logs in and walks all the way through to the character list.
 ///
 /// The two halves are deliberately one command: the session key only exists
@@ -959,6 +991,8 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         strafe,
         jump,
         face,
+        turn,
+        run_mode,
         stay,
         units,
         objects,
@@ -1246,6 +1280,55 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
                     packet.body.len()
                 );
             }
+        }
+
+        if let Some(direction) = turn {
+            let at = world::Position {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                orientation: position.orientation,
+            };
+            // A slow, deliberate rate: fast enough to be unambiguously a
+            // turn in a two-second capture, slow enough that a real client
+            // holding the key would produce the same shape of packets.
+            const RADIANS_PER_SEC: f32 = 1.5;
+            let clockwise = direction == Turn::Right;
+            println!(
+                "\nturning {} on the spot for 2s",
+                if clockwise { "right" } else { "left" }
+            );
+            let seen = connection.turn_in_place(
+                character.guid,
+                at,
+                clockwise,
+                std::time::Duration::from_secs(2),
+                RADIANS_PER_SEC,
+            )?;
+            println!("  server sent {} packets while turning", seen.len());
+            for packet in &seen {
+                println!(
+                    "    {:<32} {} bytes",
+                    world::opcode::describe(packet.opcode),
+                    packet.body.len()
+                );
+            }
+        }
+
+        if let Some(mode) = run_mode {
+            let at = world::Position {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                orientation: position.orientation,
+            };
+            let walking = mode == RunMode::Walk;
+            connection.set_run_mode(character.guid, at, walking)?;
+            connection.drain(std::time::Duration::from_millis(500), 64)?;
+            println!(
+                "\nswitched to {}",
+                if walking { "walking" } else { "running" }
+            );
         }
 
         // A named target, resolved through the same name table the unit frames
