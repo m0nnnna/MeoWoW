@@ -34,6 +34,20 @@ checked against.
 Roughly 60% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
 
+**The destination for the next few milestones is a native Questie**, and the
+ladder to it is a dependency chain rather than a preference: NPC interaction
+(4.15) → quests (4.16) → map (4.17) → minimap (4.18) → Questie's features
+(4.19). A quest tracker is a map feature — its whole value is "the thing you
+need is over there", and there is no *there* until a map exists. The scoping
+fact that matters: **most of Questie's bulk is a workaround for a restriction
+this client does not have.** An addon cannot ask the server about a quest it has
+not been offered, so it ships a hand-collected database of the entire game. This
+client can send the query. 4.19 is therefore a *presentation* milestone — pins,
+tracker, availability colouring — with facts off the wire wherever the wire will
+answer. Reference addons live in the **gitignored `addons-to-port/`**, are read
+rather than vendored, and each one's licence is checked and recorded *before* a
+port starts; see `docs/REUSE-POLICY.md`'s addon section.
+
 **Buildings are solid.** Walls stop you, floors and stairs hold you up, and
 doodads with a collision mesh are obstacles rather than scenery — from the WMO
 triangles (including the invisible collision-only ones) and the M2 collision

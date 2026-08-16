@@ -3394,3 +3394,55 @@ login spot on the local realm. An innkeeper, a questgiver whose chain is gated
 and a questgiver whose is not, all within greeting range, is the fixture the
 rest of this milestone needs -- and building one by changing the *character* or
 the *cast* rather than the technique is what closed both of 4.13's gaps.
+
+## The road to a native Questie
+
+A destination worth writing down, because it changes what "done" means for the
+four milestones in front of it. The plan is to reach **Questie's features,
+implemented natively**, and the ladder is deliberate rather than arbitrary —
+each rung is a prerequisite for the next, not a preference.
+
+```
+4.15  NPC interaction     gossip [done], vendors, buying and selling
+4.16  Quests              accept, track, turn in
+4.17  Map                 the world map, and where things are on it
+4.18  Minimap             the same, small, and following the player
+4.19  Questie, natively   what to do, where, and whether you can yet
+```
+
+### Why this order and not another
+
+A quest tracker is a map feature. Questie's whole value is *"the thing you need
+is over there"*, and there is no "there" to point at until a map exists — so
+building the tracker first would produce a list of objectives with nowhere to
+put them. Equally, a map with no quest state on it is a picture. The two are
+one feature separated by a dependency, and the dependency runs one way.
+
+Vendors come before quests because a quest reward is an item and a turn-in is
+an inventory write, and the vendor work confirms both paths against a server
+that answers loudly. Quests then reuse them rather than debugging them.
+
+### The scoping fact that should shape 4.19
+
+**Most of Questie's bulk is a workaround for a restriction this project does
+not have.** An addon cannot ask the server about a quest it has not already
+been offered, so Questie ships a hand-collected database of every quest, NPC,
+object and spawn point in the game — hundreds of thousands of rows, gathered by
+observation because the API forbade the question.
+
+This client *is* the client. It can send `CMSG_QUEST_QUERY` and the questgiver
+status queries and be told, by the server, what a quest wants and who wants it.
+Server-supplied data needs no licence, cannot drift from the realm being played
+on, and is correct on a private server with custom content where a shipped
+database is simply wrong.
+
+So 4.19 is a **presentation** milestone, not a data one: the pins, the tracker,
+the availability colouring, the "you are too low level for this" state. Facts
+come off the wire wherever the wire will answer, and only what the server
+genuinely will not volunteer — static world facts an addon collected by looking
+rather than by asking — is a candidate for reimplementation. That judgement gets
+made per feature, with the wire tried first.
+
+See `docs/REUSE-POLICY.md`'s addon section: reference copies live in the
+gitignored `addons-to-port/`, are read rather than vendored, and each one's
+licence gets checked and recorded before any port begins rather than during.

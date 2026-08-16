@@ -16,3 +16,14 @@
 
 # Machine-local build config (target-dir redirect); see docs/BUILDING.md
 /.cargo/config.toml
+
+# Third-party addons kept locally as *reference only*, never vendored.
+#
+# These are other people's Lua projects with their own licences, and this
+# client does not run addons at all -- see the UI decision in CLAUDE.md. What
+# gets read out of them is behaviour to reimplement natively, which is the
+# same rule `docs/REUSE-POLICY.md` already applies to server sources: read to
+# understand, write from scratch. Committing the folder would put someone
+# else's licensed code in this tree, which is exactly what that policy exists
+# to prevent.
+/addons-to-port/

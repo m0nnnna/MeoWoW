@@ -56,3 +56,35 @@ cipher's key derivation — is ours.
 - Copying code from any GPL project into this tree.
 - Committing game assets, including as test fixtures.
 - Vendoring a decoder for a WoW format and calling it done.
+
+## Third-party addons
+
+This client does not run addons — the interface *is* the customisation
+surface, and that decision is recorded in `CLAUDE.md`. So "porting an addon"
+here means reimplementing what it does natively, never shipping it.
+
+Addons kept locally for reference live in **`addons-to-port/`, which is
+gitignored**. They are other people's Lua projects with their own licences, and
+the same rule that governs TrinityCore governs them: **read to understand what
+a feature does; write our own implementation of how it does it.** Committing
+that folder would put someone else's licensed code in this tree.
+
+Two things need settling *before* any port, not during:
+
+- **The addon's licence.** GPL and MIT are not the only options in the
+  addon world and some carry bespoke terms. Check the actual repository rather
+  than assuming, and record the answer here. Reading is fine under any of them;
+  what varies is whether a close reimplementation is.
+- **Whether the addon's *data* is needed at all.** This is the more
+  interesting question and it usually goes the helpful way. Most large addon
+  databases exist because the addon API cannot ask the server anything — an
+  addon cannot query a quest it has not seen, so it ships a hand-collected
+  table of every quest, NPC and spawn in the game. **This project is the
+  client.** It can send the query the addon was forbidden from sending, and
+  server-supplied data needs no licence and cannot go stale. Port the
+  *presentation*; get the facts from the wire wherever the wire will answer.
+
+A database is only worth reimplementing where the server genuinely will not
+answer — static world facts an addon collected by observation rather than by
+asking. That distinction should be made per feature, with the wire tried
+first.
