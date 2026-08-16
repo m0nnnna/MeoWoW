@@ -325,6 +325,15 @@ enum Command {
         /// wrong face.
         #[arg(long)]
         appearance: bool,
+        /// After entering, find which update fields carry another player's
+        /// worn items, by the same measure-not-transcribe technique as
+        /// `--appearance`: our own character's equipment arrives twice, once
+        /// as display ids in the character list and once as item entries in
+        /// our own update fields, and `Item.dbc` bridges the two.
+        ///
+        /// `foss-wow#23`.
+        #[arg(long)]
+        visible_items: bool,
         /// After entering, print every replicated *unit* with its entry, its
         /// name and every field it has set.
         ///
@@ -757,6 +766,7 @@ fn main() -> Result<()> {
             until_death,
             swing_probe,
             appearance,
+            visible_items,
             select,
             select_self,
             release,
@@ -798,6 +808,7 @@ fn main() -> Result<()> {
                 until_death: *until_death,
                 swing_probe: *swing_probe,
                 appearance: *appearance,
+                visible_items: *visible_items,
                 select: *select,
                 select_self: *select_self,
                 release: *release,
@@ -834,6 +845,7 @@ fn main() -> Result<()> {
                 enter: enter.as_deref(),
                 locale: &cli.locale,
                 timeout: *timeout,
+                data: cli.data.as_deref(),
             })
         }
         _ => {}
@@ -959,6 +971,7 @@ struct WorldRequest<'a> {
     until_death: bool,
     swing_probe: Option<SwingProbe>,
     appearance: bool,
+    visible_items: bool,
     select: bool,
     select_self: bool,
     release: bool,
@@ -975,6 +988,10 @@ struct WorldRequest<'a> {
     cast_self: bool,
     locale: &'a str,
     timeout: u64,
+    /// Only touched by `--visible-items`, which is a game-file question
+    /// wearing a network command's clothes -- see the comment in `main`
+    /// about why `World` otherwise never demands a data directory.
+    data: Option<&'a std::path::Path>,
 }
 
 /// Which way to sidestep.
@@ -1043,6 +1060,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         until_death,
         swing_probe,
         appearance,
+        visible_items,
         select,
         select_self,
         release,
@@ -1058,6 +1076,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         cast,
         cast_self,
         locale,
+        data,
         timeout,
     } = request;
     let timeout = std::time::Duration::from_secs(timeout);
@@ -1856,10 +1875,140 @@ cast {spell_id} at {} (attempt {attempt})",
             report_appearance(&state, character);
         }
 
+        if visible_items {
+            report_visible_items(&state, character, data, locale)?;
+        }
+
         if own_fields {
             report_own_fields(&state, character.guid, "after");
         }
     }
+    Ok(())
+}
+
+/// Finds which update fields carry another player's worn items, by the same
+/// measure-not-transcribe technique [`report_appearance`] uses for a face.
+///
+/// **The bridge is `Item.dbc`, and that is why this is the one `world` flag
+/// that touches game files at all** (see the comment in `main` about `World`
+/// otherwise never demanding a data directory): the wire's visible-item
+/// fields hold item *entry* ids, and only `Item.dbc` says which display id an
+/// entry resolves to.
+///
+/// The known answer is `SMSG_CHAR_ENUM`'s own equipment block, which already
+/// gives our own character's worn items as display ids per slot. So for each
+/// set field of our own player object, read the value as an entry id,
+/// resolve it through `Item.dbc`, and report which fields' resolved display
+/// ids agree with which equipped slot. Where at least two slots each name
+/// exactly one field, a consistent `base + slot * stride` explaining all of
+/// them is reported too -- the same shape of evidence
+/// `PLAYER_FIELD_INV_SLOT_HEAD` was confirmed with, and it is what
+/// `foss-wow#23` wants named in `crates/world/src/update.rs` once it holds.
+fn report_visible_items(
+    state: &world::WorldState,
+    character: &world::Character,
+    data: Option<&std::path::Path>,
+    locale: &str,
+) -> Result<()> {
+    let Some(data) = data else {
+        println!(
+            "\n--visible-items needs game files: pass --data or set WOW_DATA \
+             (Item.dbc is what turns an item entry into a display id)"
+        );
+        return Ok(());
+    };
+
+    let mut chain = Chain::open_wow_data(data, locale)
+        .with_context(|| format!("opening archives under {}", data.display()))?;
+    let item_rows = dbc::schema::Item::parse(&chain.read(dbc::schema::Item::PATH)?)?;
+    let entry_to_display: std::collections::HashMap<u32, u32> = item_rows
+        .iter()
+        .map(|row| (row.id(), row.display_info_id()))
+        .collect();
+
+    let worn: Vec<(usize, u32)> = character
+        .equipment
+        .iter()
+        .take(world::inventory::EQUIPPED_COUNT as usize)
+        .enumerate()
+        .filter(|(_, slot)| slot.display_id != 0)
+        .map(|(index, slot)| (index, slot.display_id))
+        .collect();
+
+    println!("\nworn items, as the character list reports them:");
+    for (index, display_id) in &worn {
+        println!("  slot {index}: display {display_id}");
+    }
+
+    let Some(own) = state.get(character.guid) else {
+        println!("  our own player object is not in replicated state; nothing to search");
+        return Ok(());
+    };
+    println!(
+        "  searching {} set fields, read as item entries through Item.dbc \
+         ({} entries), against {} worn display ids",
+        own.fields.len(),
+        entry_to_display.len(),
+        worn.len(),
+    );
+
+    // Exactly one match per slot is what makes the base/stride fit below
+    // trustworthy; an ambiguous slot is reported but excluded from it, the
+    // same way `PLAYER_BYTES`' search treated more than one hit as "the
+    // question needs narrowing" rather than picking one arbitrarily.
+    let mut unambiguous: Vec<(usize, u16)> = Vec::new();
+    for (index, display_id) in &worn {
+        let fields: Vec<u16> = own
+            .fields
+            .iter()
+            .filter(|(_, value)| entry_to_display.get(value) == Some(display_id))
+            .map(|(field, _)| field)
+            .collect();
+        match fields.as_slice() {
+            [] => println!("  slot {index} (display {display_id}): no field resolves to it"),
+            [one] => {
+                println!("  slot {index} (display {display_id}): field {one:#06x}");
+                unambiguous.push((*index, *one));
+            }
+            many => println!(
+                "  slot {index} (display {display_id}): {} fields resolve to it ({many:#06x?}) -- ambiguous",
+                many.len()
+            ),
+        }
+    }
+
+    // Look for one `base + slot * stride` that explains every unambiguous
+    // pair, trying each pair as the anchor since worn slots are rarely
+    // contiguous (an empty slot leaves no field to anchor from).
+    let fit = unambiguous.iter().enumerate().find_map(|(i, &(s0, f0))| {
+        unambiguous[i + 1..].iter().find_map(|&(s1, f1)| {
+            if s1 == s0 {
+                return None;
+            }
+            let (delta_field, delta_slot) = (f1 as i64 - f0 as i64, s1 as i64 - s0 as i64);
+            if delta_field % delta_slot != 0 {
+                return None;
+            }
+            let stride = delta_field / delta_slot;
+            let base = f0 as i64 - s0 as i64 * stride;
+            unambiguous
+                .iter()
+                .all(|&(s, f)| base + s as i64 * stride == f as i64)
+                .then_some((base, stride))
+        })
+    });
+    match fit {
+        Some((base, stride)) if unambiguous.len() >= 2 => println!(
+            "\n  fits base {base:#06x} stride {stride} across {} unambiguous slot(s)",
+            unambiguous.len()
+        ),
+        _ => println!(
+            "\n  no single base/stride explains the {} unambiguous slot(s) found \
+             -- more worn slots, or a character with fewer collisions, would help",
+            unambiguous.len()
+        ),
+    }
+
     Ok(())
 }
 

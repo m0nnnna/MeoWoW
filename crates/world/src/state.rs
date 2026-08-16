@@ -443,6 +443,27 @@ impl Entity {
         })
     }
 
+    /// Another player's worn items, as **item entries** -- not display ids,
+    /// which is why this returns raw numbers rather than anything paintable.
+    /// `0` means the slot is empty, by the same reasoning `appearance` uses:
+    /// an object-create block omits zero fields, so an unworn slot has no
+    /// field here at all rather than one holding zero.
+    ///
+    /// One entry per equipped slot, in slot order, from
+    /// [`crate::update::fields::PLAYER_VISIBLE_ITEM_ENTRY_HEAD`] -- see that
+    /// constant's doc comment for how the base and stride were measured.
+    /// Resolving an entry to something drawable needs `Item.dbc`, which this
+    /// crate does not depend on; that step happens in the caller.
+    pub fn visible_item_entries(&self) -> [u32; crate::inventory::EQUIPPED_COUNT as usize] {
+        let mut entries = [0u32; crate::inventory::EQUIPPED_COUNT as usize];
+        for (slot, entry) in entries.iter_mut().enumerate() {
+            let field = crate::update::fields::PLAYER_VISIBLE_ITEM_ENTRY_HEAD
+                + slot as u16 * crate::update::fields::VISIBLE_ITEM_STRIDE;
+            *entry = self.fields.get(field).unwrap_or(0);
+        }
+        entries
+    }
+
     /// Clears any monster-move path in flight.
     ///
     /// Called whenever a fresher, authoritative position arrives -- a relayed
@@ -3642,6 +3663,39 @@ mod tests {
             ],
         )]);
         assert!(world.get(7).unwrap().appearance().is_none());
+    }
+
+    /// `visible_item_entries` reads one entry per equipped slot at
+    /// `PLAYER_VISIBLE_ITEM_ENTRY_HEAD + 2 * slot` -- the base and stride
+    /// `foss-wow#23` measured against a live realm, over two characters, by
+    /// resolving entries through `Item.dbc` and matching the character
+    /// list's display ids. A slot with no field at all reads as `0`, the
+    /// same "absent is empty, not unknown" rule `appearance` follows, since
+    /// an object-create block omits zero fields.
+    #[test]
+    fn visible_items_read_at_the_measured_slots() {
+        use crate::update::fields;
+
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            7,
+            ObjectType::Player,
+            Some(at(0.0, 0.0)),
+            &[
+                // Slot 3 (chest) and slot 17 (ranged), the two extremes the
+                // live search actually matched on the dwarf hunter. Slots
+                // between them are left unset, on purpose: that is what an
+                // empty slot looks like on the wire.
+                (fields::PLAYER_VISIBLE_ITEM_ENTRY_HEAD + 3 * 2, 9976),
+                (fields::PLAYER_VISIBLE_ITEM_ENTRY_HEAD + 17 * 2, 6606),
+            ],
+        )]);
+
+        let entries = world.get(7).unwrap().visible_item_entries();
+        assert_eq!(entries[3], 9976);
+        assert_eq!(entries[17], 6606);
+        assert_eq!(entries[0], 0, "an empty slot must read as no entry, not a stale one");
+        assert_eq!(entries.len(), crate::inventory::EQUIPPED_COUNT as usize);
     }
 
     /// A stop (`to: None`) must read as not moving, the same as a move that

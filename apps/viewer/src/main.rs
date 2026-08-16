@@ -356,6 +356,11 @@ fn build_live_scene(
 
     if args.entities {
         let mut player_looks = std::collections::HashMap::new();
+        // No bag window in this headless path, so nothing else needs item
+        // icons -- but dressing another player still needs `Item.dbc`'s
+        // entry-to-display bridge, the same table this struct already reads
+        // for icons.
+        let items = crate::items::Items::load(chain);
         let placements: Vec<world::EntityPlacement> =
             drawable_with_own(&live, (0.0, 0.0), false)
                 .iter()
@@ -366,7 +371,13 @@ fn build_live_scene(
                     let (look, look_key) = if entity.guid == live.guid {
                         (Some(live.look.clone()), live.look_key)
                     } else if let Some(appearance) = entity.appearance {
-                        let (look, key) = player_look(&mut player_looks, chain, appearance);
+                        let (look, key) = player_look(
+                            &mut player_looks,
+                            chain,
+                            &items,
+                            appearance,
+                            &entity.visible_items,
+                        );
                         (Some(look), key)
                     } else {
                         (None, 0)
@@ -2175,21 +2186,41 @@ fn lit_uniform(
 /// Returns the key as well as the look because the renderer's model cache is
 /// keyed on it: two humans with different faces must not share one built model,
 /// which is the bug `EntityPlacement::look_key` exists to prevent.
+/// Resolves and caches another player's look, gear included.
+///
+/// `visible_items` are raw item entries off the wire -- see
+/// `world::state::Entity::visible_item_entries` -- and `items` is what turns
+/// each into the `(display id, inventory type)` pair `resolve_wearing` wants,
+/// via the same `Item.dbc` pass the bag window already uses for icons. An
+/// entry with no row (nothing worn, or an id `Item.dbc` does not have) drops
+/// out rather than fabricating a display id -- the same rule the description
+/// substituter follows.
+///
+/// The cache key folds equipment in through [`character::look_key`], not
+/// just the face: two players sharing a race and appearance but not a
+/// wardrobe must not share a composed skin.
 fn player_look(
     cache: &mut std::collections::HashMap<u64, Rc<character::Look>>,
     chain: &mut Chain,
+    items: &crate::items::Items,
     appearance: ::world::Appearance,
+    visible_items: &[u32],
 ) -> (Rc<character::Look>, u64) {
     let appearance = character::Appearance::from(appearance);
-    let key = appearance.key();
+    let equipment: Vec<(u32, u8)> = visible_items
+        .iter()
+        .filter_map(|entry| (*entry != 0).then(|| items.display(*entry)).flatten())
+        .collect();
+    let key = character::look_key(&appearance, &equipment);
     let look = cache
         .entry(key)
         .or_insert_with(|| {
-            let look = character::resolve(chain, appearance);
+            let look = character::resolve_wearing(chain, appearance, &equipment);
             tracing::debug!(
-                "composed a look for {appearance:?}: body {:?}, hair {:?}",
+                "composed a look for {appearance:?}: body {:?}, hair {:?}, wearing {}",
                 look.body,
-                look.hair
+                look.hair,
+                equipment.len()
             );
             Rc::new(look)
         })
@@ -2972,6 +3003,7 @@ impl App {
                     // already holds the renderer, and `live` the live world.
                     let looks = &mut self.player_looks;
                     let chain = &mut self.chain;
+                    let items = &self.items;
                     // Eased before they are placed, so a creature turning to
                     // face its victim swings round rather than snapping. The
                     // player's own body is excluded inside `ease_facings` --
@@ -2992,7 +3024,13 @@ impl App {
                                 let (look, look_key) = if entity.guid == live.guid {
                                     (Some(live.look.clone()), live.look_key)
                                 } else if let Some(appearance) = entity.appearance {
-                                    let (look, key) = player_look(looks, chain, appearance);
+                                    let (look, key) = player_look(
+                                        looks,
+                                        chain,
+                                        items,
+                                        appearance,
+                                        &entity.visible_items,
+                                    );
                                     (Some(look), key)
                                 } else {
                                     (None, 0)

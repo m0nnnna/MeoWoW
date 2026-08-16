@@ -511,16 +511,13 @@ fn wear(chain: &mut Chain, skin: &mut Skin, row: &dbc::schema::ItemDisplayInfoRo
     }
 }
 
-/// Resolves an appearance into textures and geosets, wearing nothing.
+/// Resolves an appearance, dressed in the items whose display ids are given.
 ///
 /// Every lookup degrades to `None` rather than failing: without a game
 /// installation there are no tables to read, and the character still has to
-/// draw -- untextured, as it did before this existed, rather than not at all.
-pub fn resolve(chain: &mut Chain, look: Appearance) -> Look {
-    resolve_wearing(chain, look, &[])
-}
-
-/// Resolves an appearance, dressed in the items whose display ids are given.
+/// draw -- untextured, as it did before dressing existed, rather than not at
+/// all. An empty `equipment` resolves the same bare body this used to be a
+/// separate function for.
 ///
 /// `equipment` is taken in the order `SMSG_CHAR_ENUM` sends it, and that order
 /// is used directly for the paint order rather than being mapped through a slot

@@ -42,6 +42,11 @@ pub struct Items {
     /// at the same point the spellbook is loaded, and this map is what
     /// survives them.
     paths: HashMap<u32, String>,
+    /// Entry to `(display id, inventory type)`, for dressing *other* players.
+    /// The wire only ever gives their gear as entries -- see
+    /// `world::state::Entity::visible_item_entries` -- and this is the same
+    /// `Item.dbc` pass that builds `paths`, so it costs nothing extra to keep.
+    display: HashMap<u32, (u32, u8)>,
     /// Uploaded icons, by texture path. Many items share one icon -- every
     /// stack of linen cloth in the game is the same picture -- so this is
     /// keyed by path rather than by entry.
@@ -94,6 +99,9 @@ impl Items {
                         .paths
                         .insert(row.id(), format!("{ICON_DIR}\\{icon}.blp"));
                 }
+                items
+                    .display
+                    .insert(row.id(), (row.display_info_id(), row.inventory_type() as u8));
             }
         }
 
@@ -141,6 +149,14 @@ impl Items {
         }
         self.icons.insert(path, id);
         id
+    }
+
+    /// `(display id, inventory type)` for an item entry, the shape
+    /// `character::resolve_wearing` wants. `None` for an entry `Item.dbc`
+    /// does not have, which happens and is not an error -- see
+    /// `Item.dbc`'s own doc comment.
+    pub fn display(&self, entry: u32) -> Option<(u32, u8)> {
+        self.display.get(&entry).copied()
     }
 
     /// What to call an item, until this client can ask the server.

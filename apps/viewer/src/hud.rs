@@ -388,6 +388,7 @@ mod tests {
             swung_ms_ago: None,
             fighting: false,
             appearance: None,
+            visible_items: [0; ::world::inventory::EQUIPPED_COUNT as usize],
             sheathed: true,
             sheath_changed_ms_ago: None,
         }

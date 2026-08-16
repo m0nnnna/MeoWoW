@@ -71,6 +71,11 @@ pub struct Entity {
     /// resolved here because turning it into textures composes a skin, which
     /// is far too expensive to redo every frame -- the caller caches on it.
     pub appearance: Option<::world::Appearance>,
+    /// The same player's worn items, as raw item **entries** -- `0` for an
+    /// empty slot. All zero for every creature, which resolves to nothing
+    /// worn rather than to a wrong guess, since a creature has none of these
+    /// fields set at all. See `world::state::Entity::visible_item_entries`.
+    pub visible_items: [u32; ::world::inventory::EQUIPPED_COUNT as usize],
     /// Whether this unit is carrying its weapon in hand rather than stowed.
     ///
     /// Read from replicated state for *everyone, this client's own character
@@ -521,6 +526,7 @@ pub fn drawable_entities(
             swung_ms_ago: entity.swung_ago(now).map(|d| d.as_millis() as u32),
             fighting: state.is_fighting(entity.guid),
             appearance: entity.appearance(),
+            visible_items: entity.visible_item_entries(),
             sheathed: !entity.sheath().drawn(),
             sheath_changed_ms_ago: entity
                 .sheath_changed_ago(now)
@@ -691,6 +697,9 @@ pub fn own_entity(
         // which is the source this project has confirmed. No reason to make
         // the caller resolve it a second way.
         appearance: None,
+        // Same reasoning as `appearance` above: our own gear is already
+        // resolved from the character list, in `LiveWorld::look`.
+        visible_items: [0; ::world::inventory::EQUIPPED_COUNT as usize],
         // Read from replicated state like everyone else's, and unlike our
         // position: the server does echo this one back -- see
         // `world::state::Entity::sheath`.

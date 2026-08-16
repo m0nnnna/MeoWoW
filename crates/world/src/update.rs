@@ -1038,6 +1038,40 @@ pub mod fields {
     /// facial hair 4.
     pub const PLAYER_BYTES_2: u16 = 0x9A;
 
+    /// The base of another player's worn-item block: one item **entry** id
+    /// per equipped slot, at `PLAYER_VISIBLE_ITEM_ENTRY_HEAD + 2 * slot` for
+    /// `slot` in `0..EQUIPPED_COUNT` -- an entry, not a display id, which is
+    /// why `Item.dbc` sits between this field and anything paintable. Our own
+    /// character needs none of it: `SMSG_CHAR_ENUM` sends display ids for our
+    /// own gear directly.
+    ///
+    /// **Measured by the same technique as [`PLAYER_BYTES`], for the same
+    /// reason: a wrong index parses perfectly and dresses every stranger in
+    /// the wrong armour, with nothing in the output to say so.** Our own
+    /// equipment arrives twice by unrelated routes -- display ids in the
+    /// character list, item entries here -- so `wow-cli world --enter <name>
+    /// --visible-items` packs the known display id per slot, reads every set
+    /// field of our own player object as an item entry through `Item.dbc`,
+    /// and asks which fields' resolved display ids agree with which slot.
+    ///
+    /// Two characters gave the same answer: a dwarf hunter wearing five
+    /// items matched fields `0x121, 0x127, 0x129, 0x139, 0x13d` for slots
+    /// `3, 6, 7, 15, 17`, and a warrior wearing seventeen matched ten
+    /// *unambiguous* slots (the rest wear a visually-identical pair -- two
+    /// rings of the same kind, say -- so both fields in the pair resolve to
+    /// both slots and neither could be assigned alone). Both sets fit exactly
+    /// one `base + slot * 2`, with `base = 0x11b`, and the fit was checked
+    /// against every unambiguous point rather than picked from the first two
+    /// -- the same run-of-consecutive-fields shape that confirmed
+    /// `PLAYER_FIELD_INV_SLOT_HEAD`, and this block sits immediately before
+    /// it (`0x11b + 2*19 = 0x141`, one field short of `0x144`), which is a
+    /// fact nothing in the search assumed and did not have to come out true.
+    pub const PLAYER_VISIBLE_ITEM_ENTRY_HEAD: u16 = 0x11b;
+    /// How many update fields one visible-item slot occupies. The second
+    /// field of the pair was never resolved -- likely an enchantment id --
+    /// and this client does not read it.
+    pub const VISIBLE_ITEM_STRIDE: u16 = 2;
+
     /// How many powers a unit has, and so how far past [`UNIT_POWER1`] a power
     /// index is allowed to reach.
     pub const POWER_COUNT: u16 = 7;
