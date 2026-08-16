@@ -391,9 +391,18 @@ pub mod server {
     pub const ATTACKER_STATE_UPDATE: u16 = 0x014A;
     /// Two empty-bodied refusals that arrive when a swing cannot happen. Both
     /// were produced by attacking from out of range while facing away, three
-    /// times each, and *which* is which is not established -- neither carries
-    /// a payload to tell them apart, and no experiment has yet isolated one
-    /// condition without the other. Named for what they are.
+    /// times each, and *which* is which is **still** not established --
+    /// `foss-wow#32` varied range and facing one at a time (`wow-cli world
+    /// --swing-probe a|b|c`) specifically to separate them and could not:
+    /// a swing wrong on exactly one axis produced **no reply at all**, nine
+    /// times out of nine, where the control (right on both) produced
+    /// `ATTACK_START` and real swings every time. Neither `A` nor `B` is
+    /// what a single wrong condition sends -- the one instance of `A` seen
+    /// across every probe run arrived on the *first* tick of an otherwise
+    /// successful control attempt, which reads as a timing race (the
+    /// server's own idea of position or facing had not caught up to a swing
+    /// sent immediately after arriving) rather than a condition this pair
+    /// of names was meant to describe. Left unrenamed rather than guessed at.
     pub const ATTACK_SWING_REFUSED_A: u16 = 0x0145;
     pub const ATTACK_SWING_REFUSED_B: u16 = 0x0146;
     /// One unit's power changing without a whole object update behind it.

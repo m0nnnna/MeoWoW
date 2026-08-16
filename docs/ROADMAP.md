@@ -834,11 +834,15 @@ nothing happens -- which reads as the command being broken rather than the
 target having moved two yards. `--attack` now re-swings until swings actually
 come back, and says so when they do not.
 
-**Not done:** spell damage (`SMSG_SPELLNONMELEEDAMAGELOG`), the corpse and
-release flow, and telling the two swing-refusal opcodes apart -- no experiment
-has separated them, because neither carries a payload and both conditions were
-violated at once. Combat has also not been *watched* in the viewer yet: it is
-verified headlessly and through the CLI.
+**Not done at the time this was written:** spell damage
+(`SMSG_SPELLNONMELEEDAMAGELOG`) and the corpse and release flow -- both are
+covered in their own sections below. The two swing-refusal opcodes stayed
+unseparated even after a dedicated attempt: `foss-wow#32` varied range and
+facing one at a time and found that a swing wrong on exactly one axis gets no
+reply at all, not either named refusal -- see the doc comment on
+`ATTACK_SWING_REFUSED_A`/`B` in `opcode.rs` for the full result. Combat has
+also not been *watched* in the viewer yet: it is verified headlessly and
+through the CLI.
 
 ### 4.4 continued: floating combat text
 

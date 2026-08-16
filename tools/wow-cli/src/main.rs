@@ -342,6 +342,18 @@ enum Command {
         /// is usually a friendly guard, and swinging at one is refused.
         #[arg(long)]
         until_death: bool,
+        /// Vary one condition of a swing at a time, to tell apart the two
+        /// empty-bodied refusals seen when both range and facing were wrong
+        /// at once -- see `foss-wow#32`.
+        ///
+        /// `a` closes to melee range and deliberately faces away; `b` stays
+        /// 8-10 units out and faces correctly; `c` is the control (in range
+        /// and facing) and must produce `SMSG_ATTACKSTART` and real swings,
+        /// or the run proves nothing about `a` and `b` either. Repeated
+        /// three times each, since a creature wandering mid-approach can
+        /// turn a single refusal into a false reading of either condition.
+        #[arg(long)]
+        swing_probe: Option<SwingProbe>,
         /// Select the nearest unit whose name contains this, rather than the
         /// nearest unit of any kind.
         ///
@@ -731,6 +743,7 @@ fn main() -> Result<()> {
             target,
             own_fields,
             until_death,
+            swing_probe,
             appearance,
             select,
             select_self,
@@ -770,6 +783,7 @@ fn main() -> Result<()> {
                 target: target.as_deref(),
                 own_fields: *own_fields,
                 until_death: *until_death,
+                swing_probe: *swing_probe,
                 appearance: *appearance,
                 select: *select,
                 select_self: *select_self,
@@ -929,6 +943,7 @@ struct WorldRequest<'a> {
     target: Option<&'a str>,
     own_fields: bool,
     until_death: bool,
+    swing_probe: Option<SwingProbe>,
     appearance: bool,
     select: bool,
     select_self: bool,
@@ -965,6 +980,13 @@ enum Turn {
 enum RunMode {
     Run,
     Walk,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SwingProbe {
+    A,
+    B,
+    C,
 }
 
 /// Logs in and walks all the way through to the character list.
@@ -1004,6 +1026,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         target,
         own_fields,
         until_death,
+        swing_probe,
         appearance,
         select,
         select_self,
@@ -1541,6 +1564,18 @@ nothing replicated matches {wanted:?}"),
 
         if until_death {
             fight_until_death(&mut connection, &mut state, character, target, capture.as_mut())?;
+        }
+
+        if let Some(probe) = swing_probe {
+            here = run_swing_probe(
+                &mut connection,
+                &mut state,
+                character,
+                probe,
+                target,
+                here,
+                capture.as_mut(),
+            )?;
         }
 
         // Before `--stay`, so the names are in hand when chat starts arriving
@@ -3486,6 +3521,131 @@ fn fight_until_death(
         println!("  {:<34} x{count}", world::opcode::describe(*opcode));
     }
     Ok(())
+}
+
+/// Varies one condition of a swing at a time -- range or facing, never both
+/// -- so a refusal can be attributed to the condition that changed rather
+/// than left ambiguous between two.
+///
+/// `--attack`'s first run swung from five units away without facing the
+/// target, and got two different empty-bodied refusals with nothing to say
+/// which was which: two variables changed in one experiment, the classic way
+/// to learn nothing. This holds one of range or facing wrong and the other
+/// correct, so whatever comes back is attributable.
+///
+/// Returns the walked-to position, the same way `Connection::walk` does --
+/// replicated state still believes the login position, so a caller chaining
+/// probes has to carry the real one forward itself.
+fn run_swing_probe(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    character: &world::Character,
+    probe: SwingProbe,
+    target: Option<&str>,
+    mut here: world::Position,
+    mut capture: Option<&mut Capture>,
+) -> Result<world::Position> {
+    use std::f32::consts::PI;
+    use std::time::Duration;
+
+    const MELEE_REACH: f32 = 2.5;
+    const IN_RANGE: f32 = MELEE_REACH - 0.5;
+    // The ticket's own band: comfortably past the server's reach check
+    // without being so far the approach walk takes long enough for the
+    // target to wander somewhere else entirely.
+    const OUT_OF_RANGE: f32 = 9.0;
+    const RUN_SPEED: f32 = 7.0;
+    const ATTEMPTS: usize = 3;
+
+    let label = match probe {
+        SwingProbe::A => "A: in melee range, facing away",
+        SwingProbe::B => "B: out of range, facing correctly",
+        SwingProbe::C => "C (control): in range and facing",
+    };
+    println!("\nswing probe {label}");
+
+    for attempt in 1..=ATTEMPTS {
+        // Named, not merely nearest: the nearest unit to a starting
+        // character is very often a friendly NPC, and a swing at one is
+        // refused regardless of range or facing -- which would read as
+        // exactly the ambiguous result this probe exists to avoid.
+        let mut candidates = nearest_ordered_from(state, character.guid, here);
+        if let Some(wanted) = target {
+            let wanted = wanted.to_lowercase();
+            candidates
+                .retain(|(_, entity)| unit_label(state, entity).to_lowercase().contains(&wanted));
+        }
+        let Some(&(_, chosen)) = candidates.first() else {
+            println!("  nothing replicated to probe against");
+            break;
+        };
+        let guid = chosen.guid;
+        let Some(there) = state.get(guid).and_then(|e| e.position) else {
+            println!("  target {guid:#x} has no known position");
+            continue;
+        };
+
+        // Close or open the distance to the band this probe wants, and
+        // nothing else -- a walk toward the target changes only range, never
+        // facing, since the heading sent below is chosen independently.
+        let flat = ((there.x - here.x).powi(2) + (there.y - here.y).powi(2)).sqrt();
+        let wanted = match probe {
+            SwingProbe::A | SwingProbe::C => IN_RANGE,
+            SwingProbe::B => OUT_OF_RANGE,
+        };
+        if (flat - wanted).abs() > 1.0 {
+            let toward = (there.y - here.y).atan2(there.x - here.x);
+            let (heading, distance) = if flat > wanted {
+                (toward, flat - wanted)
+            } else {
+                (toward + PI, wanted - flat)
+            };
+            let (arrived, _) =
+                connection.walk(character.guid, here, heading, distance, RUN_SPEED)?;
+            here = arrived;
+        }
+
+        // Re-measured after any walk: the target may have moved during it,
+        // and both the facing this probe sends and the range it reports
+        // have to agree with where things actually are now.
+        let Some(there) = state.get(guid).and_then(|e| e.position) else {
+            continue;
+        };
+        let flat = ((there.x - here.x).powi(2) + (there.y - here.y).powi(2)).sqrt();
+        let correct_heading = (there.y - here.y).atan2(there.x - here.x);
+        let sent_heading = match probe {
+            SwingProbe::A => correct_heading + PI,
+            SwingProbe::B | SwingProbe::C => correct_heading,
+        };
+        connection.set_facing(character.guid, here, sent_heading)?;
+        here.orientation = sent_heading;
+        connection.set_selection(guid)?;
+
+        println!(
+            "  attempt {attempt}: {flat:.1} units from {guid:#x}, facing {}",
+            if probe == SwingProbe::A { "away" } else { "correctly" }
+        );
+        connection.attack_swing(guid)?;
+
+        let batch = connection.drain(Duration::from_millis(1200), 128)?;
+        if let Some(capture) = capture.as_mut() {
+            capture.record(&batch)?;
+        }
+        let mut counts: std::collections::BTreeMap<u16, usize> = Default::default();
+        for packet in &batch {
+            *counts.entry(packet.opcode).or_default() += 1;
+        }
+        println!("    server sent {} packets:", batch.len());
+        for (opcode, count) in &counts {
+            println!("      {:<32} x{count}", world::opcode::describe(*opcode));
+        }
+        let report = state.replicate(&batch, None);
+        print_events(&report, state, character.guid);
+        if !report.swings.is_empty() {
+            println!("    -> landed a real swing (SMSG_ATTACKERSTATEUPDATE)");
+        }
+    }
+    Ok(here)
 }
 
 /// What to call a guid, for a line of combat log.
