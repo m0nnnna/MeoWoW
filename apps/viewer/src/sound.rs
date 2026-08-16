@@ -27,6 +27,20 @@ use dbc::schema::{
 };
 use mpq::Chain;
 
+/// `SoundEntries` id for clicking a spell or an action-bar slot.
+///
+/// `SoundEntries` type 2 (257 entries, 94% of them under `Sound\Interface`)
+/// is the interface click family, and this one row names itself:
+/// `GAMESPELLBUTTONMOUSEDOWN`. Not guessed at from memory -- the string is
+/// the confirmation, the same way `ItemDisplayInfo`'s texture columns
+/// identify themselves by the component suffix in their own filenames.
+/// A single id rather than a per-frame lookup because there is exactly one
+/// interaction this client currently distinguishes with a sound: putting an
+/// ability to use. Every other click (a loot row, the release prompt, a
+/// dragged bag square) is unconfirmed and stays silent rather than reusing
+/// this one on a guess.
+pub const INTERFACE_CLICK: u32 = 83;
+
 /// Which of a zone's two tracks to use.
 ///
 /// `ZoneMusic` and `SoundAmbience` each carry a day and a night id, and often
@@ -691,5 +705,35 @@ mod tests {
         };
         assert_eq!(zone.for_time(TimeOfDay::Day), (Some(2524), Some(41)));
         assert_eq!(zone.for_time(TimeOfDay::Night), (Some(2534), Some(42)));
+    }
+
+    /// `INTERFACE_CLICK` is a hardcoded id, which this project's own rule
+    /// says to check against the *type* rather than trust because it
+    /// parses -- see CLAUDE.md's "check the id resolves to a sound of the
+    /// right type, not merely to a real row". A build that ever ships a
+    /// renumbered `SoundEntries.dbc` would otherwise silently start playing
+    /// whatever row 83 happens to be. Gated on `WOW_DATA` like every other
+    /// real-data check in this repo, and skipped rather than failed when it
+    /// is unset.
+    #[test]
+    fn the_interface_click_id_is_still_an_interface_sound() {
+        let Some(data) = std::env::var_os("WOW_DATA") else {
+            eprintln!("skipping: WOW_DATA not set");
+            return;
+        };
+        let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
+        let table = SoundEntries::parse(&chain.read(SoundEntries::PATH).unwrap()).unwrap();
+        let row = table
+            .iter()
+            .find(|row| row.id() == INTERFACE_CLICK)
+            .expect("INTERFACE_CLICK must name a real SoundEntries row");
+        assert_eq!(
+            SoundType::from_raw(row.sound_type()),
+            SoundType::Other(2),
+            "row {} is no longer an interface sound (type {})",
+            row.id(),
+            row.sound_type()
+        );
+        assert_eq!(row.name(), "GAMESPELLBUTTONMOUSEDOWN");
     }
 }

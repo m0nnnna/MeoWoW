@@ -5011,6 +5011,11 @@ impl App {
         // A clicked slot casts, after the closure has released `self.hud`.
         if let Some((bar, slot)) = hud_response.activated {
             self.activate_slot(bar, slot);
+            // Queued like every other effect -- see `pending_sounds`' doc
+            // comment -- rather than played here, which has no mixer or
+            // archive chain in scope without borrowing more of `self` than
+            // this block needs.
+            self.pending_sounds.push((sound::INTERFACE_CLICK, false));
         }
 
         // A clicked loot row takes it. `take` says what to ask for, not where

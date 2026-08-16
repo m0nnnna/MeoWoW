@@ -5,8 +5,8 @@
 
 use dbc::infer::{infer, ColumnKind};
 use dbc::schema::{
-    AreaTable, CreatureDisplayInfo, CreatureModelData, Map, Spell, SpellDuration, SpellRadius,
-    WorldSafeLocs,
+    AreaTable, CreatureDisplayInfo, CreatureModelData, Map, SoundEntries, SoundType, Spell,
+    SpellDuration, SpellRadius, SpellVisualKit, WorldSafeLocs,
 };
 use dbc::Dbc;
 use mpq::Chain;
@@ -162,6 +162,48 @@ fn world_safe_locs_columns_land_on_the_right_values() {
     let reuse = locs.iter().find(|l| l.id() == 1036).expect("graveyard 1036");
     assert_eq!(reuse.name(), "Reuse");
     assert_eq!((reuse.x(), reuse.y(), reuse.z()), (0.0, 0.0, 0.0));
+}
+
+/// `SpellVisualKit::sound` was identified by type, not by validity:
+/// `SpellVisualKit`'s own ids are 56% dense over their range, so almost any
+/// small integer in a row lands on one -- the actual argument is that the
+/// values this column holds resolve to `SoundEntries` rows of the *spell*
+/// type at 99.9%, not merely to real rows at all.
+#[test]
+fn spell_visual_kit_sound_resolves_to_spell_type_sounds() {
+    let mut chain = require_data!();
+    let kits = SpellVisualKit::parse(&chain.read(SpellVisualKit::PATH).unwrap()).unwrap();
+    let sounds = SoundEntries::parse(&chain.read(SoundEntries::PATH).unwrap()).unwrap();
+    let sound_type: std::collections::HashMap<u32, SoundType> = sounds
+        .iter()
+        .map(|row| (row.id(), SoundType::from_raw(row.sound_type())))
+        .collect();
+
+    let candidates: Vec<u32> = kits
+        .iter()
+        .map(|row| row.sound())
+        .filter(|id| *id != 0 && *id != u32::MAX)
+        .collect();
+    assert!(candidates.len() > 4000, "expected thousands of candidates, got {}", candidates.len());
+
+    let resolved: Vec<u32> = candidates
+        .iter()
+        .filter(|id| sound_type.contains_key(id))
+        .copied()
+        .collect();
+    let resolve_rate = resolved.len() as f64 / candidates.len() as f64;
+    assert!(resolve_rate > 0.99, "resolve rate {resolve_rate:.3} should exceed 99%");
+
+    // `SoundType::Other(1)`: type 1 is not yet confirmed enough to name in
+    // `SoundType` itself (see its own doc comment -- "not clean enough to
+    // put a name on" at the table level), but it is exactly clean enough
+    // here, scoped to the rows this column actually points at.
+    let spell_typed = resolved
+        .iter()
+        .filter(|id| sound_type.get(id) == Some(&SoundType::Other(1)))
+        .count();
+    let spell_rate = spell_typed as f64 / resolved.len() as f64;
+    assert!(spell_rate > 0.99, "spell-type rate {spell_rate:.3} should exceed 99%");
 }
 
 #[test]

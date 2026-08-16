@@ -666,6 +666,32 @@ dbc_table! {
 }
 
 dbc_table! {
+    /// One of a spell's visual moments -- precast, cast, impact and so on --
+    /// with the sound that plays for it.
+    ///
+    /// **Only the sound is named.** `SpellVisual.dbc` names several of these
+    /// per spell (which one plays when is client animation-state logic this
+    /// project has not built), so this table alone cannot say *when* column
+    /// 15 is heard -- only that it is a sound, and which one.
+    ///
+    /// Column 15 identified itself by the same test as `SpellDuration`:
+    /// validity is nearly free (`SpellVisualKit`'s own 8,663 ids are 56%
+    /// dense over their range, so almost any small integer lands on one),
+    /// but *type* is not. Of 4,680 non-zero, non-sentinel values in this
+    /// column, 4,653 resolve to a real `SoundEntries` row at all (99.4%),
+    /// and of those, 99.9% are `SoundEntries` type 1 -- `Sound\Spells`,
+    /// `Sound\Creature`. No other column among the table's other eighteen
+    /// non-float, non-empty candidates got anywhere close: the runner-up
+    /// (column 13) had only seven non-zero values to test at all, and the
+    /// rest scattered across four or five sound types with no single one
+    /// past 70%.
+    SpellVisualKit, SpellVisualKitRow, path = r"DBFilesClient\SpellVisualKit.dbc", fields = 38, {
+        0  id: u32,
+        15 sound: u32,
+    }
+}
+
+dbc_table! {
     /// Spell definitions. 234 columns, of which this names the few a client
     /// needs before it implements combat.
     ///
@@ -1211,7 +1237,8 @@ impl_table_info!(
     Spell,
     SpellIcon,
     SkillLineAbility,
-    WorldSafeLocs
+    WorldSafeLocs,
+    SpellVisualKit
 );
 
 /// Marker so the unused-import lint does not fire on the re-exports the macro
