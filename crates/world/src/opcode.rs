@@ -324,6 +324,66 @@ pub enum ClientOpcode {
     /// purchase.
     BuyItem = 0x01A2,
 
+    /// Open a questgiver's list. Body is the NPC's guid, unpacked.
+    ///
+    /// Distinct from [`ClientOpcode::GossipHello`] even though both greet the
+    /// same creature: a questgiver with no gossip menu answers this and not
+    /// that, and an NPC with both answers each differently.
+    QuestgiverHello = 0x0184,
+
+    /// Ask for one quest's offer text -- the scroll a player reads before
+    /// accepting. Body is `{u64 npc guid, u32 quest id, u8}`.
+    ///
+    /// **Note the trailing byte is a `u8` here and a `u32` in
+    /// [`ClientOpcode::QuestgiverAcceptQuest`].** The two requests are
+    /// otherwise identical in shape, which makes the asymmetry exactly the
+    /// kind of detail that gets guessed wrong once and then copied -- and a
+    /// wrong-width trailing field produces silence, not an error.
+    QuestgiverQueryQuest = 0x0186,
+
+    /// Take the quest. Body is `{u64 npc guid, u32 quest id, u32}`.
+    ///
+    /// Confirmed by effect, since nothing acknowledges it directly: the quest
+    /// appears in the player's own quest log fields, which are replicated.
+    QuestgiverAcceptQuest = 0x0189,
+
+    /// Offer a finished quest for hand-in. Body is `{u64 npc guid, u32 quest
+    /// id}` -- no trailing field on this one.
+    QuestgiverCompleteQuest = 0x018A,
+
+    /// Take the reward and finish. Body is `{u64 npc guid, u32 quest id, u32
+    /// reward index}`, where the index chooses among the optional rewards and
+    /// is `0` for a quest that offers none.
+    QuestgiverChooseReward = 0x018E,
+
+    /// Ask what a quest actually is: title, objectives, reward list.
+    ///
+    /// Body is `{u32 quest id}`. **The backbone of the whole quest feature**,
+    /// because `SMSG_GOSSIP_MESSAGE` and the questgiver list carry only a
+    /// title and a level -- everything else has to be asked for, and there is
+    /// no table on disk to read it from.
+    ///
+    /// There is deliberately **no bulk form**: this takes one id, so
+    /// "prefetch everything" would presuppose a list of every quest id, which
+    /// is the database this client is not shipping. Ids arrive naturally from
+    /// the gossip quest block, the questgiver list and the quest log, and the
+    /// answers are cached per realm.
+    QuestQuery = 0x005C,
+
+    /// Ask where a quest's objectives are on the map, for up to 25 quests at
+    /// once. Body is `{u32 count, u32 quest id * count}`.
+    ///
+    /// **This is what makes a native quest tracker possible without shipping
+    /// anyone's database.** WotLK shipped its own tracker, so the server
+    /// already holds the markers and hands them over: per objective a map id,
+    /// an area id and a polygon of points.
+    ///
+    /// **It answers only for quests in the player's own log**, which is the
+    /// constraint that shapes the map work: it completely covers "where do I
+    /// go for the quest I am on" and says nothing about a quest not yet
+    /// accepted.
+    QuestPoiQuery = 0x01E3,
+
     /// Ask the server where this character's body is. Empty request; the
     /// reply shares the opcode.
     ///
@@ -392,6 +452,25 @@ pub mod server {
     /// creature, in order, each pairing an item entry with the display id
     /// `Item.dbc` independently gives it.
     pub const LIST_INVENTORY: u16 = 0x019F;
+
+    /// The quests one NPC is offering, in answer to
+    /// [`QuestgiverHello`](crate::ClientOpcode::QuestgiverHello).
+    pub const QUESTGIVER_QUEST_LIST: u16 = 0x0185;
+    /// One quest's offer text, objectives and rewards -- the scroll shown
+    /// before accepting.
+    pub const QUESTGIVER_QUEST_DETAILS: u16 = 0x0188;
+    /// What a quest still wants before it can be handed in.
+    pub const QUESTGIVER_REQUEST_ITEMS: u16 = 0x018B;
+    /// The reward screen for a quest ready to turn in.
+    pub const QUESTGIVER_OFFER_REWARD: u16 = 0x018D;
+    /// The quest is done. Arrives after the reward is chosen.
+    pub const QUESTGIVER_QUEST_COMPLETE: u16 = 0x0191;
+    /// Everything about one quest, in answer to
+    /// [`QuestQuery`](crate::ClientOpcode::QuestQuery).
+    pub const QUEST_QUERY_RESPONSE: u16 = 0x005D;
+    /// Objective map markers, in answer to
+    /// [`QuestPoiQuery`](crate::ClientOpcode::QuestPoiQuery).
+    pub const QUEST_POI_QUERY_RESPONSE: u16 = 0x01E4;
 
     /// What the sky is doing: a state, an intensity, and whether it changed
     /// abruptly. Sent on entering a zone and whenever the zone's weather turns.
@@ -611,6 +690,13 @@ pub fn describe(opcode: u16) -> String {
         server::LOOT_CLEAR_MONEY => "SMSG_LOOT_CLEAR_MONEY",
         server::GOSSIP_MESSAGE => "SMSG_GOSSIP_MESSAGE",
         server::LIST_INVENTORY => "SMSG_LIST_INVENTORY",
+        server::QUESTGIVER_QUEST_LIST => "SMSG_QUESTGIVER_QUEST_LIST",
+        server::QUESTGIVER_QUEST_DETAILS => "SMSG_QUESTGIVER_QUEST_DETAILS",
+        server::QUESTGIVER_REQUEST_ITEMS => "SMSG_QUESTGIVER_REQUEST_ITEMS",
+        server::QUESTGIVER_OFFER_REWARD => "SMSG_QUESTGIVER_OFFER_REWARD",
+        server::QUESTGIVER_QUEST_COMPLETE => "SMSG_QUESTGIVER_QUEST_COMPLETE",
+        server::QUEST_QUERY_RESPONSE => "SMSG_QUEST_QUERY_RESPONSE",
+        server::QUEST_POI_QUERY_RESPONSE => "SMSG_QUEST_POI_QUERY_RESPONSE",
         server::CHAR_CREATE => "SMSG_CHAR_CREATE",
         server::CHAR_DELETE => "SMSG_CHAR_DELETE",
         server::CHARACTER_LOGIN_FAILED => "SMSG_CHARACTER_LOGIN_FAILED",

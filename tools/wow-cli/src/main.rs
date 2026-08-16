@@ -354,6 +354,35 @@ enum Command {
         /// sale price.
         #[arg(long)]
         sell_back: bool,
+        /// Greet a questgiver by creature entry and dump everything it says.
+        ///
+        /// Separate from `--gossip` because the two greetings are different
+        /// requests: a questgiver with no gossip menu answers this and not
+        /// that. Pair with `--quest-accept <id>` to drive the whole flow --
+        /// ask for the scroll, then take the quest.
+        #[arg(long, num_args = 0..=1, default_missing_value = "0")]
+        quest: Option<u32>,
+        /// Accept this quest id from the NPC `--quest` greeted, and report
+        /// which of our own update fields changed.
+        ///
+        /// **This is a measurement, not just an action.** Where the quest log
+        /// lives in the update fields is not known, and transcribing an index
+        /// from memory is what this project keeps paying for. The quest id is
+        /// an answer we already have, the server is about to store it, and no
+        /// other field has a reason to hold that exact number -- so whichever
+        /// index changes to it is the log. Same technique that found
+        /// `PLAYER_BYTES` and the visible-item block.
+        #[arg(long)]
+        quest_accept: Option<u32>,
+        /// Ask where the objectives of every quest in the log are.
+        ///
+        /// The check the whole native-tracker plan rests on: WotLK shipped its
+        /// own quest tracker, so the server already holds the map markers.
+        /// Answers **only for quests in the player's own log**, so an empty
+        /// log makes this vacuous rather than negative -- which is why the log
+        /// is printed alongside.
+        #[arg(long)]
+        quest_poi: bool,
         /// After entering, find which update field carries the character's
         /// appearance by searching for the answer the character list gives.
         ///
@@ -802,6 +831,9 @@ fn main() -> Result<()> {
             gossip_select,
             buy,
             sell_back,
+            quest,
+            quest_accept,
+            quest_poi,
             target,
             own_fields,
             until_death,
@@ -846,6 +878,9 @@ fn main() -> Result<()> {
                 gossip_select: *gossip_select,
                 buy: *buy,
                 sell_back: *sell_back,
+                quest: *quest,
+                quest_accept: *quest_accept,
+                quest_poi: *quest_poi,
 
                 target: target.as_deref(),
                 own_fields: *own_fields,
@@ -1013,6 +1048,9 @@ struct WorldRequest<'a> {
     gossip_select: Option<u32>,
     buy: Option<u32>,
     sell_back: bool,
+    quest: Option<u32>,
+    quest_accept: Option<u32>,
+    quest_poi: bool,
     target: Option<&'a str>,
     own_fields: bool,
     until_death: bool,
@@ -1105,6 +1143,9 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         gossip_select,
         buy,
         sell_back,
+        quest,
+        quest_accept,
+        quest_poi,
         target,
         own_fields,
         until_death,
@@ -1920,6 +1961,22 @@ cast {spell_id} at {} (attempt {attempt})",
                 buy,
                 sell_back,
             )?;
+        }
+
+        if let Some(entry) = quest {
+            let prefer = (entry != 0).then_some(entry);
+            survey_quests(
+                &mut connection,
+                &mut state,
+                character.guid,
+                &mut here,
+                prefer,
+                quest_accept,
+            )?;
+        }
+
+        if quest_poi {
+            survey_quest_poi(&mut connection, &mut state, character.guid)?;
         }
 
         if unit_fields {
@@ -2878,55 +2935,269 @@ fn survey_loot(
     Ok(())
 }
 
-/// Greets the nearest NPC that will talk, and reports everything that arrives.
+/// Asks the server where the objectives of every quest in the log are.
 ///
-/// **A survey, and deliberately parses nothing.** Nothing in `crates/world`
-/// understands a gossip packet yet, and this is how that stops being true: the
-/// reply is printed as an opcode and its bytes, in full. Printing a length
-/// instead is how this project once saw and lost the one packet that could
-/// have settled `SMSG_ATTACKERSTATEUPDATE`.
-///
-/// **The reason gossip is the right request to attempt first** is that it is
-/// *answered*. Nothing acknowledges an opcode as such, and an outgoing number
-/// that is wrong is read as some other valid request rather than refused -- so
-/// `CMSG_AUTOEQUIP_ITEM` had to be confirmed by watching a field move. A reply
-/// arriving here at all says the number was understood, and a reply that
-/// parses says the layout was right too.
-///
-/// **The whole design of this command is about keeping the silences apart.**
-/// A greeting that produces nothing is equally what a wrong opcode, a unit
-/// with no gossip bit, and a unit out of range look like -- three different
-/// investigations behind one printout, which is the shape that cost `--loot`
-/// three runs. So the target is chosen by [`Entity::will_talk`] rather than by
-/// proximity, its flags are printed before the send, the approach walk is
-/// reported, and a target still out of reach is refused *loudly* instead of
-/// being greeted anyway.
-fn survey_gossip(
+/// **The whole native-quest-tracker plan rests on this working.** WotLK
+/// shipped its own tracker, so the server already holds the map markers and
+/// will hand them over -- which is why this client does not need to ship
+/// anybody's quest database. If it comes back empty, that plan needs
+/// rethinking, so the command is deliberately loud about which of the two
+/// reasons an empty answer has.
+fn survey_quest_poi(
     connection: &mut world::Connection,
     state: &mut world::WorldState,
     own_guid: u64,
-    // Taken by reference and **written back**, unlike `survey_loot`'s copy.
-    // This function walks, and the fact that replicated state holds our login
-    // position forever has now been rediscovered by three separate callers --
-    // so the walked position is threaded through rather than looked up, and
-    // handing the next caller a stale one would just re-arm the same trap.
-    here: &mut world::Position,
-    // Which creature entry to greet, or `None` for whichever talker is
-    // nearest. `.npc add` spawns everything at the caller's feet, so a run
-    // that has put two NPCs down has no meaningful "nearest" -- and comparing
-    // what *different* NPCs answer is the whole method for naming the flag
-    // bits, since nothing else can distinguish them.
-    prefer: Option<u32>,
-    // Which menu option to choose after greeting, by the **server's** option
-    // id as printed in the reply -- not a row number. `None` greets and stops.
-    select: Option<u32>,
-    // Which vendor slot to buy, once a stock list has arrived. Again the
-    // server's own slot and not a row position.
-    buy: Option<u32>,
-    // Whether to sell the thing just bought straight back, which is what makes
-    // the run self-cleaning and tests both directions against one item.
-    sell_back: bool,
 ) -> Result<()> {
+    let log = quest_log_ids(state, own_guid);
+    println!("\nquest log holds {} quest(s): {log:?}", log.len());
+    if log.is_empty() {
+        println!("  nothing to ask about. The POI query answers only for quests");
+        println!("  in the log, so an empty log makes this test vacuous rather");
+        println!("  than negative. Take a quest first, or --say \".quest add 16\".");
+        return Ok(());
+    }
+
+    connection.query_quest_poi(&log)?;
+    let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+    dump_unexpected(&batch, "after CMSG_QUEST_POI_QUERY");
+    state.replicate(&batch, None);
+
+    let Some(reply) = batch
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::QUEST_POI_QUERY_RESPONSE)
+    else {
+        println!("\nno POI response at all. That is a wrong opcode or a wrong body,");
+        println!("*not* an absence of data -- the two look identical here, which is");
+        println!("why the log contents are printed above.");
+        return Ok(());
+    };
+    println!("\nSMSG_QUEST_POI_QUERY_RESPONSE, {} bytes", reply.body.len());
+
+    Ok(())
+}
+
+/// Greets a questgiver, and optionally reads and accepts one of its quests.
+///
+/// **A survey first.** Nothing quest-related is parsed by this client yet, so
+/// every reply is printed as its opcode and its bytes in full -- the moment
+/// this stops dumping bodies is the moment the next unknown shape becomes
+/// invisible.
+///
+/// The flow it drives is the real one a client uses, in order, because each
+/// step's reply is what makes the next legal: greet the NPC, ask for a
+/// specific quest's scroll, accept it. Accepting is confirmed by effect -- the
+/// quest appears in the player's own replicated log -- since nothing
+/// acknowledges the send.
+fn survey_quests(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    here: &mut world::Position,
+    prefer: Option<u32>,
+    accept: Option<u32>,
+) -> Result<()> {
+    let Some(npc) = approach_talker(connection, state, own_guid, here, prefer)? else {
+        return Ok(());
+    };
+
+    connection.set_selection(npc.guid)?;
+    println!(
+        "\ngreeting questgiver {:#018x} entry {} at {:.1} units, npcflag {} ({:#x})",
+        npc.guid, npc.entry, npc.distance, npc.flags, npc.flags
+    );
+    connection.questgiver_hello(npc.guid)?;
+    let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+    state.replicate(&batch, None);
+
+    dump_unexpected(&batch, "after CMSG_QUESTGIVER_HELLO");
+
+    let Some(wanted) = accept else {
+        return Ok(());
+    };
+
+    // Ask for the scroll before accepting, in that order, because that is the
+    // order a real client uses and the server checks the NPC actually offers
+    // the quest at each step. Skipping straight to the accept would work or
+    // not for reasons this survey could not tell apart.
+    println!("\nasking for quest {wanted}'s details");
+    connection.query_quest(npc.guid, wanted)?;
+    let details = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+    state.replicate(&details, None);
+    dump_unexpected(&details, "after CMSG_QUESTGIVER_QUERY_QUEST");
+
+    // **Snapshot every field of our own object, not a quest log we cannot yet
+    // read.**
+    //
+    // Where the quest log lives in the update fields is *not known*, and
+    // transcribing an index from memory is the mistake this project keeps
+    // paying for -- a wrong one parses perfectly and reports somebody else's
+    // number as a quest. So the accept is confirmed the way `PLAYER_BYTES` and
+    // the visible-item block were found: by searching for an answer already
+    // known from somewhere else.
+    //
+    // The quest id is that answer. We chose it, the server is about to store
+    // it, and no other field has any reason to hold it -- so whichever index
+    // changes *to that exact value* is the log, and the search cannot come out
+    // right by luck the way "contains a plausible small integer" can.
+    let before = own_fields_snapshot(state, own_guid);
+    let log_before = quest_log_ids(state, own_guid);
+    println!("\nsnapshotted {} set fields before accepting", before.len());
+    println!("quest log before: {log_before:?}");
+
+    println!("accepting quest {wanted}");
+    connection.accept_quest(npc.guid, wanted)?;
+    let accepted = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+    state.replicate(&accepted, None);
+    dump_unexpected(&accepted, "after CMSG_QUESTGIVER_ACCEPT_QUEST");
+
+    let after = own_fields_snapshot(state, own_guid);
+    let mut changed: Vec<(u16, Option<u32>, u32)> = Vec::new();
+    for (index, value) in &after {
+        if before.get(index) != Some(value) {
+            changed.push((*index, before.get(index).copied(), *value));
+        }
+    }
+    changed.sort_by_key(|(index, _, _)| *index);
+
+    println!("\n{} field(s) of our own object changed:", changed.len());
+    for (index, was, now) in &changed {
+        let note = if *now == wanted {
+            "  <-- the quest id we asked for"
+        } else {
+            ""
+        };
+        println!("  {index:#06x}: {was:?} -> {now}{note}");
+    }
+
+    let log_after = quest_log_ids(state, own_guid);
+    println!("quest log after:  {log_after:?}");
+
+    match changed.iter().find(|(_, _, now)| *now == wanted) {
+        Some((index, _, _)) => {
+            println!("\n-- quest {wanted} landed in field {index:#06x}, which is the");
+            println!("   accept confirmed by a number nothing else had reason to hold.");
+        }
+        None if log_after.contains(&wanted) && !log_before.contains(&wanted) => {
+            println!("\n-- quest {wanted} is in the log now and was not before, so the");
+            println!("   accept took even though this run did not catch the field");
+            println!("   update in its own drain.");
+        }
+        None if log_after.contains(&wanted) => {
+            println!("\n-- quest {wanted} was ALREADY in the log before this ran, so");
+            println!("   nothing here tests the accept. Clear it first:");
+            println!("   --say \".quest remove {wanted}\"");
+        }
+        None if changed.is_empty() => {
+            println!("\n-- nothing changed and the quest is not in the log. That is");
+            println!("   what a wrong opcode looks like, and also what a declined");
+            println!("   quest looks like. The bodies above are what separates them.");
+        }
+        None => {
+            println!("\n-- fields moved, but none of them holds {wanted}, and the log");
+            println!("   does not have it. The accept was probably declined.");
+        }
+    }
+
+    // **A refusal packet here does not mean the accept failed**, and reading it
+    // that way cost a whole investigation. `SMSG_QUESTGIVER_QUEST_INVALID`
+    // (`0x018F`) arrived carrying 13 on every single run -- including runs
+    // where the quest demonstrably *was* accepted, confirmed both by the
+    // server's own database and by the questgiver no longer offering it
+    // afterwards. The accept handler never sends that packet at all; it comes
+    // from a re-evaluation after the quest is already in the log, which is
+    // exactly when "you are already on that quest" is true.
+    //
+    // So it is reported as an observation and explicitly not as a verdict.
+    for packet in &accepted {
+        if packet.opcode != 0x018F || packet.body.len() != 4 {
+            continue;
+        }
+        let reason = u32::from_le_bytes(packet.body[..4].try_into().unwrap());
+        println!("\nnote: 0x018F arrived carrying {reason}. This is NOT a verdict on");
+        println!("      the accept -- it shows up even when the quest was taken.");
+        println!("      Judge the accept by the log above, not by this packet.");
+    }
+
+    Ok(())
+}
+
+/// Every quest id in the player's own log.
+///
+/// The confirmation instrument for accepting, and it reads *ids* rather than
+/// counting entries on purpose: a count going up says something happened,
+/// where the id appearing says the right thing happened.
+fn quest_log_ids(state: &world::WorldState, own_guid: u64) -> Vec<u32> {
+    state
+        .get(own_guid)
+        .map(|player| player.quest_log_ids())
+        .unwrap_or_default()
+}
+
+/// Every field set on our own player object, for diffing one state against
+/// another.
+fn own_fields_snapshot(
+    state: &world::WorldState,
+    own_guid: u64,
+) -> std::collections::BTreeMap<u16, u32> {
+    state
+        .get(own_guid)
+        .map(|player| player.fields.iter().collect())
+        .unwrap_or_default()
+}
+
+/// Prints every packet that is not constant background traffic, body and all.
+///
+/// Shared by the quest steps because each one wants the same thing and a
+/// second copy would drift. Bodies rather than lengths: a packet that is seen
+/// and dropped is the one packet that could have answered the question.
+fn dump_unexpected(batch: &[world::client::Packet], what: &str) {
+    const NOISE: [u16; 6] = [0x00DD, 0x00A9, 0x01F6, 0x0390, 0x0085, 0x0086];
+    println!("\nbodies of everything unexpected {what}:");
+    let mut shown = 0;
+    for packet in batch {
+        if NOISE.contains(&packet.opcode) {
+            continue;
+        }
+        println!(
+            "  {} ({:#06x}), {} bytes",
+            world::opcode::describe(packet.opcode),
+            packet.opcode,
+            packet.body.len()
+        );
+        println!("    {}", hex_preview(&packet.body, 640));
+        shown += 1;
+        if shown >= 16 {
+            println!("  ... stopping after {shown}");
+            break;
+        }
+    }
+    if shown == 0 {
+        println!("  none -- nothing but the usual traffic came back.");
+    }
+}
+
+/// Finds a talker, walks into range, and reports who is actually in front of
+/// you.
+///
+/// **Shared by every NPC survey rather than copied into each.** The approach
+/// loop has already had one real bug -- it walked to *exactly* its interaction
+/// reach and so could never get inside it -- and a second copy would have
+/// re-armed exactly that. Reusing a mechanism is also how this project audits
+/// one: the right-click gesture found a four-milestone-old bug in the left
+/// button's by mirroring it.
+///
+/// Returns `None` having already explained why, so callers stop rather than
+/// send into a situation whose answer they could not interpret.
+fn approach_talker(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    // Written back: this function walks, and replicated state holds our login
+    // position forever. Handing the next caller a stale one re-arms a trap
+    // three separate callers have already hit.
+    here: &mut world::Position,
+    prefer: Option<u32>,
+) -> Result<Option<Talker>> {
     // **Two distances, and collapsing them into one was a real bug.**
     //
     // `INTERACT_RANGE` is how far the server will talk from -- a server-side
@@ -2987,7 +3258,7 @@ fn survey_gossip(
         println!("  what a field of wolves looks like -- it is not a replication");
         println!("  failure. Put one within reach: --say \".npc add 295\" spawns an");
         println!("  Innkeeper Farley, whose npcflag is 66179.");
-        return Ok(());
+        return Ok(None);
     }
 
     // A requested entry that is not there is refused rather than silently
@@ -3000,7 +3271,7 @@ fn survey_gossip(
     }) else {
         println!("\nno replicated talker has entry {:?}.", prefer);
         println!("Spawn one: --say \".npc add {}\"", prefer.unwrap_or(0));
-        return Ok(());
+        return Ok(None);
     };
 
     // Walk to it. The distance is re-measured each time round rather than
@@ -3069,7 +3340,7 @@ fn survey_gossip(
                 println!("despawned, or moved out of visibility. Nothing was sent.");
             }
         }
-        return Ok(());
+        return Ok(None);
     };
 
     // **Re-read the entry and the flags from whoever is actually about to be
@@ -3087,6 +3358,80 @@ fn survey_gossip(
         ),
         None => (0, 0),
     };
+    Ok(Some(Talker {
+        guid: chosen,
+        entry,
+        flags,
+        distance,
+    }))
+}
+
+/// An NPC that will talk, as [`approach_talker`] left it: within range, its
+/// entry and flags re-read *after* the walk rather than captured before it.
+struct Talker {
+    guid: u64,
+    /// `creature_template` entry. Re-read at the end of the approach, because
+    /// the loop may have switched targets -- labelling one NPC's answer with
+    /// another's entry is the single way these surveys could produce a
+    /// confidently wrong finding.
+    entry: u32,
+    flags: u32,
+    distance: f32,
+}
+
+/// Greets the nearest NPC that will talk, and reports everything that arrives.
+///
+/// **A survey, and deliberately parses nothing.** Nothing in `crates/world`
+/// understands a gossip packet yet, and this is how that stops being true: the
+/// reply is printed as an opcode and its bytes, in full. Printing a length
+/// instead is how this project once saw and lost the one packet that could
+/// have settled `SMSG_ATTACKERSTATEUPDATE`.
+///
+/// **The reason gossip is the right request to attempt first** is that it is
+/// *answered*. Nothing acknowledges an opcode as such, and an outgoing number
+/// that is wrong is read as some other valid request rather than refused -- so
+/// `CMSG_AUTOEQUIP_ITEM` had to be confirmed by watching a field move. A reply
+/// arriving here at all says the number was understood, and a reply that
+/// parses says the layout was right too.
+///
+/// **The whole design of this command is about keeping the silences apart.**
+/// A greeting that produces nothing is equally what a wrong opcode, a unit
+/// with no gossip bit, and a unit out of range look like -- three different
+/// investigations behind one printout, which is the shape that cost `--loot`
+/// three runs. So the target is chosen by [`Entity::will_talk`] rather than by
+/// proximity, its flags are printed before the send, the approach walk is
+/// reported, and a target still out of reach is refused *loudly* instead of
+/// being greeted anyway.
+fn survey_gossip(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    // Taken by reference and **written back**, unlike `survey_loot`'s copy.
+    // This function walks, and the fact that replicated state holds our login
+    // position forever has now been rediscovered by three separate callers --
+    // so the walked position is threaded through rather than looked up, and
+    // handing the next caller a stale one would just re-arm the same trap.
+    here: &mut world::Position,
+    // Which creature entry to greet, or `None` for whichever talker is
+    // nearest. `.npc add` spawns everything at the caller's feet, so a run
+    // that has put two NPCs down has no meaningful "nearest" -- and comparing
+    // what *different* NPCs answer is the whole method for naming the flag
+    // bits, since nothing else can distinguish them.
+    prefer: Option<u32>,
+    // Which menu option to choose after greeting, by the **server's** option
+    // id as printed in the reply -- not a row number. `None` greets and stops.
+    select: Option<u32>,
+    // Which vendor slot to buy, once a stock list has arrived. Again the
+    // server's own slot and not a row position.
+    buy: Option<u32>,
+    // Whether to sell the thing just bought straight back, which is what makes
+    // the run self-cleaning and tests both directions against one item.
+    sell_back: bool,
+) -> Result<()> {
+    let Some(npc) = approach_talker(connection, state, own_guid, here, prefer)? else {
+        return Ok(());
+    };
+    let (chosen, entry, flags, distance) = (npc.guid, npc.entry, npc.flags, npc.distance);
 
     // Selected first, for the same reason `--attack` does it: the server
     // decides what a request may act on, and it decides that about the

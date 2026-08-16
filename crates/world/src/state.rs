@@ -234,6 +234,33 @@ impl Entity {
         self.npc_flags().is_some_and(|flags| flags != 0)
     }
 
+    /// Every quest id in this player's log, in slot order.
+    ///
+    /// **The gate for the whole quest feature**: a quest id is what
+    /// `CMSG_QUEST_QUERY` and `CMSG_QUEST_POI_QUERY` are asked in terms of,
+    /// so this is where the ids to ask about come from.
+    ///
+    /// An empty slot reads zero and is skipped rather than reported, because
+    /// zero is not a quest -- and a create block omits zero fields anyway, so
+    /// absent and empty are the same statement here. See
+    /// [`crate::update::fields::PLAYER_QUEST_LOG`] for how the base and stride
+    /// were measured.
+    ///
+    /// Slot order is preserved rather than sorted: it is the order the
+    /// original interface lists a quest log in, and a caller wanting them
+    /// sorted can sort them, where a caller wanting the server's order could
+    /// not recover it.
+    pub fn quest_log_ids(&self) -> Vec<u32> {
+        use crate::update::fields;
+        (0..fields::QUEST_LOG_SLOTS)
+            .filter_map(|slot| {
+                self.fields
+                    .get(fields::PLAYER_QUEST_LOG + slot * fields::QUEST_LOG_STRIDE)
+            })
+            .filter(|id| *id != 0)
+            .collect()
+    }
+
     /// What this unit has targeted, if anything. Zero means nothing, and is
     /// reported as `None` rather than as a guid no object will ever have.
     pub fn target(&self) -> Option<u64> {
@@ -3663,6 +3690,66 @@ mod tests {
             ],
         )]);
         assert!(world.get(7).unwrap().appearance().is_none());
+    }
+
+    /// The quest log reads at the base and stride measured against a live
+    /// realm: four quests we chose ourselves landed at `0x9e`, `0xa3`, `0xa8`
+    /// and `0xad`.
+    ///
+    /// Built from those exact four ids and offsets rather than from round
+    /// numbers, so the constants cannot drift without this failing.
+    #[test]
+    fn the_quest_log_reads_at_the_measured_slots() {
+        use crate::update::fields;
+
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            9,
+            ObjectType::Player,
+            Some(at(0.0, 0.0)),
+            &[
+                (0x9e, 783),
+                (0xa3, 16),
+                (0xa8, 85),
+                (0xad, 106),
+                // The coincidence that was actually present in the live dump:
+                // an unrelated field holding 85. It must not be picked up.
+                (0x184, 85),
+            ],
+        )]);
+
+        let log = world.get(9).unwrap().quest_log_ids();
+        assert_eq!(log, vec![783, 16, 85, 106], "slot order, not sorted");
+        assert_eq!(
+            fields::PLAYER_QUEST_LOG + 3 * fields::QUEST_LOG_STRIDE,
+            0xad,
+            "base and stride must still describe the measured offsets"
+        );
+    }
+
+    /// **The quest log ends exactly where the visible-item block begins**, and
+    /// the two were measured in different milestones by different methods
+    /// against different data.
+    ///
+    /// Neither search assumed it, so it is corroboration rather than
+    /// circularity -- and pinning it means a later edit to any one of the
+    /// three constants has to explain itself.
+    #[test]
+    fn the_quest_log_ends_where_the_visible_item_block_starts() {
+        use crate::update::fields;
+        assert_eq!(
+            fields::PLAYER_QUEST_LOG + fields::QUEST_LOG_SLOTS * fields::QUEST_LOG_STRIDE,
+            fields::PLAYER_VISIBLE_ITEM_ENTRY_HEAD
+        );
+    }
+
+    /// An empty log is empty, not a row of zeroes -- absent and zero are the
+    /// same statement in a sparse field set.
+    #[test]
+    fn a_player_with_no_quests_has_an_empty_log() {
+        let mut world = WorldState::new();
+        world.apply(&[create(10, ObjectType::Player, Some(at(0.0, 0.0)), &[])]);
+        assert!(world.get(10).unwrap().quest_log_ids().is_empty());
     }
 
     /// `visible_item_entries` reads one entry per equipped slot at

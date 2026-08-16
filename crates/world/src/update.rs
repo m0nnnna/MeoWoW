@@ -1038,6 +1038,45 @@ pub mod fields {
     /// facial hair 4.
     pub const PLAYER_BYTES_2: u16 = 0x9A;
 
+    /// The base of the player's own quest log: one entry per quest, at
+    /// `PLAYER_QUEST_LOG + slot * QUEST_LOG_STRIDE`, the first field of each
+    /// entry being the quest id.
+    ///
+    /// **Measured, not transcribed, and the technique is the one that keeps
+    /// working here: search for an answer you already know.** A quest id is
+    /// a number *we* chose -- we asked the server to add it -- and nothing
+    /// else in a player object has any reason to hold that exact value. So
+    /// accepting a quest and asking which field changed *to that id* cannot
+    /// come out right by luck, where "contains a plausible small integer"
+    /// would match dozens of fields.
+    ///
+    /// Quest 783 landed at `0x9e`. Three more were then added -- 16, 85 and
+    /// 106 -- and landed at `0xa3`, `0xa8` and `0xad`: an arithmetic
+    /// progression of stride 5, with four ids we picked. That progression is
+    /// the whole identification, and it had to be, because the same dump held
+    /// a field at `0x184` coincidentally reading 85. One field matching one
+    /// value is nearly free; four matching at a constant stride is not.
+    ///
+    /// **And the block's extent agrees with a neighbour measured separately.**
+    /// The log holds 25 quests, so it spans `0x9e + 25 * 5 = 0x11b` -- which
+    /// is exactly [`PLAYER_VISIBLE_ITEM_ENTRY_HEAD`], identified in a
+    /// different milestone by a different method against different data.
+    /// Two independent measurements meeting flush is corroboration nothing in
+    /// either search assumed.
+    pub const PLAYER_QUEST_LOG: u16 = 0x9E;
+
+    /// How many update fields one quest log entry occupies.
+    ///
+    /// Only the first -- the quest id -- is read by this client. The other
+    /// four carry state, objective counters and a timer, and are deliberately
+    /// **not** named: which is which has not been measured, and a wrong name
+    /// on a counter would misreport progress rather than fail.
+    pub const QUEST_LOG_STRIDE: u16 = 5;
+
+    /// How many quests the log holds. Its product with the stride is what
+    /// makes the block end exactly where the visible-item block starts.
+    pub const QUEST_LOG_SLOTS: u16 = 25;
+
     /// The base of another player's worn-item block: one item **entry** id
     /// per equipped slot, at `PLAYER_VISIBLE_ITEM_ENTRY_HEAD + 2 * slot` for
     /// `slot` in `0..EQUIPPED_COUNT` -- an entry, not a display id, which is

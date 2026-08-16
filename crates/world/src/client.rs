@@ -811,6 +811,83 @@ impl Connection {
         self.send(ClientOpcode::GossipSelectOption, &body)
     }
 
+    /// Opens a questgiver's list of quests.
+    pub fn questgiver_hello(&mut self, npc: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::QuestgiverHello, &npc.to_le_bytes())
+    }
+
+    /// Asks for one quest's offer text -- the scroll shown before accepting.
+    ///
+    /// The trailing byte is a **`u8`** here. Its sibling
+    /// [`Connection::accept_quest`] takes a `u32` in the same position, and
+    /// the two requests are otherwise identically shaped -- so the widths are
+    /// written out once each rather than shared, because a wrong-width
+    /// trailing field produces silence rather than an error.
+    pub fn query_quest(&mut self, npc: u64, quest: u32) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(13);
+        body.extend_from_slice(&npc.to_le_bytes());
+        body.extend_from_slice(&quest.to_le_bytes());
+        body.push(0);
+        self.send(ClientOpcode::QuestgiverQueryQuest, &body)
+    }
+
+    /// Takes a quest. Confirmed by effect: the quest appears in the player's
+    /// own replicated quest log.
+    pub fn accept_quest(&mut self, npc: u64, quest: u32) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&npc.to_le_bytes());
+        body.extend_from_slice(&quest.to_le_bytes());
+        // A `u32` here, not the `u8` `query_quest` sends. See that method.
+        body.extend_from_slice(&0u32.to_le_bytes());
+        self.send(ClientOpcode::QuestgiverAcceptQuest, &body)
+    }
+
+    /// Offers a finished quest for hand-in. No trailing field on this one.
+    pub fn complete_quest(&mut self, npc: u64, quest: u32) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&npc.to_le_bytes());
+        body.extend_from_slice(&quest.to_le_bytes());
+        self.send(ClientOpcode::QuestgiverCompleteQuest, &body)
+    }
+
+    /// Takes the reward and finishes a quest. `reward` chooses among the
+    /// optional rewards and is `0` for a quest offering none.
+    pub fn choose_quest_reward(
+        &mut self,
+        npc: u64,
+        quest: u32,
+        reward: u32,
+    ) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&npc.to_le_bytes());
+        body.extend_from_slice(&quest.to_le_bytes());
+        body.extend_from_slice(&reward.to_le_bytes());
+        self.send(ClientOpcode::QuestgiverChooseReward, &body)
+    }
+
+    /// Asks what a quest actually is. One id per request -- see
+    /// [`ClientOpcode::QuestQuery`] for why there is deliberately no bulk
+    /// form.
+    pub fn query_quest_info(&mut self, quest: u32) -> Result<(), Error> {
+        self.send(ClientOpcode::QuestQuery, &quest.to_le_bytes())
+    }
+
+    /// Asks where a set of quests' objectives are on the map.
+    ///
+    /// **Answers only for quests in the player's own log**, and the server
+    /// refuses outright above 25 ids, so this caps rather than letting the
+    /// caller send a request that will be dropped in silence.
+    pub fn query_quest_poi(&mut self, quests: &[u32]) -> Result<(), Error> {
+        const MAX: usize = 25;
+        let quests = &quests[..quests.len().min(MAX)];
+        let mut body = Vec::with_capacity(4 + quests.len() * 4);
+        body.extend_from_slice(&(quests.len() as u32).to_le_bytes());
+        for quest in quests {
+            body.extend_from_slice(&quest.to_le_bytes());
+        }
+        self.send(ClientOpcode::QuestPoiQuery, &body)
+    }
+
     /// Asks a vendor for its stock list, without going through a gossip menu.
     ///
     /// The guid goes out unpacked. See [`ClientOpcode::ListInventory`].
