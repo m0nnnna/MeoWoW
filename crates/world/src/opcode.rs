@@ -87,6 +87,28 @@ pub enum ClientOpcode {
     /// filled in.
     AutoEquipItem = 0x010A,
 
+    /// Candidate for moving an item between two named slots, neither of
+    /// which the server chooses -- unlike `AutoEquipItem`. **Tried against a
+    /// live realm for `foss-wow#55` and not confirmed; kept only as a
+    /// record of the negative result so a later session does not spend the
+    /// same live tests re-deriving it.**
+    ///
+    /// Sent as `{dst_bag, dst_slot, src_bag, src_slot}` (and the reverse
+    /// field order) from two different characters -- one at 1/136 HP with a
+    /// combat flag possibly still set from an earlier ticket's swing
+    /// probes, one full-health and never in combat -- against real item
+    /// pairs and against a real item paired with a genuinely empty slot.
+    /// Every attempt came back an identical `SMSG_INVENTORY_CHANGE_FAILURE`
+    /// (`0x0112`): same one-byte result code, same source item guid echoed
+    /// back, regardless of which character sent it or what the destination
+    /// held. A real swap handler evaluating an empty destination should not
+    /// behave identically to one evaluating an occupied one, so the
+    /// deterministic, state-independent failure reads as this opcode value
+    /// (or this body shape) not being what the server's swap handler
+    /// listens on, rather than as a legal refusal of the request itself --
+    /// see `foss-wow#55`'s ticket comments for the raw bytes.
+    SwapItemCandidate = 0x010B,
+
     /// Take one slot off the corpse currently open, letting the server choose
     /// where it goes in the bags.
     ///

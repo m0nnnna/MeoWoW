@@ -710,6 +710,25 @@ impl Connection {
         )
     }
 
+    /// Sends [`ClientOpcode::SwapItemCandidate`] with a `{dst_bag, dst_slot,
+    /// src_bag, src_slot}` body -- **tried live and not confirmed**, see the
+    /// opcode's own doc comment for the negative result. Kept only for
+    /// `foss-wow#55`'s `wow-cli --swap` probe and not called from the
+    /// viewer. `255` for a bag means the player's own array, the same
+    /// convention `equip_item` uses.
+    pub fn swap_item_candidate(
+        &mut self,
+        dst_bag: u8,
+        dst_slot: u8,
+        src_bag: u8,
+        src_slot: u8,
+    ) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::SwapItemCandidate,
+            &[dst_bag, dst_slot, src_bag, src_slot],
+        )
+    }
+
     /// Opens the loot on a corpse.
     ///
     /// The guid goes out **unpacked** -- eight plain bytes. Worth stating,

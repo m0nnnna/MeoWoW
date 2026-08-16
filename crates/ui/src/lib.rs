@@ -146,6 +146,31 @@ pub struct HudResponse {
     /// than a guid or a slot -- unlike a loot row there is nothing to choose
     /// between, the whole frame is the one thing it can ask for.
     pub release_clicked: bool,
+    /// A bag-window drag completed: `(picked up from, put down on)`, both as
+    /// *positions in the list this crate was handed* -- see `frames::bags`.
+    /// Never the destination alone, the same reasoning [`Self::take_loot`]
+    /// carries a slot rather than a row: this crate has no idea which (bag,
+    /// slot) pair a row corresponds to, only the caller that built the list
+    /// does.
+    pub move_item: Option<(usize, usize)>,
+    /// A bag slot was right-clicked with nothing held -- the request to
+    /// auto-equip whatever is in it. Same row-position caveat as
+    /// [`Self::move_item`].
+    pub auto_equip: Option<usize>,
+}
+
+/// What the cursor is currently carrying, picked up from either window that
+/// offers something to drag.
+///
+/// One enum rather than the two independent `Option`s it replaces, so a
+/// spell and an item can never both be held at once -- a state nothing here
+/// could draw or make sense of a drop for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Held {
+    Spell(u32),
+    /// A position in the bag-window list the caller was handed, not a real
+    /// `(bag, slot)` pair -- see [`HudResponse::move_item`].
+    Item(usize),
 }
 
 /// The interface, ready to draw.
@@ -170,14 +195,17 @@ pub struct Hud {
     /// answer is the right one for a debug overlay and the wrong one for an
     /// interface that is part of the game.
     occupied: Vec<egui::Rect>,
-    /// The spell picked up out of the spellbook and not yet put down.
+    /// The thing picked up out of the spellbook or the bag window and not yet
+    /// put down.
     ///
     /// Interface state rather than game state, so it lives here rather than
-    /// being handed in each frame: picking a spell up and dropping it on a
+    /// being handed in each frame: picking something up and dropping it on a
     /// slot is entirely a thing that happens to the layout, and the layout is
     /// what this crate owns. The caller never has to know a drag is in
-    /// progress.
-    held: Option<u32>,
+    /// progress. One field rather than two, because a hold is a single mode
+    /// the cursor is in -- a `(spell, item)` pair of options would let both
+    /// be `Some` at once, a state nothing here could make sense of.
+    held: Option<Held>,
     /// The first spell shown in the book, as it is scrolled.
     spellbook_scroll: usize,
 }
@@ -515,7 +543,13 @@ impl Hud {
                 }
                 _ => 0,
             };
-            let held = self.held;
+            // The spellbook only cares whether a *spell* is held, to grey
+            // its own entry out while it is being dragged -- a held bag item
+            // means nothing to it.
+            let held = match self.held {
+                Some(Held::Spell(id)) => Some(id),
+                _ => None,
+            };
 
             let response = egui::Area::new(egui::Id::new(("hud-element", id.key())))
                 // Behind the debug and edit windows, which are ordinary egui
@@ -532,6 +566,7 @@ impl Hud {
                             | Content::Spellbook(_)
                             | Content::Loot(_)
                             | Content::ReleasePrompt(_)
+                            | Content::Bags(_)
                     ) {
                         // The frames you interact with while playing, so they
                         // sense clicks rather than only hover.
@@ -652,10 +687,15 @@ impl Hud {
                                     // spell in the book -- and the held icon
                                     // follows the cursor precisely so that
                                     // state is never invisible.
-                                    Some(spell) => {
+                                    Some(Held::Spell(spell)) => {
                                         self.profile.bars.set(index, slot, Some(spell));
                                         response_out.layout_changed = true;
                                     }
+                                    // An item has nowhere to go on an action
+                                    // bar. Restored rather than dropped, so a
+                                    // stray click on the wrong frame does not
+                                    // silently cancel a drag.
+                                    Some(other @ Held::Item(_)) => self.held = Some(other),
                                     None => response_out.activated = Some((index, slot)),
                                 }
                             }
@@ -734,7 +774,65 @@ impl Hud {
                                 // and it only shows up once the book is long
                                 // enough to scroll.
                                 if let Some(entry) = entries.get(scroll + row) {
-                                    self.held = Some(entry.id);
+                                    self.held = Some(Held::Spell(entry.id));
+                                }
+                            }
+                        }
+                    }
+                }
+                // The same click-to-pick-up, click-to-place gesture as the
+                // spellbook above, on `self.held` rather than a second
+                // mechanism -- see `Held`. `row` is a position in the flat
+                // list this crate was handed, never a real `(bag, slot)`
+                // pair; the caller resolves it, the same way a loot row is
+                // not a loot slot.
+                (false, Content::Bags(slots)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            if let Some(row) = frames::bags::slot_at(
+                                drawn_rect,
+                                slots.len(),
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                match self.held.take() {
+                                    Some(Held::Item(from)) if from != row => {
+                                        response_out.move_item = Some((from, row));
+                                    }
+                                    // Clicked back on the slot it came from,
+                                    // or nothing was there to move: put it
+                                    // down where it started rather than
+                                    // reporting a move to itself.
+                                    Some(Held::Item(_)) => {}
+                                    // A spell has nowhere to go in a bag
+                                    // window. Restored rather than dropped,
+                                    // the same reasoning the action bar's
+                                    // arm above uses.
+                                    Some(other @ Held::Spell(_)) => self.held = Some(other),
+                                    None => {
+                                        if slots.get(row).is_some_and(|s| s.item.is_some()) {
+                                            self.held = Some(Held::Item(row));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Right-click auto-equips instead of picking up, and only
+                    // with nothing already held -- a right-click mid-drag has
+                    // no obvious meaning and this does not invent one.
+                    if response.secondary_clicked() && self.held.is_none() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            if let Some(row) = frames::bags::slot_at(
+                                drawn_rect,
+                                slots.len(),
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                if slots.get(row).is_some_and(|s| s.item.is_some()) {
+                                    response_out.auto_equip = Some(row);
                                 }
                             }
                         }
@@ -759,19 +857,19 @@ impl Hud {
             }
         }
 
-        // The spell being carried, drawn against the cursor.
+        // The thing being carried, drawn against the cursor.
         //
-        // **A hold does not outlive the book.** The indicator is drawn from
-        // the book's own entry, so a hold that survived the book closing would
-        // be a mode with nothing on screen to show it -- and a click that
-        // silently means "put" instead of "cast" is exactly the surprise this
-        // interface should not have. Closing the book therefore puts the spell
-        // back, as do Escape and a right-click anywhere.
-        match (self.held, data.spellbook) {
-            (Some(spell), Some(entries)) => {
-                let dropped = ctx.input(|i| {
-                    i.key_pressed(egui::Key::Escape) || i.pointer.secondary_clicked()
-                });
+        // **A hold does not outlive the window it came from.** The indicator
+        // is drawn from that window's own current data, so a hold that
+        // survived the window closing would be a mode with nothing on screen
+        // to show it -- and a click that silently means "put" instead of
+        // "cast" (or "move" instead of "auto-equip") is exactly the surprise
+        // this interface should not have. Closing the window therefore puts
+        // the thing back, as do Escape and a right-click anywhere.
+        let dropped =
+            ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.secondary_clicked());
+        match (self.held, data.spellbook, data.bags) {
+            (Some(Held::Spell(spell)), Some(entries), _) => {
                 match entries.iter().find(|entry| entry.id == spell) {
                     Some(entry) if !dropped => {
                         if let Some(pointer) = ctx.input(|i| i.pointer.hover_pos()) {
@@ -792,8 +890,31 @@ impl Hud {
                     _ => self.held = None,
                 }
             }
-            (Some(_), None) => self.held = None,
-            _ => {}
+            (Some(Held::Spell(_)), None, _) => self.held = None,
+            (Some(Held::Item(row)), _, Some(slots)) => {
+                match slots.get(row).and_then(|s| s.item.as_ref()) {
+                    Some(item) if !dropped => {
+                        if let Some(pointer) = ctx.input(|i| i.pointer.hover_pos()) {
+                            let painter = ctx.layer_painter(egui::LayerId::new(
+                                egui::Order::Tooltip,
+                                egui::Id::new("hud-held-item"),
+                            ));
+                            frames::bags::draw_held(
+                                &painter,
+                                pointer,
+                                item,
+                                &style,
+                                self.profile.get(ElementId::Bags).scale,
+                            );
+                        }
+                    }
+                    // Dropped, or the slot no longer holds what it did --
+                    // the server answered while it was held, say.
+                    _ => self.held = None,
+                }
+            }
+            (Some(Held::Item(_)), _, None) => self.held = None,
+            (None, ..) => {}
         }
 
         if editing {
@@ -1401,6 +1522,14 @@ mod tests {
             .collect()
     }
 
+    fn bag_slot_positions(profile: &Profile, count: usize) -> Vec<egui::Pos2> {
+        let element = profile.get(ElementId::Bags);
+        let rect = element.rect(screen(), frames::bags::size(count, &profile.style, element.scale));
+        frames::bags::slot_rects(rect, count, &profile.style, element.scale)
+            .map(|slot| slot.center())
+            .collect()
+    }
+
     fn book(count: usize) -> Vec<SpellbookEntry> {
         (0..count)
             .map(|i| SpellbookEntry {
@@ -1690,6 +1819,95 @@ mod tests {
         );
     }
 
+    fn bag_slots(items: &[(u32, &str, u32)]) -> Vec<frames::BagSlot> {
+        let mut slots = vec![frames::BagSlot::default(); 16];
+        for (index, (entry, name, count)) in items.iter().enumerate() {
+            slots[index] = frames::BagSlot {
+                item: Some(frames::BagItem {
+                    entry: *entry,
+                    name: name.to_string(),
+                    count: *count,
+                    icon: None,
+                }),
+            };
+        }
+        slots
+    }
+
+    /// The same gesture as the spellbook's, on `self.held` rather than a
+    /// second mechanism -- and the same row-is-not-a-slot caveat as loot:
+    /// this reports *positions in the list it was handed*, never a real
+    /// `(bag, slot)` pair, because this crate has no idea what those are.
+    #[test]
+    fn clicking_two_bag_slots_reports_a_move() {
+        let slots = bag_slots(&[(2589, "Linen Cloth", 3), (159, "Refreshing Spring Water", 5)]);
+        let data = HudData {
+            bags: Some(&slots),
+            ..Default::default()
+        };
+        let profile = Profile::default();
+        let positions = bag_slot_positions(&profile, slots.len());
+
+        let mut hud = Hud::default();
+        let mut script = click_script(positions[0], egui::PointerButton::Primary);
+        script.extend(click_script(positions[5], egui::PointerButton::Primary));
+        let response = drive(&mut hud, &data, &script);
+
+        assert_eq!(
+            response.move_item,
+            Some((0, 5)),
+            "picking up row 0 and clicking row 5 must report exactly that move"
+        );
+        assert_eq!(hud.held, None, "the hold must end once the move is reported");
+    }
+
+    /// Clicking the same slot twice puts the item back where it was, rather
+    /// than reporting a move onto itself -- which the caller would have no
+    /// sensible way to act on.
+    #[test]
+    fn clicking_the_same_bag_slot_twice_cancels_the_hold() {
+        let slots = bag_slots(&[(2589, "Linen Cloth", 3)]);
+        let data = HudData {
+            bags: Some(&slots),
+            ..Default::default()
+        };
+        let profile = Profile::default();
+        let positions = bag_slot_positions(&profile, slots.len());
+
+        let mut hud = Hud::default();
+        let mut script = click_script(positions[0], egui::PointerButton::Primary);
+        script.extend(click_script(positions[0], egui::PointerButton::Primary));
+        let response = drive(&mut hud, &data, &script);
+
+        assert_eq!(response.move_item, None);
+        assert_eq!(hud.held, None);
+    }
+
+    /// A right-click with nothing held asks to auto-equip, and does not also
+    /// pick the item up -- the two gestures answer different questions and a
+    /// right-click starting a hold would leave the next left-click meaning
+    /// something the user never asked for.
+    #[test]
+    fn right_clicking_a_bag_slot_reports_auto_equip() {
+        let slots = bag_slots(&[(2589, "Linen Cloth", 3)]);
+        let data = HudData {
+            bags: Some(&slots),
+            ..Default::default()
+        };
+        let profile = Profile::default();
+        let positions = bag_slot_positions(&profile, slots.len());
+
+        let mut hud = Hud::default();
+        let response = drive(
+            &mut hud,
+            &data,
+            &click_script(positions[0], egui::PointerButton::Secondary),
+        );
+
+        assert_eq!(response.auto_equip, Some(0));
+        assert_eq!(hud.held, None, "a right-click must not also start a hold");
+    }
+
     /// A slot with nothing held is still a cast, which is the behaviour that
     /// existed before assignment did and must not have been broken by it.
     #[test]
@@ -1784,7 +2002,11 @@ mod tests {
             },
             &click_script(rows[0], egui::PointerButton::Primary),
         );
-        assert_eq!(hud.held, Some(entries[0].id), "the click picked nothing up");
+        assert_eq!(
+            hud.held,
+            Some(Held::Spell(entries[0].id)),
+            "the click picked nothing up"
+        );
 
         // One frame with the book closed.
         drive(&mut hud, &HudData::default(), &[vec![]]);

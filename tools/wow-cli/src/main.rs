@@ -270,6 +270,17 @@ enum Command {
         /// in, which is how the slot vocabulary is filled in without guessing.
         #[arg(long)]
         equip: Vec<u16>,
+        /// Swap two of the player's own slots and report what moved --
+        /// `<from>:<to>`, e.g. `--swap 25:26`.
+        ///
+        /// **An experimental probe, not a confirmed feature.** Sends
+        /// `ClientOpcode::SwapItemCandidate` (`0x010B`), which `foss-wow#55`
+        /// has not yet confirmed against a live realm, and diffs the slot
+        /// array the same way `--equip` does. If nothing moves, prints every
+        /// opcode that arrived so a wrong guess and a refusal are not
+        /// mistaken for each other.
+        #[arg(long)]
+        swap: Option<String>,
         /// Open the loot on the nearest dead unit and print every byte that
         /// comes back.
         ///
@@ -738,6 +749,7 @@ fn main() -> Result<()> {
             unit_fields,
             items,
             equip,
+            swap,
             loot,
             gossip,
             target,
@@ -777,6 +789,7 @@ fn main() -> Result<()> {
                 unit_fields: *unit_fields,
                 items: *items,
                 equip,
+                swap: swap.as_deref(),
                 loot: *loot,
                 gossip: *gossip,
 
@@ -938,6 +951,7 @@ struct WorldRequest<'a> {
     unit_fields: bool,
     items: bool,
     equip: &'a [u16],
+    swap: Option<&'a str>,
     loot: bool,
     gossip: Option<u32>,
     target: Option<&'a str>,
@@ -1021,6 +1035,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         unit_fields,
         items,
         equip,
+        swap,
         loot,
         gossip,
         target,
@@ -1811,6 +1826,10 @@ cast {spell_id} at {} (attempt {attempt})",
 
         for slot in equip {
             equip_and_report(&mut connection, &mut state, character.guid, *slot)?;
+        }
+
+        if let Some(pair) = swap {
+            swap_and_report(&mut connection, &mut state, character.guid, pair)?;
         }
 
         if loot {
@@ -3101,6 +3120,104 @@ fn equip_and_report(
         println!("\n{moving:#018x} now sits at equipment slot {index}");
         println!("-- that is what this item's inventory type equips to");
     }
+
+    Ok(())
+}
+
+/// Sends the unconfirmed `SwapItemCandidate` between two of the player's own
+/// slots and reports what moved -- the same diff `equip_and_report` uses,
+/// copied rather than shared because this one is testing the *opcode itself*
+/// and has no business looking confirmed until it is.
+fn swap_and_report(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    pair: &str,
+) -> Result<()> {
+    use world::inventory::{self, InventorySlot};
+
+    let Some((a, b)) = pair.split_once(':') else {
+        anyhow::bail!("--swap wants <from>:<to>, e.g. 25:26");
+    };
+    let (a, b): (u16, u16) = (a.parse()?, b.parse()?);
+    let (Some(from), Some(to)) = (InventorySlot::new(a), InventorySlot::new(b)) else {
+        anyhow::bail!("slot past the end of the array ({} slots)", inventory::SLOT_COUNT);
+    };
+
+    let before: std::collections::BTreeMap<u16, u64> = inventory::held(state, own_guid)
+        .into_iter()
+        .map(|item| (item.slot.index(), item.guid))
+        .collect();
+    println!(
+        "\nswapping slot {a} ({:?}) and slot {b} ({:?})",
+        before.get(&a).map(|g| format!("{g:#018x}")),
+        before.get(&b).map(|g| format!("{g:#018x}")),
+    );
+    if !before.contains_key(&a) && !before.contains_key(&b) {
+        println!("both slots are empty; a run against two empty slots cannot tell");
+        println!("a working opcode from a broken one");
+        return Ok(());
+    }
+
+    connection.swap_item_candidate(
+        inventory::OWN_SLOT_ARRAY,
+        from.index() as u8,
+        inventory::OWN_SLOT_ARRAY,
+        to.index() as u8,
+    )?;
+
+    let batch = connection.drain(std::time::Duration::from_millis(1200), 128)?;
+    state.replicate(&batch, None);
+
+    let after: std::collections::BTreeMap<u16, u64> = inventory::held(state, own_guid)
+        .into_iter()
+        .map(|item| (item.slot.index(), item.guid))
+        .collect();
+
+    let mut moved = Vec::new();
+    for index in 0..inventory::SLOT_COUNT {
+        let (was, now) = (before.get(&index), after.get(&index));
+        if was != now {
+            moved.push((index, was.copied(), now.copied()));
+        }
+    }
+
+    if moved.is_empty() {
+        println!("\nnothing moved. What arrived (body in full, not just its length):");
+        for packet in &batch {
+            let hex: Vec<String> = packet.body.iter().map(|b| format!("{b:02x}")).collect();
+            println!(
+                "    {:<34} {:>3} bytes: {}",
+                world::opcode::describe(packet.opcode),
+                packet.body.len(),
+                hex.join(" ")
+            );
+        }
+        if batch.is_empty() {
+            println!("    nothing at all");
+        }
+        return Ok(());
+    }
+
+    println!("\n{} slot(s) changed:", moved.len());
+    for (index, was, now) in &moved {
+        let describe = |guid: &Option<u64>| match guid {
+            Some(guid) => format!("{guid:#018x}"),
+            None => "empty".into(),
+        };
+        println!("  slot {index:>2}: {} -> {}", describe(was), describe(now));
+    }
+    let swapped = moved.len() == 2
+        && moved.iter().any(|(i, _, now)| *i == a && *now == before.get(&b).copied())
+        && moved.iter().any(|(i, _, now)| *i == b && *now == before.get(&a).copied());
+    println!(
+        "\n{}",
+        if swapped {
+            "-- both guids landed at each other's slot: a real swap."
+        } else {
+            "-- something moved, but not the two-way swap this was testing for."
+        }
+    );
 
     Ok(())
 }

@@ -4114,6 +4114,26 @@ impl App {
         }
     }
 
+    /// Sends `CMSG_AUTOEQUIP_ITEM` for an item at a known location.
+    ///
+    /// Only `Where::Own` is sent: `Connection::equip_item` was confirmed by
+    /// effect against an item in the player's own 39-slot array, and nothing
+    /// here has confirmed the body a bag-nested source wants -- `foss-wow#55`
+    /// left that unconfirmed rather than guess it, the same call made for the
+    /// swap opcode. `at` being `None` covers both "nothing was there" and "the
+    /// square was outside the backpack and `bags_where` never got that far".
+    fn auto_equip(&mut self, at: Option<::world::inventory::Where>) {
+        let Some(::world::inventory::Where::Own(slot)) = at else {
+            return;
+        };
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.equip_item(slot) {
+            tracing::warn!("could not auto-equip: {e:#}");
+        }
+    }
+
     /// Closes the corpse, which is what unlocks it for anyone else.
     ///
     /// Sent on closing the window rather than left to the server: a corpse
@@ -4731,10 +4751,16 @@ impl App {
         // The bags themselves (worn in slots 19-22) are not drawn as squares.
         // A bag is a container rather than a thing you carry, and drawing it
         // beside its own contents would show the same six items twice.
+        // A parallel array to `bags`, naming where each square's item actually
+        // lives on the server. `HudResponse::auto_equip` hands back a square
+        // index into that same list -- see its doc comment -- and this is what
+        // turns the index back into a `Where` the connection can act on.
+        let mut bags_where: Vec<Option<::world::inventory::Where>> = Vec::new();
         let bags: Vec<ui::frames::BagSlot> = if self.bags_open {
             use ::world::inventory::{self as inv, Where};
 
             let mut slots = vec![ui::frames::BagSlot::default(); inv::BACKPACK_COUNT as usize];
+            bags_where = vec![None; inv::BACKPACK_COUNT as usize];
             if let Some(live) = self.live.as_ref() {
                 // Where each equipped bag's run of squares begins, in bag-slot
                 // order. Built before the fill so a bag's contents can be
@@ -4745,6 +4771,7 @@ impl App {
                     let Some(capacity) = bag.capacity else { continue };
                     base.insert(bag.slot.index(), slots.len());
                     slots.resize(slots.len() + capacity as usize, ui::frames::BagSlot::default());
+                    bags_where.resize(bags_where.len() + capacity as usize, None);
                 }
 
                 for carried in inv::carried(&live.state, live.guid) {
@@ -4775,6 +4802,7 @@ impl App {
                             icon: icon.flatten(),
                         }),
                     };
+                    bags_where[index] = Some(carried.at);
                 }
             }
             slots
@@ -5024,6 +5052,13 @@ impl App {
         // it was on screen -- see `ui::frames::loot`.
         if let Some(take) = hud_response.take_loot {
             self.take_loot(take);
+        }
+
+        // A right-clicked bag square auto-equips whatever is there. `index`
+        // is a square position, not a slot -- resolved back through
+        // `bags_where`, built alongside `bags` a moment ago.
+        if let Some(index) = hud_response.auto_equip {
+            self.auto_equip(bags_where.get(index).copied().flatten());
         }
 
         // A clicked release prompt releases the spirit. See

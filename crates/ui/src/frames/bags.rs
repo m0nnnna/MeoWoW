@@ -252,6 +252,45 @@ pub fn draw(
     );
 }
 
+/// Draws the held item against the cursor.
+///
+/// The same gesture as [`super::spellbook::draw_held`], and deliberately not
+/// a second design: picking a thing up and putting it down is one motion
+/// whether the thing is a spell or an item, and an indicator anywhere but the
+/// cursor would make the second half feel like it might not have registered.
+pub fn draw_held(painter: &Painter, at: Pos2, item: &BagItem, style: &Style, scale: f32) {
+    let side = style.slot_size * scale * 0.75;
+    let bounds = Rect::from_min_size(at + Vec2::splat(4.0 * scale), Vec2::splat(side));
+    let corner = corner_radius(style.corner * scale * 0.5);
+    painter.rect_filled(bounds, corner, style.slot_background);
+    match item.icon {
+        Some(icon) => {
+            painter.image(
+                icon,
+                bounds,
+                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        None => {
+            let painter = painter.with_clip_rect(bounds);
+            painter.text(
+                bounds.center(),
+                Align2::CENTER_CENTER,
+                super::action_bar::abbreviate(&item.name),
+                FontId::proportional(style.font_size * scale * 0.85),
+                style.text.into(),
+            );
+        }
+    }
+    painter.rect_stroke(
+        bounds,
+        corner,
+        Stroke::new(style.border_width * scale, style.spellbook_selected),
+        StrokeKind::Outside,
+    );
+}
+
 fn corner_radius(radius: f32) -> egui::CornerRadius {
     egui::CornerRadius::same(radius.round().clamp(0.0, 255.0) as u8)
 }
