@@ -383,6 +383,14 @@ enum Command {
         /// is printed alongside.
         #[arg(long)]
         quest_poi: bool,
+        /// Ask what a quest actually is: title, objectives, rewards.
+        ///
+        /// **The backbone of the whole quest feature.** Unlike the details a
+        /// questgiver shows, this works for *any* quest id and needs no NPC --
+        /// which is what a tracker and a map need, since they have to describe
+        /// quests the player is not standing in front of. Repeatable.
+        #[arg(long)]
+        quest_info: Vec<u32>,
         /// After entering, find which update field carries the character's
         /// appearance by searching for the answer the character list gives.
         ///
@@ -834,6 +842,7 @@ fn main() -> Result<()> {
             quest,
             quest_accept,
             quest_poi,
+            quest_info,
             target,
             own_fields,
             until_death,
@@ -881,6 +890,7 @@ fn main() -> Result<()> {
                 quest: *quest,
                 quest_accept: *quest_accept,
                 quest_poi: *quest_poi,
+                quest_info,
 
                 target: target.as_deref(),
                 own_fields: *own_fields,
@@ -1051,6 +1061,7 @@ struct WorldRequest<'a> {
     quest: Option<u32>,
     quest_accept: Option<u32>,
     quest_poi: bool,
+    quest_info: &'a [u32],
     target: Option<&'a str>,
     own_fields: bool,
     until_death: bool,
@@ -1146,6 +1157,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         quest,
         quest_accept,
         quest_poi,
+        quest_info,
         target,
         own_fields,
         until_death,
@@ -1977,6 +1989,10 @@ cast {spell_id} at {} (attempt {attempt})",
 
         if quest_poi {
             survey_quest_poi(&mut connection, &mut state, character.guid)?;
+        }
+
+        for quest in quest_info {
+            survey_quest_info(&mut connection, *quest)?;
         }
 
         if unit_fields {
@@ -2932,6 +2948,37 @@ fn survey_loot(
     }
 
     state.replicate(&batch, None);
+    Ok(())
+}
+
+/// Asks what one quest is, and dumps the answer.
+///
+/// **Needs no NPC and no quest log**, which is the whole point: a tracker has
+/// to describe quests the player is not standing in front of, and a map has to
+/// label a pin for a quest that has not been taken. This is the request that
+/// makes both possible without shipping a database.
+fn survey_quest_info(connection: &mut world::Connection, quest: u32) -> Result<()> {
+    println!("
+asking what quest {quest} is");
+    connection.query_quest_info(quest)?;
+    let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+    dump_unexpected(&batch, &format!("after CMSG_QUEST_QUERY for {quest}"));
+
+    match batch
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::QUEST_QUERY_RESPONSE)
+    {
+        Some(reply) => println!(
+            "
+SMSG_QUEST_QUERY_RESPONSE for {quest}, {} bytes",
+            reply.body.len()
+        ),
+        None => {
+            println!("
+no answer. A quest query needs no NPC and no log entry, so");
+            println!("a silence here is about the opcode or the body and nothing else.");
+        }
+    }
     Ok(())
 }
 
