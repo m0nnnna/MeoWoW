@@ -3601,6 +3601,84 @@ judgement gets made per feature with the wire tried first. It may turn out that
 streams covers more of it than expected; that is a question for 4.17, not an
 assumption to make now.
 
+### Where quest data actually comes from, measured
+
+The decision above raised a fair question: we run the realm, so we can read
+every quest table in MySQL — should the client just pull the lot at launch and
+top up whatever is missing?
+
+**Two things have to be separated first, and conflating them is the trap.**
+Reading `acore_world` over MySQL is a *development* capability. It works
+because we happen to own this realm. A player connecting to somebody else's
+server has no database access at all, so **anything built on DB reads works
+only for realm operators** — which defeats the point of not shipping a
+database. The DB stays what it has been all through 4.15: a verification
+oracle, the independent answer a wire reading gets checked against. It is not a
+data source for the client.
+
+That leaves the protocol, and it covers more than expected.
+
+#### What the wire will answer
+
+| feature | opcode | coverage |
+|---|---|---|
+| a quest's text and objectives | `CMSG_QUEST_QUERY` `0x05C` | all |
+| what is in the quest log | update fields | all |
+| **map markers for objectives** | `CMSG_QUEST_POI_QUERY` `0x1E3` | **8,953 of 9,464 quests (94.6%)** |
+| `!` / `?` over nearby NPCs | `CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY` `0x417` | NPCs in range |
+
+**The POI query is the find of this investigation.** WotLK shipped its own quest
+tracker, so the server already stores the map markers — 18,771 POI areas and
+57,162 points on this realm — and hands them over on request: per objective, a
+map id, an area id and a polygon of points. That is precisely the thing Questie
+exists to draw, available over the wire, always matching the realm being played
+on.
+
+**Its one constraint shapes the design.** The handler only answers for quests
+*in the player's log* (`GetQuestSlotQuestId(questSlot) == questId`), and takes
+at most 25 ids per request. So POI covers "where do I go for the quest I am
+on" completely, and says nothing about a quest not yet accepted.
+
+#### What the wire will not answer
+
+Where things *are* when you have not seen them: the questgiver you have not met,
+the mobs for a quest you have not taken. The server streams creatures in
+visibility range and nothing more. This realm's `creature` table holds 149,996
+spawns and `gameobject` 96,628 — none of it reachable by a client.
+
+**Answer it by observation, not by import.** This client already replicates
+every creature in range with its entry and position, and already throws that
+away. Recording it — keyed by realm — builds a spawn cache that is correct for
+the server actually being played on, custom content included, needs no licence,
+and cannot go stale. It starts empty and fills as the player explores, which is
+the honest version of "launch empty and pull from the server".
+
+#### So: no bulk prefetch at launch
+
+The instinct is right and the mechanism is not. There is **no enumerate-all
+opcode** — `CMSG_QUEST_QUERY` takes an id, so "fetch everything" presupposes a
+list of every quest id, which is the database being avoided. POI is capped at 25
+per request and log-only besides.
+
+And a mass query at login is a mistake this project has already paid for once:
+the login burst that took **thirty-seven seconds** because a drain loop had a
+packet bound and no clock. Thousands of queries fired at a realm that punishes
+eager pinging harder than no pinging is the same shape.
+
+**Demand-driven, cached, persistent.** Ask when an id is first seen — from the
+gossip quest block, a questgiver list, the quest log. Write the answer to a
+per-realm cache. Later launches warm instantly and only genuinely new ids cost a
+round trip, which is exactly "check if there are any missing entries" without
+ever needing the bulk half. A missing answer must cache as **unknown**, never as
+*nothing*: an absent reply rendering as "no objectives" is the absent-versus-
+default trap that `PLAYER_BYTES` and the loot short form have each cost this
+project once already.
+
+Seeding that cache from a realm's own database, or from a public source, stays
+possible as an **optional developer command** — never a dependency, never
+committed, and marked as unverified wherever it is displayed, because a number
+nobody can check is worse than a blank.
+
 See `docs/REUSE-POLICY.md`'s addon section: reference copies live in the
 gitignored `addons-to-port/`, are read rather than vendored, and each one's
 licence gets checked and recorded before any port begins rather than during.

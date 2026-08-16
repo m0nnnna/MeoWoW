@@ -47,10 +47,25 @@ Questie's database is not ported** — so quests are never out of date, and are
 correct on a private realm with custom content, which is what this client is
 developed against. 4.19 is therefore a *presentation* milestone — pins, tracker,
 availability colouring — with facts off the wire wherever the wire will answer.
-The cost lands on **4.16**, which must build the query layer (`CMSG_QUEST_QUERY`,
-the questgiver-status queries, and a cache that treats a missing answer as
-*unknown* rather than as *nothing*) because the map has nothing to draw without
-it. Doing only what a quest log needs there means writing it twice. Reference addons live in the **gitignored `addons-to-port/`**, are read
+The cost lands on **4.16**, which must build the query layer (`CMSG_QUEST_QUERY`
+`0x05C`, the questgiver-status queries, and a cache that treats a missing answer
+as *unknown* rather than as *nothing*) because the map has nothing to draw
+without it. Doing only what a quest log needs there means writing it twice.
+
+**`CMSG_QUEST_POI_QUERY` `0x1E3` is the find that makes this work.** WotLK
+shipped its own quest tracker, so the server already holds the objective map
+markers — **8,953 of 9,464 quests (94.6%)** on this realm — and hands over a map
+id, an area id and a polygon of points per objective. That is the thing Questie
+exists to draw, on the wire, always matching the realm played on. Its constraint
+shapes the design: it answers only for quests **in the player's log**, 25 ids per
+request. **Reading the realm's MySQL is a verification oracle, not a client
+capability** — a player on someone else's server has no DB access, so anything
+built on it works only for realm operators. What the wire genuinely cannot
+answer is where things are before you have seen them; that is solved by
+*recording what the client already streams* (every creature in range, with entry
+and position), keyed by realm, which starts empty and fills as you explore. There
+is **no enumerate-all opcode**, so no bulk prefetch at launch — and a mass query
+at login would repeat the 37-second burst. See `docs/ROADMAP.md`. Reference addons live in the **gitignored `addons-to-port/`**, are read
 rather than vendored, and each one's licence is checked and recorded *before* a
 port starts; see `docs/REUSE-POLICY.md`'s addon section.
 
