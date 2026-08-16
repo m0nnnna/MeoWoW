@@ -263,6 +263,67 @@ pub enum ClientOpcode {
     /// understood selection would have caused.
     GossipSelectOption = 0x017C,
 
+    /// Ask a vendor what it is selling, without going through a gossip menu.
+    ///
+    /// Body is the vendor's guid, unpacked. The reply is
+    /// [`LIST_INVENTORY`](server::LIST_INVENTORY), the same packet a gossip
+    /// option produces -- which is what makes this cheap to confirm: the
+    /// answer's layout is already established, so a reply that parses says
+    /// the request was understood.
+    ///
+    /// Worth having separately from the gossip route because a vendor with no
+    /// gossip menu at all still sells, and because a client re-opening a shop
+    /// window should not have to re-walk a conversation.
+    ListInventory = 0x019E,
+
+    /// Sell one item to the open vendor.
+    ///
+    /// Body is `{u64 vendor guid, u64 item guid, u32 count}` -- twenty bytes,
+    /// with `0` for the count meaning "the whole stack". The count is a `u32`
+    /// and not the `u8` a stack size would suggest, which is the sort of
+    /// detail that produces silence rather than an error when guessed.
+    ///
+    /// **Confirmed by effect**, since nothing acknowledges it: the item's guid
+    /// leaves the player's slot array and `PLAYER_FIELD_COINAGE` goes *up* by
+    /// the sell price. Both halves are already read, and both moving together
+    /// is a result that could have failed to appear.
+    ///
+    /// The item is named by **guid**, not by slot. That is the safer of the
+    /// two and worth stating: a guid cannot be stale in the way a slot index
+    /// can, so a sell request that races an inventory change refuses rather
+    /// than selling whatever has moved into that slot.
+    SellItem = 0x01A0,
+
+    /// Buy one stack from the open vendor.
+    ///
+    /// Body is `{u64 vendor guid, u32 item entry, u32 vendor slot, u32 count,
+    /// u8}` -- **twenty-one bytes, entry before slot**. The **vendor slot** is
+    /// the server's own index from [`VendorItem::slot`](crate::VendorItem) and
+    /// not a row position -- the same rule as a loot slot and a gossip option
+    /// index -- and it travels alongside the entry so the server can check the
+    /// two agree.
+    ///
+    /// **The first attempt guessed this and got total silence**, which is the
+    /// least informative failure available: three bytes short, the two `u32`s
+    /// transposed, and the count sent as a `u8`. What bounded the search was
+    /// sending [`ClientOpcode::ListInventory`] first -- an *answered* opcode
+    /// four below this one in the same block. It came back with 393 bytes of
+    /// stock, which said the numbering was right and moved the whole question
+    /// onto the body. One cheap answered request to bound a silent one is the
+    /// same move that turned three failed attempts at chat into a one-run
+    /// answer.
+    ///
+    /// The trailing byte is a bag slot and is left unnamed here: only `255`
+    /// (the player's own array) has been sent.
+    ///
+    /// Confirmed by effect the same way the sell is: the item appears in the
+    /// player's slot array and `PLAYER_FIELD_COINAGE` goes *down* by the
+    /// price the stock list quoted -- the **discounted** price, which is what
+    /// makes the coinage delta a check on
+    /// [`crate::vendor`]'s reading of that field rather than just on the
+    /// purchase.
+    BuyItem = 0x01A2,
+
     /// Ask the server where this character's body is. Empty request; the
     /// reply shares the opcode.
     ///

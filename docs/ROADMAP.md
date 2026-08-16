@@ -3468,12 +3468,50 @@ for. Walking past the line rather than up to it. Collapsing a limit and a
 target into one constant is the same mistake as a smoothing constant that is a
 maximum speed -- it looks right until the input sits exactly on it.
 
+#### Buying and selling, and a silence that had to be bounded
+
+`CMSG_BUY_ITEM` (`0x01A2`) is `{u64 vendor, u32 item entry, u32 vendor slot,
+u32 count, u8 bag}` -- twenty-one bytes. `CMSG_SELL_ITEM` (`0x01A0`) is
+`{u64 vendor, u64 item guid, u32 count}`, naming the item by **guid** rather
+than by slot so a request that races an inventory change refuses instead of
+selling whatever moved into that index.
+
+**The first attempt at the buy body got total silence**, which is the least
+informative failure available: three bytes short, the two `u32`s transposed,
+and the count sent as a `u8`. Nothing came back at all, and that is equally
+what a wrong opcode, a wrong body and a declined request look like.
+
+What bounded the search was sending `CMSG_LIST_INVENTORY` (`0x019E`) first --
+an opcode four below in the same block that is *answered*, and whose reply
+layout was already established. It came back with 393 bytes of stock, which
+said the numbering was right and moved the whole question onto the body. **One
+cheap answered request to bound a silent one** is the same move that turned
+three failed attempts at chat into a one-run answer, and it is worth reaching
+for before improving any guess.
+
+#### Two fields confirmed by consequence, not by agreement
+
+Buying one row is a better test than it looks, because it checks the *stock
+list's* reading as well as the purchase:
+
+- Vendor slot 1 quoted **23** copper. Exactly **23** left the purse, where
+  `item_template.BuyPrice` says 25. A price field read from the wrong offset
+  could not have predicted the charge, so the discounted-price finding is now
+  confirmed by an effect rather than by a table lookup.
+- The row's `buy_count` is **5**, and the item that arrived carried a **stack
+  of 5**. Every row of this vendor holds 5 in that field, so agreeing with
+  `item_template.BuyCount` had proved nothing -- a constant agreeing with a
+  constant. One purchase settled it.
+
+Selling the item straight back returned 5 copper and removed it from the bags.
+The probe does both in one run deliberately: it is self-cleaning, so it can be
+run twice, and the sell names a guid the purchase had just produced, which is
+exactly how a real shop window works.
+
 #### What is still missing
 
-Buying and selling. The stock list is readable and nothing can be purchased
-yet, so `CMSG_BUY_ITEM` and `CMSG_SELL_ITEM` are next -- both confirmable by
-effect, since the item lands in the slot array and `PLAYER_FIELD_COINAGE`
-moves, and both of those are already read. Quests follow.
+Quests. The stock list, the purchase and the sale all work; nothing is drawn in
+the interface yet, and the vendor window is still a CLI printout.
 
 
 ## The road to a native Questie
@@ -3503,7 +3541,11 @@ Vendors come before quests because a quest reward is an item and a turn-in is
 an inventory write, and the vendor work confirms both paths against a server
 that answers loudly. Quests then reuse them rather than debugging them.
 
-### The scoping fact that should shape 4.19
+### Decided: quest data comes from the server, not from a shipped database
+
+**This is a settled decision, not a preference.** Quest data is asked for over
+the wire and rendered on the map and minimap; Questie's hard-coded database is
+not ported.
 
 **Most of Questie's bulk is a workaround for a restriction this project does
 not have.** An addon cannot ask the server about a quest it has not already
@@ -3523,6 +3565,41 @@ come off the wire wherever the wire will answer, and only what the server
 genuinely will not volunteer — static world facts an addon collected by looking
 rather than by asking — is a candidate for reimplementation. That judgement gets
 made per feature, with the wire tried first.
+
+**The payoff is that quests are never out of date.** A shipped database is a
+snapshot of one version of one server's content: it drifts as the game is
+patched, and it is simply wrong on a private realm with custom quests, which is
+exactly what this client is developed against. Asking the server cannot drift,
+because the answer *is* whatever the realm being played on believes. It is also
+strictly less code — no rows to maintain, no import pipeline, no staleness
+policy.
+
+**What that decision costs, and where the cost lands.** The query layer becomes
+a **4.16 requirement rather than a 4.19 one**, because the map has nothing to
+draw without it. `SMSG_GOSSIP_MESSAGE`'s quest block is a title and a level and
+nothing else — no objectives, no locations, no turn-in — so 4.16 has to build:
+
+- `CMSG_QUEST_QUERY` and its response, for what a quest actually asks of you.
+- The questgiver status queries, for the `!`/`?` state over an NPC's head — the
+  single most Questie-ish thing on the screen, and the one that decides whether
+  a pin is drawn at all.
+- Somewhere to keep the answers, since a query is a round trip and a map redraw
+  is not. Cache by quest id, and treat a missing answer as *unknown* rather than
+  as *nothing* — an absent reply must not render as "no objectives", which is
+  the same absent-versus-default trap `PLAYER_BYTES` and the loot short form
+  both cost this project once already.
+
+The tempting shortcut is to have 4.16 parse only what the quest log needs and
+leave the rest to 4.19. That would mean writing the query layer twice, and the
+second time against a map that is already drawing wrong pins.
+
+**What stays open.** Some things the server genuinely will not volunteer —
+where a quest's objective *is* in the world, when no NPC involved is in
+visibility range. Those are the only candidates for reimplementation, and the
+judgement gets made per feature with the wire tried first. It may turn out that
+`SMSG_QUESTGIVER_STATUS_MULTIPLE` plus creature spawn data the client already
+streams covers more of it than expected; that is a question for 4.17, not an
+assumption to make now.
 
 See `docs/REUSE-POLICY.md`'s addon section: reference copies live in the
 gitignored `addons-to-port/`, are read rather than vendored, and each one's

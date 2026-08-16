@@ -27,6 +27,11 @@
 //! wrong number to every player at any standing other than neutral, and
 //! nothing about the result would look wrong. **The wire is authoritative for
 //! price; the table is not.**
+//!
+//! That reading is now confirmed by a consequence rather than by a table:
+//! buying one row quoted at 23 took **exactly 23 copper** out of the purse,
+//! where the table says 25. A price field read from the wrong offset could
+//! not have predicted the charge.
 
 use crate::protocol::{Error, Reader};
 
@@ -64,10 +69,12 @@ pub struct VendorItem {
     pub price: u32,
     /// How many the buyer gets for one purchase at [`VendorItem::price`].
     ///
-    /// Agrees with `item_template.BuyCount` on every row observed -- though
-    /// every row observed held `5`, so this is consistency rather than a
-    /// discriminating measurement, and a vendor whose stock varies in this
-    /// field is what would confirm it properly.
+    /// **Confirmed by effect rather than by agreement.** Every row of the only
+    /// vendor captured holds `5`, so matching `item_template.BuyCount` proved
+    /// nothing on its own -- a constant agreeing with a constant. What settled
+    /// it was buying one: exactly `price` copper left the purse and the item
+    /// that arrived carried a **stack count of 5**. One purchase, one price,
+    /// five items, and the field that predicted the five was this one.
     pub buy_count: u32,
     /// Whether this costs something other than money -- a currency, honour,
     /// tokens -- as a row in `ItemExtendedCost`, or `None` for a plain

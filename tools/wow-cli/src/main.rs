@@ -331,6 +331,29 @@ enum Command {
         /// nothing but a correctly understood selection could have caused it.
         #[arg(long)]
         gossip_select: Option<u32>,
+        /// After a stock list arrives, buy this **vendor slot** and report the
+        /// effect.
+        ///
+        /// Confirmed by consequence, since nothing acknowledges a purchase:
+        /// the item appears in the slot array and `PLAYER_FIELD_COINAGE`
+        /// drops. The money that leaves is compared against the *quoted*
+        /// price, which makes this a check on `vendor::VendorItem::price`
+        /// being the discounted figure rather than only on the buy working.
+        ///
+        /// The number is the server's own vendor slot, as `--gossip-select`
+        /// prints it, and the item entry is looked up from the list rather
+        /// than typed -- the server checks that the pair agree.
+        #[arg(long)]
+        buy: Option<u32>,
+        /// Sell whatever `--buy` just bought straight back to the same vendor.
+        ///
+        /// What makes the probe repeatable -- one that slowly fills the bags
+        /// with vendor water is one nobody runs twice -- and it exercises the
+        /// sell path against a guid this run just learned, which is how a real
+        /// shop window works. Expect a net loss: a vendor buys back below its
+        /// sale price.
+        #[arg(long)]
+        sell_back: bool,
         /// After entering, find which update field carries the character's
         /// appearance by searching for the answer the character list gives.
         ///
@@ -777,6 +800,8 @@ fn main() -> Result<()> {
             loot,
             gossip,
             gossip_select,
+            buy,
+            sell_back,
             target,
             own_fields,
             until_death,
@@ -819,6 +844,8 @@ fn main() -> Result<()> {
                 loot: *loot,
                 gossip: *gossip,
                 gossip_select: *gossip_select,
+                buy: *buy,
+                sell_back: *sell_back,
 
                 target: target.as_deref(),
                 own_fields: *own_fields,
@@ -984,6 +1011,8 @@ struct WorldRequest<'a> {
     loot: bool,
     gossip: Option<u32>,
     gossip_select: Option<u32>,
+    buy: Option<u32>,
+    sell_back: bool,
     target: Option<&'a str>,
     own_fields: bool,
     until_death: bool,
@@ -1074,6 +1103,8 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         loot,
         gossip,
         gossip_select,
+        buy,
+        sell_back,
         target,
         own_fields,
         until_death,
@@ -1886,6 +1917,8 @@ cast {spell_id} at {} (attempt {attempt})",
                 &mut here,
                 prefer,
                 gossip_select,
+                buy,
+                sell_back,
             )?;
         }
 
@@ -2887,6 +2920,12 @@ fn survey_gossip(
     // Which menu option to choose after greeting, by the **server's** option
     // id as printed in the reply -- not a row number. `None` greets and stops.
     select: Option<u32>,
+    // Which vendor slot to buy, once a stock list has arrived. Again the
+    // server's own slot and not a row position.
+    buy: Option<u32>,
+    // Whether to sell the thing just bought straight back, which is what makes
+    // the run self-cleaning and tests both directions against one item.
+    sell_back: bool,
 ) -> Result<()> {
     // **Two distances, and collapsing them into one was a real bug.**
     //
@@ -3272,6 +3311,12 @@ fn survey_gossip(
                     println!("               SELECT entry,displayid,BuyPrice FROM item_template WHERE entry IN (...);");
                     println!("  note: prices above are AFTER the buyer's reputation discount,");
                     println!("        so they are *below* item_template.BuyPrice. That is correct.");
+
+                    if let Some(wanted) = buy {
+                        trade_and_report(
+                            connection, state, own_guid, &list, wanted, sell_back,
+                        )?;
+                    }
                 }
                 Err(error) => println!("\nSMSG_LIST_INVENTORY did not parse: {error}"),
             }
@@ -3290,6 +3335,200 @@ fn survey_gossip(
         }
         state.replicate(&after, None);
     }
+    Ok(())
+}
+
+/// Buys one row from an open vendor, and optionally sells it straight back.
+///
+/// **Both writes are confirmed by effect, because nothing acknowledges
+/// either.** The money moves and the slot array changes, and both of those are
+/// already read -- so this snapshots them, sends, waits, and reports the
+/// difference. A wrong opcode moves nothing, which is a different printout
+/// rather than a similar one.
+///
+/// **The coinage delta is a check on more than the purchase.** The stock list
+/// quotes the *discounted* price, so if the money that leaves the purse equals
+/// that quote rather than `Item.dbc`'s `BuyPrice`, the reading of the price
+/// field in [`world::vendor`] is confirmed by an independent consequence
+/// rather than by a table lookup. That is the whole reason to compare the
+/// numbers here instead of just noting that money moved.
+///
+/// Selling the same item back is what makes the run repeatable: a probe that
+/// slowly fills the bags with water is one nobody runs twice. It also tests the
+/// sell path against a guid this run just learned, which is exactly how a real
+/// client's shop window works.
+fn trade_and_report(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    list: &world::VendorList,
+    slot: u32,
+    sell_back: bool,
+) -> Result<()> {
+    use world::inventory;
+
+    // The server's slot, looked up in the list rather than trusted from the
+    // command line, so the entry sent alongside it cannot disagree -- the
+    // server checks the pair, and inventing either half is the mistake the
+    // slot-is-not-a-row rule exists to prevent.
+    let Some(item) = list.items.iter().find(|item| item.slot == slot) else {
+        println!("\nthis vendor has no slot {slot}. It offers: {:?}",
+            list.items.iter().map(|i| i.slot).collect::<Vec<_>>());
+        return Ok(());
+    };
+
+    // **Test the block's numbering with an opcode that answers, before
+    // sending one that does not.**
+    //
+    // `CMSG_BUY_ITEM` is confirmed only by effect, so a silent failure has
+    // three causes and no way to tell them apart. `CMSG_LIST_INVENTORY` sits
+    // four below it and is *answered* with a packet whose layout is already
+    // established -- so if it comes back, the numbering around here is right
+    // and a silent buy is about the body. If it does not, the whole block is
+    // in the wrong place and the buy was never going to work.
+    //
+    // One cheap answered request to bound the search is the same move that
+    // turned three failed attempts at chat into a one-run answer.
+    println!("\nchecking the opcode block: CMSG_LIST_INVENTORY at the vendor");
+    connection.list_inventory(list.vendor)?;
+    let probe = connection.drain(std::time::Duration::from_millis(1500), 128)?;
+    state.replicate(&probe, None);
+    match probe
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::LIST_INVENTORY)
+    {
+        Some(reply) => println!(
+            "  answered: {} bytes of stock. The block is numbered correctly,",
+            reply.body.len()
+        ),
+        None => {
+            println!("  NO ANSWER. An opcode that should be answered was not, so the");
+            println!("  numbering around here is wrong and a silent buy proves nothing.");
+            println!("  Fix this before reading anything into the purchase below.");
+        }
+    }
+    if probe
+        .iter()
+        .any(|p| p.opcode == world::opcode::server::LIST_INVENTORY)
+    {
+        println!("  so a silent purchase below is about the *body*, not the number.");
+    }
+
+    let money_before = inventory::coinage(state, own_guid);
+    let held_before: std::collections::BTreeSet<u64> = inventory::held(state, own_guid)
+        .into_iter()
+        .map(|held| held.guid)
+        .collect();
+
+    println!(
+        "\nbuying vendor slot {} (entry {}) at {} copper; purse holds {money_before}",
+        item.slot, item.entry, item.price
+    );
+    if money_before < item.price {
+        // Refused loudly rather than attempted: a purchase that cannot be
+        // afforded is declined, and that decline is a silence -- which looks
+        // exactly like a wrong opcode. Same reasoning as refusing to greet
+        // from out of range.
+        println!("  not enough money ({money_before} < {}). Not sending: a refusal", item.price);
+        println!("  here would be indistinguishable from an opcode the server ignored.");
+        println!("  Top up first: --say \".modify money 10000\" --say \".save\"");
+        return Ok(());
+    }
+
+    connection.buy_item(
+        list.vendor,
+        item.slot,
+        item.entry,
+        1,
+        inventory::OWN_SLOT_ARRAY,
+    )?;
+    let batch = connection.drain(std::time::Duration::from_millis(1500), 128)?;
+    state.replicate(&batch, None);
+
+    let money_after = inventory::coinage(state, own_guid);
+    let held_after = inventory::held(state, own_guid);
+    let gained: Vec<&world::HeldItem> = held_after
+        .iter()
+        .filter(|held| !held_before.contains(&held.guid))
+        .collect();
+
+    let spent = money_before.saturating_sub(money_after);
+    println!("  money {money_before} -> {money_after} (spent {spent})");
+    for held in &gained {
+        let stack = state
+            .get(held.guid)
+            .and_then(|item| item.fields.get(world::update::fields::ITEM_FIELD_STACK_COUNT));
+        println!(
+            "  gained {:#018x} at slot {} entry {:?} stack {:?}",
+            held.guid,
+            held.slot.index(),
+            held.entry,
+            stack
+        );
+    }
+
+    if gained.is_empty() && spent == 0 {
+        println!("  nothing moved -- which is what a wrong opcode looks like, and");
+        println!("  also what a full bag looks like. Check the bags first.");
+        return Ok(());
+    }
+
+    // **The measurement, not just the confirmation.** Whether the price is per
+    // purchase or per item is a real question this run can answer rather than
+    // assume, and it is answered by what actually left the purse against what
+    // actually arrived in the bag.
+    println!(
+        "  quoted {} copper for a buy_count of {}; spent {spent}",
+        item.price, item.buy_count
+    );
+    if spent == item.price {
+        println!("  -- the quote is the price of one purchase, and the stock list's");
+        println!("     discounted figure is what is actually charged. That confirms");
+        println!("     vendor::VendorItem::price against a consequence rather than");
+        println!("     against a table.");
+    } else if spent != 0 {
+        println!("  -- spent differs from the quote. Worth investigating before");
+        println!("     anything displays a price: {spent} vs {}.", item.price);
+    }
+
+    if !sell_back {
+        return Ok(());
+    }
+
+    let Some(bought) = gained.first() else {
+        println!("\nnothing was gained, so there is nothing to sell back.");
+        return Ok(());
+    };
+
+    // Named by guid, which is the point: this is the guid the purchase just
+    // produced, not a slot index that something else could have moved into.
+    println!("\nselling {:#018x} back", bought.guid);
+    connection.sell_item(list.vendor, bought.guid, 0)?;
+    let batch = connection.drain(std::time::Duration::from_millis(1500), 128)?;
+    state.replicate(&batch, None);
+
+    let money_end = inventory::coinage(state, own_guid);
+    let still_held = inventory::held(state, own_guid)
+        .iter()
+        .any(|held| held.guid == bought.guid);
+    println!(
+        "  money {money_after} -> {money_end} (gained {})",
+        money_end.saturating_sub(money_after)
+    );
+    println!(
+        "  the item is {}",
+        if still_held {
+            "STILL in the bags -- the sell did not take"
+        } else {
+            "gone from the bags -- the sell took"
+        }
+    );
+    // A vendor buys back for less than it sells for, so the purse should not
+    // return to where it started. Saying so stops that being read as a bug.
+    println!("  net over both trades: {} -> {money_end}", money_before);
+    println!("  (a vendor buys back below its sale price, so this is expected");
+    println!("   to be a loss rather than a wash.)");
+
     Ok(())
 }
 

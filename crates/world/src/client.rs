@@ -811,6 +811,62 @@ impl Connection {
         self.send(ClientOpcode::GossipSelectOption, &body)
     }
 
+    /// Asks a vendor for its stock list, without going through a gossip menu.
+    ///
+    /// The guid goes out unpacked. See [`ClientOpcode::ListInventory`].
+    pub fn list_inventory(&mut self, vendor: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::ListInventory, &vendor.to_le_bytes())
+    }
+
+    /// Buys `count` of one stock row from the open vendor.
+    ///
+    /// `slot` is the **server's** vendor slot, from
+    /// [`VendorItem::slot`](crate::VendorItem), and `entry` the item it named.
+    /// Both travel so the server can check they agree -- which also means a
+    /// caller must not invent either from a list position.
+    ///
+    /// `bag` is where to put it; [`crate::inventory::OWN_SLOT_ARRAY`] means
+    /// the player's own array and lets the server choose the slot, the same
+    /// convention [`Connection::equip_item`] uses.
+    ///
+    /// Nothing acknowledges this -- see [`ClientOpcode::BuyItem`] for the
+    /// effect that confirms it.
+    pub fn buy_item(
+        &mut self,
+        vendor: u64,
+        slot: u32,
+        entry: u32,
+        count: u32,
+        bag: u8,
+    ) -> Result<(), Error> {
+        // **Item before slot, and the count is a `u32`.** Both were guessed
+        // wrong first time and the result was total silence -- see
+        // [`ClientOpcode::BuyItem`]. Twenty-one bytes, not eighteen.
+        let mut body = Vec::with_capacity(21);
+        body.extend_from_slice(&vendor.to_le_bytes());
+        body.extend_from_slice(&entry.to_le_bytes());
+        body.extend_from_slice(&slot.to_le_bytes());
+        body.extend_from_slice(&count.to_le_bytes());
+        body.push(bag);
+        self.send(ClientOpcode::BuyItem, &body)
+    }
+
+    /// Sells an item to the open vendor.
+    ///
+    /// The item is named by **guid** rather than by slot, deliberately: a guid
+    /// cannot go stale the way an index can, so a request that races an
+    /// inventory change is refused instead of selling whatever moved into that
+    /// slot. `count` of `0` means the whole stack.
+    pub fn sell_item(&mut self, vendor: u64, item: u64, count: u32) -> Result<(), Error> {
+        // Twenty bytes: the count is a `u32` like the buy request's, not the
+        // `u8` a stack size would suggest.
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&vendor.to_le_bytes());
+        body.extend_from_slice(&item.to_le_bytes());
+        body.extend_from_slice(&count.to_le_bytes());
+        self.send(ClientOpcode::SellItem, &body)
+    }
+
     /// Acknowledges a teleport within the current map.
     ///
     /// **The server will not finish the move until this arrives, and will

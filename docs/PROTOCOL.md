@@ -925,8 +925,33 @@ every number it showed would still look plausible — the same hazard as a
 fabricated tooltip value, which is why this project passes unresolved tokens
 through with their `$` intact rather than inventing figures.
 
+### Buying and selling
+
+```
+CMSG_LIST_INVENTORY  0x019E   u64 vendor guid
+CMSG_BUY_ITEM        0x01A2   u64 vendor, u32 item entry, u32 vendor slot,
+                              u32 count, u8 bag          (21 bytes)
+CMSG_SELL_ITEM       0x01A0   u64 vendor, u64 item guid, u32 count  (20 bytes)
+```
+
+Note **entry before slot** in the buy, and that both counts are `u32` rather
+than the `u8` a stack size suggests. A sale names the item by **guid**, not by
+slot: a guid cannot go stale the way an index can, so a request that races an
+inventory change is refused rather than selling whatever moved into that slot.
+
+Neither write is acknowledged. Both are confirmed by effect, and buying is the
+more informative of the two because it also checks the stock list's own
+reading: a row quoted at 23 copper took exactly 23 out of `PLAYER_FIELD_COINAGE`
+— where `item_template.BuyPrice` says 25 — and delivered a stack of exactly
+`buy_count`.
+
+**Bound a silent send with an answered one.** The first buy body was wrong and
+produced nothing at all, which is indistinguishable from a wrong opcode.
+`CMSG_LIST_INVENTORY` sits four below in the same block and *is* answered, with
+a reply whose layout was already known; getting 393 bytes of stock back from it
+said the numbering was right and moved the whole question onto the body.
+
 ### Not sent yet
 
-`CMSG_BUY_ITEM` and `CMSG_SELL_ITEM`. Both are confirmable by effect — the item
-lands in the slot array and `PLAYER_FIELD_COINAGE` moves, and both are already
-read.
+`CMSG_BUY_ITEM_IN_SLOT`, and buyback. Nothing vendor-related is drawn in the
+interface — the stock list is a CLI printout so far.
