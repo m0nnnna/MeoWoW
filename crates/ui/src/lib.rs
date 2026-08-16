@@ -67,6 +67,11 @@ pub struct HudData<'a> {
     /// against -- see [`frames::marker`]. `None` when nothing is selected or
     /// the selection is behind the camera.
     pub target_marker: Option<egui::Rect>,
+    /// Where the character's own current corpse is on screen, world-anchored
+    /// like `target_marker` above rather than placed by an [`Element`].
+    /// `None` while alive, while a ghost's query has not yet been answered,
+    /// or while the corpse is behind the camera.
+    pub corpse_marker: Option<egui::Rect>,
     /// Damage numbers in flight, world-anchored like the target marker rather
     /// than placed by an [`Element`] -- see [`frames::combat_text`].
     pub combat_text: &'a [frames::combat_text::FloatingText],
@@ -103,6 +108,11 @@ pub struct HudData<'a> {
     /// answer different questions, and a worn slot has a fixed identity where
     /// a bag square is only a position.
     pub character: Option<&'a [frames::EquipSlot]>,
+    /// The release-spirit prompt, or `None` when the character is alive or is
+    /// already a ghost. Like `loot`, existence *is* the flag: there is
+    /// nothing else here that could disagree about whether it should be on
+    /// screen.
+    pub release_prompt: Option<&'a frames::ReleasePromptView>,
     /// What is on the corpse currently open, or `None` when none is.
     ///
     /// Unlike every other window here this one is not toggled by a key -- it
@@ -132,6 +142,10 @@ pub struct HudResponse {
     /// are different numbers, and the difference is invisible until a corpse
     /// has been partly looted.
     pub take_loot: Option<frames::Take>,
+    /// The release-spirit prompt was clicked. Carried as a bare flag rather
+    /// than a guid or a slot -- unlike a loot row there is nothing to choose
+    /// between, the whole frame is the one thing it can ask for.
+    pub release_clicked: bool,
 }
 
 /// The interface, ready to draw.
@@ -292,7 +306,19 @@ impl Hud {
                 egui::Order::Background,
                 egui::Id::new("hud-target-marker"),
             ));
-            frames::marker::draw(&painter, rect, &style);
+            frames::marker::draw(&painter, rect, style.target_marker, style.target_marker_width);
+        }
+
+        // Same shape as the selection bracket above, and the same reasoning
+        // for staying off the `occupied` list: this sits over the player's
+        // own corpse out in the world, and claiming that rectangle would make
+        // the body itself unclickable underneath the interface.
+        if let (true, Some(rect)) = (style.show_corpse_marker, data.corpse_marker) {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("hud-corpse-marker"),
+            ));
+            frames::marker::draw(&painter, rect, style.corpse_marker, style.target_marker_width);
         }
 
         // Also drawn straight onto a layer and never added to `occupied`, for
@@ -325,6 +351,7 @@ impl Hud {
             let bags_placeholder;
             let character_placeholder;
             let loot_placeholder;
+            let release_prompt_placeholder;
             let content = match id {
                 ElementId::PlayerFrame | ElementId::TargetFrame => {
                     let live = if id == ElementId::PlayerFrame {
@@ -397,6 +424,17 @@ impl Hud {
                     }
                     None => continue,
                 },
+                // Absent while alive or already a ghost, on the same reasoning
+                // as the loot window: existence is the flag, and drawn in
+                // edit mode so it can be positioned without dying first.
+                ElementId::ReleasePrompt => match data.release_prompt {
+                    Some(view) => Content::ReleasePrompt(view),
+                    None if editing => {
+                        release_prompt_placeholder = frames::ReleasePromptView::placeholder();
+                        Content::ReleasePrompt(&release_prompt_placeholder)
+                    }
+                    None => continue,
+                },
                 _ => {
                     // An action bar. Unlike the other frames, an empty one
                     // still draws: the slots are where spells get *put*, so
@@ -429,6 +467,7 @@ impl Hud {
                 // Sized to the corpse, so a one-item corpse does not open a
                 // window with empty lines in it.
                 Content::Loot(rows) => frames::loot::size(rows.len(), &style, element.scale),
+                Content::ReleasePrompt(_) => frames::release::size(&style, element.scale),
             };
             let rect = element.rect(screen, size);
             self.occupied.push(rect);
@@ -489,7 +528,10 @@ impl Hud {
                         egui::Sense::drag()
                     } else if matches!(
                         content,
-                        Content::Bar { .. } | Content::Spellbook(_) | Content::Loot(_)
+                        Content::Bar { .. }
+                            | Content::Spellbook(_)
+                            | Content::Loot(_)
+                            | Content::ReleasePrompt(_)
                     ) {
                         // The frames you interact with while playing, so they
                         // sense clicks rather than only hover.
@@ -565,6 +607,13 @@ impl Hud {
                             &painter,
                             response.rect,
                             rows,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::ReleasePrompt(view) => frames::release::draw(
+                            &painter,
+                            response.rect,
+                            view,
                             &style,
                             element.scale,
                         ),
@@ -663,6 +712,13 @@ impl Hud {
                                 response_out.take_loot = rows.get(row).map(|row| row.take);
                             }
                         }
+                    }
+                }
+                // No row geometry to test -- the whole rectangle is the one
+                // thing this frame can ask for.
+                (false, Content::ReleasePrompt(_)) => {
+                    if response.clicked() {
+                        response_out.release_clicked = true;
                     }
                 }
                 (false, Content::Spellbook(entries)) => {
@@ -779,6 +835,7 @@ impl Hud {
                             &style,
                             scale,
                         ),
+                        ElementId::ReleasePrompt => frames::release::size(&style, scale),
                         ElementId::PlayerFrame | ElementId::TargetFrame => {
                             let unit = if id == ElementId::PlayerFrame {
                                 data.player
@@ -837,6 +894,7 @@ enum Content<'a> {
     Bags(&'a [frames::BagSlot]),
     Character(&'a [frames::EquipSlot]),
     Loot(&'a [frames::LootRow]),
+    ReleasePrompt(&'a frames::ReleasePromptView),
 }
 
 /// The outline and label that mark a frame as draggable.
@@ -1449,6 +1507,57 @@ mod tests {
         assert_eq!(response.take_loot, Some(frames::Take::Money));
     }
 
+    /// The same silent-failure shape as the loot-row test above, for the
+    /// release prompt: a frame missing from the `Sense::click()` list draws
+    /// and hit-tests fine and simply never reports a click.
+    #[test]
+    fn clicking_the_release_prompt_reports_it() {
+        let view = frames::ReleasePromptView {
+            text: "You have died.".into(),
+        };
+        let data = HudData {
+            release_prompt: Some(&view),
+            ..Default::default()
+        };
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::ReleasePrompt);
+        let rect = element.rect(screen(), frames::release::size(&hud.profile.style, element.scale));
+
+        let response = drive(&mut hud, &data, &click_script(rect.center(), egui::PointerButton::Primary));
+        assert!(response.release_clicked, "a click on the prompt was not reported");
+    }
+
+    /// And the same asymmetry as the cast bar and the loot window: absent
+    /// while alive, present once there is something to release.
+    #[test]
+    fn a_release_prompt_appears_only_while_dead_or_editing() {
+        let mut quiet = Hud::default();
+        hide_bars(&mut quiet);
+        assert!(
+            painted(&mut quiet, &HudData::default()).is_empty(),
+            "a release prompt was painted while alive"
+        );
+
+        let view = frames::ReleasePromptView {
+            text: "You have died.".into(),
+        };
+        let mut open = Hud::default();
+        hide_bars(&mut open);
+        assert!(
+            !painted(
+                &mut open,
+                &HudData {
+                    release_prompt: Some(&view),
+                    ..Default::default()
+                }
+            )
+            .is_empty(),
+            "a release prompt painted nothing while dead"
+        );
+    }
+
     /// The same asymmetry for the bag window, and for the same reason.
     #[test]
     fn a_bag_window_appears_only_when_open_or_editing() {
@@ -1709,6 +1818,7 @@ mod tests {
             ElementId::Loot => {
                 frames::loot::size(frames::loot::placeholder().len(), &profile.style, scale)
             }
+            ElementId::ReleasePrompt => frames::release::size(&profile.style, scale),
             ElementId::PlayerFrame | ElementId::TargetFrame => {
                 frames::unit::size(&profile.style, scale, true)
             }

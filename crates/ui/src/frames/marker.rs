@@ -13,9 +13,7 @@
 //! from one source is the same rule that keeps the picking ray on the matrix
 //! the scene is drawn with.
 
-use egui::{Painter, Pos2, Rect, Stroke};
-
-use crate::style::Style;
+use egui::{Color32, Painter, Pos2, Rect, Stroke};
 
 /// Corner ticks as a fraction of the bracket's shorter side.
 const TICK: f32 = 0.28;
@@ -27,11 +25,17 @@ const MIN_TICK: f32 = 4.0;
 ///
 /// Corners rather than a full outline: a closed box around a creature hides
 /// its silhouette, which is the thing you were looking at when you clicked it.
-pub fn draw(painter: &Painter, rect: Rect, style: &Style) {
+///
+/// Colour and width are taken directly rather than a `&Style`, because this
+/// draws two different things with two different colours -- the selection
+/// bracket (`style.target_marker`) and a released player's own corpse
+/// (`style.corpse_marker`) -- and a single style-shaped parameter would have
+/// to guess which one the caller meant.
+pub fn draw(painter: &Painter, rect: Rect, color: impl Into<Color32>, width: f32) {
     if !rect.is_positive() {
         return;
     }
-    let stroke = Stroke::new(style.target_marker_width, style.target_marker);
+    let stroke = Stroke::new(width, color);
     let tick = (rect.width().min(rect.height()) * TICK).max(MIN_TICK);
 
     for (corner, dx, dy) in [

@@ -1842,6 +1842,15 @@ struct App {
     /// in replicated state; this only records what we asked and whether we are
     /// still waiting, which is a fact about this client alone.
     looting: Option<Looting>,
+    /// Whether this client has already asked the server for its own corpse
+    /// since last becoming a ghost.
+    ///
+    /// Asked once per release rather than every frame, the same shape as
+    /// `looting`: the answer arrives asynchronously into
+    /// `WorldState::corpse_location`, and re-asking on every frame a corpse
+    /// run happens to take would be one query packet per frame instead of
+    /// one per death.
+    own_corpse_query_sent: bool,
     /// Held modifiers, which choose which bar a number key drives.
     modifiers: winit::keyboard::ModifiersState,
 }
@@ -2318,6 +2327,7 @@ impl App {
             bags_open: false,
             character_open: false,
             looting: None,
+            own_corpse_query_sent: false,
             modifiers: Default::default(),
         }
     }
@@ -4428,6 +4438,41 @@ impl App {
         if self.target.is_some_and(|guid| live.state.get(guid).is_none()) {
             self.target = None;
         }
+
+        // The corpse a released ghost has to run back to. See
+        // `own_corpse_query_sent`'s doc comment for why this asks once
+        // rather than every frame.
+        let is_ghost = live.state.get(live.guid).is_some_and(|e| e.is_ghost());
+        if is_ghost && !self.own_corpse_query_sent {
+            if let Err(e) = live.connection.query_corpse() {
+                tracing::warn!("asking for our corpse failed: {e:#}");
+            }
+            self.own_corpse_query_sent = true;
+        } else if !is_ghost {
+            // Cleared on the way back to life too, not only on release, so
+            // a second death asks again rather than trusting a stale
+            // `corpse_location` left over from the first one.
+            self.own_corpse_query_sent = false;
+        }
+    }
+
+    /// Releases the spirit, in response to a click on the release prompt.
+    ///
+    /// Nothing acknowledges this directly -- see
+    /// `world::client::Connection::release_spirit`'s doc comment. What
+    /// confirms it from here is the prompt disappearing on its own the next
+    /// frame: it is drawn from `entity.is_ghost()`, not from a local flag
+    /// this method could set, so a request the server silently refused would
+    /// leave the prompt exactly where it was rather than lying about success.
+    fn release_spirit(&mut self) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.release_spirit() {
+            tracing::warn!("releasing the spirit failed: {e:#}");
+            self.chat
+                .push(Line::Chat(local_notice(format!("could not release: {e}"))));
+        }
     }
 
     fn build_ui(&mut self, window: &Arc<Window>) -> egui::FullOutput {
@@ -4519,6 +4564,44 @@ impl App {
                 glam::Vec3::new(at.x, at.y, at.z),
                 scale,
                 world.entity_bounds(display_id),
+            )
+        });
+
+        // Present exactly while the character is lying dead and not yet
+        // released -- absent while alive, and absent again once a ghost, the
+        // same "existence is the flag" shape the loot window uses. See
+        // `App::release_spirit`.
+        let release_prompt = self.live.as_ref().and_then(|live| {
+            let entity = live.state.get(live.guid)?;
+            (entity.is_dead_or_ghost() && !entity.is_ghost()).then(|| ui::frames::ReleasePromptView {
+                text: "You have died.\nClick to release your spirit.".to_string(),
+            })
+        });
+
+        // Where to bracket the character's own current corpse, once the
+        // server has answered `MSG_CORPSE_QUERY` -- see
+        // `own_corpse_query_sent`. The guid still has to come from a
+        // replicated object nearest that answer, exactly as
+        // `report_reclaim` in `wow-cli` does it: corpse-shaped objects
+        // include the bones of bodies already reclaimed, and bones carry the
+        // same owner guid as the current body, so owner alone picks a stale
+        // one.
+        let corpse_marker = self.live.as_ref().and_then(|live| {
+            let body_at = live.state.corpse_location?;
+            let (_, position) = live
+                .state
+                .own_corpses(live.guid)
+                .filter_map(|c| c.position.map(|p| (c.guid, p)))
+                .min_by(|a, b| {
+                    let d = |p: &::world::update::Position| {
+                        (p.x - body_at.x).powi(2) + (p.y - body_at.y).powi(2)
+                    };
+                    d(&a.1).total_cmp(&d(&b.1))
+                })?;
+            hud::corpse_marker_rect(
+                &self.camera,
+                viewport,
+                glam::Vec3::new(position.x, position.y, position.z),
             )
         });
 
@@ -4822,6 +4905,7 @@ impl App {
                     player: player.as_ref(),
                     target: target.as_ref(),
                     target_marker,
+                    corpse_marker,
                     combat_text: &combat_text,
                     chat: &chat,
                     composing: composing.as_deref(),
@@ -4837,6 +4921,7 @@ impl App {
                     // No flag: the window exists exactly while the server
                     // says a corpse is open.
                     loot: (!loot.is_empty()).then_some(loot.as_slice()),
+                    release_prompt: release_prompt.as_ref(),
                 },
             );
 
@@ -4933,6 +5018,12 @@ impl App {
         // it was on screen -- see `ui::frames::loot`.
         if let Some(take) = hud_response.take_loot {
             self.take_loot(take);
+        }
+
+        // A clicked release prompt releases the spirit. See
+        // `App::release_spirit` for why nothing here assumes it worked.
+        if hud_response.release_clicked {
+            self.release_spirit();
         }
 
         // **The corpse has to be released, and only a transition says when.**

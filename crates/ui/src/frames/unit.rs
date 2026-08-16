@@ -20,6 +20,15 @@ pub struct UnitView {
     pub power: u32,
     pub max_power: u32,
     pub power_type: PowerType,
+    /// Whether this player has released and is walking as a ghost.
+    ///
+    /// Carried separately from [`Self::is_dead`] rather than folded into it,
+    /// because a ghost has **one** health, not zero -- see
+    /// `world::state::Entity::is_ghost`'s doc comment. `is_dead` alone would
+    /// read a ghost as an ordinary living player with a nearly empty bar.
+    /// Always `false` for anything that is not a player: nothing else in this
+    /// protocol ever carries the ghost flag.
+    pub ghost: bool,
 }
 
 impl UnitView {
@@ -38,6 +47,7 @@ impl UnitView {
             power: 2_000,
             max_power: 4_000,
             power_type: PowerType::Mana,
+            ghost: false,
         }
     }
 
@@ -118,7 +128,14 @@ pub fn draw(painter: &Painter, rect: Rect, unit: &UnitView, style: &Style, scale
     // already the fact; what it is missing is that an empty bar and a bar
     // whose maximum has not arrived look identical, and the name is the place
     // with room to say which.
-    let text: Color32 = if unit.is_dead() {
+    //
+    // Ghost is checked first and is not an `else` of `is_dead`: a ghost's
+    // health reads as one, not zero, so `is_dead()` is false for a ghost and
+    // the two conditions do not partition the space the way they look like
+    // they do.
+    let text: Color32 = if unit.ghost {
+        style.text_ghost.into()
+    } else if unit.is_dead() {
         style.text_dead.into()
     } else {
         style.text.into()
@@ -240,6 +257,7 @@ mod dead_tests {
             power: 0,
             max_power: 0,
             power_type: PowerType::Mana,
+            ghost: false,
         }
     }
 
@@ -284,6 +302,24 @@ mod dead_tests {
             alive, dead,
             "a dead unit drew exactly the same shapes as a living one"
         );
+
+        // A ghost has **one** health, not zero (see `UnitView::ghost`'s doc
+        // comment), so `is_dead()` is false for it -- the only thing that can
+        // possibly distinguish it on screen is the `ghost` flag actually
+        // being read by `draw`. This is the case that would pass silently if
+        // the check above were the only one: a ghost with `ghost: false`
+        // draws identically to an ordinary living player at 1/42 health.
+        let mut ghost = unit(1, 42);
+        ghost.ghost = true;
+        let ghost = painted(&ghost);
+        assert_ne!(
+            alive, ghost,
+            "a ghost drew exactly the same shapes as a living player"
+        );
+        assert_ne!(
+            dead, ghost,
+            "a ghost drew exactly the same shapes as a dead-not-released unit"
+        );
     }
 }
 
@@ -306,6 +342,7 @@ mod tests {
             power: 30,
             max_power: 100,
             power_type: PowerType::Mana,
+            ghost: false,
         }
     }
 

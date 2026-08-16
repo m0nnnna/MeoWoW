@@ -37,6 +37,9 @@ pub fn unit_view(entity: &::world::state::Entity, name: String) -> ui::UnitView 
             .power_type()
             .map(ui::PowerType::from_id)
             .unwrap_or_default(),
+        // `false` for anything that is not a player: `is_ghost` reads a
+        // field nothing else ever sets.
+        ghost: entity.is_ghost(),
     }
 }
 
@@ -315,6 +318,29 @@ pub fn combat_text_anchor(
 ) -> Option<egui::Pos2> {
     let (x, y) = camera.project(position, viewport)?;
     Some(egui::pos2(x, y))
+}
+
+/// Where the player's own corpse should be bracketed, as a small fixed-size
+/// box around its projected position.
+///
+/// `marker_rect`'s box comes from the model's own bounds, which a corpse has
+/// none of readily to hand -- it is not a streamed, animated entity with a
+/// display id looked up through the model cache, just a point the server
+/// answered `MSG_CORPSE_QUERY` with. A fixed screen-space size is the same
+/// trade `combat_text_anchor` already makes for a single point, just wrapped
+/// in a small rectangle so [`frames::marker::draw`](ui::frames::marker::draw)
+/// has ticks to draw.
+pub fn corpse_marker_rect(
+    camera: &render::camera::Camera,
+    viewport: (f32, f32),
+    position: Vec3,
+) -> Option<egui::Rect> {
+    const HALF_EXTENT: f32 = 20.0;
+    let centre = combat_text_anchor(camera, viewport, position)?;
+    Some(egui::Rect::from_min_max(
+        egui::pos2(centre.x - HALF_EXTENT, centre.y - HALF_EXTENT),
+        egui::pos2(centre.x + HALF_EXTENT, centre.y + HALF_EXTENT),
+    ))
 }
 
 /// What a ray selects, if anything.

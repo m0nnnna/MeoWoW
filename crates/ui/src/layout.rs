@@ -43,10 +43,11 @@ pub enum ElementId {
     Bags,
     Character,
     Loot,
+    ReleasePrompt,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 11] = [
+    pub const ALL: [ElementId; 12] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -58,6 +59,7 @@ impl ElementId {
         ElementId::Bags,
         ElementId::Character,
         ElementId::Loot,
+        ElementId::ReleasePrompt,
     ];
 
     /// Which action bar this element is, if it is one.
@@ -84,6 +86,7 @@ impl ElementId {
             ElementId::Bags => "bags",
             ElementId::Character => "character",
             ElementId::Loot => "loot",
+            ElementId::ReleasePrompt => "release-prompt",
         }
     }
 
@@ -105,6 +108,7 @@ impl ElementId {
             ElementId::Bags => "Bags",
             ElementId::Character => "Character",
             ElementId::Loot => "Loot",
+            ElementId::ReleasePrompt => "Release-spirit prompt",
         }
     }
 
@@ -201,6 +205,15 @@ impl ElementId {
             ElementId::Loot => Element {
                 anchor: Anchor::Center,
                 offset: [0.0, -40.0],
+                ..Default::default()
+            },
+            // Also centred, like the loot window it can in principle share
+            // the screen with (a creature's corpse looted moments before this
+            // character's own death) -- offset the other way so the two do
+            // not start out overlapping.
+            ElementId::ReleasePrompt => Element {
+                anchor: Anchor::Center,
+                offset: [0.0, 60.0],
                 ..Default::default()
             },
         }

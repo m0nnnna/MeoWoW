@@ -242,6 +242,13 @@ pub struct Style {
     /// The name of a unit with no health left. See `UnitView::is_dead` for
     /// why an empty bar alone is not enough to say so.
     pub text_dead: Color,
+    /// The name of a released player walking as a ghost.
+    ///
+    /// A separate colour from `text_dead` rather than a reuse of it: a ghost
+    /// carries one health, not zero, so `UnitView::is_dead` reads *false* for
+    /// one -- the two states need their own signal or a ghost draws as an
+    /// ordinary living player.
+    pub text_ghost: Color,
     pub chat_channel: Color,
     /// Damage dealt and taken. Deliberately dimmer than speech: combat fills
     /// the scrollback faster than anything else, and a colour that competes
@@ -259,6 +266,14 @@ pub struct Style {
     /// -- see [`crate::frames::marker`].
     pub show_target_marker: bool,
 
+    /// The same corner-tick shape as `target_marker`, drawn on a released
+    /// player's own corpse instead of the current selection. A different
+    /// colour so the two are never ambiguous when both could be on screen --
+    /// width is shared with `target_marker_width` rather than duplicated,
+    /// since nothing about a corpse needs its ticks a different thickness.
+    pub corpse_marker: Color,
+    pub show_corpse_marker: bool,
+
     /// Font size of a floating damage number at spawn, before scale.
     pub combat_text_size: f32,
     /// How far a number travels upward over its lifetime, in points at
@@ -275,6 +290,17 @@ pub struct Style {
     /// see [`crate::frames::combat_text::draw`].
     pub combat_text_critical: Color,
     pub combat_text_miss: Color,
+
+    /// Width of the release-spirit prompt at scale 1.0. Its own dimension
+    /// rather than a reuse of `cast_bar_width`: the two happen to match today,
+    /// but they are unrelated frames and a later change to one should not
+    /// silently resize the other.
+    pub release_prompt_width: f32,
+    /// The prompt's own text colour, distinct from `text` -- a dead player
+    /// missing a release prompt entirely reads as a bug, so this is picked to
+    /// stand out against `background` rather than blend into the rest of the
+    /// frame furniture.
+    pub release_prompt_text: Color,
 }
 
 impl Default for Style {
@@ -340,6 +366,7 @@ impl Default for Style {
             chat_emote: Color::rgb(240, 150, 80),
             chat_system: Color::rgb(240, 220, 100),
             text_dead: Color::rgb(140, 130, 130),
+            text_ghost: Color::rgb(150, 190, 230),
             chat_channel: Color::rgb(120, 210, 190),
             chat_combat: Color::rgb(190, 155, 120),
             chat_other: Color::rgb(170, 176, 190),
@@ -348,6 +375,8 @@ impl Default for Style {
             target_marker: Color::rgb(240, 225, 130),
             target_marker_width: 2.0,
             show_target_marker: true,
+            corpse_marker: Color::rgb(180, 210, 235),
+            show_corpse_marker: true,
 
             combat_text_size: 20.0,
             combat_text_rise: 40.0,
@@ -355,6 +384,9 @@ impl Default for Style {
             combat_text_damage: Color::rgb(255, 226, 120),
             combat_text_critical: Color::rgb(255, 110, 40),
             combat_text_miss: Color::rgb(200, 202, 214),
+
+            release_prompt_width: 260.0,
+            release_prompt_text: Color::rgb(230, 90, 70),
         }
     }
 }
@@ -399,6 +431,7 @@ impl Style {
         self.slot_size = self.slot_size.clamp(12.0, 200.0);
         self.slot_gap = self.slot_gap.clamp(0.0, 40.0);
         self.cast_bar_width = self.cast_bar_width.clamp(60.0, 1200.0);
+        self.release_prompt_width = self.release_prompt_width.clamp(60.0, 1200.0);
         self.character_label_width = self.character_label_width.clamp(0.0, 400.0);
         self.loot_width = self.loot_width.clamp(100.0, 900.0);
         self.spellbook_width = self.spellbook_width.clamp(120.0, 1200.0);

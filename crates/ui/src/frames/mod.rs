@@ -21,6 +21,7 @@ pub mod chat;
 pub mod loot;
 pub mod combat_text;
 pub mod marker;
+pub mod release;
 pub mod spellbook;
 pub mod unit;
 
@@ -28,5 +29,6 @@ pub use bags::{BagItem, BagSlot};
 pub use character::EquipSlot;
 pub use loot::{LootRow, Take};
 pub use cast_bar::CastBarView;
+pub use release::ReleasePromptView;
 pub use spellbook::SpellbookEntry;
 pub use unit::UnitView;
