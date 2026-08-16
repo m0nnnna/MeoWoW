@@ -3395,6 +3395,87 @@ and a questgiver whose is not, all within greeting range, is the fixture the
 rest of this milestone needs -- and building one by changing the *character* or
 the *cast* rather than the technique is what closed both of 4.13's gaps.
 
+### 4.15 continued: a menu can be chosen, and a vendor lists its stock
+
+Two opcodes, one run, and the second confirms the first.
+
+#### `CMSG_GOSSIP_SELECT_OPTION` (`0x017C`)
+
+Body is `{u64 npc guid, u32 menu id, u32 option index}` and a trailing string
+for *coded* options -- empty for everything observed. **The index is the
+server's own option id**, taken from the reply rather than from anything the
+caller typed, because menu 1291 is the standing proof that the numbering has
+holes in it.
+
+Nothing acknowledges a selection as such, so it is confirmed the way the equip
+and loot writes were -- by an effect that could not have happened otherwise.
+Choosing Innkeeper Farley's `I want to browse your goods.` produced
+`SMSG_LIST_INVENTORY`: a *different opcode carrying a stock list*, which no
+misunderstood request would have caused.
+
+#### `SMSG_LIST_INVENTORY` (`0x019F`)
+
+```
+u64 vendor guid
+u8  row count
+  u32 slot, u32 entry, u32 display id, i32 remaining (-1 = unlimited),
+  u32 price, u32 unknown, u32 buy count, u32 extended cost
+```
+
+Thirty-two bytes a row, and Farley's reply was 393 -- which is `8 + 1 + 12 * 32`
+exactly. The twelve rows are the twelve in the server's `npc_vendor` table for
+that creature, in the same order, and each pairs an item entry with the display
+id `Item.dbc` independently gives it: 159 with 18084, 414 with 21904, 422 with
+6352.
+
+**One of those pairs was already confirmed by a different packet.** Item 2070,
+Darnassian Bleu, display 6353 -- the exact pair that verified
+`SMSG_LOOT_RESPONSE`'s layout in 4.13. Two unrelated packets, parsed at
+different times against different tables, agreeing on the same two numbers is
+about as good as corroboration gets here.
+
+#### The price is not the price in the table
+
+The field worth reading this milestone for. The wire does **not** carry
+`Item.dbc`'s `BuyPrice`; the server applies the buyer's reputation discount
+first, and the arithmetic is unmistakable across three very different values:
+
+| item | `BuyPrice` | on the wire |
+|---|---|---|
+| Refreshing Spring Water | 25 | 23 |
+| Dwarven Mild | 500 | 475 |
+| Moonberry Juice | 2000 | 1900 |
+
+`BuyPrice * 0.95`, truncated. A client that displayed the table's number would
+be wrong for every player at any standing but neutral, and nothing about the
+result would look wrong -- the numbers are all plausible. This is the same
+class of hazard as a fabricated tooltip value, and the rule falls out the same
+way: **the wire is authoritative for price and the table is not.** The test
+asserts the relationship rather than three constants, and asserts the table's
+value is *not* what arrives, so nobody "fixes" it back.
+
+#### A bug in the instrument, found by the fixture moving
+
+`--gossip` walked to *exactly* its interaction reach and then asked whether it
+was within it. With the NPCs spawned at the caller's feet that never mattered;
+with `Facetest` standing 4.04 units from an innkeeper and the reach set to 4.0,
+it produced three rounds of "closing 0.0 units" and then refused to send -- a
+loop asymptotically approaching the threshold it was waiting to cross.
+
+The fix is two numbers instead of one: the range the *server* will talk from,
+which is what the send is tested against, and a closer distance the walk aims
+for. Walking past the line rather than up to it. Collapsing a limit and a
+target into one constant is the same mistake as a smoothing constant that is a
+maximum speed -- it looks right until the input sits exactly on it.
+
+#### What is still missing
+
+Buying and selling. The stock list is readable and nothing can be purchased
+yet, so `CMSG_BUY_ITEM` and `CMSG_SELL_ITEM` are next -- both confirmable by
+effect, since the item lands in the slot array and `PLAYER_FIELD_COINAGE`
+moves, and both of those are already read. Quests follow.
+
+
 ## The road to a native Questie
 
 A destination worth writing down, because it changes what "done" means for the

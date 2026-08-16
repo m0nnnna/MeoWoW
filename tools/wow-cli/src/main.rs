@@ -316,6 +316,21 @@ enum Command {
         /// `creature_template` is keyed by anyway.
         #[arg(long, num_args = 0..=1, default_missing_value = "0")]
         gossip: Option<u32>,
+        /// After greeting, choose this menu option and report what comes back.
+        ///
+        /// **The number is the server's own option id**, exactly as `--gossip`
+        /// prints it, and *not* a row position: a filtered menu leaves holes in
+        /// the numbering, so counting from the top asks for the wrong line. The
+        /// menu id is taken from the reply rather than from anything typed
+        /// here, so the request cannot name a menu the greeting did not
+        /// produce.
+        ///
+        /// `--gossip 295 --gossip-select 3` chooses an innkeeper's
+        /// `I want to browse your goods.`, which is the cheapest route to a
+        /// vendor list: the answer is a different opcode carrying stock, so
+        /// nothing but a correctly understood selection could have caused it.
+        #[arg(long)]
+        gossip_select: Option<u32>,
         /// After entering, find which update field carries the character's
         /// appearance by searching for the answer the character list gives.
         ///
@@ -761,6 +776,7 @@ fn main() -> Result<()> {
             swap,
             loot,
             gossip,
+            gossip_select,
             target,
             own_fields,
             until_death,
@@ -802,6 +818,7 @@ fn main() -> Result<()> {
                 swap: swap.as_deref(),
                 loot: *loot,
                 gossip: *gossip,
+                gossip_select: *gossip_select,
 
                 target: target.as_deref(),
                 own_fields: *own_fields,
@@ -966,6 +983,7 @@ struct WorldRequest<'a> {
     swap: Option<&'a str>,
     loot: bool,
     gossip: Option<u32>,
+    gossip_select: Option<u32>,
     target: Option<&'a str>,
     own_fields: bool,
     until_death: bool,
@@ -1055,6 +1073,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         swap,
         loot,
         gossip,
+        gossip_select,
         target,
         own_fields,
         until_death,
@@ -1860,7 +1879,14 @@ cast {spell_id} at {} (attempt {attempt})",
             // nearest. A real creature entry is never 0, so the two cannot be
             // confused.
             let prefer = (entry != 0).then_some(entry);
-            survey_gossip(&mut connection, &mut state, character.guid, &mut here, prefer)?;
+            survey_gossip(
+                &mut connection,
+                &mut state,
+                character.guid,
+                &mut here,
+                prefer,
+                gossip_select,
+            )?;
         }
 
         if unit_fields {
@@ -2858,13 +2884,31 @@ fn survey_gossip(
     // what *different* NPCs answer is the whole method for naming the flag
     // bits, since nothing else can distinguish them.
     prefer: Option<u32>,
+    // Which menu option to choose after greeting, by the **server's** option
+    // id as printed in the reply -- not a row number. `None` greets and stops.
+    select: Option<u32>,
 ) -> Result<()> {
-    // How close the server wants a client to be before it will talk. Not
-    // measured -- it is a server-side constant this client cannot observe --
-    // so it is used only to decide whether sending is *worth* it, never to
-    // explain a refusal. Slightly under the usual 5 so that a creature drifting
-    // a step while the walk finishes does not put us over.
-    const TALK_REACH: f32 = 4.0;
+    // **Two distances, and collapsing them into one was a real bug.**
+    //
+    // `INTERACT_RANGE` is how far the server will talk from -- a server-side
+    // constant this client cannot observe, so it is used only to decide
+    // whether sending is worth it and never to explain a refusal.
+    // `APPROACH_TO` is where the walk aims, and it has to be *comfortably
+    // inside* that.
+    //
+    // The first version used one number for both, so the approach closed
+    // `distance - reach` and arrived at exactly the edge. An NPC 4.04 units
+    // away with a reach of 4.0 then produced three rounds of "closing 0.0
+    // units" and a refusal to send -- a loop asymptotically approaching the
+    // threshold it was waiting to cross. Walking past the line rather than up
+    // to it is the whole fix, and it is the same shape as any controller that
+    // must not settle on its own set point.
+    const INTERACT_RANGE: f32 = 5.0;
+    const APPROACH_TO: f32 = 3.0;
+    // Below this, a walk is not worth sending: the server rounds, creatures
+    // drift, and a stream of sub-metre corrections is indistinguishable from
+    // the stall above.
+    const WORTH_WALKING: f32 = 0.5;
     const RUN_SPEED: f32 = 7.0;
     // Same reason as `--attack`'s: an NPC that wanders is not where the walk
     // aimed by the time the walk ends.
@@ -2935,11 +2979,18 @@ fn survey_gossip(
         };
         let d = ((there.x - here.x).powi(2) + (there.y - here.y).powi(2)).sqrt();
         distance = Some(d);
-        if d <= TALK_REACH {
+        // Already close enough to be answered: do not walk at all. This is
+        // the test the *send* depends on, and it is deliberately the server's
+        // range rather than the walk's target.
+        if d <= INTERACT_RANGE {
             break;
         }
         let heading = (there.y - here.y).atan2(there.x - here.x);
-        let close = d - TALK_REACH;
+        // Aim past the threshold, not at it -- see APPROACH_TO.
+        let close = d - APPROACH_TO;
+        if close < WORTH_WALKING {
+            break;
+        }
         println!(
             "\n  approach {}: closing {close:.1} units on {chosen:#x}",
             attempt + 1
@@ -2963,7 +3014,7 @@ fn survey_gossip(
         }
     }
 
-    let Some(distance) = distance.filter(|d| *d <= TALK_REACH) else {
+    let Some(distance) = distance.filter(|d| *d <= INTERACT_RANGE) else {
         // Refused loudly rather than attempted. A greeting sent from here
         // would be declined for range, and that decline is a silence -- which
         // is indistinguishable from the opcode being wrong. Better to send
@@ -2971,7 +3022,7 @@ fn survey_gossip(
         match distance {
             Some(d) => {
                 println!("\n{chosen:#018x} is still {d:.1} units away after {APPROACHES} approach(es),");
-                println!("past the {TALK_REACH:.0}-unit reach. Not sending: a refusal at this range");
+                println!("past the {INTERACT_RANGE:.0}-unit reach. Not sending: a refusal at this range");
                 println!("would be indistinguishable from an opcode the server ignored.");
             }
             None => {
@@ -3123,6 +3174,122 @@ fn survey_gossip(
     }
 
     state.replicate(&batch, None);
+
+    // **Then choose a line, if one was asked for.**
+    //
+    // The menu id and the option index both come out of the reply just
+    // parsed rather than from anything the caller typed about the menu --
+    // the caller names an option and this looks it up. That is not
+    // convenience: an option index is the *server's* id and a filtered menu
+    // leaves holes in the numbering, so a number invented here would ask for
+    // a different line than the one printed above, and the printout would
+    // look right.
+    if let Some(wanted) = select {
+        let Some(menu) = batch
+            .iter()
+            .filter(|p| p.opcode == world::opcode::server::GOSSIP_MESSAGE)
+            .find_map(|p| world::gossip::parse_gossip_message(&p.body).ok())
+        else {
+            println!("\nnothing to select from -- no menu came back.");
+            return Ok(());
+        };
+
+        let Some(option) = menu.options.iter().find(|o| o.index == wanted) else {
+            println!("\nthis menu has no option {wanted}. It offers: {:?}",
+                menu.options.iter().map(|o| o.index).collect::<Vec<_>>());
+            println!("Those are the server's own ids, not row numbers -- see");
+            println!("ClientOpcode::GossipSelectOption for why that distinction bites.");
+            return Ok(());
+        };
+
+        println!("\nchoosing option {} of menu {}: {:?}", option.index, menu.menu_id, option.message);
+        if option.coded != 0 {
+            println!("  note: this option is *coded* -- the original client would");
+            println!("  open a text box for it, and this sends an empty string.");
+        }
+        connection.gossip_select(chosen, menu.menu_id, option.index)?;
+        let after = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+
+        println!("\nbodies of everything unexpected after the choice:");
+        let mut shown = 0;
+        for packet in &after {
+            if NOISE.contains(&packet.opcode) {
+                continue;
+            }
+            println!(
+                "  {} ({:#06x}), {} bytes",
+                world::opcode::describe(packet.opcode),
+                packet.opcode,
+                packet.body.len()
+            );
+            println!("    {}", hex_preview(&packet.body, 512));
+            shown += 1;
+            if shown >= 24 {
+                println!("  ... stopping after {shown}");
+                break;
+            }
+        }
+        if shown == 0 {
+            println!("  none. A choice that is understood does *something* --");
+            println!("  a new menu, a stock list, a quest. Silence here is the");
+            println!("  same three-way ambiguity the greeting had: wrong opcode,");
+            println!("  wrong body, or an option the server declined.");
+        }
+
+        // Now that the layout is known, say what the vendor actually stocks --
+        // while still dumping the raw body above, for the usual reason.
+        for packet in &after {
+            if packet.opcode != world::opcode::server::LIST_INVENTORY {
+                continue;
+            }
+            match world::vendor::parse_vendor_list(&packet.body) {
+                Ok(list) => {
+                    println!("\nvendor {:#018x} stocks {} item(s):", list.vendor, list.items.len());
+                    for item in &list.items {
+                        println!(
+                            "  slot {:>2}: entry {:>6} (display {:>6}) {:>8} copper, {} per buy, stock {}{}",
+                            item.slot,
+                            item.entry,
+                            item.display_id,
+                            item.price,
+                            item.buy_count,
+                            match item.remaining {
+                                Some(left) => left.to_string(),
+                                None => "unlimited".into(),
+                            },
+                            match item.extended_cost {
+                                Some(row) => format!(", extended cost {row}"),
+                                None => String::new(),
+                            },
+                        );
+                    }
+                    // **The price is the discounted one and the table's is
+                    // not**, so the cross-check has to be stated as the
+                    // relationship rather than as equality -- somebody
+                    // comparing these to `BuyPrice` and finding them lower
+                    // should find the explanation here rather than file a bug.
+                    println!("  cross-check: SELECT item FROM npc_vendor WHERE entry={entry} ORDER BY slot;");
+                    println!("               SELECT entry,displayid,BuyPrice FROM item_template WHERE entry IN (...);");
+                    println!("  note: prices above are AFTER the buyer's reputation discount,");
+                    println!("        so they are *below* item_template.BuyPrice. That is correct.");
+                }
+                Err(error) => println!("\nSMSG_LIST_INVENTORY did not parse: {error}"),
+            }
+        }
+
+        println!("\nevery opcode seen after the choice:");
+        let mut seen_after: std::collections::BTreeMap<u16, usize> = Default::default();
+        for packet in &after {
+            *seen_after.entry(packet.opcode).or_default() += 1;
+        }
+        for (opcode, count) in &seen_after {
+            println!(
+                "  {:<34} ({opcode:#06x}) x{count}",
+                world::opcode::describe(*opcode)
+            );
+        }
+        state.replicate(&after, None);
+    }
     Ok(())
 }
 

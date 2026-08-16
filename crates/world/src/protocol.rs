@@ -95,6 +95,15 @@ pub enum Error {
     UnconfirmedSwingDamageBlocks { count: u8 },
     #[error("SMSG_POWER_UPDATE: power type {got} is past the end of the power array")]
     UnknownPowerType { got: u8 },
+    #[error(
+        "SMSG_LIST_INVENTORY: {count} rows need {expected} bytes but the body has {got} left -- \
+         the row count and the body disagree, so the header is not where this parser thinks"
+    )]
+    VendorRowCount {
+        count: u8,
+        expected: usize,
+        got: usize,
+    },
 }
 
 /// A bounds-checked cursor over a packet body.

@@ -242,6 +242,27 @@ pub enum ClientOpcode {
     /// alongside whatever comes back, to keep those three apart.
     GossipHello = 0x017B,
 
+    /// Choose a line from the menu a greeting produced.
+    ///
+    /// Body is `{u64 npc guid, u32 menu id, u32 option index}`, followed by a
+    /// null-terminated string when the option is a *coded* one -- a bank name,
+    /// a guild name -- and by an empty one otherwise.
+    ///
+    /// **The index is the server's own option id and never a row position.**
+    /// It comes from [`GossipOption::index`](crate::GossipOption), and menu
+    /// 1291 is the standing proof of why: it has four rows in the database,
+    /// the server filters one out for the season, and the three that arrive
+    /// are numbered 1, 2 and 3 with the numbering *not* closed up. A client
+    /// that sent a row number would ask for the wrong thing, and only at NPCs
+    /// whose menus are conditional. The menu id travels too, so the server can
+    /// tell which menu the answer belongs to.
+    ///
+    /// Confirmed by effect and the effect is loud: choosing an innkeeper's
+    /// `I want to browse your goods.` produces `SMSG_LIST_INVENTORY`, a
+    /// different opcode carrying a stock list, which nothing but a correctly
+    /// understood selection would have caused.
+    GossipSelectOption = 0x017C,
+
     /// Ask the server where this character's body is. Empty request; the
     /// reply shares the opcode.
     ///
@@ -299,6 +320,17 @@ pub mod server {
     /// Farley produced a body carrying his menu id, his three menu options and
     /// their icons, all of which the database independently agrees with.
     pub const GOSSIP_MESSAGE: u16 = 0x017D;
+
+    /// A vendor's stock list. See [`crate::vendor`] for the layout and how
+    /// every field of it was checked.
+    ///
+    /// **Identified by content and by cause at once.** It arrived in answer to
+    /// a gossip option reading `I want to browse your goods.`, so a reply at
+    /// all confirms `CMSG_GOSSIP_SELECT_OPTION`; and its body holds exactly
+    /// the twelve rows the server's own `npc_vendor` table lists for that
+    /// creature, in order, each pairing an item entry with the display id
+    /// `Item.dbc` independently gives it.
+    pub const LIST_INVENTORY: u16 = 0x019F;
 
     /// What the sky is doing: a state, an intensity, and whether it changed
     /// abruptly. Sent on entering a zone and whenever the zone's weather turns.
@@ -517,6 +549,7 @@ pub fn describe(opcode: u16) -> String {
         server::LOOT_REMOVED => "SMSG_LOOT_REMOVED",
         server::LOOT_CLEAR_MONEY => "SMSG_LOOT_CLEAR_MONEY",
         server::GOSSIP_MESSAGE => "SMSG_GOSSIP_MESSAGE",
+        server::LIST_INVENTORY => "SMSG_LIST_INVENTORY",
         server::CHAR_CREATE => "SMSG_CHAR_CREATE",
         server::CHAR_DELETE => "SMSG_CHAR_DELETE",
         server::CHARACTER_LOGIN_FAILED => "SMSG_CHARACTER_LOGIN_FAILED",

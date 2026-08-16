@@ -789,6 +789,28 @@ impl Connection {
         self.send(ClientOpcode::GossipHello, &target.to_le_bytes())
     }
 
+    /// Chooses a line from the menu a greeting produced.
+    ///
+    /// `option` is the **server's** option id, straight off
+    /// [`GossipOption::index`](crate::GossipOption) -- not a position in
+    /// whatever list a caller built. See
+    /// [`ClientOpcode::GossipSelectOption`]: a filtered menu leaves holes in
+    /// the numbering, so re-indexing picks the wrong line.
+    ///
+    /// `menu` is the id from the same reply, sent back so the server knows
+    /// which menu is being answered. The trailing empty string is the box
+    /// text a *coded* option would carry; every option observed so far has
+    /// `coded == 0`, and sending an empty one is what a client with nothing
+    /// to type does.
+    pub fn gossip_select(&mut self, target: u64, menu: u32, option: u32) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(17);
+        body.extend_from_slice(&target.to_le_bytes());
+        body.extend_from_slice(&menu.to_le_bytes());
+        body.extend_from_slice(&option.to_le_bytes());
+        body.push(0);
+        self.send(ClientOpcode::GossipSelectOption, &body)
+    }
+
     /// Acknowledges a teleport within the current map.
     ///
     /// **The server will not finish the move until this arrives, and will

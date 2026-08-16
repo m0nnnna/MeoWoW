@@ -25,12 +25,14 @@ pub mod query;
 pub mod spell;
 pub mod state;
 pub mod update;
+pub mod vendor;
 pub mod weather;
 
 pub use chat::{ChatMessage, ChatType};
 pub use client::{Connection, DEFAULT_PORT};
 pub use crypt::HeaderCrypt;
 pub use gossip::{Gossip, GossipOption, GossipQuest};
+pub use vendor::{VendorItem, VendorList};
 pub use inventory::{Carried, HeldItem, InventorySlot, SlotKind, Where};
 pub use loot::{Loot, LootItem};
 pub use movement::MovementInfo;

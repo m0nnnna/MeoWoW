@@ -876,3 +876,57 @@ check that the character asking could have exhibited it.
 `CMSG_GOSSIP_SELECT_OPTION`, so the menu can be read and not clicked. The
 greeting text id resolves to nothing without the `npc_text` query. Vendor lists,
 buying, selling and the quest flow past this one-line summary are all untouched.
+
+## Choosing a gossip option, and a vendor's stock
+
+`CMSG_GOSSIP_SELECT_OPTION` (`0x017C`) carries
+`{u64 npc guid, u32 menu id, u32 option index}` plus a trailing string for
+*coded* options — the ones the original client opens a text box for. Empty for
+everything observed.
+
+**The option index is the server's own id, taken from the reply.** Menu 1291
+has four rows in the database and sends three, numbered 1, 2 and 3 with the
+filtered row's number left as a hole, so a client that counted rows would ask
+for a different line than the one it displayed. The menu id travels back too, so
+the server knows which menu is being answered.
+
+Nothing acknowledges a selection. It is confirmed by an effect that could not
+have happened otherwise: choosing `I want to browse your goods.` produces a
+stock list under a *different opcode*.
+
+### `SMSG_LIST_INVENTORY` (`0x019F`)
+
+```
+u64 vendor guid
+u8  row count
+  u32 slot            the vendor's own slot, and the handle a purchase uses
+  u32 entry           item_template.entry / Item.dbc row
+  u32 display id      ItemDisplayInfo row -- pairs with the entry
+  i32 remaining       -1 means an endless supply
+  u32 price           in copper, AFTER the reputation discount
+  u32 unknown         zero on every row observed; deliberately unnamed
+  u32 buy count       how many one purchase gives
+  u32 extended cost   ItemExtendedCost row, 0 for a plain money price
+```
+
+Thirty-two bytes a row. Farley's reply was 393 = `8 + 1 + 12 * 32` exactly, its
+twelve rows are the twelve in `npc_vendor` for that creature in the same order,
+and every entry/display pair agrees with `Item.dbc`. One of them — 2070 with
+6353 — is the same pair that independently confirmed `SMSG_LOOT_RESPONSE`.
+
+### The price is not the table's price
+
+The server applies the buyer's reputation discount before sending:
+`BuyPrice * 0.95`, truncated. 25 arrives as 23, 500 as 475, 2000 as 1900.
+
+**Use the wire value.** A client that displayed `Item.dbc`'s `BuyPrice` would
+show the wrong number to every player at any standing other than neutral, and
+every number it showed would still look plausible — the same hazard as a
+fabricated tooltip value, which is why this project passes unresolved tokens
+through with their `$` intact rather than inventing figures.
+
+### Not sent yet
+
+`CMSG_BUY_ITEM` and `CMSG_SELL_ITEM`. Both are confirmable by effect — the item
+lands in the slot array and `PLAYER_FIELD_COINAGE` moves, and both are already
+read.
