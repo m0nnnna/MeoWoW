@@ -14,6 +14,19 @@
 *.adt
 *.wdt
 
+# **A screenshot of the game is a game asset**, and this list did not say so
+# until two of them had been committed, pushed, and then removed from the
+# history. Every pixel in one is Blizzard's art; the rule was always meant to
+# cover them and only ever named the file formats the archives use.
+#
+# Take them, keep them, put them in a release page or an issue -- just not in
+# this repository. 5.6MB of somebody else's artwork was living in the history
+# of a project whose first rule is not to ship any.
+/screenshots/
+*.png
+*.jpg
+*.jpeg
+
 # Machine-local build config (target-dir redirect); see docs/BUILDING.md
 /.cargo/config.toml
 

@@ -66,7 +66,7 @@ impl Gpu {
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("open-wow device"),
+                label: Some("MeoWoW device"),
                 required_features: features,
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,

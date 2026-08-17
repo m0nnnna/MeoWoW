@@ -2729,7 +2729,7 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("open-wow viewer")
+            .with_title("MeoWoW")
             .with_inner_size(winit::dpi::LogicalSize::new(
                 self.args.width,
                 self.args.height,
@@ -6589,7 +6589,7 @@ impl App {
                 },
             );
 
-            egui::Window::new("open-wow")
+            egui::Window::new("MeoWoW")
                 // Over the interface rather than in among it: a window's
                 // default order is now where the playing frames live, and a
                 // stats readout buried under an action bar is a stats readout

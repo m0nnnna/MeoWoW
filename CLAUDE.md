@@ -1,7 +1,15 @@
-# open-wow-client
+# MeoWoW
+
+*The open source WoW client for cats.*
 
 Open-source reimplementation of the WoW 3.3.5a (build 12340) client in Rust.
 Client only — no server, no bundled assets.
+
+**The name is the product's, not the tree's.** The directory, the crates and
+the binaries are still `open-wow-client`, `wow-viewer` and `wow-cli`, and the
+layout still lives in `%APPDATA%\open-wow\ui.toml` — renaming that last one
+would orphan every existing arrangement of bars and frames for nothing. What
+changed is what a person sees: the window, the README, this file.
 
 ## Where the project is
 

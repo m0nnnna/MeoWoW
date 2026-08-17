@@ -7,7 +7,7 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/floofywolf/open-wow-client"
+repository = "https://github.com/m0nnnna/MeoWoW"
 
 [workspace.dependencies]
 # Generic plumbing only. Every WoW-specific format is implemented in-tree

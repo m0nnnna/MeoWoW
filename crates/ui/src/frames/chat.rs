@@ -166,7 +166,7 @@ pub fn placeholder() -> Vec<ChatEntry> {
         ChatEntry {
             kind: ChatKind::System,
             who: None,
-            text: "Welcome to open-wow.".into(),
+            text: "Welcome to MeoWoW.".into(),
             prefix: None,
         },
         ChatEntry {

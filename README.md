@@ -1,4 +1,6 @@
-# open-wow-client
+# MeoWoW
+
+*The open source WoW client for cats.*
 
 An open-source reimplementation of the World of Warcraft 3.3.5a (build 12340)
 client, written from scratch in Rust.
@@ -8,9 +10,13 @@ the 3.3.5a data files you already own, exactly as
 [OpenMW](https://openmw.org/) does for Morrowind. It talks to existing
 3.3.5a-compatible servers.
 
-> **Status: the world renders.** Reads a real installation's data and streams
-> Azeroth as you fly across it -- terrain, buildings, doodads, animated
-> creatures. No networking or UI yet. See [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status: it plays.** Every data format reads, the world renders and streams,
+> and the protocol reaches a live realm: log in, walk around, see other
+> players move, cast spells, swing a sword. A native interface -- unit frames,
+> chat, a spellbook, action bars -- draws over it, with no `FrameXML` and no
+> addons. Roughly 58% of the way to something a person could sit down and
+> play. See [docs/ROADMAP.md](docs/ROADMAP.md) for the milestone ladder and
+> what's still missing (inventory, quests, most spell effects).
 
 ## What works today
 
@@ -20,9 +26,11 @@ the 3.3.5a data files you already own, exactly as
   installation in the client's load order, including delete markers, so
   patches correctly shadow *and remove* base content.
 
-- **DBC tables** — the client's database files, with typed schemas for `Map`,
-  `AreaTable`, `Spell`, `CreatureDisplayInfo`, and `CreatureModelData`, plus
-  column-type inference for transcribing the ones that have no schema yet.
+- **DBC tables** — the client's database files. 18 tables have typed schemas
+  (`Map`, `Spell` and its duration/radius siblings, the creature and
+  character-customisation tables, `Item`/`ItemDisplayInfo`, the lighting
+  tables, and more), verified with `wow-cli dbc check`; column-type inference
+  transcribes the rest of the 245 tables in the install on demand.
 - **BLP textures** — DXT1/3/5, palettized at every alpha depth, and raw BGRA,
   with PNG export. Compressed blocks are also exposed unmodified, so the
   renderer can hand them to the GPU without a CPU decode.
@@ -36,6 +44,25 @@ the 3.3.5a data files you already own, exactly as
   materials, render batches, collision separation, and doodad sets.
 - **ADT terrain** — WDT tile maps, height fields, texture layers with their
   alpha maps, and the doodad and world-object placements that fill the world.
+
+- **Protocol** — SRP6 login against the auth server, the realm list, the world
+  handshake and its RC4 header cipher, movement (walk, strafe, jump, fall),
+  chat, spellcasting, melee combat, and a replicated `WorldState` that folds
+  every packet into the world other players and creatures actually see:
+  creatures slide along their real path and play the model's own walk/stand
+  cycles. Confirmed against a live realm with two clients at once, including
+  one watching the other move.
+- **Interface** — a native, from-scratch UI with no addon support: player and
+  target unit frames, click-to-target, a chat window, three action bars with
+  real spell icons, hover tooltips, a cooldown sweep, and a spellbook you build
+  the bars from. Every position, size and colour is a plain number in
+  `ui.toml`, editable by hand or by dragging frames in-game. See
+  [docs/UI.md](docs/UI.md).
+- **Game** — auto-attack and swing-timer melee with a named combat log, spell
+  casting off real `Spell.dbc` data (82% of its description templates
+  resolve), and a player character drawn in third person with its own chosen
+  face, skin, hair and gear -- weapon included, drawn on the correct attachment
+  bone and sheathed to the position `Item.dbc` names for it.
 
 Verified against a stock build 12340 install: 203,949 paths, of which 198,827
 read and decompress cleanly (21.4 GiB) and 5,121 are correctly masked by patch
@@ -81,6 +108,23 @@ cargo run -p wow-viewer -- --screenshot frame.png --creature 1216 --yaw 0
 Drag to orbit, scroll to zoom. DXT textures are handed to the GPU as `Bc1/2/3`
 blocks with no CPU decode, and the overlay reports which path each texture took
 and why. See [docs/RENDERING.md](docs/RENDERING.md).
+
+## Playing on a realm
+
+Point the same viewer at a running 3.3.5a-compatible server instead of a bare
+tile, and it logs in, enters the world, and streams whatever the server says
+is around you:
+
+```console
+cargo run -p wow-viewer -- --realm-host <host> --user <account> --character <name>
+```
+
+`W`/`S` walk, `A`/`D` turn, `Q`/`E` strafe, `Space` jumps, right-drag steers
+while left-drag swings the camera, left-click selects and right-click
+attacks. `Enter` opens a chat line, `P` opens the spellbook, `F1` unlocks the
+interface for dragging. `wow-cli world` and `wow-cli auth` do the login half
+headlessly, for scripting or for checking a capture without a window. See
+[docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Getting started
 
