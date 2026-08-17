@@ -45,11 +45,12 @@ pub enum ElementId {
     Loot,
     QuestLog,
     Questgiver,
+    WorldMap,
     ReleasePrompt,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 14] = [
+    pub const ALL: [ElementId; 15] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -63,6 +64,7 @@ impl ElementId {
         ElementId::Loot,
         ElementId::QuestLog,
         ElementId::Questgiver,
+        ElementId::WorldMap,
         ElementId::ReleasePrompt,
     ];
 
@@ -92,6 +94,7 @@ impl ElementId {
             ElementId::Loot => "loot",
             ElementId::QuestLog => "quest-log",
             ElementId::Questgiver => "questgiver",
+            ElementId::WorldMap => "world-map",
             ElementId::ReleasePrompt => "release-prompt",
         }
     }
@@ -116,6 +119,7 @@ impl ElementId {
             ElementId::Loot => "Loot",
             ElementId::QuestLog => "Quest log",
             ElementId::Questgiver => "Questgiver",
+            ElementId::WorldMap => "World map",
             ElementId::ReleasePrompt => "Release-spirit prompt",
         }
     }
@@ -243,6 +247,15 @@ impl ElementId {
             ElementId::Questgiver => Element {
                 anchor: Anchor::Top,
                 offset: [0.0, 16.0],
+                ..Default::default()
+            },
+            // Dead centre, and the only window here that wants to be: a map
+            // is read stopped, it is the largest frame in the interface, and
+            // anchoring it to a corner would put half of it off a small
+            // screen at any scale above one.
+            ElementId::WorldMap => Element {
+                anchor: Anchor::Center,
+                offset: [0.0, 0.0],
                 ..Default::default()
             },
         }

@@ -78,6 +78,9 @@ enum Command {
     /// Inspect terrain.
     #[command(subcommand)]
     Adt(AdtCommand),
+    /// Inspect world map pages and the world-to-page projection.
+    #[command(subcommand)]
+    Map(MapCommand),
     /// Resolve the lighting that applies at a place and an hour.
     ///
     /// Prints every colour and scalar curve owned by the chosen light, sampled
@@ -638,6 +641,65 @@ enum AdtCommand {
 }
 
 #[derive(Subcommand)]
+enum MapCommand {
+    /// List every page: the world rectangle it shows and where its art lives.
+    Pages {
+        /// Only pages on this `Map.dbc` id.
+        #[arg(long)]
+        map: Option<u32>,
+        /// Only pages whose directory contains this.
+        filter: Option<String>,
+    },
+    /// Resolve a world position to a page and a pixel on it.
+    ///
+    /// Prints every step -- which pages contain the point, which one wins, the
+    /// fraction and then the pixel -- because a pin in the wrong place because
+    /// the wrong *page* was chosen and one in the wrong place because the
+    /// projection is wrong look identical as a single coordinate, and want
+    /// opposite investigations. Same reasoning as `adt height`.
+    Locate {
+        #[arg(long, default_value_t = 0)]
+        map: u32,
+        /// Clap reads a bare negative number as a flag, so pass `--x=-8950`.
+        #[arg(long, allow_hyphen_values = true)]
+        x: f32,
+        #[arg(long, allow_hyphen_values = true)]
+        y: f32,
+    },
+    /// Measure how much of a page's twelve tiles is art rather than padding.
+    ///
+    /// The tiles make a 1024x768 image and the picture stops short of its
+    /// right and bottom edges, so a client that treats the whole grid as the
+    /// map puts every pin a couple of percent off -- small enough to look like
+    /// something else and never to fail. The art states where it ends, in its
+    /// own alpha channel, so this asks it rather than assuming.
+    Canvas {
+        /// Page directory, e.g. `Elwynn`. Omit to check every page.
+        directory: Option<String>,
+    },
+    /// Fit the world-to-page projection against the terrain, and report it.
+    ///
+    /// **The experiment that chose the projection, kept so it can be re-run.**
+    /// Every `WorldMapOverlay` row states in page pixels where an area sits;
+    /// every terrain chunk states in world coordinates which area it belongs
+    /// to. Projecting the second and regressing it against the first fits a
+    /// slope and an offset per axis.
+    ///
+    /// It presupposes neither answer it is testing. A flipped axis fits a
+    /// **negative** slope, and the page's pixel size is whatever the slope's
+    /// magnitude comes out as rather than a number chosen in advance -- so
+    /// this can refute the projection instead of agreeing with it, which is
+    /// the only kind of check worth running.
+    Calibrate {
+        /// Map directory, e.g. `Azeroth`. Omit for every map with pages.
+        map: Option<String>,
+        /// Report every page's own fit as well as the totals.
+        #[arg(long)]
+        verbose: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum WmoCommand {
     /// Show a root file and its groups.
     Info {
@@ -998,6 +1060,7 @@ fn main() -> Result<()> {
         Command::Spell(cmd) => spell_cmd(&mut chain, &cmd),
         Command::Wmo(cmd) => wmo_cmd(&mut chain, cmd),
         Command::Adt(cmd) => adt_cmd(&mut chain, cmd),
+        Command::Map(cmd) => map_cmd(&mut chain, cmd),
         Command::Light {
             map,
             x,
@@ -2029,7 +2092,7 @@ cast {spell_id} at {} (attempt {attempt})",
         }
 
         if quest_poi {
-            survey_quest_poi(&mut connection, &mut state, character.guid)?;
+            survey_quest_poi(&mut connection, &mut state, character.guid, data, locale)?;
         }
 
         for quest in quest_info {
@@ -3281,6 +3344,8 @@ fn survey_quest_poi(
     connection: &mut world::Connection,
     state: &mut world::WorldState,
     own_guid: u64,
+    data: Option<&std::path::Path>,
+    locale: &str,
 ) -> Result<()> {
     let log = quest_log_ids(state, own_guid);
     println!("\nquest log holds {} quest(s): {log:?}", log.len());
@@ -3306,6 +3371,68 @@ fn survey_quest_poi(
         return Ok(());
     };
     println!("\nSMSG_QUEST_POI_QUERY_RESPONSE, {} bytes", reply.body.len());
+
+    let sets = world::quest::parse_quest_poi(&reply.body)?;
+    println!(
+        "{} quest(s) answered, {} marker(s), {} point(s)",
+        sets.len(),
+        sets.iter().map(|s| s.markers.len()).sum::<usize>(),
+        sets.iter()
+            .flat_map(|s| &s.markers)
+            .map(|m| m.points.len())
+            .sum::<usize>()
+    );
+
+    // The projection, from the same module the viewer draws with rather than
+    // recomputed here -- two copies of a coordinate transform agree only until
+    // one of them changes, and this exists to check the one the window uses.
+    let atlas = match data {
+        Some(data) => {
+            let mut chain = Chain::open_wow_data(data, locale)
+                .with_context(|| format!("opening archives under {}", data.display()))?;
+            Some(load_atlas(&mut chain)?)
+        }
+        None => {
+            println!(
+                "\n(pass --data or set WOW_DATA to see where each marker lands on \
+                 its page; WorldMapArea.dbc is what turns a world coordinate into \
+                 a pixel)"
+            );
+            None
+        }
+    };
+
+    for set in &sets {
+        println!("\nquest {}: {} marker(s)", set.quest_id, set.markers.len());
+        for poi in &set.markers {
+            let page = atlas.as_ref().and_then(|a| a.page(poi.world_map_area_id));
+            let name = page.map_or_else(
+                || "no such page".to_string(),
+                |page| page.directory.clone(),
+            );
+            println!(
+                "  marker {} objective {:?} map {} page {} ({name}) {} point(s)",
+                poi.id,
+                poi.objective_index,
+                poi.map_id,
+                poi.world_map_area_id,
+                poi.points.len()
+            );
+            let Some(page) = page else { continue };
+            // Every point, not a centroid: a marker whose points are right and
+            // whose middle is wrong and one whose points are all wrong look
+            // the same from a single averaged number.
+            for (x, y) in &poi.points {
+                let (px, py) = page.project_pixels(*x as f32, *y as f32);
+                let on_page = (0.0..=dbc::worldmap::PAGE_WIDTH).contains(&px)
+                    && (0.0..=dbc::worldmap::PAGE_HEIGHT).contains(&py);
+                println!(
+                    "    world {x:>7}, {y:>7}  ->  pixel {px:>7.1}, {py:>7.1}{}",
+                    if on_page { "" } else { "   OFF THE PAGE" }
+                );
+            }
+        }
+    }
 
     Ok(())
 }
@@ -6386,6 +6513,410 @@ fn adt_survey(chain: &mut Chain, map: Option<&str>, limit: Option<usize>) -> Res
         }
     }
     Ok(())
+}
+
+fn map_cmd(chain: &mut Chain, cmd: MapCommand) -> Result<()> {
+    match cmd {
+        MapCommand::Pages { map, filter } => map_pages(chain, map, filter.as_deref()),
+        MapCommand::Locate { map, x, y } => map_locate(chain, map, x, y),
+        MapCommand::Canvas { directory } => map_canvas(chain, directory.as_deref()),
+        MapCommand::Calibrate { map, verbose } => map_calibrate(chain, map.as_deref(), verbose),
+    }
+}
+
+fn load_atlas(chain: &mut Chain) -> Result<dbc::worldmap::Atlas> {
+    use dbc::schema::WorldMapArea;
+    let table = WorldMapArea::parse(&chain.read(WorldMapArea::PATH)?)?;
+    Ok(dbc::worldmap::Atlas::from_table(&table))
+}
+
+fn map_pages(chain: &mut Chain, map: Option<u32>, filter: Option<&str>) -> Result<()> {
+    let atlas = load_atlas(chain)?;
+    let needle = filter.map(str::to_ascii_lowercase);
+    println!(
+        "{:>4}  {:>4}  {:>5}  {:<22}  {:>10} {:>10}  {:>10} {:>10}",
+        "id", "map", "area", "directory", "x_min", "x_max", "y_min", "y_max"
+    );
+    let mut shown = 0usize;
+    for page in atlas.pages() {
+        if map.is_some_and(|m| m != page.map_id) {
+            continue;
+        }
+        if needle
+            .as_deref()
+            .is_some_and(|n| !page.directory.to_ascii_lowercase().contains(n))
+        {
+            continue;
+        }
+        println!(
+            "{:>4}  {:>4}  {:>5}  {:<22}  {:>10.1} {:>10.1}  {:>10.1} {:>10.1}",
+            page.id,
+            page.map_id,
+            page.area_id,
+            page.directory,
+            page.x_min,
+            page.x_max,
+            page.y_min,
+            page.y_max
+        );
+        shown += 1;
+    }
+    println!("\n{shown} of {} pages with bounds", atlas.pages().len());
+    Ok(())
+}
+
+fn map_locate(chain: &mut Chain, map: u32, x: f32, y: f32) -> Result<()> {
+    use dbc::schema::AreaTable;
+
+    let atlas = load_atlas(chain)?;
+    let areas = AreaTable::parse(&chain.read(AreaTable::PATH)?).ok();
+    let area_name = |id: u32| -> String {
+        areas
+            .as_ref()
+            .and_then(|t| t.iter().find(|r| r.id() == id))
+            .map(|r| r.name().to_string())
+            .unwrap_or_default()
+    };
+
+    println!("map {map} at {x:.2}, {y:.2}\n");
+    println!("pages containing it, smallest first:");
+    let mut containing: Vec<_> = atlas
+        .pages()
+        .iter()
+        .filter(|p| p.map_id == map && p.contains(x, y))
+        .collect();
+    containing.sort_by(|a, b| {
+        a.world_area()
+            .partial_cmp(&b.world_area())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if containing.is_empty() {
+        println!("  none -- that position is outside every page on this map");
+    }
+    for page in &containing {
+        let kind = if page.area_id == 0 { "continent" } else { "zone" };
+        println!(
+            "  [{:>4}] {:<22} {kind:<9} {} ({})",
+            page.id,
+            page.directory,
+            page.area_id,
+            area_name(page.area_id)
+        );
+    }
+
+    match atlas.zone_page(map, x, y) {
+        Some(page) => {
+            let (u, v) = page.project(x, y);
+            let (px, py) = page.project_pixels(x, y);
+            println!("\nchosen: {} (page {})", page.directory, page.id);
+            println!("  fraction  {u:.4}, {v:.4}   (0,0 is the top left)");
+            println!(
+                "  pixel     {px:.1}, {py:.1}   of {:.0}x{:.0}",
+                dbc::worldmap::PAGE_WIDTH,
+                dbc::worldmap::PAGE_HEIGHT
+            );
+            let (col, row) = dbc::worldmap::Page::tile_grid(
+                1 + (px / 256.0).floor().max(0.0) as usize
+                    + 4 * (py / 256.0).floor().max(0.0) as usize,
+            );
+            println!("  tile      column {col}, row {row}");
+        }
+        None => println!("\nno zone page covers it"),
+    }
+    Ok(())
+}
+
+/// Measures the drawn extent of every page's tile grid from the art's alpha.
+///
+/// A tile that is entirely opaque says nothing about where the picture ends;
+/// only the tiles carrying padding do, which is why this reports the furthest
+/// opaque column and row across the whole grid rather than per tile.
+fn map_canvas(chain: &mut Chain, directory: Option<&str>) -> Result<()> {
+    use dbc::worldmap::{Page, TILE_COLUMNS, TILE_ROWS, TILE_TEXELS};
+
+    let atlas = load_atlas(chain)?;
+    let mut pages: Vec<_> = atlas.pages().to_vec();
+    if let Some(only) = directory {
+        pages.retain(|p| p.directory.eq_ignore_ascii_case(only));
+        if pages.is_empty() {
+            anyhow::bail!("no page with directory {only}");
+        }
+    }
+
+    println!(
+        "{:<24} {:>11}  {:>11}  {}",
+        "page", "content", "grid", "tiles read"
+    );
+    let mut tally: std::collections::BTreeMap<(usize, usize), usize> = Default::default();
+    for page in &pages {
+        let (mut right, mut bottom, mut read) = (0usize, 0usize, 0usize);
+        for tile in 1..=TILE_COLUMNS * TILE_ROWS {
+            let path = page.tile_path(tile);
+            let Ok(bytes) = chain.read(&path) else {
+                continue;
+            };
+            let Ok(image) = blp::Blp::parse(&bytes) else {
+                continue;
+            };
+            let (w, h) = (image.width() as usize, image.height() as usize);
+            let Some(rgba) = image.decode_rgba(0) else {
+                continue;
+            };
+            read += 1;
+            let (col, row) = Page::tile_grid(tile);
+            for y in 0..h {
+                for x in 0..w {
+                    // A fully-opaque tile is the common case and its whole
+                    // extent counts; padding is what the alpha marks out.
+                    if rgba[(y * w + x) * 4 + 3] > 127 {
+                        right = right.max(col * TILE_TEXELS + x + 1);
+                        bottom = bottom.max(row * TILE_TEXELS + y + 1);
+                    }
+                }
+            }
+        }
+        if read == 0 {
+            continue;
+        }
+        println!(
+            "{:<24} {:>5}x{:<5}  {:>5}x{:<5}  {read}",
+            page.directory,
+            right,
+            bottom,
+            TILE_COLUMNS * TILE_TEXELS,
+            TILE_ROWS * TILE_TEXELS
+        );
+        *tally.entry((right, bottom)).or_default() += 1;
+    }
+
+    println!("\ncontent rectangles seen:");
+    for ((w, h), n) in &tally {
+        println!("  {w:>5}x{h:<5}  on {n} page(s)");
+    }
+    println!(
+        "\nthis client uses {:.0}x{:.0}",
+        dbc::worldmap::PAGE_WIDTH,
+        dbc::worldmap::PAGE_HEIGHT
+    );
+    Ok(())
+}
+
+/// A least-squares fit of `observed = slope * predicted + intercept`.
+#[derive(Default, Clone, Copy)]
+struct Fit {
+    n: usize,
+    sx: f64,
+    sy: f64,
+    sxx: f64,
+    sxy: f64,
+    syy: f64,
+}
+
+impl Fit {
+    fn push(&mut self, predicted: f64, observed: f64) {
+        self.n += 1;
+        self.sx += predicted;
+        self.sy += observed;
+        self.sxx += predicted * predicted;
+        self.sxy += predicted * observed;
+        self.syy += observed * observed;
+    }
+
+    /// `(slope, intercept, r_squared)`, or `None` when the samples do not vary
+    /// enough to fit a line -- which is a real outcome, not an error: a page
+    /// whose overlays all sit in one spot says nothing about the projection.
+    fn solve(&self) -> Option<(f64, f64, f64)> {
+        let n = self.n as f64;
+        if self.n < 3 {
+            return None;
+        }
+        let denom = n * self.sxx - self.sx * self.sx;
+        if denom.abs() < 1e-9 {
+            return None;
+        }
+        let slope = (n * self.sxy - self.sx * self.sy) / denom;
+        let intercept = (self.sy - slope * self.sx) / n;
+        let ss_tot = self.syy - self.sy * self.sy / n;
+        let ss_res = self.syy - intercept * self.sy - slope * self.sxy;
+        let r2 = if ss_tot.abs() < 1e-9 {
+            1.0
+        } else {
+            1.0 - ss_res / ss_tot
+        };
+        Some((slope, intercept, r2))
+    }
+}
+
+/// Fits the projection against the terrain, per page and overall.
+fn map_calibrate(chain: &mut Chain, map: Option<&str>, verbose: bool) -> Result<()> {
+    use dbc::schema::{Map, WorldMapOverlay};
+    use std::collections::HashMap;
+
+    let atlas = load_atlas(chain)?;
+    let overlays = WorldMapOverlay::parse(&chain.read(WorldMapOverlay::PATH)?)?;
+    let map_table = Map::parse(&chain.read(Map::PATH)?)?;
+
+    // Directory names, because a page names a `Map.dbc` id and the terrain
+    // files are found by that map's folder.
+    let mut directories: Vec<(u32, String)> = map_table
+        .iter()
+        .map(|m| (m.id(), m.directory().to_string()))
+        .filter(|(_, d)| !d.is_empty())
+        .collect();
+    if let Some(only) = map {
+        directories.retain(|(_, d)| d.eq_ignore_ascii_case(only));
+        if directories.is_empty() {
+            anyhow::bail!("no map directory called {only}");
+        }
+    }
+    // Only maps that actually have pages are worth reading terrain for.
+    directories.retain(|(id, _)| atlas.pages().iter().any(|p| p.map_id == *id));
+
+    // Where every area id's terrain is, in world coordinates. Summed rather
+    // than stored per chunk: a centroid is all the fit needs and a million
+    // samples is not worth holding.
+    let mut centroids: HashMap<u32, (f64, f64, u64)> = HashMap::new();
+    for (_, directory) in &directories {
+        let Ok(wdt) = load_wdt(chain, directory) else {
+            continue;
+        };
+        let (mut tiles, mut chunks) = (0usize, 0u64);
+        for ty in 0..adt::TILES_PER_MAP {
+            for tx in 0..adt::TILES_PER_MAP {
+                if !wdt.has_tile(tx, ty) {
+                    continue;
+                }
+                let path = adt::tile_path(directory, tx, ty);
+                let Ok(bytes) = chain.read(&path) else {
+                    continue;
+                };
+                let Ok(parsed) = adt::Adt::parse(&bytes, wdt.big_alpha()) else {
+                    continue;
+                };
+                tiles += 1;
+                for chunk in &parsed.chunks {
+                    if chunk.area_id == 0 {
+                        continue;
+                    }
+                    // The chunk's stored position is its origin corner and both
+                    // axes run inwards from it, so the middle is half a chunk
+                    // *down* in each.
+                    let e = centroids.entry(chunk.area_id).or_default();
+                    e.0 += (chunk.position[0] - adt::CHUNK_SIZE / 2.0) as f64;
+                    e.1 += (chunk.position[1] - adt::CHUNK_SIZE / 2.0) as f64;
+                    e.2 += 1;
+                    chunks += 1;
+                }
+            }
+        }
+        println!("{directory}: {tiles} tiles, {chunks} chunks with an area id");
+    }
+    if centroids.is_empty() {
+        anyhow::bail!("no terrain read, so there is nothing to calibrate against");
+    }
+
+    // The four readings of the bounds. `project` is the one this client uses;
+    // the other three are what it would be with an axis reversed, and they are
+    // here so the result can come out the other way.
+    let candidates: [(&str, fn(f32, f32) -> (f32, f32)); 4] = [
+        ("as written", |u, v| (u, v)),
+        ("x flipped", |u, v| (1.0 - u, v)),
+        ("y flipped", |u, v| (u, 1.0 - v)),
+        ("both flipped", |u, v| (1.0 - u, 1.0 - v)),
+    ];
+    let mut fits = [[Fit::default(); 2]; 4];
+    let mut per_page: HashMap<u32, [[Fit; 2]; 4]> = HashMap::new();
+    let mut scored = 0usize;
+
+    for row in overlays.iter() {
+        let Some(page) = atlas.page(row.world_map_area_id()) else {
+            continue;
+        };
+        if !directories.iter().any(|(id, _)| *id == page.map_id) {
+            continue;
+        }
+        // Every area this one texture covers, pooled -- the overlay states one
+        // rectangle for the lot, so the prediction has to be the pool's
+        // centroid rather than any single area's.
+        let (mut sx, mut sy, mut n) = (0.0f64, 0.0f64, 0u64);
+        for area in [
+            row.area_id_0(),
+            row.area_id_1(),
+            row.area_id_2(),
+            row.area_id_3(),
+        ] {
+            if area == 0 {
+                continue;
+            }
+            if let Some((ax, ay, an)) = centroids.get(&area) {
+                sx += ax;
+                sy += ay;
+                n += an;
+            }
+        }
+        if n == 0 {
+            continue;
+        }
+        let (wx, wy) = (sx / n as f64, sy / n as f64);
+        // The clickable box is the honest observation: the texture rectangle
+        // is padded to a power of two, so its centre is not the area's centre.
+        let obs_x = (row.hit_left() + row.hit_right()) as f64 / 2.0;
+        let obs_y = (row.hit_top() + row.hit_bottom()) as f64 / 2.0;
+        if row.hit_right() <= row.hit_left() || row.hit_bottom() <= row.hit_top() {
+            continue;
+        }
+        let (u, v) = page.project(wx as f32, wy as f32);
+        scored += 1;
+        let slot = per_page.entry(page.id).or_default();
+        for (i, (_, flip)) in candidates.iter().enumerate() {
+            let (fu, fv) = flip(u, v);
+            fits[i][0].push(fu as f64, obs_x);
+            fits[i][1].push(fv as f64, obs_y);
+            slot[i][0].push(fu as f64, obs_x);
+            slot[i][1].push(fv as f64, obs_y);
+        }
+    }
+
+    println!("\n{scored} overlays scored against terrain centroids\n");
+    println!(
+        "{:<14}  {:>28}  {:>28}",
+        "reading", "horizontal: slope/offset/r2", "vertical: slope/offset/r2"
+    );
+    for (i, (name, _)) in candidates.iter().enumerate() {
+        let h = fits[i][0].solve();
+        let v = fits[i][1].solve();
+        println!("{name:<14}  {:>28}  {:>28}", show_fit(h), show_fit(v));
+    }
+    println!(
+        "\nA slope near +{:.0} horizontally and +{:.0} vertically is this client's\n\
+         projection agreeing with the art. A negative slope is an axis read backwards.",
+        dbc::worldmap::PAGE_WIDTH,
+        dbc::worldmap::PAGE_HEIGHT
+    );
+
+    if verbose {
+        println!("\nper page, for the reading this client uses:");
+        let mut ids: Vec<_> = per_page.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let f = &per_page[&id];
+            let name = atlas.page(id).map(|p| p.directory.clone()).unwrap_or_default();
+            println!(
+                "  [{id:>4}] {name:<22} n={:<4} {:>28}  {:>28}",
+                f[0][0].n,
+                show_fit(f[0][0].solve()),
+                show_fit(f[0][1].solve())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn show_fit(fit: Option<(f64, f64, f64)>) -> String {
+    match fit {
+        Some((slope, intercept, r2)) => format!("{slope:>10.1} {intercept:>8.1} {r2:>7.4}"),
+        None => "too few samples".to_string(),
+    }
 }
 
 fn wmo_cmd(chain: &mut Chain, cmd: WmoCommand) -> Result<()> {

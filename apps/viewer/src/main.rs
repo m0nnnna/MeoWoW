@@ -12,6 +12,7 @@ mod character;
 mod hud;
 mod items;
 mod live;
+mod maps;
 mod model;
 mod scene;
 mod sound;
@@ -1791,6 +1792,16 @@ struct App {
     spellbook_open: bool,
     /// Item icons, loaded from the archives if there are any.
     items: items::Items,
+    /// World map pages and their art.
+    maps: maps::Maps,
+    /// Whether the map is open. Runtime state, like the spellbook: where the
+    /// window sits is worth saving and whether it was open at exit is not.
+    map_open: bool,
+    /// Where the realm says the log's objectives are. Held even while the map
+    /// is shut, for the same reason the quest cache is: what the log holds is
+    /// what decides which ids to ask about, and closing a window is not a
+    /// reason to throw away an answer already paid for.
+    objectives: maps::Objectives,
     /// The sound tables, and the two channels that play them.
     ///
     /// The output stream is held for its whole life on purpose: dropping it
@@ -2372,6 +2383,12 @@ impl App {
         // rather than inline because the camera's starting distance is one of
         // the settings it carries.
         let hud = ui::Hud::load();
+        // Read at startup rather than with the spellbook: the two tables the
+        // map needs are small and, unlike a spellbook, they do not depend on
+        // anything the server sends -- so `M` works before the character has
+        // finished logging in, and the arrow simply has nowhere to be yet.
+        let mut chain = chain;
+        let maps = maps::Maps::load(&mut chain);
         Self {
             // The saved preference, which the wheel then moves from. Kept as
             // live state rather than read from the profile every frame: the
@@ -2425,6 +2442,9 @@ impl App {
             bars_seeded: false,
             spellbook_open: false,
             items: items::Items::default(),
+            maps,
+            map_open: false,
+            objectives: maps::Objectives::default(),
             area: None,
             sounds: sound::Sounds::default(),
             effects: sound::Effects::default(),
@@ -2859,6 +2879,12 @@ impl ApplicationHandler for App {
                             // `L` for the quest log, as 3.3.5a binds it.
                             KeyCode::KeyL => {
                                 self.quest_log_open = !self.quest_log_open;
+                                window.request_redraw();
+                                return;
+                            }
+                            // `M` for the world map, as 3.3.5a binds it.
+                            KeyCode::KeyM => {
+                                self.map_open = !self.map_open;
                                 window.request_redraw();
                                 return;
                             }
@@ -4915,6 +4941,36 @@ impl App {
                         ::world::opcode::server::QUESTGIVER_REQUEST_ITEMS => {
                             tracing::debug!("that quest is not finished yet");
                         }
+                        // Where the log's objectives are. One reply answers
+                        // for every id in the request, and an empty marker
+                        // list is a real answer -- see `maps::Objectives` for
+                        // why it is still not written to disk.
+                        ::world::opcode::server::QUEST_POI_QUERY_RESPONSE => {
+                            match ::world::quest::parse_quest_poi(&packet.body) {
+                                Ok(sets) => {
+                                    // **Info rather than debug, deliberately.**
+                                    // A map with no pins on it is the symptom
+                                    // of a request that never went out *and*
+                                    // of a realm with nothing to say, and the
+                                    // two want opposite investigations. One
+                                    // line per reply, and replies are rare --
+                                    // an id is asked about once.
+                                    tracing::info!(
+                                        "objectives for {} quest(s): {} marker(s), {} point(s)",
+                                        sets.len(),
+                                        sets.iter().map(|s| s.markers.len()).sum::<usize>(),
+                                        sets.iter()
+                                            .flat_map(|s| &s.markers)
+                                            .map(|m| m.points.len())
+                                            .sum::<usize>()
+                                    );
+                                    self.objectives.insert(&sets);
+                                }
+                                Err(error) => {
+                                    tracing::warn!("a quest POI reply would not parse: {error}")
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -5014,6 +5070,24 @@ impl App {
                     // the promise that the caller would send it.
                     self.quests.give_up(quest);
                     break;
+                }
+            }
+        }
+        // Where those quests' objectives are, on the same budget and for the
+        // same reasons. **This one is asked about the log rather than about a
+        // quest**: `CMSG_QUEST_POI_QUERY` answers only for quests the player
+        // is actually carrying, so a quest handed in has to be forgotten or
+        // its markers would outlive it on the map.
+        self.objectives.retain_log(&log);
+        const OBJECTIVES_PER_REQUEST: usize = 8;
+        let ask = self
+            .objectives
+            .take_unknown(&log, OBJECTIVES_PER_REQUEST, Instant::now());
+        if !ask.is_empty() {
+            if let Err(e) = live.connection.query_quest_poi(&ask) {
+                tracing::warn!("asking where {} quests' objectives are failed: {e:#}", ask.len());
+                for quest in ask {
+                    self.objectives.give_up(quest);
                 }
             }
         }
@@ -5328,6 +5402,58 @@ impl App {
             Vec::new()
         };
 
+        // Built here rather than beside the other windows below because it
+        // needs the renderer to upload its tiles, and the borrow of that has
+        // to end before anything reads `self` whole.
+        // **The map is built from the walked position, never from replicated
+        // state.** The server does not relay our own movement back, so the
+        // entity for `live.guid` holds the position the character logged in
+        // at, forever. That trap has now caught three separate callers here --
+        // the thing that draws the player, the thing that aims at it, and a
+        // loot range check that reported fifteen units at a distance of two --
+        // and a map is the one window where being wrong about it would look
+        // entirely plausible. `live.position` is the walked one.
+        let map_view = self.map_open.then(|| {
+            let standing = self.live.as_ref().map(|live| maps::Standing {
+                map_id: live.map_id,
+                x: live.position.x,
+                y: live.position.y,
+                orientation: live.orientation,
+            });
+            // **The title comes from the cache or the marker says a number.**
+            // A reward already reads `item 2224 x1` on this principle: a made
+            // -up name cannot be checked and would be believed, where an id
+            // is checkable and visibly unfinished.
+            let log: Vec<u32> = self
+                .live
+                .as_ref()
+                .and_then(|live| live.state.get(live.guid))
+                .map(|player| player.quest_log_ids())
+                .unwrap_or_default();
+            let objectives: Vec<maps::Objective<'_>> = log
+                .iter()
+                .map(|quest| maps::Objective {
+                    label: match self.quests.answer(*quest) {
+                        ::world::Answer::Known(info) => info.title.clone(),
+                        // The title is still coming, or never came. Either way
+                        // the marker is real and the id is what is honestly
+                        // known about it.
+                        _ => format!("quest {quest}"),
+                    },
+                    markers: self.objectives.markers(*quest),
+                })
+                .filter(|objective| !objective.markers.is_empty())
+                .collect();
+            maps::build_view(
+                &mut self.maps,
+                &r.gpu,
+                &mut r.egui_renderer,
+                &mut self.chain,
+                standing,
+                &objectives,
+            )
+        });
+
         // The bag window, built only while it is open, and rebuilt every frame
         // for the same reasons the spellbook is.
         //
@@ -5594,6 +5720,8 @@ impl App {
                     // Existence is the flag, like the loot window: the window
                     // is on screen exactly while a conversation is open.
                     questgiver: questgiver_view.as_ref(),
+                    // `None` when shut, like the spellbook and the log.
+                    world_map: map_view.as_ref(),
                     // No flag: the window exists exactly while the server
                     // says a corpse is open.
                     loot: (!loot.is_empty()).then_some(loot.as_slice()),

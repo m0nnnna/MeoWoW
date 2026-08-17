@@ -40,7 +40,7 @@ pub use frames::chat::{ChatEntry, ChatKind};
 pub use frames::combat_text::{CombatTextKind, FloatingText};
 pub use frames::{
     CastBarView, QuestDetail, QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
-    QuestgiverView, SpellbookEntry, UnitView,
+    MapMarker, MapView, MarkerKind, QuestgiverView, SpellbookEntry, UnitView,
 };
 pub use layout::{default_path, ElementId, Profile};
 pub use style::{Color, PowerType, Style};
@@ -138,6 +138,14 @@ pub struct HudData<'a> {
     /// flag, as it is for the loot window: the caller already decides when a
     /// conversation is open and a second copy here could disagree.
     pub questgiver: Option<&'a frames::QuestgiverView>,
+    /// The world map, or `None` when it is shut. Existence is the flag, as it
+    /// is for the spellbook and the bag window.
+    ///
+    /// The caller has already turned the player's position and every quest
+    /// marker into fractions of the page -- this crate does not own the
+    /// projection and must not, because a second copy of it would agree with
+    /// `dbc::worldmap` right up until one of them changed.
+    pub world_map: Option<&'a frames::MapView>,
     /// The character's money in copper, drawn along the bottom of the bag
     /// window. Ignored when `bags` is `None`.
     pub copper: u32,
@@ -406,6 +414,7 @@ impl Hud {
             let loot_placeholder;
             let quest_log_placeholder;
             let questgiver_placeholder;
+            let world_map_placeholder;
             let release_prompt_placeholder;
             let content = match id {
                 ElementId::PlayerFrame | ElementId::TargetFrame => {
@@ -495,6 +504,17 @@ impl Hud {
                     }
                     None => continue,
                 },
+                // Same rule again: shut means absent, and edit mode draws it
+                // so the largest window in the interface can be positioned
+                // without standing in a zone that has a page.
+                ElementId::WorldMap => match data.world_map {
+                    Some(view) => Content::WorldMap(view),
+                    None if editing => {
+                        world_map_placeholder = frames::world_map::placeholder();
+                        Content::WorldMap(&world_map_placeholder)
+                    }
+                    None => continue,
+                },
                 // Absent while alive or already a ghost, on the same reasoning
                 // as the loot window: existence is the flag, and drawn in
                 // edit mode so it can be positioned without dying first.
@@ -549,6 +569,9 @@ impl Hud {
                 Content::Questgiver(view) => {
                     frames::questgiver::size(view, &style, element.scale)
                 }
+                // The one frame whose size ignores its contents entirely:
+                // the page's shape is fixed by the art, not by what is on it.
+                Content::WorldMap(_) => frames::world_map::size(&style, element.scale),
                 Content::ReleasePrompt(_) => frames::release::size(&style, element.scale),
             };
             let rect = element.rect(screen, size);
@@ -716,6 +739,13 @@ impl Hud {
                             &style,
                             element.scale,
                         ),
+                        Content::WorldMap(view) => frames::world_map::draw(
+                            &painter,
+                            response.rect,
+                            view,
+                            &style,
+                            element.scale,
+                        ),
                         Content::ReleasePrompt(view) => frames::release::draw(
                             &painter,
                             response.rect,
@@ -857,6 +887,25 @@ impl Hud {
                                 // caller reads it.
                                 response_out.selected_quest =
                                     entries.get(row).map(|entry| entry.id);
+                            }
+                        }
+                    }
+                }
+                // Hover only, and no click: a pin says which quest it belongs
+                // to and nothing here can act on it yet. It is deliberately
+                // *not* in the `Sense::click()` list above, so nothing reads
+                // a click that would never arrive.
+                (false, Content::WorldMap(view)) => {
+                    if let Some(pointer) = response.hover_pos() {
+                        if let Some(index) = frames::world_map::marker_at(
+                            drawn_rect,
+                            view,
+                            &style,
+                            element.scale,
+                            pointer,
+                        ) {
+                            if let Some(marker) = view.markers.get(index) {
+                                frames::world_map::hover_tooltip(&response, &marker.label);
                             }
                         }
                     }
@@ -1073,6 +1122,7 @@ impl Hud {
                             &style,
                             scale,
                         ),
+                        ElementId::WorldMap => frames::world_map::size(&style, scale),
                         ElementId::Loot => frames::loot::size(
                             data.loot
                                 .map(|rows| rows.len())
@@ -1141,6 +1191,7 @@ enum Content<'a> {
     Loot(&'a [frames::LootRow]),
     QuestLog(&'a [frames::QuestLogEntry]),
     Questgiver(&'a frames::QuestgiverView),
+    WorldMap(&'a frames::MapView),
     ReleasePrompt(&'a frames::ReleasePromptView),
 }
 
@@ -1809,6 +1860,108 @@ mod tests {
         assert!(!painted(&mut hud, &HudData::default()).is_empty());
     }
 
+    /// A page with one pin and one region, for the two map tests below.
+    fn map_view() -> frames::MapView {
+        frames::MapView {
+            title: "Elwynn Forest".into(),
+            tiles: Default::default(),
+            markers: vec![
+                frames::MapMarker {
+                    u: 0.48,
+                    v: 0.44,
+                    facing: 0.0,
+                    kind: frames::MarkerKind::Objective,
+                    label: "A Threat Within".into(),
+                    outline: Vec::new(),
+                },
+                frames::MapMarker {
+                    u: 0.3,
+                    v: 0.3,
+                    facing: 0.0,
+                    kind: frames::MarkerKind::Player,
+                    label: String::new(),
+                    outline: Vec::new(),
+                },
+            ],
+            note: None,
+        }
+    }
+
+    /// **A region has to be drawn as a region.** A third of this realm's quest
+    /// markers are polygons rather than points, and the difference between a
+    /// ring and a pin is invisible in a rectangle-only check -- the same hole
+    /// that let the loot window ship without ever receiving a click.
+    #[test]
+    fn a_quest_region_paints_more_than_a_pin_does() {
+        fn shape_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
+            fn walk(shape: &egui::Shape) -> usize {
+                match shape {
+                    egui::Shape::Vec(shapes) => shapes.iter().map(walk).sum(),
+                    _ => 1,
+                }
+            }
+            shapes.iter().map(|clipped| walk(&clipped.shape)).sum()
+        }
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let pin = map_view();
+        let plain = shape_count(&shapes(
+            &mut hud,
+            &HudData {
+                world_map: Some(&pin),
+                ..Default::default()
+            },
+            None,
+        ));
+
+        let mut region = map_view();
+        region.markers[0].outline = vec![(0.4, 0.4), (0.4, 0.5), (0.5, 0.5), (0.5, 0.4)];
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let ringed = shape_count(&shapes(
+            &mut hud,
+            &HudData {
+                world_map: Some(&region),
+                ..Default::default()
+            },
+            None,
+        ));
+        assert!(
+            ringed > plain,
+            "a marker with an outline painted {ringed} shapes, the same pin without one {plain}"
+        );
+    }
+
+    /// The pin is the only thing on the map that can say which quest it is
+    /// for, so hovering it has to name one -- and hovering empty parchment
+    /// must not, or every marker would look labelled.
+    #[test]
+    fn hovering_a_quest_pin_names_its_quest() {
+        let view = map_view();
+        let data = HudData {
+            world_map: Some(&view),
+            ..Default::default()
+        };
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::WorldMap);
+        let rect = element.rect(screen(), frames::world_map::size(&hud.profile.style, 1.0));
+        let art = frames::world_map::art_rect(rect, &hud.profile.style, 1.0);
+
+        let on_pin = frames::world_map::marker_pos(art, 0.48, 0.44);
+        let text = painted_text(&shapes(&mut hud, &data, Some(on_pin))).join(" | ");
+        assert!(text.contains("A Threat Within"), "{text}");
+
+        // The same window, hovered where there is no marker: any difference is
+        // the tooltip and nothing else.
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let empty = frames::world_map::marker_pos(art, 0.8, 0.8);
+        let text = painted_text(&shapes(&mut hud, &data, Some(empty))).join(" | ");
+        assert!(!text.contains("A Threat Within"), "{text}");
+    }
+
     /// **The text a player would read, asserted from the painted shapes.**
     /// Every earlier frame here was checked only by its rectangle, and a
     /// rectangle is drawn identically whether the row inside it says the right
@@ -2406,6 +2559,7 @@ mod tests {
             ElementId::Questgiver => {
                 frames::questgiver::size(&frames::questgiver::placeholder(), &profile.style, scale)
             }
+            ElementId::WorldMap => frames::world_map::size(&profile.style, scale),
             ElementId::Loot => {
                 frames::loot::size(frames::loot::placeholder().len(), &profile.style, scale)
             }
@@ -2535,9 +2689,16 @@ mod tests {
         // Only what is actually shown. The two modifier bars default to
         // hidden and sit deliberately where the first one would be if it grew,
         // so overlapping while invisible is not a fault.
+        //
+        // **The world map is excluded here and asserted separately below.**
+        // It is 760 by 520 in the middle of the screen and there is nowhere on
+        // any screen to put a window that size without touching something; a
+        // map is the one frame whose job is to cover the view while it is
+        // open. What has to be true of it is narrower and is a real claim
+        // rather than an exemption -- see the test that follows.
         let shown: Vec<(ElementId, egui::Rect)> = ElementId::ALL
             .into_iter()
-            .filter(|id| profile.get(*id).visible)
+            .filter(|id| profile.get(*id).visible && *id != ElementId::WorldMap)
             .map(|id| (id, profile.get(id).rect(screen, size_of(&profile, id))))
             .collect();
         for (i, (a_id, a)) in shown.iter().enumerate() {
@@ -2549,6 +2710,41 @@ mod tests {
                     b_id.label()
                 );
             }
+        }
+    }
+
+    /// The map may cover a window somebody opened; it may not cover the frames
+    /// that are simply *there*.
+    ///
+    /// The distinction is the whole reason the map is left out of the test
+    /// above. A player who opens the map has chosen to stop and read it, and
+    /// the loot window or the release prompt underneath it can be dealt with
+    /// by closing the map -- but health, target, chat and the action bars are
+    /// not things anyone opened, and a map that hid them would be taking the
+    /// game away rather than putting something on top of it.
+    #[test]
+    fn the_world_map_covers_only_windows_that_were_opened() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let profile = Profile::default();
+        let map = profile
+            .get(ElementId::WorldMap)
+            .rect(screen, size_of(&profile, ElementId::WorldMap));
+        // Everything that appears without the player asking for it.
+        for id in [
+            ElementId::PlayerFrame,
+            ElementId::TargetFrame,
+            ElementId::ChatFrame,
+            ElementId::CastBar,
+            ElementId::ActionBar1,
+            ElementId::ActionBar2,
+            ElementId::ActionBar3,
+        ] {
+            let rect = profile.get(id).rect(screen, size_of(&profile, id));
+            assert!(
+                !map.intersects(rect),
+                "the world map at {map:?} covers {} at {rect:?}",
+                id.label()
+            );
         }
     }
 }

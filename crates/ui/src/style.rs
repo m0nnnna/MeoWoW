@@ -236,6 +236,23 @@ pub struct Style {
     /// on purpose: those rows are not content and should not read as content.
     pub quest_dim: Color,
 
+    /// How wide the world map is at scale 1.0. **Its height is not
+    /// configurable**, and deliberately: a page's art is 1002x668 and drawing
+    /// it to any other shape either stretches the world or crops it, which
+    /// moves every marker on it. One dimension is the honest number of knobs.
+    pub world_map_width: f32,
+    /// Behind a page, so one that will not load is still a map-shaped thing
+    /// with the markers on it rather than a hole in the window.
+    pub world_map_backing: Color,
+    /// The player's arrow.
+    pub world_map_player: Color,
+    /// A quest objective's pin.
+    pub world_map_objective: Color,
+    /// Drawn around both, so a pin stays visible over parchment of any shade.
+    pub world_map_outline: Color,
+    /// Radius of a pin, and the reach of the hover test, at scale 1.0.
+    pub world_map_pin: f32,
+
     /// Width of the cast bar at scale 1.0. Reuses `bar_height` for its
     /// thickness -- a cast bar is one bar, the same shape as a health bar
     /// turned wide, and does not need a dimension of its own for that.
@@ -372,6 +389,13 @@ impl Default for Style {
             questgiver_width: 420.0,
             quest_dim: Color::rgba(170, 178, 195, 210),
 
+            world_map_width: 760.0,
+            world_map_backing: Color::rgba(28, 24, 18, 245),
+            world_map_player: Color::rgb(240, 220, 90),
+            world_map_objective: Color::rgb(230, 90, 70),
+            world_map_outline: Color::rgba(10, 10, 12, 220),
+            world_map_pin: 7.0,
+
             cast_bar_width: 260.0,
             casting: Color::rgb(220, 170, 60),
 
@@ -458,6 +482,8 @@ impl Style {
         self.spellbook_row = self.spellbook_row.clamp(10.0, 200.0);
         self.quest_log_width = self.quest_log_width.clamp(120.0, 1400.0);
         self.questgiver_width = self.questgiver_width.clamp(160.0, 1600.0);
+        self.world_map_width = self.world_map_width.clamp(200.0, 2400.0);
+        self.world_map_pin = self.world_map_pin.clamp(1.0, 60.0);
         self.chat_width = self.chat_width.clamp(120.0, 2000.0);
         self.chat_height = self.chat_height.clamp(40.0, 1200.0);
         self.chat_scrollback = self.chat_scrollback.clamp(10, 10_000);

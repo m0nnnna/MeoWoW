@@ -6,7 +6,7 @@
 use dbc::infer::{infer, ColumnKind};
 use dbc::schema::{
     AreaTable, CreatureDisplayInfo, CreatureModelData, Map, SoundEntries, SoundType, Spell,
-    SpellDuration, SpellRadius, SpellVisualKit, WorldSafeLocs,
+    SpellDuration, SpellRadius, SpellVisualKit, WorldMapArea, WorldMapOverlay, WorldSafeLocs,
 };
 use dbc::Dbc;
 use mpq::Chain;
@@ -523,5 +523,177 @@ fn weather_blends_from_clear_to_storm_in_order() {
     assert_eq!(
         lighting.sample_in(map, x, y, minute, -2.0),
         lighting.sample_in(map, x, y, minute, 0.0)
+    );
+}
+
+
+/// Every page states a rectangle the right way round, or states nothing.
+///
+/// `max`/`min` are names this schema *earned*: if any row had them the other
+/// way round, `Page::has_bounds` would silently exclude a real page and the
+/// zone it draws would open the continent map instead.
+///
+/// Exactly three of the 108 rows carry all zeroes, and they are named rather
+/// than counted -- a count passes just as well when a page that used to state
+/// a rectangle stops doing so, which is the change worth hearing about.
+#[test]
+fn world_map_pages_state_their_bounds_max_first() {
+    let mut chain = require_data!();
+    let table = WorldMapArea::parse(&chain.read(WorldMapArea::PATH).expect("the table"))
+        .expect("parsing WorldMapArea");
+
+    let (mut stated, mut silent) = (0usize, Vec::new());
+    for row in table.iter() {
+        let (x_max, x_min, y_max, y_min) = (row.x_max(), row.x_min(), row.y_max(), row.y_min());
+        if x_max == 0.0 && x_min == 0.0 && y_max == 0.0 && y_min == 0.0 {
+            silent.push(row.directory().to_string());
+            continue;
+        }
+        assert!(
+            x_max > x_min && y_max > y_min,
+            "page {} ({}) states x {x_min}..{x_max}, y {y_min}..{y_max}",
+            row.id(),
+            row.directory()
+        );
+        stated += 1;
+    }
+    assert_eq!(stated, 105, "pages stating a rectangle");
+    assert_eq!(silent, ["Dalaran", "TheNexus", "UtgardeKeep"]);
+}
+
+/// The overlay hit box is top/left/bottom/right, and the alternative reading
+/// is excluded rather than merely unchosen.
+///
+/// Four columns of pixel numbers admit two orderings and both parse. What
+/// separates them is containment: a patch's clickable box should lie inside
+/// the patch's own texture rectangle, and read the other way the very first
+/// row's box starts seventy-seven pixels outside it. Asserting only that the
+/// chosen reading fits would pass just as well under the wrong one on a table
+/// where the two happened to agree, so this counts **both** readings over the
+/// whole table and requires the chosen one to win by a margin no coincidence
+/// covers.
+///
+/// The result: **862 of 868 rows fit as transcribed, 123 fit the other way**,
+/// which is a seven-to-one separation rather than a coincidence.
+///
+/// **It is not unanimous, and the six exceptions are recorded rather than
+/// filtered away.** Five spill between one and seventy pixels over an edge of
+/// their own texture (`PURGATIONISLE`, `HIGHPERCH`, `THEHEAP`,
+/// `TheLivingWood`, `SilvermoonCity`) and `KHARANOS` states a box whose bottom
+/// is above its top, which no ordering of these four columns can rescue. That
+/// is authoring slop in the table; a filter tuned until the count came out
+/// clean would be describing a tidier table than the one that ships.
+#[test]
+fn overlay_hit_rects_lie_inside_their_textures() {
+    let mut chain = require_data!();
+    let table = WorldMapOverlay::parse(&chain.read(WorldMapOverlay::PATH).expect("the table"))
+        .expect("parsing WorldMapOverlay");
+
+    let (mut checked, mut chosen_fits, mut swapped_fits) = (0usize, 0usize, 0usize);
+    for row in table.iter() {
+        // A patch with no size, or one that states no box at all, has nothing
+        // to be inside of. Both are common and neither is a reading of these
+        // columns -- 158 of the 988 rows are one or the other.
+        let no_box = row.hit_top() == 0
+            && row.hit_left() == 0
+            && row.hit_bottom() == 0
+            && row.hit_right() == 0;
+        if row.width() == 0 || row.height() == 0 || row.texture().is_empty() || no_box {
+            continue;
+        }
+        let (left, top) = (row.offset_x(), row.offset_y());
+        let (right, bottom) = (left + row.width(), top + row.height());
+        let inside = |l: u32, t: u32, r: u32, b: u32| {
+            l >= left && t >= top && r <= right && b <= bottom && r > l && b > t
+        };
+        checked += 1;
+        // As transcribed: 13 is the top, 14 the left, 15 the bottom, 16 the
+        // right.
+        if inside(row.hit_left(), row.hit_top(), row.hit_right(), row.hit_bottom()) {
+            chosen_fits += 1;
+        }
+        // And the same four numbers read as left/top/right/bottom, which is
+        // the reading a reader who had not measured would assume.
+        if inside(row.hit_top(), row.hit_left(), row.hit_bottom(), row.hit_right()) {
+            swapped_fits += 1;
+        }
+    }
+
+    assert!(checked > 800, "only {checked} overlays stated both rectangles");
+    assert!(
+        chosen_fits * 100 >= checked * 99,
+        "only {chosen_fits} of {checked} hit boxes lie inside their own texture"
+    );
+    assert!(
+        swapped_fits * 4 < checked,
+        "the other reading fits {swapped_fits} of {checked} rows, which is not a \
+         separation this table can be read from"
+    );
+}
+
+/// The projection, checked against art rather than against itself.
+///
+/// `Stormwind` is a page in its own right *and* a patch drawn on the `Elwynn`
+/// page, so the world rectangle one row states can be projected through
+/// another row and landed on a picture whose pixel position a third table
+/// gives independently. Nothing here is derived from anything else here:
+/// disagreement would mean the projection is wrong, and three of the four
+/// possible readings miss by more than the whole overlay is wide.
+#[test]
+fn a_citys_page_projects_onto_the_patch_that_draws_it() {
+    let mut chain = require_data!();
+    let table = WorldMapArea::parse(&chain.read(WorldMapArea::PATH).expect("the table"))
+        .expect("parsing WorldMapArea");
+    let overlays = WorldMapOverlay::parse(&chain.read(WorldMapOverlay::PATH).expect("the table"))
+        .expect("parsing WorldMapOverlay");
+    let atlas = dbc::worldmap::Atlas::from_table(&table);
+
+    let elwynn = atlas
+        .pages()
+        .iter()
+        .find(|p| p.directory == "Elwynn")
+        .expect("the Elwynn page");
+    let stormwind = atlas
+        .pages()
+        .iter()
+        .find(|p| p.directory == "Stormwind")
+        .expect("the Stormwind page");
+    let patch = overlays
+        .iter()
+        .find(|row| {
+            row.world_map_area_id() == elwynn.id && row.texture().eq_ignore_ascii_case("STORMWIND")
+        })
+        .expect("Elwynn's STORMWIND patch");
+
+    // Where the city's own rectangle lands on the zone page...
+    let (left, top) = elwynn.project_pixels(stormwind.x_max, stormwind.y_max);
+    let (right, bottom) = elwynn.project_pixels(stormwind.x_min, stormwind.y_min);
+    // ...against where the picture of it actually sits.
+    let (art_left, art_top) = (patch.offset_x() as f32, patch.offset_y() as f32);
+    let (art_right, art_bottom) = (
+        art_left + patch.width() as f32,
+        art_top + patch.height() as f32,
+    );
+    // A generous margin on purpose: the city page's rectangle and the drawn
+    // patch are authored separately and are not expected to agree to the
+    // pixel. What is being excluded is the flips, which miss by hundreds.
+    let near = |a: f32, b: f32| (a - b).abs() < 120.0;
+    assert!(
+        near(left, art_left) && near(right, art_right),
+        "horizontal {left:.0}..{right:.0} against the patch's {art_left:.0}..{art_right:.0}"
+    );
+    assert!(
+        near(top, art_top) && near(bottom, art_bottom),
+        "vertical {top:.0}..{bottom:.0} against the patch's {art_top:.0}..{art_bottom:.0}"
+    );
+    // The same numbers with an axis reversed, which is what a different
+    // reading of the bounds would produce.
+    assert!(
+        !near(dbc::worldmap::PAGE_WIDTH - left, art_left),
+        "a flipped horizontal axis lands on the patch too"
+    );
+    assert!(
+        !near(dbc::worldmap::PAGE_HEIGHT - top, art_top),
+        "a flipped vertical axis lands on the patch too"
     );
 }

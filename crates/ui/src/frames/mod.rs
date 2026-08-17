@@ -26,6 +26,7 @@ pub mod quest_log;
 pub mod questgiver;
 pub mod spellbook;
 pub mod unit;
+pub mod world_map;
 
 pub use bags::{BagItem, BagSlot};
 pub use character::EquipSlot;
@@ -36,3 +37,4 @@ pub use quest_log::{QuestDetail, QuestLogEntry};
 pub use questgiver::{QuestgiverAction, QuestgiverClick, QuestgiverRow, QuestgiverView};
 pub use spellbook::SpellbookEntry;
 pub use unit::UnitView;
+pub use world_map::{MapMarker, MapView, MarkerKind};

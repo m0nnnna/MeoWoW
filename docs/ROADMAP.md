@@ -3956,3 +3956,131 @@ Complete a press means comes from the same function that drew the label, on the
 frame the click lands. A flag stored when the window opened would go stale
 exactly when it matters: between the frame that drew `Accept` and the click that
 pressed it, the quest may already be in the log.
+
+### 4.17: the map, and the objectives on it
+
+`M` opens the page for the zone the character is standing in, with the
+character's own arrow on it and a marker for every objective the realm says
+belongs to that page. It is the rung the tracker needs: until now this client
+could say *what* to do and had nowhere to say *where*.
+
+#### The projection, and why choosing it by eye was not allowed
+
+`WorldMapArea.dbc` states, per page, the rectangle of world it draws. Turning a
+position into a place on that picture has **four plausible readings** — the
+horizontal axis can run either way and so can the vertical — and every one of
+them produces a map with things on it. This project has already paid full price
+for settling a question of that shape by looking: the ADT placement rotation
+shipped at `-90`, was "fixed" to `+90` because a render of the abbey looked
+better, and both were ninety degrees wrong, because a building has four sides
+and every rotation shows a door to somebody.
+
+So the reading was fitted against something that could refute it.
+`WorldMapOverlay` states, in page pixels, where a named area's art sits; the
+terrain files state, in world coordinates, which area every chunk of ground
+belongs to. Those come from different files authored by different tools, so
+agreement between them is evidence rather than a restatement.
+`wow-cli map calibrate` regresses one against the other and presupposes neither
+answer: a reversed axis fits a **negative** slope, and the page's pixel size is
+whatever the slope's magnitude comes out as rather than a number decided in
+advance.
+
+```
+Azeroth: 687 tiles, 173413 chunks with an area id
+296 overlays scored against terrain centroids
+
+reading          horizontal: slope/offset/r2     vertical: slope/offset/r2
+as written            984.2      9.2  0.9864        633.3     18.3  0.9717
+x flipped            -984.2    993.4  0.9864        633.3     18.3  0.9717
+y flipped             984.2      9.2  0.9864       -633.3    651.6  0.9717
+```
+
+A slope of +984 against a page 1002 pixels wide, and +633 against one 668
+high, at r² 0.986 and 0.972 over 296 overlays. The flips fit the same data with
+the sign reversed, which is exactly what a wrong reading looks like and exactly
+what this experiment was built to be able to say.
+
+Two hand checks with margins no measurement error covers came first, and are
+kept as unit tests: the `Stormwind` page's own world box, projected onto the
+`Elwynn` page, lands where Elwynn's `STORMWIND` overlay art sits, and every
+other orientation puts it more than five hundred pixels away on a canvas a
+thousand wide; and the Northshire spawn `(-8950, -132)` — the position this
+project has logged in at more than any other — projects inside Elwynn's
+`NORTHSHIREVALLEY` box.
+
+#### The page is bigger than the picture, and the art said so itself
+
+Twelve 256x256 tiles in four columns and three rows make a 1024x768 image, but
+the map stops short of its right and bottom edges. **The tiles announced it**:
+on every page, the right column and the bottom row carry an alpha channel and
+the rest do not — padding is transparent, content is not. Measuring the
+furthest opaque pixel across all 91 pages whose art loads gives **1002x668,
+unanimously**.
+
+That 2% horizontally and 15% vertically is the kind of error that never fails.
+A client that drew the twelve tiles to fit its frame would look entirely
+correct and put every marker in the wrong place, worst at the bottom of the
+page. So the grid is drawn *larger* than the frame and clipped to it.
+
+#### The markers are the server's, and they name their own page
+
+`CMSG_QUEST_POI_QUERY` answers with a map id, a `WorldMapArea` id and a polygon
+per objective — the data Questie exists to ship, on the wire, always matching
+the realm being played on. Two decisions about it are worth recording.
+
+**A marker names the page it belongs to, so nothing guesses.**
+`quest_poi.WorldMapAreaId` is a row in the same table the pages are keyed by,
+which makes "does this marker go on the page being drawn" an equality rather
+than a containment test. Testing containment instead would put a Westfall
+objective on the Elwynn page wherever the two rectangles overlap, and it would
+look entirely reasonable. `Testwolf`'s log is the case that shows it: quests 16,
+85 and 783 mark Elwynn and quest 106 marks Westfall, and standing in Northshire
+the Westfall marker is correctly absent.
+
+**A third of the markers are regions, so a region is drawn as a region.** Of
+the 18,768 markers in this realm's `quest_poi_points`, 12,794 carry a single
+point and 5,974 carry between three and dozens — a valley to search rather than
+a door to walk to. Those are drawn as the ring the server sent, with the pin at
+its middle only as somewhere to hang the label. Collapsing a polygon to its
+centroid would be claiming a precision the server never offered.
+
+Live, against the local realm, `Testwolf`'s four quests answered with 18
+markers and 126 points, matching `quest_poi_points` exactly, and **all 126
+project inside their own page's rectangle**. That is a check on the page
+assignment and the scale rather than on the orientation — a flipped axis lands
+inside the rectangle too, which is why the calibration above is the experiment
+that settles the flips and this one is not.
+
+#### What the window will not do
+
+**No invented names.** A marker's label is the quest's title where the cache
+has one and `quest 106` where it does not — the same rule that leaves a reward
+reading `item 2224 x1`.
+
+**No pin without an answer.** A quest with no POI reply draws nothing rather
+than a marker at the questgiver, because "the server did not say" and "it is
+here" are different statements.
+
+**Nothing is cached to disk.** Unlike `SMSG_QUEST_QUERY_RESPONSE`, a POI answer
+is given only for quests in the player's own log, and a quest that is not in
+the log gets the same empty list as a quest with no markers. Writing that down
+would turn "you did not have it then" into "it has no markers", permanently. So
+the store is memory-only and forgets a quest the moment it leaves the log.
+
+**The map covers windows, never the frames you did not open.** It is the
+largest frame in the interface and the only one anchored dead centre, so it is
+excluded from the layout test that forbids overlapping defaults — and given a
+narrower test of its own instead: it may sit over the loot window or the
+release prompt, and it may not touch the unit frames, the chat log, the cast
+bar or the action bars. An exemption with nothing asserted in its place is how
+a layout rule quietly stops meaning anything.
+
+#### What is still missing
+
+No overlays, so the page is drawn fully explored rather than revealed as the
+character walks it. No zoom or panning, and no way to open a page other than
+the one you are standing on. No continent view, no minimap (4.18), no `!` or
+`?` over questgivers, and nothing on the map for anything but quest objectives
+— no vendors, no flight points, no trainers. Three of the 108 pages state no
+rectangle at all (`Dalaran`, `TheNexus`, `UtgardeKeep`) and a character
+standing in one gets a window that says so rather than a blank picture.

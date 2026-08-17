@@ -1132,6 +1132,102 @@ dbc_table! {
     }
 }
 
+dbc_table! {
+    /// One drawable map page, and the rectangle of the world it shows.
+    ///
+    /// 108 rows in this build: a page per zone, per city and per instance,
+    /// plus a whole-continent page each for `Azeroth`, `Kalimdor`,
+    /// `Expansion01` and `Northrend` (the rows whose `area_id` is 0).
+    ///
+    /// **The four bounds are named for the axis they were measured to hold,
+    /// not for an edge of the picture.** Which world axis each pair covers is
+    /// a fact about the data; which *side* of the image a bound corresponds to
+    /// is a fact about the projection, and that is decided once in
+    /// [`crate::worldmap`] rather than smuggled in through a field name here.
+    /// The measurement: quest 783's server-side point of interest is
+    /// `(-8903, -163)` in `WorldMapAreaId` 30, and this table's row 30
+    /// (`Elwynn`) has fields 6/7 spanning `-7939.583 .. -10254.166` and fields
+    /// 4/5 spanning `1535.417 .. -1935.417`. Only one assignment puts the
+    /// point inside its own zone, and `wow-cli map calibrate` re-runs that
+    /// containment test across every zone using terrain area ids.
+    ///
+    /// `field 4 > field 5` and `field 6 > field 7` on all 108 rows, which is
+    /// what makes `max`/`min` the honest names.
+    WorldMapArea, WorldMapAreaRow, path = r"DBFilesClient\WorldMapArea.dbc", fields = 11, {
+        0 id: u32,
+        /// The [`Map`] row this page belongs to.
+        1 map_id: u32,
+        /// The [`AreaTable`] zone this page draws, or 0 for a continent page.
+        2 area_id: u32,
+        /// Folder under `Interface\WorldMap` holding the twelve tiles, e.g.
+        /// `Elwynn` -- an internal name, not the player-facing one, which
+        /// lives in [`AreaTable`].
+        3 directory: str,
+        /// Largest world `y` the page covers.
+        4 y_max: f32,
+        /// Smallest world `y` the page covers.
+        5 y_min: f32,
+        /// Largest world `x` the page covers.
+        6 x_max: f32,
+        /// Smallest world `x` the page covers.
+        7 x_min: f32,
+    }
+}
+
+dbc_table! {
+    /// A patch of a zone page revealed once the player has explored it.
+    ///
+    /// The base twelve tiles of a zone page are the *unexplored* picture;
+    /// every named sub-area is a separate texture blitted on top at a pixel
+    /// offset. 988 rows in this build.
+    ///
+    /// This client does not draw the overlays yet -- what it uses them for is
+    /// **calibration**. Each row states, in map-image pixels, where an
+    /// [`AreaTable`] area sits on its page, and the terrain files state, in
+    /// world coordinates, which area every chunk belongs to. Those two are
+    /// derived from different files by different tools, so agreement between
+    /// them is evidence about the projection rather than about either one.
+    /// See `wow-cli map calibrate`.
+    ///
+    /// Fields 6 and 7 are zero on all 988 rows and are therefore left
+    /// unnamed: a column that never varies cannot be identified, and guessing
+    /// at it would be transcription.
+    WorldMapOverlay, WorldMapOverlayRow,
+    path = r"DBFilesClient\WorldMapOverlay.dbc", fields = 17, {
+        0  id: u32,
+        /// The [`WorldMapArea`] page this patch is drawn on.
+        1  world_map_area_id: u32,
+        /// The [`AreaTable`] area revealed. Three more follow it, non-zero on
+        /// the rows where one texture covers several areas.
+        2  area_id_0: u32,
+        3  area_id_1: u32,
+        4  area_id_2: u32,
+        5  area_id_3: u32,
+        /// Base name of the patch texture, e.g. `NORTHSHIREVALLEY`.
+        8  texture: str,
+        9  width: u32,
+        10 height: u32,
+        /// Pixels from the page's left edge to the patch's left edge.
+        11 offset_x: u32,
+        /// Pixels from the page's top edge to the patch's top edge.
+        12 offset_y: u32,
+        /// The clickable box inside the patch, in page pixels.
+        ///
+        /// **The order named itself, by a margin rather than unanimously.**
+        /// Read as top/left/bottom/right, 862 of the 868 rows stating both a
+        /// texture rectangle and a box put the box inside the rectangle; read
+        /// as left/top/right/bottom, only 123 do, and the very first row's box
+        /// starts 77 pixels left of the texture that contains it. The six that
+        /// fit neither are named in
+        /// `overlay_hit_rects_lie_inside_their_textures`, which counts both
+        /// readings over the whole table.
+        13 hit_top: u32,
+        14 hit_left: u32,
+        15 hit_bottom: u32,
+        16 hit_right: u32,
+    }
+}
+
 /// The [`SoundEntriesRow::sound_type`] values this client acts on.
 ///
 /// **Measured, not remembered.** The column runs 1-53 across 26 distinct
