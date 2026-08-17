@@ -706,6 +706,30 @@ impl World {
     /// Falls through untouched when nothing solid is resident, which is the
     /// common case: most of a tile is open ground, and a query that found
     /// nothing must not perturb the position by so much as a float.
+    /// How far along `from` -> `to` the first solid surface is, as a fraction
+    /// of the way, or `None` for a clear line.
+    ///
+    /// For the camera: a wall between the character and where the eye wants to
+    /// sit is a wall the eye has to stop at, or the view ends up outside the
+    /// building looking through it.
+    ///
+    /// **The nearest hit across every tile the line touches**, not the first
+    /// tile's answer -- a segment near a tile edge crosses two, and taking
+    /// whichever came first in the map would let the camera through a wall
+    /// depending on which way the character was facing.
+    pub fn first_obstruction(&self, from: Vec3, to: Vec3) -> Option<f32> {
+        let mut nearest: Option<f32> = None;
+        for tile in self.tiles_touching(from, to) {
+            if tile.solid.is_empty() {
+                continue;
+            }
+            if let Some(t) = tile.solid.first_hit(from, to) {
+                nearest = Some(nearest.map_or(t, |best: f32| best.min(t)));
+            }
+        }
+        nearest
+    }
+
     pub fn slide(&self, from: Vec3, to: Vec3, radius: f32, height: f32, step: f32) -> Vec3 {
         let mut at = to;
         for tile in self.tiles_touching(from, to) {

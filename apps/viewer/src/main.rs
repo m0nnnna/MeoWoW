@@ -880,6 +880,51 @@ fn pull_camera_out_of_the_ground(
     focus + span * allowed
 }
 
+/// How far in front of a wall the eye stops, in units.
+///
+/// Enough that the near plane does not slice into the surface that stopped it,
+/// which reads as the wall vanishing and the room beyond appearing -- exactly
+/// the thing this exists to prevent, arriving by a different route.
+const CAMERA_WALL_CLEARANCE: f32 = 0.35;
+
+/// How close to the character the eye may be pushed by a wall.
+///
+/// A wall directly behind the character would otherwise put the eye inside the
+/// head, and this client *draws* that head -- a screenful of the inside of a
+/// face. The original hides the model at that range instead; until this one
+/// does, stopping short is the smaller of the two wrongs.
+const CAMERA_MIN_PULL_IN: f32 = 1.5;
+
+/// Pulls the camera in until nothing solid is between it and the character.
+///
+/// Buildings, not terrain: [`pull_camera_out_of_the_ground`] already handles
+/// the ground it stands on, and it does that by sampling a height field, which
+/// knows nothing about a wall. Standing inside the abbey with the camera
+/// outside it -- the view passing through a wall and looking back in -- is what
+/// this fixes, and no amount of ground sampling could.
+///
+/// **Along the view ray and nowhere else**, for the same reason as the ground
+/// version: shortening the distance is the only move that leaves the picture
+/// pointing where it did. The subject stays centred; only the range changes.
+fn pull_camera_in_front_of_walls(
+    focus: glam::Vec3,
+    eye: glam::Vec3,
+    first_hit: impl Fn(glam::Vec3, glam::Vec3) -> Option<f32>,
+) -> glam::Vec3 {
+    let span = eye - focus;
+    let length = span.length();
+    if length < 1e-3 {
+        return eye;
+    }
+    let Some(t) = first_hit(focus, eye) else {
+        return eye;
+    };
+    // The hit is a fraction of the way out; back off a fixed distance from it
+    // and never come closer to the character than the floor above.
+    let stopped = (t * length - CAMERA_WALL_CLEARANCE).clamp(CAMERA_MIN_PULL_IN, length);
+    focus + span * (stopped / length)
+}
+
 /// Places the eye on a sphere around a character, looking at them.
 ///
 /// **Shared by the screenshot placement and the per-frame follow on purpose.**
@@ -4041,11 +4086,20 @@ impl App {
         // per frame, would be absurd for twelve lookups.
         let focus = camera_at + glam::Vec3::Z * FOLLOW_HEIGHT;
         let eye = match self.renderer.as_ref().and_then(|r| r.scene.as_ref()) {
-            Some(Scene::Streaming(world)) => pull_camera_out_of_the_ground(
-                focus,
-                placed.position,
-                |x, y| world.height_at(x, y),
-            ),
+            Some(Scene::Streaming(world)) => {
+                // Ground first, then walls, and the order matters: the ground
+                // pass marches outwards and can only ever shorten the ray, so
+                // the wall test that follows is asking about a line the eye
+                // could actually have reached.
+                let above_ground = pull_camera_out_of_the_ground(
+                    focus,
+                    placed.position,
+                    |x, y| world.height_at(x, y),
+                );
+                pull_camera_in_front_of_walls(focus, above_ground, |from, to| {
+                    world.first_obstruction(from, to)
+                })
+            }
             _ => placed.position,
         };
         if let Camera::Fly(fly) = &mut self.camera {
@@ -6718,6 +6772,41 @@ mod gesture_tests {
                 "{name} must not report a turn as well"
             );
         }
+    }
+
+    /// **A wall stops the eye short; open air leaves it exactly where it
+    /// was.** The second half is the one that would ruin the game if it broke:
+    /// a camera that pulled in whenever the query was consulted would sit in
+    /// the character's head all the time.
+    #[test]
+    fn a_wall_pulls_the_camera_in_and_open_air_does_not() {
+        let focus = glam::Vec3::new(0.0, 0.0, 2.0);
+        let eye = glam::Vec3::new(-10.0, 0.0, 2.0);
+
+        assert_eq!(
+            pull_camera_in_front_of_walls(focus, eye, |_, _| None),
+            eye,
+            "nothing in the way must leave the camera alone"
+        );
+
+        // Something four units out along a ten-unit ray.
+        let pulled = pull_camera_in_front_of_walls(focus, eye, |_, _| Some(0.4));
+        let range = (pulled - focus).length();
+        assert!(
+            (range - (4.0 - CAMERA_WALL_CLEARANCE)).abs() < 1e-3,
+            "stopped at {range} rather than just short of the wall"
+        );
+        // Still on the view ray, or the subject slides off centre -- the bug
+        // the ground version was written to avoid.
+        assert!(
+            (pulled - focus).normalize().dot((eye - focus).normalize()) > 0.9999,
+            "the eye came off its own ray"
+        );
+
+        // A wall against the character's back must not put the eye inside the
+        // head this client draws.
+        let against_the_back = pull_camera_in_front_of_walls(focus, eye, |_, _| Some(0.02));
+        assert!((against_the_back - focus).length() >= CAMERA_MIN_PULL_IN - 1e-3);
     }
 
     /// **A sidestep turns the drawn body towards where it is going; a

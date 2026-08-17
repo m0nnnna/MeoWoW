@@ -109,6 +109,17 @@ impl Triangle {
     /// The push-out resolver cannot see that case by construction, because it
     /// only ever looks at where the move *ended*.
     fn crossed_by(&self, from: Vec3, to: Vec3) -> bool {
+        self.hit_at(from, to).is_some()
+    }
+
+    /// How far along the segment `from` -> `to` it meets this triangle, as a
+    /// fraction, or `None` if it misses.
+    ///
+    /// The same intersection [`Triangle::crossed_by`] does -- it discarded the
+    /// distance and answered a yes/no, which is all a movement check needs.
+    /// A camera needs the number: "something is in the way" tells you nothing
+    /// about where to stop.
+    fn hit_at(&self, from: Vec3, to: Vec3) -> Option<f32> {
         let direction = to - from;
         let edge1 = self.b - self.a;
         let edge2 = self.c - self.a;
@@ -117,21 +128,21 @@ impl Triangle {
         // Parallel to the triangle: a grazing path along a wall, which is what
         // sliding produces and must not be treated as a crossing.
         if determinant.abs() < 1e-9 {
-            return false;
+            return None;
         }
         let inverse = 1.0 / determinant;
         let s = from - self.a;
         let u = inverse * s.dot(h);
         if !(-1e-5..=1.0 + 1e-5).contains(&u) {
-            return false;
+            return None;
         }
         let q = s.cross(edge1);
         let v = inverse * direction.dot(q);
         if v < -1e-5 || u + v > 1.0 + 1e-5 {
-            return false;
+            return None;
         }
         let t = inverse * edge2.dot(q);
-        (0.0..=1.0).contains(&t)
+        (0.0..=1.0).contains(&t).then_some(t)
     }
 
     /// The shortest distance from a vertical segment to this triangle, in the
@@ -412,6 +423,34 @@ impl World {
         false
     }
 
+    /// How far along `from` -> `to` the first solid surface is, as a fraction,
+    /// or `None` for a clear line.
+    ///
+    /// **Floors count here, and that is the difference from
+    /// [`World::crosses_wall`].** That one asks whether a *body* can walk a
+    /// path and so ignores the ground it walks on; this one exists for the
+    /// camera, which is stopped by a floor above it and a ceiling below it
+    /// exactly as it is stopped by a wall. Asking the same question for both
+    /// would either let the camera through walls or refuse to let a character
+    /// walk anywhere.
+    ///
+    /// A bare segment rather than a swept sphere: the camera is a point, and
+    /// the caller keeps its own margin so the near plane does not end up
+    /// inside the surface it stopped at.
+    pub fn first_hit(&self, from: Vec3, to: Vec3) -> Option<f32> {
+        if self.triangles.is_empty() {
+            return None;
+        }
+        let span = (to.truncate() - from.truncate()).length();
+        let middle = (from.truncate() + to.truncate()) * 0.5;
+        self.near(middle, span * 0.5 + CELL)
+            .into_iter()
+            .filter_map(|index| self.triangles[index as usize].hit_at(from, to))
+            .fold(None, |nearest: Option<f32>, t| {
+                Some(nearest.map_or(t, |best| best.min(t)))
+            })
+    }
+
     /// Whether a cylinder here overlaps anything solid.
     pub fn blocked(&self, at: Vec3, radius: f32, height: f32, step: f32) -> bool {
         let (low, high) = (at.z + step, at.z + height);
@@ -470,6 +509,72 @@ mod tests {
             world.add(t);
         }
         world
+    }
+
+    /// **A wall between two points is found, at the right distance**, and open
+    /// air between them is not.
+    ///
+    /// This is what a third-person camera needs and what `crosses_wall` cannot
+    /// give it: that one answers yes or no, and a camera pulled all the way in
+    /// whenever *anything* was in the way would sit in the character's head
+    /// every time they walked past a doorframe.
+    ///
+    /// Both halves, because a query that always reported a hit would pass a
+    /// test that only checked the wall.
+    #[test]
+    fn the_first_hit_is_found_and_measured() {
+        // A wall two units thick, its near face at x = 4.
+        let world = world_with(box_at(
+            Vec3::new(4.0, -10.0, 0.0),
+            Vec3::new(6.0, 10.0, 5.0),
+        ));
+        let eye = Vec3::new(10.0, 0.0, 2.0);
+        let from = Vec3::new(0.0, 0.0, 2.0);
+
+        let t = world.first_hit(from, eye).expect("the wall was missed");
+        // Ten units out, the near face at four: four tenths of the way.
+        assert!((t - 0.4).abs() < 1e-3, "hit reported at {t}");
+
+        // Along the wall rather than through it: nothing in the way.
+        assert_eq!(
+            world.first_hit(Vec3::new(0.0, 0.0, 2.0), Vec3::new(0.0, 9.0, 2.0)),
+            None,
+            "open air reported a hit, which would jam the camera against nothing"
+        );
+        // And over the top of it, which is the case a yes/no answer for the
+        // whole segment would get wrong.
+        assert_eq!(
+            world.first_hit(Vec3::new(0.0, 0.0, 8.0), Vec3::new(10.0, 0.0, 8.0)),
+            None,
+            "a line clearing the wall was stopped by it"
+        );
+    }
+
+    /// **A floor stops the camera and does not stop a walker.** The two
+    /// queries disagree on purpose: `crosses_wall` skips floors so a character
+    /// can walk on them, and `first_hit` must not, or the eye drops through
+    /// the ground it is standing over.
+    #[test]
+    fn a_floor_blocks_the_camera_but_not_a_walker() {
+        let world = world_with(box_at(
+            Vec3::new(-5.0, -5.0, 0.0),
+            Vec3::new(5.0, 5.0, 0.2),
+        ));
+        let above = Vec3::new(0.0, 0.0, 3.0);
+        let below = Vec3::new(0.0, 0.0, -3.0);
+        assert!(
+            world.first_hit(above, below).is_some(),
+            "the camera would pass through the floor"
+        );
+        assert!(
+            !world.crosses_wall(
+                Vec3::new(-3.0, 0.0, 0.2),
+                Vec3::new(3.0, 0.0, 0.2),
+                2.0,
+                0.5
+            ),
+            "walking across a floor must stay allowed"
+        );
     }
 
     /// The whole point: a character cannot end up on the far side of a wall.
