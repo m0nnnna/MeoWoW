@@ -1094,6 +1094,41 @@ pub mod fields {
     /// makes the block end exactly where the visible-item block starts.
     pub const QUEST_LOG_SLOTS: u16 = 25;
 
+    /// Offset within a quest-log entry of the first objective counter --
+    /// how many of each "kill 8 of these" the character has done.
+    ///
+    /// **Two counters per field, sixteen bits each, and that was measured
+    /// rather than assumed.** Three readings of these bytes are all plausible
+    /// -- four counters of eight bits in one field, two of sixteen across two
+    /// fields, or one `u32` each -- and every one of them displays a small
+    /// number for the first objective, which is the only objective most
+    /// quests have. So the sample had to be a quest with **four** objectives,
+    /// with all four counters non-zero at once.
+    ///
+    /// Quest 837 `Encroachment` wants four kills of each of four creatures.
+    /// Taken and completed on a live realm, its log entry reads:
+    ///
+    /// ```text
+    ///    quest          +1         +2         +3         +4
+    ///      837           1     262148     262148          0
+    /// ```
+    ///
+    /// `262148` is `0x0004_0004`. Two fields each holding two fours is the
+    /// sixteen-bit reading and nothing else: eight-bit quarters would have put
+    /// `0x04040404` in `+2` alone and left `+3` zero, and a `u32` per counter
+    /// would need three fields for four counters and have nowhere left for the
+    /// timer that `+4` holds. Quest 7, which has a single objective, agrees --
+    /// four kobolds killed read `4` in the low half of `+2`, and the server's
+    /// own `character_queststatus.mobcount1` said `4` at the same moment.
+    pub const QUEST_LOG_COUNTS: u16 = 2;
+
+    /// How many objective counters share one update field.
+    pub const COUNTERS_PER_FIELD: u32 = 2;
+
+    /// How many objectives a quest's counters cover. The same four slots
+    /// `SMSG_QUEST_QUERY_RESPONSE` carries, in the same order.
+    pub const QUEST_LOG_OBJECTIVES: u32 = 4;
+
     /// The base of another player's worn-item block: one item **entry** id
     /// per equipped slot, at `PLAYER_VISIBLE_ITEM_ENTRY_HEAD + 2 * slot` for
     /// `slot` in `0..EQUIPPED_COUNT` -- an entry, not a display id, which is

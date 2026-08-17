@@ -4148,3 +4148,76 @@ questgivers, and nothing on the map for anything but quest objectives — no
 vendors, no flight points, no trainers. Three of the 108 pages state no
 rectangle at all (`Dalaran`, `TheNexus`, `UtgardeKeep`) and a character
 standing in one gets a window that says so rather than a blank picture.
+
+### 4.17 continued: what the log says you have done
+
+The map showed where objectives are before the log could say how many of them
+were done. Four things came out of one live test, and three of them were bugs
+in things that already worked.
+
+#### The objective counters, and the sample that could tell three readings apart
+
+A quest-log entry is five update fields: the id, the state, **two fields of
+counters**, and a timer. The counters are the part that had never been read,
+and the three plausible readings of those bytes -- four counters of eight bits
+in one field, two of sixteen across two fields, or one `u32` each -- all
+display a small number for the first objective, which is the only objective
+most quests have.
+
+So the sample had to be a quest with **four** objectives, all counted at once.
+Quest 837 `Encroachment` wants four kills of each of four creatures; taken and
+completed on the live realm, its entry reads:
+
+```
+   quest          +1         +2         +3         +4
+     837           1     262148     262148          0
+```
+
+`262148` is `0x0004_0004`. Two fields each holding two fours is the sixteen-bit
+reading and nothing else: eight-bit quarters would have put `0x04040404` in
+`+2` and left `+3` zero, and a `u32` per counter needs three fields for four
+counters and leaves nowhere for the timer in `+4`. Quest 7, with one objective,
+agrees independently -- four kobolds killed read `4` in the low half of `+2`
+while the server's own `character_queststatus.mobcount1` said `4`.
+
+**Two objectives of the same quest are counted from two different places.** A
+kill or a use is counted by the server in those fields. An item objective is
+not there at all -- `.additem` moves nothing in them, because the original
+client counts the items in the bags itself and the server only checks at
+hand-in. So this client counts kills from the wire and items from its own
+replicated inventory, which is the same split the original makes.
+
+**The objective's wire slot indexes the counter, never its position in the
+parsed list.** `SMSG_QUEST_QUERY_RESPONSE`'s objectives are pruned on the way
+in -- a quest with one objective yields one, not four with three blanks -- so a
+quest whose only objective sits in slot 2 would otherwise read counter 0, which
+is a permanent zero or somebody else's progress. The slot travels with the
+objective now.
+
+#### Action bars belong to a character
+
+They were kept once, for everybody. A rogue logging in held a warrior's bar:
+every icon drew, every key pressed, and every cast was refused by the server --
+which reads as "the bars do not work" rather than as "those are somebody else's
+spells".
+
+`ui.toml` now keeps a set per character. The migration rule is the interesting
+part: a leftover bar is **adopted** by the first character who can cast all of
+it, and thrown away for one who cannot. On the only evidence available -- a
+spellbook -- a bar whose every spell is in this character's book is this
+character's, and a warrior's `Heroic Strike` never passes that test for a
+rogue. One arrangement survives the change; nobody inherits spells they do not
+know.
+
+#### The pointer is held for the duration of a drag
+
+Turning the camera ran out of desk: the pointer reached the edge of the window
+and the camera stopped, or left the window and the next click landed in another
+application. It is now hidden, confined, and warped back to where the gesture
+started after every movement, so a turn is unlimited.
+
+That broke the click test and had to be replaced rather than patched. A click
+was a press and release *in the same place*, which is exactly what a pinned
+pointer produces for every drag. It is now distance **travelled** since the
+press, which is also the more honest question: a gesture that swings the camera
+around and comes back is a drag by any reading.

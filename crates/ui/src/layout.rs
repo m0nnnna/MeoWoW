@@ -315,11 +315,39 @@ impl ActionBars {
     }
 }
 
+/// What [`Profile::use_character`] found for a character logging in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterBars {
+    /// The file already held this character's own bars.
+    Restored,
+    /// It did not, and the bars from the last session are all castable by this
+    /// character, so they were taken to be theirs.
+    Adopted,
+    /// It did not, and the leftover bars were somebody else's, so this
+    /// character starts empty and gets seeded from its own spellbook.
+    Fresh,
+}
+
 /// The complete interface layout.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
     pub style: Style,
+    /// The bars in play, which belong to whichever character is logged in.
+    ///
+    /// **An action bar is character state wearing a layout file's clothes.**
+    /// One shared set across every character means a rogue logs in holding a
+    /// warrior's bar: every icon draws, every key presses, and every cast is
+    /// refused by the server because the character does not know the spell.
+    /// That reads as "the bars do not work" rather than as "these are somebody
+    /// else's spells", which is the expensive kind of wrong.
+    ///
+    /// So the file keeps a set per character, [`Profile::characters`], and
+    /// this is the one swapped in for the character at the keyboard. See
+    /// [`Profile::use_character`].
     pub bars: ActionBars,
+    /// Every character's bars, by name, including the one currently in
+    /// [`Profile::bars`] as of the last save.
+    pub characters: BTreeMap<String, ActionBars>,
     /// How the camera behaves. Not a frame, and not drawn by this crate at
     /// all -- it lives here because this profile is the one thing written to
     /// `ui.toml`, and a setting the player changes is one they expect to still
@@ -333,6 +361,7 @@ impl Default for Profile {
         Self {
             style: Style::default(),
             bars: ActionBars::default(),
+            characters: BTreeMap::new(),
             camera: crate::camera::Camera::default(),
             elements: ElementId::ALL
                 .into_iter()
@@ -348,7 +377,14 @@ impl Default for Profile {
 #[serde(default, deny_unknown_fields)]
 struct Stored {
     style: Style,
+    /// The bars of whoever was last at the keyboard.
+    ///
+    /// Kept as a plain key rather than folded into `characters` so a file
+    /// written by an earlier build still parses -- and so a player with one
+    /// character sees the same file they always did.
     bars: ActionBars,
+    /// Bars per character name, written under `[characters.<name>]`.
+    characters: BTreeMap<String, ActionBars>,
     camera: crate::camera::Camera,
     elements: BTreeMap<String, Element>,
 }
@@ -358,6 +394,7 @@ impl Default for Stored {
         Self {
             style: Style::default(),
             bars: ActionBars::default(),
+            characters: BTreeMap::new(),
             camera: crate::camera::Camera::default(),
             elements: BTreeMap::new(),
         }
@@ -397,10 +434,61 @@ impl Profile {
         self.set(id, id.default_element());
     }
 
+    /// Puts a character's own bars in play, and says what happened.
+    ///
+    /// Three outcomes, and they are genuinely different:
+    ///
+    /// - the file already holds bars for this character, so they are restored;
+    /// - it does not, but the bars left over from the last session are ones
+    ///   this character **can cast**, so they are adopted;
+    /// - neither, so the bars start empty and the caller's seeding fills them.
+    ///
+    /// **The middle case is the one worth explaining.** Before bars were kept
+    /// per character there was one shared set, and the honest question about
+    /// it is whose it was. A bar every one of whose spells is in this
+    /// character's own spellbook is, on the only evidence available, this
+    /// character's -- a warrior's `Heroic Strike` never passes that test for a
+    /// rogue. It means one arrangement survives the change instead of being
+    /// silently thrown away, and it cannot hand anyone spells they do not
+    /// know.
+    ///
+    /// `knows` is asked about spell ids rather than handed a list, because the
+    /// caller's list is a `HashSet` it already owns and this crate does not
+    /// need to see it.
+    pub fn use_character(&mut self, name: &str, knows: &dyn Fn(u32) -> bool) -> CharacterBars {
+        if let Some(saved) = self.characters.get(name) {
+            self.bars = saved.clone();
+            return CharacterBars::Restored;
+        }
+        let castable = !self.bars.is_empty()
+            && self
+                .bars
+                .bars
+                .iter()
+                .flatten()
+                .filter(|id| **id != 0)
+                .all(|id| knows(*id));
+        if !castable {
+            self.bars = ActionBars::default();
+        }
+        self.characters.insert(name.to_string(), self.bars.clone());
+        if castable {
+            CharacterBars::Adopted
+        } else {
+            CharacterBars::Fresh
+        }
+    }
+
+    /// Files the bars in play under a character's name, so a save keeps them.
+    pub fn remember_character(&mut self, name: &str) {
+        self.characters.insert(name.to_string(), self.bars.clone());
+    }
+
     pub fn to_toml(&self) -> Result<String, Error> {
         let stored = Stored {
             style: self.style,
             bars: self.bars.clone(),
+            characters: self.characters.clone(),
             camera: self.camera,
             elements: self
                 .elements
@@ -438,9 +526,17 @@ impl Profile {
         // A camera setting is read once a frame from a file a person can type
         // into, so the guard belongs at the point of use, where it cannot be
         // skipped by a caller that built the struct some other way.
+        let mut characters = stored.characters;
+        for (name, bars) in &mut characters {
+            if bars.sanitise() {
+                warnings.push(format!("{name}: the action bars were resized"));
+            }
+        }
+
         let mut profile = Profile {
             style,
             bars,
+            characters,
             camera: stored.camera,
             elements: BTreeMap::new(),
         };
@@ -641,5 +737,85 @@ mod tests {
         for id in ElementId::ALL {
             assert!(text.contains(id.key()), "{} is missing from {text}", id.key());
         }
+    }
+
+    /// **A rogue must not log in holding a warrior's bar.** Every icon draws,
+    /// every key presses, and every cast is refused by the server -- which
+    /// reads as "the bars are broken" rather than as "those are somebody
+    /// else's spells".
+    #[test]
+    fn a_character_who_cannot_cast_the_leftover_bar_gets_a_fresh_one() {
+        let mut profile = Profile::default();
+        // What the last session left behind: a warrior's.
+        profile.bars.set(0, 0, Some(78)); // Heroic Strike
+        profile.bars.set(0, 1, Some(6603)); // Auto Attack
+
+        // The rogue knows neither, so the bar is not theirs.
+        let outcome = profile.use_character("Roguetest", &|id| id == 1752 || id == 6603);
+        assert_eq!(outcome, CharacterBars::Fresh);
+        assert!(profile.bars.is_empty(), "{:?}", profile.bars);
+    }
+
+    /// The other half, and it has to be asserted beside the first: a filter
+    /// that threw *every* leftover bar away would pass the test above on its
+    /// own, and would silently cost the one character whose bar it was.
+    #[test]
+    fn a_character_who_can_cast_the_leftover_bar_keeps_it() {
+        let mut profile = Profile::default();
+        profile.bars.set(0, 0, Some(78));
+        profile.bars.set(0, 1, Some(6603));
+
+        let outcome = profile.use_character("Testwolf", &|id| [78, 6603, 2457].contains(&id));
+        assert_eq!(outcome, CharacterBars::Adopted);
+        assert_eq!(profile.bars.get(0, 0), Some(78));
+        assert_eq!(profile.bars.get(0, 1), Some(6603));
+    }
+
+    /// And once a character has a set of their own, it comes back whatever
+    /// anyone else did in between -- which is the whole point of keying them.
+    #[test]
+    fn each_character_gets_its_own_bars_back() {
+        let mut profile = Profile::default();
+        profile.bars.set(0, 0, Some(78));
+        assert_eq!(
+            profile.use_character("Testwolf", &|id| id == 78),
+            CharacterBars::Adopted
+        );
+
+        // A second character arranges a different bar...
+        assert_eq!(
+            profile.use_character("Roguetest", &|id| id == 1752),
+            CharacterBars::Fresh
+        );
+        profile.bars.set(0, 0, Some(1752));
+        profile.remember_character("Roguetest");
+
+        // ...and the first one's is untouched.
+        assert_eq!(
+            profile.use_character("Testwolf", &|_| true),
+            CharacterBars::Restored
+        );
+        assert_eq!(profile.bars.get(0, 0), Some(78));
+        assert_eq!(
+            profile.use_character("Roguetest", &|_| true),
+            CharacterBars::Restored
+        );
+        assert_eq!(profile.bars.get(0, 0), Some(1752));
+    }
+
+    /// Per-character bars have to survive the round trip through the file, or
+    /// they are a session-long feature that looks permanent.
+    #[test]
+    fn character_bars_round_trip_through_the_file() {
+        let mut profile = Profile::default();
+        profile.bars.set(0, 0, Some(1752));
+        profile.remember_character("Roguetest");
+        let text = profile.to_toml().unwrap();
+        assert!(text.contains("Roguetest"), "{text}");
+
+        let (mut back, warnings) = Profile::from_toml(&text).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(back.use_character("Roguetest", &|_| false), CharacterBars::Restored);
+        assert_eq!(back.bars.get(0, 0), Some(1752));
     }
 }

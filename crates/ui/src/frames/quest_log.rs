@@ -38,6 +38,17 @@ pub enum QuestDetail {
         /// genuinely has none.
         objective: String,
         level: i32,
+        /// One line per objective, already counted by the caller -- `Kobold
+        /// Vermin slain: 4/8`.
+        ///
+        /// **Formatted by the caller, not here.** How far along an objective
+        /// is comes from the player's own quest-log counters for a kill and
+        /// from the bags for an item, and neither is something this crate can
+        /// see. Empty for a quest whose objectives are all of a kind nothing
+        /// can count yet, which is different from a quest with no objectives:
+        /// the first draws its one-line summary and nothing under it, and so
+        /// does the second.
+        progress: Vec<String>,
     },
     /// Asked, still waiting.
     Waiting,
@@ -103,6 +114,19 @@ impl QuestLogEntry {
         }
     }
 
+    /// The counted lines under it, one per objective.
+    fn progress(&self) -> &[String] {
+        match &self.detail {
+            QuestDetail::Known { progress, .. } => progress,
+            _ => &[],
+        }
+    }
+
+    /// How many lines this entry draws below its title.
+    fn sub_lines(&self) -> usize {
+        usize::from(self.objective().is_some()) + self.progress().len()
+    }
+
     /// Whether this row is a statement about the client rather than about the
     /// quest, which is drawn dimmer so it does not read as content.
     fn is_placeholder(&self) -> bool {
@@ -110,15 +134,16 @@ impl QuestLogEntry {
     }
 }
 
-/// How tall one entry is: a title line, plus an objective line when there is
-/// one.
+/// How tall one entry is: a title line, plus a line for the summary and one
+/// per counted objective.
 fn entry_height(entry: &QuestLogEntry, style: &Style, scale: f32) -> f32 {
     let row = style.spellbook_row * scale;
-    if entry.objective().is_some() {
-        row + (style.font_size + style.gap) * scale
-    } else {
-        row
-    }
+    row + entry.sub_lines() as f32 * sub_line_height(style, scale)
+}
+
+/// The height of one line under a title.
+fn sub_line_height(style: &Style, scale: f32) -> f32 {
+    (style.font_size + style.gap) * scale
 }
 
 /// How much room the window wants.
@@ -233,17 +258,32 @@ pub fn draw(
             font.clone(),
             colour,
         );
-        if let Some(objective) = entry.objective() {
+        // The summary line, then one line per objective. Both are laid out
+        // from the same accumulator, so a quest with no summary does not
+        // leave a gap where one would have been.
+        let mut line_top = bounds.min.y + style.spellbook_row * scale;
+        let step = sub_line_height(style, scale);
+        let mut sub_line = |painter: &Painter, body: &str, indent: f32, colour: Color32| {
             painter.text(
                 Pos2::new(
-                    bounds.min.x + style.gap * scale * 2.0,
-                    bounds.min.y + style.spellbook_row * scale + (style.font_size * 0.5) * scale,
+                    bounds.min.x + style.gap * scale * indent,
+                    line_top + (style.font_size * 0.5) * scale,
                 ),
                 Align2::LEFT_CENTER,
-                objective,
+                body,
                 small.clone(),
-                dim,
+                colour,
             );
+            line_top += step;
+        };
+        if let Some(objective) = entry.objective() {
+            sub_line(&painter, objective, 2.0, dim);
+        }
+        for line in entry.progress() {
+            // Indented past the summary and drawn in the ordinary text colour:
+            // a count is content, where the summary above it is a restatement
+            // of what the quest is about.
+            sub_line(&painter, line, 4.0, colour);
         }
     }
 
@@ -278,6 +318,7 @@ pub fn placeholder() -> Vec<QuestLogEntry> {
                 title: "A Threat Within".into(),
                 objective: "Speak with Marshal McBride.".into(),
                 level: 1,
+                progress: vec!["Kobold Vermin slain: 4/8".into()],
             },
             complete: true,
         },
@@ -304,6 +345,7 @@ mod tests {
             detail: QuestDetail::Known {
                 title: "Title".into(),
                 objective: objective.into(),
+                progress: Vec::new(),
                 level: 5,
             },
             complete: false,

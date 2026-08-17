@@ -76,6 +76,15 @@ impl ObjectiveTarget {
 /// One "kill N of these" or "use N of those" objective.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuestObjective {
+    /// Which of the wire's four objective slots this came from, `0..4`.
+    ///
+    /// **Kept because the list is pruned and the progress counter is not.**
+    /// The player's quest-log entry holds one counter per *wire* slot, so a
+    /// quest whose only objective sits in slot 2 has its kills counted in
+    /// counter 2 -- and a client that used the position in this trimmed list
+    /// would read counter 0, which is some other objective's progress or a
+    /// permanent zero. Nothing about either number looks wrong on screen.
+    pub slot: u8,
     /// What to kill or use, and **`None` is a real slot rather than an empty
     /// one.** Quest 28 names no creature at all and still carries an item
     /// drop, so a reader that treats "target zero" as "no objective here"
@@ -345,7 +354,7 @@ pub fn parse_quest_query(body: &[u8]) -> Result<QuestInfo, Error> {
     }
 
     let mut objectives = Vec::new();
-    for (target, count, item_drop) in targets {
+    for (slot, (target, count, item_drop)) in targets.into_iter().enumerate() {
         let text = r.cstring()?;
         // **The string is read for every slot, kept only for some.** All four
         // are on the wire whether the slot is used or not, so reading only the
@@ -354,6 +363,7 @@ pub fn parse_quest_query(body: &[u8]) -> Result<QuestInfo, Error> {
         // error rather than as wrong data. Read first, filter second.
         if target.is_some() || item_drop != 0 {
             objectives.push(QuestObjective {
+                slot: slot as u8,
                 target,
                 count,
                 item_drop,

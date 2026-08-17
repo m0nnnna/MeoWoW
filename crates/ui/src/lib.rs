@@ -42,7 +42,7 @@ pub use frames::{
     CastBarView, QuestDetail, QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
     MapMarker, MapPatch, MapView, MarkerKind, QuestgiverView, SpellbookEntry, UnitView,
 };
-pub use layout::{default_path, ElementId, Profile};
+pub use layout::{default_path, CharacterBars, ElementId, Profile};
 pub use style::{Color, PowerType, Style};
 
 #[derive(Debug, thiserror::Error)]
@@ -218,6 +218,15 @@ pub struct Hud {
     /// logged, because a customisation that did not take effect needs to say
     /// so where the customising is happening.
     pub status: Option<String>,
+    /// Whose bars are in play, so every save files them under the right name.
+    ///
+    /// **Kept here rather than passed to `save`** because there are several
+    /// save paths -- a spell dropped on a bar, a frame dragged, the window
+    /// closing -- and one of them forgetting the name would write a
+    /// character's bars into another's the next time they logged in. The rule
+    /// this project keeps relearning: when a fact is easy to forget, attach it
+    /// to the thing that needs it rather than to the call that usually has it.
+    character: Option<String>,
     /// Screen rectangles the interface drew into last frame, used by
     /// [`Hud::captures_pointer`].
     ///
@@ -250,6 +259,7 @@ impl Default for Hud {
             edit: EditState::default(),
             path: None,
             status: None,
+            character: None,
             occupied: Vec::new(),
             held: None,
             spellbook_scroll: 0,
@@ -301,7 +311,23 @@ impl Hud {
         hud
     }
 
+    /// Puts a character's own action bars in play.
+    ///
+    /// Everything after this -- arranging a bar, saving the file -- happens to
+    /// that character's set. See [`Profile::use_character`] for what happens
+    /// when the file has never seen this character before.
+    pub fn use_character(&mut self, name: &str, knows: &dyn Fn(u32) -> bool) -> CharacterBars {
+        self.character = Some(name.to_string());
+        self.profile.use_character(name, knows)
+    }
+
     pub fn save(&mut self) {
+        // Filed under the character before anything is written, on every save
+        // path there is. Skipped when no character is logged in, so a layout
+        // edited from the asset viewer does not invent one.
+        if let Some(name) = self.character.clone() {
+            self.profile.remember_character(&name);
+        }
         let Some(path) = self.path.clone() else {
             self.status = Some("there is nowhere to save the layout".into());
             return;
@@ -1820,6 +1846,7 @@ mod tests {
                 detail: frames::QuestDetail::Known {
                     title: "A Threat Within".into(),
                     objective: "Speak with Marshal McBride.".into(),
+                    progress: Vec::new(),
                     level: 1,
                 },
                 complete: true,
@@ -1830,6 +1857,63 @@ mod tests {
                 complete: false,
             },
         ]
+    }
+
+    /// **A quest in progress has to show the progress**, and it is the one
+    /// line whose absence is invisible: a log that says `Kobold Camp Cleanup`
+    /// and nothing else looks exactly like a log that is working.
+    #[test]
+    fn the_quest_log_counts_each_objective() {
+        let entries = vec![frames::QuestLogEntry {
+            id: 7,
+            detail: frames::QuestDetail::Known {
+                title: "Kobold Camp Cleanup".into(),
+                objective: "Kill 8 Kobold Vermin.".into(),
+                level: 2,
+                progress: vec![
+                    "Kobold Vermin: 4/8".into(),
+                    "Large Candle: 0/3".into(),
+                ],
+            },
+            complete: false,
+        }];
+        let data = HudData {
+            quest_log: Some(&entries),
+            ..Default::default()
+        };
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let text = painted_text(&shapes(&mut hud, &data, None)).join(" | ");
+        assert!(text.contains("Kobold Vermin: 4/8"), "{text}");
+        assert!(text.contains("Large Candle: 0/3"), "{text}");
+        // And the summary above them still draws -- the counted lines are an
+        // addition, not a replacement.
+        assert!(text.contains("Kill 8 Kobold Vermin."), "{text}");
+    }
+
+    /// The window has to grow for those lines, or the last quest in a log is
+    /// drawn outside the frame and simply is not there.
+    #[test]
+    fn counted_objectives_make_the_log_taller() {
+        let style = style::Style::default();
+        let bare = vec![frames::QuestLogEntry {
+            id: 7,
+            detail: frames::QuestDetail::Known {
+                title: "Kobold Camp Cleanup".into(),
+                objective: "Kill 8 Kobold Vermin.".into(),
+                level: 2,
+                progress: Vec::new(),
+            },
+            complete: false,
+        }];
+        let mut counted = bare.clone();
+        if let frames::QuestDetail::Known { progress, .. } = &mut counted[0].detail {
+            progress.push("Kobold Vermin: 4/8".into());
+        }
+        assert!(
+            frames::quest_log::size(&counted, &style, 1.0).y
+                > frames::quest_log::size(&bare, &style, 1.0).y
+        );
     }
 
     /// The quest log is drawn when it is open and not otherwise -- the same
@@ -2004,6 +2088,7 @@ mod tests {
             detail: frames::QuestDetail::Known {
                 title: "Westfall Stew".into(),
                 objective: String::new(),
+                progress: Vec::new(),
                 level: 13,
             },
             complete: false,

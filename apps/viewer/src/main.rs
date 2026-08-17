@@ -39,7 +39,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 /// Shown when nothing else is asked for: present in every locale of a stock
 /// install, so the window is never empty.
@@ -1648,6 +1648,30 @@ struct App {
     camera: Camera,
     dragging: bool,
     last_cursor: Option<(f64, f64)>,
+    /// Whether the pointer is currently held by a drag: hidden, confined to
+    /// the window, and warped back to where the gesture started after every
+    /// movement.
+    ///
+    /// **Without this a long turn runs out of desk.** The pointer reaches the
+    /// edge of the window and the camera simply stops turning, or leaves the
+    /// window entirely and the next click lands in another application. Both
+    /// read as the drag "sticking" rather than as the mouse having gone
+    /// somewhere.
+    cursor_captured: bool,
+    /// Where a captured pointer is pinned, and where it is put back when the
+    /// button comes up. The press position, so the cursor reappears where the
+    /// gesture started rather than wherever the warping left it.
+    capture_anchor: Option<(f64, f64)>,
+    /// How far the pointer has travelled since each button went down.
+    ///
+    /// **Distance travelled, not the distance between press and release**,
+    /// which is what separates a click from a look now that a captured pointer
+    /// is warped back to its anchor: measured end to end, every drag would
+    /// finish exactly where it started and so would be a click. Accumulating
+    /// is also the more honest question -- a gesture that circles the camera
+    /// and comes back is a drag by any reading.
+    left_travel: f64,
+    right_travel: f64,
     error: Option<String>,
     keys: KeyState,
     last_frame: Instant,
@@ -2403,6 +2427,10 @@ impl App {
             keys: KeyState::default(),
             dragging: false,
             last_cursor: None,
+            cursor_captured: false,
+            capture_anchor: None,
+            left_travel: 0.0,
+            right_travel: 0.0,
             error: None,
             last_frame: Instant::now(),
             camera_z: None,
@@ -2645,7 +2673,7 @@ impl ApplicationHandler for App {
         _id: WindowId,
         event: WindowEvent,
     ) {
-        let (Some(window), Some(r)) = (self.window.clone(), self.renderer.as_mut()) else {
+        let Some(window) = self.window.clone() else {
             return;
         };
         // **A button that is not held down must never leave the camera
@@ -2672,11 +2700,22 @@ impl ApplicationHandler for App {
                 state: ElementState::Released,
                 button,
                 ..
-            } => match button {
-                MouseButton::Left => self.dragging = false,
-                MouseButton::Right => self.steering = false,
-                _ => {}
-            },
+            } => {
+                match button {
+                    MouseButton::Left => self.dragging = false,
+                    MouseButton::Right => self.steering = false,
+                    _ => {}
+                }
+                // The pointer goes back the moment neither drag is live, and
+                // from here rather than from the branch below, for the same
+                // reason the flags are cleared here: a frame that appears
+                // mid-gesture eats the release, and a cursor left hidden and
+                // grabbed by that is far worse than a camera that keeps
+                // turning.
+                if !self.dragging && !self.steering {
+                    self.release_cursor(&window);
+                }
+            }
             // Losing focus mid-drag is the other way a release never arrives:
             // alt-tab away with a button down and the window is simply not
             // told it came up again.
@@ -2685,10 +2724,18 @@ impl ApplicationHandler for App {
                 self.steering = false;
                 self.press_at = None;
                 self.right_press_at = None;
+                self.release_cursor(&window);
             }
             _ => {}
         }
 
+        // The renderer is borrowed *after* the block above, not with the
+        // window at the top: releasing the pointer needs `&mut self`, and a
+        // renderer borrow held across it would make the one correction that
+        // must happen on every path the one that cannot compile.
+        let Some(r) = self.renderer.as_mut() else {
+            return;
+        };
         if r.egui_state.on_window_event(&window, &event).consumed {
             window.request_redraw();
             return;
@@ -2715,16 +2762,19 @@ impl ApplicationHandler for App {
                 self.dragging = state == ElementState::Pressed;
                 if self.dragging {
                     self.press_at = self.last_cursor;
+                    self.left_travel = 0.0;
+                    self.capture_cursor(&window);
                 } else {
-                    // A press and release in the same place is a click; the
-                    // same two events with movement between them is the drag
-                    // that turns the camera. Nothing else distinguishes them,
-                    // so the distance has to be measured.
-                    if let (Some(press), Some(release)) = (self.press_at.take(), self.last_cursor) {
-                        let moved =
-                            ((release.0 - press.0).powi(2) + (release.1 - press.1).powi(2)).sqrt();
-                        if moved <= CLICK_SLOP {
-                            self.click_at(release);
+                    // A press and release with the pointer barely moving is a
+                    // click; the same two events with travel between them is
+                    // the drag that turns the camera. Nothing else
+                    // distinguishes them, so the movement has to be measured --
+                    // and it is measured as distance *travelled*, because a
+                    // captured pointer is pinned and so ends every drag exactly
+                    // where it began.
+                    if let Some(press) = self.press_at.take() {
+                        if self.left_travel <= CLICK_SLOP {
+                            self.click_at(press);
                         }
                     }
                     // `last_cursor` deliberately survives the release.
@@ -2762,14 +2812,16 @@ impl ApplicationHandler for App {
                 self.steering = pressed && self.live.is_some();
                 if pressed {
                     self.right_press_at = self.last_cursor;
+                    self.right_travel = 0.0;
+                    // Captured even when there is no character to steer: the
+                    // right button still turns the camera, and half a gesture
+                    // holding the pointer and half not would be worse than
+                    // either.
+                    self.capture_cursor(&window);
                 } else {
-                    if let (Some(press), Some(release)) =
-                        (self.right_press_at.take(), self.last_cursor)
-                    {
-                        let moved =
-                            ((release.0 - press.0).powi(2) + (release.1 - press.1).powi(2)).sqrt();
-                        if moved <= CLICK_SLOP {
-                            self.right_click_at(release);
+                    if let Some(press) = self.right_press_at.take() {
+                        if self.right_travel <= CLICK_SLOP {
+                            self.right_click_at(press);
                         }
                     }
                 }
@@ -2842,6 +2894,24 @@ impl ApplicationHandler for App {
                             // nothing that was already spoken for.
                             KeyCode::KeyP => {
                                 self.spellbook_open = !self.spellbook_open;
+                                // **Logged, because "the window did not open"
+                                // and "the window opened empty" are the same
+                                // report and want opposite investigations.**
+                                // The count is the whole diagnosis: a book with
+                                // rows that nobody can see is a layout problem,
+                                // and a book with no rows is the spell filter.
+                                if self.spellbook_open {
+                                    tracing::info!(
+                                        "spellbook opened: {} spell(s) it would list",
+                                        Self::castable_spells(
+                                            self.live.as_ref(),
+                                            &self.spells
+                                        )
+                                        .len()
+                                    );
+                                } else {
+                                    tracing::info!("spellbook closed");
+                                }
                                 window.request_redraw();
                                 return;
                             }
@@ -2943,6 +3013,18 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let now = (position.x, position.y);
+                // Travel per held button, before anything else reads the
+                // movement -- the warp that pins a captured pointer sets
+                // `last_cursor` itself and so contributes a zero step here.
+                if let Some(prev) = self.last_cursor {
+                    let step = ((now.0 - prev.0).powi(2) + (now.1 - prev.1).powi(2)).sqrt();
+                    if self.press_at.is_some() {
+                        self.left_travel += step;
+                    }
+                    if self.right_press_at.is_some() {
+                        self.right_travel += step;
+                    }
+                }
                 if self.steering {
                     // Steering turns the *character*. The camera needs no
                     // separate handling: it is rebuilt from the character's
@@ -2978,6 +3060,7 @@ impl ApplicationHandler for App {
                         .clamp(-FOLLOW_PITCH_LIMIT, FOLLOW_PITCH_LIMIT);
                     }
                     self.last_cursor = Some(now);
+                    self.pin_cursor(&window);
                     window.request_redraw();
                     return;
                 }
@@ -3023,6 +3106,7 @@ impl ApplicationHandler for App {
                     }
                 }
                 self.last_cursor = Some(now);
+                self.pin_cursor(&window);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let notches = match delta {
@@ -4163,6 +4247,17 @@ impl App {
         }
         self.bars_seeded = true;
 
+        // **Whose bars are these?** Done here rather than at login because it
+        // needs the spellbook: a leftover arrangement is taken to belong to
+        // this character only if this character can cast all of it, and that
+        // question cannot be asked before `SMSG_INITIAL_SPELLS` arrives.
+        let castable_by_us: std::collections::HashSet<u32> = known.iter().copied().collect();
+        let name = live.character.clone();
+        let outcome = self
+            .hud
+            .use_character(&name, &|id| castable_by_us.contains(&id));
+        tracing::info!("action bars for {name}: {outcome:?}");
+
         if !self.hud.profile.bars.is_empty() {
             tracing::debug!("action bars already arranged; leaving them alone");
             return;
@@ -4190,6 +4285,163 @@ impl App {
             castable.len(),
             placed.join(", ")
         );
+    }
+
+    /// Which of the character's known spells belong on a bar or in the book.
+    ///
+    /// One function rather than the same three lines in the spellbook view and
+    /// the seeder: they must agree about what a spellbook contains, and two
+    /// copies of a filter agree only until one of them is changed.
+    /// Takes its two pieces rather than `&self` on purpose: the caller drawing
+    /// the book already holds the renderer mutably, and a method borrowing all
+    /// of `self` could not be called from there.
+    fn castable_spells(live: Option<&live::LiveWorld>, book: &spells::Spellbook) -> Vec<u32> {
+        let Some(live) = live else {
+            return Vec::new();
+        };
+        let known: Vec<u32> = live.state.spells.spells.iter().map(|s| s.id).collect();
+        let class = live
+            .state
+            .get(live.guid)
+            .and_then(|entity| entity.class())
+            .unwrap_or(1);
+        book.castable(&known, class)
+    }
+
+    /// One line per objective of a quest in the log: what it wants, and how
+    /// far along it is.
+    ///
+    /// **Two objectives of a quest are counted from two different places, and
+    /// that is not an inconsistency.** A kill or a use is counted by the
+    /// *server*, in the player's own quest-log counters -- see
+    /// `world::update::fields::QUEST_LOG_COUNTS`, where the packing was
+    /// measured. An item objective is not there at all: `.additem` moves
+    /// nothing in those fields, because the original client counts the items
+    /// in the bags itself and the server only checks at hand-in. So this
+    /// counts the bags for those, which this client can do because inventory
+    /// is replicated.
+    ///
+    /// **The objective's *wire* slot indexes the counter, never its position
+    /// in this list**, which is pruned. See `world::quest::QuestObjective`.
+    fn quest_progress(&self, quest: &::world::quest::QuestInfo) -> Vec<String> {
+        let Some(live) = self.live.as_ref() else {
+            return Vec::new();
+        };
+        let Some(player) = live.state.get(live.guid) else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+
+        for objective in &quest.objectives {
+            let Some(done) = player.quest_objective_progress(quest.id, objective.slot) else {
+                continue;
+            };
+            // A slot carrying only an item drop has nothing to kill and no
+            // count of its own; the drop is counted with the item objectives
+            // below.
+            let Some(target) = objective.target else {
+                continue;
+            };
+            // The server's own wording when it has one; otherwise the name if
+            // this client has ever been told it, and the id if not. **Never an
+            // invented name** -- an id is checkable and a plausible wrong name
+            // is not.
+            let what = if !objective.text.is_empty() {
+                objective.text.clone()
+            } else {
+                match target {
+                    ::world::quest::ObjectiveTarget::Creature(entry) => live
+                        .state
+                        .names
+                        .creature(entry)
+                        .flatten()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("creature {entry}")),
+                    ::world::quest::ObjectiveTarget::GameObject(id) => format!("object {id}"),
+                }
+            };
+            lines.push(format!("{what}: {done}/{}", objective.count.max(1)));
+        }
+
+        for item in &quest.item_objectives {
+            let carried: u32 = ::world::inventory::carried(&live.state, live.guid)
+                .iter()
+                .filter(|held| held.item.entry == Some(item.item))
+                .map(|held| held.item.count)
+                .sum();
+            lines.push(format!(
+                "{}: {carried}/{}",
+                self.items.name(item.item),
+                item.count.max(1)
+            ));
+        }
+
+        lines
+    }
+
+    /// Takes hold of the pointer for the duration of a drag.
+    ///
+    /// Hidden, confined to the window, and pinned to where the gesture
+    /// started. **Confined rather than locked on purpose**: winit implements
+    /// `Locked` on some platforms and `Confined` on others, and the pin below
+    /// is what actually gives an unlimited turn, so the grab only has to stop
+    /// the pointer escaping. A platform that refuses both still turns the
+    /// camera -- it simply runs out of window, which is what it did before.
+    fn capture_cursor(&mut self, window: &Window) {
+        if self.cursor_captured {
+            return;
+        }
+        self.capture_anchor = self.last_cursor;
+        if window.set_cursor_grab(CursorGrabMode::Confined).is_err()
+            && window.set_cursor_grab(CursorGrabMode::Locked).is_err()
+        {
+            tracing::debug!("this platform holds neither cursor grab mode");
+        }
+        window.set_cursor_visible(false);
+        self.cursor_captured = true;
+    }
+
+    /// Gives the pointer back, where the drag began.
+    ///
+    /// Putting it back matters: a captured pointer has been warped to the
+    /// anchor all through the drag, so releasing without restoring it leaves
+    /// the visible cursor wherever the last warp put it -- which is the anchor
+    /// anyway, but only by luck, and a platform that refused the warp would
+    /// hand back a cursor at the window edge.
+    fn release_cursor(&mut self, window: &Window) {
+        if !self.cursor_captured {
+            return;
+        }
+        let _ = window.set_cursor_grab(CursorGrabMode::None);
+        window.set_cursor_visible(true);
+        if let Some((x, y)) = self.capture_anchor.take() {
+            let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y));
+            self.last_cursor = Some((x, y));
+        }
+        self.cursor_captured = false;
+    }
+
+    /// Puts a captured pointer back on its anchor after a movement.
+    ///
+    /// This is what makes a turn unlimited: every frame of the drag reads a
+    /// delta and then the pointer is returned to the middle of the gesture, so
+    /// it never reaches an edge. `last_cursor` moves with it, so the next
+    /// delta is measured from the anchor and the warp itself contributes
+    /// nothing -- the event it generates arrives with the position already
+    /// recorded here.
+    fn pin_cursor(&mut self, window: &Window) {
+        if !self.cursor_captured {
+            return;
+        }
+        let Some((x, y)) = self.capture_anchor else {
+            return;
+        };
+        if window
+            .set_cursor_position(winit::dpi::PhysicalPosition::new(x, y))
+            .is_ok()
+        {
+            self.last_cursor = Some((x, y));
+        }
     }
 
     /// Selects whatever is under the cursor, and tells the server.
@@ -5373,19 +5625,15 @@ impl App {
         // mid-session should appear without a relog. The cost is a filter over
         // a few dozen ids, which is nothing beside the icons it resolves --
         // and those are cached by path inside `Spellbook`.
+        // Resolved before the icons, because loading one borrows the renderer
+        // and the archive chain while this borrows `self` whole.
+        let castable = if self.spellbook_open {
+            Self::castable_spells(self.live.as_ref(), &self.spells)
+        } else {
+            Vec::new()
+        };
         let spellbook: Vec<ui::SpellbookEntry> = if self.spellbook_open {
-            let (known, class) = match self.live.as_ref() {
-                Some(live) => (
-                    live.state.spells.spells.iter().map(|s| s.id).collect(),
-                    live.state
-                        .get(live.guid)
-                        .and_then(|entity| entity.class())
-                        .unwrap_or(1),
-                ),
-                None => (Vec::new(), 1),
-            };
-            self.spells
-                .castable(&known, class)
+            castable
                 .into_iter()
                 .map(|id| {
                     let icon =
@@ -5681,6 +5929,7 @@ impl App {
                             title: quest.title.clone(),
                             objective: quest.objectives_text.clone(),
                             level: quest.level,
+                            progress: self.quest_progress(quest),
                         },
                         // Never asked and asked-but-waiting are both "the
                         // answer is coming" as far as a player is concerned;

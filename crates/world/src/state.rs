@@ -302,6 +302,38 @@ impl Entity {
         })
     }
 
+    /// How many of one objective this player has done, by the objective's
+    /// **wire slot** rather than its position in a pruned list.
+    ///
+    /// `None` when the quest is not in the log; `Some(0)` when it is and
+    /// nothing has been done yet, which are different answers -- one draws
+    /// nothing and the other draws `0/8`.
+    ///
+    /// See [`crate::update::fields::QUEST_LOG_COUNTS`] for how the packing was
+    /// measured.
+    pub fn quest_objective_progress(&self, quest: u32, slot: u8) -> Option<u32> {
+        use crate::update::fields;
+        if u32::from(slot) >= fields::QUEST_LOG_OBJECTIVES {
+            return None;
+        }
+        (0..fields::QUEST_LOG_SLOTS).find_map(|log_slot| {
+            let base = fields::PLAYER_QUEST_LOG + log_slot * fields::QUEST_LOG_STRIDE;
+            if self.fields.get(base)? != quest {
+                return None;
+            }
+            let counter = u32::from(slot);
+            let field = base
+                + fields::QUEST_LOG_COUNTS
+                + (counter / fields::COUNTERS_PER_FIELD) as u16;
+            // An absent field is a zero here, not an unknown: an update block
+            // carries only what is non-zero, so a quest nothing has been done
+            // for has no counter field at all.
+            let packed = self.fields.get(field).unwrap_or(0);
+            let shift = (counter % fields::COUNTERS_PER_FIELD) * 16;
+            Some((packed >> shift) & 0xFFFF)
+        })
+    }
+
     pub fn quest_log_ids(&self) -> Vec<u32> {
         use crate::update::fields;
         (0..fields::QUEST_LOG_SLOTS)
@@ -3801,6 +3833,65 @@ mod tests {
             fields::PLAYER_QUEST_LOG + 3 * fields::QUEST_LOG_STRIDE,
             0xad,
             "base and stride must still describe the measured offsets"
+        );
+    }
+
+    /// **The objective counters, built from the live dump that identified the
+    /// packing.** Quest 837 wants four kills of each of four creatures; taken
+    /// and completed on a live realm its entry read `+2` and `+3` as
+    /// `0x0004_0004` with `+4` zero.
+    ///
+    /// The test asserts the four counters *and* a fifth thing: that a quest
+    /// with a single objective reads its count in the low half of `+2` and
+    /// zero everywhere else. Asserting only the four-objective case would pass
+    /// under an eight-bit reading for any count below 256, which is every
+    /// count in the game that matters.
+    #[test]
+    fn objective_counters_are_sixteen_bits_two_to_a_field() {
+        use crate::update::fields;
+
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            9,
+            ObjectType::Player,
+            Some(at(0.0, 0.0)),
+            &[
+                // Quest 837 in slot 0, completed: four counters of four.
+                (0x9e, 837),
+                (0x9f, 1),
+                (0xa0, 0x0004_0004),
+                (0xa1, 0x0004_0004),
+                // Quest 7 in slot 1, four kobolds of eight killed.
+                (0xa3, 7),
+                (0xa5, 4),
+            ],
+        )]);
+        let player = world.get(9).unwrap();
+
+        for slot in 0..4 {
+            assert_eq!(
+                player.quest_objective_progress(837, slot),
+                Some(4),
+                "objective {slot} of the four-objective quest"
+            );
+        }
+        // The single-objective quest: the first counter, and nothing bleeding
+        // into the others from the neighbouring quest's fields.
+        assert_eq!(player.quest_objective_progress(7, 0), Some(4));
+        assert_eq!(player.quest_objective_progress(7, 1), Some(0));
+        assert_eq!(player.quest_objective_progress(7, 2), Some(0));
+        assert_eq!(player.quest_objective_progress(7, 3), Some(0));
+
+        // A quest that is not in the log at all, which is not the same as one
+        // with nothing done.
+        assert_eq!(player.quest_objective_progress(38, 0), None);
+        // And a slot past the four the wire carries.
+        assert_eq!(player.quest_objective_progress(837, 4), None);
+
+        assert_eq!(
+            fields::PLAYER_QUEST_LOG + fields::QUEST_LOG_COUNTS,
+            0xa0,
+            "the counters must still start where they were measured"
         );
     }
 
