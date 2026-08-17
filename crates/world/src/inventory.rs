@@ -232,6 +232,26 @@ pub enum Where {
     InBag { bag: InventorySlot, slot: u16 },
 }
 
+impl Where {
+    /// The `(bag, slot)` pair every item-addressing request on this wire
+    /// takes -- `CMSG_AUTOEQUIP_ITEM`, `CMSG_SWAP_ITEM`, `CMSG_USE_ITEM`.
+    ///
+    /// **On the data rather than at the call site**, because there are now
+    /// three callers and the conversion has one non-obvious half: an item in
+    /// the player's own array is addressed with the bag byte
+    /// [`OWN_SLOT_ARRAY`], while one inside a container is addressed by the
+    /// *slot the container is worn in*. Getting that backwards addresses a
+    /// real, different item rather than failing, which is the class of
+    /// mistake this project keeps paying for when a fact lives beside its
+    /// first caller instead of on the thing it is about.
+    pub fn address(self) -> (u8, u8) {
+        match self {
+            Where::Own(slot) => (OWN_SLOT_ARRAY, slot.index() as u8),
+            Where::InBag { bag, slot } => (bag.index() as u8, slot as u8),
+        }
+    }
+}
+
 /// One carried item and where it lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Carried {

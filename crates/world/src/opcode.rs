@@ -36,6 +36,13 @@ pub enum ClientOpcode {
     /// Keyed by entry like [`Self::CreatureQuery`], so one answer names every
     /// copy of a thing.
     ItemQuerySingle = 0x0056,
+    /// Use the thing in this bag slot -- drink the water, eat the bread, go
+    /// home on the hearthstone.
+    ///
+    /// **Not an equip and not a swap**, which is what the bag window used to
+    /// do with every right-click: an item with an on-use spell was offered to
+    /// the equipment slots, refused, and appeared to do nothing.
+    UseItem = 0x00AB,
     MessageChat = 0x0095,
     /// Ask to cast. What comes back is either the world reacting or
     /// `SMSG_CAST_FAILED` explaining why not.

@@ -373,6 +373,21 @@ enum Command {
         /// bag with contents.
         #[arg(long = "item-query", num_args = 0.., value_delimiter = ',')]
         item_query: Option<Vec<u32>>,
+        /// Use the carried item with this entry, and report what changed.
+        ///
+        /// **A write nothing acknowledges, confirmed by consequence.** The
+        /// item's stack count is read before and after: a consumable that
+        /// drops by one was used, and nothing else in a quiet session moves
+        /// that field. Pick something stackable and harmless -- entry 159,
+        /// `Refreshing Spring Water`, is what this was confirmed against --
+        /// rather than a hearthstone, which works but moves the character.
+        ///
+        /// The on-use spell is looked up with `CMSG_ITEM_QUERY_SINGLE`
+        /// first, which also bounds the silence: that request *is* answered,
+        /// so a run that gets a name and then no effect has a use-item
+        /// problem rather than an addressing one.
+        #[arg(long = "use-item")]
+        use_item: Option<u32>,
         /// Greet a questgiver by creature entry and dump everything it says.
         ///
         /// Separate from `--gossip` because the two greetings are different
@@ -982,6 +997,7 @@ fn main() -> Result<()> {
             sell_back,
             quest,
             item_query,
+            use_item,
             quest_accept,
             quest_turnin,
             quest_sweep,
@@ -1035,6 +1051,7 @@ fn main() -> Result<()> {
                 sell_back: *sell_back,
                 quest: *quest,
                 item_query: item_query.as_deref(),
+                use_item: *use_item,
                 quest_accept: *quest_accept,
                 quest_turnin: *quest_turnin,
                 quest_sweep: *quest_sweep,
@@ -1212,6 +1229,7 @@ struct WorldRequest<'a> {
     sell_back: bool,
     quest: Option<u32>,
     item_query: Option<&'a [u32]>,
+    use_item: Option<u32>,
     quest_accept: Option<u32>,
     quest_turnin: Option<u32>,
     quest_sweep: Option<u32>,
@@ -1313,6 +1331,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         sell_back,
         quest,
         item_query,
+        use_item,
         quest_accept,
         quest_turnin,
         quest_sweep,
@@ -2183,6 +2202,10 @@ cast {spell_id} at {} (attempt {attempt})",
             report_visible_items(&state, character, data, locale)?;
         }
 
+        if let Some(entry) = use_item {
+            survey_use_item(&mut connection, &mut state, character.guid, entry)?;
+        }
+
         if let Some(entries) = item_query {
             survey_item_query(
                 &mut connection,
@@ -2228,6 +2251,126 @@ cast {spell_id} at {} (attempt {attempt})",
 /// them is reported too -- the same shape of evidence
 /// `PLAYER_FIELD_INV_SLOT_HEAD` was confirmed with, and it is what
 /// `foss-wow#23` wants named in `crates/world/src/update.rs` once it holds.
+/// Uses a carried item and reports what changed.
+///
+/// **Nothing acknowledges a use, so this is confirmed by consequence** --
+/// the same shape as the buy that was proved by `PLAYER_FIELD_COINAGE`
+/// dropping. The item's stack count is read before and after; a consumable
+/// that drops by one was used, and nothing else in a quiet session moves
+/// that field.
+///
+/// The silence is bounded first, the way `CMSG_LIST_INVENTORY` bounded
+/// `CMSG_BUY_ITEM`: the on-use spell has to be fetched with
+/// `CMSG_ITEM_QUERY_SINGLE` anyway, and that request *is* answered. A run
+/// that resolves the name and spell and then sees no effect has a use-item
+/// problem; one that never resolves the name has a session problem, and the
+/// two want opposite investigations.
+fn survey_use_item(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    entry: u32,
+) -> Result<()> {
+    // Where the thing actually is, including inside a bag -- `Where` carries
+    // the distinction and `address` turns it into the pair the wire wants.
+    let found = world::inventory::carried(state, own_guid)
+        .into_iter()
+        .find(|carried| carried.item.entry == Some(entry));
+    let Some(carried) = found else {
+        println!("\n--use-item: nothing with entry {entry} is in the bags");
+        return Ok(());
+    };
+    let (bag, slot) = carried.at.address();
+    println!(
+        "\nusing entry {entry}: guid {:#x} at bag {bag} slot {slot}, stack {}",
+        carried.item.guid, carried.item.count
+    );
+
+    // The answered request first: it supplies the spell id the use needs and
+    // proves the session is live before anything silent is sent.
+    connection.ask_item(entry, carried.item.guid)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut info = None;
+    while std::time::Instant::now() < deadline && info.is_none() {
+        let batch = connection.drain(std::time::Duration::from_millis(700), 256)?;
+        for packet in &batch {
+            if packet.opcode == world::opcode::server::ITEM_QUERY_SINGLE_RESPONSE {
+                if let Ok(parsed) = world::query::parse_item_query_response(&packet.body) {
+                    if parsed.entry == entry {
+                        info = Some(parsed);
+                    }
+                }
+            }
+        }
+        state.replicate(&batch, None);
+    }
+    let Some(info) = info else {
+        println!("  the item query was never answered -- the session, not the use, is the problem");
+        return Ok(());
+    };
+    println!(
+        "  it is {:?}, spells {:?}",
+        info.name.as_deref().unwrap_or("<unnamed>"),
+        info.spells
+            .iter()
+            .filter(|s| s.id != 0)
+            .collect::<Vec<_>>()
+    );
+    let Some(spell_id) = info.use_spell() else {
+        println!("  no on-use spell: this item does nothing when clicked, which is not a bug");
+        return Ok(());
+    };
+    println!("  on-use spell {spell_id}");
+
+    let before = world::inventory::carried(state, own_guid)
+        .into_iter()
+        .find(|c| c.item.guid == carried.item.guid)
+        .map(|c| c.item.count);
+    connection.use_item(bag, slot, carried.item.guid, spell_id, None)?;
+
+    // Long enough for a cast to finish: a consumable is instant, but the
+    // stack does not move until the spell lands.
+    let mut seen: Vec<u16> = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        let batch = connection.drain(std::time::Duration::from_millis(700), 256)?;
+        for packet in &batch {
+            if !seen.contains(&packet.opcode) {
+                seen.push(packet.opcode);
+            }
+        }
+        state.replicate(&batch, None);
+    }
+
+    let after = world::inventory::carried(state, own_guid)
+        .into_iter()
+        .find(|c| c.item.guid == carried.item.guid)
+        .map(|c| c.item.count);
+    println!("  stack {before:?} -> {after:?}");
+    match (before, after) {
+        (Some(before), Some(after)) if after < before => {
+            println!("  USED: the stack dropped by {}", before - after)
+        }
+        (Some(_), None) => println!("  USED: the last one was consumed and the item is gone"),
+        _ => println!(
+            "  no change. The query above answered, so the session is fine and the \
+             use is the problem -- opcode, body shape, or a refusal."
+        ),
+    }
+    // Printed whatever the verdict: an opcode nobody decoded is the evidence
+    // that separates "never understood" from "understood and declined", and
+    // this project has twice found the answer in this list rather than in
+    // the effect.
+    println!(
+        "  opcodes seen after the send: {}",
+        seen.iter()
+            .map(|op| format!("{} ({op:#06x})", world::opcode::describe(*op)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
+}
+
 /// Asks the server about item entries and checks what comes back.
 ///
 /// **This exists to confirm a parse, not to fetch names.** `foss-wow#56`'s

@@ -347,6 +347,7 @@ mod tests {
             buy_price: 25,
             sell_price: 5,
             max_durability: 55,
+            spells: Vec::new(),
         }
     }
 

@@ -226,6 +226,13 @@ pub fn hover_tooltip(response: &egui::Response, spell: &SlotSpell) {
         if !spell.description.is_empty() {
             ui.label(&spell.description);
         }
+        // **Said here because it was already true and nobody could tell.**
+        // Right-click has cleared a slot since the bars were built, and the
+        // first report from playing was "we need a way to remove a spell" --
+        // a gesture with no affordance is the same as an absent one. This is
+        // the only place a person is already looking at the slot they want
+        // rid of.
+        ui.weak("Right-click to clear this slot");
     });
 }
 

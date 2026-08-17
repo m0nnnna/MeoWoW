@@ -196,10 +196,20 @@ pub struct HudResponse {
     /// slot) pair a row corresponds to, only the caller that built the list
     /// does.
     pub move_item: Option<(usize, usize)>,
-    /// A bag slot was right-clicked with nothing held -- the request to
-    /// auto-equip whatever is in it. Same row-position caveat as
-    /// [`Self::move_item`].
-    pub auto_equip: Option<usize>,
+    /// A bag slot was right-clicked with nothing held. Same row-position
+    /// caveat as [`Self::move_item`].
+    ///
+    /// **The gesture, not the action.** Right-click means "activate this",
+    /// and what that *is* depends on the item: equip a sword, drink the
+    /// water, go home on the hearthstone. Only the caller can decide, because
+    /// only the caller has the server's answer about what the item does --
+    /// this crate is handed a name, a count and an icon.
+    ///
+    /// This field was called `auto_equip`, and the name quietly decided the
+    /// question: every right-click became an equip request, so a hearthstone
+    /// was offered to the equipment slots, refused, and appeared to do
+    /// nothing at all.
+    pub activate_item: Option<usize>,
     /// A quest log row was clicked, reported as the **quest id** rather than
     /// as the row's position. Same reasoning as [`Self::take_loot`] carrying a
     /// loot slot: a row number means nothing outside the list this crate was
@@ -1132,7 +1142,7 @@ impl Hud {
                                 pointer,
                             ) {
                                 if slots.get(row).is_some_and(|s| s.item.is_some()) {
-                                    response_out.auto_equip = Some(row);
+                                    response_out.activate_item = Some(row);
                                 }
                             }
                         }
@@ -3071,7 +3081,7 @@ mod tests {
     /// right-click starting a hold would leave the next left-click meaning
     /// something the user never asked for.
     #[test]
-    fn right_clicking_a_bag_slot_reports_auto_equip() {
+    fn right_clicking_a_bag_slot_reports_the_gesture() {
         let slots = bag_slots(&[(2589, "Linen Cloth", 3)]);
         let data = HudData {
             bags: Some(&slots),
@@ -3087,7 +3097,7 @@ mod tests {
             &click_script(positions[0], egui::PointerButton::Secondary),
         );
 
-        assert_eq!(response.auto_equip, Some(0));
+        assert_eq!(response.activate_item, Some(0));
         assert_eq!(hud.held, None, "a right-click must not also start a hold");
     }
 

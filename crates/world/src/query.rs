@@ -184,6 +184,48 @@ pub struct ItemInfo {
     pub buy_price: i32,
     pub sell_price: u32,
     pub max_durability: u32,
+    /// The spells this item carries, in wire order.
+    ///
+    /// **Kept rather than skipped because using an item needs one.**
+    /// `CMSG_USE_ITEM` carries the spell id the item is being used *for*, and
+    /// there is nowhere else to get it: the item-to-spell mapping is server
+    /// data, exactly like the name. A Hearthstone with its spell block
+    /// discarded is an item a client can see and cannot use.
+    pub spells: Vec<ItemSpell>,
+}
+
+/// One of an item's five spell slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemSpell {
+    /// Zero for an empty slot, which most are.
+    pub id: u32,
+    /// What makes it fire. [`ITEM_SPELLTRIGGER_ON_USE`] is the one a click
+    /// acts on; the others go off by themselves.
+    pub trigger: u32,
+}
+
+/// `ITEM_SPELLTRIGGER_ON_USE`: the trigger a "use this" click acts on.
+///
+/// **Only this one is named**, and the rest are deliberately left as raw
+/// numbers. This project does not transcribe enum members it has not
+/// confirmed, and this value is confirmed the way the rest of the protocol
+/// here is -- by effect, against a real consumable whose stack count drops
+/// when it is used. Naming the neighbours from memory is the habit that
+/// produced `CHAT_MSG_SAY = 0x00`.
+pub const ITEM_SPELLTRIGGER_ON_USE: u32 = 0;
+
+impl ItemInfo {
+    /// The spell a click on this item should cast, if any.
+    ///
+    /// `None` for anything with no on-use spell -- a sword, a trade good, a
+    /// bag -- which is most items, and is why a caller has to treat "not
+    /// usable" as an ordinary answer rather than a failure.
+    pub fn use_spell(&self) -> Option<u32> {
+        self.spells
+            .iter()
+            .find(|spell| spell.id != 0 && spell.trigger == ITEM_SPELLTRIGGER_ON_USE)
+            .map(|spell| spell.id)
+    }
 }
 
 /// Parses `SMSG_ITEM_QUERY_SINGLE_RESPONSE`.
@@ -227,6 +269,7 @@ pub fn parse_item_query_response(body: &[u8]) -> Result<ItemInfo, Error> {
             buy_price: 0,
             sell_price: 0,
             max_durability: 0,
+            spells: Vec::new(),
         });
     }
 
@@ -285,10 +328,16 @@ pub fn parse_item_query_response(body: &[u8]) -> Result<ItemInfo, Error> {
     let _delay = r.u32()?;
     let _ammo_type = r.u32()?;
     let _ranged_mod_range = r.f32()?;
+    let mut spells = Vec::with_capacity(ITEM_SPELLS);
     for _ in 0..ITEM_SPELLS {
-        for _ in 0..ITEM_SPELL_FIELDS {
+        let id = r.u32()?;
+        let trigger = r.u32()?;
+        // Charges, cooldown, category, category cooldown -- read to keep the
+        // cursor aligned, not kept. `ITEM_SPELL_FIELDS` is what says six.
+        for _ in 2..ITEM_SPELL_FIELDS {
             r.u32()?;
         }
+        spells.push(ItemSpell { id, trigger });
     }
 
     let _bonding = r.u32()?;
@@ -338,6 +387,7 @@ pub fn parse_item_query_response(body: &[u8]) -> Result<ItemInfo, Error> {
         buy_price,
         sell_price,
         max_durability,
+        spells,
     })
 }
 

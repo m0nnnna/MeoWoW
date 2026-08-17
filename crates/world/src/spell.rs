@@ -108,14 +108,73 @@ pub fn cast_spell(spell_id: u32, target: Option<u64>) -> Vec<u8> {
     body.push(0u8);
     body.extend_from_slice(&spell_id.to_le_bytes());
     body.push(0u8); // cast flags
+    write_cast_targets(target, &mut body);
+    body
+}
 
+/// The `SpellCastTargets` block that ends both a cast and an item use.
+///
+/// **One writer, because two would drift.** `CMSG_USE_ITEM` ends in exactly
+/// this structure and the server reads it with the same code it reads a
+/// cast's with; a second copy here would be a second place to get the mask
+/// wrong, and the failure mode is not a rejection -- the server reads the
+/// bytes that follow *according to the mask it was given*, so claiming a
+/// unit target without supplying a guid makes it take the next fields as
+/// one. Same rule as defining a both-ways structure once.
+pub fn write_cast_targets(target: Option<u64>, body: &mut Vec<u8>) {
     match target {
         Some(guid) => {
             body.extend_from_slice(&target_flags::UNIT.to_le_bytes());
-            write_packed_guid(guid, &mut body);
+            write_packed_guid(guid, body);
         }
         None => body.extend_from_slice(&target_flags::SELF.to_le_bytes()),
     }
+}
+
+/// `CMSG_USE_ITEM`'s body: click a thing in a bag and have it do what it does.
+///
+/// Layout from AzerothCore's `HandleUseItemOpcode` -- for a packet the
+/// *client* writes, the authority is the server's **reader**, and that
+/// reader is `bagIndex >> slot >> castCount >> spellId >> itemGUID >>
+/// glyphIndex >> castFlags` followed by the cast targets.
+///
+/// Two things in it are worth stating because both are the shape that fails
+/// silently rather than loudly:
+///
+/// - **`item_guid` goes out raw, not packed.** `ObjectGuid`'s stream
+///   operator reads a plain `u64`. Getting this backwards is precisely the
+///   bug that deleted the player when `SMSG_DESTROY_OBJECT` was read as
+///   packed, and here it would shorten the body so everything after it --
+///   including the target mask -- is read from the wrong offset.
+/// - **`spell_id` is the item's own on-use spell**, from
+///   [`crate::query::ItemInfo::use_spell`], and there is nowhere else to get
+///   it. The server looks the item up by position *and* checks the spell, so
+///   a plausible-looking wrong id is refused rather than acted on.
+///
+/// `bag` is [`crate::inventory::OWN_SLOT_ARRAY`] for anything in the
+/// player's own array, matching what `equip_item` and `swap_item_candidate`
+/// already send.
+pub fn use_item(
+    bag: u8,
+    slot: u8,
+    item_guid: u64,
+    spell_id: u32,
+    target: Option<u64>,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(bag);
+    body.push(slot);
+    // Cast count, as in `cast_spell`: zero for a client with one use in
+    // flight at a time.
+    body.push(0u8);
+    body.extend_from_slice(&spell_id.to_le_bytes());
+    body.extend_from_slice(&item_guid.to_le_bytes());
+    // Glyph index. The server range-checks this before it looks at anything
+    // else and refuses the whole request if it is out of range, so a junk
+    // value here reads as "no such item".
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.push(0u8); // cast flags
+    write_cast_targets(target, &mut body);
     body
 }
 

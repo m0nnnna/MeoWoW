@@ -741,6 +741,26 @@ impl Connection {
         )
     }
 
+    /// Uses an item where it sits: `(bag, slot)` addressed exactly as
+    /// [`Self::equip_item`] and [`Self::swap_item_candidate`] address theirs.
+    ///
+    /// `spell_id` is the item's own on-use spell -- see
+    /// [`crate::spell::use_item`] for why there is nowhere else to get it and
+    /// why the guid goes out unpacked.
+    pub fn use_item(
+        &mut self,
+        bag: u8,
+        slot: u8,
+        item_guid: u64,
+        spell_id: u32,
+        target: Option<u64>,
+    ) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::UseItem,
+            &crate::spell::use_item(bag, slot, item_guid, spell_id, target),
+        )
+    }
+
     /// Opens the loot on a corpse.
     ///
     /// The guid goes out **unpacked** -- eight plain bytes. Worth stating,

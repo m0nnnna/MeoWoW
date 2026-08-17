@@ -5278,6 +5278,52 @@ impl App {
         }
     }
 
+    /// What a right-click on a bag square means, decided here because this is
+    /// the side that knows what the item is.
+    ///
+    /// **Use beats equip, and an item that can do neither does nothing.** An
+    /// item carrying an on-use spell is used where it sits; anything else is
+    /// offered to the equipment slots as before. Deciding it in the `ui`
+    /// crate is impossible -- it has a name, a count and an icon, and what an
+    /// item *does* is server data that arrives with
+    /// `SMSG_ITEM_QUERY_SINGLE_RESPONSE`.
+    ///
+    /// A square whose item has not been answered for yet falls through to the
+    /// equip path rather than being swallowed. That is the safer of the two
+    /// wrong answers: the server refuses an equip it does not like, where a
+    /// silently dropped click reads as the window being broken -- which is
+    /// exactly the report this whole area just came out of.
+    fn activate_item(&mut self, at: Option<::world::inventory::Where>) {
+        let Some(at) = at else { return };
+        let Some(live) = self.live.as_ref() else {
+            return;
+        };
+        let held = ::world::inventory::carried(&live.state, live.guid)
+            .into_iter()
+            .find(|carried| carried.at == at);
+        let usable = held.and_then(|carried| {
+            let entry = carried.item.entry?;
+            let spell = live.state.names.item(entry).flatten()?.use_spell()?;
+            Some((carried, spell))
+        });
+
+        match usable {
+            Some((carried, spell)) => {
+                let (bag, slot) = at.address();
+                let Some(live) = self.live.as_mut() else {
+                    return;
+                };
+                if let Err(e) =
+                    live.connection
+                        .use_item(bag, slot, carried.item.guid, spell, None)
+                {
+                    tracing::warn!("could not use the item: {e:#}");
+                }
+            }
+            None => self.auto_equip(Some(at)),
+        }
+    }
+
     /// Sends `SwapItemCandidate` for a completed bag-window drag.
     ///
     /// `from`/`to` are looked up through `bags_where` at the call site --
@@ -5295,19 +5341,14 @@ impl App {
         from: Option<::world::inventory::Where>,
         to: Option<::world::inventory::Where>,
     ) {
-        use ::world::inventory::{Where, OWN_SLOT_ARRAY};
         let (Some(from), Some(to)) = (from, to) else {
             return;
         };
         let Some(live) = self.live.as_mut() else {
             return;
         };
-        let bytes = |w: Where| match w {
-            Where::Own(slot) => (OWN_SLOT_ARRAY, slot.index() as u8),
-            Where::InBag { bag, slot } => (bag.index() as u8, slot as u8),
-        };
-        let (src_bag, src_slot) = bytes(from);
-        let (dst_bag, dst_slot) = bytes(to);
+        let (src_bag, src_slot) = from.address();
+        let (dst_bag, dst_slot) = to.address();
         if let Err(e) = live
             .connection
             .swap_item_candidate(dst_bag, dst_slot, src_bag, src_slot)
@@ -6945,8 +6986,8 @@ impl App {
         // A right-clicked bag square auto-equips whatever is there. `index`
         // is a square position, not a slot -- resolved back through
         // `bags_where`, built alongside `bags` a moment ago.
-        if let Some(index) = hud_response.auto_equip {
-            self.auto_equip(bags_where.get(index).copied().flatten());
+        if let Some(index) = hud_response.activate_item {
+            self.activate_item(bags_where.get(index).copied().flatten());
         }
 
         // A completed bag-window drag: both ends are square positions,
