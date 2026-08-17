@@ -880,6 +880,16 @@ fn pull_camera_out_of_the_ground(
     focus + span * allowed
 }
 
+/// How close a ghost has to be to its body before the server will hand it
+/// back, in yards.
+///
+/// **The server's number, not a guess**: `CORPSE_RECLAIM_RADIUS` in
+/// `Corpse.h`, checked in `HandleReclaimCorpseOpcode` alongside five other
+/// conditions that all refuse in silence. Used here only to decide what the
+/// prompt *says* -- the request is sent whenever it is pressed in range, and
+/// the server remains the one that decides.
+const CORPSE_RECLAIM_RADIUS: f32 = 39.0;
+
 /// How far in front of a wall the eye stops, in units.
 ///
 /// Enough that the near plane does not slice into the surface that stopped it,
@@ -1852,6 +1862,14 @@ struct App {
     /// this project keeps paying for. Starts `true`, so a body that is never
     /// drawn at all says so on the first frame.
     own_body_drawn: bool,
+    /// Which replicated object is this character's current corpse, and where.
+    ///
+    /// Resolved once per frame and kept, because the bracket drawn round the
+    /// body and the request that asks for it back must name the same object --
+    /// and picking it is not trivial: a graveyard is full of corpse-shaped
+    /// objects, including the *bones* of bodies already reclaimed, which carry
+    /// the same owner guid as the current one.
+    own_corpse: Option<(u64, glam::Vec3)>,
     /// Composed looks for *other* players, keyed by `character::Appearance`.
     ///
     /// Cached because resolving one reads several DBCs and composes a skin
@@ -2643,6 +2661,7 @@ impl App {
             last_ping: Instant::now(),
             last_undrawable_warned: 0,
             own_body_drawn: true,
+            own_corpse: None,
             player_looks: std::collections::HashMap::new(),
             offline_map: None,
             lighting: None,
@@ -5872,6 +5891,35 @@ impl App {
         }
     }
 
+    /// Asks for the body back, in response to a click on the ghost prompt.
+    ///
+    /// **Refused in silence six different ways**, and the handler makes no
+    /// attempt to hide that: alive, in an arena, not yet released, no corpse,
+    /// inside the thirty seconds after releasing, or further than
+    /// [`CORPSE_RECLAIM_RADIUS`] from the body. The prompt is drawn from
+    /// `is_ghost` rather than from anything set here, so a refusal leaves it
+    /// exactly where it was -- which is the honest outcome, and the same shape
+    /// the release prompt already had.
+    ///
+    /// The distance check is duplicated at the *prompt*, not here: the point
+    /// of it there is to say how far there is left to walk, which is a thing
+    /// to draw rather than a thing to enforce. The server decides.
+    fn reclaim_corpse(&mut self) {
+        let Some((corpse, _)) = self.own_corpse else {
+            // Nothing to ask for yet. Silent: the prompt already says the
+            // body is still being looked for.
+            return;
+        };
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.reclaim_corpse(corpse) {
+            tracing::warn!("reclaiming the corpse failed: {e:#}");
+            self.chat
+                .push(Line::Chat(local_notice(format!("could not resurrect: {e}"))));
+        }
+    }
+
     fn build_ui(&mut self, window: &Arc<Window>) -> egui::FullOutput {
         let Some(r) = self.renderer.as_mut() else {
             return egui::FullOutput::default();
@@ -6019,28 +6067,61 @@ impl App {
             )
         });
 
-        // Present exactly while the character is lying dead and not yet
-        // released -- absent while alive, and absent again once a ghost, the
-        // same "existence is the flag" shape the loot window uses. See
-        // `App::release_spirit`.
+        // Present exactly while the character is dead: first as the release
+        // prompt, then as the way back. Absent while alive, the same
+        // "existence is the flag" shape the loot window uses. See
+        // `App::release_spirit` and `App::reclaim_corpse`.
+        //
+        // **A ghost had no prompt at all**, which is how a character could die
+        // and have nothing to do about it ever again -- release worked, and
+        // then the client offered no way back into the body it had just
+        // learned the position of.
         let release_prompt = self.live.as_ref().and_then(|live| {
             let entity = live.state.get(live.guid)?;
-            (entity.is_dead_or_ghost() && !entity.is_ghost()).then(|| ui::frames::ReleasePromptView {
-                text: "You have died.\nClick to release your spirit.".to_string(),
+            if !entity.is_dead_or_ghost() {
+                return None;
+            }
+            if !entity.is_ghost() {
+                return Some(ui::frames::ReleasePromptView {
+                    text: "You have died.\nClick to release your spirit.".to_string(),
+                });
+            }
+            // A ghost. What it can do depends on how far it has walked back.
+            Some(ui::frames::ReleasePromptView {
+                text: match self.own_corpse {
+                    Some((_, at)) => {
+                        let away = at.truncate().distance(live.position.truncate());
+                        if away <= CORPSE_RECLAIM_RADIUS {
+                            "You are a ghost.\nClick to return to your body.".to_string()
+                        } else {
+                            // The distance rather than a bare instruction: a
+                            // prompt that says "go back" without saying how
+                            // far is no better than the marker already on
+                            // screen.
+                            format!("You are a ghost.\nYour body is {away:.0} yards away.")
+                        }
+                    }
+                    // The query has been sent and not yet answered, or the
+                    // body is too far off to be a replicated object. Saying
+                    // so beats an instruction that cannot be followed.
+                    None => "You are a ghost.\nLooking for your body...".to_string(),
+                },
             })
         });
 
-        // Where to bracket the character's own current corpse, once the
-        // server has answered `MSG_CORPSE_QUERY` -- see
-        // `own_corpse_query_sent`. The guid still has to come from a
-        // replicated object nearest that answer, exactly as
-        // `report_reclaim` in `wow-cli` does it: corpse-shaped objects
-        // include the bones of bodies already reclaimed, and bones carry the
-        // same owner guid as the current body, so owner alone picks a stale
-        // one.
-        let corpse_marker = self.live.as_ref().and_then(|live| {
+        // The character's own current corpse: which object it is, and where.
+        //
+        // Resolved once and kept, because two things need it and they must not
+        // disagree -- the bracket drawn around the body, and the request that
+        // asks for it back. Available from the moment the server answers
+        // `MSG_CORPSE_QUERY` -- see `own_corpse_query_sent`. The guid has to
+        // come from a replicated object nearest that answer, exactly as
+        // `report_reclaim` in `wow-cli` does it: corpse-shaped objects include
+        // the bones of bodies already reclaimed, and bones carry the same
+        // owner guid as the current body, so owner alone picks a stale one.
+        self.own_corpse = self.live.as_ref().and_then(|live| {
             let body_at = live.state.corpse_location?;
-            let (_, position) = live
+            let (guid, position) = live
                 .state
                 .own_corpses(live.guid)
                 .filter_map(|c| c.position.map(|p| (c.guid, p)))
@@ -6050,12 +6131,11 @@ impl App {
                     };
                     d(&a.1).total_cmp(&d(&b.1))
                 })?;
-            hud::corpse_marker_rect(
-                &self.camera,
-                viewport,
-                glam::Vec3::new(position.x, position.y, position.z),
-            )
+            Some((guid, glam::Vec3::new(position.x, position.y, position.z)))
         });
+        let corpse_marker = self
+            .own_corpse
+            .and_then(|(_, at)| hud::corpse_marker_rect(&self.camera, viewport, at));
 
         // Every number still rising, oldest first. Pruned here rather than in
         // `pump_live_connection`, which runs on the network's schedule, not
@@ -6621,10 +6701,20 @@ impl App {
             self.auto_equip(bags_where.get(index).copied().flatten());
         }
 
-        // A clicked release prompt releases the spirit. See
-        // `App::release_spirit` for why nothing here assumes it worked.
+        // The same prompt does both halves of dying, and which one depends on
+        // the state the prompt was drawn from -- see where it is built. See
+        // `App::release_spirit` for why nothing here assumes either worked.
         if hud_response.release_clicked {
-            self.release_spirit();
+            let ghost = self
+                .live
+                .as_ref()
+                .and_then(|live| live.state.get(live.guid))
+                .is_some_and(|entity| entity.is_ghost());
+            if ghost {
+                self.reclaim_corpse();
+            } else {
+                self.release_spirit();
+            }
         }
 
         // **The corpse has to be released, and only a transition says when.**
