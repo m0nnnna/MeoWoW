@@ -456,6 +456,59 @@ pub fn purse(copper: u32) -> (u32, u32, u32) {
     (copper / 10_000, (copper / 100) % 100, copper % 100)
 }
 
+/// What `SMSG_INVENTORY_CHANGE_FAILURE` said, refusing a
+/// `SwapItemCandidate` (or an `AutoEquipItem`) request.
+///
+/// `code` is kept raw rather than named -- only `59` has ever been observed
+/// (a same-array slot swap between two occupied backpack slots) and naming
+/// the rest from memory is the mistake `describe_cast_failure` exists to
+/// refuse. `item_a` and `item_b` are real item guids: `item_a` is the item
+/// named by the *leading* `(bag, slot)` pair of the request that provoked
+/// the refusal, which is how the opcode and body were confirmed understood
+/// rather than merely rejected -- see [`crate::opcode::ClientOpcode::SwapItemCandidate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryChangeFailure {
+    pub code: u8,
+    pub item_a: u64,
+    pub item_b: u64,
+    /// The eighteenth byte. Unconfirmed -- see the opcode's own doc comment
+    /// -- so it is kept rather than dropped, on the same reasoning
+    /// [`crate::spell::CastFailed`] keeps a reason it does not interpret.
+    pub trailing: u8,
+}
+
+/// Parses `SMSG_INVENTORY_CHANGE_FAILURE`.
+///
+/// Every observed body is exactly 18 bytes, so unlike
+/// [`crate::spell::parse_cast_failed`] this asserts full consumption --
+/// there is no per-reason tail here to be cut short by.
+pub fn parse_inventory_change_failure(
+    body: &[u8],
+) -> Result<InventoryChangeFailure, crate::protocol::Error> {
+    let mut r = crate::protocol::Reader::new(body, "SMSG_INVENTORY_CHANGE_FAILURE");
+    let failure = InventoryChangeFailure {
+        code: r.u8()?,
+        item_a: r.u64()?,
+        item_b: r.u64()?,
+        trailing: r.u8()?,
+    };
+    r.finish()?;
+    Ok(failure)
+}
+
+/// A description of an inventory-change refusal.
+///
+/// Deliberately almost empty, for the reason [`crate::spell::describe_cast_failure`]
+/// is: a wrong name here does not error, it confidently misexplains a
+/// refusal and sends the next reader looking in the wrong place. So a code
+/// is named only once observed against a live realm; everything else keeps
+/// its number.
+pub fn describe_inventory_failure(code: u8) -> String {
+    match code {
+        other => format!("reason {other} ({other:#04x})"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -88,39 +88,36 @@ pub enum ClientOpcode {
     AutoEquipItem = 0x010A,
 
     /// Moving an item between two named slots, neither of which the server
-    /// chooses -- unlike `AutoEquipItem`. **The request is understood and
-    /// declined; what the refusal *means* is the open question**
-    /// (`foss-wow#55`). Nothing in the viewer sends it.
+    /// chooses -- unlike `AutoEquipItem`.
     ///
     /// Body is `{dst_bag, dst_slot, src_bag, src_slot}`. `255` for a bag
     /// means the player's own array, as with `AutoEquipItem`.
     ///
-    /// **The first reading of this was that the opcode or the body was
-    /// wrong, and re-running it says otherwise.** Two real backpack items
-    /// produce an 18-byte `SMSG_INVENTORY_CHANGE_FAILURE` (`0x0112`) that
-    /// divides exactly as `{u8 code, u64 guid, u64 guid, u8}` -- and the
-    /// first guid is a **real item**: the one named by the *leading*
-    /// `(bag, slot)` pair of the request. Reversing the two slots reverses
-    /// which item comes back (`--swap 23:24` echoes slot 24's,
-    /// `--swap 24:23` echoes slot 23's), so the server is reading bytes 0
-    /// and 1 as a bag and a slot and resolving them. A body it could not
-    /// parse could not have produced a guid that tracks the argument order.
+    /// **`foss-wow#55` is closed: this was the wrong opcode by exactly one,
+    /// not a mysterious refusal.** `0x010B` is a different, real request
+    /// (`CMSG_AUTOSTORE_BAG_ITEM`, a 3-byte `{src_bag, src_slot, dst_bag}`
+    /// body that auto-stores an item into *any* free slot of a bag rather
+    /// than a chosen one) -- this client's 4-byte body happened to line its
+    /// first three bytes up with that shape closely enough to be read as a
+    /// request, with the fourth byte silently unread. Sent against two
+    /// occupied slots, byte 1 resolves to a real item and bytes 2-3 name the
+    /// player's own array as both the unequip check and the auto-store
+    /// target -- which the item is already validly sitting in, so the
+    /// "move" is a no-op and the answer is `SMSG_INVENTORY_CHANGE_FAILURE`
+    /// code 59, `EQUIP_ERR_NONE`: *there was nothing wrong with the request,
+    /// nothing needed to happen.* Sent with an **equipped** source slot the
+    /// same request is not a no-op -- unequipping is a real state change --
+    /// and it was live-confirmed doing exactly that: the item left the
+    /// equipped slot and landed in the first free backpack square, not at
+    /// the slot this client asked for. That the destination was ignored is
+    /// what named the bug: a real swap honours a *chosen* destination.
     ///
-    /// **And the outcome is not state-independent, which was the whole basis
-    /// of the earlier conclusion.** Against two occupied slots the refusal
-    /// arrives; against a real item and a genuinely *empty* destination
-    /// nothing comes back at all. Those are different answers to different
-    /// requests, which is what a handler evaluating the request looks like.
-    /// A two-byte `{src_slot, dst_slot}` body was also tried, on the theory
-    /// that a same-array move needs no bag bytes, and is answered by silence
-    /// in both cases -- so the four-byte shape is the one the server reads.
-    ///
-    /// What is left is the code itself, observed only as **59** and
-    /// deliberately not named: naming a status code from memory is the
-    /// mistake `describe_cast_failure` exists to refuse. The way to settle
-    /// it is the way every other refusal here was settled -- vary one
-    /// condition at a time and find the input that changes the output.
-    SwapItemCandidate = 0x010B,
+    /// The genuine `CMSG_SWAP_ITEM` sits one number up, at `0x010C`, wants
+    /// exactly the four-byte body already built here, and was confirmed live
+    /// the same way `AutoEquipItem` was: two backpack items requested by
+    /// slot landed at each other's positions, a real two-way swap, nothing
+    /// left in between.
+    SwapItemCandidate = 0x010C,
 
     /// Take one slot off the corpse currently open, letting the server choose
     /// where it goes in the bags.
@@ -608,6 +605,10 @@ pub mod server {
     pub const MESSAGECHAT: u16 = 0x0096;
     /// The spellbook, sent unprompted during the login burst. There is no
     /// query for it: miss the packet and the character appears to know nothing.
+    /// The refusal to `ClientOpcode::SwapItemCandidate` and `AutoEquipItem`
+    /// alike -- see [`ClientOpcode::SwapItemCandidate`] for how its 18-byte
+    /// shape was confirmed against a live realm (`foss-wow#55`).
+    pub const INVENTORY_CHANGE_FAILURE: u16 = 0x0112;
     pub const INITIAL_SPELLS: u16 = 0x012A;
     pub const CAST_FAILED: u16 = 0x0130;
     pub const SPELL_START: u16 = 0x0131;
@@ -742,6 +743,7 @@ pub fn describe(opcode: u16) -> String {
         server::NAME_QUERY_RESPONSE => "SMSG_NAME_QUERY_RESPONSE",
         server::CREATURE_QUERY_RESPONSE => "SMSG_CREATURE_QUERY_RESPONSE",
         server::MESSAGECHAT => "SMSG_MESSAGECHAT",
+        server::INVENTORY_CHANGE_FAILURE => "SMSG_INVENTORY_CHANGE_FAILURE",
         server::INITIAL_SPELLS => "SMSG_INITIAL_SPELLS",
         server::CAST_FAILED => "SMSG_CAST_FAILED",
         server::SPELL_START => "SMSG_SPELL_START",

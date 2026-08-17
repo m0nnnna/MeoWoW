@@ -909,6 +909,10 @@ pub struct Replication {
     /// Casts the server refused. Returned rather than stored for the same
     /// reason chat is: they are events, not state.
     pub cast_failures: Vec<crate::spell::CastFailed>,
+    /// Inventory moves (`SwapItemCandidate`, `AutoEquipItem`) the server
+    /// refused this batch. Returned rather than stored for the same reason
+    /// `cast_failures` is: an event, not state.
+    pub inventory_failures: Vec<crate::inventory::InventoryChangeFailure>,
     /// Chat received this batch.
     ///
     /// Handed back rather than stored: chat is a stream of events, not state,
@@ -2080,6 +2084,16 @@ impl WorldState {
                 crate::opcode::server::CAST_FAILED => {
                     match crate::spell::parse_cast_failed(&packet.body) {
                         Ok(failure) => report.cast_failures.push(failure),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::INVENTORY_CHANGE_FAILURE => {
+                    match crate::inventory::parse_inventory_change_failure(&packet.body) {
+                        Ok(failure) => report.inventory_failures.push(failure),
                         Err(error) => report.failures.push((
                             packet.opcode,
                             error,

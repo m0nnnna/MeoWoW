@@ -5202,6 +5202,44 @@ impl App {
         }
     }
 
+    /// Sends `SwapItemCandidate` for a completed bag-window drag.
+    ///
+    /// `from`/`to` are looked up through `bags_where` at the call site --
+    /// see `HudResponse::move_item`'s doc comment for why a square position
+    /// is not itself an address. Either end can be `Where::Own` (backpack, or
+    /// an equipped slot dragged from the character panel) or
+    /// `Where::InBag`, and the request names whichever pair it was given:
+    /// there is nothing here restricting a move to same-container pairs.
+    ///
+    /// Whatever the server does with it is reported through
+    /// `inventory_failures`/the object update that follows, not from here --
+    /// nothing acknowledges this send on success, the same as `equip_item`.
+    fn move_item(
+        &mut self,
+        from: Option<::world::inventory::Where>,
+        to: Option<::world::inventory::Where>,
+    ) {
+        use ::world::inventory::{Where, OWN_SLOT_ARRAY};
+        let (Some(from), Some(to)) = (from, to) else {
+            return;
+        };
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let bytes = |w: Where| match w {
+            Where::Own(slot) => (OWN_SLOT_ARRAY, slot.index() as u8),
+            Where::InBag { bag, slot } => (bag.index() as u8, slot as u8),
+        };
+        let (src_bag, src_slot) = bytes(from);
+        let (dst_bag, dst_slot) = bytes(to);
+        if let Err(e) = live
+            .connection
+            .swap_item_candidate(dst_bag, dst_slot, src_bag, src_slot)
+        {
+            tracing::warn!("could not move item: {e:#}");
+        }
+    }
+
     /// Closes the corpse, which is what unlocks it for anyone else.
     ///
     /// Sent on closing the window rather than left to the server: a corpse
@@ -5419,6 +5457,23 @@ impl App {
                         ::world::spell::describe_cast_failure(failure.reason)
                     );
                     tracing::debug!("cast refused -- {text}");
+                    self.chat.push(Line::Chat(local_notice(text)));
+                }
+                // Same reasoning, for a bag-window drag: `foss-wow#55` left
+                // the gesture wired to nothing, so picking an item up and
+                // dropping it did nothing and said nothing either -- exactly
+                // the silent-failure shape the cast-failure block above was
+                // already written to avoid.
+                for failure in &report.inventory_failures {
+                    let text = format!(
+                        "Could not move item: {}",
+                        ::world::inventory::describe_inventory_failure(failure.code)
+                    );
+                    tracing::debug!(
+                        "inventory move refused -- {text} (items {:#018x}, {:#018x})",
+                        failure.item_a,
+                        failure.item_b
+                    );
                     self.chat.push(Line::Chat(local_notice(text)));
                 }
                 // Fourth category this crate returns rather than stores, and
@@ -6336,6 +6391,16 @@ impl App {
 
             let mut slots = vec![ui::frames::BagSlot::default(); inv::BACKPACK_COUNT as usize];
             bags_where = vec![None; inv::BACKPACK_COUNT as usize];
+            // The backpack's own squares have a fixed address whether or not
+            // they hold anything -- unlike the occupied-only fill below, this
+            // covers every square so a drag can be **dropped** on an empty
+            // one, not just picked up from a full one.
+            for i in 0..inv::BACKPACK_COUNT {
+                bags_where[i as usize] = Some(Where::Own(
+                    inv::InventorySlot::new(inv::BACKPACK_FIRST + i)
+                        .expect("backpack slot is always in range"),
+                ));
+            }
             if let Some(live) = self.live.as_ref() {
                 // Where each equipped bag's run of squares begins, in bag-slot
                 // order. Built before the fill so a bag's contents can be
@@ -6344,9 +6409,19 @@ impl App {
                 let mut base = std::collections::HashMap::new();
                 for bag in inv::bags(&live.state, live.guid).into_iter().flatten() {
                     let Some(capacity) = bag.capacity else { continue };
-                    base.insert(bag.slot.index(), slots.len());
-                    slots.resize(slots.len() + capacity as usize, ui::frames::BagSlot::default());
-                    bags_where.resize(bags_where.len() + capacity as usize, None);
+                    let start = slots.len();
+                    base.insert(bag.slot.index(), start);
+                    slots.resize(start + capacity as usize, ui::frames::BagSlot::default());
+                    bags_where.resize(start + capacity as usize, None);
+                    // Same reasoning as the backpack fill above: every square
+                    // in a bag's run gets an address immediately, occupied or
+                    // not, so dropping on an empty one inside a bag works too.
+                    for offset in 0..capacity {
+                        bags_where[start + offset as usize] = Some(Where::InBag {
+                            bag: bag.slot,
+                            slot: offset as u16,
+                        });
+                    }
                 }
 
                 for carried in inv::carried(&live.state, live.guid) {
@@ -6699,6 +6774,17 @@ impl App {
         // `bags_where`, built alongside `bags` a moment ago.
         if let Some(index) = hud_response.auto_equip {
             self.auto_equip(bags_where.get(index).copied().flatten());
+        }
+
+        // A completed bag-window drag: both ends are square positions,
+        // resolved through the same `bags_where` list `auto_equip` uses just
+        // above. `bags_where` now names every square, occupied or not (see
+        // where it is built), so a drop onto an empty square resolves too.
+        if let Some((from, to)) = hud_response.move_item {
+            self.move_item(
+                bags_where.get(from).copied().flatten(),
+                bags_where.get(to).copied().flatten(),
+            );
         }
 
         // The same prompt does both halves of dying, and which one depends on

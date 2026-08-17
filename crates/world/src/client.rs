@@ -710,12 +710,12 @@ impl Connection {
         )
     }
 
-    /// Sends [`ClientOpcode::SwapItemCandidate`] with a `{dst_bag, dst_slot,
-    /// src_bag, src_slot}` body -- **tried live and not confirmed**, see the
-    /// opcode's own doc comment for the negative result. Kept only for
-    /// `foss-wow#55`'s `wow-cli --swap` probe and not called from the
-    /// viewer. `255` for a bag means the player's own array, the same
-    /// convention `equip_item` uses.
+    /// Sends [`ClientOpcode::SwapItemCandidate`] (`CMSG_SWAP_ITEM`) with a
+    /// `{dst_bag, dst_slot, src_bag, src_slot}` body -- **confirmed live**,
+    /// see the opcode's own doc comment for how `foss-wow#55` settled it.
+    /// `255` for a bag means the player's own array, the same convention
+    /// `equip_item` uses. Works for any pair: two backpack slots, an
+    /// equipped slot and a backpack slot, or a slot inside an equipped bag.
     pub fn swap_item_candidate(
         &mut self,
         dst_bag: u8,
@@ -727,26 +727,6 @@ impl Connection {
             ClientOpcode::SwapItemCandidate,
             &[dst_bag, dst_slot, src_bag, src_slot],
         )
-    }
-
-    /// The **two-byte** body for the same opcode: two slots in the player's
-    /// own array and no bag byte at all.
-    ///
-    /// **Why this shape is worth trying separately.** The four-byte attempt
-    /// came back as `SMSG_INVENTORY_CHANGE_FAILURE` every time, and that
-    /// reply is itself evidence *for* the opcode rather than against it: the
-    /// server routed the request to an inventory handler, which a number it
-    /// did not recognise would not have done -- an unknown opcode is dropped,
-    /// not answered. So the suspicion moves from the number to the body.
-    ///
-    /// [`ClientOpcode::AutoEquipItem`] sits next door at `0x010A` and takes
-    /// exactly two bytes, `{bag, slot}`. A request that names two slots of
-    /// the *same* array has no need of two bag bytes, and a four-byte body
-    /// handed to a two-byte reader is read as a slot pair followed by
-    /// trailing rubbish -- which would refuse identically whatever the
-    /// destination held, which is precisely the symptom observed.
-    pub fn swap_own_slots(&mut self, src_slot: u8, dst_slot: u8) -> Result<(), Error> {
-        self.send(ClientOpcode::SwapItemCandidate, &[src_slot, dst_slot])
     }
 
     /// Opens the loot on a corpse.

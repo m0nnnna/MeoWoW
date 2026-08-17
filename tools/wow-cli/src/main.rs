@@ -276,12 +276,11 @@ enum Command {
         /// Swap two of the player's own slots and report what moved --
         /// `<from>:<to>`, e.g. `--swap 25:26`.
         ///
-        /// **An experimental probe, not a confirmed feature.** Sends
-        /// `ClientOpcode::SwapItemCandidate` (`0x010B`), which `foss-wow#55`
-        /// has not yet confirmed against a live realm, and diffs the slot
-        /// array the same way `--equip` does. If nothing moves, prints every
-        /// opcode that arrived so a wrong guess and a refusal are not
-        /// mistaken for each other.
+        /// Sends `ClientOpcode::SwapItemCandidate` (`CMSG_SWAP_ITEM`,
+        /// `0x010C`), confirmed live against this realm -- see the opcode's
+        /// own doc comment for `foss-wow#55`'s finding. Diffs the slot array
+        /// the same way `--equip` does, and prints any
+        /// `SMSG_INVENTORY_CHANGE_FAILURE` in full if the server declines.
         #[arg(long)]
         swap: Option<String>,
         /// Open the loot on the nearest dead unit and print every byte that
@@ -4862,10 +4861,9 @@ fn equip_and_report(
     Ok(())
 }
 
-/// Sends the unconfirmed `SwapItemCandidate` between two of the player's own
-/// slots and reports what moved -- the same diff `equip_and_report` uses,
-/// copied rather than shared because this one is testing the *opcode itself*
-/// and has no business looking confirmed until it is.
+/// Sends `SwapItemCandidate` (`CMSG_SWAP_ITEM`, confirmed -- `foss-wow#55`)
+/// between two of the player's own slots and reports what moved -- the same
+/// diff `equip_and_report` uses.
 fn swap_and_report(
     connection: &mut world::Connection,
     state: &mut world::WorldState,
@@ -4892,141 +4890,46 @@ fn swap_and_report(
         before.get(&b).map(|g| format!("{g:#018x}")),
     );
     if !before.contains_key(&a) && !before.contains_key(&b) {
-        println!("both slots are empty; a run against two empty slots cannot tell");
-        println!("a working opcode from a broken one");
+        println!("both slots are empty; there is nothing here for a swap to move.");
         return Ok(());
     }
 
-    // **Both body shapes, one run, and the comparison is the point.** The
-    // four-byte form was tried alone and refused identically whatever the
-    // destination held -- but the refusal was
-    // `SMSG_INVENTORY_CHANGE_FAILURE`, which the server only sends after
-    // routing the request to an inventory handler. An opcode it did not
-    // recognise is dropped in silence, not answered, so that reply is
-    // evidence *for* the number and against the body. `CMSG_AUTOEQUIP_ITEM`
-    // next door at 0x010A takes two bytes; a request naming two slots of the
-    // same array has no use for two bag bytes.
-    //
-    // Sending both in one session against the same pair is what makes the
-    // answer readable: the two attempts differ in the body alone, so a
-    // difference in what comes back cannot be about the character, the
-    // slots, or the state of the world.
-    let attempts: [(&str, Box<dyn Fn(&mut world::Connection) -> Result<(), world::client::Error>>); 2] = [
-        (
-            "four-byte {dst_bag, dst_slot, src_bag, src_slot}",
-            Box::new(move |c: &mut world::Connection| {
-                c.swap_item_candidate(
-                    inventory::OWN_SLOT_ARRAY,
-                    to.index() as u8,
-                    inventory::OWN_SLOT_ARRAY,
-                    from.index() as u8,
-                )
-            }),
-        ),
-        (
-            "two-byte {src_slot, dst_slot}",
-            Box::new(move |c: &mut world::Connection| {
-                c.swap_own_slots(from.index() as u8, to.index() as u8)
-            }),
-        ),
-    ];
+    connection.swap_item_candidate(
+        inventory::OWN_SLOT_ARRAY,
+        to.index() as u8,
+        inventory::OWN_SLOT_ARRAY,
+        from.index() as u8,
+    )?;
+    let batch = connection.drain(std::time::Duration::from_millis(1200), 128)?;
+    let report = state.replicate(&batch, None);
+
+    // A refusal is a real answer and worth showing whole -- print the body,
+    // not just its length, the same rule every silent-send probe here
+    // follows.
+    for failure in &report.inventory_failures {
+        println!(
+            "  refused: {} (items {:#018x}, {:#018x})",
+            world::inventory::describe_inventory_failure(failure.code),
+            failure.item_a,
+            failure.item_b
+        );
+    }
+
+    let after: std::collections::BTreeMap<u16, u64> = inventory::held(state, own_guid)
+        .into_iter()
+        .map(|item| (item.slot.index(), item.guid))
+        .collect();
 
     let mut moved = Vec::new();
-    let mut after: std::collections::BTreeMap<u16, u64>;
-
-    for (shape, send) in &attempts {
-        println!("\n--- body: {shape}");
-        send(connection)?;
-        let batch = connection.drain(std::time::Duration::from_millis(1200), 128)?;
-        state.replicate(&batch, None);
-
-        after = inventory::held(state, own_guid)
-            .into_iter()
-            .map(|item| (item.slot.index(), item.guid))
-            .collect();
-
-        moved.clear();
-        for index in 0..inventory::SLOT_COUNT {
-            let (was, now) = (before.get(&index), after.get(&index));
-            if was != now {
-                moved.push((index, was.copied(), now.copied()));
-            }
-        }
-
-        // The bodies of whatever came back, always -- a refusal that is seen
-        // and dropped is the one packet that could have answered the
-        // question. The failure's own result code is the informative byte and
-        // it is printed raw rather than named: naming a status code from
-        // memory is what `describe_cast_failure` exists to refuse.
-        println!("    what arrived (body in full, not just its length):");
-        let mut said_something = false;
-        for packet in &batch {
-            // The constant traffic would bury the answer; it is counted in
-            // the histogram the caller already prints.
-            const NOISE: [u16; 6] = [0x00DD, 0x00A9, 0x01F6, 0x0390, 0x0085, 0x0086];
-            if NOISE.contains(&packet.opcode) {
-                continue;
-            }
-            let hex: Vec<String> = packet.body.iter().map(|b| format!("{b:02x}")).collect();
-            println!(
-                "      {:<34} {:>3} bytes: {}",
-                world::opcode::describe(packet.opcode),
-                packet.body.len(),
-                hex.join(" ")
-            );
-            said_something = true;
-
-            // **Split the refusal up, because its shape is the finding.**
-            // An 18-byte body divides exactly as `{u8 code, u64 guid, u64
-            // guid, u8}`, and the first guid is a *real item* -- the one
-            // named by the leading (bag, slot) pair of the request. A server
-            // that had misparsed the body could not have resolved it, so
-            // this is a considered refusal rather than a rejected shape,
-            // which is the opposite of what the four-byte attempt was
-            // originally read as meaning.
-            //
-            // The code is printed raw and **not named**. Only one value has
-            // ever been observed and naming a status code from memory is
-            // exactly what `describe_cast_failure` exists to refuse.
-            if packet.opcode == 0x0112 && packet.body.len() == 18 {
-                let code = packet.body[0];
-                let guid = |at: usize| {
-                    u64::from_le_bytes(packet.body[at..at + 8].try_into().unwrap())
-                };
-                let (first, second) = (guid(1), guid(9));
-                println!("        result code {code} ({code:#04x}), not named -- only this value seen");
-                println!("        item {first:#018x}{}", match before.iter().find(|(_, g)| **g == first) {
-                    Some((slot, _)) => format!("  = the item in slot {slot}"),
-                    None => "  -- not a slot this run knows about".into(),
-                });
-                println!("        item {second:#018x}, trailing byte {}", packet.body[17]);
-                println!("        a resolved guid means the body PARSED; this is a refusal,");
-                println!("        not a shape the server failed to read.");
-            }
-        }
-        if !said_something {
-            println!("      nothing but the usual traffic -- complete silence,");
-            println!("      which is a different answer from a refusal.");
-        }
-
-        if moved.is_empty() {
-            println!("    nothing moved.");
-        } else {
-            println!("    {} slot(s) changed -- see below.", moved.len());
-            break;
+    for index in 0..inventory::SLOT_COUNT {
+        let (was, now) = (before.get(&index), after.get(&index));
+        if was != now {
+            moved.push((index, was.copied(), now.copied()));
         }
     }
 
     if moved.is_empty() {
-        println!("\nneither body shape moved anything.");
-        println!("**Read the two attempts against each other rather than alone.** A");
-        println!("refusal that names a real item guid says the server parsed the body");
-        println!("and declined the request; silence says it did not get that far. If");
-        println!("one shape is answered and the other is not, that difference is about");
-        println!("the body -- and if the answer changes with what the destination slot");
-        println!("holds, the handler is evaluating the request, which is the opposite");
-        println!("of an unrecognised opcode. Run this against a real/real pair AND a");
-        println!("real/empty pair before concluding anything: they do not agree.");
+        println!("\nnothing moved.");
         return Ok(());
     }
 
@@ -5046,7 +4949,7 @@ fn swap_and_report(
         if swapped {
             "-- both guids landed at each other's slot: a real swap."
         } else {
-            "-- something moved, but not the two-way swap this was testing for."
+            "-- something moved, but not a two-way swap of this exact pair."
         }
     );
 
