@@ -363,7 +363,7 @@ fn build_live_scene(
         // for icons.
         let items = crate::items::Items::load(chain);
         let placements: Vec<world::EntityPlacement> =
-            drawable_with_own(&live, (0.0, 0.0), false)
+            drawable_with_own(&live, (0.0, 0.0), 0.0, false)
                 .iter()
                 .map(|entity| {
                     // Same three sources as the windowed path -- see `redraw`.
@@ -602,23 +602,58 @@ fn live_pace(moving: ::world::motion::Motion) -> f32 {
     }
 }
 
-/// Which way the character is sidestepping, signed, left positive, and only
-/// while nothing else is going on.
+/// How far the *drawn* body is turned towards where it is travelling, in
+/// radians, left positive.
 ///
-/// Exists for the `F4` A/B alone -- see [`App::sidestep_shuffles`]. The
-/// shuffles are the only lateral cycle a land model has, so offering the
-/// alternative at all means being able to name a side.
-fn live_strafe(moving: ::world::motion::Motion) -> f32 {
+/// **This is the answer the cycle question kept failing to be.** A character
+/// sidestepping plays the run -- there is no lateral travel cycle in the art,
+/// and `AnimationData` says so -- and it looked wrong anyway, because the run
+/// was being played by a body pointing straight at the camera: *"the player
+/// runs the exact same way as W when you hit Q"*. The original does not have
+/// a sideways run because it does not need one. **It turns the model**, far
+/// enough that the legs are seen from the side while the same forward run
+/// plays.
+///
+/// So the rule is the movement's own: the body faces the direction it is
+/// actually travelling, clamped to a limit. `atan2` of the two axes gives
+/// that angle for free, and the clamp is what keeps a sidestep from reading
+/// as a turn -- a character strafing around a target still faces the target,
+/// which is the half of this that a full rotation would break.
+///
+/// **Render only.** `live.orientation` is what the movement direction and
+/// every outgoing `MSG_MOVE_*` are computed from, and turning *that* would
+/// send the character round in a circle. This is added where the body is
+/// placed and nowhere else.
+///
+/// A pure retreat gets nothing: there is no lateral component to lean into,
+/// and `Walkbackwards` exists precisely so a character can back away facing
+/// forwards.
+fn strafe_yaw(moving: ::world::motion::Motion, limit: f32) -> f32 {
     use ::world::motion::Axis;
-    if moving.longitudinal().is_some() {
-        return 0.0;
-    }
-    match moving.lateral() {
-        Some(Axis::Positive) => 1.0,
+    let lateral = match moving.lateral() {
+        Some(Axis::Positive) => 1.0f32,
+        Some(Axis::Negative) => -1.0,
+        None => return 0.0,
+    };
+    let longitudinal = match moving.longitudinal() {
+        Some(Axis::Positive) => 1.0f32,
         Some(Axis::Negative) => -1.0,
         None => 0.0,
-    }
+    };
+    lateral.atan2(longitudinal).clamp(-limit, limit)
 }
+
+/// How far a sidestep may turn the body, in degrees, and the choices `F4`
+/// cycles through.
+///
+/// **A chosen number, and the reason it is a list is that it has to be looked
+/// at.** Nothing in the archives says how far the original leans -- this is a
+/// client rendering decision, not a table -- so the honest thing is to make
+/// comparing them a keypress rather than a rebuild. 45 is the default because
+/// it is the angle a diagonal already travels at, so a sidestep and a
+/// forward-sidestep agree.
+const STRAFE_YAW_CHOICES: [f32; 5] = [0.0, 30.0, 45.0, 60.0, 90.0];
+const STRAFE_YAW_DEFAULT: usize = 2;
 
 /// The rate the A/D keys are turning the character on the spot, signed, with
 /// left positive.
@@ -1863,27 +1898,22 @@ struct App {
     /// as one facing the wrong way, which is very likely why the two
     /// observations above disagree.
     flip_winding: bool,
-    /// Debug: play the `Shuffle` cycles while sidestepping instead of the run,
-    /// toggled with `F4`.
+    /// Which of [`STRAFE_YAW_CHOICES`] the drawn body leans by while
+    /// sidestepping, cycled with `F4`.
     ///
-    /// **Here because the same question has now been decided four times from a
-    /// render and reversed four times**, which is the signature of a
-    /// comparison nobody has actually made. Each answer looked wrong on its
-    /// own: the shuffles read as standing still with the feet moving, the run
-    /// reads as running forwards while travelling sideways. Neither report was
-    /// mistaken, and a model with only those two lateral options cannot offer
-    /// a third.
+    /// **The cycle question was asked four times and the answer was never a
+    /// cycle.** Both of the two lateral options a land model has were shown at
+    /// the window and both were rejected, correctly: the shuffles read as
+    /// standing still with the feet moving, and the run read as *"the exact
+    /// same way as W"*. What the original does is play that same run with the
+    /// **model turned**, so the legs are seen from the side. There was never a
+    /// third animation to find.
     ///
-    /// `AnimationData.dbc` says which is *authentic* -- see [`live_pace`],
-    /// where bit 64 of `body_flags` marks the cycles that carry a character
-    /// and the shuffles do not have it -- so the run is the default and stays
-    /// the default. What the table cannot say is which one somebody would
-    /// rather look at. This is the F2 treatment for exactly that: one key, one
-    /// variable, the person at the window pressing it while sidestepping.
-    ///
-    /// The movement itself is untouched either way. Only the cycle changes,
-    /// which is what makes it an A/B rather than two builds.
-    sidestep_shuffles: bool,
+    /// How far it turns is not in any table -- it is a rendering decision --
+    /// so this is the `F2` treatment applied to the number instead of to the
+    /// choice: one key, one variable, the person at the window pressing it
+    /// while sidestepping. Movement is untouched at every setting.
+    strafe_yaw_choice: usize,
     /// The line being typed, or `None` when not typing. While this is `Some`,
     /// keys are text rather than movement.
     composing: Option<String>,
@@ -2110,6 +2140,11 @@ fn action_slot(code: KeyCode) -> Option<usize> {
 fn drawable_with_own(
     live: &live::LiveWorld,
     pace: (f32, f32),
+    // How far to turn the drawn body towards where it is going -- see
+    // [`strafe_yaw`]. Added to the orientation here rather than to
+    // `live.orientation`, which is what movement and every outgoing packet
+    // are computed from.
+    lean: f32,
     airborne: bool,
 ) -> Vec<live::Entity> {
     let mut entities = live::drawable_entities(&live.state, live.guid, live.position);
@@ -2117,7 +2152,7 @@ fn drawable_with_own(
         &live.state,
         live.guid,
         live.position,
-        live.orientation,
+        live.orientation + lean,
         pace.0,
         pace.1,
         airborne,
@@ -2578,8 +2613,7 @@ impl App {
             combat_text: Vec::new(),
             entity_flip: false,
             flip_winding: false,
-            // The run, which is what the table says the original plays.
-            sidestep_shuffles: false,
+            strafe_yaw_choice: STRAFE_YAW_DEFAULT,
             composing: None,
             spells: spells::Spellbook::default(),
             bars_seeded: false,
@@ -3143,20 +3177,17 @@ impl ApplicationHandler for App {
                                 ))));
                                 tracing::info!("model winding {state}");
                             }
-                            // See `App::sidestep_shuffles`: hold `Q` or `E`
-                            // and press this to compare the two, which is the
-                            // step that four flips of this decision skipped.
+                            // See `App::strafe_yaw_choice`: hold `Q` or `E`
+                            // and press this until the legs look right from
+                            // behind, which is a comparison and not a guess.
                             KeyCode::F4 => {
-                                self.sidestep_shuffles = !self.sidestep_shuffles;
-                                let state = if self.sidestep_shuffles {
-                                    "the shuffle"
-                                } else {
-                                    "the run (what AnimationData says the original plays)"
-                                };
+                                self.strafe_yaw_choice =
+                                    (self.strafe_yaw_choice + 1) % STRAFE_YAW_CHOICES.len();
+                                let degrees = STRAFE_YAW_CHOICES[self.strafe_yaw_choice];
                                 self.chat.push(Line::Chat(local_notice(format!(
-                                    "sidestep cycle: {state}"
+                                    "sidestep lean: {degrees:.0} degrees"
                                 ))));
-                                tracing::info!("sidestep cycle: {state}");
+                                tracing::info!("sidestep lean {degrees:.0} degrees");
                             }
                             // Only offer a chat line when there is somewhere
                             // to send it.
@@ -3359,6 +3390,7 @@ impl App {
         // borrowed mutably below and holds that borrow for the whole draw, so
         // anything wanting `&self` has to have asked already.
         let pace = self.animation_pace();
+        let lean = self.strafe_lean();
 
         // **Before the renderer is borrowed**, because this needs the archive
         // chain and the scene at the same time and the draw below holds the
@@ -3413,7 +3445,7 @@ impl App {
                     // player's own body is excluded inside `ease_facings` --
                     // its heading comes from the keys and is already smooth,
                     // and easing it would make the camera lag the character.
-                    let mut drawn = drawable_with_own(live, pace, self.jump.is_some());
+                    let mut drawn = drawable_with_own(live, pace, lean, self.jump.is_some());
                     // See `App::own_body_drawn`: submitted-and-not-drawn and
                     // never-submitted are the same report from the window.
                     let own_drawn = drawn.iter().any(|entity| entity.guid == live.guid);
@@ -3697,18 +3729,23 @@ impl App {
     /// disagree, which is the same rule that unprojects the picking ray from
     /// the matrix the scene was drawn with.
     fn animation_pace(&self) -> (f32, f32) {
-        let turning = live_turning(self.keys, self.steering, self.live_move);
-        let strafe = live_strafe(self.live_move);
-        // The `F4` A/B, and the only thing it changes -- see
-        // `App::sidestep_shuffles`. A pace of zero is what lets the animation
-        // chooser reach the shuffles; the movement integrator never reads
-        // this, so the character travels either way.
-        if self.sidestep_shuffles && strafe != 0.0 {
-            return (0.0, strafe);
-        }
-        // Otherwise: the run, and the shuffles reserved for turning on the
-        // spot, which is the only in-place lateral gesture there is.
-        (live_pace(self.live_move), turning)
+        (
+            live_pace(self.live_move),
+            // Turning on the spot, and only that: the shuffles carry nobody
+            // anywhere, and a sidestep is carried by the run with the body
+            // turned -- see [`strafe_yaw`].
+            live_turning(self.keys, self.steering, self.live_move),
+        )
+    }
+
+    /// How far the drawn body leans into a sidestep this frame, in radians.
+    ///
+    /// Read from [`App::strafe_yaw_choice`], which `F4` cycles.
+    fn strafe_lean(&self) -> f32 {
+        strafe_yaw(
+            self.live_move,
+            STRAFE_YAW_CHOICES[self.strafe_yaw_choice].to_radians(),
+        )
     }
 
     fn drive_live_movement(&mut self) {
@@ -5154,7 +5191,7 @@ impl App {
         // The speed only chooses an animation, which a click test does not care
         // about -- but the same list has to come out here as the renderer drew,
         // so it is passed the same way rather than left at a default.
-        let entities = drawable_with_own(live, pace, self.jump.is_some());
+        let entities = drawable_with_own(live, pace, self.strafe_lean(), self.jump.is_some());
         Some(hud::pick(&ray, &entities, &|display_id| {
             world.entity_bounds(display_id)
         }))
@@ -6681,6 +6718,65 @@ mod gesture_tests {
                 "{name} must not report a turn as well"
             );
         }
+    }
+
+    /// **A sidestep turns the drawn body towards where it is going; a
+    /// straight run and a straight retreat turn nothing.**
+    ///
+    /// This is what the cycle question turned out to be about. There is no
+    /// sideways run in the art because the original does not need one -- it
+    /// plays the same forward run with the model turned, which is why a
+    /// sidestep looked "exactly the same as W" with the body pointing at the
+    /// camera.
+    ///
+    /// Both halves, and the second is the one that matters: leaning is only
+    /// correct where there is a lateral component. A retreat that leaned would
+    /// undo `Walkbackwards`, whose whole purpose is backing away *facing
+    /// forwards*, and a forward run that leaned would be permanently crabbing.
+    #[test]
+    fn only_a_sidestep_leans_and_it_leans_towards_its_travel() {
+        use ::world::motion::Motion;
+        use std::f32::consts::FRAC_PI_2;
+
+        let limit = 90f32.to_radians();
+        let m = |forward, backward, left, right| Motion {
+            forward,
+            backward,
+            strafe_left: left,
+            strafe_right: right,
+        };
+
+        // Nothing lateral, nothing to lean into.
+        for (name, motion) in [
+            ("still", m(false, false, false, false)),
+            ("run", m(true, false, false, false)),
+            ("retreat", m(false, true, false, false)),
+            ("both keys held", m(true, true, false, false)),
+            ("both strafes held", m(false, false, true, true)),
+        ] {
+            assert_eq!(strafe_yaw(motion, limit), 0.0, "{name} must not lean");
+        }
+
+        // A pure sidestep travels at a right angle to the facing, and left is
+        // the positive side -- the same sign convention as `Motion::direction`
+        // and `Side`.
+        assert!((strafe_yaw(m(false, false, true, false), limit) - FRAC_PI_2).abs() < 1e-5);
+        assert!((strafe_yaw(m(false, false, false, true), limit) + FRAC_PI_2).abs() < 1e-5);
+
+        // A diagonal travels at 45 degrees and leans exactly that far, which
+        // is why 45 is the default limit: a sidestep and a forward-sidestep
+        // then agree rather than snapping between two angles.
+        let diagonal = strafe_yaw(m(true, false, true, false), limit);
+        assert!((diagonal - FRAC_PI_2 / 2.0).abs() < 1e-5, "{diagonal}");
+
+        // And the limit is a limit: at 30 degrees a sidestep leans 30, not 90.
+        let tight = 30f32.to_radians();
+        assert!((strafe_yaw(m(false, false, true, false), tight) - tight).abs() < 1e-5);
+        assert_eq!(
+            strafe_yaw(m(false, false, true, false), 0.0),
+            0.0,
+            "the zero choice must draw the body exactly as it did before"
+        );
     }
 
     /// **Which cycle a sidestep plays was decided by a column, after three
