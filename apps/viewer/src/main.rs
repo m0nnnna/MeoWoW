@@ -2815,7 +2815,24 @@ impl ApplicationHandler for App {
         let Some(r) = self.renderer.as_mut() else {
             return;
         };
-        if r.egui_state.on_window_event(&window, &event).consumed {
+        let consumed = r.egui_state.on_window_event(&window, &event).consumed;
+        // **Which way a button press went, and nothing else.** "The window
+        // ignored my click" and "the click went past the window into the
+        // world" are the same report from the far side of the screen and want
+        // opposite investigations, and this is the fork in the road: taken,
+        // the interface has the press and the rest of this function never
+        // runs -- including the cursor grab, which is why a click on a button
+        // no longer hides the pointer for its own duration.
+        if let WindowEvent::MouseInput { state, button, .. } = &event {
+            tracing::debug!(
+                "{:?} {:?} at {:?} -> {}",
+                button,
+                state,
+                self.last_cursor,
+                if consumed { "the interface" } else { "the world" }
+            );
+        }
+        if consumed {
             window.request_redraw();
             return;
         }

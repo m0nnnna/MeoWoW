@@ -428,6 +428,14 @@ const NPC_ITEM_SLOTS: [u8; 11] = [
 /// is equipment -- see [`Look::shows`].
 const MANAGED_GROUPS: [u32; 4] = [0, 1, 2, 3];
 
+/// The scalp, in geoset group zero, shown when `CharHairGeosets.show_scalp`
+/// says the hairstyle does not cover the top of the head.
+///
+/// Identified from the shape of the whole table rather than from one row: no
+/// hairstyle of any playable race names it. They run from 2 upwards, the bald
+/// style names 0, and 1 is left over -- see [`hair_and_geosets`].
+const SCALP_GEOSET: u32 = 1;
+
 // There was a `HIDDEN_WITHOUT_EQUIPMENT` list here, holding group 15 alone, on
 // the reading that the group had no bare-body variant. It had one -- see
 // [`NECK_PATCH`] -- and the list existed to describe a single misidentified
@@ -735,21 +743,34 @@ fn hair_and_geosets(
     });
 
     let mut geosets = Vec::new();
-    // Hair. A style names a geoset in group zero; zero itself is the bald
-    // scalp, which is a real choice rather than a missing one.
-    let hair_geoset = hair_geosets
-        .and_then(|table| {
-            table
-                .iter()
-                .find(|row| {
-                    row.race() == u32::from(look.race)
-                        && row.gender() == u32::from(look.gender)
-                        && row.variation() == u32::from(look.hair_style)
-                })
-                .map(|row| row.geoset())
+    // Hair. A style names a geoset in group zero; zero itself means no hair
+    // mesh at all, which is a real choice rather than a missing one.
+    let row = hair_geosets.and_then(|table| {
+        table.iter().find(|row| {
+            row.race() == u32::from(look.race)
+                && row.gender() == u32::from(look.gender)
+                && row.variation() == u32::from(look.hair_style)
         })
-        .unwrap_or(0);
+    });
+    let hair_geoset = row.as_ref().map(|row| row.geoset()).unwrap_or(0);
     geosets.push(hair_geoset);
+
+    // **The scalp is a geoset of its own, and `show_scalp` is what asks for
+    // it.** The field was parsed, documented and then read by nobody, which
+    // is the shape that hid `Track::global_sequence` for four milestones.
+    //
+    // What identifies geoset 1 as the scalp is the whole table rather than
+    // one row: in every playable race the hairstyles start at geoset **2**
+    // and count up, the bald style names **0**, and *no style anywhere names
+    // 1*. The 19 rows that set `show_scalp` are exactly the styles that leave
+    // the top of the head bare -- every race's bald option, the troll and
+    // tuskarr styles shaved at the sides -- and `HumanMale.m2` has a
+    // 44-triangle piece at the crown, drawn with the body texture, sitting at
+    // geoset 1 with nothing else able to select it. A model with no such
+    // piece (an orc) simply has no geoset 1 and this adds nothing.
+    if row.is_some_and(|row| row.show_scalp() != 0) {
+        geosets.push(SCALP_GEOSET);
+    }
 
     // Facial hair, across three groups at once. The columns are variants in
     // groups 1, 3 and 2 -- in that order, which is not the order they are
@@ -1476,6 +1497,131 @@ mod tests {
         }
     }
 
+    /// **Geoset 1 of group zero is the scalp, and this is what says so.**
+    ///
+    /// The identification is a property of the whole table rather than of any
+    /// row: across all ten races a character can be created as, both genders,
+    /// the hairstyles start at geoset **2** and count up, the bald style names
+    /// **0**, and nothing names 1. Twenty race/gender pairs, unanimous. That
+    /// leaves exactly one group-zero geoset no hairstyle can ever select, and
+    /// exactly one field in the table -- `show_scalp` -- with nothing else to
+    /// mean.
+    ///
+    /// The four races that *do* name geoset 1 are named here rather than
+    /// filtered out, because the exception is the interesting half: all four
+    /// are NPC-only models with no bald style to reserve it for.
+    #[test]
+    fn no_hairstyle_a_player_can_choose_names_the_scalp_geoset() {
+        let Some(data) = std::env::var_os("WOW_DATA") else {
+            eprintln!("skipping: WOW_DATA not set");
+            return;
+        };
+        let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
+        let table =
+            CharHairGeosets::parse(&chain.read(CharHairGeosets::PATH).expect("CharHairGeosets"))
+                .expect("parsing CharHairGeosets");
+
+        // The ten a 3.3.5 character can be created as.
+        const PLAYABLE: [u32; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11];
+
+        let mut pairs = 0;
+        for race in PLAYABLE {
+            for gender in [0, 1] {
+                let styles: Vec<_> = table
+                    .iter()
+                    .filter(|row| row.race() == race && row.gender() == gender)
+                    .collect();
+                if styles.is_empty() {
+                    continue;
+                }
+                pairs += 1;
+                let lowest = styles
+                    .iter()
+                    .map(|row| row.geoset())
+                    .filter(|geoset| *geoset != 0)
+                    .min()
+                    .expect("a race with no hairstyle at all");
+                assert_eq!(
+                    lowest, 2,
+                    "race {race} gender {gender} starts its hairstyles at {lowest}, \
+                     so {SCALP_GEOSET} is not reserved"
+                );
+                assert!(
+                    !styles.iter().any(|row| row.geoset() == SCALP_GEOSET),
+                    "race {race} gender {gender} has a hairstyle naming the scalp geoset"
+                );
+            }
+        }
+        assert_eq!(pairs, 20, "not every playable race/gender was checked");
+
+        // And the exceptions, so a change to them fails here rather than
+        // quietly widening the claim above.
+        let mut naming: Vec<u32> = table
+            .iter()
+            .filter(|row| row.geoset() == SCALP_GEOSET)
+            .map(|row| row.race())
+            .collect();
+        naming.sort_unstable();
+        naming.dedup();
+        assert_eq!(
+            naming,
+            [9, 14, 17, 19],
+            "only Goblin, Broken, Tuskarr and Taunka should name the scalp geoset"
+        );
+    }
+
+    /// A bald character is given the scalp and a styled one is not.
+    ///
+    /// **Both halves, because the second is what the first is
+    /// indistinguishable from.** Asserting only that a bald head gets geoset 1
+    /// would pass just as well if it were handed to everybody, which would put
+    /// a bare patch through the middle of every hairstyle in the game.
+    #[test]
+    fn a_bald_character_is_given_the_scalp_and_a_styled_one_is_not() {
+        let Some(data) = std::env::var_os("WOW_DATA") else {
+            eprintln!("skipping: WOW_DATA not set");
+            return;
+        };
+        let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
+        let sections = CharSections::parse(&chain.read(CharSections::PATH).unwrap()).ok();
+        let geosets =
+            CharHairGeosets::parse(&chain.read(CharHairGeosets::PATH).unwrap()).ok();
+        let facial =
+            CharacterFacialHairStyles::parse(&chain.read(CharacterFacialHairStyles::PATH).unwrap())
+                .ok();
+
+        let human_male = |hair_style: u8| Appearance {
+            race: 1,
+            gender: 0,
+            skin: 0,
+            face: 0,
+            hair_style,
+            hair_colour: 0,
+            facial_hair: 0,
+        };
+
+        // Style 0 is human male's bald option: every colour of it has an empty
+        // texture and `CharHairGeosets` gives it geoset 0, so nothing is drawn
+        // on top of the head and the scalp is the whole of the hairstyle.
+        let (hair, bald) =
+            hair_and_geosets(sections.as_ref(), geosets.as_ref(), facial.as_ref(), human_male(0));
+        assert_eq!(hair, None, "human male style 0 should have no hair texture");
+        assert!(
+            bald.contains(&SCALP_GEOSET),
+            "a bald head must be closed by the scalp: {bald:?}"
+        );
+
+        // Style 7 is an ordinary head of hair, and must not also get one --
+        // the scalp would show through it.
+        let (hair, styled) =
+            hair_and_geosets(sections.as_ref(), geosets.as_ref(), facial.as_ref(), human_male(7));
+        assert!(hair.is_some(), "human male style 7 should have a hair texture");
+        assert!(
+            !styled.contains(&SCALP_GEOSET),
+            "a styled head must not be given the scalp as well: {styled:?}"
+        );
+    }
+
     /// The two hands must be different attachment points.
     ///
     /// Trivial to state and exactly the mistake that a copy-paste in
@@ -1644,8 +1790,13 @@ mod tests {
 
     /// The body is geoset zero of group zero, and a bald character is the
     /// `geoset 0` case -- so an empty choice must not hide the head.
+    ///
+    /// Renamed from "still has a scalp", which it never checked: the scalp is
+    /// geoset **1** and belongs to `show_scalp`, not to this. A test whose
+    /// name claims more than its assertion is worse than no test, because the
+    /// next reader takes the name for coverage.
     #[test]
-    fn a_bald_character_still_has_a_scalp() {
+    fn a_bald_character_still_has_a_body() {
         let look = look_with(vec![0]);
         assert!(look.shows(0));
     }
