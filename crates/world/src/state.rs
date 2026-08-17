@@ -830,6 +830,18 @@ pub struct Stats {
     pub value_updates: usize,
     pub movement_updates: usize,
     pub removed: usize,
+    /// Removals naming a guid that was not there. The mirror of
+    /// [`Stats::orphaned`], and it is here because its absence cost a
+    /// session: `SMSG_DESTROY_OBJECT` was read as a packed guid when it
+    /// carries a raw one, so **every** destroy named a small number nobody
+    /// had ever created -- while the object the server meant lingered as a
+    /// ghost and the occasional collision deleted a player. A count of
+    /// removals that hit nothing would have said so from the first minute of
+    /// the first session, in one number, with no window open.
+    ///
+    /// Not always a fault: an object can be destroyed for us that we never
+    /// received a create for. Like `orphaned`, it should stay near zero.
+    pub removed_unknown: usize,
     /// Updates naming a guid never created. Each one is a change applied to
     /// nothing, and a rising count means create blocks are being lost.
     pub orphaned: usize,
@@ -1564,6 +1576,10 @@ impl WorldState {
             self.stats.removed += 1;
             true
         } else {
+            // See `Stats::removed_unknown`: a removal that names nothing is
+            // the cheapest possible signal that removals are being addressed
+            // wrongly, and it was the number missing when they were.
+            self.stats.removed_unknown += 1;
             false
         }
     }
@@ -2072,9 +2088,7 @@ impl WorldState {
                     }
                 }
                 crate::opcode::server::DESTROY_OBJECT => {
-                    let mut reader =
-                        crate::protocol::Reader::new(&packet.body, "SMSG_DESTROY_OBJECT");
-                    match update::read_packed_guid(&mut reader) {
+                    match parse_destroy_object(&packet.body) {
                         Ok(guid) => {
                             report.destroys += 1;
                             self.remove(guid);
@@ -2092,6 +2106,34 @@ impl WorldState {
 
         report
     }
+}
+
+/// The guid `SMSG_DESTROY_OBJECT` names, and whether it died.
+///
+/// **A raw eight-byte guid, not a packed one**, and reading it as packed is
+/// how the player's own character kept going invisible a couple of minutes
+/// into every session. A packed read takes the first byte as a mask and
+/// assembles the rest from whichever bytes it says are non-zero, so a
+/// creature's guid read that way comes out as an arbitrary small number --
+/// and small numbers are exactly what *player* guids are. Guid `0x9` was
+/// removed from replicated state on a realm where `0x9` is a character, by a
+/// packet that was talking about a despawning wolf.
+///
+/// It is also the second thing this project has lost to skipping its own rule
+/// about consuming the whole body. Nine bytes read as `packed guid` leaves a
+/// remainder that depends on the mask, so nothing was ever left over in a way
+/// anybody checked -- and the parse "succeeded" every time. The `finish()`
+/// below is what makes the shape falsifiable: the body is eight bytes and one
+/// flag, and anything else is an error rather than a silent removal.
+///
+/// The flag says the client should play a death, which nothing here does yet.
+/// It is read rather than skipped so the length check means something.
+fn parse_destroy_object(body: &[u8]) -> Result<u64, crate::protocol::Error> {
+    let mut reader = crate::protocol::Reader::new(body, "SMSG_DESTROY_OBJECT");
+    let guid = reader.u64()?;
+    let _on_death = reader.u8()?;
+    reader.finish()?;
+    Ok(guid)
 }
 
 #[cfg(test)]
@@ -2492,8 +2534,12 @@ mod tests {
         let mut world = WorldState::new();
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
 
-        let mut good_destroy = Vec::new();
-        crate::update::write_packed_guid(7, &mut good_destroy);
+        // A raw guid and the death flag -- see `parse_destroy_object`. This
+        // used to be written packed, matching a reader that was wrong, and
+        // the two agreeing with each other is precisely why neither was
+        // questioned.
+        let mut good_destroy = 7u64.to_le_bytes().to_vec();
+        good_destroy.push(0);
 
         let packets = vec![
             // A valid create for a second object, so the good path is proven
@@ -2502,8 +2548,7 @@ mod tests {
                 opcode: crate::opcode::server::UPDATE_OBJECT,
                 body: update_object_body(8, &[(crate::update::fields::UNIT_LEVEL, 5)]),
             },
-            // Truncated: a mask byte claiming every one of the eight guid
-            // bytes is present, with none of them supplied.
+            // Truncated: one byte where nine are wanted.
             Packet {
                 opcode: crate::opcode::server::DESTROY_OBJECT,
                 body: vec![0xFF],
@@ -2527,6 +2572,60 @@ mod tests {
 
         assert!(world.get(7).is_none(), "the valid destroy did not apply");
         assert!(world.get(8).is_some(), "the valid create did not apply");
+    }
+
+    /// **A destroy names a raw guid, and reading it as a packed one deletes
+    /// whatever small number falls out of the mask.**
+    ///
+    /// This is the bug behind a character going invisible a couple of minutes
+    /// into every session, found by logging the *change* in whether the
+    /// player's own body was submitted to the renderer: `something removed
+    /// guid 0x9`, on a realm where `0x9` is a character and nothing had
+    /// happened to it. A packed read takes the first byte as a mask and
+    /// assembles the guid from the bytes it claims are present, so a
+    /// creature's raw guid comes out as an arbitrary small integer -- and
+    /// small integers are exactly what player guids are. The creature here is
+    /// chosen to make that concrete: its low bytes are `01 09`, so a packed
+    /// read of its raw guid yields precisely `9`.
+    ///
+    /// Both halves are asserted, because each alone passes under the mirror
+    /// image of the bug: the creature the packet *names* must go, and the
+    /// player it does not name must stay.
+    #[test]
+    fn a_destroy_removes_the_guid_it_names_and_not_a_packed_misreading_of_it() {
+        use crate::client::Packet;
+
+        const PLAYER: u64 = 0x9;
+        const WOLF: u64 = 0xF130_0003_3701_0901;
+
+        let mut world = WorldState::new();
+        world.apply(&[
+            create(PLAYER, ObjectType::Player, Some(at(0.0, 0.0)), &[]),
+            create(WOLF, ObjectType::Unit, Some(at(1.0, 0.0)), &[]),
+        ]);
+
+        let mut body = WOLF.to_le_bytes().to_vec();
+        // The flag that asks for a death animation, which nothing here plays
+        // yet -- but the body is nine bytes and the parse says so.
+        body.push(0);
+        let report = world.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::DESTROY_OBJECT,
+                body,
+            }],
+            None,
+        );
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.destroys, 1);
+        assert!(
+            world.get(WOLF).is_none(),
+            "the creature the packet actually named is still here"
+        );
+        assert!(
+            world.get(PLAYER).is_some(),
+            "the player the packet never mentioned was removed"
+        );
     }
 
     #[test]

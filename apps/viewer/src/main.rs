@@ -1395,10 +1395,16 @@ fn describe_live(live: &live::LiveWorld) -> String {
     // number that does not add up long before the world looks wrong.
     let stats = live.state.stats();
     text.push_str(&format!(
-        "\n{} replicated ({} created, {} removed, {} moves, {} orphaned)",
+        "\n{} replicated ({} created, {} removed, {} removals hit nothing, \
+         {} moves, {} orphaned)",
         live.state.len(),
         stats.created,
         stats.removed,
+        // The number whose absence hid a wire-format bug for a whole
+        // milestone -- see `Stats::removed_unknown`. It belongs beside
+        // `removed` rather than anywhere else: the two together are the
+        // statement, and either alone reads as healthy.
+        stats.removed_unknown,
         stats.movement_updates,
         stats.orphaned,
     ));
