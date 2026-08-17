@@ -372,25 +372,43 @@ pub struct World {
     /// buffer and its bind group only need to be created once per
     /// (display id, moving) pair, not once per rebuild tick.
     entity_bones: HashMap<(u32, Motion), BoneBuffer>,
-    /// The animation each display id's shared pose was most recently doing,
-    /// and when that became current -- what a fresh transition blends out
-    /// of, instead of cutting straight to the new cycle's first frame.
+    /// `(display id, motion)` buckets that were being posed as of the
+    /// previous [`Self::update_animations`] call.
     ///
-    /// **Keyed by display id alone**, the same simplification
-    /// [`Self::entity_bones`] already makes for pose sharing: every instance
-    /// of a species draws from one buffer, so it blends as one too. A crowd
-    /// of the same creature in different motions at once shares a single
-    /// blend timer between them, which is visibly imperfect for exactly
-    /// that crowd -- and correct for the case this was reported for, one
-    /// character's own jump, run and attack, which is the only identity a
-    /// shared bone buffer was ever going to have anyway.
+    /// **Compared against, never mutated mid-frame.** The first version of
+    /// this feature kept one "current motion" value per display id and
+    /// overwrote it as each bucket was processed -- so with two buckets of
+    /// the same species live at once (some wolves standing, some walking,
+    /// which is the ordinary case, not an edge one), whichever bucket was
+    /// processed second every frame saw the first one's write and read it
+    /// as *its own* transition, forever. That is what "wolves twitch and
+    /// slide, NPCs slide" was: every standing wolf blending toward Walk and
+    /// every walking one blending toward Stand, every single frame, with
+    /// the blend never allowed to finish because the next frame reset it
+    /// again. Comparing against a frozen snapshot of the *previous* frame
+    /// means a bucket's own history cannot be disturbed by a sibling bucket
+    /// processed earlier or later in the same pass.
+    active_motion_buckets: RefCell<std::collections::HashSet<(u32, Motion)>>,
+    /// Where a currently-blending bucket started and what it blends from.
+    /// Written once, the frame a bucket is first found absent from
+    /// [`Self::active_motion_buckets`]; read every frame after, gated on
+    /// elapsed time, until the blend window passes. Left in place after
+    /// that rather than cleared early -- a stale entry is inert, since
+    /// nothing re-reads it once its own bucket's elapsed time exceeds the
+    /// window -- and pruned alongside `entity_bones` in `set_entities`.
+    blending: RefCell<HashMap<(u32, Motion), (Motion, Instant)>>,
+    /// The most recent motion touched for a given display id, across
+    /// whichever of its buckets was processed most recently.
     ///
-    /// A `RefCell` because [`Self::update_animations`] takes `&self` --
-    /// every other caller already treats the world as read-only during
-    /// rendering, and widening that to `&mut self` here would ripple into
-    /// every call site for a change that is, from the outside, exactly as
-    /// pure as the pose it produces.
-    recent_motion: RefCell<HashMap<u32, MotionState>>,
+    /// Consulted **only** at the instant a bucket is found newly active, to
+    /// pick what it blends from -- never compared frame-to-frame the way
+    /// the old, buggy design compared a "current motion" value, which is
+    /// what made same-frame write order matter. Which sibling bucket wrote
+    /// this last within one frame can make a single newly-appearing
+    /// bucket's blend source slightly wrong; it cannot make an
+    /// already-settled bucket re-detect a transition, because settled
+    /// buckets never consult this at all.
+    last_motion_per_display: RefCell<HashMap<u32, Motion>>,
     /// Origin for the animation clock. The server does not say which frame of
     /// a walk cycle a creature is on -- nothing does, since 3.3.5a leaves that
     /// entirely to the client -- so any fixed origin that advances is enough
@@ -455,7 +473,9 @@ impl World {
             game_objects_tried: false,
             entities: Vec::new(),
             entity_bones: HashMap::new(),
-            recent_motion: RefCell::new(HashMap::new()),
+            active_motion_buckets: RefCell::new(std::collections::HashSet::new()),
+            blending: RefCell::new(HashMap::new()),
+            last_motion_per_display: RefCell::new(HashMap::new()),
             started: Instant::now(),
             tiles: HashMap::new(),
             pending: VecDeque::new(),
@@ -1207,6 +1227,20 @@ impl World {
         // Drop bone buffers for creatures that changed bucket or left view,
         // rather than growing this cache for the life of the session.
         self.entity_bones.retain(|key, _| wanted_bones.contains(key));
+        // Same reasoning, for the blend bookkeeping -- otherwise every
+        // one-shot bucket a session ever creates (`Motion::Dying`,
+        // `Attacking`, `Sheathing` all carry a timestamp in the key) stays
+        // in `blending` forever, since nothing else ever removes an entry.
+        self.blending
+            .borrow_mut()
+            .retain(|key, _| wanted_bones.contains(key));
+        {
+            let wanted_displays: std::collections::HashSet<u32> =
+                wanted_bones.iter().map(|(display, _)| *display).collect();
+            self.last_motion_per_display
+                .borrow_mut()
+                .retain(|display, _| wanted_displays.contains(display));
+        }
 
         self.entities = built;
         self.refresh_stats();
@@ -1275,6 +1309,10 @@ impl World {
             Some(m2::Model::pose_bones(&model.bones, sequence, time_ms))
         };
 
+        let now = Instant::now();
+        let mut next_active: std::collections::HashSet<(u32, Motion)> =
+            std::collections::HashSet::new();
+
         for group in &self.entities {
             let Some((display_id, motion)) = group.animation else {
                 continue;
@@ -1285,29 +1323,39 @@ impl World {
             ) else {
                 continue;
             };
+            let key = (display_id, motion);
+            next_active.insert(key);
 
-            // Record the transition and blend out of whatever this display
-            // was doing a moment ago -- see `Self::recent_motion`'s doc
-            // comment for the one thing this simplifies away.
-            let now = Instant::now();
-            let blend_from = {
-                let mut history = self.recent_motion.borrow_mut();
-                let state = history.entry(display_id).or_insert(MotionState {
-                    current: motion,
-                    changed_at: now,
-                    blending_from: None,
-                });
-                if state.current != motion {
-                    state.blending_from = Some(state.current);
-                    state.current = motion;
-                    state.changed_at = now;
+            // A bucket newly found active gets a blend source from whatever
+            // this display's *other* buckets last recorded; one already
+            // active from last frame keeps whatever `Self::blending` has on
+            // file for it (or nothing, if it settled or never blended). Pure
+            // and pulled out to `bucket_transition` precisely so the
+            // ordering bug this exists to prevent (see
+            // `Self::active_motion_buckets`'s doc comment) can be pinned by
+            // a test that never opens a window.
+            match bucket_transition(
+                &self.active_motion_buckets.borrow(),
+                &self.last_motion_per_display.borrow(),
+                display_id,
+                motion,
+            ) {
+                BucketTransition::New(Some(from)) => {
+                    self.blending.borrow_mut().insert(key, (from, now));
                 }
-                let elapsed = now.saturating_duration_since(state.changed_at).as_millis() as u32;
-                (elapsed < TRANSITION_BLEND_MS)
-                    .then_some(state.blending_from)
-                    .flatten()
-                    .map(|from| (from, elapsed))
-            };
+                BucketTransition::New(None) => {
+                    self.blending.borrow_mut().remove(&key);
+                }
+                BucketTransition::Continuing => {}
+            }
+            self.last_motion_per_display
+                .borrow_mut()
+                .insert(display_id, motion);
+
+            let blend_from = self.blending.borrow().get(&key).and_then(|(from, started)| {
+                let elapsed = now.saturating_duration_since(*started).as_millis() as u32;
+                (elapsed < TRANSITION_BLEND_MS).then_some((*from, elapsed))
+            });
 
             let final_pose = match blend_from.and_then(|(from, elapsed)| {
                 pose_for(&group.model, from).map(|old| (old, elapsed))
@@ -1326,6 +1374,12 @@ impl World {
             meshes.update_bones(gpu, bones, &pose);
             poses.insert((display_id, motion), final_pose);
         }
+        // Replaces last frame's snapshot wholesale rather than being updated
+        // bucket-by-bucket above: a bucket absent from `self.entities` this
+        // pass (its creature died, despawned, or changed motion) has to
+        // stop counting as active, or its *next* reappearance would be
+        // missed as a transition.
+        *self.active_motion_buckets.borrow_mut() = next_active;
 
         // Then everything hanging off those poses. A held item's transform is
         // the wielder's own instance transform times the hand's animated
@@ -2057,20 +2111,43 @@ fn plays_once(animation_id: u16) -> bool {
 /// weapon or landing a jump does not read as slow motion.
 const TRANSITION_BLEND_MS: u32 = 150;
 
-/// What a display id's shared pose was last doing, for
-/// [`World::update_animations`] to blend out of. See
-/// [`World::recent_motion`]'s doc comment for the granularity this is kept
-/// at and why.
-struct MotionState {
-    current: Motion,
-    changed_at: Instant,
-    /// `None` the first time a display is ever seen -- there is nothing to
-    /// blend from, and blending from the bind pose would be its own new
-    /// snap. Set whenever `current` changes and left alone after: whether a
-    /// blend is still live is a question of elapsed time against
-    /// [`TRANSITION_BLEND_MS`], asked at the read site rather than by
-    /// clearing this early.
-    blending_from: Option<Motion>,
+/// What [`bucket_transition`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketTransition {
+    /// This bucket was already active last frame -- whatever
+    /// `World::blending` has on file for it, if anything, stands.
+    Continuing,
+    /// This bucket was not active last frame. `Some` names what to blend
+    /// from; `None` means either this display has never been seen before,
+    /// or its last-recorded motion *is* this one already (a bucket that
+    /// vanished and immediately reappeared with nothing else happening in
+    /// between) -- either way, nothing to blend from.
+    New(Option<Motion>),
+}
+
+/// Decides whether a `(display id, motion)` bucket just became active and,
+/// if so, what to seed its blend from.
+///
+/// Pure and free of `World` entirely -- deliberately, so the ordering bug
+/// this exists to prevent (see `World::active_motion_buckets`'s doc
+/// comment) can be pinned by a test that never opens a window. The bug was
+/// comparing against a value sibling buckets of the same display could
+/// still be writing *this same frame*; `active_last_frame` is a frozen
+/// snapshot precisely so that cannot happen here.
+fn bucket_transition(
+    active_last_frame: &std::collections::HashSet<(u32, Motion)>,
+    last_motion_per_display: &HashMap<u32, Motion>,
+    display_id: u32,
+    motion: Motion,
+) -> BucketTransition {
+    if active_last_frame.contains(&(display_id, motion)) {
+        return BucketTransition::Continuing;
+    }
+    let from = last_motion_per_display
+        .get(&display_id)
+        .copied()
+        .filter(|seen| *seen != motion);
+    BucketTransition::New(from)
 }
 
 /// Interpolates two bone palettes, per bone.
@@ -2220,6 +2297,86 @@ mod tests {
         let to = vec![Mat4::from_translation(Vec3::new(10.0, 0.0, 0.0))];
         assert_eq!(blend_poses(&from, &to, -1.0), from);
         assert_eq!(blend_poses(&from, &to, 2.0), to);
+    }
+
+    /// **The bug this whole mechanism exists to prevent, pinned directly.**
+    /// Reported live: every wolf around a player twitching, sliding, or
+    /// walking in place -- and every NPC sliding too. The cause was that the
+    /// first version of this feature kept one "current motion" value per
+    /// *display id*, shared by every bucket of that species -- so with two
+    /// wolves alive at once in different motions (the ordinary case, since
+    /// wolves wander independently), whichever bucket a frame's loop reached
+    /// second saw the first one's write and read it as its own transition.
+    /// Forever, because the next frame reset it right back.
+    ///
+    /// A single simulated wolf pack: display 299 has a Stand bucket and a
+    /// Walk bucket, both already active. Checking either against the
+    /// *other's* presence in the same, frozen `active_last_frame` snapshot
+    /// must read `Continuing` -- not `New` -- however many times and in
+    /// whatever order they are checked, which is what a `HashSet` snapshot
+    /// guarantees and a mutable shared value did not.
+    #[test]
+    fn two_buckets_of_the_same_display_do_not_retrigger_each_other() {
+        const WOLF: u32 = 299;
+        let active: std::collections::HashSet<(u32, Motion)> =
+            [(WOLF, Motion::Stand), (WOLF, Motion::Walk)].into_iter().collect();
+        let mut last_motion = HashMap::new();
+        last_motion.insert(WOLF, Motion::Walk);
+
+        for _ in 0..3 {
+            assert_eq!(
+                bucket_transition(&active, &last_motion, WOLF, Motion::Stand),
+                BucketTransition::Continuing,
+                "the standing wolves must not see the walking ones as a transition"
+            );
+            assert_eq!(
+                bucket_transition(&active, &last_motion, WOLF, Motion::Walk),
+                BucketTransition::Continuing,
+                "the walking wolves must not see the standing ones as a transition"
+            );
+        }
+    }
+
+    /// The case the mechanism exists *for*, so the fix above did not lose
+    /// it: a bucket that genuinely is new blends from the display's last
+    /// recorded motion.
+    #[test]
+    fn a_genuinely_new_bucket_blends_from_the_last_recorded_motion() {
+        let active = std::collections::HashSet::new(); // nothing active yet
+        let mut last_motion = HashMap::new();
+        last_motion.insert(7, Motion::Stand);
+
+        assert_eq!(
+            bucket_transition(&active, &last_motion, 7, Motion::Run),
+            BucketTransition::New(Some(Motion::Stand))
+        );
+    }
+
+    /// A display never seen before has nothing to blend from -- blending
+    /// out of an invented "previous" pose would itself be a new snap, not a
+    /// fix for one.
+    #[test]
+    fn a_display_seen_for_the_first_time_has_no_blend_source() {
+        let active = std::collections::HashSet::new();
+        let last_motion = HashMap::new();
+        assert_eq!(
+            bucket_transition(&active, &last_motion, 7, Motion::Stand),
+            BucketTransition::New(None)
+        );
+    }
+
+    /// A bucket that vanished and reappeared with the display's last motion
+    /// unchanged (nothing else happened while it was gone) has nothing new
+    /// to blend from either.
+    #[test]
+    fn a_bucket_reappearing_as_its_own_last_motion_does_not_blend() {
+        let active = std::collections::HashSet::new(); // this bucket just dropped out
+        let mut last_motion = HashMap::new();
+        last_motion.insert(7, Motion::Stand);
+        assert_eq!(
+            bucket_transition(&active, &last_motion, 7, Motion::Stand),
+            BucketTransition::New(None)
+        );
     }
 
     /// Backing up is its own cycle, at any pace, and forward is unaffected.
