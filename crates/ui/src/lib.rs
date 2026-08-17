@@ -1062,7 +1062,33 @@ impl Hud {
                 // not a loot slot.
                 (false, Content::Bags(slots)) => {
                     if response.clicked() {
-                        if let Some(pointer) = response.interact_pointer_pos() {
+                        // **Logged because the silent branches here are the
+                        // whole difficulty of `foss-wow#79`.** "I clicked an
+                        // item and nothing happened" has four causes that look
+                        // identical from the far side of the screen: the frame
+                        // never got the click, it got one with no pointer
+                        // position, the position mapped to no square, or it
+                        // mapped to an empty square. Only the first is visible
+                        // in the press router's own line, and the rest were
+                        // invisible everywhere -- so a report could not be
+                        // told apart from a report about the opposite bug.
+                        let pointer = response.interact_pointer_pos();
+                        let landed = pointer.and_then(|pointer| {
+                            frames::bags::slot_at(
+                                drawn_rect,
+                                slots.len(),
+                                &style,
+                                element.scale,
+                                pointer,
+                            )
+                        });
+                        tracing::debug!(
+                            "bags: click at {pointer:?} over {drawn_rect:?} -> slot {landed:?} \
+                             of {}, holding {:?}",
+                            slots.len(),
+                            self.held
+                        );
+                        if let Some(pointer) = pointer {
                             if let Some(row) = frames::bags::slot_at(
                                 drawn_rect,
                                 slots.len(),
