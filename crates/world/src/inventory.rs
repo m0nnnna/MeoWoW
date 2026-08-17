@@ -505,6 +505,13 @@ pub fn parse_inventory_change_failure(
 /// its number.
 pub fn describe_inventory_failure(code: u8) -> String {
     match code {
+        // Observed live: `foss-wow#79`'s reported swap failure reproduced on
+        // a character sitting dead from earlier testing, and reviving them
+        // made the identical swap succeed -- the one variable that changed.
+        // AzerothCore's `InventoryResult` enum names 38 `EQUIP_ERR_YOU_ARE_DEAD`,
+        // which is what made the hypothesis cheap to form; the revive/retry
+        // pair is what confirmed it rather than transcribed it.
+        38 => "you are dead".to_string(),
         other => format!("reason {other} ({other:#04x})"),
     }
 }
@@ -966,5 +973,20 @@ mod tests {
         // The number `.modify money` was actually given, and what the field
         // came back holding.
         assert_eq!(purse(123_456), (12, 34, 56));
+    }
+
+    /// Pinned against the live observation `describe_inventory_failure`'s
+    /// doc comment records: a swap refused with code 38 on a dead character,
+    /// accepted once revived.
+    #[test]
+    fn code_38_is_named_you_are_dead() {
+        assert_eq!(describe_inventory_failure(38), "you are dead");
+    }
+
+    /// Everything else keeps its bare number rather than a guessed name --
+    /// see this module's own rule on `describe_inventory_failure`.
+    #[test]
+    fn an_unobserved_code_stays_a_number() {
+        assert_eq!(describe_inventory_failure(59), "reason 59 (0x3b)");
     }
 }
