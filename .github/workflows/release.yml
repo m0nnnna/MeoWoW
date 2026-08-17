@@ -1,0 +1,106 @@
+name: Release
+
+# Builds wow-viewer.exe and wow-cli.exe and attaches them, zipped, to a
+# GitHub Release. Client only -- no game data or server code is bundled, in
+# line with this repo's rule 1: nothing here ships an asset a user has to
+# already own to legally have.
+#
+# Two triggers: pushing a tag like v0.1.0 cuts a real, named release;
+# workflow_dispatch lets one be cut on demand from the Actions tab without
+# needing a tag at all, which is the only way to test this workflow before
+# the project's first real tag exists.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish under (e.g. v0.1.0-dev). Not pushed to git -- this only names the release."
+        required: true
+        default: "v0.0.0-dev"
+
+# Building needs the MSVC linker and Windows SDK -- docs/BUILDING.md's own
+# requirement -- which is why this runs on windows-latest rather than the
+# cheaper ubuntu-latest cross-compiling: the wgpu/egui-wgpu/egui-winit stack
+# is pinned together (see docs/RENDERING.md) and this project has already
+# paid once for guessing at that pairing; matching the documented dev setup
+# exactly is not a place to improvise a second one.
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "push") {
+            $tag = "${{ github.ref_name }}"
+          } else {
+            $tag = "${{ inputs.tag }}"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      # Zero-warning build and a green test suite are this project's own
+      # finishing bar (CLAUDE.md) -- enforced here too, rather than only by
+      # whoever happens to run them locally before tagging. WOW_DATA is
+      # unset on a runner with no game install, which is the documented,
+      # correct way for the real-data tests to skip rather than fail.
+      - name: Build (zero warnings)
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = "-D warnings"
+          cargo build --release --workspace
+
+      - name: Test
+        shell: pwsh
+        run: cargo test --release --workspace
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "stage/open-wow-client-${{ steps.version.outputs.tag }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/wow-viewer.exe $stage/
+          Copy-Item target/release/wow-cli.exe $stage/
+          Copy-Item README.md $stage/
+          # A plain array of lines rather than a here-string: PowerShell
+          # requires a here-string's closing token at column 0, which a
+          # YAML block scalar's indentation cannot deliver -- see this
+          # repo's own CLAUDE.md/PowerShell tooling notes on exactly this
+          # trap.
+          $notice = @(
+            "This is a client only -- no server, no game data.",
+            "",
+            "You need your own legally-obtained World of Warcraft 3.3.5a",
+            "(build 12340) installation. Point WOW_DATA at its Data directory,",
+            "or pass --data explicitly; see README.md and docs/BUILDING.md in",
+            "the source repository for details."
+          )
+          Set-Content -Encoding utf8 -Path "$stage/READ-ME-FIRST.txt" -Value $notice
+          Compress-Archive -Path "$stage/*" -DestinationPath "open-wow-client-${{ steps.version.outputs.tag }}-windows-x86_64.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-wow-client-${{ steps.version.outputs.tag }}-windows-x86_64
+          path: open-wow-client-*.zip
+
+      # Only a real tag push creates a GitHub Release; a manual dispatch run
+      # (used to test this workflow itself) stops at the artifact above,
+      # since inventing releases with no corresponding tag would leave the
+      # release list disagreeing with the repo's own history.
+      - name: Create GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: open-wow-client-*.zip
+          generate_release_notes: true
