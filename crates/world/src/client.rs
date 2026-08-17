@@ -613,6 +613,18 @@ impl Connection {
         )
     }
 
+    /// Asks what an item entry is -- its name, quality and the rest.
+    ///
+    /// `guid` may be `0`: the server keys the answer on the entry alone, and
+    /// most things a client wants named (a loot row, a vendor's stock) are
+    /// not objects it holds. See [`crate::query::item_query`].
+    pub fn ask_item(&mut self, entry: u32, guid: u64) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::ItemQuerySingle,
+            &crate::query::item_query(entry, guid),
+        )
+    }
+
     /// Says something.
     ///
     /// `language` is not optional in practice: see

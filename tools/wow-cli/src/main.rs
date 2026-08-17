@@ -356,6 +356,23 @@ enum Command {
         /// sale price.
         #[arg(long)]
         sell_back: bool,
+        /// Ask the server what these item entries are, and check the answers
+        /// against `Item.dbc`.
+        ///
+        /// **The cross-check is the point, not the names.** A ninety-field
+        /// packet with one variable-length block parses perfectly when it is
+        /// wrong; what makes an answer trustworthy is that its display id
+        /// matches the one `Item.dbc` gives that entry, and the server never
+        /// sends that table. Same evidence as the entry-to-display-id pairing
+        /// that confirmed `SMSG_LOOT_RESPONSE`. Needs `--data` for the check;
+        /// without it the names still print and the check says so.
+        ///
+        /// With no entries given, asks about everything the character is
+        /// actually carrying -- a spread of real types beats a hand-picked
+        /// one, and `Huntertest` on `OWC34` carries a gun, a quiver and a
+        /// bag with contents.
+        #[arg(long = "item-query", num_args = 0.., value_delimiter = ',')]
+        item_query: Option<Vec<u32>>,
         /// Greet a questgiver by creature entry and dump everything it says.
         ///
         /// Separate from `--gossip` because the two greetings are different
@@ -964,6 +981,7 @@ fn main() -> Result<()> {
             buy,
             sell_back,
             quest,
+            item_query,
             quest_accept,
             quest_turnin,
             quest_sweep,
@@ -1016,6 +1034,7 @@ fn main() -> Result<()> {
                 buy: *buy,
                 sell_back: *sell_back,
                 quest: *quest,
+                item_query: item_query.as_deref(),
                 quest_accept: *quest_accept,
                 quest_turnin: *quest_turnin,
                 quest_sweep: *quest_sweep,
@@ -1192,6 +1211,7 @@ struct WorldRequest<'a> {
     buy: Option<u32>,
     sell_back: bool,
     quest: Option<u32>,
+    item_query: Option<&'a [u32]>,
     quest_accept: Option<u32>,
     quest_turnin: Option<u32>,
     quest_sweep: Option<u32>,
@@ -1292,6 +1312,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         buy,
         sell_back,
         quest,
+        item_query,
         quest_accept,
         quest_turnin,
         quest_sweep,
@@ -2162,6 +2183,17 @@ cast {spell_id} at {} (attempt {attempt})",
             report_visible_items(&state, character, data, locale)?;
         }
 
+        if let Some(entries) = item_query {
+            survey_item_query(
+                &mut connection,
+                &mut state,
+                character.guid,
+                entries,
+                data,
+                locale,
+            )?;
+        }
+
         if own_fields {
             report_own_fields(&state, character.guid, "after");
         }
@@ -2196,6 +2228,235 @@ cast {spell_id} at {} (attempt {attempt})",
 /// them is reported too -- the same shape of evidence
 /// `PLAYER_FIELD_INV_SLOT_HEAD` was confirmed with, and it is what
 /// `foss-wow#23` wants named in `crates/world/src/update.rs` once it holds.
+/// Asks the server about item entries and checks what comes back.
+///
+/// **This exists to confirm a parse, not to fetch names.** `foss-wow#56`'s
+/// response is some ninety fields with one variable-length block in the
+/// middle, which is precisely the shape this project's notes call the most
+/// expensive: every field the right width but one, and the packet still
+/// parses. Three things are therefore reported rather than just the name:
+///
+/// - **The display id against `Item.dbc`.** The server never sends that
+///   table, so agreement is evidence from outside the packet -- the same
+///   check that confirmed `SMSG_LOOT_RESPONSE`'s entry/display pairing.
+/// - **Whether the parse consumed the whole body.** A failure prints the
+///   bytes rather than the length, because a shape that is refused and
+///   discarded is a capture nobody can look at.
+/// - **Entries the server refuses.** "No such item" is an answer with its
+///   own encoding (the entry's top bit), and it has to be distinguishable
+///   from silence.
+fn survey_item_query(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    asked: &[u32],
+    data: Option<&std::path::Path>,
+    locale: &str,
+) -> Result<()> {
+    // With nothing named, ask about what the character is actually carrying.
+    // A hand-picked entry exercises one shape; a real inventory brings
+    // weapons, containers, stackable trade goods and quest items, which is
+    // the population that can show a field being wrong.
+    let mut entries: Vec<u32> = asked.to_vec();
+    if entries.is_empty() {
+        if state.get(own_guid).is_none() {
+            println!("\n--item-query: our own player object is not in replicated state yet");
+            return Ok(());
+        }
+        // Through the inventory accessors rather than by walking the slot
+        // array here: it is an array of guid *pairs*, and reading each word
+        // as a guid happens to work for the low guids a test character's
+        // items have and silently stops working for anything else.
+        let held = world::inventory::held(state, own_guid);
+        let mut carried: Vec<u32> = held.iter().filter_map(|item| item.entry).collect();
+        // A bag's contents are the interesting half -- `Huntertest`'s quiver
+        // carries shot, and a container's contents exercise a different
+        // path from the squares that hold them.
+        for bag in held.iter().filter(|item| item.capacity.is_some()) {
+            carried.extend(
+                world::inventory::bag_contents(state, *bag)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.entry),
+            );
+        }
+        carried.sort_unstable();
+        carried.dedup();
+        entries = carried;
+    }
+
+    if entries.is_empty() {
+        println!("\n--item-query: nothing to ask about -- name entries explicitly");
+        return Ok(());
+    }
+
+    // `Item.dbc` is the independent half of the check. Without it the names
+    // still print, and the tool says plainly that nothing confirmed them --
+    // an instrument that quietly does less than its help text promises has
+    // already cost this project an afternoon.
+    let entry_to_display: std::collections::HashMap<u32, u32> = match data {
+        Some(data) => {
+            let mut chain = Chain::open_wow_data(data, locale)
+                .with_context(|| format!("opening archives under {}", data.display()))?;
+            dbc::schema::Item::parse(&chain.read(dbc::schema::Item::PATH)?)?
+                .iter()
+                .map(|row| (row.id(), row.display_info_id()))
+                .collect()
+        }
+        None => {
+            println!(
+                "\n--item-query: no --data, so nothing checks the answers -- \
+                 names will print unconfirmed"
+            );
+            std::collections::HashMap::new()
+        }
+    };
+
+    println!("\nasking about {} item entr(y/ies)", entries.len());
+    for entry in &entries {
+        connection.ask_item(*entry, 0)?;
+    }
+
+    // A wall clock as well as a packet count. Northshire is never quiet --
+    // it emits a monster move fourteen times a second -- so a drain bounded
+    // only by a packet count runs until it has collected that many pieces of
+    // background traffic, which is how a two-minute job became twenty.
+    let mut answers: Vec<world::query::ItemInfo> = Vec::new();
+    let mut failures: Vec<(u32, String, Vec<u8>)> = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline && answers.len() + failures.len() < entries.len() {
+        let batch = connection.drain(std::time::Duration::from_millis(800), 256)?;
+        if batch.is_empty() {
+            continue;
+        }
+        for packet in &batch {
+            if packet.opcode != world::opcode::server::ITEM_QUERY_SINGLE_RESPONSE {
+                continue;
+            }
+            match world::query::parse_item_query_response(&packet.body) {
+                Ok(info) => answers.push(info),
+                Err(error) => {
+                    // The body, not the length. A parser that declines a
+                    // shape is only useful if the shape survives the
+                    // refusal -- this project has lost the one packet that
+                    // could have answered a question exactly this way.
+                    let entry = packet
+                        .body
+                        .get(..4)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .unwrap_or(0);
+                    failures.push((entry, error.to_string(), packet.body.clone()));
+                }
+            }
+        }
+        state.replicate(&batch, None);
+        println!(
+            "  ... {} answered, {} failed, {} still out",
+            answers.len(),
+            failures.len(),
+            entries.len().saturating_sub(answers.len() + failures.len())
+        );
+    }
+
+    let mut agreed = 0usize;
+    let mut disagreed = 0usize;
+    let mut uncheckable = 0usize;
+    println!("\nanswers:");
+    for info in &answers {
+        match &info.name {
+            None => println!("  {:>6}: server has no such item", info.entry),
+            Some(name) => {
+                let check = match entry_to_display.get(&info.entry) {
+                    Some(&dbc) if dbc == info.display_id => {
+                        agreed += 1;
+                        format!("display {} == Item.dbc", info.display_id)
+                    }
+                    Some(&dbc) => {
+                        disagreed += 1;
+                        format!(
+                            "display {} != Item.dbc's {dbc}  <-- THE PARSE IS WRONG",
+                            info.display_id
+                        )
+                    }
+                    None => {
+                        uncheckable += 1;
+                        format!("display {} (no Item.dbc row to check)", info.display_id)
+                    }
+                };
+                println!(
+                    "  {:>6}: {name:<40} q{} ilvl{} req{} stack {} {check}",
+                    info.entry, info.quality, info.item_level, info.required_level, info.stackable
+                );
+                if !info.description.is_empty() {
+                    println!("          \"{}\"", info.description);
+                }
+            }
+        }
+    }
+
+    for (entry, error, body) in &failures {
+        println!("\n  entry {entry}: PARSE FAILED -- {error}");
+        println!("    {} bytes: {}", body.len(), hex_preview(body, 512));
+    }
+
+    // **Parsing an answer and *storing* it are different claims.** The loop
+    // above parses each body directly, which says nothing about whether
+    // `WorldState::replicate`'s dispatch arm exists or reaches the cache --
+    // and a parser wired to nothing is exactly the failure this project has
+    // hit before (a value stored into a field nothing consulted). So read
+    // the answers back out of the cache the interface will read.
+    let cached = entries
+        .iter()
+        .filter(|entry| state.names.item(**entry).is_some())
+        .count();
+    let named = entries
+        .iter()
+        .filter(|entry| {
+            state
+                .names
+                .item(**entry)
+                .flatten()
+                .is_some_and(|info| info.name.is_some())
+        })
+        .count();
+    println!("cache: {cached} of {} settled, {named} with a name", entries.len());
+    if cached < answers.len() {
+        println!(
+            "  <-- answers parsed here that the cache does not hold: the \
+             dispatch arm in WorldState::replicate is not reaching it"
+        );
+    }
+
+    let silent = entries
+        .len()
+        .saturating_sub(answers.len() + failures.len());
+    println!(
+        "\n{} asked, {} answered, {} parse failures, {} never answered",
+        entries.len(),
+        answers.len(),
+        failures.len(),
+        silent
+    );
+    println!(
+        "cross-check: {agreed} agreed with Item.dbc, {disagreed} disagreed, \
+         {uncheckable} had no row to check against"
+    );
+    if disagreed > 0 {
+        println!(
+            "A disagreement is the useful result: the packet parsed and the \
+             display id is wrong, which means a field above it has the wrong \
+             width. Nothing else in this run can tell you that."
+        );
+    } else if agreed > 0 {
+        println!(
+            "Every checkable answer agrees with a table the server never sent, \
+             which is what makes the ninety fields above the display id \
+             trustworthy rather than merely well-formed."
+        );
+    }
+    Ok(())
+}
+
 fn report_visible_items(
     state: &world::WorldState,
     character: &world::Character,

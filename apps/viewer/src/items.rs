@@ -159,11 +159,17 @@ impl Items {
         self.display.get(&entry).copied()
     }
 
-    /// What to call an item, until this client can ask the server.
+    /// What to call an item when the server has not said.
     ///
-    /// See the module comment: the entry is shown rather than a made-up name,
-    /// so a slot with no icon says something checkable instead of something
-    /// plausible.
+    /// **The fallback, not the answer.** An item's name is server data --
+    /// `Item.dbc` carries its model and not what it is called -- so the real
+    /// name comes from `SMSG_ITEM_QUERY_SINGLE_RESPONSE` via
+    /// `world::Names::item`, and callers should go through
+    /// `App::item_name`, which consults that first.
+    ///
+    /// This still shows the entry rather than a made-up name, for the reason
+    /// in the module comment: a slot that has not been answered for says
+    /// something checkable instead of something plausible.
     pub fn name(&self, entry: u32) -> String {
         format!("Item {entry}")
     }

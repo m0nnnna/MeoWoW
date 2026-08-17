@@ -28,6 +28,14 @@ pub enum ClientOpcode {
     /// wolf of a kind shares one answer.
     NameQuery = 0x0050,
     CreatureQuery = 0x0060,
+    /// What is item entry N? `Item.dbc` carries an item's *model*, and this
+    /// client already reads it -- but not its **name**, which is server data
+    /// and reaches a client only in answer to this. Every bag square,
+    /// equipment slot and loot row showing `item 2224` is waiting on it.
+    ///
+    /// Keyed by entry like [`Self::CreatureQuery`], so one answer names every
+    /// copy of a thing.
+    ItemQuerySingle = 0x0056,
     MessageChat = 0x0095,
     /// Ask to cast. What comes back is either the world reacting or
     /// `SMSG_CAST_FAILED` explaining why not.
@@ -602,6 +610,9 @@ pub mod server {
     /// the name cache has to time requests out rather than wait.
     pub const NAME_QUERY_RESPONSE: u16 = 0x0051;
     pub const CREATURE_QUERY_RESPONSE: u16 = 0x0061;
+    /// The answer to [`ClientOpcode::ItemQuerySingle`] -- see
+    /// [`crate::query::parse_item_query_response`], which parses it whole.
+    pub const ITEM_QUERY_SINGLE_RESPONSE: u16 = 0x0058;
     pub const MESSAGECHAT: u16 = 0x0096;
     /// The spellbook, sent unprompted during the login burst. There is no
     /// query for it: miss the packet and the character appears to know nothing.

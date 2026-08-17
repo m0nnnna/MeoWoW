@@ -1846,6 +1846,25 @@ impl WorldState {
                         )),
                     }
                 }
+                // Item detail. **Stored, never returned** -- the same
+                // decision as the corpse marker below, and for the reason
+                // recorded there: a returned category has been silently
+                // dropped by three separate callers in this project's
+                // history, and an item name is read by every bag square,
+                // equipment slot and loot row rather than by one consumer.
+                crate::opcode::server::ITEM_QUERY_SINGLE_RESPONSE => {
+                    match crate::query::parse_item_query_response(&packet.body) {
+                        Ok(answer) => {
+                            report.names += 1;
+                            self.names.apply_item(&answer);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
                 // Where a released ghost was sent. Stored rather than returned:
                 // unlike chat or a swing this is *state* -- the marker stays on
                 // the minimap until the server takes it off again with the same

@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::query::{CreatureInfo, PlayerName};
+use crate::query::{CreatureInfo, ItemInfo, PlayerName};
 
 /// How long an unanswered query stays outstanding before it may be asked
 /// again.
@@ -35,21 +35,32 @@ use crate::query::{CreatureInfo, PlayerName};
 /// dropped one resolves within a few seconds of standing still.
 pub const RETRY_AFTER: Duration = Duration::from_secs(5);
 
-/// A name we asked for, and what came back.
+/// Something we asked for, and what came back.
+///
+/// Generic over the payload because items answer with more than a name --
+/// quality, stack size, the display id the parse is checked against -- and
+/// the three keyspaces are worth sharing one *mechanism* even when they do
+/// not share one payload. The ask-once/retry logic below is the part that
+/// has tests, and a second copy of it for items is a second thing to get
+/// wrong.
 #[derive(Debug, Clone, PartialEq)]
-enum Entry {
+enum Entry<T> {
     /// Asked at this time, nothing back yet.
     Pending(Instant),
     /// The server answered. `None` means it answered "no such thing", which is
     /// as final as a name.
-    Known(Option<String>),
+    Known(Option<T>),
 }
 
-/// Names for players and creatures, and the bookkeeping to fetch them once.
+/// Names for players and creatures, item detail, and the bookkeeping to fetch
+/// each once.
 #[derive(Debug, Default)]
 pub struct Names {
-    players: HashMap<u64, Entry>,
-    creatures: HashMap<u32, Entry>,
+    players: HashMap<u64, Entry<String>>,
+    creatures: HashMap<u32, Entry<String>>,
+    /// Keyed by entry, like creatures: every Small Dagger in the game shares
+    /// one answer, so a bag of twenty stacks costs one query per *kind*.
+    items: HashMap<u32, Entry<ItemInfo>>,
     /// Every answer ever folded in, and every query handed out, so a caller
     /// can see whether the two are diverging without inspecting the maps.
     pub stats: NameStats,
@@ -92,6 +103,19 @@ impl Names {
         }
     }
 
+    /// Everything the server said about an item entry.
+    ///
+    /// The same three-state answer as [`Self::player`]: `None` is "not asked
+    /// yet or still waiting", `Some(None)` is "the server says there is no
+    /// such item". A caller that collapses them either retries a settled
+    /// question forever or stops asking about one it never asked.
+    pub fn item(&self, entry: u32) -> Option<Option<&ItemInfo>> {
+        match self.items.get(&entry)? {
+            Entry::Known(info) => Some(info.as_ref()),
+            Entry::Pending(_) => None,
+        }
+    }
+
     /// Whether a player query should be sent, marking it outstanding if so.
     ///
     /// Deliberately one call rather than a separate "should I?" and "I did":
@@ -106,8 +130,12 @@ impl Names {
         Self::claim(&mut self.creatures, entry, now, &mut self.stats)
     }
 
-    fn claim<K: std::hash::Hash + Eq>(
-        map: &mut HashMap<K, Entry>,
+    pub fn claim_item(&mut self, entry: u32, now: Instant) -> bool {
+        Self::claim(&mut self.items, entry, now, &mut self.stats)
+    }
+
+    fn claim<K: std::hash::Hash + Eq, T>(
+        map: &mut HashMap<K, Entry<T>>,
         key: K,
         now: Instant,
         stats: &mut NameStats,
@@ -151,15 +179,38 @@ impl Names {
             .insert(answer.entry, Entry::Known(answer.name.clone()));
     }
 
-    /// How many names are settled, and how many queries are still in flight.
+    /// Folds in a `SMSG_ITEM_QUERY_SINGLE_RESPONSE`.
+    ///
+    /// An answer with no name -- the server's "no such entry" -- is stored as
+    /// `Known(None)` rather than as an `ItemInfo` full of zeroes, so a caller
+    /// cannot mistake a refusal for an item of quality 0 with no display.
+    pub fn apply_item(&mut self, answer: &ItemInfo) {
+        self.stats.answers += 1;
+        if !matches!(self.items.get(&answer.entry), Some(Entry::Pending(_))) {
+            self.stats.unsolicited += 1;
+        }
+        let known = answer.name.as_ref().map(|_| answer.clone());
+        self.items.insert(answer.entry, Entry::Known(known));
+    }
+
+    /// How many answers are settled, and how many queries are still in flight.
     pub fn counts(&self) -> (usize, usize) {
         let known = self
             .players
             .values()
-            .chain(self.creatures.values())
             .filter(|entry| matches!(entry, Entry::Known(_)))
-            .count();
-        let pending = self.players.len() + self.creatures.len() - known;
+            .count()
+            + self
+                .creatures
+                .values()
+                .filter(|entry| matches!(entry, Entry::Known(_)))
+                .count()
+            + self
+                .items
+                .values()
+                .filter(|entry| matches!(entry, Entry::Known(_)))
+                .count();
+        let pending = self.players.len() + self.creatures.len() + self.items.len() - known;
         (known, pending)
     }
 }
@@ -277,6 +328,61 @@ mod tests {
         names.claim_creature(299, Instant::now());
         names.apply_creature(&creature(299, Some("Young Wolf")));
         assert_eq!(names.stats.unsolicited, 1, "that one was asked for");
+    }
+
+    fn item(entry: u32, name: Option<&str>) -> ItemInfo {
+        ItemInfo {
+            entry,
+            name: name.map(str::to_string),
+            description: String::new(),
+            display_id: 1542,
+            quality: 2,
+            item_class: 2,
+            sub_class: 15,
+            inventory_type: 21,
+            item_level: 3,
+            required_level: 1,
+            stackable: 1,
+            container_slots: 0,
+            buy_price: 25,
+            sell_price: 5,
+            max_durability: 55,
+        }
+    }
+
+    /// Items key by entry for the same reason creatures do: a bag holding
+    /// five stacks of the same thing is one question, not five.
+    #[test]
+    fn one_item_query_answers_every_copy() {
+        let mut names = Names::new();
+        let now = Instant::now();
+        assert!(names.claim_item(2224, now));
+        for _ in 0..20 {
+            assert!(!names.claim_item(2224, now));
+        }
+        names.apply_item(&item(2224, Some("Small Dagger")));
+        assert_eq!(
+            names.item(2224).map(|info| info.map(|i| i.name.clone())),
+            Some(Some(Some("Small Dagger".to_string())))
+        );
+        assert_eq!(names.stats.queries_issued, 1);
+    }
+
+    /// "No such entry" must not be stored as an item whose fields are all
+    /// zero -- that reads as a real item of quality 0 with no display, which
+    /// is a thing the interface would try to draw.
+    #[test]
+    fn a_refused_item_is_stored_as_a_refusal_not_an_empty_item() {
+        let mut names = Names::new();
+        let now = Instant::now();
+        names.claim_item(999_999, now);
+        names.apply_item(&item(999_999, None));
+
+        assert_eq!(names.item(999_999).map(|info| info.is_none()), Some(true));
+        assert!(
+            !names.claim_item(999_999, now + RETRY_AFTER * 10),
+            "a refusal is an answer; asking again gets the same refusal forever"
+        );
     }
 
     /// The books have to balance the same way replication's do.

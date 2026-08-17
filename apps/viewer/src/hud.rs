@@ -232,6 +232,49 @@ pub enum NameRequest {
     Creature { entry: u32, guid: u64 },
 }
 
+/// Item entries worth asking about, and marking them asked.
+///
+/// The same shape as [`names_to_ask`] and for the same reasons: the cache
+/// refuses to ask twice, so this is safe to call every frame, and `limit`
+/// only stops a freshly-opened bag firing thirty packets in one frame.
+///
+/// **What is in a bag is not what is in range**, so this walks the
+/// inventory rather than replicated entities: the player's own slots, plus
+/// the contents of every equipped container. `extra` carries entries that
+/// are on screen without being owned -- a loot window's rows, a vendor's
+/// stock -- which is the same job `extra_players` does for chat senders who
+/// were never in visibility range.
+pub fn items_to_ask(
+    state: &mut ::world::WorldState,
+    player_guid: u64,
+    extra: &[u32],
+    limit: usize,
+) -> Vec<u32> {
+    let now = std::time::Instant::now();
+    let held = ::world::inventory::held(state, player_guid);
+    let mut wanted: Vec<u32> = held.iter().filter_map(|item| item.entry).collect();
+    for bag in held.iter().filter(|item| item.capacity.is_some()) {
+        wanted.extend(
+            ::world::inventory::bag_contents(state, *bag)
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.entry),
+        );
+    }
+    wanted.extend_from_slice(extra);
+
+    let mut asking = Vec::new();
+    for entry in wanted {
+        if asking.len() >= limit {
+            break;
+        }
+        if entry != 0 && state.names.claim_item(entry, now) {
+            asking.push(entry);
+        }
+    }
+    asking
+}
+
 /// The volume a click has to pass through to select an entity.
 ///
 /// Axis-aligned and square in `x`/`y`, sized by the model's widest horizontal

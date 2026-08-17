@@ -4699,6 +4699,30 @@ impl App {
     ///
     /// **The objective's *wire* slot indexes the counter, never its position
     /// in this list**, which is pruned. See `world::quest::QuestObjective`.
+    /// What to call an item entry: the server's answer if it has given one,
+    /// and `Item 2224` until then.
+    ///
+    /// **One helper rather than the lookup at each call site.** Four places
+    /// draw an item name -- bag squares, the character panel, loot rows and
+    /// a quest's item objectives -- and this project has already watched a
+    /// returned value be silently dropped by three separate callers. A
+    /// caller that forgets the cache here does not draw a wrong name, it
+    /// draws the *old* one, which looks like the feature not working.
+    ///
+    /// A refusal (`Some(None)` -- the server says there is no such entry)
+    /// falls back to the entry too. That is deliberate: an item the server
+    /// disowns still occupies a square, and printing nothing would leave a
+    /// blank nobody could diagnose.
+    /// Takes the two pieces it reads rather than `&self`, deliberately: the
+    /// frame builder holds `self.renderer` mutably for its whole length, so
+    /// anything borrowing all of `self` cannot be called from inside it.
+    fn item_name(live: Option<&live::LiveWorld>, items: &items::Items, entry: u32) -> String {
+        live.and_then(|live| live.state.names.item(entry))
+            .flatten()
+            .and_then(|info| info.name.clone())
+            .unwrap_or_else(|| items.name(entry))
+    }
+
     fn quest_progress(&self, quest: &::world::quest::QuestInfo) -> Vec<String> {
         let Some(live) = self.live.as_ref() else {
             return Vec::new();
@@ -4747,7 +4771,7 @@ impl App {
                 .sum();
             lines.push(format!(
                 "{}: {carried}/{}",
-                self.items.name(item.item),
+                Self::item_name(self.live.as_ref(), &self.items, item.item),
                 item.count.max(1)
             ));
         }
@@ -5827,6 +5851,29 @@ impl App {
                 break;
             }
         }
+        // Item names, on the same budget and for the same reason. `foss-wow#56`:
+        // an item's name is server data -- `Item.dbc` has its model and not
+        // what it is called -- so every bag square showing `Item 2224` is
+        // waiting on this.
+        const ITEMS_PER_FRAME: usize = 6;
+        // An open loot window's rows are on screen without being owned yet,
+        // so they are named here rather than found by walking the bags.
+        let looted: Vec<u32> = live
+            .state
+            .loot
+            .as_ref()
+            .map(|loot| loot.items.iter().map(|item| item.entry).collect())
+            .unwrap_or_default();
+        let own_guid = live.guid;
+        let asking = hud::items_to_ask(&mut live.state, own_guid, &looted, ITEMS_PER_FRAME);
+        for entry in asking {
+            // Guid zero: the server keys the answer on the entry, and most of
+            // these are things no object in view is holding.
+            if let Err(e) = live.connection.ask_item(entry, 0) {
+                tracing::warn!("asking about an item failed: {e:#}");
+                break;
+            }
+        }
         // Quests, a few per frame, exactly as names are asked for above and
         // for the same reasons: the cache refuses to ask twice, so calling
         // this every frame is safe, and the cap is only about not firing
@@ -6531,6 +6578,10 @@ impl App {
                     // window that dropped it would show a replication gap as
                     // an empty bag.
                     let entry = carried.item.entry.unwrap_or(0);
+                    // Resolved before `icon`, which takes `self.items` and
+                    // `self.chain` mutably: the immutable borrow this needs
+                    // has to end first.
+                    let name = Self::item_name(self.live.as_ref(), &self.items, entry);
                     let icon = (entry != 0).then(|| {
                         self.items
                             .icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, entry)
@@ -6538,7 +6589,7 @@ impl App {
                     *square = ui::frames::BagSlot {
                         item: Some(ui::frames::BagItem {
                             entry,
-                            name: self.items.name(entry),
+                            name,
                             count: carried.item.count,
                             icon: icon.flatten(),
                         }),
@@ -6576,13 +6627,16 @@ impl App {
                     let held = worn[index as usize];
                     let item = held.map(|held| {
                         let entry = held.entry.unwrap_or(0);
+                        // Before `icon`, as in the bag squares above.
+                        let name =
+                            Self::item_name(self.live.as_ref(), &self.items, entry);
                         let icon = (entry != 0).then(|| {
                             self.items
                                 .icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, entry)
                         });
                         ui::frames::BagItem {
                             entry,
-                            name: self.items.name(entry),
+                            name,
                             count: held.count,
                             icon: icon.flatten(),
                         }
@@ -6631,6 +6685,8 @@ impl App {
                     // directly, which would skip a table lookup -- and would
                     // then be a second path to the same picture that could
                     // drift from the first.
+                    let name =
+                        Self::item_name(self.live.as_ref(), &self.items, item.entry);
                     let icon = self
                         .items
                         .icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, item.entry);
@@ -6638,7 +6694,7 @@ impl App {
                         // The server's slot, carried rather than derived. See
                         // `ui::frames::loot`.
                         take: ui::frames::Take::Item(item.slot),
-                        name: self.items.name(item.entry),
+                        name,
                         count: item.count,
                         icon,
                     });
