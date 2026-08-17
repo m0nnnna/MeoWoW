@@ -121,6 +121,17 @@ const MAX_PARENT_HOPS: u32 = 8;
 /// has an ancestor that does name something -- Dun Morogh's own ambience
 /// and music are both set. Only 76 of the 1,359 have no ancestor with
 /// anything either, which is a real silence rather than a missed one.
+///
+/// **An id that names no row is treated exactly like a zero and the walk
+/// continues.** This changes nothing on a stock install -- measured, rather
+/// than assumed: of 2,307 areas in this build, **zero** name a `zone_music`
+/// or `ambience_id` missing from `ZoneMusic.dbc`/`SoundAmbience.dbc`, so the
+/// branch is unreachable against the reference data and is defensive only.
+/// It is here because the alternative -- returning `None` at the first
+/// unresolvable id -- makes an area with a dangling reference *silent*
+/// rather than falling back, which is the same failure this whole function
+/// exists to close, and a patched or partial install is the one place it
+/// could appear.
 fn resolve_zone_sound(
     areas: &std::collections::HashMap<u32, (u32, u32, u32)>,
     table: &std::collections::HashMap<u32, (u32, u32)>,
@@ -132,9 +143,15 @@ fn resolve_zone_sound(
         let Some(&row) = areas.get(&current) else {
             return None;
         };
+        // The zero check stays explicit rather than being folded into the
+        // lookup: zero means "names nothing" whatever the table happens to
+        // hold, and a table that did carry a row 0 would otherwise turn
+        // every inheriting area into a resolved one.
         let id = pick(row);
         if id != 0 {
-            return table.get(&id).copied();
+            if let Some(sound) = table.get(&id) {
+                return Some(*sound);
+            }
         }
         let parent = row.2;
         if parent == 0 || parent == current {
@@ -788,6 +805,23 @@ mod tests {
         .collect();
         let table = [(99, (990, 991))].into_iter().collect();
         assert_eq!(resolve_zone_sound(&areas, &table, 3, |r| r.0), Some((990, 991)));
+    }
+
+    /// An id naming a row that is not there is the same statement as naming
+    /// nothing, and must not stop the climb.
+    ///
+    /// **No area in a stock build exercises this** -- 0 of 2,307 name a
+    /// `zone_music` or `ambience_id` missing from its table, measured with
+    /// `dbc rows AreaTable` against `dbc dump ZoneMusic/SoundAmbience` --
+    /// so this pins a defensive branch rather than a reported bug. Kept
+    /// because the failure it prevents is the one this whole function
+    /// exists to close: an area going silent instead of inheriting.
+    #[test]
+    fn an_unresolvable_id_is_climbed_past_like_a_zero() {
+        let areas = [(2, area(77, 0, 1)), (1, area(99, 0, 0))].into_iter().collect();
+        // 77 names no row; 99 does.
+        let table = [(99, (990, 991))].into_iter().collect();
+        assert_eq!(resolve_zone_sound(&areas, &table, 2, |r| r.0), Some((990, 991)));
     }
 
     /// Some areas genuinely have nothing anywhere up their chain -- 76 of
