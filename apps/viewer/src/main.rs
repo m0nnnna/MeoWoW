@@ -602,6 +602,24 @@ fn live_pace(moving: ::world::motion::Motion) -> f32 {
     }
 }
 
+/// Which way the character is sidestepping, signed, left positive, and only
+/// while nothing else is going on.
+///
+/// Exists for the `F4` A/B alone -- see [`App::sidestep_shuffles`]. The
+/// shuffles are the only lateral cycle a land model has, so offering the
+/// alternative at all means being able to name a side.
+fn live_strafe(moving: ::world::motion::Motion) -> f32 {
+    use ::world::motion::Axis;
+    if moving.longitudinal().is_some() {
+        return 0.0;
+    }
+    match moving.lateral() {
+        Some(Axis::Positive) => 1.0,
+        Some(Axis::Negative) => -1.0,
+        None => 0.0,
+    }
+}
+
 /// The rate the A/D keys are turning the character on the spot, signed, with
 /// left positive.
 ///
@@ -1845,6 +1863,27 @@ struct App {
     /// as one facing the wrong way, which is very likely why the two
     /// observations above disagree.
     flip_winding: bool,
+    /// Debug: play the `Shuffle` cycles while sidestepping instead of the run,
+    /// toggled with `F4`.
+    ///
+    /// **Here because the same question has now been decided four times from a
+    /// render and reversed four times**, which is the signature of a
+    /// comparison nobody has actually made. Each answer looked wrong on its
+    /// own: the shuffles read as standing still with the feet moving, the run
+    /// reads as running forwards while travelling sideways. Neither report was
+    /// mistaken, and a model with only those two lateral options cannot offer
+    /// a third.
+    ///
+    /// `AnimationData.dbc` says which is *authentic* -- see [`live_pace`],
+    /// where bit 64 of `body_flags` marks the cycles that carry a character
+    /// and the shuffles do not have it -- so the run is the default and stays
+    /// the default. What the table cannot say is which one somebody would
+    /// rather look at. This is the F2 treatment for exactly that: one key, one
+    /// variable, the person at the window pressing it while sidestepping.
+    ///
+    /// The movement itself is untouched either way. Only the cycle changes,
+    /// which is what makes it an A/B rather than two builds.
+    sidestep_shuffles: bool,
     /// The line being typed, or `None` when not typing. While this is `Some`,
     /// keys are text rather than movement.
     composing: Option<String>,
@@ -2539,6 +2578,8 @@ impl App {
             combat_text: Vec::new(),
             entity_flip: false,
             flip_winding: false,
+            // The run, which is what the table says the original plays.
+            sidestep_shuffles: false,
             composing: None,
             spells: spells::Spellbook::default(),
             bars_seeded: false,
@@ -3102,6 +3143,21 @@ impl ApplicationHandler for App {
                                 ))));
                                 tracing::info!("model winding {state}");
                             }
+                            // See `App::sidestep_shuffles`: hold `Q` or `E`
+                            // and press this to compare the two, which is the
+                            // step that four flips of this decision skipped.
+                            KeyCode::F4 => {
+                                self.sidestep_shuffles = !self.sidestep_shuffles;
+                                let state = if self.sidestep_shuffles {
+                                    "the shuffle"
+                                } else {
+                                    "the run (what AnimationData says the original plays)"
+                                };
+                                self.chat.push(Line::Chat(local_notice(format!(
+                                    "sidestep cycle: {state}"
+                                ))));
+                                tracing::info!("sidestep cycle: {state}");
+                            }
                             // Only offer a chat line when there is somewhere
                             // to send it.
                             KeyCode::Enter | KeyCode::NumpadEnter if self.live.is_some() => {
@@ -3299,6 +3355,10 @@ impl App {
             self.anim_time_ms = self.anim_time_ms.wrapping_add(step);
         }
         let (anim, anim_time) = (self.anim, self.anim_time_ms);
+        // Read here for the same reason as the pair above: the renderer is
+        // borrowed mutably below and holds that borrow for the whole draw, so
+        // anything wanting `&self` has to have asked already.
+        let pace = self.animation_pace();
 
         // **Before the renderer is borrowed**, because this needs the archive
         // chain and the scene at the same time and the draw below holds the
@@ -3341,13 +3401,6 @@ impl App {
                     // The keys, not the wire: the server never relays our own
                     // movement back to us. Held means running -- there is no
                     // walk toggle here, and `LIVE_RUN_SPEED` is the run speed.
-                    let pace = (
-                        live_pace(self.live_move),
-                        // Turning on the spot, and *only* that: the shuffle
-                        // cycles carry nobody anywhere -- see `live_pace` --
-                        // so a sidestep has no business reaching them.
-                        live_turning(self.keys, self.steering, self.live_move),
-                    );
                     // F2. See `App::entity_flip`.
                     let flip = if self.entity_flip { std::f32::consts::PI } else { 0.0 };
                     // Borrowed as fields rather than through `&mut self`: `r`
@@ -3632,6 +3685,30 @@ impl App {
         };
         *state = Some(smoothed);
         smoothed
+    }
+
+    /// What the character's own body should be *animating* at: how fast along
+    /// its facing, and how fast it is turning on the spot.
+    ///
+    /// **Not how fast it travels** -- that is [`live_pace`] read directly by
+    /// `drive_live_movement`, and the two parting company for one commit is
+    /// what stopped sidestepping from moving anybody. One function so the
+    /// frame that is drawn and the list a click is tested against cannot
+    /// disagree, which is the same rule that unprojects the picking ray from
+    /// the matrix the scene was drawn with.
+    fn animation_pace(&self) -> (f32, f32) {
+        let turning = live_turning(self.keys, self.steering, self.live_move);
+        let strafe = live_strafe(self.live_move);
+        // The `F4` A/B, and the only thing it changes -- see
+        // `App::sidestep_shuffles`. A pace of zero is what lets the animation
+        // chooser reach the shuffles; the movement integrator never reads
+        // this, so the character travels either way.
+        if self.sidestep_shuffles && strafe != 0.0 {
+            return (0.0, strafe);
+        }
+        // Otherwise: the run, and the shuffles reserved for turning on the
+        // spot, which is the only in-place lateral gesture there is.
+        (live_pace(self.live_move), turning)
     }
 
     fn drive_live_movement(&mut self) {
@@ -5060,6 +5137,10 @@ impl App {
             "click at {at:?} goes to the world; the interface claims {} rectangle(s)",
             self.hud.occupied_count()
         );
+        // Read before the renderer's borrow narrows things: one function
+        // answers this for the frame and for the click, so the list picked
+        // through is the list drawn.
+        let pace = self.animation_pace();
         let (Some(live), Some(Scene::Streaming(world))) = (self.live.as_ref(), r.scene.as_ref())
         else {
             return None;
@@ -5073,14 +5154,7 @@ impl App {
         // The speed only chooses an animation, which a click test does not care
         // about -- but the same list has to come out here as the renderer drew,
         // so it is passed the same way rather than left at a default.
-        let entities = drawable_with_own(
-            live,
-            (
-                live_pace(self.live_move),
-                live_turning(self.keys, self.steering, self.live_move),
-            ),
-            self.jump.is_some(),
-        );
+        let entities = drawable_with_own(live, pace, self.jump.is_some());
         Some(hud::pick(&ray, &entities, &|display_id| {
             world.entity_bounds(display_id)
         }))
