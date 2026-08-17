@@ -1706,28 +1706,25 @@ impl Motion {
     /// character sprinting while facing the wrong way -- reported from play as
     /// exactly that. Negative is backwards; there is only one backwards cycle,
     /// so its magnitude chooses nothing.
-    /// The cycle a movement calls for: how fast along the facing, and how fast
-    /// the character is turning on the spot.
     ///
-    /// **Strafing is travelling, and travelling plays a travelling cycle.**
-    /// The first version of this gave a pure sidestep the `Shuffle` cycles and
-    /// it was reported straight back as the character *shimmying* -- which is
-    /// what those cycles are, and the data said so before the render did. Both
-    /// advance the character by 0.00, `AnimationData` sends both back to Stand
-    /// rather than to a travel cycle, and both run half a second. Three
-    /// separate statements that they are a standing-adjacent adjustment, played
-    /// while the character moved at seven units a second.
+    /// **Strafing is travelling, and travelling plays a travelling cycle**, so
+    /// the caller folds a sidestep into `forward` and there is nothing left
+    /// for a lateral term to decide. Which cycle that should be was argued
+    /// from renders three times and flipped three times; what ended it was
+    /// `AnimationData.dbc`'s `body_flags`, whose **bit 64 marks exactly the
+    /// twenty-eight animations that carry the character somewhere** and
+    /// nothing else in 506 rows. `ShuffleLeft` and `ShuffleRight` do not carry
+    /// it -- they hold `Stand`'s exact value -- which is precisely how the
+    /// last report described them: *he stands perfectly still and his feet
+    /// shuffle*. See `live_pace` in the viewer for the two pieces of evidence
+    /// that had been used instead and do not hold.
     ///
-    /// So a sidestep uses the run, exactly as running forward does, and the
-    /// caller folds it into `forward` -- there is nothing left for a lateral
-    /// term to decide. What the shuffle *is* for, on this reading, is turning
-    /// on the spot: `turning` is the signed rate the A and D keys apply, and it
-    /// only chooses a cycle when nothing else is happening.
-    ///
-    /// **That last part is a hypothesis and the rest is not.** Speed 0.00 and a
-    /// Stand fallback say what the cycle is not; they do not say what it is.
-    /// A recording of the original client turning in place would settle it, and
-    /// it is the only claim here that needs one.
+    /// So the shuffles are what turning on the spot gets: `turning` is the
+    /// signed rate the A and D keys apply, and it only chooses a cycle when
+    /// nothing else is happening. **That last part is still the one claim here
+    /// without direct evidence** -- a table saying a cycle does not travel says
+    /// what it is not. It is now at least the only in-place lateral cycle
+    /// there is, put to the only in-place lateral gesture there is.
     ///
     /// `turning` is positive to the left, matching both `Axis::Positive` and
     /// [`Side`]. Replicated creatures pass zero, and that is an absence rather

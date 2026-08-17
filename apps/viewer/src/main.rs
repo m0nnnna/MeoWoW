@@ -551,91 +551,54 @@ const LIVE_RUN_SPEED: f32 = 7.0;
 /// off the wire is the right fix and is not this one.
 const LIVE_BACK_SPEED: f32 = 4.5;
 
-/// What the keys currently held mean for the body: how fast it travels, and
-/// what its animation should read.
+/// How fast the character is travelling for the keys currently held,
+/// **signed** so the renderer can tell retreating from advancing.
 ///
-/// **These were one number, and making them one number was itself a fix.** The
-/// comment that used to sit here said the two uses "have to agree: the number
-/// that moves the character and the number that chooses its animation. They
-/// did not, and the result was a character reversing at a full run with the
-/// forward run cycle playing." That was correct, and it stayed correct right
-/// up until a sidestep needed to travel at one speed and animate as though it
-/// were not travelling at all -- at which point the rule that fixed one bug
-/// caused the next one, and the character stopped moving sideways entirely.
+/// One number for both uses -- what moves the character and what chooses its
+/// animation -- because in every case they are the same number. It has been
+/// two numbers once, for one commit, and that is the story worth keeping:
 ///
-/// So they are two numbers now, returned together from one function, which is
-/// the same protection expressed differently: a reader changing one has the
-/// other in front of them, and no call site can pick a speed out of the air.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Gait {
-    /// Units per second along the direction the keys chose. Signed, so a
-    /// caller that wants a magnitude asks for one.
-    travel: f32,
-    /// What the animation chooser reads. Equal to [`Gait::travel`] in every
-    /// case but the sidestep.
-    pace: f32,
-}
-
-fn live_gait(moving: ::world::motion::Motion) -> Gait {
+/// **The sidestep cycle was flip-flopped three times before anybody asked the
+/// table.** Given the `Shuffle` cycles it came back from play as the character
+/// shimmying; given the run, as "running sideways plays the forward
+/// animation"; given `Shuffle` again, as "he stands perfectly still and his
+/// feet shuffle". Each fix was argued from a render. The argument that ended
+/// it is one column: `AnimationData.dbc`'s `body_flags` **bit 64 is set on
+/// exactly the twenty-eight animations that carry the character somewhere** --
+/// `Walk`, `Run`, `Walkbackwards`, `Sprint`, the swim, stealth and flight
+/// families, the ground-to-flight transitions -- and on nothing else in 506
+/// rows. `ShuffleLeft` and `ShuffleRight` do not have it. They sit at
+/// `body_flags: 1`, which is `Stand`'s value, and `Stop`'s.
+///
+/// So the game's own table classes the shuffles with standing still, which is
+/// precisely how the last report described them. There is no lateral cycle on
+/// land that travels, so a sidestep plays the run -- and the shuffles are
+/// what [`live_turning`] uses, for a character turning on the spot, which is
+/// the one thing an in-place cycle is for.
+///
+/// **The evidence that had been used instead does not survive contact with the
+/// same table.** A sequence's `move_speed` was read as "this cycle does not
+/// travel": `Walkbackwards` declares `0.00` and carries the travel bit, and
+/// only two of the twenty-eight travelling animations declare a speed at all.
+/// `AnimationData`'s `fallback` was read as "the shuffles fall back to Stand":
+/// their fallback is `0`, and so is `Walk`'s and `Run`'s, because `0` there
+/// means *no fallback* rather than row zero.
+fn live_pace(moving: ::world::motion::Motion) -> f32 {
     use ::world::motion::Axis;
     match moving.longitudinal() {
         // Backing up is the only direction with its own speed *and* its own
         // cycle.
-        Some(Axis::Negative) => Gait {
-            travel: -LIVE_BACK_SPEED,
-            pace: -LIVE_BACK_SPEED,
-        },
-        // Running forward, with or without a sideways component: a diagonal
-        // is mostly a run and the run is what the original plays for it.
-        Some(Axis::Positive) => Gait {
-            travel: LIVE_RUN_SPEED,
-            pace: LIVE_RUN_SPEED,
-        },
-        // **A pure sidestep travels at the run speed and animates as though
-        // it were standing still**, and that split is the whole reason this
-        // returns a pair.
-        //
-        // Which cycle to play has been flipped once in each direction and
-        // both reports were right about what they saw. Given the `Shuffle`
-        // cycles it was called shimmying; given the run it was called
-        // "running sideways plays the forward animation". The art is the
-        // tie-breaker and it is blunter than either fix assumed:
-        // `HumanMale.m2` has `Walk`, `Run`, `Walkbackwards`, and
-        // `ShuffleLeft`/`ShuffleRight` at 500ms which advance the character by
-        // 0.00. **There is no sideways run in the game's own data.** So the
-        // honest choice is the cycle that is at least a sidestep, played in
-        // place -- and `pace: 0.0` is what lets the animation chooser reach
-        // it, while `travel` keeps the character moving. Reporting a pace of
-        // zero to *both* is what stopped `Q` and `E` moving anybody at all.
-        None if moving.is_moving() => Gait {
-            travel: LIVE_RUN_SPEED,
-            pace: 0.0,
-        },
-        _ => Gait {
-            travel: 0.0,
-            pace: 0.0,
-        },
-    }
-}
-
-/// Which way the character is sidestepping, signed, left positive.
-///
-/// Separate from [`live_turning`] because the two are different gestures that
-/// happen to share a cycle: turning on the spot with `A`/`D` and strafing with
-/// `Q`/`E`. Reporting them through one function would mean a caller could not
-/// tell which is happening, and the day they need different animations that
-/// distinction is the whole change.
-fn live_strafe(moving: ::world::motion::Motion) -> f32 {
-    use ::world::motion::Axis;
-    // Only while there is no forward or backward travel. A diagonal run is a
-    // run, and a sidestep laid over one is the shimmy that was reported.
-    if moving.longitudinal().is_some() {
-        return 0.0;
-    }
-    match moving.lateral() {
-        Some(Axis::Positive) => 1.0,
-        Some(Axis::Negative) => -1.0,
-        None => 0.0,
+        Some(Axis::Negative) => -LIVE_BACK_SPEED,
+        // Forward, and forward with a sideways component: a diagonal is
+        // mostly a run.
+        Some(Axis::Positive) => LIVE_RUN_SPEED,
+        // A pure sidestep. Travels at the run speed and plays the run, per
+        // the travel bit above -- and reporting `0.0` here, which the
+        // shuffle-cycle attempt did, stops the character moving at all,
+        // because this same number is what the movement integrator scales the
+        // direction by.
+        None if moving.is_moving() => LIVE_RUN_SPEED,
+        _ => 0.0,
     }
 }
 
@@ -3379,17 +3342,11 @@ impl App {
                     // movement back to us. Held means running -- there is no
                     // walk toggle here, and `LIVE_RUN_SPEED` is the run speed.
                     let pace = (
-                        // The animation half of the gait, never the travel
-                        // half: a sidestep travels and must still play a
-                        // cycle that does not.
-                        live_gait(self.live_move).pace,
-                        // Turning on the spot and sidestepping share the
-                        // shuffle cycles, and only one of them can be
-                        // happening: `live_strafe` reports nothing while the
-                        // character is travelling, and `live_turning` reports
-                        // nothing while it is moving at all.
-                        live_turning(self.keys, self.steering, self.live_move)
-                            + live_strafe(self.live_move),
+                        live_pace(self.live_move),
+                        // Turning on the spot, and *only* that: the shuffle
+                        // cycles carry nobody anywhere -- see `live_pace` --
+                        // so a sidestep has no business reaching them.
+                        live_turning(self.keys, self.steering, self.live_move),
                     );
                     // F2. See `App::entity_flip`.
                     let flip = if self.entity_flip { std::f32::consts::PI } else { 0.0 };
@@ -3719,12 +3676,12 @@ impl App {
 
         let (dx, dy) = desired.direction(live.orientation);
         if (dx, dy) != (0.0, 0.0) {
-            // **The travel half of the gait, and it is not the animation
-            // half.** `direction` is already a unit vector carrying which way
-            // the keys point, so all that is wanted here is a magnitude --
-            // and reading the animation's pace instead is what left a
-            // sidestepping character standing perfectly still.
-            let speed = live_gait(desired).travel.abs();
+            // `direction` is already a unit vector carrying which way the
+            // keys point, so all that is wanted here is a magnitude. This is
+            // the caller that made a pace of zero mean "do not move", which
+            // is why `live_pace` cannot answer an animation question with a
+            // number the movement integrator also reads.
+            let speed = live_pace(desired).abs();
             let wanted = glam::Vec3::new(
                 live.position.x + dx * speed * dt,
                 live.position.y + dy * speed * dt,
@@ -5119,9 +5076,8 @@ impl App {
         let entities = drawable_with_own(
             live,
             (
-                live_gait(self.live_move).pace,
-                live_turning(self.keys, self.steering, self.live_move)
-                    + live_strafe(self.live_move),
+                live_pace(self.live_move),
+                live_turning(self.keys, self.steering, self.live_move),
             ),
             self.jump.is_some(),
         );
@@ -6605,39 +6561,19 @@ mod gesture_tests {
         assert!(!was_click(900.0));
     }
 
-    /// **A sidestep travels, and animates as though it did not.**
+    /// **A sidestep travels at the run speed and plays the run**, and the
+    /// number saying so is the same number for both -- which is the whole
+    /// point, because the one commit where it was two numbers is the commit
+    /// where `Q` and `E` moved nobody.
     ///
-    /// Both halves, because each on its own has been shipped and each was a
-    /// bug you could see from the window. Asserting only the pace gives the
-    /// character that plays a tidy shuffle while standing rooted to the spot,
-    /// which is what `Q` and `E` did; asserting only the travel gives the one
-    /// that slides sideways playing the forward run, which is what they did
-    /// before that.
+    /// The cycle itself is settled in `AnimationData` rather than here; see
+    /// [`live_pace`] and the test below it.
     #[test]
-    fn a_sidestep_travels_while_its_animation_stands_still() {
+    fn a_sidestep_travels_at_the_run_speed_like_every_other_direction() {
         use ::world::motion::Motion;
 
         let sidestep = Motion {
             strafe_left: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            live_gait(sidestep).travel,
-            LIVE_RUN_SPEED,
-            "sidestepping must move the character"
-        );
-        assert_eq!(
-            live_gait(sidestep).pace,
-            0.0,
-            "and must not ask for a run cycle, which the art does not have"
-        );
-        assert_eq!(live_strafe(sidestep), 1.0, "left is the positive side");
-
-        // The three that must not have been disturbed: a run, a retreat, and
-        // standing still. A diagonal is a run, and the sidestep laid over it
-        // reports nothing -- a shuffle over a run is a stumble.
-        let run = Motion {
-            forward: true,
             ..Default::default()
         };
         let diagonal = Motion {
@@ -6645,21 +6581,108 @@ mod gesture_tests {
             strafe_right: true,
             ..Default::default()
         };
+        let run = Motion {
+            forward: true,
+            ..Default::default()
+        };
         let back = Motion {
             backward: true,
             ..Default::default()
         };
         for (name, motion, expected) in [
+            ("sidestep", sidestep, LIVE_RUN_SPEED),
             ("run", run, LIVE_RUN_SPEED),
             ("diagonal", diagonal, LIVE_RUN_SPEED),
             ("retreat", back, -LIVE_BACK_SPEED),
             ("still", Motion::default(), 0.0),
         ] {
-            let gait = live_gait(motion);
-            assert_eq!(gait.travel, expected, "{name} travel");
-            assert_eq!(gait.pace, expected, "{name} pace should equal its travel");
+            assert_eq!(live_pace(motion), expected, "{name}");
         }
-        assert_eq!(live_strafe(diagonal), 0.0, "a diagonal run is a run");
+        // The other half: a *travelling* character must not also be reported
+        // as turning on the spot, or the shuffle would be laid over the run.
+        for (name, motion) in [("sidestep", sidestep), ("diagonal", diagonal)] {
+            assert_eq!(
+                live_turning(KeyState::default(), false, motion),
+                0.0,
+                "{name} must not report a turn as well"
+            );
+        }
+    }
+
+    /// **Which cycle a sidestep plays was decided by a column, after three
+    /// renders decided it wrongly.**
+    ///
+    /// Given the `Shuffle` cycles it was reported as shimmying; given the run,
+    /// as "running sideways plays the forward animation"; given `Shuffle`
+    /// again, as "he stands perfectly still and his feet shuffle". A render
+    /// could not settle it because both readings draw a plausible picture --
+    /// the same shape as the placement rotation that took four attempts.
+    ///
+    /// `AnimationData.dbc`'s `body_flags` settles it: bit 64 is set on exactly
+    /// the animations that carry the character somewhere, and on nothing else
+    /// in the table. This asserts both directions of that, because "the
+    /// travelling ones have it" is worth nothing without "the shuffles do
+    /// not" -- and the shuffles sharing `Stand`'s exact value is the finding.
+    #[test]
+    fn the_shuffles_are_not_travelling_cycles_and_walk_run_and_backwards_are() {
+        const TRAVELS: u32 = 64;
+
+        let Some(data) = std::env::var_os("WOW_DATA") else {
+            eprintln!("skipping: WOW_DATA not set");
+            return;
+        };
+        let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
+        let table = dbc::schema::AnimationData::parse(
+            &chain
+                .read(dbc::schema::AnimationData::PATH)
+                .expect("AnimationData"),
+        )
+        .expect("parsing AnimationData");
+
+        let by_name = |wanted: &str| {
+            table
+                .iter()
+                .find(|row| row.name() == wanted)
+                .unwrap_or_else(|| panic!("no {wanted} row"))
+                .body_flags()
+        };
+
+        for name in ["Walk", "Run", "Walkbackwards", "Sprint", "SwimLeft"] {
+            assert!(
+                by_name(name) & TRAVELS != 0,
+                "{name} carries the character and must have the travel bit"
+            );
+        }
+        for name in ["ShuffleLeft", "ShuffleRight"] {
+            assert!(
+                by_name(name) & TRAVELS == 0,
+                "{name} would be a travelling cycle, which is what a sidestep wanted"
+            );
+            assert_eq!(
+                by_name(name),
+                by_name("Stand"),
+                "{name} is classed with standing still, exactly as it looks on screen"
+            );
+        }
+
+        // And the population, so the bit is a *measurement* rather than five
+        // rows that happened to agree: every animation carrying it is a
+        // locomotion cycle, in a table of five hundred.
+        let travelling: Vec<String> = table
+            .iter()
+            .filter(|row| row.body_flags() & TRAVELS != 0)
+            .map(|row| row.name().to_string())
+            .collect();
+        assert_eq!(travelling.len(), 28, "{travelling:?}");
+        assert!(
+            travelling.iter().all(|name| {
+                ["Walk", "Run", "Swim", "Sprint", "Stealth", "Fly", "ToFly", "ToHover",
+                 "ToGround", "Settle"]
+                    .iter()
+                    .any(|stem| name.contains(stem))
+            }),
+            "something that is not a locomotion cycle carries the travel bit: {travelling:?}"
+        );
     }
 }
 
