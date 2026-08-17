@@ -1495,6 +1495,7 @@ mod tests {
                 description: String::new(),
                 icon: None,
                 cooldown_fraction: fraction,
+                press_fraction: 0.0,
             });
             vec![slots]
         }
@@ -1522,6 +1523,53 @@ mod tests {
         assert!(
             cooldown_shapes > ready_shapes,
             "the cooldown sweep painted no extra shape: {cooldown_shapes} vs {ready_shapes}"
+        );
+    }
+
+    /// A just-pressed slot paints an extra shape (the flash ring) the same
+    /// way a cooldown paints an extra one -- see `a_cooldown_darkens_the_slot`.
+    /// This is the property that would have caught `foss-wow#74`: a click
+    /// that reaches the slot but is never drawn is indistinguishable from a
+    /// dropped keypress, and this is the check that it is not dropped.
+    #[test]
+    fn a_press_flashes_the_slot() {
+        fn bars_with_press(fraction: f32) -> Vec<Vec<frames::action_bar::SlotView>> {
+            let mut slots = frames::action_bar::placeholder(0);
+            slots[0].spell = Some(frames::action_bar::SlotSpell {
+                id: 78,
+                name: "Heroic Strike".into(),
+                rank: String::new(),
+                description: String::new(),
+                icon: None,
+                cooldown_fraction: 0.0,
+                press_fraction: fraction,
+            });
+            vec![slots]
+        }
+
+        let mut idle = Hud::default();
+        let idle_shapes = painted(
+            &mut idle,
+            &HudData {
+                bars: &bars_with_press(0.0),
+                ..Default::default()
+            },
+        )
+        .len();
+
+        let mut pressed = Hud::default();
+        let pressed_shapes = painted(
+            &mut pressed,
+            &HudData {
+                bars: &bars_with_press(1.0),
+                ..Default::default()
+            },
+        )
+        .len();
+
+        assert!(
+            pressed_shapes > idle_shapes,
+            "the press flash painted no extra shape: {pressed_shapes} vs {idle_shapes}"
         );
     }
 
@@ -1677,6 +1725,7 @@ mod tests {
             description: "A strong attack.".into(),
             icon: None,
             cooldown_fraction: 0.0,
+            press_fraction: 0.0,
         });
         let bars = vec![slots];
         let data = HudData {

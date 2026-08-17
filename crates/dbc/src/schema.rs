@@ -717,6 +717,36 @@ dbc_table! {
         /// often and are pure coincidence -- any column of small integers
         /// hits somewhere in a 130-row table.
         40  duration_index: u32,
+        /// Milliseconds before this spell itself can be cast again, `0` for
+        /// no individual cooldown -- `foss-wow#74`'s action-bar sweep.
+        ///
+        /// **Not located by this project's usual property test.** This
+        /// column and [`Self::category_recovery_time`] sit at the same
+        /// offsets AzerothCore's own `SpellEntry` struct names them at
+        /// (`DBCStructure.h`, which documents the 3.3.5a client's DBC
+        /// layout -- public documentation of a file format, not server
+        /// logic; rule 2 permits reading it for a field's meaning).
+        /// What stands in for a property test here is that this project's
+        /// *own*, separately-derived columns already agree with that same
+        /// struct's numbering at two other offsets with no coordination
+        /// possible between the two derivations: [`Self::duration_index`]
+        /// (40, found from `$d` token correlation) and
+        /// [`Self::effect_die_sides`] (74-76, found from `$M1`/`$m1`
+        /// ranges). A layout that was wrong here would have to be wrong at
+        /// 40 and 74 too by coincidence, in a way that still produced a
+        /// 98.5% and 96.6% correlation. Confirmed live rather than left at
+        /// that: casting a spell with a real, well-known cooldown and
+        /// watching the sweep clear on time, not instantly and not never --
+        /// see the seeding code in `apps/viewer/src/spells.rs`.
+        29  recovery_time: u32,
+        /// Milliseconds before every spell **sharing this spell's
+        /// `category`** can be cast again -- a shared cooldown, the way all
+        /// potions or all forms of one shapeshift compete for one timer.
+        /// `0` when the spell has no category-wide cooldown. See
+        /// [`Self::recovery_time`]'s doc comment for how this offset was
+        /// identified; the sweep uses whichever of the two is non-zero,
+        /// preferring the spell's own.
+        30  category_recovery_time: u32,
         /// Die sides per effect, behind `$M1`: the top of a damage range,
         /// where [`Self::effect_base_points`] plus one is the bottom.
         ///

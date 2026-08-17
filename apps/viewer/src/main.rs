@@ -1945,6 +1945,19 @@ struct App {
     /// Damage numbers currently rising and fading, oldest first. Pruned every
     /// frame once a number's age passes `1.0` -- see [`PendingCombatText`].
     combat_text: Vec<PendingCombatText>,
+    /// The action slot most recently activated, and when -- a brief flash so
+    /// a *click* has something to show for itself.
+    ///
+    /// Deliberately not a claim that the cast landed, or even that it was
+    /// sent: it is the same affordance retail gives a button the instant it
+    /// is pressed, nothing more. It exists because an instant-cast spell has
+    /// no cast bar (there is no cast *time* to show one for) and this
+    /// realm's cooldown sweep does not reliably start either -- see
+    /// `SpellCooldown`'s doc comment in `crates/world/src/spell.rs` -- so
+    /// without this, pressing a key for an instant ability that is not on
+    /// cooldown produces no visible response at all, silent success reading
+    /// identical to a dropped keypress.
+    action_flash: Option<((usize, usize), Instant)>,
     /// Debug: add a half turn to every entity's facing, toggled with F2.
     ///
     /// Here because two observations disagree and a live A/B settles it in
@@ -2675,6 +2688,7 @@ impl App {
             steering: false,
             chat: Vec::new(),
             combat_text: Vec::new(),
+            action_flash: None,
             entity_flip: false,
             flip_winding: false,
             strafe_yaw_choice: STRAFE_YAW_DEFAULT,
@@ -4215,6 +4229,7 @@ impl App {
         };
         if spell == spells::AUTO_ATTACK {
             self.toggle_auto_attack();
+            self.action_flash = Some(((bar, slot), Instant::now()));
             return;
         }
         let target = self.target;
@@ -4223,7 +4238,20 @@ impl App {
             return;
         };
         match live.connection.cast_spell(spell, target) {
-            Ok(()) => tracing::debug!("cast {name} ({spell})"),
+            Ok(()) => {
+                tracing::debug!("cast {name} ({spell})");
+                self.action_flash = Some(((bar, slot), Instant::now()));
+                // Predicted, not server-confirmed -- see
+                // `WorldState::predict_cooldown`'s doc comment for why the
+                // server itself mostly stays quiet about an ordinary cast's
+                // cooldown. A spell with none of its own reads `0` and
+                // starts nothing.
+                live.state.predict_cooldown(
+                    spell,
+                    Instant::now(),
+                    self.spells.cooldown_ms(spell),
+                );
+            }
             Err(e) => {
                 tracing::warn!("casting {spell} failed: {e:#}");
                 self.chat.push(Line::Chat(local_notice(format!("could not cast: {e}"))));
@@ -6235,6 +6263,16 @@ impl App {
         };
         let composing = self.composing.clone();
         let now = std::time::Instant::now();
+        // How long the press flash lasts -- see `App::action_flash`'s doc
+        // comment for why it exists at all. Short enough to read as "that one
+        // registered" rather than as a cooldown of its own.
+        const ACTION_FLASH: std::time::Duration = std::time::Duration::from_millis(200);
+        if self
+            .action_flash
+            .is_some_and(|(_, pressed)| now.saturating_duration_since(pressed) >= ACTION_FLASH)
+        {
+            self.action_flash = None;
+        }
         // Slot contents, resolved fresh each frame: an icon that failed to
         // load earlier can succeed later, a rearranged bar takes effect
         // immediately, and a cooldown sweep needs to be re-measured against
@@ -6250,6 +6288,13 @@ impl App {
                         .as_ref()
                         .map(|live| live.state.cooldown_fraction(id, now))
                         .unwrap_or(0.0);
+                    let press_fraction = match self.action_flash {
+                        Some(((f_bar, f_slot), pressed)) if (f_bar, f_slot) == (bar, slot) => {
+                            let elapsed = now.saturating_duration_since(pressed);
+                            1.0 - (elapsed.as_secs_f32() / ACTION_FLASH.as_secs_f32()).min(1.0)
+                        }
+                        _ => 0.0,
+                    };
                     ui::frames::action_bar::SlotSpell {
                         id,
                         name: self.spells.name(id),
@@ -6257,6 +6302,7 @@ impl App {
                         description: self.spells.description(id),
                         icon,
                         cooldown_fraction,
+                        press_fraction,
                     }
                 });
                 slots.push(ui::frames::action_bar::SlotView {

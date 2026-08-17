@@ -1238,6 +1238,38 @@ impl WorldState {
             .unwrap_or(0.0)
     }
 
+    /// Starts a cooldown this client worked out for itself, rather than one
+    /// the server announced.
+    ///
+    /// `foss-wow#74`: `SMSG_SPELL_COOLDOWN` is not a general mechanism --
+    /// AzerothCore's own `Spell::SendSpellCooldown` only sends it for a
+    /// handful of special cases (an aura that modifies cooldown length, a
+    /// vehicle spell) and simply returns for an ordinary cast, exactly as a
+    /// real client would need nothing more: it already has the duration in
+    /// its own `Spell.dbc`. This crate has no DBC dependency and cannot read
+    /// that column itself, so the caller (which does) looks the duration up
+    /// and hands it here -- the same division of labour as `WorldState`
+    /// holding replicated fields it did not compute.
+    ///
+    /// A later, real cooldown update overwrites this the same way any two
+    /// writes to `cooldowns` do -- last one in wins, and the server's own
+    /// account is exactly the case that should win if it ever arrives.
+    /// Zero durations are not inserted, matching `remaining_fraction`
+    /// already reading `0.0` for one: a spell with no cooldown at all should
+    /// not occupy an entry that a future lookup has to walk past.
+    pub fn predict_cooldown(&mut self, spell: u32, now: std::time::Instant, duration_ms: u32) {
+        if duration_ms == 0 {
+            return;
+        }
+        self.cooldowns.insert(
+            spell,
+            Cooldown {
+                started: now,
+                duration_ms,
+            },
+        );
+    }
+
     /// The cast a given caster is in the middle of, if any -- `None` once
     /// `progress_fraction` would read `1.0`, not only once `SMSG_SPELL_GO`
     /// clears the entry. See [`Cast`]'s doc comment for why a caller must not
@@ -2669,6 +2701,30 @@ mod tests {
             instant.remaining_fraction(started),
             0.0,
             "a zero-duration cooldown is never actually on cooldown"
+        );
+    }
+
+    /// `foss-wow#74`: the caller's own DBC-derived duration has to reach the
+    /// same map a server-driven cooldown would, and a spell with no
+    /// cooldown at all must not occupy an entry.
+    #[test]
+    fn predict_cooldown_starts_one_but_skips_a_zero_duration() {
+        let mut world = WorldState::new();
+        let now = std::time::Instant::now();
+
+        world.predict_cooldown(78, now, 0);
+        assert_eq!(
+            world.cooldown_fraction(78, now),
+            0.0,
+            "a zero-duration prediction must not start a cooldown at all"
+        );
+
+        world.predict_cooldown(78, now, 4000);
+        assert_eq!(world.cooldown_fraction(78, now), 1.0);
+        assert!(
+            (world.cooldown_fraction(78, now + std::time::Duration::from_millis(2000)) - 0.5)
+                .abs()
+                < 0.01
         );
     }
 

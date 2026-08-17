@@ -53,6 +53,15 @@ pub struct SlotSpell {
     /// same as `Element::scale`, so a wrong duration cannot paint a sweep
     /// that overshoots or reverses.
     pub cooldown_fraction: f32,
+    /// `1.0` the instant the slot is activated, fading to `0.0` over a short
+    /// fixed window the caller owns. **Not a claim the cast landed or was
+    /// even sent** -- only that the slot was pressed, the same affordance a
+    /// button gives on a mouse-down. Exists because an instant-cast spell has
+    /// no cast bar and `cooldown_fraction` cannot be trusted to move on this
+    /// realm (see the caller's own notes), so without it a successful press
+    /// of a ready instant ability looks identical to a keypress that never
+    /// registered.
+    pub press_fraction: f32,
 }
 
 /// How much room a bar wants.
@@ -136,6 +145,7 @@ pub fn draw(painter: &Painter, rect: Rect, slots: &[SlotView], style: &Style, sc
                     Stroke::new(style.border_width * scale, style.border),
                     StrokeKind::Inside,
                 );
+                draw_press_flash(painter, bounds, slot_corner, spell.press_fraction);
             }
             None => {
                 painter.rect_stroke(
@@ -182,6 +192,23 @@ fn draw_cooldown(painter: &Painter, bounds: Rect, fraction: f32) {
         egui::pos2(bounds.max.x, bounds.min.y + bounds.height() * fraction),
     );
     painter.rect_filled(covered, 0, Color32::from_black_alpha(170));
+}
+
+/// A bright ring around a slot, fading with the fraction the caller supplies
+/// -- the visible half of [`SlotSpell::press_fraction`]. Drawn as a stroke
+/// rather than a fill so it reads as "this one" without hiding the icon or
+/// fighting the cooldown sweep for the same pixels.
+fn draw_press_flash(painter: &Painter, bounds: Rect, corner: egui::CornerRadius, fraction: f32) {
+    let fraction = fraction.clamp(0.0, 1.0);
+    if fraction <= 0.0 {
+        return;
+    }
+    painter.rect_stroke(
+        bounds,
+        corner,
+        Stroke::new(2.0, Color32::from_white_alpha((fraction * 255.0) as u8)),
+        StrokeKind::Inside,
+    );
 }
 
 /// Explains what is in a hovered slot: name, rank if it has one, and

@@ -91,6 +91,16 @@ pub struct Spellbook {
     /// than [`Self::known`], because a description may refer to a spell the
     /// character does not know -- see [`dbc::spelltext::referenced_spells`].
     values: HashMap<u32, Values>,
+    /// How long a cast puts the spell itself on cooldown, in milliseconds --
+    /// `Spell.dbc`'s `recovery_time` if the spell has one of its own, else
+    /// `category_recovery_time` if it shares one, else absent. See
+    /// [`dbc::schema::Spell::recovery_time`]'s doc comment for how the two
+    /// columns were identified. Absent rather than zero for a spell with
+    /// neither, the same reasoning [`Self::known_name`] returns `None`
+    /// rather than an empty string: "no cooldown" and "never looked up" want
+    /// different callers to be able to tell them apart, even though today's
+    /// one caller treats them the same.
+    cooldowns: HashMap<u32, u32>,
     /// Whether a game installation was available at all.
     pub have_data: bool,
 }
@@ -159,6 +169,16 @@ impl Spellbook {
             let description = row.description().to_string();
             spelltext::referenced_spells(&description, &mut referenced);
             book.values.insert(id, values_of(&row, &durations, &radii));
+            // The spell's own cooldown wins over a shared category one --
+            // see `Spell::recovery_time`'s doc comment.
+            let cooldown_ms = if row.recovery_time() > 0 {
+                row.recovery_time()
+            } else {
+                row.category_recovery_time()
+            };
+            if cooldown_ms > 0 {
+                book.cooldowns.insert(id, cooldown_ms);
+            }
             book.known.insert(
                 id,
                 SpellInfo {
@@ -288,6 +308,14 @@ impl Spellbook {
             Some(info) => spelltext::substitute(&info.description, spell, &self.values),
             None => String::new(),
         }
+    }
+
+    /// How long a successful cast puts this spell on cooldown, in
+    /// milliseconds. `0` for a spell with no cooldown of its own -- most of
+    /// them -- and for one this book has never heard of, which without game
+    /// data is every spell.
+    pub fn cooldown_ms(&self, spell: u32) -> u32 {
+        self.cooldowns.get(&spell).copied().unwrap_or(0)
     }
 
     /// The icon for a spell, uploading it the first time it is asked for.
@@ -588,5 +616,33 @@ mod tests {
             book.description(774),
             "Heals the target for ${$m1*5*$<mult>} over 15 sec."
         );
+    }
+
+    /// `foss-wow#74`: `recovery_time`/`category_recovery_time` located by
+    /// reading AzerothCore's public `SpellEntry` layout rather than this
+    /// project's usual property test -- see `Spell::recovery_time`'s doc
+    /// comment for why that stands in for one here. What settles it is a
+    /// number nobody could get right by accident: `Charge` (spell 100) has
+    /// no cooldown of its own, `category_recovery_time` `15000` and nothing
+    /// else on the row resembling a duration -- and fifteen seconds is
+    /// Charge's real, independently-known cooldown in this client's build.
+    /// `Heroic Strike` and `Battle Shout` are the controls: both are
+    /// castable at will in the real game and both columns read `0` on their
+    /// rows, so the test would fail if either candidate column were merely
+    /// "some small integer" rather than the one that means cooldown.
+    #[test]
+    fn charges_cooldown_reads_its_real_fifteen_seconds() {
+        let mut chain = match chain() {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping: WOW_DATA not set");
+                return;
+            }
+        };
+
+        let book = Spellbook::load(&mut chain, &HashSet::from([100, 78, 6673]));
+        assert_eq!(book.cooldown_ms(100), 15_000, "Charge's real 15s cooldown");
+        assert_eq!(book.cooldown_ms(78), 0, "Heroic Strike is GCD-only");
+        assert_eq!(book.cooldown_ms(6673), 0, "Battle Shout has no cooldown");
     }
 }
