@@ -68,6 +68,51 @@ impl ElementId {
         ElementId::ReleasePrompt,
     ];
 
+    /// What order the frames are drawn in, lowest first.
+    ///
+    /// **This decides which window a click reaches, not just what looks
+    /// tidy.** Every frame is an egui area of the same order, so the one built
+    /// last is on top -- and the map is 760 by 520 in the middle of the
+    /// screen, which is exactly where a questgiver's scroll grows down into.
+    /// With both open the Accept button was underneath the map: drawn,
+    /// hit-tested, and unreachable, which reads as a window that has stopped
+    /// working rather than as one that is behind something.
+    ///
+    /// The ranking is by *how much answering it matters*. The map is a thing
+    /// you read while stopped, so it goes at the bottom. The panels you open
+    /// and close sit above it. The frames that are simply always there --
+    /// health, target, chat, the bars -- sit above those, because an open
+    /// window must never eat a click meant for an action bar. On top are the
+    /// windows that appeared because something happened and want an answer:
+    /// a corpse, a questgiver, a death.
+    pub fn stacking(self) -> u8 {
+        match self {
+            ElementId::WorldMap => 0,
+            ElementId::Spellbook
+            | ElementId::Bags
+            | ElementId::Character
+            | ElementId::QuestLog => 1,
+            ElementId::PlayerFrame
+            | ElementId::TargetFrame
+            | ElementId::ChatFrame
+            | ElementId::CastBar
+            | ElementId::ActionBar1
+            | ElementId::ActionBar2
+            | ElementId::ActionBar3 => 2,
+            ElementId::Loot | ElementId::Questgiver | ElementId::ReleasePrompt => 3,
+        }
+    }
+
+    /// Every element, bottom of the interface first. See
+    /// [`ElementId::stacking`].
+    pub fn in_draw_order() -> Vec<ElementId> {
+        let mut all = ElementId::ALL.to_vec();
+        // Stable, so elements of one rank keep the order `ALL` states and the
+        // layout does not change on a whim of the sort.
+        all.sort_by_key(|id| id.stacking());
+        all
+    }
+
     /// Which action bar this element is, if it is one.
     pub fn action_bar(self) -> Option<usize> {
         match self {

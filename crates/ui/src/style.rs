@@ -253,6 +253,17 @@ pub struct Style {
     /// Radius of a pin, and the reach of the hover test, at scale 1.0.
     pub world_map_pin: f32,
 
+    /// Whether the `!` and `?` over questgivers are drawn at all.
+    pub show_quest_marks: bool,
+    /// The bright form: a quest to take, or one ready to hand in.
+    pub quest_mark_bright: Color,
+    /// The dim form: a quest outlevelled, or one still in progress.
+    pub quest_mark_dim: Color,
+    /// How tall a mark is drawn, in pixels. **Not scaled by an element's
+    /// scale**, because a mark belongs to a creature in the world rather than
+    /// to a frame -- there is no element to take a scale from.
+    pub quest_mark_size: f32,
+
     /// Width of the cast bar at scale 1.0. Reuses `bar_height` for its
     /// thickness -- a cast bar is one bar, the same shape as a health bar
     /// turned wide, and does not need a dimension of its own for that.
@@ -396,6 +407,11 @@ impl Default for Style {
             world_map_outline: Color::rgba(10, 10, 12, 220),
             world_map_pin: 7.0,
 
+            show_quest_marks: true,
+            quest_mark_bright: Color::rgb(250, 210, 60),
+            quest_mark_dim: Color::rgb(150, 150, 150),
+            quest_mark_size: 26.0,
+
             cast_bar_width: 260.0,
             casting: Color::rgb(220, 170, 60),
 
@@ -484,6 +500,7 @@ impl Style {
         self.questgiver_width = self.questgiver_width.clamp(160.0, 1600.0);
         self.world_map_width = self.world_map_width.clamp(200.0, 2400.0);
         self.world_map_pin = self.world_map_pin.clamp(1.0, 60.0);
+        self.quest_mark_size = self.quest_mark_size.clamp(6.0, 120.0);
         self.chat_width = self.chat_width.clamp(120.0, 2000.0);
         self.chat_height = self.chat_height.clamp(40.0, 1200.0);
         self.chat_scrollback = self.chat_scrollback.clamp(10, 10_000);

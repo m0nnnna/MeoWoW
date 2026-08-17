@@ -789,6 +789,91 @@ pub fn parse_questgiver_details(body: &[u8]) -> Result<QuestgiverDetails, Error>
     Ok(QuestgiverDetails { npc, quest })
 }
 
+/// What mark belongs over an NPC's head.
+///
+/// **Every value here was produced by a state this project created, one change
+/// at a time, and nothing else is named.** The wire carries a single byte and
+/// the temptation is to write the whole enum down from memory -- which is the
+/// urge that produced `CHAT_MSG_SAY = 0x00` and cost a day. So: a character
+/// was created from nothing, and the same four questgivers were asked about
+/// after each change to its quest log.
+///
+/// | byte | how it was produced |
+/// |---|---|
+/// | 0 | an innkeeper with no quests, and a questgiver whose quests are gated behind one not yet done |
+/// | 2 | the same available quest, asked by a character levelled to 26 |
+/// | 5 | quest 7 in the log with none of its eight kobolds killed, asked at its ender |
+/// | 8 | quest 783 on offer to a fresh level-one human |
+/// | 10 | quest 783 in the log and finished, asked at its ender |
+///
+/// Anything else reads as [`QuestgiverMark::Unknown`] and draws nothing. A
+/// mark this client has not seen the server produce is a guess, and a wrong
+/// exclamation over an NPC sends a player somewhere for no reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestgiverMark {
+    /// Nothing to offer and nothing to hand in.
+    None,
+    /// A quest is on offer. The bright exclamation.
+    Available,
+    /// A quest is on offer, and the character has outlevelled it. The grey
+    /// exclamation.
+    AvailableTrivial,
+    /// A quest of theirs is in the log and not finished. The grey question
+    /// mark.
+    Incomplete,
+    /// A quest of theirs is in the log and finished. The bright question mark.
+    Complete,
+    /// A value the server sent that this client has never produced
+    /// deliberately, so it has no name and draws nothing.
+    Unknown(u8),
+}
+
+impl QuestgiverMark {
+    /// Reads the byte the server sends. See the type's own table.
+    pub fn from_status(raw: u8) -> Self {
+        match raw {
+            0 => Self::None,
+            2 => Self::AvailableTrivial,
+            5 => Self::Incomplete,
+            8 => Self::Available,
+            10 => Self::Complete,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Whether anything should be drawn over the NPC at all.
+    pub fn is_drawn(self) -> bool {
+        matches!(
+            self,
+            Self::Available | Self::AvailableTrivial | Self::Incomplete | Self::Complete
+        )
+    }
+}
+
+/// One NPC's mark, in answer to `CMSG_QUESTGIVER_STATUS_QUERY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuestgiverStatus {
+    pub npc: u64,
+    pub mark: QuestgiverMark,
+}
+
+/// Parses `SMSG_QUESTGIVER_STATUS`: a guid and one byte.
+///
+/// **Nine bytes, confirmed by the guid coming back.** Nothing acknowledges an
+/// outgoing opcode, so the proof that `CMSG_QUESTGIVER_STATUS_QUERY` is the
+/// right number is that the reply names the exact NPC it was asked about --
+/// twenty-nine of them in one run, each matching its own request.
+pub fn parse_questgiver_status(body: &[u8]) -> Result<QuestgiverStatus, Error> {
+    let mut r = Reader::new(body, "SMSG_QUESTGIVER_STATUS");
+    let npc = r.u64()?;
+    let status = r.u8()?;
+    r.finish()?;
+    Ok(QuestgiverStatus {
+        npc,
+        mark: QuestgiverMark::from_status(status),
+    })
+}
+
 /// One marker area for a quest objective -- a polygon on the world map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuestPoi {
@@ -925,6 +1010,44 @@ mod tests {
         0x01, 0x00, 0x00, 0x00, //
         0x39, 0xdd, 0xff, 0xff, 0x5d, 0xff, 0xff, 0xff, // (-8903, -163)
     ];
+
+    /// **The captured reply, byte for byte**, and the five marks each read
+    /// from the state that produced it. The bytes are the ones a live realm
+    /// sent about Deputy Willem to a fresh level-one human: guid then `08`.
+    #[test]
+    fn a_questgiver_status_reply_parses_and_names_only_measured_marks() {
+        const WILLEM_AVAILABLE: [u8; 9] = [
+            0x8c, 0x2a, 0x01, 0x37, 0x03, 0x00, 0x30, 0xf1, // the NPC's guid
+            0x08, // "there is a quest here to take"
+        ];
+        let status = parse_questgiver_status(&WILLEM_AVAILABLE).unwrap();
+        assert_eq!(status.npc, 0xf130_0003_3701_2a8c);
+        assert_eq!(status.mark, QuestgiverMark::Available);
+        assert!(status.mark.is_drawn());
+
+        // The other four states, each produced deliberately -- see
+        // `QuestgiverMark`'s table.
+        assert_eq!(QuestgiverMark::from_status(0), QuestgiverMark::None);
+        assert_eq!(
+            QuestgiverMark::from_status(2),
+            QuestgiverMark::AvailableTrivial
+        );
+        assert_eq!(QuestgiverMark::from_status(5), QuestgiverMark::Incomplete);
+        assert_eq!(QuestgiverMark::from_status(10), QuestgiverMark::Complete);
+        assert!(!QuestgiverMark::None.is_drawn());
+
+        // **A value nobody has produced draws nothing rather than guessing.**
+        // The enum has more values than this client has ever seen, and a mark
+        // invented for one of them sends a player somewhere for no reason.
+        assert_eq!(QuestgiverMark::from_status(7), QuestgiverMark::Unknown(7));
+        assert!(!QuestgiverMark::Unknown(7).is_drawn());
+
+        // A body of the wrong length is an error, not a partial read.
+        assert!(parse_questgiver_status(&WILLEM_AVAILABLE[..8]).is_err());
+        let mut trailing = WILLEM_AVAILABLE.to_vec();
+        trailing.push(0);
+        assert!(parse_questgiver_status(&trailing).is_err());
+    }
 
     #[test]
     fn a_captured_response_parses_exactly() {

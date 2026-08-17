@@ -324,6 +324,26 @@ pub enum ClientOpcode {
     /// purchase.
     BuyItem = 0x01A2,
 
+    /// Ask what mark belongs over one NPC's head -- an exclamation for a quest
+    /// on offer, a question mark for one ready to hand in, and grey versions
+    /// of each for a quest that cannot be taken or finished yet. Body is the
+    /// NPC's guid, unpacked.
+    ///
+    /// **The server decides this, and that is the whole reason to ask.**
+    /// Whether a quest is available depends on level, race, class, faction
+    /// standing, every prerequisite in its chain and whatever else the realm
+    /// has been scripted to check -- a client working it out from
+    /// `quest_template` would be reimplementing the server's eligibility rules
+    /// and would be wrong on any realm with custom content, which is the case
+    /// this client is developed against.
+    QuestgiverStatusQuery = 0x0182,
+
+    /// The same question for every questgiver in range at once. Empty body.
+    ///
+    /// One request per NPC per frame is what a client that does not know this
+    /// exists ends up sending; a starting zone has a dozen of them.
+    QuestgiverStatusMultipleQuery = 0x0416,
+
     /// Open a questgiver's list. Body is the NPC's guid, unpacked.
     ///
     /// Distinct from [`ClientOpcode::GossipHello`] even though both greet the
@@ -453,6 +473,12 @@ pub mod server {
     /// `Item.dbc` independently gives it.
     pub const LIST_INVENTORY: u16 = 0x019F;
 
+    /// What mark belongs over one NPC's head, in answer to
+    /// [`QuestgiverStatusQuery`](crate::ClientOpcode::QuestgiverStatusQuery).
+    pub const QUESTGIVER_STATUS: u16 = 0x0183;
+    /// The same for every questgiver in range, in answer to
+    /// [`QuestgiverStatusMultipleQuery`](crate::ClientOpcode::QuestgiverStatusMultipleQuery).
+    pub const QUESTGIVER_STATUS_MULTIPLE: u16 = 0x0417;
     /// The quests one NPC is offering, in answer to
     /// [`QuestgiverHello`](crate::ClientOpcode::QuestgiverHello).
     pub const QUESTGIVER_QUEST_LIST: u16 = 0x0185;
@@ -690,6 +716,8 @@ pub fn describe(opcode: u16) -> String {
         server::LOOT_CLEAR_MONEY => "SMSG_LOOT_CLEAR_MONEY",
         server::GOSSIP_MESSAGE => "SMSG_GOSSIP_MESSAGE",
         server::LIST_INVENTORY => "SMSG_LIST_INVENTORY",
+        server::QUESTGIVER_STATUS => "SMSG_QUESTGIVER_STATUS",
+        server::QUESTGIVER_STATUS_MULTIPLE => "SMSG_QUESTGIVER_STATUS_MULTIPLE",
         server::QUESTGIVER_QUEST_LIST => "SMSG_QUESTGIVER_QUEST_LIST",
         server::QUESTGIVER_QUEST_DETAILS => "SMSG_QUESTGIVER_QUEST_DETAILS",
         server::QUESTGIVER_REQUEST_ITEMS => "SMSG_QUESTGIVER_REQUEST_ITEMS",

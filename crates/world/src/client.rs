@@ -872,6 +872,16 @@ impl Connection {
         self.send(ClientOpcode::QuestQuery, &quest.to_le_bytes())
     }
 
+    /// Asks what mark belongs over one NPC's head.
+    pub fn query_questgiver_status(&mut self, npc: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::QuestgiverStatusQuery, &npc.to_le_bytes())
+    }
+
+    /// Asks the same about every questgiver in range at once. No body.
+    pub fn query_questgiver_status_multiple(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::QuestgiverStatusMultipleQuery, &[])
+    }
+
     /// Asks where a set of quests' objectives are on the map.
     ///
     /// **Answers only for quests in the player's own log**, and the server

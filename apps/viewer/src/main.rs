@@ -1826,6 +1826,24 @@ struct App {
     /// what decides which ids to ask about, and closing a window is not a
     /// reason to throw away an answer already paid for.
     objectives: maps::Objectives,
+    /// What mark belongs over each NPC's head, by guid, as the server last
+    /// said.
+    ///
+    /// **Kept per guid rather than per creature entry.** Two Deputy Willems
+    /// standing side by side can carry different marks -- the quest is on one
+    /// of them as far as the server is concerned -- and more importantly the
+    /// answer is about *this character's* progress, so it changes under a
+    /// fixed entry as quests are taken and handed in.
+    quest_marks: std::collections::HashMap<u64, ::world::quest::QuestgiverMark>,
+    /// Guids a status request has gone out for and when, so a talker is asked
+    /// about once rather than once a frame, and an unanswered request is
+    /// eventually sent again.
+    quest_marks_asked: std::collections::HashMap<u64, Instant>,
+    /// The quest log the marks were asked against. **Every mark is stale the
+    /// moment the log changes** -- accepting a quest turns its giver's
+    /// exclamation into nothing and its ender's nothing into a question mark,
+    /// and neither NPC sends anything to say so.
+    quest_marks_log: Vec<u32>,
     /// The sound tables, and the two channels that play them.
     ///
     /// The output stream is held for its whole life on purpose: dropping it
@@ -2485,6 +2503,9 @@ impl App {
             maps,
             map_open: false,
             objectives: maps::Objectives::default(),
+            quest_marks: std::collections::HashMap::new(),
+            quest_marks_asked: std::collections::HashMap::new(),
+            quest_marks_log: Vec::new(),
             area: None,
             sounds: sound::Sounds::default(),
             effects: sound::Effects::default(),
@@ -5291,6 +5312,34 @@ impl App {
                         ::world::opcode::server::QUESTGIVER_REQUEST_ITEMS => {
                             tracing::debug!("that quest is not finished yet");
                         }
+                        // What mark belongs over one NPC. Nine bytes, and the
+                        // guid coming back is what confirms the request went
+                        // out as the right opcode.
+                        ::world::opcode::server::QUESTGIVER_STATUS => {
+                            match ::world::quest::parse_questgiver_status(&packet.body) {
+                                Ok(status) => {
+                                    self.quest_marks_asked.remove(&status.npc);
+                                    if let ::world::quest::QuestgiverMark::Unknown(raw) =
+                                        status.mark
+                                    {
+                                        // Loud, and once per arrival: a value
+                                        // this client has never produced
+                                        // deliberately is the next thing worth
+                                        // measuring, and it draws nothing
+                                        // until it has been.
+                                        tracing::info!(
+                                            "questgiver {:#018x} carries status {raw}, \
+                                             which nothing here has named",
+                                            status.npc
+                                        );
+                                    }
+                                    self.quest_marks.insert(status.npc, status.mark);
+                                }
+                                Err(error) => {
+                                    tracing::warn!("a questgiver status would not parse: {error}")
+                                }
+                            }
+                        }
                         // Where the log's objectives are. One reply answers
                         // for every id in the request, and an empty marker
                         // list is a real answer -- see `maps::Objectives` for
@@ -5441,6 +5490,49 @@ impl App {
                 }
             }
         }
+        // What mark belongs over each nearby NPC's head, a few per frame.
+        //
+        // **The whole set is thrown away whenever the quest log changes**, and
+        // that is not caution: taking a quest turns its giver's exclamation
+        // into nothing and its ender's nothing into a question mark, and the
+        // server does not volunteer either. A client that asked once would
+        // leave an exclamation over an NPC with nothing left to give, which is
+        // worse than no mark at all.
+        if self.quest_marks_log != log {
+            self.quest_marks_log = log.clone();
+            self.quest_marks.clear();
+            self.quest_marks_asked.clear();
+        }
+        const MARKS_PER_FRAME: usize = 6;
+        // Long enough that a slow realm is not asked twice, short enough that
+        // a lost reply costs a pause rather than the session.
+        const MARK_RETRY: Duration = Duration::from_secs(15);
+        let now = Instant::now();
+        let ask: Vec<u64> = live
+            .state
+            .iter()
+            .filter(|entity| entity.guid != live.guid && entity.will_talk())
+            .map(|entity| entity.guid)
+            .filter(|guid| !self.quest_marks.contains_key(guid))
+            .filter(|guid| {
+                self.quest_marks_asked
+                    .get(guid)
+                    .is_none_or(|sent| now.duration_since(*sent) >= MARK_RETRY)
+            })
+            .take(MARKS_PER_FRAME)
+            .collect();
+        for guid in ask {
+            match live.connection.query_questgiver_status(guid) {
+                Ok(()) => {
+                    self.quest_marks_asked.insert(guid, now);
+                }
+                Err(e) => {
+                    tracing::warn!("asking what mark {guid:#018x} wears failed: {e:#}");
+                    break;
+                }
+            }
+        }
+
         // **A question with no answer has to stop being a question.** Without
         // this the log would draw "asking the server..." for the rest of the
         // session, which is the state that looks like a hang rather than like
@@ -5582,6 +5674,61 @@ impl App {
         );
 
         // Where to bracket the selection.
+        // The `!` and `?` over questgivers, projected the same way the
+        // selection bracket is -- through `marker_rect`, from the very box a
+        // click is tested against, so a mark cannot float away from the
+        // creature it belongs to.
+        let quest_marks: Vec<(egui::Rect, ui::frames::QuestMark)> = match (
+            self.live.as_ref(),
+            r.scene.as_ref(),
+        ) {
+            (Some(live), Some(Scene::Streaming(world))) => self
+                .quest_marks
+                .iter()
+                .filter_map(|(guid, mark)| {
+                    let mark = match mark {
+                        ::world::quest::QuestgiverMark::Available => {
+                            ui::frames::QuestMark::Available
+                        }
+                        ::world::quest::QuestgiverMark::AvailableTrivial => {
+                            ui::frames::QuestMark::AvailableTrivial
+                        }
+                        ::world::quest::QuestgiverMark::Incomplete => {
+                            ui::frames::QuestMark::Incomplete
+                        }
+                        ::world::quest::QuestgiverMark::Complete => {
+                            ui::frames::QuestMark::Complete
+                        }
+                        // Nothing to say, or a value nobody has named. Both
+                        // draw nothing; see `world::quest::QuestgiverMark`.
+                        _ => return None,
+                    };
+                    let entity = live.state.get(*guid)?;
+                    // A dead questgiver has nothing to offer until it gets
+                    // back up, and a mark over a corpse reads as a bug.
+                    if entity.is_dead_or_ghost() {
+                        return None;
+                    }
+                    let at = entity.interpolated_position(std::time::Instant::now())?;
+                    let display_id = entity.display_id()?;
+                    let scale = entity
+                        .fields
+                        .get_f32(::world::update::fields::OBJECT_SCALE)
+                        .filter(|s| *s > 0.0)
+                        .unwrap_or(1.0);
+                    let rect = hud::marker_rect(
+                        &self.camera,
+                        viewport,
+                        glam::Vec3::new(at.x, at.y, at.z),
+                        scale,
+                        world.entity_bounds(display_id),
+                    )?;
+                    Some((rect, mark))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
         let target_marker = self.target.and_then(|guid| {
             let Some(Scene::Streaming(world)) = r.scene.as_ref() else {
                 return None;
@@ -6062,6 +6209,7 @@ impl App {
                     player: player.as_ref(),
                     target: target.as_ref(),
                     target_marker,
+                    quest_marks: &quest_marks,
                     corpse_marker,
                     combat_text: &combat_text,
                     chat: &chat,

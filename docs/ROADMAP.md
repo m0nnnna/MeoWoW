@@ -4221,3 +4221,66 @@ was a press and release *in the same place*, which is exactly what a pinned
 pointer produces for every drag. It is now distance **travelled** since the
 press, which is also the more honest question: a gesture that swings the camera
 around and comes back is a drag by any reading.
+
+### 4.17 continued: the marks over questgivers, and a window nobody could press
+
+#### A window sealed under another one
+
+The Accept button stopped working, and it was not the button. Every frame is an
+egui area of the same order, so the one built last is on top -- and the map is
+760 by 520 in the middle of the screen, exactly where a questgiver's scroll
+grows down into. With both open the button was drawn, hit-tested, and
+unreachable, which reads as a window that has stopped working rather than as
+one that is behind something.
+
+Frames now draw in an explicit order, ranked by **how much answering them
+matters**: the map at the bottom, the panels you open and close above it, then
+the frames that are simply always there -- health, target, chat, the bars,
+which no window may ever eat a click meant for -- and on top the windows that
+appeared because something happened and want an answer: a corpse, a
+questgiver, a death. The live bug is now a headless test that asserts the two
+windows really do overlap before it asserts the click gets through, because a
+test whose premise has quietly stopped holding passes for the wrong reason.
+
+#### `!` and `?`, and an enum that was measured rather than remembered
+
+`CMSG_QUESTGIVER_STATUS_QUERY` (`0x0182`) asks what mark belongs over one NPC's
+head and `SMSG_QUESTGIVER_STATUS` (`0x0183`) answers in nine bytes: the guid,
+and one status byte. **The guid coming back is the confirmation** -- nothing
+acknowledges an outgoing opcode, and twenty-nine requests in one run each came
+back naming the NPC they were about.
+
+The byte is an enum with more values than this client has ever seen, and
+writing the rest down from memory is the urge that produced `CHAT_MSG_SAY =
+0x00`. So a character was created from nothing and the same four questgivers
+were asked about after each change to its state:
+
+| byte | the state that produced it | mark |
+|---|---|---|
+| 0 | an innkeeper with no quests; a questgiver whose quests are gated behind one not yet done | none |
+| 2 | the same available quest, asked after `.levelup 25` | grey `!` |
+| 5 | quest 7 in the log with none of its eight kobolds killed, asked at its ender | grey `?` |
+| 8 | quest 783 on offer to a fresh level-one human | yellow `!` |
+| 10 | quest 783 in the log and finished, asked at its ender | yellow `?` |
+
+Anything else parses to `Unknown(n)`, draws nothing, and says so in the log
+once -- a mark invented for a value nobody has produced would send a player
+somewhere for no reason.
+
+**Why ask at all, rather than work it out from the quest tables?** Because
+whether a quest can be taken depends on level, race, class, reputation, every
+prerequisite in its chain and whatever the realm has been scripted to check. A
+client deciding that for itself would be reimplementing the server's
+eligibility rules, and would be wrong on exactly the realms this client is
+developed against.
+
+**Every mark is thrown away when the quest log changes.** Taking a quest turns
+its giver's exclamation into nothing and its ender's nothing into a question
+mark, and the server volunteers neither. Asking once and keeping the answer
+would leave an exclamation over an NPC with nothing left to give, which is
+worse than no mark at all.
+
+`SMSG_QUESTGIVER_STATUS_MULTIPLE` is **not** used: the request went out in the
+same runs and nothing ever came back, so the one-guid form is what this client
+has evidence for. Per-guid asking is capped at six a frame with a retry window,
+the same shape every other query here uses.

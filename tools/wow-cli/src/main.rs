@@ -417,6 +417,22 @@ enum Command {
         /// is printed alongside.
         #[arg(long)]
         quest_poi: bool,
+        /// Ask what mark belongs over every nearby NPC's head.
+        ///
+        /// **A probe for two opcodes at once, and the pair is the point.**
+        /// `CMSG_QUESTGIVER_STATUS_QUERY` asks about one guid and
+        /// `CMSG_QUESTGIVER_STATUS_MULTIPLE_QUERY` asks about everything in
+        /// range with an empty body; sending both in one run means a silence
+        /// from either is bounded by the other's answer rather than being one
+        /// more thing that might be a wrong opcode.
+        ///
+        /// The status numbers are printed raw and **not named**, because what
+        /// each value means is exactly what this exists to find out: run it
+        /// against NPCs whose state you already know -- one offering a quest,
+        /// one whose quest is in your log unfinished, one with nothing to say
+        /// -- and the numbers name themselves.
+        #[arg(long)]
+        questgiver_status: bool,
         /// Ask what a quest actually is: title, objectives, rewards.
         ///
         /// **The backbone of the whole quest feature.** Unlike the details a
@@ -954,6 +970,7 @@ fn main() -> Result<()> {
             quest_sweep,
             quest_log,
             quest_poi,
+            questgiver_status,
             quest_info,
             target,
             own_fields,
@@ -1005,6 +1022,7 @@ fn main() -> Result<()> {
                 quest_sweep: *quest_sweep,
                 quest_log: *quest_log,
                 quest_poi: *quest_poi,
+                questgiver_status: *questgiver_status,
                 quest_info,
 
                 target: target.as_deref(),
@@ -1180,6 +1198,7 @@ struct WorldRequest<'a> {
     quest_sweep: Option<u32>,
     quest_log: bool,
     quest_poi: bool,
+    questgiver_status: bool,
     quest_info: &'a [u32],
     target: Option<&'a str>,
     own_fields: bool,
@@ -1279,6 +1298,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         quest_sweep,
         quest_log,
         quest_poi,
+        questgiver_status,
         quest_info,
         target,
         own_fields,
@@ -2109,6 +2129,10 @@ cast {spell_id} at {} (attempt {attempt})",
 
         if quest_poi {
             survey_quest_poi(&mut connection, &mut state, character.guid, data, locale)?;
+        }
+
+        if questgiver_status {
+            survey_questgiver_status(&mut connection, &mut state, character.guid)?;
         }
 
         for quest in quest_info {
@@ -3356,6 +3380,146 @@ no answer. A quest query needs no NPC and no log entry, so");
 /// anybody's quest database. If it comes back empty, that plan needs
 /// rethinking, so the command is deliberately loud about which of the two
 /// reasons an empty answer has.
+/// Asks what mark belongs over every nearby NPC's head, both ways.
+///
+/// **Two sends, because a silence from one is bounded by the other's answer.**
+/// Nothing acknowledges an outgoing opcode, so a wrong number and a request
+/// the server declined look identical -- exactly the trap that cost three runs
+/// on `CMSG_BUY_ITEM`. Asking per guid and asking for everything at once are
+/// separate opcodes with separate replies, and either arriving proves the
+/// numbering of that half.
+///
+/// Statuses are printed raw. What each value means is the question, and the
+/// answer comes from running this against NPCs whose state is already known.
+fn survey_questgiver_status(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+) -> Result<()> {
+    let talkers: Vec<(u64, u32, u32)> = state
+        .iter()
+        .filter(|entity| entity.guid != own_guid)
+        .filter(|entity| entity.will_talk())
+        .map(|entity| {
+            (
+                entity.guid,
+                entity
+                    .fields
+                    .get(world::update::fields::OBJECT_ENTRY)
+                    .unwrap_or(0),
+                entity.npc_flags().unwrap_or(0),
+            )
+        })
+        .collect();
+
+    println!("\n{} talker(s) in range", talkers.len());
+    if talkers.is_empty() {
+        println!("  nothing to ask about, which makes a silence below mean nothing.");
+        println!("  Put one in reach: --say \".npc add 823\"");
+        return Ok(());
+    }
+
+    for (guid, entry, flags) in &talkers {
+        connection.query_questgiver_status(*guid)?;
+        println!("  asked about {guid:#018x} entry {entry} npcflag {flags} ({flags:#x})");
+    }
+    connection.query_questgiver_status_multiple()?;
+    println!("  asked about everything in range at once");
+
+    let batch = connection.drain(std::time::Duration::from_millis(3000), 256)?;
+    state.replicate(&batch, None);
+
+    let singles: Vec<_> = batch
+        .iter()
+        .filter(|p| p.opcode == world::opcode::server::QUESTGIVER_STATUS)
+        .collect();
+    let multiple: Vec<_> = batch
+        .iter()
+        .filter(|p| p.opcode == world::opcode::server::QUESTGIVER_STATUS_MULTIPLE)
+        .collect();
+
+    println!(
+        "\n{} single reply(s), {} multiple reply(s)",
+        singles.len(),
+        multiple.len()
+    );
+    if singles.is_empty() && multiple.is_empty() {
+        println!("  nothing came back at all -- a wrong opcode, a wrong body, or a");
+        println!("  server that answers neither. Every opcode that did arrive:");
+        let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+        for packet in &batch {
+            *seen.entry(packet.opcode).or_default() += 1;
+        }
+        for (opcode, count) in seen {
+            println!("    {:<32} x{count}", world::opcode::describe(opcode));
+        }
+        return Ok(());
+    }
+
+    let name_of = |guid: u64| -> String {
+        state
+            .get(guid)
+            .and_then(|e| e.fields.get(world::update::fields::OBJECT_ENTRY))
+            .map(|entry| format!("entry {entry}"))
+            .unwrap_or_else(|| "not replicated".into())
+    };
+
+    for packet in &singles {
+        println!(
+            "\nSMSG_QUESTGIVER_STATUS, {} bytes: {}",
+            packet.body.len(),
+            packet
+                .body
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        if packet.body.len() >= 9 {
+            let guid = u64::from_le_bytes(packet.body[..8].try_into().unwrap());
+            println!(
+                "  guid {guid:#018x} ({})  status byte {}",
+                name_of(guid),
+                packet.body[8]
+            );
+        }
+    }
+
+    for packet in &multiple {
+        println!(
+            "\nSMSG_QUESTGIVER_STATUS_MULTIPLE, {} bytes",
+            packet.body.len()
+        );
+        if packet.body.len() < 4 {
+            continue;
+        }
+        let count = u32::from_le_bytes(packet.body[..4].try_into().unwrap());
+        println!("  {count} entries");
+        // Nine bytes each if the status is a byte, twelve if it is a `u32`.
+        // Both are printed rather than one assumed: the arithmetic below says
+        // which reading the length agrees with, and a reading that does not
+        // divide the body exactly is wrong however plausible it looks.
+        let rest = packet.body.len() - 4;
+        for (width, label) in [(9usize, "u64 + u8"), (12, "u64 + u32")] {
+            if count > 0 && rest == count as usize * width {
+                println!("  body divides exactly as {count} x {width} bytes ({label})");
+                for i in 0..count as usize {
+                    let at = 4 + i * width;
+                    let guid = u64::from_le_bytes(packet.body[at..at + 8].try_into().unwrap());
+                    let status = if width == 9 {
+                        u32::from(packet.body[at + 8])
+                    } else {
+                        u32::from_le_bytes(packet.body[at + 8..at + 12].try_into().unwrap())
+                    };
+                    println!("    guid {guid:#018x} ({})  status {status}", name_of(guid));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn survey_quest_poi(
     connection: &mut world::Connection,
     state: &mut world::WorldState,

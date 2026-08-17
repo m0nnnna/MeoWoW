@@ -75,6 +75,12 @@ pub struct HudData<'a> {
     /// `None` while alive, while a ghost's query has not yet been answered,
     /// or while the corpse is behind the camera.
     pub corpse_marker: Option<egui::Rect>,
+    /// The `!` and `?` over questgivers, each with the screen box of the unit
+    /// it belongs to. World-anchored like the two markers above, and resolved
+    /// by the caller: which mark an NPC gets is the *server's* answer to
+    /// `CMSG_QUESTGIVER_STATUS_QUERY`, not something this crate could work
+    /// out.
+    pub quest_marks: &'a [(egui::Rect, frames::QuestMark)],
     /// Damage numbers in flight, world-anchored like the target marker rather
     /// than placed by an [`Element`] -- see [`frames::combat_text`].
     pub combat_text: &'a [frames::combat_text::FloatingText],
@@ -408,6 +414,28 @@ impl Hud {
             frames::marker::draw(&painter, rect, style.corpse_marker, style.target_marker_width);
         }
 
+        // The exclamations and question marks over questgivers. Same layer
+        // treatment and the same reason: a mark floats over a creature, and
+        // claiming its rectangle for the interface would make the creature
+        // underneath unclickable -- which for a questgiver would mean the mark
+        // saying "talk to me" was the thing preventing it.
+        if style.show_quest_marks && !data.quest_marks.is_empty() {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("hud-quest-marks"),
+            ));
+            for (rect, mark) in data.quest_marks {
+                frames::quest_mark::draw(
+                    &painter,
+                    *rect,
+                    *mark,
+                    style.quest_mark_bright.into(),
+                    style.quest_mark_dim.into(),
+                    style.quest_mark_size,
+                );
+            }
+        }
+
         // Also drawn straight onto a layer and never added to `occupied`, for
         // the same reason as the target marker above: a damage number sits
         // over a creature, and claiming that rectangle for the interface
@@ -420,7 +448,11 @@ impl Hud {
             frames::combat_text::draw(&painter, data.combat_text, &style);
         }
 
-        for id in ElementId::ALL {
+        // **Bottom of the interface first**, so a window that wants an answer
+        // is never sealed under one that was only being read. See
+        // [`ElementId::stacking`] -- egui stacks same-order areas by the order
+        // they are built, which makes this loop's sequence the z-order.
+        for id in ElementId::in_draw_order() {
             let element = self.profile.get(id);
             if !element.visible {
                 continue;
@@ -2166,6 +2198,67 @@ mod tests {
     /// hit test that disagreed with the drawing would decline quests the
     /// player meant to take. Driven through the real event loop, which is also
     /// what proves the frame is in the `Sense::click()` list at all.
+    /// **A window you have to answer must not be sealed under one you were
+    /// only reading.** The map is the largest frame in the interface and sits
+    /// dead centre; the questgiver window is anchored to the top edge and
+    /// grows down into the same space. With both open, every frame is an egui
+    /// area of the same order, so whichever is built last is on top -- and the
+    /// Accept button was underneath, which reads as a window that has stopped
+    /// working rather than as one that is behind something.
+    #[test]
+    fn the_accept_button_works_with_the_map_open_over_it() {
+        // A real quest scroll, not a one-liner: Northshire's own run to
+        // several paragraphs, and the window grows down into the map's space
+        // exactly because the text is long.
+        let view = frames::QuestgiverView::Quest {
+            id: 783,
+            title: "A Threat Within".into(),
+            body: (0..14)
+                .map(|line| format!("Line {line} of what the questgiver says."))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            objectives: vec!["Speak with Marshal McBride.".into()],
+            rewards: vec!["item 2224 x1".into()],
+            action: frames::QuestgiverAction::Accept,
+        };
+        let map = map_view();
+        let data = HudData {
+            questgiver: Some(&view),
+            world_map: Some(&map),
+            ..Default::default()
+        };
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::Questgiver);
+        let rect = element.rect(
+            screen(),
+            frames::questgiver::size(&view, &hud.profile.style, element.scale),
+        );
+        let (accept, _) = frames::questgiver::button_rects(rect, &hud.profile.style, element.scale);
+        // The premise of the test: the two windows really do overlap where the
+        // button is, or this proves nothing about stacking.
+        let map_element = hud.profile.get(ElementId::WorldMap);
+        let map_rect = map_element.rect(
+            screen(),
+            frames::world_map::size(&hud.profile.style, map_element.scale),
+        );
+        assert!(
+            map_rect.contains(accept.center()),
+            "the map at {map_rect:?} does not cover the Accept button at {:?}",
+            accept.center()
+        );
+
+        let response = drive(
+            &mut hud,
+            &data,
+            &click_script(accept.center(), egui::PointerButton::Primary),
+        );
+        assert_eq!(response.questgiver.acted, Some(783));
+    }
+
+    /// Accept and Close sit side by side, so a hit test that disagreed with
+    /// the drawing would decline quests the player meant to take.
     #[test]
     fn pressing_accept_reports_the_quest_and_pressing_close_does_not() {
         let view = frames::QuestgiverView::Quest {
