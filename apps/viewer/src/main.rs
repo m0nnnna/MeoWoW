@@ -564,15 +564,45 @@ fn live_pace(moving: ::world::motion::Motion) -> f32 {
         // Backing up is the only direction with its own speed *and* its own
         // cycle.
         Some(Axis::Negative) => -LIVE_BACK_SPEED,
-        // **Strafing is folded in here on purpose**, and the comment that used
-        // to sit at this spot -- "strafing sideways uses the run" -- was right
-        // after all. Sidestepping was briefly given the `Shuffle` cycles and
-        // came straight back from play as the character shimmying, which is
-        // what those cycles are: they advance the character by 0.00 and
-        // `AnimationData` falls them back to Stand. A character travelling at
-        // the run speed plays the run, whichever way it is pointing.
-        _ if moving.is_moving() => LIVE_RUN_SPEED,
+        // Running forward, with or without a sideways component: a diagonal
+        // is mostly a run and the run is what the original plays for it.
+        Some(Axis::Positive) => LIVE_RUN_SPEED,
+        // **Pure sidestepping reports no forward travel**, so the sidestep
+        // cycles below get their chance.
+        //
+        // This has been flipped once in each direction and both reports were
+        // right about what they saw. Given the `Shuffle` cycles it was called
+        // shimmying; given the run it was called "running sideways plays the
+        // forward animation". The art is the tie-breaker and it is blunter
+        // than either fix assumed: `HumanMale.m2` has `Walk`, `Run`,
+        // `Walkbackwards`, and `ShuffleLeft`/`ShuffleRight` at 500ms which
+        // advance the character by 0.00. **There is no sideways run in the
+        // game's own data**, so the honest choice is the cycle that is at
+        // least a sidestep, played while the movement system does the
+        // travelling -- exactly as `Walkbackwards` already works.
+        None if moving.is_moving() => 0.0,
         _ => 0.0,
+    }
+}
+
+/// Which way the character is sidestepping, signed, left positive.
+///
+/// Separate from [`live_turning`] because the two are different gestures that
+/// happen to share a cycle: turning on the spot with `A`/`D` and strafing with
+/// `Q`/`E`. Reporting them through one function would mean a caller could not
+/// tell which is happening, and the day they need different animations that
+/// distinction is the whole change.
+fn live_strafe(moving: ::world::motion::Motion) -> f32 {
+    use ::world::motion::Axis;
+    // Only while there is no forward or backward travel. A diagonal run is a
+    // run, and a sidestep laid over one is the shimmy that was reported.
+    if moving.longitudinal().is_some() {
+        return 0.0;
+    }
+    match moving.lateral() {
+        Some(Axis::Positive) => 1.0,
+        Some(Axis::Negative) => -1.0,
+        None => 0.0,
     }
 }
 
@@ -3282,7 +3312,13 @@ impl App {
                     // walk toggle here, and `LIVE_RUN_SPEED` is the run speed.
                     let pace = (
                         live_pace(self.live_move),
-                        live_turning(self.keys, self.steering, self.live_move),
+                        // Turning on the spot and sidestepping share the
+                        // shuffle cycles, and only one of them can be
+                        // happening: `live_strafe` reports nothing while the
+                        // character is travelling, and `live_turning` reports
+                        // nothing while it is moving at all.
+                        live_turning(self.keys, self.steering, self.live_move)
+                            + live_strafe(self.live_move),
                     );
                     // F2. See `App::entity_flip`.
                     let flip = if self.entity_flip { std::f32::consts::PI } else { 0.0 };
@@ -4953,9 +4989,20 @@ impl App {
         let r = self.renderer.as_ref()?;
         // A click on the interface belongs to the interface: clicking a health
         // bar must not target whatever is standing behind it.
+        //
+        // **Logged, because "the window ignored my click" and "the click went
+        // past the window into the world" are the same report and want
+        // opposite investigations.** One says the frame's own handler is not
+        // reading the click; the other says the interface never claimed the
+        // rectangle at all.
         if self.hud.captures_pointer(&r.egui_ctx) {
+            tracing::debug!("click at {at:?} belongs to the interface");
             return None;
         }
+        tracing::debug!(
+            "click at {at:?} goes to the world; the interface claims {} rectangle(s)",
+            self.hud.occupied_count()
+        );
         let (Some(live), Some(Scene::Streaming(world))) = (self.live.as_ref(), r.scene.as_ref())
         else {
             return None;
@@ -4973,7 +5020,8 @@ impl App {
             live,
             (
                 live_pace(self.live_move),
-                live_turning(self.keys, self.steering, self.live_move),
+                live_turning(self.keys, self.steering, self.live_move)
+                    + live_strafe(self.live_move),
             ),
             self.jump.is_some(),
         );
@@ -6391,6 +6439,20 @@ impl App {
             self.selected_quest = (self.selected_quest != Some(quest)).then_some(quest);
         }
 
+        // **Logged whenever the window reports anything at all**, so a click
+        // that reached the frame and one that never did can be told apart
+        // from the log alone. Rare -- a press of a button, not a frame event.
+        if hud_response.questgiver.picked.is_some()
+            || hud_response.questgiver.acted.is_some()
+            || hud_response.questgiver.closed
+        {
+            tracing::info!(
+                "questgiver window: picked {:?}, acted {:?}, closed {}",
+                hud_response.questgiver.picked,
+                hud_response.questgiver.acted,
+                hud_response.questgiver.closed
+            );
+        }
         if let Some(quest) = hud_response.questgiver.picked {
             if let Some(questgiver) = self.questgiver.as_mut() {
                 questgiver.showing = Some(quest);

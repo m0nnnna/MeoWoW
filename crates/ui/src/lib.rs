@@ -371,6 +371,14 @@ impl Hud {
     /// Answered from the rectangles this crate drew last frame plus egui's own
     /// opinion about its windows -- see [`Hud::occupied`] for why the second
     /// alone is not enough.
+    /// How many rectangles the interface drew into last frame. For a caller
+    /// reporting why a click went where it did -- an interface that claims
+    /// nothing and one whose handler ignored a click look identical from
+    /// outside.
+    pub fn occupied_count(&self) -> usize {
+        self.occupied.len()
+    }
+
     pub fn captures_pointer(&self, ctx: &egui::Context) -> bool {
         if ctx.egui_wants_pointer_input() {
             return true;

@@ -1135,6 +1135,35 @@ fn compose(chain: &mut Chain, sections: &CharSections, look: Appearance) -> Opti
         }
     }
 
+    // **The scalp, which is the half of a hairstyle that is not a mesh.**
+    // A hair row carries three textures, not one: the first dresses the hair
+    // *geoset*, and the other two are `ScalpLower`/`ScalpUpper`, painted onto
+    // the head the same way the face halves are. Without them a character
+    // wears floating hair over a bare scalp -- no hairline, no sideburns, no
+    // shaved back-and-sides -- and the styles that are mostly scalp render as
+    // very nearly nothing at all, which reads as "that hairstyle is missing".
+    //
+    // Indexed by hair colour, like the beard above and unlike the face: a
+    // hairline is hair.
+    if let Some(row) = row_for(
+        sections,
+        look.race,
+        look.gender,
+        3,
+        look.hair_style,
+        look.hair_colour,
+    ) {
+        // **Columns 1 and 2, not 0.** Column 0 dresses the hair *geoset* and
+        // painting it onto the head would put a sheet of hair texture across
+        // the face.
+        if let Some(l) = layer(chain, row.1.as_str()) {
+            blend(&mut skin, region::FACE_LOWER, l);
+        }
+        if let Some(l) = layer(chain, row.2.as_str()) {
+            blend(&mut skin, region::FACE_UPPER, l);
+        }
+    }
+
     // Underwear. Not modesty for its own sake: the base skin has no smallclothes
     // painted on, so without this the character is nude.
     if let Some(row) = row_for(sections, look.race, look.gender, 4, 0, look.skin) {
@@ -1146,7 +1175,13 @@ fn compose(chain: &mut Chain, sections: &CharSections, look: Appearance) -> Opti
     Some(skin)
 }
 
-/// A section row's first two texture columns.
+/// A section row's three texture columns.
+///
+/// **All three, because which two matter depends on the section.** A face
+/// splits its lower and upper halves across columns 0 and 1; a hair row puts
+/// the mesh's own texture in column 0 and the scalp halves in 1 and 2. A
+/// helper that returned "the first two" made that impossible to say, and the
+/// scalp went unpainted for as long as it did partly because of it.
 fn row_for(
     sections: &CharSections,
     race: u8,
@@ -1154,7 +1189,7 @@ fn row_for(
     section_type: u32,
     variation: u8,
     colour: u8,
-) -> Option<(String, String)> {
+) -> Option<(String, String, String)> {
     sections
         .iter()
         .find(|row| {
@@ -1164,7 +1199,13 @@ fn row_for(
                 && row.variation() == u32::from(variation)
                 && row.colour() == u32::from(colour)
         })
-        .map(|row| (row.texture_0().to_string(), row.texture_1().to_string()))
+        .map(|row| {
+            (
+                row.texture_0().to_string(),
+                row.texture_1().to_string(),
+                row.texture_2().to_string(),
+            )
+        })
 }
 
 /// One `CharSections` row's first texture, if it exists.
