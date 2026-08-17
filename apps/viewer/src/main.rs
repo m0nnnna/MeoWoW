@@ -1960,6 +1960,18 @@ const MAIN_HAND_SLOT: usize = 15;
 /// a click rather than as a look.
 const CLICK_SLOP: f64 = 4.0;
 
+/// Whether a gesture that moved this far was a click.
+///
+/// **Distance travelled, not the distance between press and release**, and the
+/// difference is the whole reason this is a function. While a drag holds the
+/// pointer the camera is turned by raw device movement and the pointer itself
+/// does not go anywhere, so every drag would end exactly where it began --
+/// measured end to end, a full turn of the camera is a click on whatever was
+/// under the cursor when it started.
+fn was_click(travel: f64) -> bool {
+    travel <= CLICK_SLOP
+}
+
 /// The action-bar slot a key drives, if any.
 ///
 /// The number row in order, `1` through `=`. Matched on the *physical* key
@@ -2667,6 +2679,22 @@ impl ApplicationHandler for App {
         self.window = Some(window);
     }
 
+    /// Raw mouse movement, independent of where the pointer is.
+    ///
+    /// Only used while a drag holds the pointer -- see [`App::device_motion`].
+    /// Outside a drag the position-based `CursorMoved` is the right event,
+    /// because what matters then is what the pointer is *over*.
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device: winit::event::DeviceId,
+        event: winit::event::DeviceEvent,
+    ) {
+        if let winit::event::DeviceEvent::MouseMotion { delta } = event {
+            self.device_motion(delta.0, delta.1);
+        }
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -2773,7 +2801,7 @@ impl ApplicationHandler for App {
                     // captured pointer is pinned and so ends every drag exactly
                     // where it began.
                     if let Some(press) = self.press_at.take() {
-                        if self.left_travel <= CLICK_SLOP {
+                        if was_click(self.left_travel) {
                             self.click_at(press);
                         }
                     }
@@ -2820,7 +2848,7 @@ impl ApplicationHandler for App {
                     self.capture_cursor(&window);
                 } else {
                     if let Some(press) = self.right_press_at.take() {
-                        if self.right_travel <= CLICK_SLOP {
+                        if was_click(self.right_travel) {
                             self.right_click_at(press);
                         }
                     }
@@ -3013,9 +3041,19 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let now = (position.x, position.y);
-                // Travel per held button, before anything else reads the
-                // movement -- the warp that pins a captured pointer sets
-                // `last_cursor` itself and so contributes a zero step here.
+                // **While the pointer is held, this event does not turn
+                // anything.** The camera is driven by `device_motion` from raw
+                // deltas instead, and letting both act would double every
+                // movement -- so this branch only keeps `last_cursor` current
+                // for the click that ends the gesture.
+                if self.cursor_captured {
+                    self.last_cursor = Some(now);
+                    window.request_redraw();
+                    return;
+                }
+                // Travel per held button. A gesture that is *not* captured --
+                // a press egui took, or a platform that refused the grab --
+                // still has to be told from a click.
                 if let Some(prev) = self.last_cursor {
                     let step = ((now.0 - prev.0).powi(2) + (now.1 - prev.1).powi(2)).sqrt();
                     if self.press_at.is_some() {
@@ -3060,7 +3098,6 @@ impl ApplicationHandler for App {
                         .clamp(-FOLLOW_PITCH_LIMIT, FOLLOW_PITCH_LIMIT);
                     }
                     self.last_cursor = Some(now);
-                    self.pin_cursor(&window);
                     window.request_redraw();
                     return;
                 }
@@ -3106,7 +3143,6 @@ impl ApplicationHandler for App {
                     }
                 }
                 self.last_cursor = Some(now);
-                self.pin_cursor(&window);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let notches = match delta {
@@ -3130,6 +3166,17 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // **The invariant, checked where it cannot be skipped.** A
+                // captured pointer is invisible and confined, so a gesture
+                // whose release never arrived -- swallowed by a window that
+                // opened under the cursor, or lost with the focus -- would
+                // leave the interface unusable with nothing on screen saying
+                // why. Every path that ends a drag already releases it; this
+                // is the one that catches the path nobody thought of.
+                if self.cursor_captured && !self.dragging && !self.steering {
+                    tracing::debug!("the pointer was still held with no button down");
+                    self.release_cursor(&window);
+                }
                 self.redraw(&window);
                 window.request_redraw();
             }
@@ -4421,27 +4468,78 @@ impl App {
         self.cursor_captured = false;
     }
 
-    /// Puts a captured pointer back on its anchor after a movement.
+    /// Turns the camera from a raw device movement, while the pointer is held.
     ///
-    /// This is what makes a turn unlimited: every frame of the drag reads a
-    /// delta and then the pointer is returned to the middle of the gesture, so
-    /// it never reaches an edge. `last_cursor` moves with it, so the next
-    /// delta is measured from the anchor and the warp itself contributes
-    /// nothing -- the event it generates arrives with the position already
-    /// recorded here.
-    fn pin_cursor(&mut self, window: &Window) {
+    /// **This exists because warping the pointer back to its anchor did not
+    /// work, and the way it failed is worth keeping.** The first version read
+    /// deltas from `CursorMoved` and then put the pointer back, so a drag
+    /// could never run out of window. But a warp is a request to the OS whose
+    /// own move event arrives later, and any real movement already queued
+    /// behind it is then measured against the anchor rather than against where
+    /// the pointer actually was -- so the camera jumped instead of turning.
+    /// Worse, egui saw the pointer teleporting on every frame of a drag, and a
+    /// widget that is somewhere else by the time the release lands cannot be
+    /// clicked: the whole interface stopped responding.
+    ///
+    /// A raw device delta has no position in it at all, so there is nothing to
+    /// fight over: the pointer sits still against the edge of the window while
+    /// the mouse keeps reporting movement, and both the camera and egui get an
+    /// honest answer.
+    fn device_motion(&mut self, dx: f64, dy: f64) {
         if !self.cursor_captured {
             return;
         }
-        let Some((x, y)) = self.capture_anchor else {
+        // The gesture is still measured, so a press and release that moved the
+        // mouse is a look rather than a click even though the pointer never
+        // left the spot.
+        let step = (dx * dx + dy * dy).sqrt();
+        if self.press_at.is_some() {
+            self.left_travel += step;
+        }
+        if self.right_press_at.is_some() {
+            self.right_travel += step;
+        }
+
+        let Some(window) = self.window.clone() else {
             return;
         };
-        if window
-            .set_cursor_position(winit::dpi::PhysicalPosition::new(x, y))
-            .is_ok()
-        {
-            self.last_cursor = Some((x, y));
+        let speed = self
+            .hud
+            .profile
+            .camera
+            .radians_per_pixel(window.inner_size().width as f32);
+        let (turn, pitch) = (-dx as f32 * speed, dy as f32 * speed);
+        if self.steering {
+            // Right drag steers the character; the camera follows its facing.
+            // See the `CursorMoved` branch this mirrors for why the swing is
+            // folded away on the first movement rather than at the press.
+            self.camera_yaw_offset = 0.0;
+            if let Some(live) = self.live.as_mut() {
+                live.orientation = (live.orientation + turn).rem_euclid(std::f32::consts::TAU);
+            }
+            self.camera_pitch = (self.camera_pitch
+                - pitch * self.hud.profile.camera.pitch_sign())
+            .clamp(-FOLLOW_PITCH_LIMIT, FOLLOW_PITCH_LIMIT);
+            window.request_redraw();
+            return;
         }
+        if !self.dragging {
+            return;
+        }
+        let following = self.live.is_some();
+        match &mut self.camera {
+            Camera::Orbit(c) => c.orbit(turn, pitch),
+            Camera::Fly(_) if following => {}
+            Camera::Fly(c) => c.look(turn, -pitch),
+        }
+        if following {
+            self.camera_yaw_offset =
+                (self.camera_yaw_offset + turn).rem_euclid(std::f32::consts::TAU);
+            self.camera_pitch = (self.camera_pitch
+                - pitch * self.hud.profile.camera.pitch_sign())
+            .clamp(-FOLLOW_PITCH_LIMIT, FOLLOW_PITCH_LIMIT);
+        }
+        window.request_redraw();
     }
 
     /// Selects whatever is under the cursor, and tells the server.
@@ -6171,6 +6269,25 @@ impl App {
                 .handle_platform_output(window, output.platform_output.clone());
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod gesture_tests {
+    use super::*;
+
+    /// **A pinned pointer ends every drag where it began**, so the click test
+    /// cannot be about where the release happened. Both halves are asserted:
+    /// a gesture that barely moved is still a click, or the rule would have
+    /// turned every click in the game into a look.
+    #[test]
+    fn travel_tells_a_click_from_a_look() {
+        assert!(was_click(0.0), "a press and release that never moved");
+        assert!(was_click(CLICK_SLOP), "a hand that shook a little");
+        assert!(!was_click(CLICK_SLOP + 0.1));
+        // A full turn of the camera: hundreds of pixels of movement, and the
+        // pointer back exactly where it started.
+        assert!(!was_click(900.0));
     }
 }
 
