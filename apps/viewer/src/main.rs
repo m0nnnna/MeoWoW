@@ -551,37 +551,70 @@ const LIVE_RUN_SPEED: f32 = 7.0;
 /// off the wire is the right fix and is not this one.
 const LIVE_BACK_SPEED: f32 = 4.5;
 
-/// How fast the character is travelling for the keys currently held, **signed**
-/// so the renderer can tell retreating from advancing.
+/// What the keys currently held mean for the body: how fast it travels, and
+/// what its animation should read.
 ///
-/// One function rather than a constant at each site, because the two uses have
-/// to agree: the number that moves the character and the number that chooses
-/// its animation. They did not, and the result was a character reversing at a
-/// full run with the forward run cycle playing.
-fn live_pace(moving: ::world::motion::Motion) -> f32 {
+/// **These were one number, and making them one number was itself a fix.** The
+/// comment that used to sit here said the two uses "have to agree: the number
+/// that moves the character and the number that chooses its animation. They
+/// did not, and the result was a character reversing at a full run with the
+/// forward run cycle playing." That was correct, and it stayed correct right
+/// up until a sidestep needed to travel at one speed and animate as though it
+/// were not travelling at all -- at which point the rule that fixed one bug
+/// caused the next one, and the character stopped moving sideways entirely.
+///
+/// So they are two numbers now, returned together from one function, which is
+/// the same protection expressed differently: a reader changing one has the
+/// other in front of them, and no call site can pick a speed out of the air.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Gait {
+    /// Units per second along the direction the keys chose. Signed, so a
+    /// caller that wants a magnitude asks for one.
+    travel: f32,
+    /// What the animation chooser reads. Equal to [`Gait::travel`] in every
+    /// case but the sidestep.
+    pace: f32,
+}
+
+fn live_gait(moving: ::world::motion::Motion) -> Gait {
     use ::world::motion::Axis;
     match moving.longitudinal() {
         // Backing up is the only direction with its own speed *and* its own
         // cycle.
-        Some(Axis::Negative) => -LIVE_BACK_SPEED,
+        Some(Axis::Negative) => Gait {
+            travel: -LIVE_BACK_SPEED,
+            pace: -LIVE_BACK_SPEED,
+        },
         // Running forward, with or without a sideways component: a diagonal
         // is mostly a run and the run is what the original plays for it.
-        Some(Axis::Positive) => LIVE_RUN_SPEED,
-        // **Pure sidestepping reports no forward travel**, so the sidestep
-        // cycles below get their chance.
+        Some(Axis::Positive) => Gait {
+            travel: LIVE_RUN_SPEED,
+            pace: LIVE_RUN_SPEED,
+        },
+        // **A pure sidestep travels at the run speed and animates as though
+        // it were standing still**, and that split is the whole reason this
+        // returns a pair.
         //
-        // This has been flipped once in each direction and both reports were
-        // right about what they saw. Given the `Shuffle` cycles it was called
-        // shimmying; given the run it was called "running sideways plays the
-        // forward animation". The art is the tie-breaker and it is blunter
-        // than either fix assumed: `HumanMale.m2` has `Walk`, `Run`,
-        // `Walkbackwards`, and `ShuffleLeft`/`ShuffleRight` at 500ms which
-        // advance the character by 0.00. **There is no sideways run in the
-        // game's own data**, so the honest choice is the cycle that is at
-        // least a sidestep, played while the movement system does the
-        // travelling -- exactly as `Walkbackwards` already works.
-        None if moving.is_moving() => 0.0,
-        _ => 0.0,
+        // Which cycle to play has been flipped once in each direction and
+        // both reports were right about what they saw. Given the `Shuffle`
+        // cycles it was called shimmying; given the run it was called
+        // "running sideways plays the forward animation". The art is the
+        // tie-breaker and it is blunter than either fix assumed:
+        // `HumanMale.m2` has `Walk`, `Run`, `Walkbackwards`, and
+        // `ShuffleLeft`/`ShuffleRight` at 500ms which advance the character by
+        // 0.00. **There is no sideways run in the game's own data.** So the
+        // honest choice is the cycle that is at least a sidestep, played in
+        // place -- and `pace: 0.0` is what lets the animation chooser reach
+        // it, while `travel` keeps the character moving. Reporting a pace of
+        // zero to *both* is what stopped `Q` and `E` moving anybody at all.
+        None if moving.is_moving() => Gait {
+            travel: LIVE_RUN_SPEED,
+            pace: 0.0,
+        },
+        _ => Gait {
+            travel: 0.0,
+            pace: 0.0,
+        },
     }
 }
 
@@ -1741,6 +1774,17 @@ struct App {
     /// runs every frame) warns once per change instead of every frame for the
     /// rest of the session.
     last_undrawable_warned: usize,
+    /// Whether the player's own body was in the list handed to the renderer
+    /// last frame, so its disappearance is reported **once, when it happens**.
+    ///
+    /// A character that has gone invisible is two completely different faults
+    /// wearing one report: either the body stopped being submitted -- our own
+    /// object left replicated state, or lost its display id -- or it was
+    /// submitted and something downstream did not draw it. Those want opposite
+    /// investigations and look identical from the window, which is the shape
+    /// this project keeps paying for. Starts `true`, so a body that is never
+    /// drawn at all says so on the first frame.
+    own_body_drawn: bool,
     /// Composed looks for *other* players, keyed by `character::Appearance`.
     ///
     /// Cached because resolving one reads several DBCs and composes a skin
@@ -2510,6 +2554,7 @@ impl App {
             last_heartbeat: Instant::now(),
             last_ping: Instant::now(),
             last_undrawable_warned: 0,
+            own_body_drawn: true,
             player_looks: std::collections::HashMap::new(),
             offline_map: None,
             lighting: None,
@@ -3328,7 +3373,10 @@ impl App {
                     // movement back to us. Held means running -- there is no
                     // walk toggle here, and `LIVE_RUN_SPEED` is the run speed.
                     let pace = (
-                        live_pace(self.live_move),
+                        // The animation half of the gait, never the travel
+                        // half: a sidestep travels and must still play a
+                        // cycle that does not.
+                        live_gait(self.live_move).pace,
                         // Turning on the spot and sidestepping share the
                         // shuffle cycles, and only one of them can be
                         // happening: `live_strafe` reports nothing while the
@@ -3350,6 +3398,9 @@ impl App {
                     // its heading comes from the keys and is already smooth,
                     // and easing it would make the camera lag the character.
                     let mut drawn = drawable_with_own(live, pace, self.jump.is_some());
+                    // See `App::own_body_drawn`: submitted-and-not-drawn and
+                    // never-submitted are the same report from the window.
+                    let own_drawn = drawn.iter().any(|entity| entity.guid == live.guid);
                     live.ease_facings(&mut drawn, self.frame_ms / 1000.0);
                     let placements: Vec<crate::world::EntityPlacement> =
                         drawn
@@ -3408,6 +3459,27 @@ impl App {
                         tracing::warn!("{undrawable} replicated object(s) had no loadable model");
                     }
                     self.last_undrawable_warned = undrawable;
+
+                    // On the change only, and naming which of the two things
+                    // went wrong. Silence here while the character is
+                    // invisible is itself the finding: the body was handed to
+                    // the renderer and the fault is past this point.
+                    if own_drawn != self.own_body_drawn {
+                        match live.state.get(live.guid) {
+                            None => tracing::warn!(
+                                "the player's own body left replicated state -- \
+                                 something removed guid {:#x}",
+                                live.guid
+                            ),
+                            Some(entity) => tracing::warn!(
+                                "the player's own body is {} the drawn list; \
+                                 replicated display id {:?}",
+                                if own_drawn { "back in" } else { "gone from" },
+                                entity.display_id()
+                            ),
+                        }
+                        self.own_body_drawn = own_drawn;
+                    }
                 }
             }
 
@@ -3641,10 +3713,15 @@ impl App {
 
         let (dx, dy) = desired.direction(live.orientation);
         if (dx, dy) != (0.0, 0.0) {
-            let pace = live_pace(desired).abs();
+            // **The travel half of the gait, and it is not the animation
+            // half.** `direction` is already a unit vector carrying which way
+            // the keys point, so all that is wanted here is a magnitude --
+            // and reading the animation's pace instead is what left a
+            // sidestepping character standing perfectly still.
+            let speed = live_gait(desired).travel.abs();
             let wanted = glam::Vec3::new(
-                live.position.x + dx * pace * dt,
-                live.position.y + dy * pace * dt,
+                live.position.x + dx * speed * dt,
+                live.position.y + dy * speed * dt,
                 live.position.z,
             );
             // **Buildings are solid, and nothing but this client says so.**
@@ -5036,7 +5113,7 @@ impl App {
         let entities = drawable_with_own(
             live,
             (
-                live_pace(self.live_move),
+                live_gait(self.live_move).pace,
                 live_turning(self.keys, self.steering, self.live_move)
                     + live_strafe(self.live_move),
             ),
@@ -6520,6 +6597,63 @@ mod gesture_tests {
         // A full turn of the camera: hundreds of pixels of movement, and the
         // pointer back exactly where it started.
         assert!(!was_click(900.0));
+    }
+
+    /// **A sidestep travels, and animates as though it did not.**
+    ///
+    /// Both halves, because each on its own has been shipped and each was a
+    /// bug you could see from the window. Asserting only the pace gives the
+    /// character that plays a tidy shuffle while standing rooted to the spot,
+    /// which is what `Q` and `E` did; asserting only the travel gives the one
+    /// that slides sideways playing the forward run, which is what they did
+    /// before that.
+    #[test]
+    fn a_sidestep_travels_while_its_animation_stands_still() {
+        use ::world::motion::Motion;
+
+        let sidestep = Motion {
+            strafe_left: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            live_gait(sidestep).travel,
+            LIVE_RUN_SPEED,
+            "sidestepping must move the character"
+        );
+        assert_eq!(
+            live_gait(sidestep).pace,
+            0.0,
+            "and must not ask for a run cycle, which the art does not have"
+        );
+        assert_eq!(live_strafe(sidestep), 1.0, "left is the positive side");
+
+        // The three that must not have been disturbed: a run, a retreat, and
+        // standing still. A diagonal is a run, and the sidestep laid over it
+        // reports nothing -- a shuffle over a run is a stumble.
+        let run = Motion {
+            forward: true,
+            ..Default::default()
+        };
+        let diagonal = Motion {
+            forward: true,
+            strafe_right: true,
+            ..Default::default()
+        };
+        let back = Motion {
+            backward: true,
+            ..Default::default()
+        };
+        for (name, motion, expected) in [
+            ("run", run, LIVE_RUN_SPEED),
+            ("diagonal", diagonal, LIVE_RUN_SPEED),
+            ("retreat", back, -LIVE_BACK_SPEED),
+            ("still", Motion::default(), 0.0),
+        ] {
+            let gait = live_gait(motion);
+            assert_eq!(gait.travel, expected, "{name} travel");
+            assert_eq!(gait.pace, expected, "{name} pace should equal its travel");
+        }
+        assert_eq!(live_strafe(diagonal), 0.0, "a diagonal run is a run");
     }
 }
 

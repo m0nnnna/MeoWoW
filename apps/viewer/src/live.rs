@@ -667,7 +667,13 @@ pub fn own_entity(
     let display_id = entity.display_id().filter(|id| *id != 0)?;
     // Worth a line: a body that is not drawn and a body drawn somewhere
     // unexpected look identical from the outside, and this says which.
-    tracing::debug!(
+    //
+    // **`trace`, not `debug`, because this runs every frame.** At debug it
+    // wrote five thousand lines and four megabytes in the first minute of a
+    // session, which buries the once-per-gesture lines that a live test is
+    // actually reading -- an instrument that drowns the thing it was turned
+    // on for.
+    tracing::trace!(
         "own body: display {display_id} at {:.1}, {:.1}, {:.1} facing {orientation:.2}, \
          weapon {:?}",
         position.x,

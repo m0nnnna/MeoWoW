@@ -1414,7 +1414,9 @@ impl World {
             tracing::debug!("game object display {display_id} names no model");
             return None;
         }
-        tracing::debug!("game object display {display_id} -> {path}");
+        // `trace`, for the same reason as `own body` in `live.rs`: this is
+        // asked once per object per frame, so at debug it is most of the log.
+        tracing::trace!("game object display {display_id} -> {path}");
         // The table names `.mdx` even where the archive ships `.m2`; the model
         // loader already rewrites that, and a `.wmo` passes through untouched.
         Some(path)
