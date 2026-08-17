@@ -6,7 +6,8 @@
 use dbc::infer::{infer, ColumnKind};
 use dbc::schema::{
     AreaTable, CreatureDisplayInfo, CreatureModelData, Map, SoundEntries, SoundType, Spell,
-    SpellDuration, SpellRadius, SpellVisualKit, WorldMapArea, WorldMapOverlay, WorldSafeLocs,
+    SpellDuration, SpellRadius, SpellVisual, SpellVisualKit, WorldMapArea, WorldMapOverlay,
+    WorldSafeLocs,
 };
 use dbc::Dbc;
 use mpq::Chain;
@@ -204,6 +205,132 @@ fn spell_visual_kit_sound_resolves_to_spell_type_sounds() {
         .count();
     let spell_rate = spell_typed as f64 / resolved.len() as f64;
     assert!(spell_rate > 0.99, "spell-type rate {spell_rate:.3} should exceed 99%");
+}
+
+/// `Spell::spell_visual` (field 131) resolves into a real `SpellVisual` row
+/// for effectively every spell that names one -- the same test as
+/// `duration_index`, and what backs trusting field 131 rather than field 132.
+#[test]
+fn spell_visual_link_resolves_for_every_nonzero_spell() {
+    let mut chain = require_data!();
+    let spells = Spell::parse(&chain.read(Spell::PATH).unwrap()).unwrap();
+    let visuals = SpellVisual::parse(&chain.read(SpellVisual::PATH).unwrap()).unwrap();
+    let visual_ids: std::collections::HashSet<u32> = visuals.iter().map(|v| v.id()).collect();
+
+    let nonzero: Vec<u32> = spells
+        .iter()
+        .map(|s| s.spell_visual())
+        .filter(|id| *id != 0)
+        .collect();
+    assert!(nonzero.len() > 20_000, "expected tens of thousands, got {}", nonzero.len());
+
+    let resolved = nonzero.iter().filter(|id| visual_ids.contains(id)).count();
+    let rate = resolved as f64 / nonzero.len() as f64;
+    assert!(rate > 0.99, "resolve rate {rate:.3} should exceed 99%");
+}
+
+/// `SpellVisual::has_missile` and `Spell::speed` are transcribed from two
+/// separately-offset columns in two different tables. If the offsets are
+/// right, they describe the same fact -- whether a spell has a projectile --
+/// and should agree far more than chance. If either offset were wrong this
+/// would most likely read as noise near 50/50, not as a strong but imperfect
+/// correlation.
+#[test]
+fn spell_visual_has_missile_tracks_spell_speed() {
+    let mut chain = require_data!();
+    let spells = Spell::parse(&chain.read(Spell::PATH).unwrap()).unwrap();
+    let visuals = SpellVisual::parse(&chain.read(SpellVisual::PATH).unwrap()).unwrap();
+    let missile_by_visual: std::collections::HashMap<u32, bool> =
+        visuals.iter().map(|v| (v.id(), v.has_missile())).collect();
+
+    let mut with_speed = (0u32, 0u32); // (has_missile, total)
+    let mut without_speed = (0u32, 0u32);
+    for spell in spells.iter() {
+        let Some(&has_missile) = missile_by_visual.get(&spell.spell_visual()) else {
+            continue;
+        };
+        let bucket = if spell.speed() > 0.0 {
+            &mut with_speed
+        } else {
+            &mut without_speed
+        };
+        bucket.1 += 1;
+        if has_missile {
+            bucket.0 += 1;
+        }
+    }
+
+    let rate = |b: (u32, u32)| b.0 as f64 / b.1 as f64;
+    assert!(with_speed.1 > 1000 && without_speed.1 > 1000, "population too small to test");
+    assert!(
+        rate(with_speed) > 0.8,
+        "speed>0 should mostly have a missile, got {:.3}",
+        rate(with_speed)
+    );
+    assert!(
+        rate(without_speed) < 0.1,
+        "speed==0 should rarely have a missile, got {:.3}",
+        rate(without_speed)
+    );
+}
+
+/// The decisive test: which `SpellVisual` column is which was settled by the
+/// sound's own name, the same evidence `INTERFACE_CLICK` rests on. Six
+/// well-known spells, picked so each moment (precast, casting, impact, and a
+/// persistent state) is checked against a sound whose name states what it is.
+#[test]
+fn spell_visual_kit_columns_land_on_the_right_moment() {
+    let mut chain = require_data!();
+    let spells = Spell::parse(&chain.read(Spell::PATH).unwrap()).unwrap();
+    let visuals = SpellVisual::parse(&chain.read(SpellVisual::PATH).unwrap()).unwrap();
+    let kits = SpellVisualKit::parse(&chain.read(SpellVisualKit::PATH).unwrap()).unwrap();
+    let sounds = SoundEntries::parse(&chain.read(SoundEntries::PATH).unwrap()).unwrap();
+
+    let visual = |id: u32| visuals.iter().find(|v| v.id() == id).expect("visual exists");
+    let kit_sound = |kit_id: u32| {
+        kits.iter()
+            .find(|k| k.id() == kit_id)
+            .map(|k| k.sound())
+            .filter(|id| *id != 0)
+    };
+    let sound_name = |id: u32| {
+        sounds
+            .iter()
+            .find(|s| s.id() == id)
+            .map(|s| s.name().to_string())
+            .expect("sound exists")
+    };
+    // Case-insensitive: this build's names are not consistently capitalised
+    // ("Precast Fire Low" vs "PrecastMagicLow").
+    let names = |kit_id: u32| kit_sound(kit_id).map(sound_name).unwrap_or_default().to_lowercase();
+
+    for (spell_id, name) in [(116, "Frostbolt"), (133, "Fireball"), (686, "Shadow Bolt")] {
+        let spell = spells.iter().find(|s| s.id() == spell_id).expect("spell exists");
+        assert_eq!(spell.name(), name);
+        let v = visual(spell.spell_visual());
+        assert!(
+            names(v.precast_kit()).contains("precast"),
+            "{name}'s precast kit should be named as a precast"
+        );
+        assert!(
+            names(v.casting_kit()).contains("cast"),
+            "{name}'s casting kit should be named as a cast"
+        );
+        assert!(
+            names(v.impact_kit()).contains("impact"),
+            "{name}'s impact kit should be named as an impact"
+        );
+    }
+
+    // Power Word: Shield has no impact -- it never resolves against a target
+    // the way a missile does -- but its persistent shield is column 4.
+    let shield = spells.iter().find(|s| s.id() == 17).expect("spell exists");
+    assert_eq!(shield.name(), "Power Word: Shield");
+    let v = visual(shield.spell_visual());
+    assert!(
+        names(v.state_kit()).contains("shield"),
+        "Power Word: Shield's state kit should name a shield"
+    );
 }
 
 #[test]

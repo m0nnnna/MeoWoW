@@ -5487,6 +5487,21 @@ impl App {
                     tracing::debug!("cast refused -- {text}");
                     self.chat.push(Line::Chat(local_notice(text)));
                 }
+                // A cast's own sound, keyed by spell id rather than by
+                // caster or weapon the way combat sounds are -- most spells
+                // have no confirmed sound at all (see `Sounds::spell_cast`'s
+                // doc comment), so this is silent far more often than not,
+                // and that silence is correct rather than a gap.
+                for start in &report.cast_starts {
+                    if let Some(id) = self.sounds.spell_cast(start.spell_id) {
+                        self.pending_sounds.push((id, false));
+                    }
+                }
+                for go in &report.cast_landings {
+                    if let Some(id) = self.sounds.spell_impact(go.spell_id) {
+                        self.pending_sounds.push((id, false));
+                    }
+                }
                 // Same reasoning, for a bag-window drag: `foss-wow#55` left
                 // the gesture wired to nothing, so picking an item up and
                 // dropping it did nothing and said nothing either -- exactly

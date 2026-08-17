@@ -666,13 +666,72 @@ dbc_table! {
 }
 
 dbc_table! {
+    /// A spell's set of visual *moments* -- precast, casting, impact and so
+    /// on -- each naming a [`SpellVisualKit`] row.
+    ///
+    /// **The six kit columns identified themselves by name, the same way
+    /// `INTERFACE_CLICK` did.** AzerothCore's `SpellVisualEntry` documents
+    /// this table's layout in comments but reads none of it -- the fields are
+    /// declared and then unused, so nothing there was ever property-tested
+    /// against real behaviour. Two structural facts backed trusting the
+    /// *positions* anyway: the format string (`"dxxxxxxiixxx...x"`, 32
+    /// characters) puts six skipped columns between the id and a `HasMissile`
+    /// bool, matching the six kit fields exactly; and `HasMissile` (column 7)
+    /// is true for 88.4% of spells with a non-zero `Spell.dbc` `Speed` (a
+    /// missile travel speed, independently offset-matched the same way
+    /// `duration_index` was) against 1.8% of speed-zero spells -- two
+    /// separately-derived columns agreeing on which spells have a projectile.
+    ///
+    /// That confirmed the *block*, not which label attaches to which of the
+    /// three early columns -- so six spells with an obvious, well-known sound
+    /// were checked by ear... by name, rather: `Spell.dbc` id 116 (Frostbolt)
+    /// names column 1's kit `Frost Precast`, column 2's `Ice Cast`, column
+    /// 3's `BlizzardImpactVariations`. Fireball (133) gives `Precast Fire
+    /// Low`, `Fire Cast`, `Molten Blast Impact`. Shadow Bolt (686) gives
+    /// `Precast Shadow Low`, `Shadow Cast`, `DeathCoil Impact`. Power Word:
+    /// Shield's column 4 -- `StateKit`, not one of the three -- names `Divine
+    /// Shield`, a persistent buff rather than a cast or an impact. Every
+    /// spell checked agrees with the label its own sound's name asserts.
+    /// [`Spell::spell_visual`] is the 100%-resolving link into this table,
+    /// same test as [`Spell::duration_index`].
+    SpellVisual, SpellVisualRow, path = r"DBFilesClient\SpellVisual.dbc", fields = 32, {
+        0 id: u32,
+        /// Plays as the cast begins, before [`Self::casting_kit`]. Named
+        /// `Frost Precast`, `Precast Fire Low`, `PrecastMagicLow` -- the word
+        /// is in the sound's own name.
+        1 precast_kit: u32,
+        /// The sustained cast visual/sound, e.g. `Ice Cast`, `Fire Cast`,
+        /// `Shadow Cast`, `Magic Cast`.
+        2 casting_kit: u32,
+        /// Plays when the spell resolves against its target, e.g. `Molten
+        /// Blast Impact`, `BlizzardImpactVariations`, `DeathCoil Impact`.
+        3 impact_kit: u32,
+        /// A persistent visual/sound for as long as the spell's effect
+        /// lasts, e.g. Power Word: Shield's `Divine Shield`. No channel-tick
+        /// or aura-duration event exists yet to hang this off, so it is
+        /// transcribed and unused.
+        4 state_kit: u32,
+        5 state_done_kit: u32,
+        /// A channelled spell's own visual, e.g. Arcane Missiles'
+        /// `PrecastMagicLow`. Unused for the same reason as
+        /// [`Self::state_kit`] -- no channel event exists yet.
+        6 channel_kit: u32,
+        /// True for 88.4% of spells with a non-zero `Spell.dbc` `Speed`
+        /// against 1.8% of speed-zero spells -- see the table's doc comment.
+        /// Not consulted by anything yet; recorded because it is what
+        /// confirmed the columns before it.
+        7 has_missile: bool,
+    }
+}
+
+dbc_table! {
     /// One of a spell's visual moments -- precast, cast, impact and so on --
     /// with the sound that plays for it.
     ///
-    /// **Only the sound is named.** `SpellVisual.dbc` names several of these
-    /// per spell (which one plays when is client animation-state logic this
-    /// project has not built), so this table alone cannot say *when* column
-    /// 15 is heard -- only that it is a sound, and which one.
+    /// **Only the sound is named here.** Which *moment* a row belongs to
+    /// (precast, casting, impact...) is not this table's business -- that is
+    /// [`SpellVisual`], which names several of these per spell and is where
+    /// the moment is now confirmed.
     ///
     /// Column 15 identified itself by the same test as `SpellDuration`:
     /// validity is nearly free (`SpellVisualKit`'s own 8,663 ids are 56%
@@ -787,6 +846,21 @@ dbc_table! {
         98  effect_aura_period: i32,
         99  effect_aura_period_2: i32,
         100 effect_aura_period_3: i32,
+        /// A missile's travel speed in yards/second, `0` for a spell with no
+        /// projectile. Offset-matched against AzerothCore's `SpellEntry`
+        /// like [`Self::recovery_time`], and cross-checked rather than left
+        /// at that: [`SpellVisual::has_missile`] is true for 88.4% of the
+        /// spells this is non-zero for, against 1.8% of the spells it is
+        /// zero for -- two independently-offset columns agreeing on which
+        /// spells have a projectile.
+        47  speed: f32,
+        /// Row in [`SpellVisual`], which names the sounds a cast makes.
+        /// Resolves for 100% of the 32,770 non-zero values in this build --
+        /// the same test as [`Self::duration_index`]. A second slot sits at
+        /// field 132 (`AzerothCore`'s `SpellVisual[2]`); not transcribed
+        /// because nothing here has needed it and its meaning (a second
+        /// race/form variant, per public documentation) is unconfirmed.
+        131 spell_visual: u32,
         133 spell_icon_id: u32,
         134 active_icon_id: u32,
         136 name: loc,

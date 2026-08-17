@@ -906,6 +906,14 @@ pub struct Replication {
     /// `SMSG_SPELL_START` and clears nothing, which is correct and not
     /// counted here.
     pub casts_landed: usize,
+    /// The `SMSG_SPELL_START`s themselves, in arrival order. Returned rather
+    /// than stored for the same reason `swings` is: a cast beginning is an
+    /// event a caller (the cast's own sound) needs to react to once, and
+    /// `casts_started` above only ever told a caller a count, never which
+    /// spell or who cast it.
+    pub cast_starts: Vec<crate::spell::SpellStart>,
+    /// The `SMSG_SPELL_GO`s themselves. See [`Self::cast_starts`].
+    pub cast_landings: Vec<crate::spell::SpellGo>,
     /// Casts the server refused. Returned rather than stored for the same
     /// reason chat is: they are events, not state.
     pub cast_failures: Vec<crate::spell::CastFailed>,
@@ -1980,6 +1988,7 @@ impl WorldState {
                                     duration_ms: start.cast_time_ms,
                                 },
                             );
+                            report.cast_starts.push(start);
                         }
                         Err(error) => report.failures.push((
                             packet.opcode,
@@ -1999,6 +2008,7 @@ impl WorldState {
                             if self.casts.remove(&go.caster).is_some() {
                                 report.casts_landed += 1;
                             }
+                            report.cast_landings.push(go);
                         }
                         Err(error) => report.failures.push((
                             packet.opcode,

@@ -23,7 +23,7 @@ use std::io::Cursor;
 
 use dbc::schema::{
     AreaTable, CreatureDisplayInfo, CreatureModelData, CreatureSoundData, Item, SoundAmbience,
-    SoundEntries, SoundType, WeaponImpactSounds, ZoneMusic,
+    SoundEntries, SoundType, Spell, SpellVisual, SpellVisualKit, WeaponImpactSounds, ZoneMusic,
 };
 use mpq::Chain;
 
@@ -165,6 +165,17 @@ pub struct Sounds {
     weapon_subclass: std::collections::HashMap<u32, u32>,
     /// Weapon subclass to its `(flesh, flesh_critical)` impact sounds.
     impacts: std::collections::HashMap<u32, (u32, u32)>,
+    /// Spell id to the sound it makes when the cast begins, resolved
+    /// `Spell -> SpellVisual -> SpellVisualKit -> SoundEntries` at load.
+    /// Absent for most spells -- not every moment names a sound, and this
+    /// keeps only the ones that do rather than a zero standing in for
+    /// silence. See `dbc::schema::SpellVisual`'s doc comment for how the
+    /// column that means "cast" was identified.
+    spell_cast: std::collections::HashMap<u32, u32>,
+    /// Spell id to the sound it makes when the cast resolves against its
+    /// target. Same resolution as [`Self::spell_cast`], through
+    /// `SpellVisual::impact_kit` instead.
+    spell_impact: std::collections::HashMap<u32, u32>,
 }
 
 /// What one kind of creature sounds like.
@@ -351,14 +362,73 @@ impl Sounds {
             })
             .unwrap_or_default();
 
+        // Spell sounds: Spell -> SpellVisual -> SpellVisualKit -> sound id,
+        // for the two moments this client can act on -- a cast beginning
+        // (`SMSG_SPELL_START`) and a cast landing (`SMSG_SPELL_GO`). See
+        // `dbc::schema::SpellVisual`'s doc comment for how `casting_kit` and
+        // `impact_kit` were told apart from the table's other four columns.
+        if let (Some(spells), Some(visuals), Some(kits)) = (
+            chain
+                .read(Spell::PATH)
+                .ok()
+                .and_then(|bytes| Spell::parse(&bytes).ok()),
+            chain
+                .read(SpellVisual::PATH)
+                .ok()
+                .and_then(|bytes| SpellVisual::parse(&bytes).ok()),
+            chain
+                .read(SpellVisualKit::PATH)
+                .ok()
+                .and_then(|bytes| SpellVisualKit::parse(&bytes).ok()),
+        ) {
+            let visual_by_id: std::collections::HashMap<u32, _> =
+                visuals.iter().map(|v| (v.id(), v)).collect();
+            let kit_sound: std::collections::HashMap<u32, u32> = kits
+                .iter()
+                .map(|k| (k.id(), k.sound()))
+                .filter(|(_, sound)| *sound != 0)
+                .collect();
+            for spell in spells.iter() {
+                let Some(visual) = visual_by_id.get(&spell.spell_visual()) else {
+                    continue;
+                };
+                // A spell with no casting-kit sound (e.g. it only has a
+                // precast one) still deserves a cast sound rather than
+                // silence -- `Entry::pick`'s own reasoning, one level up.
+                let cast = [visual.casting_kit(), visual.precast_kit()]
+                    .into_iter()
+                    .find_map(|kit| kit_sound.get(&kit).copied());
+                if let Some(id) = cast {
+                    sounds.spell_cast.insert(spell.id(), id);
+                }
+                if let Some(id) = kit_sound.get(&visual.impact_kit()).copied() {
+                    sounds.spell_impact.insert(spell.id(), id);
+                }
+            }
+        }
+
         tracing::info!(
-            "sound tables loaded in {:?}: {} entries, {} areas with sound, {} creature voices",
+            "sound tables loaded in {:?}: {} entries, {} areas with sound, {} creature voices, \
+             {} spells with a cast sound, {} with an impact sound",
             started.elapsed(),
             sounds.entries.len(),
             sounds.zones.len(),
-            sounds.creatures.len()
+            sounds.creatures.len(),
+            sounds.spell_cast.len(),
+            sounds.spell_impact.len()
         );
         sounds
+    }
+
+    /// What a spell sounds like when the cast begins (`SMSG_SPELL_START`).
+    pub fn spell_cast(&self, spell_id: u32) -> Option<u32> {
+        self.spell_cast.get(&spell_id).copied()
+    }
+
+    /// What a spell sounds like when it resolves against its target
+    /// (`SMSG_SPELL_GO`).
+    pub fn spell_impact(&self, spell_id: u32) -> Option<u32> {
+        self.spell_impact.get(&spell_id).copied()
     }
 
     /// What a creature with this display id sounds like.
