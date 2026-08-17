@@ -100,6 +100,51 @@ impl ZoneSound {
     }
 }
 
+/// How many parent hops a zone-sound lookup will walk before giving up.
+///
+/// `AreaTable`'s hierarchy is two or three levels deep in practice -- a
+/// continent's zones and their sub-areas -- so this is generous headroom
+/// against a cycle in the data rather than a limit anyone should expect to
+/// hit. A lookup that walked forever on a malformed `parent_area_id` chain
+/// would be indistinguishable from the client hanging.
+const MAX_PARENT_HOPS: u32 = 8;
+
+/// The music or ambience id a zone should use: its own, or its nearest
+/// ancestor's if it names none.
+///
+/// **Most areas name neither** -- see [`ZoneSound`]'s doc comment, 1,359 of
+/// 2,307 in this build -- and a flat, area-by-area lookup silently treated
+/// every one of them as having no sound at all, rather than as inheriting
+/// what the zone containing it plays. Live-reported as "the wind and birds
+/// are just gone": Coldridge Valley (`AreaTable` id 132) is a sub-area of
+/// Dun Morogh (id 1, `parent_area_id`) and, like 1,283 of those 1,359 areas,
+/// has an ancestor that does name something -- Dun Morogh's own ambience
+/// and music are both set. Only 76 of the 1,359 have no ancestor with
+/// anything either, which is a real silence rather than a missed one.
+fn resolve_zone_sound(
+    areas: &std::collections::HashMap<u32, (u32, u32, u32)>,
+    table: &std::collections::HashMap<u32, (u32, u32)>,
+    area_id: u32,
+    pick: impl Fn((u32, u32, u32)) -> u32,
+) -> Option<(u32, u32)> {
+    let mut current = area_id;
+    for _ in 0..MAX_PARENT_HOPS {
+        let Some(&row) = areas.get(&current) else {
+            return None;
+        };
+        let id = pick(row);
+        if id != 0 {
+            return table.get(&id).copied();
+        }
+        let parent = row.2;
+        if parent == 0 || parent == current {
+            return None;
+        }
+        current = parent;
+    }
+    None
+}
+
 /// One `SoundEntries` row, flattened to what playing it needs.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -270,10 +315,18 @@ impl Sounds {
             .ok()
             .and_then(|bytes| AreaTable::parse(&bytes).ok())
         {
+            // Own (zone_music, ambience_id, parent_area_id) per area, read
+            // once so the walk below is a hash lookup rather than a second
+            // pass over the table per area.
+            let rows: std::collections::HashMap<u32, (u32, u32, u32)> = areas
+                .iter()
+                .map(|a| (a.id(), (a.zone_music(), a.ambience_id(), a.parent_area_id())))
+                .collect();
+
             for area in areas.iter() {
                 let entry = ZoneSound {
-                    music: music.get(&area.zone_music()).copied(),
-                    ambience: ambience.get(&area.ambience_id()).copied(),
+                    music: resolve_zone_sound(&rows, &music, area.id(), |r| r.0),
+                    ambience: resolve_zone_sound(&rows, &ambience, area.id(), |r| r.1),
                 };
                 if entry.music.is_some() || entry.ambience.is_some() {
                     sounds.zones.insert(area.id(), entry);
@@ -693,6 +746,79 @@ mod tests {
                 .map(|(path, weight)| (path.to_string(), *weight))
                 .collect(),
         }
+    }
+
+    /// `(zone_music, ambience_id, parent_area_id)`, matching
+    /// `resolve_zone_sound`'s own `areas` map.
+    fn area(music: u32, ambience: u32, parent: u32) -> (u32, u32, u32) {
+        (music, ambience, parent)
+    }
+
+    /// An area naming its own sound uses it, parent or not.
+    #[test]
+    fn an_areas_own_sound_is_used_over_its_parents() {
+        let areas = [(1, area(10, 0, 0)), (2, area(20, 0, 1))].into_iter().collect();
+        let table = [(20, (200, 201))].into_iter().collect();
+        assert_eq!(resolve_zone_sound(&areas, &table, 2, |r| r.0), Some((200, 201)));
+    }
+
+    /// **The bug live-reported as "the wind and birds are gone".** Coldridge
+    /// Valley (a sub-area) names no ambience of its own; Dun Morogh (its
+    /// parent) does, and that is what a character standing in Coldridge
+    /// Valley should hear.
+    #[test]
+    fn a_zoneless_area_inherits_its_parents_sound() {
+        let areas =
+            [(132, area(0, 0, 1)), (1, area(8, 42, 0))].into_iter().collect();
+        let table = [(42, (420, 421))].into_iter().collect();
+        assert_eq!(resolve_zone_sound(&areas, &table, 132, |r| r.1), Some((420, 421)));
+    }
+
+    /// The walk goes as many levels up as it has to -- a sub-sub-area
+    /// inheriting from its grandparent, neither of the levels in between
+    /// naming anything either.
+    #[test]
+    fn the_walk_climbs_more_than_one_level() {
+        let areas = [
+            (3, area(0, 0, 2)),
+            (2, area(0, 0, 1)),
+            (1, area(99, 0, 0)),
+        ]
+        .into_iter()
+        .collect();
+        let table = [(99, (990, 991))].into_iter().collect();
+        assert_eq!(resolve_zone_sound(&areas, &table, 3, |r| r.0), Some((990, 991)));
+    }
+
+    /// Some areas genuinely have nothing anywhere up their chain -- 76 of
+    /// the 1,359 zoneless areas in this build, per this function's own doc
+    /// comment -- and that has to read as real silence, not as a failed
+    /// lookup that happens to look the same.
+    #[test]
+    fn an_area_with_no_ancestor_sound_resolves_to_none() {
+        let areas = [(5, area(0, 0, 4)), (4, area(0, 0, 0))].into_iter().collect();
+        let table = std::collections::HashMap::new();
+        assert_eq!(resolve_zone_sound(&areas, &table, 5, |r| r.0), None);
+    }
+
+    /// A cycle in `parent_area_id` must terminate rather than hang -- this
+    /// project's own rule about a loop over live data needing a bound, this
+    /// time for one over a table rather than a network stream.
+    #[test]
+    fn a_cycle_terminates_rather_than_looping_forever() {
+        let areas = [(1, area(0, 0, 2)), (2, area(0, 0, 1))].into_iter().collect();
+        let table = std::collections::HashMap::new();
+        assert_eq!(resolve_zone_sound(&areas, &table, 1, |r| r.0), None);
+    }
+
+    /// An area absent from the map entirely (should not happen -- every
+    /// `AreaTable` row populates it -- but the function must not panic if
+    /// one somehow is) resolves to nothing rather than panicking.
+    #[test]
+    fn an_unknown_area_resolves_to_none() {
+        let areas = std::collections::HashMap::new();
+        let table = std::collections::HashMap::new();
+        assert_eq!(resolve_zone_sound(&areas, &table, 999, |r| r.0), None);
     }
 
     /// The weighted pick, at every boundary. Exact because the roll is handed
