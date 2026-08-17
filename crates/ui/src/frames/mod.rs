@@ -20,6 +20,7 @@ pub mod character;
 pub mod chat;
 pub mod loot;
 pub mod combat_text;
+pub mod loot_sparkle;
 pub mod marker;
 pub mod release;
 pub mod quest_log;

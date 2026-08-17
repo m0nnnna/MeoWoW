@@ -234,6 +234,18 @@ impl Entity {
         self.npc_flags().is_some_and(|flags| flags != 0)
     }
 
+    /// Whether this unit currently has loot on it.
+    ///
+    /// Reads live: the field this asks clears the moment a corpse is
+    /// emptied, the same replicated update that already tells
+    /// `world::inventory` an item moved -- there is nothing here to cache or
+    /// invalidate.
+    pub fn lootable(&self) -> bool {
+        self.fields
+            .get(crate::update::fields::UNIT_DYNAMIC_FLAGS)
+            .is_some_and(|flags| flags & crate::update::fields::UNIT_DYNFLAG_LOOTABLE != 0)
+    }
+
     /// Every quest id in this player's log, in slot order.
     ///
     /// **The gate for the whole quest feature**: a quest id is what
@@ -2280,6 +2292,57 @@ mod tests {
         assert_eq!(entity.display_id(), Some(49));
         assert_eq!(entity.position, Some(at(1.0, 2.0)));
         assert_eq!(world.stats().created, 1);
+    }
+
+    /// `foss-wow#81`: a corpse's dynamic flags is a live-confirmed field
+    /// (see [`crate::update::fields::UNIT_DYNAMIC_FLAGS`]'s doc comment) --
+    /// pinned here against the exact value that field read on a real kill,
+    /// `13`, `LOOTABLE | TAPPED | TAPPED_BY_PLAYER`.
+    #[test]
+    fn a_creature_with_the_lootable_bit_set_is_lootable() {
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            9,
+            ObjectType::Unit,
+            None,
+            &[(crate::update::fields::UNIT_DYNAMIC_FLAGS, 13)],
+        )]);
+        assert!(world.get(9).expect("created").lootable());
+    }
+
+    /// Neither an ordinary living creature (the field present and zero) nor
+    /// one whose fields have not replicated yet (the field entirely absent)
+    /// is lootable -- the same "present-and-zero is not the same as absent"
+    /// distinction [`Entity::npc_flags`] already documents.
+    #[test]
+    fn a_living_or_unreplicated_creature_is_not_lootable() {
+        let mut world = WorldState::new();
+        world.apply(&[
+            create(
+                9,
+                ObjectType::Unit,
+                None,
+                &[(crate::update::fields::UNIT_DYNAMIC_FLAGS, 0)],
+            ),
+            create(10, ObjectType::Unit, None, &[]),
+        ]);
+        assert!(!world.get(9).expect("created").lootable());
+        assert!(!world.get(10).expect("created").lootable());
+    }
+
+    /// Only the lootable bit gates the sparkle -- `TAPPED`/`TAPPED_BY_PLAYER`
+    /// alone (a creature fought but not yet dead, or fought by someone else)
+    /// must not.
+    #[test]
+    fn tapped_without_lootable_is_not_lootable() {
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            9,
+            ObjectType::Unit,
+            None,
+            &[(crate::update::fields::UNIT_DYNAMIC_FLAGS, 0x4 | 0x8)],
+        )]);
+        assert!(!world.get(9).expect("created").lootable());
     }
 
     /// The central property of replication: a `Values` block carries only what

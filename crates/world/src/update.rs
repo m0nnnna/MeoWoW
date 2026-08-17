@@ -1362,6 +1362,35 @@ pub mod fields {
     /// lookup and is how the equip and loot writes were confirmed.
     pub const UNIT_NPC_FLAGS: u16 = 0x52;
 
+    /// `UNIT_DYNAMIC_FLAGS`: whether this unit has loot on it, is tapped, or
+    /// is tapped by a threat list rather than one player. `foss-wow#81`'s
+    /// gate -- a corpse sparkles while this is lootable and stops the moment
+    /// it is not.
+    ///
+    /// **Not read off a capture -- read off the offset from a field this
+    /// client had already confirmed.** AzerothCore's `UpdateFields.h` names
+    /// `UNIT_NPC_FLAGS` at `OBJECT_END + 0x4C`; this project's own,
+    /// independently-measured `UNIT_NPC_FLAGS` constant is `0x52`, so
+    /// `OBJECT_END` is `0x06` on this build, and the same header names
+    /// `UNIT_DYNAMIC_FLAGS` at `OBJECT_END + 0x49` -- `0x4F`. Two
+    /// independently-derived numbers agreeing on a base is the same
+    /// cross-check `Spell::recovery_time` rests on.
+    ///
+    /// Confirmed live rather than left at the hypothesis: this field reads
+    /// `0` on every one of twenty-odd nearby, living creatures, and
+    /// `13` -- `UNIT_DYNFLAG_LOOTABLE | UNIT_DYNFLAG_TAPPED |
+    /// UNIT_DYNFLAG_TAPPED_BY_PLAYER` -- on the one creature a real fight
+    /// (not a GM `.die`, which this project has already learned rolls no
+    /// loot) had just killed. Same field, same guid, before and after the
+    /// one thing that changed.
+    pub const UNIT_DYNAMIC_FLAGS: u16 = 0x4F;
+
+    /// `UNIT_DYNFLAG_LOOTABLE`, see [`UNIT_DYNAMIC_FLAGS`]. Only this one bit
+    /// is named -- which of the others fire under which conditions has not
+    /// been checked against this realm, and this project does not transcribe
+    /// enum members it has not itself confirmed.
+    pub const UNIT_DYNFLAG_LOOTABLE: u32 = 0x1;
+
     /// `ITEM_FIELD_STACK_COUNT`: how many are in this stack.
     ///
     /// Measured by **variation**, which is the only thing that could separate

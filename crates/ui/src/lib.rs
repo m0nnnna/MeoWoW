@@ -81,6 +81,17 @@ pub struct HudData<'a> {
     /// `CMSG_QUESTGIVER_STATUS_QUERY`, not something this crate could work
     /// out.
     pub quest_marks: &'a [(egui::Rect, frames::QuestMark)],
+    /// A lootable corpse's screen box, one per corpse -- world-anchored like
+    /// `quest_marks`, and resolved the same way: the caller already knows
+    /// which entities are lootable (`world::state::Entity::lootable`) and
+    /// where they project to, so this crate only draws boxes it is handed.
+    pub loot_markers: &'a [egui::Rect],
+    /// Seconds on the caller's own running clock, for the sparkle's pulse.
+    /// This crate never reads a clock itself -- see [`Self::bars`]'
+    /// `cooldown_fraction` for the same rule applied to a bar icon -- so the
+    /// one animation here that genuinely has no state to be a fraction *of*
+    /// still takes the time as a plain number instead.
+    pub loot_sparkle_time: f32,
     /// Damage numbers in flight, world-anchored like the target marker rather
     /// than placed by an [`Element`] -- see [`frames::combat_text`].
     pub combat_text: &'a [frames::combat_text::FloatingText],
@@ -440,6 +451,27 @@ impl Hud {
                     style.quest_mark_bright.into(),
                     style.quest_mark_dim.into(),
                     style.quest_mark_size,
+                );
+            }
+        }
+
+        // Same layer treatment as the quest marks just above, and the same
+        // reason: a sparkle sits over a corpse, and claiming its rectangle
+        // for the interface would make the corpse underneath unclickable --
+        // which here would mean the shine saying "loot me" was the thing
+        // stopping you from doing it.
+        if style.show_loot_sparkle && !data.loot_markers.is_empty() {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("hud-loot-sparkle"),
+            ));
+            for rect in data.loot_markers {
+                frames::loot_sparkle::draw(
+                    &painter,
+                    *rect,
+                    data.loot_sparkle_time,
+                    style.loot_sparkle.into(),
+                    style.loot_sparkle_size,
                 );
             }
         }

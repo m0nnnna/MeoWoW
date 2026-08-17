@@ -6144,6 +6144,36 @@ impl App {
             _ => Vec::new(),
         };
 
+        // `foss-wow#81`: which corpses sparkle. Unlike the quest marks above
+        // this needs no query and no cache -- lootable is a replicated field
+        // (`UNIT_DYNAMIC_FLAGS`), current the moment the object update that
+        // carries it arrives, so every live entity is simply checked and
+        // projected fresh each frame.
+        let loot_markers: Vec<egui::Rect> = match (self.live.as_ref(), r.scene.as_ref()) {
+            (Some(live), Some(Scene::Streaming(world))) => live
+                .state
+                .iter()
+                .filter(|entity| entity.lootable())
+                .filter_map(|entity| {
+                    let at = entity.interpolated_position(std::time::Instant::now())?;
+                    let display_id = entity.display_id()?;
+                    let scale = entity
+                        .fields
+                        .get_f32(::world::update::fields::OBJECT_SCALE)
+                        .filter(|s| *s > 0.0)
+                        .unwrap_or(1.0);
+                    hud::marker_rect(
+                        &self.camera,
+                        viewport,
+                        glam::Vec3::new(at.x, at.y, at.z),
+                        scale,
+                        world.entity_bounds(display_id),
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
         let target_marker = self.target.and_then(|guid| {
             let Some(Scene::Streaming(world)) = r.scene.as_ref() else {
                 return None;
@@ -6695,6 +6725,8 @@ impl App {
                     target: target.as_ref(),
                     target_marker,
                     quest_marks: &quest_marks,
+                    loot_markers: &loot_markers,
+                    loot_sparkle_time: self.started.elapsed().as_secs_f32(),
                     corpse_marker,
                     combat_text: &combat_text,
                     chat: &chat,

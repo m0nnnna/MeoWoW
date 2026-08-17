@@ -264,6 +264,15 @@ pub struct Style {
     /// to a frame -- there is no element to take a scale from.
     pub quest_mark_size: f32,
 
+    /// Whether a lootable corpse sparkles at all.
+    pub show_loot_sparkle: bool,
+    /// The sparkle's colour.
+    pub loot_sparkle: Color,
+    /// Its radius at full pulse, in pixels. Not scaled by an element's scale,
+    /// the same reasoning as [`Self::quest_mark_size`]: a sparkle belongs to
+    /// a corpse in the world, not to a frame.
+    pub loot_sparkle_size: f32,
+
     /// Width of the cast bar at scale 1.0. Reuses `bar_height` for its
     /// thickness -- a cast bar is one bar, the same shape as a health bar
     /// turned wide, and does not need a dimension of its own for that.
@@ -412,6 +421,10 @@ impl Default for Style {
             quest_mark_dim: Color::rgb(150, 150, 150),
             quest_mark_size: 26.0,
 
+            show_loot_sparkle: true,
+            loot_sparkle: Color::rgb(255, 235, 120),
+            loot_sparkle_size: 14.0,
+
             cast_bar_width: 260.0,
             casting: Color::rgb(220, 170, 60),
 
@@ -501,6 +514,7 @@ impl Style {
         self.world_map_width = self.world_map_width.clamp(200.0, 2400.0);
         self.world_map_pin = self.world_map_pin.clamp(1.0, 60.0);
         self.quest_mark_size = self.quest_mark_size.clamp(6.0, 120.0);
+        self.loot_sparkle_size = self.loot_sparkle_size.clamp(2.0, 80.0);
         self.chat_width = self.chat_width.clamp(120.0, 2000.0);
         self.chat_height = self.chat_height.clamp(40.0, 1200.0);
         self.chat_scrollback = self.chat_scrollback.clamp(10, 10_000);
