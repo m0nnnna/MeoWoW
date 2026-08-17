@@ -2982,7 +2982,31 @@ impl ApplicationHandler for App {
         let Some(r) = self.renderer.as_mut() else {
             return;
         };
-        let consumed = r.egui_state.on_window_event(&window, &event).consumed;
+        // **Two mechanisms used to answer "is the pointer over the interface"
+        // and they disagreed, which is `foss-wow#79`.**
+        //
+        // egui's own `consumed` does not count a layer in `Order::Background`
+        // as an area the pointer is over. `ElementId::layer` puts the bags,
+        // spellbook, character panel, quest log and map exactly there -- so a
+        // press over any of them came back unconsumed, this function ran on,
+        // started a camera drag and grabbed the cursor, and the click never
+        // reached the square under it. The loot, questgiver and release
+        // windows sit in `Order::Middle` and were unaffected, which is why
+        // looting worked while the bag window "let the mouse through".
+        //
+        // `Hud::captures_pointer` is the authority that already blends egui's
+        // opinion with the rectangles the interface actually drew -- its own
+        // doc comment says the first alone is not enough -- and `pick_at` has
+        // always used it. This is the same question, so it gets the same
+        // answer from the same place rather than a second opinion.
+        //
+        // **Buttons only.** Swallowing `CursorMoved` here would stop
+        // `last_cursor` tracking, and a press then reads its start position
+        // from a stale field -- which is the shape of a bug this file has
+        // already had once.
+        let consumed = r.egui_state.on_window_event(&window, &event).consumed
+            || (matches!(event, WindowEvent::MouseInput { .. })
+                && self.hud.captures_pointer(&r.egui_ctx));
         // **Which way a button press went, and nothing else.** "The window
         // ignored my click" and "the click went past the window into the
         // world" are the same report from the far side of the screen and want

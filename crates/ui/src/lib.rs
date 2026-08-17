@@ -1927,6 +1927,189 @@ mod tests {
             .collect()
     }
 
+    /// **`foss-wow#79`, reproduced or refuted.** Every other click test in
+    /// this file calls `hide_bars` first, which removes the frames that sit
+    /// in the layer *above* the bag window -- so the whole suite has been
+    /// asserting the one arrangement the player never has. This runs the
+    /// identical click twice, bars hidden and bars visible, and the pair is
+    /// the point: if only the second fails, a frame above the bags is eating
+    /// the click and the report "mouse clicks through the bag window" is
+    /// exactly right.
+    #[test]
+    fn a_bag_square_takes_a_click_with_the_action_bars_visible() {
+        let slots = bag_slots(&[(2224, "Small Dagger", 1), (159, "Refreshing Spring Water", 5)]);
+        let data = HudData {
+            bags: Some(&slots),
+            ..Default::default()
+        };
+
+        let quiet = {
+            let mut hud = Hud::default();
+            hide_bars(&mut hud);
+            let centres = bag_slot_positions(&hud.profile, slots.len());
+            drive(
+                &mut hud,
+                &data,
+                &click_script(centres[0], egui::PointerButton::Primary),
+            );
+            hud.held
+        };
+        assert_eq!(
+            quiet,
+            Some(Held::Item(0)),
+            "with the bars hidden, clicking a bag square must pick the item up"
+        );
+
+        let as_played = {
+            let mut hud = Hud::default();
+            let centres = bag_slot_positions(&hud.profile, slots.len());
+            drive(
+                &mut hud,
+                &data,
+                &click_script(centres[0], egui::PointerButton::Primary),
+            );
+            hud.held
+        };
+        assert_eq!(
+            as_played, quiet,
+            "the same click must do the same thing with the interface a player \
+             actually has on screen -- if this differs, something above the \
+             bag window is taking the click"
+        );
+    }
+
+    /// The same click again, but with the bag window **opened into an
+    /// interface that was already on screen** -- which is the only way it
+    /// ever happens in play, and the arrangement that hid the questgiver
+    /// stacking bug for a whole milestone.
+    ///
+    /// `drive` above builds a fresh context per script, so every area is new
+    /// in one pass and egui leaves them in build order; that is the one
+    /// arrangement where the draw loop's sequence decides the z-order. Here
+    /// the bars, chat and unit frames exist for several passes first and the
+    /// bags appear afterwards, so egui's own between-frame ordering is what
+    /// answers.
+    #[test]
+    fn a_bag_square_takes_a_click_when_opened_over_a_live_interface() {
+        let slots = bag_slots(&[(2224, "Small Dagger", 1), (159, "Refreshing Spring Water", 5)]);
+        let mut hud = Hud::default();
+        let centres = bag_slot_positions(&hud.profile, slots.len());
+        let ctx = egui::Context::default();
+
+        // The interface a player is looking at before they press B.
+        let closed = HudData::default();
+        for _ in 0..3 {
+            pass(&ctx, &mut hud, &closed, Vec::new());
+        }
+
+        // Now the bags open, and the click follows.
+        let open = HudData {
+            bags: Some(&slots),
+            ..Default::default()
+        };
+        for events in click_script(centres[0], egui::PointerButton::Primary) {
+            pass(&ctx, &mut hud, &open, events);
+        }
+
+        assert_eq!(
+            hud.held,
+            Some(Held::Item(0)),
+            "a bag square clicked in a window opened over the running interface \
+             must pick the item up; picking nothing up is `foss-wow#79`"
+        );
+    }
+
+    /// **The quantity the *viewer* branches on, which is not the one the two
+    /// tests above assert.**
+    ///
+    /// Those check `hud.held` -- this crate's own view of its own click, and
+    /// it is correct. But the window decides whether a press belongs to the
+    /// interface *before* any of that, from `egui_state.on_window_event(..)
+    /// .consumed`, which egui answers out of `wants_pointer_input`. If that
+    /// comes back false the press never reaches this crate at all: the viewer
+    /// treats it as a world click, grabs the cursor for a camera drag, and
+    /// the bag window looks exactly like a window the mouse goes through.
+    ///
+    /// So this asserts the same property for a window that **works in play**
+    /// (loot) and one that is **reported not to** (bags). Asserting only the
+    /// broken one would pass the day someone made every window equally
+    /// unclickable.
+    #[test]
+    fn egui_claims_the_pointer_over_the_bag_window_as_it_does_over_loot() {
+        let rows = vec![
+            frames::LootRow {
+                take: frames::Take::Money,
+                name: "2c".into(),
+                count: 1,
+                icon: None,
+            },
+            frames::LootRow {
+                take: frames::Take::Item(7),
+                name: "Frayed Shoes".into(),
+                count: 1,
+                icon: None,
+            },
+        ];
+        let loot_data = HudData {
+            loot: Some(&rows),
+            ..Default::default()
+        };
+        let mut hud = Hud::default();
+        let element = hud.profile.get(ElementId::Loot);
+        let loot_at = element
+            .rect(
+                screen(),
+                frames::loot::size(rows.len(), &hud.profile.style, element.scale),
+            )
+            .center();
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            pass(&ctx, &mut hud, &loot_data, vec![egui::Event::PointerMoved(loot_at)]);
+        }
+        let over_loot = ctx.egui_wants_pointer_input();
+
+        let slots = bag_slots(&[(2224, "Small Dagger", 1), (159, "Refreshing Spring Water", 5)]);
+        let bag_data = HudData {
+            bags: Some(&slots),
+            ..Default::default()
+        };
+        let mut hud = Hud::default();
+        let bag_at = bag_slot_positions(&hud.profile, slots.len())[0];
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            pass(&ctx, &mut hud, &bag_data, vec![egui::Event::PointerMoved(bag_at)]);
+        }
+        let over_bags = ctx.egui_wants_pointer_input();
+
+        // The asymmetry that caused `foss-wow#79`, recorded rather than
+        // asserted: egui counts the loot window and not the bag window,
+        // because `ElementId::layer` puts one in `Order::Middle` and the
+        // other in `Order::Background`. Not asserted, because it is egui's
+        // behaviour rather than ours and an upgrade may reasonably change
+        // it -- what must hold is the line below.
+        assert!(
+            over_loot,
+            "the loot window takes clicks in play, so egui must want the pointer over it"
+        );
+        if !over_bags {
+            eprintln!(
+                "note: egui does not claim the pointer over a Background-order \
+                 frame; `captures_pointer` is what covers the difference"
+            );
+        }
+
+        // **The property the viewer must be able to rely on.** Its press
+        // router asks this, not egui, precisely because of the asymmetry
+        // above -- a press over *any* frame the interface drew has to read as
+        // the interface's, or it starts a camera drag and grabs the cursor
+        // out from under the click.
+        assert!(
+            hud.captures_pointer(&ctx),
+            "`captures_pointer` must claim the bag window even where egui does \
+             not -- this is what `foss-wow#79` turned on"
+        );
+    }
+
     fn book(count: usize) -> Vec<SpellbookEntry> {
         (0..count)
             .map(|i| SpellbookEntry {
