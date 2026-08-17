@@ -6289,6 +6289,11 @@ impl App {
             );
 
             egui::Window::new("open-wow")
+                // Over the interface rather than in among it: a window's
+                // default order is now where the playing frames live, and a
+                // stats readout buried under an action bar is a stats readout
+                // nobody can read. Same reasoning as the edit window.
+                .order(egui::Order::Foreground)
                 .default_width(430.0)
                 .show(ctx, |ui| {
                     ui.label(egui::RichText::new(&gpu_line).strong());

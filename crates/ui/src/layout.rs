@@ -71,12 +71,15 @@ impl ElementId {
     /// What order the frames are drawn in, lowest first.
     ///
     /// **This decides which window a click reaches, not just what looks
-    /// tidy.** Every frame is an egui area of the same order, so the one built
-    /// last is on top -- and the map is 760 by 520 in the middle of the
-    /// screen, which is exactly where a questgiver's scroll grows down into.
-    /// With both open the Accept button was underneath the map: drawn,
-    /// hit-tested, and unreachable, which reads as a window that has stopped
-    /// working rather than as one that is behind something.
+    /// tidy.** The map is 760 by 520 in the middle of the screen, which is
+    /// exactly where a questgiver's scroll grows down into. With both open the
+    /// Accept button was underneath the map: drawn, hit-tested, and
+    /// unreachable, which reads as a window that has stopped working rather
+    /// than as one that is behind something.
+    ///
+    /// The rank is a statement of intent; [`ElementId::layer`] is what makes
+    /// egui honour it, and the difference between the two is where the first
+    /// attempt at this went wrong.
     ///
     /// The ranking is by *how much answering it matters*. The map is a thing
     /// you read while stopped, so it goes at the bottom. The panels you open
@@ -100,6 +103,41 @@ impl ElementId {
             | ElementId::ActionBar2
             | ElementId::ActionBar3 => 2,
             ElementId::Loot | ElementId::Questgiver | ElementId::ReleasePrompt => 3,
+        }
+    }
+
+    /// Which egui layer this element's frame is built in, and whether it is
+    /// pinned to the top of that layer every frame.
+    ///
+    /// **The draw-order loop is not enough on its own, and believing it was
+    /// cost a whole fix.** egui keeps one z-order per [`egui::Order`] that
+    /// *persists between frames*: an area is appended to it the first time it
+    /// is seen and stays where it is, so the sequence a loop builds them in
+    /// only decides the order of areas that are all new at once. Two things
+    /// move an area after that, both of them egui's own doing -- being
+    /// clicked, and **appearing after having been absent**. So the map, opened
+    /// while a questgiver's scroll was already up, was moved above it and
+    /// swallowed the Accept button exactly as before. The test that said
+    /// otherwise built both windows into a fresh context, which is the one
+    /// arrangement where they are both new and the build order wins.
+    ///
+    /// What egui does offer is two controls that hold: the layer an area
+    /// belongs to, and [`egui::Context::move_to_top`], which is documented to
+    /// move an area to the top *of its own layer*. Two layers and one
+    /// pin-every-frame flag is four ranks, which is exactly what
+    /// [`ElementId::stacking`] asks for. Within a rank the order is still
+    /// egui's -- most recently opened on top -- and that is the right answer
+    /// for peers: open the bags over the spellbook and the bags are in front.
+    ///
+    /// `Order::Foreground` and above are deliberately left to the edit and
+    /// debug windows, which must stay over the interface they are used to
+    /// change.
+    pub fn layer(self) -> (egui::Order, bool) {
+        match self.stacking() {
+            0 => (egui::Order::Background, false),
+            1 => (egui::Order::Background, true),
+            2 => (egui::Order::Middle, false),
+            _ => (egui::Order::Middle, true),
         }
     }
 

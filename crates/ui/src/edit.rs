@@ -71,6 +71,12 @@ pub(crate) fn window(
     let mut action = EditAction::None;
 
     egui::Window::new("Interface")
+        // **Above the whole interface, deliberately.** A window's default is
+        // `Order::Middle`, which is where the frames you interact with while
+        // playing now live -- see [`ElementId::layer`] -- so left at the
+        // default this window would be *under* the action bars it is being
+        // used to move. The tool goes over the thing being worked on.
+        .order(egui::Order::Foreground)
         .default_width(320.0)
         .show(ctx, |ui| {
             ui.label("Drag any frame to move it.");

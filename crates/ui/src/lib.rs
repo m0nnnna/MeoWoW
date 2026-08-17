@@ -371,14 +371,6 @@ impl Hud {
     /// Answered from the rectangles this crate drew last frame plus egui's own
     /// opinion about its windows -- see [`Hud::occupied`] for why the second
     /// alone is not enough.
-    /// How many rectangles the interface drew into last frame. For a caller
-    /// reporting why a click went where it did -- an interface that claims
-    /// nothing and one whose handler ignored a click look identical from
-    /// outside.
-    pub fn occupied_count(&self) -> usize {
-        self.occupied.len()
-    }
-
     pub fn captures_pointer(&self, ctx: &egui::Context) -> bool {
         if ctx.egui_wants_pointer_input() {
             return true;
@@ -387,6 +379,14 @@ impl Hud {
             return false;
         };
         self.occupied.iter().any(|rect| rect.contains(pointer))
+    }
+
+    /// How many rectangles the interface drew into last frame. For a caller
+    /// reporting why a click went where it did -- an interface that claims
+    /// nothing and one whose handler ignored a click look identical from
+    /// outside.
+    pub fn occupied_count(&self) -> usize {
+        self.occupied.len()
     }
 
     /// Draws the whole interface, and handles edit-mode dragging.
@@ -694,11 +694,17 @@ impl Hud {
                 _ => None,
             };
 
-            let response = egui::Area::new(egui::Id::new(("hud-element", id.key())))
-                // Behind the debug and edit windows, which are ordinary egui
-                // windows: the interface is the thing being worked on, not the
-                // thing doing the working.
-                .order(egui::Order::Background)
+            // Which egui layer this frame belongs in, and whether it has to be
+            // pinned to the top of it. See [`ElementId::layer`]: the loop's
+            // sequence alone does *not* decide the z-order, because egui keeps
+            // one per layer that outlives the frame.
+            let (order, pinned) = id.layer();
+            let layer = egui::LayerId::new(order, egui::Id::new(("hud-element", id.key())));
+            let response = egui::Area::new(layer.id)
+                // Below the debug and edit windows, which are ordinary egui
+                // windows moved up to `Order::Foreground`: the interface is the
+                // thing being worked on, not the thing doing the working.
+                .order(order)
                 .fixed_pos(rect.min)
                 .show(ctx, |ui| {
                     let sense = if editing {
@@ -826,6 +832,20 @@ impl Hud {
                     response
                 })
                 .inner;
+
+            // **Asked for every frame, not only when it opens.** egui moves an
+            // area to the top of its layer when it is clicked or when it
+            // appears, and both of those would otherwise leave a lower-ranked
+            // frame above a higher-ranked one for as long as it stayed open --
+            // press an action bar that a loot window overlaps and the bar
+            // would come out in front of the window it is covering. Asking
+            // every frame costs a set insertion and settles the question in
+            // one direction only: egui's end-of-frame sort is stable, so
+            // pinned frames keep their own order among themselves and merely
+            // sit above the unpinned ones.
+            if pinned {
+                ctx.move_to_top(layer);
+            }
 
             // Clicking a slot casts, and hovering one explains what is in
             // it. Both read the same geometry the slots were drawn with, so
@@ -1720,6 +1740,33 @@ mod tests {
         last
     }
 
+    /// One pass through the real event loop, against a context the caller
+    /// keeps.
+    ///
+    /// [`drive`] makes a fresh context per script, which is exactly what hides
+    /// a stacking bug: every area is then new in the same pass and egui leaves
+    /// them in the order they were built. A test about *which window is on
+    /// top* has to open them at different moments, and so has to hold the
+    /// context across the passes itself.
+    fn pass(
+        ctx: &egui::Context,
+        hud: &mut Hud,
+        data: &HudData<'_>,
+        events: Vec<egui::Event>,
+    ) -> HudResponse {
+        let input = egui::RawInput {
+            screen_rect: Some(screen()),
+            events,
+            ..Default::default()
+        };
+        let mut response = HudResponse::default();
+        let output = ctx.run_ui(input, |ui| {
+            response = hud.show(ui, data);
+        });
+        output.drop_without_applying_deltas();
+        response
+    }
+
     /// One complete click at a point, as the passes it takes.
     fn click_script(pos: egui::Pos2, button: egui::PointerButton) -> Vec<Vec<egui::Event>> {
         let modifiers = egui::Modifiers::default();
@@ -2263,6 +2310,149 @@ mod tests {
             &click_script(accept.center(), egui::PointerButton::Primary),
         );
         assert_eq!(response.questgiver.acted, Some(783));
+    }
+
+    /// **And the map opened *after* the questgiver window must not seal it
+    /// either** -- which is the arrangement the live bug actually had, and the
+    /// one the test above cannot produce.
+    ///
+    /// That test builds both windows into a fresh context, and that is the
+    /// single arrangement in which egui orders same-layer areas by the
+    /// sequence they were built: an area that was **not visible last frame**
+    /// is moved to the top of its layer, so with both of them new the stable
+    /// sort at the end of the pass leaves them exactly as the loop built them.
+    /// Live they appear at different moments -- you greet an NPC, read the
+    /// scroll, then press `M` -- and whichever appears second is moved above
+    /// the other whatever order the loop builds them in. The draw-order loop
+    /// is therefore not enough on its own, and the test that said it was
+    /// passed because its premise had quietly stopped holding.
+    #[test]
+    fn a_map_opened_after_the_questgiver_does_not_seal_it() {
+        let view = frames::QuestgiverView::Quest {
+            id: 783,
+            title: "A Threat Within".into(),
+            body: (0..14)
+                .map(|line| format!("Line {line} of what the questgiver says."))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            objectives: vec!["Speak with Marshal McBride.".into()],
+            rewards: vec!["item 2224 x1".into()],
+            action: frames::QuestgiverAction::Accept,
+        };
+        let map = map_view();
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::Questgiver);
+        let rect = element.rect(
+            screen(),
+            frames::questgiver::size(&view, &hud.profile.style, element.scale),
+        );
+        let (accept, _) = frames::questgiver::button_rects(rect, &hud.profile.style, element.scale);
+        let map_element = hud.profile.get(ElementId::WorldMap);
+        let map_rect = map_element.rect(
+            screen(),
+            frames::world_map::size(&hud.profile.style, map_element.scale),
+        );
+        // The premise, asserted before anything else: the two really do
+        // overlap where the button is.
+        assert!(
+            map_rect.contains(accept.center()),
+            "the map at {map_rect:?} does not cover the Accept button at {:?}",
+            accept.center()
+        );
+
+        let ctx = egui::Context::default();
+        let greeted = HudData {
+            questgiver: Some(&view),
+            ..Default::default()
+        };
+        let and_the_map = HudData {
+            questgiver: Some(&view),
+            world_map: Some(&map),
+            ..Default::default()
+        };
+        // The scroll is open and read for a couple of passes...
+        for _ in 0..2 {
+            pass(&ctx, &mut hud, &greeted, Vec::new());
+        }
+        // ...and only then is the map opened over it.
+        let mut response = HudResponse::default();
+        for events in click_script(accept.center(), egui::PointerButton::Primary) {
+            response = pass(&ctx, &mut hud, &and_the_map, events);
+        }
+        assert_eq!(
+            response.questgiver.acted,
+            Some(783),
+            "the map was opened second and swallowed the Accept button"
+        );
+    }
+
+    /// **The same thing for a panel, which is the rank the pin is for.** The
+    /// questgiver window is in a different egui layer from the map and could
+    /// not be sealed by it whatever else happened; the quest log is in the
+    /// *same* layer, one rank above, and stays there only because it asks to
+    /// be on top of that layer every frame. Reading the log and then opening
+    /// the map over it is the obvious thing to do with the two of them.
+    #[test]
+    fn a_map_opened_after_the_quest_log_does_not_seal_it() {
+        let entries = log_entries();
+        let map = map_view();
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        // **Moved onto the map on purpose.** The default layout keeps the log
+        // off to one side, so with the shipped positions these two never
+        // overlap and the test would prove nothing -- but every position here
+        // belongs to the user, and a log dragged over the middle of the screen
+        // is an ordinary thing to have done. The rank has to hold for the
+        // layout somebody made, not only for the one that shipped.
+        {
+            let log = hud.profile.edit(ElementId::QuestLog);
+            log.anchor = crate::element::Anchor::Center;
+            log.offset = [0.0, 0.0];
+        }
+        let element = hud.profile.get(ElementId::QuestLog);
+        let rect = element.rect(
+            screen(),
+            frames::quest_log::size(&entries, &hud.profile.style, element.scale),
+        );
+        let row = frames::quest_log::entry_rects(rect, &entries, &hud.profile.style, element.scale)
+            [1]
+        .center();
+        let map_element = hud.profile.get(ElementId::WorldMap);
+        let map_rect = map_element.rect(
+            screen(),
+            frames::world_map::size(&hud.profile.style, map_element.scale),
+        );
+        // The premise again: with no overlap this proves nothing at all.
+        assert!(
+            map_rect.contains(row),
+            "the map at {map_rect:?} does not cover the quest row at {row:?}"
+        );
+
+        let ctx = egui::Context::default();
+        let log_only = HudData {
+            quest_log: Some(&entries),
+            ..Default::default()
+        };
+        let and_the_map = HudData {
+            quest_log: Some(&entries),
+            world_map: Some(&map),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            pass(&ctx, &mut hud, &log_only, Vec::new());
+        }
+        let mut response = HudResponse::default();
+        for events in click_script(row, egui::PointerButton::Primary) {
+            response = pass(&ctx, &mut hud, &and_the_map, events);
+        }
+        assert_eq!(
+            response.selected_quest,
+            Some(38),
+            "the map was opened over the quest log and swallowed the row"
+        );
     }
 
     /// Accept and Close sit side by side, so a hit test that disagreed with
