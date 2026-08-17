@@ -76,6 +76,24 @@ pub struct MapMarker {
     pub outline: Vec<(f32, f32)>,
 }
 
+/// A patch of explored art drawn over the base tiles.
+///
+/// **The base tiles are the unexplored picture**: a zone page with no patches
+/// on it is a coastline and nothing else, and the roads, buildings and names
+/// arrive one explored area at a time. The caller decides which patches those
+/// are; this crate only puts them where it is told.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapPatch {
+    pub texture: egui::TextureId,
+    /// Where it goes, as fractions of the drawn page: `[u0, v0, u1, v1]`.
+    pub rect: [f32; 4],
+    /// Which part of the texture to take, as fractions. Not always the whole
+    /// of it: a patch tile is stored at a power-of-two size that can be larger
+    /// than the part of the patch it holds, and drawing the padding would let
+    /// a patch bleed past the rectangle the table gave it.
+    pub uv: [f32; 4],
+}
+
 /// Everything the frame draws.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MapView {
@@ -84,6 +102,8 @@ pub struct MapView {
     /// The twelve tiles in reading order. A `None` is a tile that would not
     /// load, and leaves a hole rather than shifting the others.
     pub tiles: [Option<egui::TextureId>; TILE_COUNT],
+    /// Explored patches, drawn over the tiles and under the markers.
+    pub patches: Vec<MapPatch>,
     pub markers: Vec<MapMarker>,
     /// Drawn across the middle when the page itself is missing -- see the
     /// module comment for why the markers stay.
@@ -96,6 +116,7 @@ pub fn placeholder() -> MapView {
     MapView {
         title: "World Map".into(),
         tiles: Default::default(),
+        patches: Vec::new(),
         markers: vec![MapMarker {
             u: 0.5,
             v: 0.5,
@@ -193,6 +214,23 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MapView, style: &Style, scale:
             *id,
             at,
             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    }
+
+    // The explored patches, over the base art and under everything else.
+    for patch in &view.patches {
+        let at = Rect::from_min_max(
+            marker_pos(art, patch.rect[0], patch.rect[1]),
+            marker_pos(art, patch.rect[2], patch.rect[3]),
+        );
+        clipped.image(
+            patch.texture,
+            at,
+            Rect::from_min_max(
+                Pos2::new(patch.uv[0], patch.uv[1]),
+                Pos2::new(patch.uv[2], patch.uv[3]),
+            ),
             Color32::WHITE,
         );
     }

@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use dbc::worldmap::{Atlas, Page};
+use dbc::worldmap::{Atlas, Overlay, Page};
 use mpq::Chain;
 use render::{Gpu, UploadedTexture};
 use ui::frames::world_map::TILE_COUNT;
@@ -34,10 +34,31 @@ pub struct Maps {
     /// `directory` is an internal name -- `SwampOfSorrows`, `Ogrimmar` -- and
     /// putting that on screen would be showing the player a file path.
     zone_names: HashMap<u32, String>,
+    /// `AreaTable` id to the bit that says whether it has been explored --
+    /// which is what decides whether that area's patch of the page is drawn.
+    /// Areas with bit 0 are not in here: the column is a real index and zero
+    /// belongs to one row, so treating "no bit" as bit zero would reveal a
+    /// patch on the strength of an absent field.
+    area_bits: HashMap<u32, u32>,
     /// Uploaded tiles per page id. A `None` is a tile that would not load.
     tiles: HashMap<u32, [Option<egui::TextureId>; TILE_COUNT]>,
+    /// Uploaded patch tiles, keyed by overlay id and tile number.
+    patches: HashMap<(u32, usize), Option<PatchTile>>,
     /// Kept alive because egui holds only the id.
     uploaded: Vec<UploadedTexture>,
+}
+
+/// One uploaded patch tile and the size it is actually stored at.
+///
+/// The stored size is kept because it is **not** the size of the piece of map
+/// the tile holds: a patch tile is padded up to a power of two, so the drawn
+/// rectangle has to be cropped against the patch's stated width and height and
+/// the texture coordinates cropped with it.
+#[derive(Clone, Copy)]
+struct PatchTile {
+    texture: egui::TextureId,
+    width: f32,
+    height: f32,
 }
 
 impl Maps {
@@ -47,13 +68,21 @@ impl Maps {
     /// the atlas is empty, every position resolves to no page, and the map
     /// window says so instead of refusing to open.
     pub fn load(chain: &mut Chain) -> Self {
-        use dbc::schema::{AreaTable, WorldMapArea};
+        use dbc::schema::{AreaTable, WorldMapArea, WorldMapOverlay};
 
         let started = std::time::Instant::now();
         let mut maps = Maps::default();
         if let Ok(bytes) = chain.read(WorldMapArea::PATH) {
             if let Ok(table) = WorldMapArea::parse(&bytes) {
                 maps.atlas = Atlas::from_table(&table);
+            }
+        }
+        // The patches are what turn a coastline into a map, but a missing
+        // overlay table is not a reason to have no atlas -- it is an
+        // unexplored one, which is a state the map can draw and explain.
+        if let Ok(bytes) = chain.read(WorldMapOverlay::PATH) {
+            if let Ok(table) = WorldMapOverlay::parse(&bytes) {
+                maps.atlas = std::mem::take(&mut maps.atlas).with_overlays(&table);
             }
         }
         if let Ok(bytes) = chain.read(AreaTable::PATH) {
@@ -63,13 +92,19 @@ impl Maps {
                     .filter(|row| !row.name().is_empty())
                     .map(|row| (row.id(), row.name().to_string()))
                     .collect();
+                maps.area_bits = table
+                    .iter()
+                    .filter(|row| row.area_bit() != 0)
+                    .map(|row| (row.id(), row.area_bit()))
+                    .collect();
             }
         }
         tracing::info!(
-            "world map pages loaded in {:?}: {} pages, {} area names",
+            "world map pages loaded in {:?}: {} pages, {} area names, {} areas with an explored bit",
             started.elapsed(),
             maps.atlas.pages().len(),
-            maps.zone_names.len()
+            maps.zone_names.len(),
+            maps.area_bits.len()
         );
         maps
     }
@@ -132,6 +167,128 @@ impl Maps {
         self.tiles.insert(page.id, ids);
         ids
     }
+
+    /// The explored patches of a page, uploading their art the first time each
+    /// is drawn.
+    ///
+    /// `explored` answers "has this area bit been walked into", which is the
+    /// player's own replicated `PLAYER_EXPLORED_ZONES`. **A patch whose areas
+    /// have no explored bit is not drawn**, because that is what the original
+    /// client does and because drawing it would be telling the player they
+    /// have been somewhere they have not.
+    pub fn patches(
+        &mut self,
+        gpu: &Gpu,
+        renderer: &mut egui_wgpu::Renderer,
+        chain: &mut Chain,
+        page: &Page,
+        explored: &dyn Fn(u32) -> bool,
+    ) -> Vec<ui::MapPatch> {
+        let wanted: Vec<Overlay> = self
+            .atlas
+            .overlays(page.id)
+            .filter(|overlay| {
+                overlay
+                    .areas
+                    .iter()
+                    .filter(|area| **area != 0)
+                    .any(|area| self.area_bits.get(area).is_some_and(|bit| explored(*bit)))
+            })
+            .cloned()
+            .collect();
+
+        let mut out = Vec::new();
+        for overlay in &wanted {
+            for tile in 1..=overlay.tile_count() {
+                let Some(loaded) = self.patch_tile(gpu, renderer, chain, page, overlay, tile) else {
+                    continue;
+                };
+                if let Some(patch) = place_patch(overlay, tile, &loaded) {
+                    out.push(patch);
+                }
+            }
+        }
+        out
+    }
+
+    /// One patch tile, uploaded once and remembered -- failures too, on the
+    /// same reasoning as the page tiles: a file that would not load this frame
+    /// will not load next frame either.
+    fn patch_tile(
+        &mut self,
+        gpu: &Gpu,
+        renderer: &mut egui_wgpu::Renderer,
+        chain: &mut Chain,
+        page: &Page,
+        overlay: &Overlay,
+        tile: usize,
+    ) -> Option<PatchTile> {
+        if let Some(cached) = self.patches.get(&(overlay.id, tile)) {
+            return *cached;
+        }
+        let path = overlay.tile_path(&page.directory, tile);
+        let loaded = (|| {
+            let bytes = chain.read(&path).ok()?;
+            let image = blp::Blp::parse(&bytes).ok()?;
+            let (width, height) = (image.width() as f32, image.height() as f32);
+            let uploaded = render::texture::upload_blp(gpu, &image, &path);
+            let texture = renderer.register_native_texture(
+                &gpu.device,
+                &uploaded.view,
+                wgpu::FilterMode::Linear,
+            );
+            self.uploaded.push(uploaded);
+            Some(PatchTile {
+                texture,
+                width,
+                height,
+            })
+        })();
+        if loaded.is_none() {
+            tracing::debug!("world map patch {path} would not load");
+        }
+        self.patches.insert((overlay.id, tile), loaded);
+        loaded
+    }
+}
+
+/// Where one patch tile goes on the page, cropped to the patch's own
+/// rectangle.
+///
+/// **The crop is the whole of this function's reason to exist.** A tile is
+/// stored at a power-of-two size that is often bigger than the piece of map it
+/// carries -- `FORESTSEDGE` is 341 pixels tall and its second tile is stored
+/// 128 tall to hold the remaining 85 rows -- so a tile drawn at its own size
+/// reaches past the rectangle `WorldMapOverlay` gave it. Cropping the drawn
+/// rectangle and the texture coordinates together is what keeps the picture
+/// aligned; cropping one without the other would stretch it instead.
+fn place_patch(overlay: &Overlay, tile: usize, loaded: &PatchTile) -> Option<ui::MapPatch> {
+    let (origin_x, origin_y) = overlay.tile_origin(tile);
+    // How much of this tile is inside the patch, in page pixels.
+    let stop_x = (overlay.offset_x + overlay.width).min(origin_x + loaded.width as u32);
+    let stop_y = (overlay.offset_y + overlay.height).min(origin_y + loaded.height as u32);
+    let (used_w, used_h) = (
+        stop_x.saturating_sub(origin_x) as f32,
+        stop_y.saturating_sub(origin_y) as f32,
+    );
+    if used_w <= 0.0 || used_h <= 0.0 {
+        return None;
+    }
+    Some(ui::MapPatch {
+        texture: loaded.texture,
+        rect: [
+            origin_x as f32 / dbc::worldmap::PAGE_WIDTH,
+            origin_y as f32 / dbc::worldmap::PAGE_HEIGHT,
+            (origin_x as f32 + used_w) / dbc::worldmap::PAGE_WIDTH,
+            (origin_y as f32 + used_h) / dbc::worldmap::PAGE_HEIGHT,
+        ],
+        uv: [
+            0.0,
+            0.0,
+            used_w / loaded.width,
+            used_h / loaded.height,
+        ],
+    })
 }
 
 /// Where the realm says each quest's objectives are.
@@ -261,6 +418,7 @@ pub fn build_view(
     chain: &mut Chain,
     standing: Option<Standing>,
     objectives: &[Objective<'_>],
+    explored: &dyn Fn(u32) -> bool,
 ) -> ui::MapView {
     let Some(at) = standing else {
         return ui::MapView {
@@ -282,6 +440,7 @@ pub fn build_view(
 
     let (u, v) = page.project(at.x, at.y);
     let tiles = maps.tiles(gpu, renderer, chain, &page);
+    let patches = maps.patches(gpu, renderer, chain, &page, explored);
     // Objectives first so the player's arrow is painted over them rather than
     // under: where you are is never the thing to obscure.
     let mut markers: Vec<ui::MapMarker> = objectives
@@ -303,11 +462,20 @@ pub fn build_view(
     });
     ui::MapView {
         title: maps.title(&page),
-        note: tiles
-            .iter()
-            .all(Option::is_none)
-            .then(|| format!("no art for {}", page.directory)),
+        // **Three states, three sentences.** A page whose art would not load
+        // at all, a page whose art loaded and which the character has explored
+        // nothing of, and an ordinary map are different situations, and only
+        // the first is this client's fault. Saying nothing for the second
+        // makes an unexplored zone look like a broken one.
+        note: if tiles.iter().all(Option::is_none) {
+            Some(format!("no art for {}", page.directory))
+        } else if patches.is_empty() {
+            Some("nothing here explored yet".into())
+        } else {
+            None
+        },
         tiles,
+        patches,
         markers,
     }
 }
@@ -523,6 +691,97 @@ mod tests {
         assert_eq!(objectives.take_unknown(&[783], 4, now), vec![783]);
         objectives.give_up(783);
         assert_eq!(objectives.take_unknown(&[783], 4, now), vec![783]);
+    }
+
+    fn overlay(width: u32, height: u32, offset: (u32, u32)) -> Overlay {
+        Overlay {
+            id: 1,
+            page_id: 30,
+            areas: [9, 0, 0, 0],
+            texture: "FORESTSEDGE".into(),
+            width,
+            height,
+            offset_x: offset.0,
+            offset_y: offset.1,
+        }
+    }
+
+    /// A tile that fits inside its patch is drawn whole, at the page pixels
+    /// the table names.
+    #[test]
+    fn a_whole_patch_tile_lands_where_the_table_puts_it() {
+        // NORTHSHIREVALLEY: 256x256 at (381, 147), one tile.
+        let patch = place_patch(
+            &overlay(256, 256, (381, 147)),
+            1,
+            &PatchTile {
+                texture: egui::TextureId::default(),
+                width: 256.0,
+                height: 256.0,
+            },
+        )
+        .expect("a patch");
+        assert_eq!(patch.uv, [0.0, 0.0, 1.0, 1.0], "the whole texture is used");
+        let (w, h) = (dbc::worldmap::PAGE_WIDTH, dbc::worldmap::PAGE_HEIGHT);
+        assert!((patch.rect[0] - 381.0 / w).abs() < 1e-6);
+        assert!((patch.rect[1] - 147.0 / h).abs() < 1e-6);
+        assert!((patch.rect[2] - (381.0 + 256.0) / w).abs() < 1e-6);
+        assert!((patch.rect[3] - (147.0 + 256.0) / h).abs() < 1e-6);
+    }
+
+    /// **The crop, which is the whole reason this function exists.**
+    /// `FORESTSEDGE` is 256x341 and its second tile is stored 128 tall to
+    /// carry the remaining 85 rows. Drawn at the file's own size the patch
+    /// would reach 43 pixels past the rectangle the table gave it -- and it
+    /// would look like a slightly-too-tall picture rather than like a bug.
+    ///
+    /// The drawn rectangle and the texture coordinates must be cropped
+    /// *together*: cropping the rectangle alone squashes the art, cropping the
+    /// coordinates alone stretches it, and either reads as "the map is a bit
+    /// off" rather than as anything checkable.
+    #[test]
+    fn a_padded_patch_tile_is_cropped_in_both_the_rectangle_and_the_texture() {
+        let forests_edge = overlay(256, 341, (124, 327));
+        let bottom = place_patch(
+            &forests_edge,
+            2,
+            &PatchTile {
+                texture: egui::TextureId::default(),
+                width: 256.0,
+                height: 128.0,
+            },
+        )
+        .expect("a patch");
+
+        // 341 - 256 = 85 rows of a 128-tall file.
+        assert!((bottom.uv[3] - 85.0 / 128.0).abs() < 1e-6, "{:?}", bottom.uv);
+        assert_eq!(bottom.uv[2], 1.0, "the full width is used");
+        let h = dbc::worldmap::PAGE_HEIGHT;
+        assert!((bottom.rect[1] - (327.0 + 256.0) / h).abs() < 1e-6);
+        assert!(
+            (bottom.rect[3] - (327.0 + 341.0) / h).abs() < 1e-6,
+            "the patch must stop exactly at its stated height"
+        );
+        // The two crops agree: the same fraction of the file and of the space.
+        let drawn = (bottom.rect[3] - bottom.rect[1]) * h;
+        assert!((drawn - 85.0).abs() < 1e-3, "drew {drawn} page pixels");
+    }
+
+    /// A tile entirely outside its patch's rectangle is not drawn at all,
+    /// rather than drawn with a zero or negative size.
+    #[test]
+    fn a_tile_past_the_end_of_its_patch_is_dropped() {
+        let one_tile = overlay(256, 256, (0, 0));
+        assert!(place_patch(
+            &one_tile,
+            2,
+            &PatchTile {
+                texture: egui::TextureId::default(),
+                width: 256.0,
+                height: 256.0,
+            }
+        )
+        .is_none());
     }
 
     /// The four cardinal headings, each asserted as a screen *direction*.

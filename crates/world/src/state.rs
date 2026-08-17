@@ -313,6 +313,31 @@ impl Entity {
             .collect()
     }
 
+    /// Whether this player has explored the area with this `AreaTable` area
+    /// bit.
+    ///
+    /// **An absent field is a `0`, never an unknown**, which is the rule this
+    /// project already paid for on `PLAYER_BYTES`: an update block carries
+    /// only non-zero fields, so a character who has explored nothing in a
+    /// given word simply has no field there. Reporting that as "not known"
+    /// would draw the whole map as explored for exactly the characters who
+    /// have explored least.
+    ///
+    /// A bit past the block is `false` rather than an error: the field is 128
+    /// words wide, `AreaTable` reaches nowhere near that, and a caller cannot
+    /// do anything useful with a failure here anyway.
+    pub fn has_explored(&self, area_bit: u32) -> bool {
+        use crate::update::fields;
+        let word = area_bit / 32;
+        if word >= fields::EXPLORED_ZONES_WORDS as u32 {
+            return false;
+        }
+        let field = fields::PLAYER_EXPLORED_ZONES + word as u16;
+        self.fields
+            .get(field)
+            .is_some_and(|bits| bits & (1 << (area_bit % 32)) != 0)
+    }
+
     /// What this unit has targeted, if anything. Zero means nothing, and is
     /// reported as `None` rather than as a guid no object will ever have.
     pub fn target(&self) -> Option<u64> {
@@ -3777,6 +3802,53 @@ mod tests {
             0xad,
             "base and stride must still describe the measured offsets"
         );
+    }
+
+    /// **The explored-areas bitfield, built from the two live dumps that
+    /// identified it**, so the base cannot drift without this failing.
+    ///
+    /// `Watcher` had explored `Northshire Valley` (area bit 125, word 3) and
+    /// held `0x20000000` at field `0x0414`; `Huntertest` had explored one Dun
+    /// Morogh area (bit 212, word 6) and held `0x00100000` at `0x0417`. Two
+    /// bits three words apart at two fields three apart is the whole
+    /// identification -- one character's single set word would have matched
+    /// any flag field in the object.
+    ///
+    /// Both halves are asserted on each character: the bit that is set, and a
+    /// bit that is not. A reading that answered `true` to everything would
+    /// pass the first half alone and draw a fully explored map for a character
+    /// who had just logged in.
+    #[test]
+    fn explored_areas_read_at_the_measured_base_for_both_characters() {
+        use crate::update::fields;
+
+        let mut world = WorldState::new();
+        world.apply(&[
+            create(9, ObjectType::Player, Some(at(0.0, 0.0)), &[(0x0414, 0x2000_0000)]),
+            create(10, ObjectType::Player, Some(at(0.0, 0.0)), &[(0x0417, 0x0010_0000)]),
+        ]);
+
+        let watcher = world.get(9).unwrap();
+        assert!(watcher.has_explored(125), "Northshire Valley");
+        assert!(!watcher.has_explored(212), "and nowhere in Dun Morogh");
+        // The neighbouring bits in the same word, which a shifted mask would
+        // pick up.
+        assert!(!watcher.has_explored(124) && !watcher.has_explored(126));
+
+        let hunter = world.get(10).unwrap();
+        assert!(hunter.has_explored(212));
+        assert!(!hunter.has_explored(125), "and not Northshire");
+
+        // A character with no field at all has explored nothing, rather than
+        // everything -- an absent field is a zero, not an unknown.
+        world.apply(&[create(11, ObjectType::Player, Some(at(0.0, 0.0)), &[])]);
+        let fresh = world.get(11).unwrap();
+        assert!(!fresh.has_explored(125));
+        // And a bit past the block does not read some other field.
+        assert!(!fresh.has_explored(fields::EXPLORED_ZONES_WORDS as u32 * 32));
+
+        assert_eq!(fields::PLAYER_EXPLORED_ZONES + 3, 0x0414);
+        assert_eq!(fields::PLAYER_EXPLORED_ZONES + 6, 0x0417);
     }
 
     /// **The completion field, measured against two quests in opposite

@@ -5444,6 +5444,21 @@ impl App {
                 })
                 .filter(|objective| !objective.markers.is_empty())
                 .collect();
+            // **Exploration comes from the player's own replicated field**,
+            // not from anywhere this client could decide for itself. A patch
+            // of the page is drawn only where `PLAYER_EXPLORED_ZONES` says the
+            // character has been, which is what makes the map fill in as it is
+            // walked -- and what stops it claiming ground nobody has covered.
+            let explored_bits: std::collections::HashSet<u32> = self
+                .live
+                .as_ref()
+                .and_then(|live| live.state.get(live.guid))
+                .map(|player| {
+                    (0..::world::update::fields::EXPLORED_ZONES_WORDS as u32 * 32)
+                        .filter(|bit| player.has_explored(*bit))
+                        .collect()
+                })
+                .unwrap_or_default();
             maps::build_view(
                 &mut self.maps,
                 &r.gpu,
@@ -5451,6 +5466,7 @@ impl App {
                 &mut self.chain,
                 standing,
                 &objectives,
+                &|bit| explored_bits.contains(&bit),
             )
         });
 

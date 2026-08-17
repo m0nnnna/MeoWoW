@@ -37,4 +37,4 @@ pub use quest_log::{QuestDetail, QuestLogEntry};
 pub use questgiver::{QuestgiverAction, QuestgiverClick, QuestgiverRow, QuestgiverView};
 pub use spellbook::SpellbookEntry;
 pub use unit::UnitView;
-pub use world_map::{MapMarker, MapView, MarkerKind};
+pub use world_map::{MapMarker, MapPatch, MapView, MarkerKind};

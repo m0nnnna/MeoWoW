@@ -4075,12 +4075,76 @@ release prompt, and it may not touch the unit frames, the chat log, the cast
 bar or the action bars. An exemption with nothing asserted in its place is how
 a layout rule quietly stops meaning anything.
 
+### 4.17 continued: the map fills in as it is explored
+
+The first version drew the twelve base tiles and nothing else, and the report
+back was that the abbey the character had walked through was not on the map.
+That is the correct complaint about a wrong assumption: **the base tiles are
+the *unexplored* picture.** A zone page on its own is a coastline and some
+water. Every road, building, mine and name is a separate `WorldMapOverlay`
+patch, blitted on at a stated pixel offset, and drawn only where the player has
+been.
+
+#### One patch per area, and the files say how they are cut
+
+A patch is stored the way a page is: 256-pixel tiles, `<TEXTURE><n>.blp`,
+across before down. The counts on disk are what confirm it rather than
+anything transcribed — `Interface\WorldMap\Elwynn` holds exactly
+`NorthshireValley1`, `ForestsEdge1..2` (the patch is 256x341, so one column and
+two rows), `RidgepointTower1..2` (306x233, two columns and one row) and
+`Stormwind1..4` (485x405). Swept over the whole game with
+`wow-cli map overlays --verify`: **886 patches on 105 pages, 1,524 of 1,524
+tile files resolved**, by path rather than through a listing, because an MPQ
+finds files by hash and a listing has answered this question wrongly here
+before.
+
+**A tile is stored larger than the piece of map it carries.** `FORESTSEDGE` is
+341 pixels tall and its second tile is a 256x**128** file holding the remaining
+85 rows. So the drawn rectangle *and* the texture coordinates are cropped
+together against the patch's stated size: crop one without the other and the
+art stretches or squashes instead of stopping, which reads as "the map is
+slightly off" rather than as anything checkable.
+
+Asking for the file one past the computed count turns one up for **76 of the
+886** patches, which looks like a miscount and is not: `ceil(w/256) *
+ceil(h/256)` covers the stated rectangle exactly, so a further file has nowhere
+to be placed. Exporting a pair settles what they are — `MarshlightLake1` is the
+whole labelled patch and `MarshlightLake2` is nearly blank, an offcut of a
+taller earlier version left in the archive when the table row shrank.
+
+#### The explored bitfield, measured against two characters
+
+Which patches to draw comes from `PLAYER_EXPLORED_ZONES`, 128 update fields
+holding one bit per `AreaTable` row's area bit. **A bitmask is a poor search
+target on its own** — a single set word is just a power of two, and a player
+object is full of flags — so it was measured against two characters whose set
+bits sit in *different words*:
+
+| character | explored | area bit | word | field |
+|---|---|---|---|---|
+| `Watcher` | Northshire Valley | 125 | 3 | `0x0414` |
+| `Huntertest` | one Dun Morogh area | 212 | 6 | `0x0417` |
+
+Two fields three apart for two bits three words apart, giving the same base
+`0x0411` from either character. The server's own `characters.exploredZones` —
+128 words per character, a source no client is ever sent — agrees with both.
+
+An absent field is a **zero**, not an unknown, which is the same rule
+`PLAYER_BYTES` established: an update block carries only non-zero fields, so a
+character who has explored nothing in a word simply has no field there.
+Reading that as "not known" would draw the whole map explored for exactly the
+characters who have explored least.
+
+So `Testwolf`, having walked Northshire Valley, the Abbey and Echo Ridge Mine,
+gets Elwynn's `NORTHSHIREVALLEY` patch and eleven others hidden — and a page
+with nothing revealed says `nothing here explored yet`, which is a third state
+beside "no art for this page" and an ordinary map.
+
 #### What is still missing
 
-No overlays, so the page is drawn fully explored rather than revealed as the
-character walks it. No zoom or panning, and no way to open a page other than
-the one you are standing on. No continent view, no minimap (4.18), no `!` or
-`?` over questgivers, and nothing on the map for anything but quest objectives
-— no vendors, no flight points, no trainers. Three of the 108 pages state no
+No zoom or panning, and no way to open a page other than the one you are
+standing on. No continent view, no minimap (4.18), no `!` or `?` over
+questgivers, and nothing on the map for anything but quest objectives — no
+vendors, no flight points, no trainers. Three of the 108 pages state no
 rectangle at all (`Dalaran`, `TheNexus`, `UtgardeKeep`) and a character
 standing in one gets a window that says so rather than a blank picture.

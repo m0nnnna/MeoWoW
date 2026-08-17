@@ -45,7 +45,7 @@
 //! channel and tiles 1, 2, 3, 5, 6 and 7 do not, which is exactly the right
 //! column and the bottom row. Padding is transparent; content is not.
 
-use crate::schema::{WorldMapArea, WorldMapAreaRow};
+use crate::schema::{WorldMapArea, WorldMapAreaRow, WorldMapOverlay, WorldMapOverlayRow};
 
 /// Tiles across a page, and down it.
 pub const TILE_COLUMNS: usize = 4;
@@ -147,22 +147,139 @@ impl Page {
     }
 }
 
+/// A patch of a page revealed by exploring the area it covers.
+///
+/// **The twelve base tiles are the *unexplored* picture.** A zone page with no
+/// overlays on it draws as blank parchment with a coastline: the roads, the
+/// buildings and the names all live in these patches, one per named sub-area,
+/// blitted on at a stated pixel offset. A client that draws only the base
+/// tiles has a map that never fills in, which is exactly how this was found --
+/// the map worked, and the abbey the character had walked through was not on
+/// it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Overlay {
+    pub id: u32,
+    /// The [`Page`] this patch is drawn on.
+    pub page_id: u32,
+    /// The `AreaTable` areas it reveals -- up to four, zero where absent. Any
+    /// one of them being explored shows the whole patch, because one texture
+    /// is all the table offers.
+    pub areas: [u32; 4],
+    /// Base name of the texture, e.g. `NORTHSHIREVALLEY`. Upper case in the
+    /// table and mixed case on disk, which does not matter: an MPQ hashes the
+    /// upper-cased path, so either resolves.
+    pub texture: String,
+    pub width: u32,
+    pub height: u32,
+    /// Pixels from the page's left and top edges, in the same 1002x668 space
+    /// [`Page::project_pixels`] returns.
+    pub offset_x: u32,
+    pub offset_y: u32,
+}
+
+impl Overlay {
+    /// Whether the patch states a rectangle and a texture to fill it.
+    pub fn is_drawable(&self) -> bool {
+        self.width > 0 && self.height > 0 && !self.texture.is_empty()
+    }
+
+    /// Tiles across the patch, and down it.
+    ///
+    /// A patch wider or taller than one tile is split the same way a page is,
+    /// and **the file count is what confirms the rule**: `STORMWIND` is
+    /// 485x405 and ships four files, `FORESTSEDGE` is 256x341 and ships two,
+    /// `RIDGEPOINTTOWER` is 306x233 and ships two. Nothing here was
+    /// transcribed.
+    pub fn tile_grid(&self) -> (usize, usize) {
+        let across = (self.width as usize).div_ceil(TILE_TEXELS);
+        let down = (self.height as usize).div_ceil(TILE_TEXELS);
+        (across.max(1), down.max(1))
+    }
+
+    /// How many files the patch is stored in.
+    ///
+    /// **76 patches have a file past this count, and it is right to ignore
+    /// them.** `wow-cli map overlays --verify` resolves every predicted tile
+    /// across the whole game -- 1,524 of 1,524 -- and then asks for the one
+    /// past the end, which turns up for 76 of the 886 patches. The count
+    /// cannot be too low: `ceil(w/256) * ceil(h/256)` covers the stated
+    /// rectangle exactly, so a further file has nowhere to go. Exporting the
+    /// pair settles what they are -- `MarshlightLake1` is the whole labelled
+    /// picture and `MarshlightLake2` is nearly blank, an offcut of some
+    /// earlier, taller version of the patch left in the archive when the table
+    /// row shrank.
+    pub fn tile_count(&self) -> usize {
+        let (across, down) = self.tile_grid();
+        across * down
+    }
+
+    /// Archive path of one tile, `1..=tile_count()`, in reading order.
+    pub fn tile_path(&self, page_directory: &str, tile: usize) -> String {
+        format!(
+            r"Interface\WorldMap\{page_directory}\{texture}{tile}.blp",
+            texture = self.texture
+        )
+    }
+
+    /// Where one tile's top-left corner sits on the page, in page pixels.
+    ///
+    /// **A tile is stored at a power-of-two size that is usually larger than
+    /// the part of the patch it holds** -- `FORESTSEDGE` is 341 tall and its
+    /// second tile is stored 128 tall to carry the remaining 85 rows. So the
+    /// caller has to crop against [`Overlay::width`] and [`Overlay::height`]
+    /// rather than drawing the file at its own size, or the patch bleeds past
+    /// the rectangle the table gave it.
+    pub fn tile_origin(&self, tile: usize) -> (u32, u32) {
+        let (across, _) = self.tile_grid();
+        let index = tile.saturating_sub(1);
+        let (col, row) = (index % across, index / across);
+        (
+            self.offset_x + (col * TILE_TEXELS) as u32,
+            self.offset_y + (row * TILE_TEXELS) as u32,
+        )
+    }
+}
+
 /// Every page in the table, ready to be searched by position.
 #[derive(Debug, Clone, Default)]
 pub struct Atlas {
     pages: Vec<Page>,
+    overlays: Vec<Overlay>,
 }
 
 impl Atlas {
     /// Reads every row, keeping the ones that state a rectangle.
+    ///
+    /// Overlays arrive separately through [`Atlas::with_overlays`], because a
+    /// caller with no `WorldMapOverlay.dbc` should still get a usable atlas
+    /// rather than none: a map with no patches on it is an unexplored map,
+    /// which is a real state, where a map with no pages is nothing at all.
     pub fn from_table(table: &WorldMapArea) -> Self {
         let pages = table.iter().map(page_from_row).filter(Page::has_bounds).collect();
-        Self { pages }
+        Self {
+            pages,
+            overlays: Vec::new(),
+        }
+    }
+
+    /// Adds the patch table, keeping the rows that state a texture and a size.
+    pub fn with_overlays(mut self, table: &WorldMapOverlay) -> Self {
+        self.overlays = table
+            .iter()
+            .map(overlay_from_row)
+            .filter(Overlay::is_drawable)
+            .collect();
+        self
     }
 
     /// All pages, in table order.
     pub fn pages(&self) -> &[Page] {
         &self.pages
+    }
+
+    /// Every patch drawn on one page, in table order.
+    pub fn overlays(&self, page_id: u32) -> impl Iterator<Item = &Overlay> {
+        self.overlays.iter().filter(move |o| o.page_id == page_id)
     }
 
     /// The page with this `WorldMapArea.dbc` id.
@@ -192,6 +309,24 @@ impl Atlas {
     /// The whole-continent page for a map, if it has one.
     pub fn continent_page(&self, map_id: u32) -> Option<&Page> {
         self.pages.iter().find(|p| p.map_id == map_id && p.area_id == 0)
+    }
+}
+
+fn overlay_from_row(row: WorldMapOverlayRow<'_>) -> Overlay {
+    Overlay {
+        id: row.id(),
+        page_id: row.world_map_area_id(),
+        areas: [
+            row.area_id_0(),
+            row.area_id_1(),
+            row.area_id_2(),
+            row.area_id_3(),
+        ],
+        texture: row.texture().to_string(),
+        width: row.width(),
+        height: row.height(),
+        offset_x: row.offset_x(),
+        offset_y: row.offset_y(),
     }
 }
 
@@ -313,6 +448,7 @@ mod tests {
     fn the_smallest_containing_page_wins() {
         let atlas = Atlas {
             pages: vec![elwynn(), stormwind()],
+            overlays: Vec::new(),
         };
         // The Trade District, comfortably inside both rectangles.
         let page = atlas.zone_page(0, -8800.0, 600.0).expect("a page");
@@ -320,6 +456,70 @@ mod tests {
         // And a point in Elwynn proper is only in the one page.
         let page = atlas.zone_page(0, -9450.0, -1100.0).expect("a page");
         assert_eq!(page.id, 30, "expected Elwynn, got {}", page.directory);
+    }
+
+    fn overlay(texture: &str, width: u32, height: u32, offset: (u32, u32)) -> Overlay {
+        Overlay {
+            id: 0,
+            page_id: 30,
+            areas: [9, 0, 0, 0],
+            texture: texture.into(),
+            width,
+            height,
+            offset_x: offset.0,
+            offset_y: offset.1,
+        }
+    }
+
+    /// **The file counts on disk are what settle this**, so the three rows
+    /// picked are the ones whose counts differ: a patch inside one tile, one
+    /// split vertically, one split horizontally, and one split both ways.
+    /// `Interface\WorldMap\Elwynn` holds exactly `NorthshireValley1`,
+    /// `ForestsEdge1..2`, `RidgepointTower1..2` and `Stormwind1..4`.
+    #[test]
+    fn a_patch_is_split_into_tiles_the_way_its_files_are() {
+        let northshire = overlay("NORTHSHIREVALLEY", 256, 256, (381, 147));
+        assert_eq!(northshire.tile_grid(), (1, 1));
+        assert_eq!(northshire.tile_count(), 1);
+
+        // 256x341: one column, two rows.
+        assert_eq!(overlay("FORESTSEDGE", 256, 341, (124, 327)).tile_count(), 2);
+        // 306x233: two columns, one row.
+        assert_eq!(
+            overlay("RIDGEPOINTTOWER", 306, 233, (696, 435)).tile_count(),
+            2
+        );
+        // 485x405: two by two.
+        let stormwind = overlay("STORMWIND", 485, 405, (0, 0));
+        assert_eq!(stormwind.tile_grid(), (2, 2));
+        assert_eq!(stormwind.tile_count(), 4);
+
+        assert_eq!(
+            northshire.tile_path("Elwynn", 1),
+            r"Interface\WorldMap\Elwynn\NORTHSHIREVALLEY1.blp"
+        );
+    }
+
+    /// Reading order, and it matters: read down-then-across instead, a
+    /// two-by-two patch puts its top-right corner at the bottom left and the
+    /// picture is still a picture.
+    #[test]
+    fn a_patchs_tiles_run_across_before_down() {
+        let stormwind = overlay("STORMWIND", 485, 405, (100, 200));
+        assert_eq!(stormwind.tile_origin(1), (100, 200));
+        assert_eq!(stormwind.tile_origin(2), (100 + 256, 200));
+        assert_eq!(stormwind.tile_origin(3), (100, 200 + 256));
+        assert_eq!(stormwind.tile_origin(4), (100 + 256, 200 + 256));
+    }
+
+    /// A row with no texture or no size states no patch. 94 of the table's 988
+    /// rows are like that and drawing them would be drawing nothing at a
+    /// position, which reads as a hole in the art.
+    #[test]
+    fn a_patch_with_no_texture_or_no_size_is_not_drawable() {
+        assert!(!overlay("", 256, 256, (0, 0)).is_drawable());
+        assert!(!overlay("SOMETHING", 0, 256, (0, 0)).is_drawable());
+        assert!(overlay("SOMETHING", 256, 256, (0, 0)).is_drawable());
     }
 
     #[test]

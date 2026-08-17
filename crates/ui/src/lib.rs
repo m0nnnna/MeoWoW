@@ -40,7 +40,7 @@ pub use frames::chat::{ChatEntry, ChatKind};
 pub use frames::combat_text::{CombatTextKind, FloatingText};
 pub use frames::{
     CastBarView, QuestDetail, QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
-    MapMarker, MapView, MarkerKind, QuestgiverView, SpellbookEntry, UnitView,
+    MapMarker, MapPatch, MapView, MarkerKind, QuestgiverView, SpellbookEntry, UnitView,
 };
 pub use layout::{default_path, ElementId, Profile};
 pub use style::{Color, PowerType, Style};
@@ -1865,6 +1865,7 @@ mod tests {
         frames::MapView {
             title: "Elwynn Forest".into(),
             tiles: Default::default(),
+            patches: Vec::new(),
             markers: vec![
                 frames::MapMarker {
                     u: 0.48,

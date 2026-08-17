@@ -1263,6 +1263,42 @@ pub mod fields {
     /// other field would coincidentally hold.
     pub const PLAYER_FIELD_COINAGE: u16 = 0x0492;
 
+    /// The base of the explored-areas bitfield: 128 fields, one bit per
+    /// `AreaTable.dbc` row's [`area_bit`], set once the character has walked
+    /// into that area.
+    ///
+    /// **This is the field that decides what a map shows.** A zone page's
+    /// twelve base tiles are the *unexplored* picture -- coastline and
+    /// nothing else -- and every road, building and name is a separate
+    /// `WorldMapOverlay` patch drawn only where this says the player has been.
+    /// Read it wrong and the map is either permanently blank or permanently
+    /// complete, and both look deliberate.
+    ///
+    /// **Measured against two characters whose explored sets differ, which is
+    /// what makes it an identification rather than a match.** A bitmask is a
+    /// bad search target on its own: a single set word like `0x20000000` is
+    /// just a power of two and a player object is full of flags. So two
+    /// characters were dumped whose *word* index differs. `Watcher` has
+    /// explored one area, `Northshire Valley`, whose area bit is 125 -- word
+    /// 3 -- and holds `0x20000000` at field `0x0414`. `Huntertest` has
+    /// explored one area in Dun Morogh, area bit 212 -- word 6 -- and holds
+    /// `0x00100000` at field `0x0417`. Two fields three apart, for two bits
+    /// three words apart, giving the same base from either character.
+    ///
+    /// The server's own `characters.exploredZones` is 128 space-separated
+    /// words and agrees with both, which is the same class of evidence as
+    /// `creature_template.npcflag`: a source no client is ever sent.
+    ///
+    /// [`area_bit`]: https://wowdev.wiki/DB/AreaTable
+    pub const PLAYER_EXPLORED_ZONES: u16 = 0x0411;
+
+    /// How many fields the explored-areas bitfield spans, so 4,096 area bits.
+    ///
+    /// Not guessed from the largest area bit in the table: the server stores
+    /// exactly 128 words per character and both measured characters' words sit
+    /// inside that span.
+    pub const EXPLORED_ZONES_WORDS: u16 = 128;
+
     /// `UNIT_NPC_FLAGS`: what this creature will do if you talk to it --
     /// gossip, hand out quests, sell things, train, repair.
     ///

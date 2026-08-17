@@ -677,6 +677,22 @@ enum MapCommand {
         /// Page directory, e.g. `Elwynn`. Omit to check every page.
         directory: Option<String>,
     },
+    /// List the explored-art patches drawn on a page, and check their files.
+    ///
+    /// The twelve base tiles are the *unexplored* picture; every road and
+    /// building is one of these, revealed when the area it covers is explored.
+    /// A patch larger than one tile is split into files the way a page is, and
+    /// **that rule is confirmed here rather than assumed**: `--verify` resolves
+    /// every tile of every patch by path, which is the only way to ask an MPQ
+    /// whether a file exists -- a listing is a different question and has
+    /// answered it wrongly here before.
+    Overlays {
+        /// Page directory, e.g. `Elwynn`. Omit to sweep every page.
+        directory: Option<String>,
+        /// Resolve every tile file, and report the ones that are missing.
+        #[arg(long)]
+        verify: bool,
+    },
     /// Fit the world-to-page projection against the terrain, and report it.
     ///
     /// **The experiment that chose the projection, kept so it can be re-run.**
@@ -6520,14 +6536,134 @@ fn map_cmd(chain: &mut Chain, cmd: MapCommand) -> Result<()> {
         MapCommand::Pages { map, filter } => map_pages(chain, map, filter.as_deref()),
         MapCommand::Locate { map, x, y } => map_locate(chain, map, x, y),
         MapCommand::Canvas { directory } => map_canvas(chain, directory.as_deref()),
+        MapCommand::Overlays { directory, verify } => {
+            map_overlays(chain, directory.as_deref(), verify)
+        }
         MapCommand::Calibrate { map, verbose } => map_calibrate(chain, map.as_deref(), verbose),
     }
 }
 
 fn load_atlas(chain: &mut Chain) -> Result<dbc::worldmap::Atlas> {
-    use dbc::schema::WorldMapArea;
+    use dbc::schema::{WorldMapArea, WorldMapOverlay};
     let table = WorldMapArea::parse(&chain.read(WorldMapArea::PATH)?)?;
-    Ok(dbc::worldmap::Atlas::from_table(&table))
+    let atlas = dbc::worldmap::Atlas::from_table(&table);
+    let overlays = WorldMapOverlay::parse(&chain.read(WorldMapOverlay::PATH)?)?;
+    Ok(atlas.with_overlays(&overlays))
+}
+
+/// Lists a page's explored-art patches, optionally resolving every tile.
+fn map_overlays(chain: &mut Chain, directory: Option<&str>, verify: bool) -> Result<()> {
+    use dbc::schema::AreaTable;
+
+    let atlas = load_atlas(chain)?;
+    let areas = AreaTable::parse(&chain.read(AreaTable::PATH)?).ok();
+    let area_name = |id: u32| -> String {
+        areas
+            .as_ref()
+            .and_then(|t| t.iter().find(|r| r.id() == id))
+            .map(|r| r.name().to_string())
+            .unwrap_or_default()
+    };
+
+    let pages: Vec<_> = atlas
+        .pages()
+        .iter()
+        .filter(|page| directory.is_none_or(|only| page.directory.eq_ignore_ascii_case(only)))
+        .cloned()
+        .collect();
+    if pages.is_empty() {
+        anyhow::bail!("no page matched");
+    }
+
+    let (mut patches, mut tiles, mut missing) = (0usize, 0usize, Vec::new());
+    // Every file the rule *predicts* resolving proves the count is not too
+    // high; nothing about it proves the count is not too low, and a patch
+    // missing its last tile is a hole in the map that looks like unexplored
+    // ground. So the file one past the end is asked for too, and must not be
+    // there.
+    let mut overshoot = Vec::new();
+    for page in &pages {
+        let owned: Vec<_> = atlas.overlays(page.id).cloned().collect();
+        if owned.is_empty() {
+            continue;
+        }
+        println!("\n{} (page {}), {} patch(es)", page.directory, page.id, owned.len());
+        for overlay in &owned {
+            let (across, down) = overlay.tile_grid();
+            let named: Vec<String> = overlay
+                .areas
+                .iter()
+                .filter(|a| **a != 0)
+                .map(|a| format!("{a} {}", area_name(*a)))
+                .collect();
+            println!(
+                "  [{:>4}] {:<24} {:>4}x{:<4} at {:>4},{:<4}  {across}x{down} tile(s)  areas: {}",
+                overlay.id,
+                overlay.texture,
+                overlay.width,
+                overlay.height,
+                overlay.offset_x,
+                overlay.offset_y,
+                named.join(", ")
+            );
+            patches += 1;
+            if !verify {
+                continue;
+            }
+            for tile in 1..=overlay.tile_count() {
+                let path = overlay.tile_path(&page.directory, tile);
+                tiles += 1;
+                // **Resolved by path, never looked up in a listing.** An MPQ
+                // finds a file by hashing its name, so a file absent from
+                // `(listfile)` still reads perfectly -- a coverage check built
+                // on `ls` once concluded 0.1% of the baked NPC textures
+                // shipped, and forty random reads by path got forty hits.
+                if chain.read(&path).is_err() {
+                    missing.push(path);
+                }
+            }
+            let past_the_end = overlay.tile_path(&page.directory, overlay.tile_count() + 1);
+            if chain.read(&past_the_end).is_ok() {
+                overshoot.push(format!(
+                    "{past_the_end}  (the table says {}x{}, so {} tile(s))",
+                    overlay.width,
+                    overlay.height,
+                    overlay.tile_count()
+                ));
+            }
+        }
+    }
+
+    println!("\n{patches} patch(es) across {} page(s)", pages.len());
+    if verify {
+        println!(
+            "{} of {tiles} tile file(s) resolved",
+            tiles - missing.len()
+        );
+        for path in missing.iter().take(20) {
+            println!("  missing: {path}");
+        }
+        if missing.len() > 20 {
+            println!("  ... and {} more", missing.len() - 20);
+        }
+        // Expected, and not a miscount: the tile grid covers the stated
+        // rectangle exactly, so a further file has nowhere to be drawn.
+        // `MarshlightLake1` is a whole labelled patch and `MarshlightLake2` is
+        // nearly blank -- an offcut of a taller earlier version, left behind
+        // when the table row shrank.
+        println!(
+            "{} patch(es) keep a file past the tile grid, unreadable by any \
+             placement of the rectangle the table states",
+            overshoot.len()
+        );
+        for path in overshoot.iter().take(10) {
+            println!("  unread: {path}");
+        }
+        if overshoot.len() > 10 {
+            println!("  ... and {} more", overshoot.len() - 10);
+        }
+    }
+    Ok(())
 }
 
 fn map_pages(chain: &mut Chain, map: Option<u32>, filter: Option<&str>) -> Result<()> {
