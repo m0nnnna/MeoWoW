@@ -14,6 +14,7 @@
 //! enough to be visible as a stall, so only a couple are admitted per frame and
 //! the rest wait.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::Instant;
@@ -371,6 +372,25 @@ pub struct World {
     /// buffer and its bind group only need to be created once per
     /// (display id, moving) pair, not once per rebuild tick.
     entity_bones: HashMap<(u32, Motion), BoneBuffer>,
+    /// The animation each display id's shared pose was most recently doing,
+    /// and when that became current -- what a fresh transition blends out
+    /// of, instead of cutting straight to the new cycle's first frame.
+    ///
+    /// **Keyed by display id alone**, the same simplification
+    /// [`Self::entity_bones`] already makes for pose sharing: every instance
+    /// of a species draws from one buffer, so it blends as one too. A crowd
+    /// of the same creature in different motions at once shares a single
+    /// blend timer between them, which is visibly imperfect for exactly
+    /// that crowd -- and correct for the case this was reported for, one
+    /// character's own jump, run and attack, which is the only identity a
+    /// shared bone buffer was ever going to have anyway.
+    ///
+    /// A `RefCell` because [`Self::update_animations`] takes `&self` --
+    /// every other caller already treats the world as read-only during
+    /// rendering, and widening that to `&mut self` here would ripple into
+    /// every call site for a change that is, from the outside, exactly as
+    /// pure as the pose it produces.
+    recent_motion: RefCell<HashMap<u32, MotionState>>,
     /// Origin for the animation clock. The server does not say which frame of
     /// a walk cycle a creature is on -- nothing does, since 3.3.5a leaves that
     /// entirely to the client -- so any fixed origin that advances is enough
@@ -435,6 +455,7 @@ impl World {
             game_objects_tried: false,
             entities: Vec::new(),
             entity_bones: HashMap::new(),
+            recent_motion: RefCell::new(HashMap::new()),
             started: Instant::now(),
             tiles: HashMap::new(),
             pending: VecDeque::new(),
@@ -1209,18 +1230,14 @@ impl World {
         // should be derived from one source -- and a hand that disagreed with
         // its own model by a frame is a sword that trails behind the arm.
         let mut poses: HashMap<(u32, Motion), Vec<Mat4>> = HashMap::new();
-        for group in &self.entities {
-            let Some((display_id, motion)) = group.animation else {
-                continue;
-            };
-            let (Some(sequence), Some(bones)) = (
-                sequence_for(&group.model, motion),
-                self.entity_bones.get(&(display_id, motion)),
-            ) else {
-                continue;
-            };
-            let duration = group.model.sequences[sequence].duration_ms.max(1);
-            let now_ms = self.started.elapsed().as_millis() as u32;
+        let now_ms = self.started.elapsed().as_millis() as u32;
+
+        // Poses a single motion at its own clock -- exactly what this
+        // function always computed, pulled out so a transition's outgoing
+        // cycle can be posed the same way as its incoming one, below.
+        let pose_for = |model: &CachedModel, motion: Motion| -> Option<Vec<Mat4>> {
+            let sequence = sequence_for(model, motion)?;
+            let duration = model.sequences[sequence].duration_ms.max(1);
             // A loop wraps; a cycle that plays once *holds its last frame*.
             //
             // Holding is what makes a corpse stay down. Wrapping a death cycle
@@ -1237,7 +1254,7 @@ impl World {
             // is a statue. Meanwhile `Motion::Dead` carries no start time at
             // all and yet must hold, because on most models it resolves to the
             // *fall* -- looping that is a creature dying over and over.
-            let played = group.model.sequences[sequence].id;
+            let played = model.sequences[sequence].id;
             let time_ms = if played == DEATH_ANIMATION_ID && motion == Motion::Dead {
                 // Settled onto the last frame of the fall. No start time is
                 // needed or wanted: this pose is the same however long ago the
@@ -1255,10 +1272,59 @@ impl World {
             } else {
                 now_ms % duration
             };
-            let posed = m2::Model::pose_bones(&group.model.bones, sequence, time_ms);
-            let pose: Vec<[[f32; 4]; 4]> = posed.iter().map(|m| m.to_cols_array_2d()).collect();
+            Some(m2::Model::pose_bones(&model.bones, sequence, time_ms))
+        };
+
+        for group in &self.entities {
+            let Some((display_id, motion)) = group.animation else {
+                continue;
+            };
+            let (Some(bones), Some(posed)) = (
+                self.entity_bones.get(&(display_id, motion)),
+                pose_for(&group.model, motion),
+            ) else {
+                continue;
+            };
+
+            // Record the transition and blend out of whatever this display
+            // was doing a moment ago -- see `Self::recent_motion`'s doc
+            // comment for the one thing this simplifies away.
+            let now = Instant::now();
+            let blend_from = {
+                let mut history = self.recent_motion.borrow_mut();
+                let state = history.entry(display_id).or_insert(MotionState {
+                    current: motion,
+                    changed_at: now,
+                    blending_from: None,
+                });
+                if state.current != motion {
+                    state.blending_from = Some(state.current);
+                    state.current = motion;
+                    state.changed_at = now;
+                }
+                let elapsed = now.saturating_duration_since(state.changed_at).as_millis() as u32;
+                (elapsed < TRANSITION_BLEND_MS)
+                    .then_some(state.blending_from)
+                    .flatten()
+                    .map(|from| (from, elapsed))
+            };
+
+            let final_pose = match blend_from.and_then(|(from, elapsed)| {
+                pose_for(&group.model, from).map(|old| (old, elapsed))
+            }) {
+                // A linear blend of the *matrices* would shear a rotating
+                // bone rather than turn it -- `blend_poses` decomposes each
+                // one first so this crossfades a rotation instead.
+                Some((old, elapsed)) => {
+                    blend_poses(&old, &posed, elapsed as f32 / TRANSITION_BLEND_MS as f32)
+                }
+                None => posed,
+            };
+
+            let pose: Vec<[[f32; 4]; 4]> =
+                final_pose.iter().map(|m| m.to_cols_array_2d()).collect();
             meshes.update_bones(gpu, bones, &pose);
-            poses.insert((display_id, motion), posed);
+            poses.insert((display_id, motion), final_pose);
         }
 
         // Then everything hanging off those poses. A held item's transform is
@@ -1982,6 +2048,53 @@ fn plays_once(animation_id: u16) -> bool {
     )
 }
 
+/// How long a transition blends the outgoing cycle into the incoming one,
+/// rather than cutting straight to the new cycle's first frame.
+///
+/// No table names this -- there is no `AnimationData` column for it, the
+/// same way there is no column for [`sound::DAYLIGHT_HOURS`] -- so this is a
+/// plausible short window and nothing more. Short enough that drawing a
+/// weapon or landing a jump does not read as slow motion.
+const TRANSITION_BLEND_MS: u32 = 150;
+
+/// What a display id's shared pose was last doing, for
+/// [`World::update_animations`] to blend out of. See
+/// [`World::recent_motion`]'s doc comment for the granularity this is kept
+/// at and why.
+struct MotionState {
+    current: Motion,
+    changed_at: Instant,
+    /// `None` the first time a display is ever seen -- there is nothing to
+    /// blend from, and blending from the bind pose would be its own new
+    /// snap. Set whenever `current` changes and left alone after: whether a
+    /// blend is still live is a question of elapsed time against
+    /// [`TRANSITION_BLEND_MS`], asked at the read site rather than by
+    /// clearing this early.
+    blending_from: Option<Motion>,
+}
+
+/// Interpolates two bone palettes, per bone.
+///
+/// **Decomposed rather than blended as raw matrices.** A linear blend of two
+/// rotation matrices is not itself a rotation -- the result shears rather
+/// than turns, which on a swinging limb reads as the arm briefly deforming
+/// rather than smoothly moving. Translation and scale lerp; rotation slerps.
+fn blend_poses(from: &[Mat4], to: &[Mat4], t: f32) -> Vec<Mat4> {
+    let t = t.clamp(0.0, 1.0);
+    from.iter()
+        .zip(to.iter())
+        .map(|(a, b)| {
+            let (scale_a, rot_a, trans_a) = a.to_scale_rotation_translation();
+            let (scale_b, rot_b, trans_b) = b.to_scale_rotation_translation();
+            Mat4::from_scale_rotation_translation(
+                scale_a.lerp(scale_b, t),
+                rot_a.slerp(rot_b, t),
+                trans_a.lerp(trans_b, t),
+            )
+        })
+        .collect()
+}
+
 /// Which of a model's sequences a motion plays, if it has one.
 ///
 /// Resolved here and consulted by both `set_entities` (which creates the bone
@@ -2050,6 +2163,63 @@ mod tests {
             (placed - Vec3::new(1000.0, -0.5, 2.0)).length() < 1e-4,
             "hand motion applied outside the placement: {placed}"
         );
+    }
+
+    /// The boundaries of a blend must be exact: a transition's first frame
+    /// is entirely the outgoing pose and its last is entirely the incoming
+    /// one, or a cycle that never moves would still visibly hitch at the
+    /// moment `update_animations` calls the blend finished.
+    #[test]
+    fn a_blend_reaches_both_poses_exactly_at_its_ends() {
+        let from = vec![Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0))];
+        let to = vec![Mat4::from_translation(Vec3::new(10.0, 0.0, 0.0))];
+        assert_eq!(blend_poses(&from, &to, 0.0), from);
+        assert_eq!(blend_poses(&from, &to, 1.0), to);
+    }
+
+    /// Translation blends linearly, same as a naive matrix lerp would --
+    /// this is the case a raw lerp gets right, so it is not what
+    /// distinguishes `blend_poses` from one.
+    #[test]
+    fn a_blend_halfway_through_is_halfway_between() {
+        let from = vec![Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0))];
+        let to = vec![Mat4::from_translation(Vec3::new(10.0, 20.0, 0.0))];
+        let mid = blend_poses(&from, &to, 0.5)[0].transform_point3(Vec3::ZERO);
+        assert!((mid - Vec3::new(5.0, 10.0, 0.0)).length() < 1e-4, "{mid}");
+    }
+
+    /// **The case a raw matrix lerp gets wrong.** Blending two rotations by
+    /// averaging their matrices does not produce a rotation at all -- the
+    /// result is not orthonormal, and a unit-length vector fed through it
+    /// comes out shorter, which is a limb visibly shrinking mid-swing rather
+    /// than turning. `blend_poses` decomposes and slerps for exactly this
+    /// reason, so a vector's length must survive the blend.
+    #[test]
+    fn a_blended_rotation_keeps_vectors_the_same_length() {
+        let from = vec![Mat4::from_rotation_z(0.0)];
+        let to = vec![Mat4::from_rotation_z(std::f32::consts::PI)]; // a half turn
+        let arm = Vec3::new(1.0, 0.0, 0.0);
+        for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let blended = blend_poses(&from, &to, t)[0];
+            let rotated = blended.transform_vector3(arm);
+            assert!(
+                (rotated.length() - 1.0).abs() < 1e-4,
+                "at t={t} the arm changed length to {} -- a raw matrix lerp would do this at t=0.5",
+                rotated.length()
+            );
+        }
+    }
+
+    /// Blending never sees a `t` outside `0.0..=1.0` in practice -- elapsed
+    /// time is checked against the window before this is called -- but a
+    /// clamp costs nothing and a caller that got the arithmetic wrong should
+    /// not extrapolate past either pose.
+    #[test]
+    fn an_out_of_range_t_is_clamped() {
+        let from = vec![Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0))];
+        let to = vec![Mat4::from_translation(Vec3::new(10.0, 0.0, 0.0))];
+        assert_eq!(blend_poses(&from, &to, -1.0), from);
+        assert_eq!(blend_poses(&from, &to, 2.0), to);
     }
 
     /// Backing up is its own cycle, at any pace, and forward is unaffected.
