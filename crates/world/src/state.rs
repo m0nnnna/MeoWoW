@@ -2253,11 +2253,23 @@ impl WorldState {
                         )),
                     }
                 }
-                // A GM's line shares the body, so it shares the parser. It is
-                // a separate opcode purely so a client can style it
-                // differently.
-                crate::opcode::server::MESSAGECHAT | crate::opcode::server::GM_MESSAGECHAT => {
+                crate::opcode::server::MESSAGECHAT => {
                     match crate::chat::parse_message_chat(&packet.body) {
+                        Ok(message) => report.chat.push(message),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // **Not the same body as the opcode above**, despite arriving
+                // for the same `ChatType`s -- see
+                // `chat::parse_gm_message_chat`'s doc comment for the live
+                // capture that disproved the opposite assumption this dispatch
+                // used to make.
+                crate::opcode::server::GM_MESSAGECHAT => {
+                    match crate::chat::parse_gm_message_chat(&packet.body) {
                         Ok(message) => report.chat.push(message),
                         Err(error) => report.failures.push((
                             packet.opcode,

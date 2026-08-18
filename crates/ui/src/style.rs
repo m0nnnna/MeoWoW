@@ -302,6 +302,9 @@ pub struct Style {
     /// ordinary living player.
     pub text_ghost: Color,
     pub chat_channel: Color,
+    /// Party chat -- see [`crate::frames::chat::ChatKind::Party`] for why it
+    /// is not folded into [`Self::chat_other`].
+    pub chat_party: Color,
     /// Damage dealt and taken. Deliberately dimmer than speech: combat fills
     /// the scrollback faster than anything else, and a colour that competes
     /// with a whisper makes the whisper unreadable during a fight.
@@ -480,6 +483,7 @@ impl Default for Style {
             text_dead: Color::rgb(140, 130, 130),
             text_ghost: Color::rgb(150, 190, 230),
             chat_channel: Color::rgb(120, 210, 190),
+            chat_party: Color::rgb(170, 170, 255),
             chat_combat: Color::rgb(190, 155, 120),
             chat_other: Color::rgb(170, 176, 190),
             chat_composing: Color::rgb(150, 235, 150),

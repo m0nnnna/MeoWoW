@@ -29,6 +29,11 @@ pub enum ChatKind {
     Emote,
     System,
     Channel,
+    /// Party chat. Its own kind rather than folded into `Other`: a line said
+    /// to five people and a line said to everyone in earshot read the same
+    /// to a person only if the interface makes them look the same, which is
+    /// the one thing a party's privacy assumption cannot survive.
+    Party,
     /// Damage this character dealt or took. Its own kind because combat is
     /// the one category that arrives faster than it can be read, so it wants
     /// a colour that recedes rather than one that competes with a whisper.
@@ -88,6 +93,7 @@ pub fn colour(kind: ChatKind, style: &Style) -> Color {
         ChatKind::Emote => style.chat_emote,
         ChatKind::System => style.chat_system,
         ChatKind::Channel => style.chat_channel,
+        ChatKind::Party => style.chat_party,
         ChatKind::Combat => style.chat_combat,
         ChatKind::Other => style.chat_other,
     }
@@ -223,6 +229,17 @@ mod tests {
         assert_eq!(entry.rendered(), "[General] Watcher: anyone selling?");
     }
 
+    #[test]
+    fn a_party_line_names_itself() {
+        let entry = ChatEntry {
+            kind: ChatKind::Party,
+            who: Some("Watcher".into()),
+            text: "on my way".into(),
+            prefix: Some("party".into()),
+        };
+        assert_eq!(entry.rendered(), "[party] Watcher: on my way");
+    }
+
     /// A system line has no speaker and must not render a stray separator.
     #[test]
     fn a_speakerless_line_has_no_separator() {
@@ -247,6 +264,7 @@ mod tests {
             ChatKind::Emote,
             ChatKind::System,
             ChatKind::Channel,
+            ChatKind::Party,
             ChatKind::Other,
         ];
         for (i, a) in kinds.iter().enumerate() {

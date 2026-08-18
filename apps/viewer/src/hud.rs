@@ -134,6 +134,7 @@ pub fn chat_entry(message: &::world::ChatMessage, state: &::world::WorldState) -
         ChatType::Yell => Some("yell".into()),
         ChatType::Whisper => Some("whisper".into()),
         ChatType::WhisperInform => Some("to".into()),
+        ChatType::Party => Some("party".into()),
         _ => None,
     };
 
@@ -219,6 +220,7 @@ fn chat_kind(chat_type: ::world::ChatType) -> ui::ChatKind {
         | ChatType::RaidBossEmote => ui::ChatKind::Emote,
         ChatType::System => ui::ChatKind::System,
         ChatType::Channel => ui::ChatKind::Channel,
+        ChatType::Party => ui::ChatKind::Party,
         _ => ui::ChatKind::Other,
     }
 }
@@ -757,6 +759,34 @@ mod tests {
         };
         let state = ::world::WorldState::new();
         assert_eq!(chat_entry(&message, &state).who.as_deref(), Some("Young Wolf"));
+    }
+
+    /// A party line has to read as party, not fall into the `Other` bucket
+    /// every unhandled chat type lands in -- see `chat_kind`'s match arm.
+    #[test]
+    fn a_party_line_is_named_and_coloured_as_party() {
+        let message = ::world::ChatMessage {
+            chat_type: ::world::ChatType::Party,
+            language: 7,
+            sender: 0x35,
+            sender_name: None,
+            target: 0,
+            channel: None,
+            text: "on my way".into(),
+            tag: 0,
+        };
+        let mut state = ::world::WorldState::new();
+        state.names.apply_player(&::world::PlayerName {
+            guid: 0x35,
+            name: Some("Watcher".into()),
+            realm: String::new(),
+            race: 1,
+            gender: 0,
+            class: 1,
+        });
+        let entry = chat_entry(&message, &state);
+        assert_eq!(entry.kind, ui::ChatKind::Party);
+        assert_eq!(entry.rendered(), "[party] Watcher: on my way");
     }
 
     fn camera() -> render::camera::Camera {

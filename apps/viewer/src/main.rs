@@ -2147,6 +2147,47 @@ struct Renderer {
     scene: Option<Scene>,
 }
 
+/// Which `CMSG_MESSAGECHAT` an unprefixed line becomes.
+///
+/// A whisper carries the recipient's name inside the channel itself rather
+/// than as a separate field, because that is what the composing indicator has
+/// to show and what has to survive a sticky switch: "whisper" alone would
+/// leave the player unable to tell *who* the next line goes to without
+/// checking anywhere else.
+#[derive(Debug, Clone, PartialEq)]
+enum ChatChannel {
+    Say,
+    Party,
+    Yell,
+    Whisper(String),
+}
+
+impl ChatChannel {
+    /// The `world::ChatType` this channel sends as, and the whisper target if
+    /// there is one -- `message_chat` ignores the target for every other
+    /// type, so `""` is not a special case there.
+    fn wire(&self) -> (::world::ChatType, &str) {
+        match self {
+            ChatChannel::Say => (::world::ChatType::Say, ""),
+            ChatChannel::Party => (::world::ChatType::Party, ""),
+            ChatChannel::Yell => (::world::ChatType::Yell, ""),
+            ChatChannel::Whisper(name) => (::world::ChatType::Whisper, name.as_str()),
+        }
+    }
+
+    /// What to show before the composing text, or `None` for the default
+    /// channel -- see `App::chat_channel`'s doc comment for why this exists
+    /// at all rather than sending silently on whatever was last chosen.
+    fn label(&self) -> Option<String> {
+        match self {
+            ChatChannel::Say => None,
+            ChatChannel::Party => Some("party".into()),
+            ChatChannel::Yell => Some("yell".into()),
+            ChatChannel::Whisper(name) => Some(format!("to {name}")),
+        }
+    }
+}
+
 struct App {
     args: Args,
     chain: Chain,
@@ -2372,6 +2413,14 @@ struct App {
     /// The line being typed, or `None` when not typing. While this is `Some`,
     /// keys are text rather than movement.
     composing: Option<String>,
+    /// Which channel an unprefixed line goes to next.
+    ///
+    /// **Sticky, and shown in the composing line for exactly that reason.**
+    /// Switching it (`/p` alone, `/w Name` alone) changes every line typed
+    /// after it until switched back -- a client that changed this silently
+    /// would say a private line out loud, or a party line to nobody, the
+    /// moment the player forgot which mode they were in.
+    chat_channel: ChatChannel,
     /// Spell names and icons, loaded from the archives if there are any.
     spells: spells::Spellbook,
     /// Whether the bars have been filled from the spellbook yet. The spellbook
@@ -3101,6 +3150,7 @@ impl App {
             flip_winding: false,
             strafe_yaw_choice: STRAFE_YAW_DEFAULT,
             composing: None,
+            chat_channel: ChatChannel::Say,
             spells: spells::Spellbook::default(),
             bars_seeded: false,
             spellbook_open: false,
@@ -4875,6 +4925,53 @@ impl App {
                     self.promote_in_party(argument);
                 }
             }
+            // `/p` mirrors `/invite`'s split: no argument switches the
+            // sticky channel, an argument sends one line without touching
+            // it. Refused locally either way when there is no group to hear
+            // it -- a party line sent with no group is silently dropped by
+            // the server, which is indistinguishable from a broken send.
+            "p" | "party" => {
+                if !in_group {
+                    self.notice("you are not in a group.".into());
+                } else if argument.is_empty() {
+                    self.chat_channel = ChatChannel::Party;
+                } else {
+                    self.send_on_channel(&ChatChannel::Party, argument);
+                }
+            }
+            "s" | "say" => {
+                if argument.is_empty() {
+                    self.chat_channel = ChatChannel::Say;
+                } else {
+                    self.send_on_channel(&ChatChannel::Say, argument);
+                }
+            }
+            "y" | "yell" => {
+                if argument.is_empty() {
+                    self.chat_channel = ChatChannel::Yell;
+                } else {
+                    self.send_on_channel(&ChatChannel::Yell, argument);
+                }
+            }
+            // Unlike the others, `/w` always needs a name -- there is no
+            // sensible "whisper, to whoever" default -- so the split is on
+            // the name rather than on whether there is an argument at all.
+            "w" | "whisper" | "tell" => {
+                if argument.is_empty() {
+                    self.notice("usage: /w <name> [text]".into());
+                } else {
+                    let (name, text) = match argument.split_once(char::is_whitespace) {
+                        Some((name, text)) => (name, text.trim()),
+                        None => (argument, ""),
+                    };
+                    let channel = ChatChannel::Whisper(name.to_string());
+                    if text.is_empty() {
+                        self.chat_channel = channel;
+                    } else {
+                        self.send_on_channel(&channel, text);
+                    }
+                }
+            }
             // Said rather than refused: a client that swallowed every
             // unrecognised slash line would make a typo indistinguishable
             // from a command that did nothing.
@@ -5027,6 +5124,29 @@ impl App {
         if self.run_command(line) {
             return;
         }
+        self.send_on_channel(&self.chat_channel.clone(), line);
+    }
+
+    /// Says `text` on `channel`, whether that came from the sticky channel or
+    /// a one-shot `/p`, `/s`, `/y`, `/w`.
+    ///
+    /// **Party is checked again here**, not only at the `/p` call site in
+    /// [`Self::run_command`]: the sticky channel can still be `Party` after
+    /// the group it was switched for has since been left, and an ordinary
+    /// unprefixed line typed in that state would otherwise be silently
+    /// dropped by the server -- the exact failure this whole ticket exists to
+    /// avoid, just reached from a different door.
+    fn send_on_channel(&mut self, channel: &ChatChannel, text: &str) {
+        if matches!(channel, ChatChannel::Party)
+            && !self
+                .live
+                .as_ref()
+                .and_then(|live| live.state.party.as_ref())
+                .is_some_and(|party| party.in_group())
+        {
+            self.notice("you are not in a group.".into());
+            return;
+        }
         let Some(live) = self.live.as_mut() else {
             return;
         };
@@ -5039,10 +5159,8 @@ impl App {
             .and_then(|entity| entity.race())
             .unwrap_or(1);
         let language = ::world::chat::language_for_race(race);
-        if let Err(e) = live
-            .connection
-            .say(::world::ChatType::Say, language, "", line)
-        {
+        let (chat_type, target) = channel.wire();
+        if let Err(e) = live.connection.say(chat_type, language, target, text) {
             tracing::warn!("sending chat failed: {e:#}");
             // Locally, so a failure to speak is visible where speaking
             // happens rather than only in a log nobody has open.
@@ -7318,7 +7436,14 @@ impl App {
                 .collect(),
             None => Vec::new(),
         };
-        let composing = self.composing.clone();
+        // The raw buffer is what `run_command`/`send_chat` read on Enter; what
+        // the frame draws is that buffer with the sticky channel's label in
+        // front, when it has one -- see `ChatChannel::label`'s doc comment
+        // for why a default channel deliberately draws no label at all.
+        let composing = self.composing.as_ref().map(|text| match self.chat_channel.label() {
+            Some(label) => format!("[{label}] {text}"),
+            None => text.clone(),
+        });
         let now = std::time::Instant::now();
         // How long the press flash lasts -- see `App::action_flash`'s doc
         // comment for why it exists at all. Short enough to read as "that one
@@ -8273,6 +8398,42 @@ mod gesture_tests {
                     .any(|stem| name.contains(stem))
             }),
             "something that is not a locomotion cycle carries the travel bit: {travelling:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod chat_channel_tests {
+    use super::*;
+
+    /// Every channel but whisper ignores the target string -- `message_chat`
+    /// only reads it for `Whisper`/`Channel` -- and whisper has to carry the
+    /// recipient through, since that name is the whole reason the sticky
+    /// channel exists.
+    #[test]
+    fn wire_carries_the_whisper_target_and_nothing_else_does() {
+        assert_eq!(ChatChannel::Say.wire(), (::world::ChatType::Say, ""));
+        assert_eq!(ChatChannel::Party.wire(), (::world::ChatType::Party, ""));
+        assert_eq!(ChatChannel::Yell.wire(), (::world::ChatType::Yell, ""));
+        assert_eq!(
+            ChatChannel::Whisper("Watcher".into()).wire(),
+            (::world::ChatType::Whisper, "Watcher")
+        );
+    }
+
+    /// **The default channel draws no label, and every other one does.**
+    /// `App`'s composing line only prefixes the buffer when this returns
+    /// `Some` -- see the call site's doc comment -- so a `None` here for Say
+    /// is what keeps ordinary typing looking exactly as it always did, and a
+    /// label appearing at all is what tells the player the channel changed.
+    #[test]
+    fn only_the_default_channel_has_no_label() {
+        assert_eq!(ChatChannel::Say.label(), None);
+        assert_eq!(ChatChannel::Party.label(), Some("party".into()));
+        assert_eq!(ChatChannel::Yell.label(), Some("yell".into()));
+        assert_eq!(
+            ChatChannel::Whisper("Watcher".into()).label(),
+            Some("to Watcher".into())
         );
     }
 }

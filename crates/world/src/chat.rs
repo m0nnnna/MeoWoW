@@ -175,9 +175,11 @@ pub struct ChatMessage {
     pub chat_type: ChatType,
     pub language: u32,
     pub sender: u64,
-    /// Present only for the kinds that carry it inline -- see
-    /// [`ChatType::carries_sender_name`]. For a player, this is `None` and the
-    /// name has to come from the name cache.
+    /// Present for the kinds that carry it inline -- see
+    /// [`ChatType::carries_sender_name`] -- and also for anything that
+    /// arrived as `SMSG_GM_MESSAGECHAT`, whatever [`ChatType`] it carries; see
+    /// [`parse_gm_message_chat`]. Otherwise `None`, and the name has to come
+    /// from the name cache.
     pub sender_name: Option<String>,
     pub target: u64,
     /// Set for [`ChatType::Channel`].
@@ -189,7 +191,36 @@ pub struct ChatMessage {
 
 /// Parses `SMSG_MESSAGECHAT`.
 pub fn parse_message_chat(body: &[u8]) -> Result<ChatMessage, Error> {
-    let mut r = Reader::new(body, "SMSG_MESSAGECHAT");
+    parse_message_chat_body(body, "SMSG_MESSAGECHAT", false)
+}
+
+/// Parses `SMSG_GM_MESSAGECHAT`.
+///
+/// **Measured from a live capture, not shared with the ordinary parser above
+/// despite the identical opcode comment that used to sit here** ("a GM's line
+/// shares the body, so it shares the parser") -- that was never actually
+/// tested against a GM-flagged account until this project's own party chat
+/// went out from one and came back undecodable with seventeen trailing bytes.
+/// A GM message carries the sender's name inline, exactly like a monster's
+/// line, regardless of what [`ChatType`] the message itself is: a `Party`
+/// line from `Testwolf`, a GM-level character on the local realm, came back
+/// as `0x02 0x07000000 <8-byte guid> 0x00000000 0x09000000 "Testwolf\0" <8
+/// zero bytes> 0x05000000 "test\0" 0x00`, which is exactly the monster-shaped
+/// layout -- a name length, the name, then the ordinary target/length/text/tag
+/// tail -- and consumes the packet to its last byte. `ChatType::Party` itself
+/// says nothing about this; only the *opcode* the server chose to answer on
+/// does, which is why this needs a name distinct from
+/// [`ChatType::carries_sender_name`] rather than a new variant of it.
+pub fn parse_gm_message_chat(body: &[u8]) -> Result<ChatMessage, Error> {
+    parse_message_chat_body(body, "SMSG_GM_MESSAGECHAT", true)
+}
+
+fn parse_message_chat_body(
+    body: &[u8],
+    label: &'static str,
+    always_carries_name: bool,
+) -> Result<ChatMessage, Error> {
+    let mut r = Reader::new(body, label);
     let chat_type = ChatType::from_id(r.u8()?);
     let language = r.u32()?;
     let sender = r.u64()?;
@@ -201,7 +232,7 @@ pub fn parse_message_chat(body: &[u8]) -> Result<ChatMessage, Error> {
     let mut channel = None;
     let target;
 
-    if chat_type.carries_sender_name() {
+    if always_carries_name || chat_type.carries_sender_name() {
         // A length *and* a NUL terminator, and the length counts the
         // terminator. Reading the string by its length rather than to its NUL
         // would leave the terminator behind and desynchronise everything after
@@ -359,6 +390,40 @@ mod tests {
             parsed.sender_name, None,
             "a player's name comes from a query, never inline"
         );
+    }
+
+    /// **The exact bytes captured live** from a GM-flagged character
+    /// (`Testwolf`, local realm, GM level 3) sending party chat -- see
+    /// [`parse_gm_message_chat`]'s doc comment. `parse_message_chat` on this
+    /// same body must fail rather than silently misread it: reading it as an
+    /// ordinary player line (no inline name) lands the parser in the middle
+    /// of the name-length field and text, and the assertion here is that
+    /// *both* readings are checked, not just that the right one succeeds --
+    /// the ordinary parser returning `Ok` with garbage would be invisible in
+    /// a test that only tried `parse_gm_message_chat`.
+    #[test]
+    fn a_gm_flagged_players_line_carries_its_name_inline() {
+        let body: Vec<u8> = [
+            0x02, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x54, 0x65, 0x73, 0x74, 0x77, 0x6f, 0x6c,
+            0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+            0x74, 0x65, 0x73, 0x74, 0x00, 0x00,
+        ]
+        .to_vec();
+
+        assert!(
+            parse_message_chat(&body).is_err(),
+            "the ordinary parser must refuse a GM-shaped body rather than misread it"
+        );
+
+        let parsed = parse_gm_message_chat(&body).expect("gm body should parse whole");
+        assert_eq!(parsed.chat_type, ChatType::Party);
+        assert_eq!(parsed.language, 7);
+        assert_eq!(parsed.sender, 1);
+        assert_eq!(parsed.sender_name.as_deref(), Some("Testwolf"));
+        assert_eq!(parsed.target, 0);
+        assert_eq!(parsed.text, "test");
+        assert_eq!(parsed.tag, 0);
     }
 
     /// A creature carries its name inline, which is a *different shape of
