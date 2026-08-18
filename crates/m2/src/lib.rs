@@ -14,9 +14,13 @@
 //! of detail. See [`skin`].
 
 pub mod anim;
+pub mod emitter;
+pub mod particles;
 pub mod skin;
 
-pub use anim::{Interpolation, Keyframe, Keyframes, Pose, Sequence, Track};
+pub use anim::{Fixed16, Interpolation, Keyframe, Keyframes, Pose, Sequence, Track};
+pub use emitter::{EmitterType, PartTrack, ParticleEmitter, RibbonEmitter};
+pub use particles::{Particle, ParticleSystem, RibbonTrail, Sprite};
 pub use skin::Skin;
 
 use glam::{Mat4, Quat, Vec3};
@@ -96,14 +100,10 @@ impl<'a> HeaderReader<'a> {
             offset: self.u32(),
         }
     }
-
-    fn skip_floats(&mut self, n: usize) {
-        self.pos += n * 4;
-    }
 }
 
-/// Header fields this reader uses. Trailing fields (lights, cameras, particle
-/// emitters) are deliberately not parsed yet.
+/// Header fields this reader uses. Lights, cameras and events are read past
+/// but not kept -- reading in order is what keeps the emitter offsets honest.
 #[derive(Debug, Default)]
 struct Header {
     version: u32,
@@ -132,6 +132,10 @@ struct Header {
     collision_indices: Array,
     collision_positions: Array,
     attachments: Array,
+    /// Trails: a sword swing's arc, a comet's tail. See [`emitter`].
+    ribbons: Array,
+    /// Flames, sparks, smoke. See [`emitter`].
+    particles: Array,
 }
 
 /// One vertex in the model's shared pool.
@@ -354,7 +358,18 @@ impl Model {
         // stored one can.
         let _collision_normals = r.array();
         h.attachments = r.array();
-        r.skip_floats(0);
+        // Read through to the emitters rather than skipping to them: the field
+        // order *is* the layout, and a missing array here would shift both
+        // emitter blocks onto a neighbour's numbers, which parses.
+        let _attachment_lookup = r.array();
+        let _events = r.array();
+        let _lights = r.array();
+        let _cameras = r.array();
+        let _camera_lookup = r.array();
+        h.ribbons = r.array();
+        h.particles = r.array();
+        // `texture_combiner_combos` follows when `global_flags & 0x8`, and is
+        // the last field. Nothing here reads it.
 
         let model = Self {
             data: bytes.to_vec(),
@@ -370,6 +385,8 @@ impl Model {
         model.slice("texture_combos", model.header.texture_combos, 2)?;
         model.slice("bone_combos", model.header.bone_combos, 2)?;
         model.slice("attachments", model.header.attachments, ATTACHMENT_SIZE)?;
+        model.slice("ribbons", model.header.ribbons, emitter::RIBBON_SIZE)?;
+        model.slice("particles", model.header.particles, emitter::PARTICLE_SIZE)?;
         Ok(model)
     }
 
@@ -771,6 +788,227 @@ impl Model {
                     bone: u16::from_le_bytes([a[4], a[5]]),
                     // Bytes 6..8 are padding that keeps the position aligned.
                     position: [f(8), f(12), f(16)],
+                }
+            })
+            .collect()
+    }
+
+    pub fn particle_emitter_count(&self) -> u32 {
+        self.header.particles.count
+    }
+
+    pub fn ribbon_emitter_count(&self) -> u32 {
+        self.header.ribbons.count
+    }
+
+    /// Reads an `M2PartTrack`: a curve over one particle's own life.
+    ///
+    /// Two `(count, offset)` pairs and nothing else -- no interpolation type,
+    /// no global sequence, no per-sequence outer array. The timestamps are
+    /// `u16` fractions of a lifetime rather than milliseconds, which is the
+    /// whole difference from [`Model::read_track`] and the thing that makes
+    /// reading one as the other silently wrong. See [`emitter::PartTrack`].
+    fn read_part_track<T: anim::Keyframe>(&self, base: usize) -> emitter::PartTrack<T> {
+        let times = Array {
+            count: self.u32_at(base),
+            offset: self.u32_at(base + 4),
+        };
+        let values = Array {
+            count: self.u32_at(base + 8),
+            offset: self.u32_at(base + 12),
+        };
+        // The two are parallel by construction. Taking the shorter means a
+        // misread layout produces a short track rather than reading values out
+        // of whatever follows.
+        let count = times.count.min(values.count) as usize;
+        emitter::PartTrack {
+            times: (0..count)
+                .map(|i| {
+                    let at = times.offset as usize + i * 2;
+                    self.data
+                        .get(at..at + 2)
+                        .map(|b| anim::fixed16(u16::from_le_bytes([b[0], b[1]])))
+                        .unwrap_or(0.0)
+                })
+                .collect(),
+            values: (0..count)
+                .filter_map(|i| {
+                    let at = values.offset as usize + i * T::SIZE;
+                    self.data.get(at..at + T::SIZE).map(T::read)
+                })
+                .collect(),
+        }
+    }
+
+    /// Which sequences carry their keyframes in this file, for track reads.
+    fn inline_sequences(&self) -> Vec<bool> {
+        self.sequences().iter().map(|s| s.is_inline()).collect()
+    }
+
+    /// The model's particle emitters: flames, sparks, smoke.
+    ///
+    /// Empty for nearly every model. See [`emitter`] for what a record means
+    /// and how its stride was measured.
+    pub fn particle_emitters(&self) -> Vec<ParticleEmitter> {
+        let Ok(raw) = self.slice("particles", self.header.particles, emitter::PARTICLE_SIZE) else {
+            return Vec::new();
+        };
+        let base = self.header.particles.offset as usize;
+        let inline = self.inline_sequences();
+        let external = Default::default();
+
+        (0..raw.len() / emitter::PARTICLE_SIZE)
+            .map(|i| {
+                let at = base + i * emitter::PARTICLE_SIZE;
+                let f = |o: usize| self.f32_at(at + o);
+                let h = |o: usize| {
+                    self.data
+                        .get(at + o..at + o + 2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .unwrap_or(0)
+                };
+                let byte = |o: usize| self.data.get(at + o).copied().unwrap_or(0);
+                let track = |o: usize| self.read_track::<f32>(at + o, &external, &inline);
+
+                ParticleEmitter {
+                    id: self.u32_at(at) as i32,
+                    flags: self.u32_at(at + 4),
+                    position: [f(8), f(12), f(16)],
+                    bone: h(20),
+                    texture: h(22),
+                    // 24..40 are the two model filenames a "geometry" emitter
+                    // spawns whole models from. Unread: nothing here draws one,
+                    // and a path that is read and ignored reads as supported.
+                    blend: byte(40),
+                    emitter_type: emitter::EmitterType::from_raw(byte(41)),
+                    color_index: h(42),
+                    particle_type: byte(44),
+                    head_or_tail: byte(45),
+                    texture_tile_rotation: h(46) as i16,
+                    rows: h(48),
+                    columns: h(50),
+
+                    emission_speed: track(52),
+                    speed_variation: track(72),
+                    vertical_range: track(92),
+                    horizontal_range: track(112),
+                    gravity: track(132),
+                    lifespan: track(152),
+                    lifespan_vary: f(172),
+                    emission_rate: track(176),
+                    emission_rate_vary: f(196),
+                    emission_area_length: track(200),
+                    emission_area_width: track(220),
+                    z_source: track(240),
+
+                    color: self.read_part_track(at + 260),
+                    alpha: {
+                        let raw: emitter::PartTrack<anim::Fixed16> =
+                            self.read_part_track(at + 276);
+                        emitter::PartTrack {
+                            times: raw.times,
+                            values: raw.values.into_iter().map(|v| v.0).collect(),
+                        }
+                    },
+                    scale: self.read_part_track(at + 292),
+                    scale_vary: [f(308), f(312)],
+                    head_cell: self.read_part_track(at + 316),
+                    tail_cell: self.read_part_track(at + 332),
+
+                    tail_length: f(348),
+                    twinkle_speed: f(352),
+                    twinkle_percent: f(356),
+                    twinkle_scale: [f(360), f(364)],
+                    burst_multiplier: f(368),
+                    drag: f(372),
+                    base_spin: f(376),
+                    base_spin_vary: f(380),
+                    spin: f(384),
+                    spin_vary: f(388),
+                    tumble: [f(392), f(396), f(400), f(404), f(408), f(412)],
+                    wind: [f(416), f(420), f(424)],
+                    wind_time: f(428),
+                    follow_speed: [f(432), f(440)],
+                    follow_scale: [f(436), f(444)],
+                    spline_points: {
+                        let array = Array {
+                            count: self.u32_at(at + 448),
+                            offset: self.u32_at(at + 452),
+                        };
+                        (0..array.count as usize)
+                            .map(|k| {
+                                let p = array.offset as usize + k * 12;
+                                [self.f32_at(p), self.f32_at(p + 4), self.f32_at(p + 8)]
+                            })
+                            .collect()
+                    },
+                    enabled_in: self.read_track::<u8>(at + 456, &external, &inline),
+                }
+            })
+            .collect()
+    }
+
+    /// The model's ribbon emitters: trails behind a moving bone.
+    pub fn ribbon_emitters(&self) -> Vec<RibbonEmitter> {
+        let Ok(raw) = self.slice("ribbons", self.header.ribbons, emitter::RIBBON_SIZE) else {
+            return Vec::new();
+        };
+        let base = self.header.ribbons.offset as usize;
+        let inline = self.inline_sequences();
+        let external = Default::default();
+
+        (0..raw.len() / emitter::RIBBON_SIZE)
+            .map(|i| {
+                let at = base + i * emitter::RIBBON_SIZE;
+                let f = |o: usize| self.f32_at(at + o);
+                let h = |o: usize| {
+                    self.data
+                        .get(at + o..at + o + 2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .unwrap_or(0)
+                };
+                let indices = |o: usize| {
+                    let array = Array {
+                        count: self.u32_at(at + o),
+                        offset: self.u32_at(at + o + 4),
+                    };
+                    self.u16_table("ribbon indices", array)
+                };
+
+                RibbonEmitter {
+                    id: self.u32_at(at) as i32,
+                    bone: self.u32_at(at + 4) as u16,
+                    position: [f(8), f(12), f(16)],
+                    textures: indices(20),
+                    materials: indices(28),
+                    color: self.read_track::<[f32; 3]>(at + 36, &external, &inline),
+                    alpha: {
+                        let raw: anim::Track<anim::Fixed16> =
+                            self.read_track(at + 56, &external, &inline);
+                        anim::Track {
+                            interpolation: raw.interpolation,
+                            global_sequence: raw.global_sequence,
+                            sequences: raw
+                                .sequences
+                                .into_iter()
+                                .map(|k| anim::Keyframes {
+                                    times: k.times,
+                                    values: k.values.into_iter().map(|v| v.0).collect(),
+                                })
+                                .collect(),
+                        }
+                    },
+                    height_above: self.read_track::<f32>(at + 76, &external, &inline),
+                    height_below: self.read_track::<f32>(at + 96, &external, &inline),
+                    edges_per_second: f(116),
+                    edge_lifetime: f(120),
+                    gravity: f(124),
+                    rows: h(128),
+                    columns: h(130),
+                    texture_slot: self.read_track::<u16>(at + 132, &external, &inline),
+                    visibility: self.read_track::<u8>(at + 152, &external, &inline),
+                    // 172..176 are `priorityPlane` and two bytes of padding,
+                    // which is what makes this record 176 rather than 172.
                 }
             })
             .collect()

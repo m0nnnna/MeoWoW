@@ -868,6 +868,35 @@ enum M2Command {
         #[arg(long)]
         survey: bool,
     },
+    /// List a model's particle and ribbon emitters: what it burns, trails or
+    /// sprays, and the curves each does it along.
+    ///
+    /// None of this is in the `.skin` file -- an emitter is a description and
+    /// the geometry is made at runtime -- so this is the only way to look at
+    /// it before the renderer does.
+    Emitters {
+        /// Archive path, or a substring to filter on when `--survey` is set.
+        path: String,
+        /// Read every model in the archives instead, and check the emitter
+        /// blocks account for their own bytes.
+        ///
+        /// The question is the record stride, and it is asked in the one way
+        /// that can come out the other way: every offset a record refers to
+        /// must land *after* the whole block of records, and the first of them
+        /// must land within one 16-byte alignment pad of the block's end. A
+        /// stride a word short leaves the last record's tracks inside the
+        /// block; a word long runs the block into the data it points at.
+        #[arg(long)]
+        survey: bool,
+        /// Score a range of candidate strides rather than only the one the
+        /// parser uses, and print the tally for each.
+        ///
+        /// A single stride agreeing with the data proves less than the
+        /// neighbours disagreeing with it, which is the whole reason this
+        /// exists.
+        #[arg(long)]
+        strides: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7977,6 +8006,17 @@ fn m2_cmd(chain: &mut Chain, cmd: M2Command) -> Result<()> {
                 m2_attachments(chain, &path, anim)
             }
         }
+        M2Command::Emitters {
+            path,
+            survey,
+            strides,
+        } => {
+            if survey || strides {
+                m2_emitter_survey(chain, &path, strides)
+            } else {
+                m2_emitters(chain, &path)
+            }
+        }
     }
 }
 
@@ -9090,6 +9130,511 @@ fn m2_attachments(chain: &mut Chain, path: &str, anim: Option<usize>) -> Result<
 /// side column is the other half -- ids that come in mirrored pairs (the two
 /// hands, the two shoulders) sit consistently on one side of the model's plane
 /// of symmetry, which is what identifies them without transcribing a table.
+/// Dumps one model's emitters, with the tracks that drive them.
+///
+/// Prints the *values* of every curve rather than only its length, because an
+/// emitter cannot be checked any other way: a flame is right when its colour
+/// ramp runs orange to pale and its scale ramp grows then shrinks, and those
+/// are visible here and nowhere else until something is drawn.
+fn m2_emitters(chain: &mut Chain, path: &str) -> Result<()> {
+    let path = m2::model_path(path);
+    let bytes = chain.read(&path)?;
+    let model = m2::Model::parse(&bytes)?;
+    let textures = model.textures();
+    let bones = model.bones();
+    let sequences = model.sequences();
+
+    let texture_name = |i: u16| -> String {
+        match textures.get(i as usize) {
+            Some(t) if t.is_hardcoded() => t.filename.clone(),
+            Some(t) => format!("<supplied at runtime, type {}>", t.kind),
+            None => format!("<no texture {i}, model has {}>", textures.len()),
+        }
+    };
+
+    println!("{path}");
+    println!(
+        "  {} bones, {} textures, {} sequences",
+        bones.len(),
+        textures.len(),
+        sequences.len()
+    );
+
+    let particles = model.particle_emitters();
+    let ribbons = model.ribbon_emitters();
+    println!(
+        "  {} particle emitter(s), {} ribbon emitter(s)",
+        particles.len(),
+        ribbons.len()
+    );
+
+    /// First non-empty sequence of a track, with the sequence it came from.
+    fn first_keys<T: m2::Keyframe + std::fmt::Debug>(
+        track: &m2::Track<T>,
+    ) -> Option<(usize, String)> {
+        track.sequences.iter().enumerate().find_map(|(i, k)| {
+            (!k.values.is_empty()).then(|| {
+                let vals: Vec<String> =
+                    k.values.iter().take(6).map(|v| format!("{v:?}")).collect();
+                (i, vals.join(", "))
+            })
+        })
+    }
+
+    fn show_track(label: &str, track: &m2::Track<f32>) {
+        match first_keys(track) {
+            Some((seq, vals)) => println!("      {label:<22} seq {seq}: [{vals}]"),
+            None => println!("      {label:<22} (no keys)"),
+        }
+    }
+
+    fn show_part<T: m2::Keyframe + std::fmt::Debug>(label: &str, track: &m2::PartTrack<T>) {
+        if track.values.is_empty() {
+            println!("      {label:<22} (no keys)");
+            return;
+        }
+        let pairs: Vec<String> = track
+            .times
+            .iter()
+            .zip(&track.values)
+            .map(|(t, v)| format!("{t:.2}->{v:?}"))
+            .collect();
+        println!("      {label:<22} {}", pairs.join("  "));
+    }
+
+    for (i, p) in particles.iter().enumerate() {
+        println!(
+            "\n  particle {i}: id {} flags {:#x} bone {} ({}) texture {} = {}",
+            p.id,
+            p.flags,
+            p.bone,
+            if (p.bone as usize) < bones.len() {
+                "in range"
+            } else {
+                "OUT OF RANGE"
+            },
+            p.texture,
+            texture_name(p.texture),
+        );
+        println!(
+            "    at [{:.3} {:.3} {:.3}]  {} emitter, blend {}, {}x{} cells, \
+             colour index {}, type {}, head/tail {}",
+            p.position[0],
+            p.position[1],
+            p.position[2],
+            p.emitter_type.name(),
+            p.blend,
+            p.rows,
+            p.columns,
+            p.color_index,
+            p.particle_type,
+            p.head_or_tail,
+        );
+        println!(
+            "    lifespan vary {:.3}, rate vary {:.3}, drag {:.3}, spin {:.3}/{:.3}, \
+             tail {:.3}, follow {:?}/{:?}",
+            p.lifespan_vary,
+            p.emission_rate_vary,
+            p.drag,
+            p.base_spin,
+            p.spin,
+            p.tail_length,
+            p.follow_speed,
+            p.follow_scale,
+        );
+        println!("    per-sequence tracks (milliseconds into the animation):");
+        show_track("emission rate", &p.emission_rate);
+        show_track("emission speed", &p.emission_speed);
+        show_track("speed variation", &p.speed_variation);
+        show_track("vertical range", &p.vertical_range);
+        show_track("horizontal range", &p.horizontal_range);
+        show_track("gravity", &p.gravity);
+        show_track("lifespan", &p.lifespan);
+        show_track("area length", &p.emission_area_length);
+        show_track("area width", &p.emission_area_width);
+        show_track("z source", &p.z_source);
+        println!("    per-particle tracks (fraction of one particle's life):");
+        show_part("colour (0..255)", &p.color);
+        show_part("alpha", &p.alpha);
+        show_part("scale", &p.scale);
+        show_part("head cell", &p.head_cell);
+        show_part("tail cell", &p.tail_cell);
+        let enabled: Vec<String> = (0..sequences.len().max(1))
+            .map(|s| format!("{}", u8::from(p.enabled(s, 0))))
+            .collect();
+        println!("      {:<22} {}", "enabled per sequence", enabled.join(""));
+    }
+
+    for (i, r) in ribbons.iter().enumerate() {
+        println!(
+            "\n  ribbon {i}: id {} bone {} ({}) at [{:.3} {:.3} {:.3}]",
+            r.id,
+            r.bone,
+            if (r.bone as usize) < bones.len() {
+                "in range"
+            } else {
+                "OUT OF RANGE"
+            },
+            r.position[0],
+            r.position[1],
+            r.position[2],
+        );
+        println!(
+            "    {:.1} edges/s, edge lives {:.3}s, gravity {:.3}, {}x{} cells",
+            r.edges_per_second, r.edge_lifetime, r.gravity, r.rows, r.columns,
+        );
+        for t in &r.textures {
+            println!("    texture {t} = {}", texture_name(*t));
+        }
+        println!("    materials {:?}", r.materials);
+        show_track("height above", &r.height_above);
+        show_track("height below", &r.height_below);
+        show_track("alpha", &r.alpha);
+        match first_keys(&r.color) {
+            Some((seq, vals)) => println!("      {:<22} seq {seq}: [{vals}]", "colour (0..255)"),
+            None => println!("      {:<22} (no keys)", "colour (0..255)"),
+        }
+    }
+
+    if particles.is_empty() && ribbons.is_empty() {
+        println!("\n  nothing to draw: this model burns, trails and sprays nothing.");
+    }
+    Ok(())
+}
+
+/// Where an `(count, offset)` pair sits inside one emitter record.
+///
+/// Derived here rather than asked of the `m2` crate on purpose. The crate's
+/// reading is the thing under test, and a probe that consults it would agree
+/// with it however wrong both were -- the same reason the SRP6 tests carry a
+/// server written from the protocol rather than from the client.
+fn particle_array_positions() -> Vec<usize> {
+    let mut out = vec![24, 32, 448];
+    // Every `M2Track`: its two outer arrays sit at +4 and +12.
+    for base in [52, 72, 92, 112, 132, 152, 176, 200, 220, 240, 456] {
+        out.push(base + 4);
+        out.push(base + 12);
+    }
+    // Every `M2PartTrack`: two arrays back to back, no header at all.
+    for base in [260, 276, 292, 316, 332] {
+        out.push(base);
+        out.push(base + 8);
+    }
+    out
+}
+
+fn ribbon_array_positions() -> Vec<usize> {
+    let mut out = vec![20, 28];
+    for base in [36, 56, 76, 96, 132, 152] {
+        out.push(base + 4);
+        out.push(base + 12);
+    }
+    out
+}
+
+/// Whether one emitter block accounts for its own bytes at this stride.
+///
+/// The test that can fail: read every `(count, offset)` pair out of every
+/// record, and require that all of them point *past* the end of the block and
+/// inside the file, with the nearest one landing within a 16-byte alignment
+/// pad of the block's end. A stride that is too small leaves later records'
+/// data inside the block; one that is too large overruns into the data. A
+/// stride that is wrong by a whole record's worth mangles the fields
+/// themselves, which shows up as counts in the millions.
+fn block_accounts_for_itself(
+    data: &[u8],
+    offset: usize,
+    count: usize,
+    stride: usize,
+    positions: &[usize],
+) -> bool {
+    let word = |at: usize| -> Option<u32> {
+        data.get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    let end = match offset.checked_add(count * stride) {
+        Some(end) if end <= data.len() => end,
+        _ => return false,
+    };
+    let mut nearest = usize::MAX;
+    for record in 0..count {
+        let at = offset + record * stride;
+        for &position in positions {
+            let (Some(n), Some(o)) = (word(at + position), word(at + position + 4)) else {
+                return false;
+            };
+            if n == 0 {
+                continue;
+            }
+            let o = o as usize;
+            // A count of tens of thousands inside a record this size is not a
+            // count; it is a float being read as one.
+            if n > 0x1_0000 || o < end || o >= data.len() {
+                return false;
+            }
+            nearest = nearest.min(o);
+        }
+    }
+    // A block whose records refer to nothing at all cannot vote either way.
+    nearest == usize::MAX || nearest - end < 16
+}
+
+/// Reads every model and asks whether the emitter blocks parse as themselves.
+///
+/// Two questions, and they are different. The **stride** question is settled by
+/// byte accounting, which can come out the other way -- see
+/// [`block_accounts_for_itself`]. The **field** question is settled by
+/// properties the values must have: a bone index has to name a bone that
+/// exists, a texture index a texture that exists, and an emitter type has to
+/// be one of the three the format defines. A wrong offset satisfies none of
+/// those for long.
+fn m2_emitter_survey(chain: &mut Chain, filter: &str, strides: bool) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let needle = filter.to_lowercase();
+    let names: Vec<String> = chain
+        .list()?
+        .into_iter()
+        .filter(|n| {
+            let l = n.to_lowercase();
+            l.ends_with(".m2") && (needle.is_empty() || l.contains(needle.as_str()))
+        })
+        .collect();
+
+    // Candidates a word either side of the reading under test, plus the two
+    // sizes the format took in other builds, so the answer is a comparison
+    // rather than a single number that agrees with itself.
+    let particle_candidates: Vec<usize> = vec![464, 468, 472, 476, 480, 484, 492];
+    let ribbon_candidates: Vec<usize> = vec![164, 168, 172, 176, 180, 184];
+
+    let particle_positions = particle_array_positions();
+    let ribbon_positions = ribbon_array_positions();
+
+    let mut particle_votes: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut ribbon_votes: BTreeMap<usize, usize> = BTreeMap::new();
+    let (mut with_particles, mut with_ribbons) = (0usize, 0usize);
+    let (mut particle_blocks, mut ribbon_blocks) = (0usize, 0usize);
+    let (mut multi_particle, mut multi_ribbon) = (0usize, 0usize);
+
+    // The field questions, asked of the parser's own reading.
+    let mut types: BTreeMap<String, usize> = BTreeMap::new();
+    let mut blends: BTreeMap<u8, usize> = BTreeMap::new();
+    let (mut stray_bone, mut stray_texture, mut total_particles) = (0usize, 0usize, 0usize);
+    let (mut ribbon_stray_bone, mut ribbon_stray_texture, mut total_ribbons) = (0, 0usize, 0usize);
+    let (mut lifespan_vary_odd, mut lifespan_vary_set) = (0usize, 0usize);
+    // Which range each colour track is authored in. A particle's reads
+    // `(255, 72, 0)` and a ribbon's `(0.0, 0.96, 1.0)` on the two models that
+    // were dumped by hand, which is either a real difference between the two
+    // records or a misread offset in one of them -- and only a population can
+    // say which. Anything above 1.0 cannot be a normalised colour; anything
+    // non-zero below it is very unlikely to be a byte.
+    let (mut particle_over_one, mut particle_colour_keys) = (0usize, 0usize);
+    let (mut ribbon_over_one, mut ribbon_colour_keys) = (0usize, 0usize);
+    let mut parsed = 0usize;
+    let mut failed = 0usize;
+    let mut geometryless = 0usize;
+    let mut cells: BTreeMap<(u16, u16), usize> = BTreeMap::new();
+    // The models worth dumping by hand afterwards. A survey that says 317
+    // models carry ribbons and names none of them leaves the next person
+    // guessing filenames, which is how a whole afternoon went once already.
+    let (mut particle_examples, mut ribbon_examples) = (Vec::new(), Vec::new());
+
+    for name in &names {
+        let Ok(bytes) = chain.read(name) else { continue };
+        if bytes.len() < 0x130 {
+            continue;
+        }
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let (ribbon_count, ribbon_offset) = (word(0x120) as usize, word(0x124) as usize);
+        let (particle_count, particle_offset) = (word(0x128) as usize, word(0x12C) as usize);
+        if particle_count == 0 && ribbon_count == 0 {
+            continue;
+        }
+        // Does the model carry any geometry of its own? A model whose entire
+        // content is an emitter is a real and common thing -- a campfire's
+        // flame is a doodad with no mesh -- and a loader that reads "no
+        // triangles" as "nothing to draw" makes every one of them invisible.
+        if word(0x3C) == 0 {
+            geometryless += 1;
+        }
+
+        if particle_count > 0 {
+            with_particles += 1;
+            particle_blocks += particle_count;
+            if particle_count > 1 {
+                multi_particle += 1;
+                if particle_examples.len() < 4 {
+                    particle_examples.push(format!("{name} ({particle_count})"));
+                }
+            }
+            for &stride in &particle_candidates {
+                if block_accounts_for_itself(
+                    &bytes,
+                    particle_offset,
+                    particle_count,
+                    stride,
+                    &particle_positions,
+                ) {
+                    *particle_votes.entry(stride).or_default() += 1;
+                }
+            }
+        }
+        if ribbon_count > 0 {
+            with_ribbons += 1;
+            ribbon_blocks += ribbon_count;
+            if ribbon_count > 1 {
+                multi_ribbon += 1;
+            }
+            if ribbon_examples.len() < 4 {
+                ribbon_examples.push(format!("{name} ({ribbon_count})"));
+            }
+            for &stride in &ribbon_candidates {
+                if block_accounts_for_itself(
+                    &bytes,
+                    ribbon_offset,
+                    ribbon_count,
+                    stride,
+                    &ribbon_positions,
+                ) {
+                    *ribbon_votes.entry(stride).or_default() += 1;
+                }
+            }
+        }
+
+        let Ok(model) = m2::Model::parse(&bytes) else {
+            failed += 1;
+            continue;
+        };
+        parsed += 1;
+        let bones = model.bones().len();
+        let textures = model.textures().len();
+        for p in model.particle_emitters() {
+            total_particles += 1;
+            if p.bone as usize >= bones {
+                stray_bone += 1;
+            }
+            if p.texture as usize >= textures {
+                stray_texture += 1;
+            }
+            *types.entry(p.emitter_type.name().to_string()).or_default() += 1;
+            *blends.entry(p.blend).or_default() += 1;
+            *cells.entry((p.rows, p.columns)).or_default() += 1;
+            // Is `lifespanVary` a float or an integer? Read as a float, a
+            // small integer decodes to a denormal near 1e-43, which is the
+            // tell. Anything genuinely authored is a fraction of a second.
+            if p.lifespan_vary != 0.0 {
+                lifespan_vary_set += 1;
+                if !p.lifespan_vary.is_finite()
+                    || p.lifespan_vary.abs() < 1e-6
+                    || p.lifespan_vary.abs() > 1e4
+                {
+                    lifespan_vary_odd += 1;
+                }
+            }
+            for c in &p.color.values {
+                particle_colour_keys += 1;
+                if c.iter().any(|v| *v > 1.001) {
+                    particle_over_one += 1;
+                }
+            }
+        }
+        for r in model.ribbon_emitters() {
+            total_ribbons += 1;
+            if r.bone as usize >= bones {
+                ribbon_stray_bone += 1;
+            }
+            if r.textures.iter().any(|t| *t as usize >= textures) {
+                ribbon_stray_texture += 1;
+            }
+            for keys in &r.color.sequences {
+                for c in &keys.values {
+                    ribbon_colour_keys += 1;
+                    if c.iter().any(|v| *v > 1.001) {
+                        ribbon_over_one += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    println!(
+        "\n{} models scanned; {with_particles} carry particle emitters ({particle_blocks} \
+         emitters, {multi_particle} models with more than one), {with_ribbons} carry ribbons \
+         ({ribbon_blocks} emitters, {multi_ribbon} models with more than one)",
+        names.len()
+    );
+
+    if strides {
+        println!(
+            "\nstride probe -- how many models' emitter blocks account for their own bytes.\n\
+             A model with several emitters is the discriminating one: with a single record\n\
+             only the block's end moves, and alignment padding hides a word either way."
+        );
+        println!("\n  particle stride:");
+        for stride in &particle_candidates {
+            let hits = particle_votes.get(stride).copied().unwrap_or(0);
+            let pct = 100.0 * hits as f64 / with_particles.max(1) as f64;
+            println!(
+                "    {stride:>4} bytes: {hits:>6}/{with_particles} ({pct:5.1}%){}",
+                if *stride == m2::emitter::PARTICLE_SIZE {
+                    "  <- what the parser uses"
+                } else {
+                    ""
+                }
+            );
+        }
+        println!("\n  ribbon stride:");
+        for stride in &ribbon_candidates {
+            let hits = ribbon_votes.get(stride).copied().unwrap_or(0);
+            let pct = 100.0 * hits as f64 / with_ribbons.max(1) as f64;
+            println!(
+                "    {stride:>4} bytes: {hits:>6}/{with_ribbons} ({pct:5.1}%){}",
+                if *stride == m2::emitter::RIBBON_SIZE {
+                    "  <- what the parser uses"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+
+    println!("\n{parsed} models parsed, {failed} refused by the reader");
+    println!(
+        "{geometryless} of those carry no vertices at all: the emitter is the whole \
+         model,\n  so a loader that requires geometry draws none of them"
+    );
+    println!(
+        "\nparticle fields, over {total_particles} emitters:\n  \
+         {stray_bone} name a bone that does not exist, {stray_texture} a texture that does not"
+    );
+    println!("  emitter types: {types:?}");
+    println!("  blend modes: {blends:?}");
+    let mut grid: Vec<((u16, u16), usize)> = cells.into_iter().collect();
+    grid.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    grid.truncate(8);
+    println!("  flipbook grids (rows x columns): {grid:?}");
+    println!(
+        "  lifespan variance: {lifespan_vary_set} non-zero, {lifespan_vary_odd} of those \
+         implausible as a float"
+    );
+    println!(
+        "\nribbon fields, over {total_ribbons} emitters:\n  \
+         {ribbon_stray_bone} name a bone that does not exist, {ribbon_stray_texture} \
+         a texture that does not"
+    );
+    println!(
+        "\ncolour range -- keys with any component above 1.0, which no normalised\n\
+         colour can have:\n  \
+         particle: {particle_over_one}/{particle_colour_keys}\n  \
+         ribbon:   {ribbon_over_one}/{ribbon_colour_keys}"
+    );
+    println!("\nmodels worth dumping by hand:");
+    for example in particle_examples.iter().chain(&ribbon_examples) {
+        println!("  {example}");
+    }
+    Ok(())
+}
+
 fn m2_attachment_survey(chain: &mut Chain, filter: &str) -> Result<()> {
     use std::collections::BTreeMap;
 

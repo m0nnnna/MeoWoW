@@ -4444,3 +4444,182 @@ with its real amount while health never moves. `.gm on` instead satisfies
 `IsImmuneToEnvironmentalDamage` and suppresses the packet entirely, which would
 have read as the client failing to parse it. With the cheat off, the same tick
 killed the character, which is the other half of the same claim.
+
+### 4.19: things burn
+
+M2 particle and ribbon emitters: torches, campfires, braziers, spell effects,
+and the trails a moving bone leaves behind it. The first thing this renderer
+draws that has no geometry in any file.
+
+#### The stride was an experiment, not a transcription
+
+An emitter record is a flat struct with nothing self-describing in it, which is
+the shape this project has paid for more than any other: a wrong stride parses
+perfectly and returns nonsense. So the two record sizes were *measured*, by
+accounting for every byte -- the same move `MH2O`'s three block sizes needed.
+
+Read every `(count, offset)` pair out of every record in a block and require
+that all of them point past the end of the block and inside the file, with the
+nearest landing within one 16-byte alignment pad of the block's end. A stride a
+word short leaves a later record's tracks inside the block; a word long runs the
+block into the data it points at. `wow-cli m2 emitters --strides` scores a range
+of candidates over all 22,844 models:
+
+| particle stride | blocks that account for their own bytes |
+|---|---|
+| 464 | 0 / 6,429 |
+| 468 | 1,739 / 6,429 |
+| 472 | 1,739 / 6,429 |
+| **476** | **6,429 / 6,429** |
+| 480 | 1,739 / 6,429 |
+| 484 | 0 / 6,429 |
+
+**The 1,739 is the finding, not the 6,429.** 6,429 models carry an emitter and
+4,690 carry more than one -- so exactly 1,739 have a single record, and with a
+single record only the block's *end* moves, which alignment padding hides a word
+either way. Every model with two emitters refutes every neighbouring stride, and
+the two numbers agreeing exactly is what says the probe is measuring what it
+claims to. Ribbons repeat the shape: 176 fits all 317, its neighbours fit 68,
+and 317 minus 249 multi-ribbon models is 68.
+
+The probe reads the header and the records itself rather than calling the `m2`
+crate. The crate's reading is the thing under test, and a probe that consulted
+it would agree with it however wrong both were -- the same reason the SRP6 tests
+carry a server written from the protocol rather than from the client.
+
+#### Two kinds of track, and only one of them is the usual one
+
+An emitter carries the ordinary `M2Track` -- per sequence, timestamps in
+milliseconds -- *and* an `M2PartTrack`, which is sixteen bytes of two arrays
+with no interpolation type, no global sequence and no per-sequence outer array
+at all. Its timestamps are a **fraction of one particle's life**, stored as a
+`u16` over `0..=32767`.
+
+`Club_1H_Torch_A_01`'s read `0, 16384, 32767` -- start, half, end -- which is
+what identified the encoding. Reading one as the other parses cleanly: a
+lifetime fraction taken for milliseconds puts every key inside the first
+thirty-three seconds of an animation, which for a looping torch is "the last
+key, forever" and draws as a flame that never changes colour.
+
+#### A particle's colour is 0..255 and a ribbon's is 0..1
+
+Both records store a colour as three floats and they are not in the same range.
+The torch's particle track runs `(255, 72, 0)`, `(223, 138, 47)`,
+`(255, 234, 177)` -- orange to pale yellow, which is a flame.
+`CelestialDragonWyrm`'s ribbon reads `(0.0, 0.96, 1.0)`.
+
+Two samples is a guess, so it was counted: keys with any component above 1.0,
+which no normalised colour can have, are **77,410 of 78,377 particle keys and 0
+of 1,572 ribbon keys**. The 967 particle keys under 1.0 are the genuinely
+near-black ones. Getting this backwards gives a plausible dark ramp in one
+direction and a blown-out white trail in the other, and nothing about either
+render says which was meant.
+
+#### 653 models are nothing but an emitter, and every one was invisible
+
+`UndeadFireLarge.m2` is 2,208 bytes with a 48-byte skin: a campfire's flame is a
+doodad with a particle emitter and **no mesh at all**. The loader had bailed on
+`produced no drawable geometry` since it was written, and 653 of the 6,500
+emitter-carrying models in the archives are like that.
+
+It hid because the two states are indistinguishable from outside: "the model
+failed to load" and "the model has nothing in it" are the same empty patch of
+ground. It surfaced the moment there was something to draw for one -- the first
+render of `UndeadFireLarge` was an error message, not a picture. The check now
+refuses a model that draws nothing *and* emits nothing, which is the case it was
+written for.
+
+#### What the simulation does, and why it is on the CPU
+
+Rain has no CPU-side list at all: a drop's position is a pure function of its
+index, so 4.10 drew sixteen thousand of them with `draw(0..6, 0..count)` and
+uploaded nothing. A particle cannot work that way, and the reason is worth
+stating because it looks like a missed simplification. A drop is
+indistinguishable from every other drop and immortal. A particle is born at
+wherever its emitter's bone happened to be *at that instant*, carries a lifespan
+sampled from a track that is itself animated, and dies. Its position is a
+function of the **history of a bone**, which no shader has.
+
+So: `m2::particles` steps a `ParticleSystem` per placement with no GPU in sight,
+and `render::particles` draws whatever list it is handed. What is kept from the
+rain is everything else -- six vertices expanded in the shader, depth tested and
+never written, no sorting.
+
+**Particles live in the world, not in the model.** A torch carried past you
+leaves its flames behind it; a system simulated in model space drags the whole
+plume along rigidly, which reads as a sticker rather than a fire. The cost is
+that a system belongs to one *placement* rather than to one model, and that the
+emitter's current world transform has to be handed in every frame.
+
+Three constants exist only because the data demanded them:
+
+* **The emission remainder is carried between frames.** A torch emits twenty
+  particles a second, which at 60fps is a third of a particle per frame --
+  truncate each frame's share independently and it emits *nothing, ever*. That
+  would have silently killed every emitter under sixty per second, which is
+  most of them.
+* **A long frame is clamped, not paid back.** A tile streaming in must not
+  produce a thousand particles at once.
+* **A lifespan of zero is clamped to epsilon**, because `age / lifespan` is then
+  NaN, every curve samples to NaN, and the emitter draws nothing at all -- which
+  reads as never having run.
+
+#### Identity, and why a placement index would not do
+
+A system is keyed by placement, and the key has to survive between frames.
+Entity groups are rebuilt **every frame** and their order changes whenever a
+creature spawns, dies or changes cycle -- so an index into the transform vector
+would jump between creatures and restart every plume several times a second.
+Entities therefore carry their guid down to the group; doodads use a hash of
+their tile, path and placement index, which is equally stable and survives the
+tile being streamed out and back. The tile is in the hash because two tiles
+routinely place the same model, and a bare index would give the fifth torch on
+one tile the same identity as the fifth on its neighbour -- one plume for two
+fires.
+
+#### Looking at it is the only check that matters
+
+An emitter has no ground truth to compare against. Nothing says whether a flame
+reads as a flame, which is the same problem the composed character skin had, and
+it got the same answer: a way to see it as itself. `wow-viewer --model <path>
+--screenshot <png>` now draws a lone model's emitters, and the headless path
+**warms the system up over sixty steps with the animation clock running** rather
+than drawing one frame.
+
+Both halves of that are needed. One frame of a particle system is an emitter
+that has just been switched on -- a few sparks at the nozzle and no fire -- so a
+single-frame render says the feature does not work when it does. And a *ribbon*
+is the history of a bone, so sixty steps at one frozen instant lay every edge in
+the same place and draw nothing at all, which reads as ribbons being
+unimplemented.
+
+What those renders showed, in order: the torch burning orange at the head of its
+own bone; `LargeFirePit01`'s three emitters lighting the inside of the pit;
+`CelestialDragonWyrm` trailing three strips and shedding stars; and
+`UndeadFireLarge` burning green with orange embers at its base, which is what
+Scourge fire looks like and is not a colour anything in this client chose.
+
+#### What this deliberately does not do
+
+* **No sorting.** Sprites blend without writing depth, which is what lets
+  hundreds of them stack, and the price is that two overlapping emitters with
+  different blend modes can be in the wrong order. Every emitter measured is
+  additive or alpha over a self-lit texture, where the order does not show.
+* **No spin, tumble, wind, drag-free follow, or `zSource`.** All parsed, all
+  carried, none acted on. A parsed field that nothing reads is at least visible
+  in `wow-cli m2 emitters`; an unparsed one is not.
+* **No geometry or recursion sub-models.** A handful of emitters spawn whole
+  models rather than sprites; their filenames are deliberately not even read,
+  because a path that is read and ignored reads as supported.
+* **No spline emitters.** 140 of 26,374, drawn as planes.
+* **A ribbon's material is not resolved.** The record names a material index
+  rather than a blend mode, and every ribbon in the archives is a magical
+  effect, so additive is chosen and said so rather than guessed quietly.
+* **Only the first of a ribbon's textures.** All 1,572 name exactly one, and
+  the `texSlot` track that would animate between several is parsed and unread.
+* **The offline `--world` tile view draws no emitters**, only `--stream` and
+  `--model`. That path keeps its placements in a different structure and
+  extending it would be a second copy of the same wiring.
+* **Not yet confirmed at the window.** Everything above is headless: four
+  screenshots, a GPU test that reads pixels back, and the counters in the
+  overlay. A live run is the outstanding half.

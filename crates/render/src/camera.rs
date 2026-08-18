@@ -387,6 +387,29 @@ impl Camera {
         }
     }
 
+    /// The camera's own right and up axes in world space -- what a billboard
+    /// is widened along.
+    ///
+    /// Built from the same `look_to`/`look_at` the view matrix is, not from
+    /// the yaw and pitch separately. A sprite widened along a basis that
+    /// disagrees with the projection leans, and a leaning sprite reads as a
+    /// bad texture rather than as a stale copy of an angle -- the same trap as
+    /// a picking ray rebuilt from the camera instead of unprojected from the
+    /// matrix the scene was drawn with.
+    pub fn billboard_basis(&self) -> (Vec3, Vec3) {
+        let view = match self {
+            Self::Orbit(c) => {
+                glam::camera::rh::view::look_at_mat4(c.eye(), c.target, Vec3::Z)
+            }
+            Self::Fly(c) => {
+                glam::camera::rh::view::look_to_mat4(c.position, c.forward(), Vec3::Z)
+            }
+        };
+        // The view matrix's rows are the camera's axes: it maps world space
+        // into view space, so its transpose maps back.
+        (view.row(0).truncate(), view.row(1).truncate())
+    }
+
     /// Where a world point lands on screen, in the same coordinates
     /// [`Camera::ray_through`] takes.
     ///

@@ -9,6 +9,7 @@
 //! in CI.
 
 mod character;
+mod emitters;
 mod hud;
 mod items;
 mod liquid;
@@ -391,6 +392,7 @@ fn build_live_scene(
                         (None, 0)
                     };
                     world::EntityPlacement {
+                        guid: entity.guid,
                         display_id: entity.display_id,
                         position: entity.position,
                         orientation: entity.orientation,
@@ -1053,6 +1055,11 @@ fn draw_scene(
     // same is true of the weather.
     sky: &render::SkyRenderer,
     precipitation: &render::PrecipitationRenderer,
+    // Everything alight, already stepped and uploaded for this frame by
+    // `World::update_emitters`. Immutable here on purpose: a render pass holds
+    // the encoder, so nothing may be built or grown once it is open.
+    particles: &render::ParticleRenderer,
+    emitters: &emitters::Emitters,
     falling: Option<Falling>,
     material_binds: &[wgpu::BindGroup],
     bones: Option<&BoneBuffer>,
@@ -1090,6 +1097,8 @@ fn draw_scene(
             liquid_renderer,
             sky,
             precipitation,
+            particles,
+            emitters,
             falling,
             bones,
             lighting,
@@ -1267,6 +1276,14 @@ fn draw_scene(
                     0..1,
                 );
             }
+
+            // A torch drawn on its own is the cheapest way to *look* at an
+            // emitter, and looking is the only way one can be checked: no
+            // amount of dumping says whether a flame reads as a flame. Same
+            // reasoning as the composed character skin getting a dump command.
+            let (right, up) = camera.billboard_basis();
+            particles.set_camera(gpu, camera.view_proj(aspect), right, up);
+            emitters.draw(&mut pass, particles);
         }
     }
 }
@@ -1297,6 +1314,54 @@ fn upload_pose(
         _ => vec![glam::Mat4::IDENTITY.to_cols_array_2d(); m.bones.len().max(1)],
     };
     meshes.update_bones(gpu, bones, &pose);
+}
+
+/// Runs a lone model's emitters up to their steady state.
+///
+/// **Several steps, not one.** One frame of a particle system is an emitter
+/// that has just been switched on -- a few sparks at the nozzle and no fire --
+/// so a single-frame render says the feature does not work when it does. The
+/// step is fixed rather than wall-clock so two runs produce the same picture,
+/// the same reason `--screenshot` pins the weather's clock.
+fn warm_emitters(
+    gpu: &Gpu,
+    particles: &mut render::ParticleRenderer,
+    emitters: &mut emitters::Emitters,
+    m: &LoadedModel,
+    anim: Option<usize>,
+    time_ms: u32,
+    steps: usize,
+) {
+    if m.particles.is_empty() && m.ribbons.is_empty() {
+        return;
+    }
+    let sequence = anim.filter(|s| *s < m.sequences.len()).unwrap_or(0);
+    let duration = m
+        .sequences
+        .get(sequence)
+        .map(|s| s.duration_ms.max(1))
+        .unwrap_or(1);
+    // **The clock advances across the warm-up, and a ribbon is why.** A trail
+    // is the *history* of a bone: run sixty steps at one frozen instant and
+    // every edge lands in the same place, which draws as nothing at all and
+    // reads as ribbons being unimplemented. Stepping the animation makes the
+    // bone move, and the strip appears. With `steps` of 1 -- the windowed
+    // path, where the caller's own clock is already running -- this is a
+    // no-op.
+    for step in 0..steps.max(1) {
+        let time_ms = (time_ms + (step as u32 * 1000 / 60)) % duration;
+        let pose = if m.sequences.is_empty() {
+            vec![glam::Mat4::IDENTITY; m.bones.len().max(1)]
+        } else {
+            m2::Model::pose_bones(&m.bones, sequence, time_ms)
+        };
+        emitters.update(
+            gpu,
+            particles,
+            std::iter::once(emitters::single_model(m, &pose, sequence, time_ms)),
+            1.0 / 60.0,
+        );
+    }
 }
 
 /// One bind-group list per scene item, since each carries its own textures.
@@ -1451,6 +1516,8 @@ fn draw_streaming(
     // built. A parameter that can be wrong is worse than no parameter.
     sky: &render::SkyRenderer,
     precipitation: &render::PrecipitationRenderer,
+    particles: &render::ParticleRenderer,
+    emitters: &emitters::Emitters,
     falling: Option<Falling>,
     bones: Option<&BoneBuffer>,
     lighting: Option<(dbc::light::Sample, f32)>,
@@ -1580,6 +1647,20 @@ fn draw_streaming(
         camera.eye(),
         seconds,
     );
+
+    // **After the liquid and before the weather.** A torch's flame has to be
+    // drawn over the water it is reflected in rather than under it, for the
+    // same reason the liquid comes after the riverbed; and rain falls in front
+    // of a fire, not behind it. Both sprites and strips test depth without
+    // writing it, so nothing here occludes anything else.
+    //
+    // The camera basis is taken from the matrix this pass is drawn with, not
+    // rebuilt from the camera's angles -- a billboard widened along a basis
+    // that disagrees with the projection leans, and reads as a bad texture
+    // rather than as a stale copy. Same rule as the picking ray.
+    let (right, up) = camera.billboard_basis();
+    particles.set_camera(gpu, view_proj, right, up);
+    emitters.draw(&mut pass, particles);
 
     // Last, so it falls in front of everything solid -- and inside the same
     // pass, so it can still be depth-tested against the world it is falling
@@ -1921,6 +2002,38 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     };
     let weather = frame_weather(live.as_ref(), args);
 
+    // **Stepped before the encoder opens, and stepped several times.** A
+    // headless render draws one frame, and one frame of a particle system is
+    // an emitter that has just been switched on: no fire, a few sparks at the
+    // nozzle, and a picture that says the feature does not work. Running it
+    // forward to its steady state is what makes a screenshot comparable to
+    // what a window shows -- and the fixed step keeps two runs identical, the
+    // same reason the weather gets a pinned clock below.
+    let mut particles = render::ParticleRenderer::new(&gpu, format);
+    let mut emitters = emitters::Emitters::new();
+    match &scene {
+        Scene::Streaming(world) => {
+            world.update_animations(&gpu, &meshes);
+            for _ in 0..60 {
+                world.update_emitters(&gpu, &mut particles, &mut emitters, 1.0 / 60.0);
+            }
+        }
+        Scene::Model(m) => warm_emitters(
+            &gpu,
+            &mut particles,
+            &mut emitters,
+            m,
+            args.anim,
+            args.anim_time,
+            60,
+        ),
+        _ => {}
+    }
+    // Always, not only when something was drawn. Silence would be equally
+    // what an empty scene produces, and "no emitters ran" and "there were
+    // none" are the two answers this line exists to separate.
+    tracing::info!("{}", emitters.describe());
+
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1941,6 +2054,8 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
         &liquid_types,
         &sky,
         &precipitation,
+        &particles,
+        &emitters,
         // A fixed clock, so two screenshots of the same weather are the same
         // picture: a headless render exists to be compared against another
         // one, and a wall clock would make every drop move between runs.
@@ -2004,6 +2119,14 @@ struct Renderer {
     terrain_renderer: TerrainRenderer,
     sky: render::SkyRenderer,
     precipitation: render::PrecipitationRenderer,
+    /// The pipelines and buffers for everything alight, and the live emitter
+    /// state that feeds them.
+    ///
+    /// Two objects rather than one because they are used at different times:
+    /// the renderer is grown and written before the pass opens, and only read
+    /// once it has.
+    particles: render::ParticleRenderer,
+    emitters: emitters::Emitters,
     liquid_renderer: render::LiquidRenderer,
     /// Surface art for the liquid types the offline scenes use.
     ///
@@ -3058,6 +3181,8 @@ impl ApplicationHandler for App {
         let terrain_renderer = TerrainRenderer::new(&gpu, format, meshes.camera_layout());
         let sky = render::SkyRenderer::new(&gpu, format);
         let precipitation = render::PrecipitationRenderer::new(&gpu, format);
+        let particles = render::ParticleRenderer::new(&gpu, format);
+        let emitters = emitters::Emitters::new();
         let liquid_renderer = render::LiquidRenderer::new(&gpu, format);
         let mut liquid_types = liquid::LiquidTypes::default();
         let depth = DepthBuffer::new(&gpu, config.width, config.height);
@@ -3148,6 +3273,8 @@ impl ApplicationHandler for App {
             terrain_renderer,
             sky,
             precipitation,
+            particles,
+            emitters,
             liquid_renderer,
             liquid_types,
             material_binds,
@@ -3860,6 +3987,7 @@ impl App {
                                     (None, 0)
                                 };
                                 crate::world::EntityPlacement {
+                                    guid: entity.guid,
                                     display_id: entity.display_id,
                                     position: entity.position,
                                     orientation: entity.orientation + flip,
@@ -3933,10 +4061,40 @@ impl App {
             // different clocks, and tying a walk cycle to the coarser one made
             // it visibly stutter.
             world.update_animations(&r.gpu, &r.meshes);
+            // ...and everything alight, after the poses it hangs off. A flame
+            // on a hand is placed by the very matrix the hand was drawn with,
+            // so stepping first would leave every emitter a frame behind the
+            // skeleton carrying it -- exactly the lag a held weapon had before
+            // it was moved after the pose for the same reason.
+            //
+            // `frame_ms` rather than a wall clock: a particle's fall is
+            // integrated, so it needs how long the *last* frame took, and the
+            // simulation clamps the step itself so a stall cannot be paid back
+            // as a burst.
+            world.update_emitters(
+                &r.gpu,
+                &mut r.particles,
+                &mut r.emitters,
+                self.frame_ms / 1000.0,
+            );
         }
 
         if let (Some(Scene::Model(m)), Some(bones)) = (&r.scene, &r.bones) {
             upload_pose(&r.gpu, &r.meshes, bones, m, anim, anim_time);
+        }
+        if let Some(Scene::Model(m)) = &r.scene {
+            // One step here, because the window runs at sixty of them a
+            // second. The headless path warms up instead -- see
+            // `warm_emitters`.
+            warm_emitters(
+                &r.gpu,
+                &mut r.particles,
+                &mut r.emitters,
+                m,
+                anim,
+                anim_time,
+                1,
+            );
         }
 
         use wgpu::CurrentSurfaceTexture as Acquired;
@@ -4002,6 +4160,8 @@ impl App {
                 &r.liquid_types,
                 &r.sky,
                 &r.precipitation,
+                &r.particles,
+                &r.emitters,
                 resolve_precipitation(weather, self.started.elapsed().as_secs_f32()),
                 &r.material_binds,
                 r.bones.as_ref(),
@@ -6593,9 +6753,17 @@ impl App {
         let gpu_line = r.gpu.describe();
         let bc = r.gpu.supports_bc();
         let pipelines = r.meshes.pipeline_count();
+        // Emitters get their own line rather than being folded into the scene
+        // summary: "no fires are lit" and "the emitter code is not running"
+        // look identical from the window, and only the counts separate them.
+        let emitters = r.emitters.describe();
         let summary = r.scene.as_ref().map(|scene| match &self.live {
-            Some(live) => format!("{}\n\n{}", describe_live(live), describe(scene)),
-            None => describe(scene),
+            Some(live) => format!(
+                "{}\n\n{}\n{emitters}",
+                describe_live(live),
+                describe(scene)
+            ),
+            None => format!("{}\n{emitters}", describe(scene)),
         });
         let (error, frame_ms) = (self.error.clone(), self.frame_ms);
         let camera = self.camera;

@@ -34,6 +34,13 @@ pub struct LoadedModel {
     /// thirty-nine and a tree none -- and the only way to hang a weapon on a
     /// hand after the file has been dropped.
     pub attachments: Vec<m2::Attachment>,
+    /// What this model burns or sprays, and what it trails. Empty for the
+    /// great majority: 6,429 models of 22,844 carry a particle emitter and 317
+    /// carry a ribbon. Carried alongside the geometry for the same reason the
+    /// attachments are -- the file is gone by the time anything wants to emit,
+    /// and re-reading it per placement would parse a torch once per torch.
+    pub particles: Vec<m2::ParticleEmitter>,
+    pub ribbons: Vec<m2::RibbonEmitter>,
     /// Human-readable name per sequence, from `AnimationData.dbc`.
     pub sequence_names: Vec<String>,
     pub min: Vec3,
@@ -348,7 +355,19 @@ pub fn load_dressed(
             (min.min(p), max.max(p))
         },
     );
-    if vertices.is_empty() || indices.is_empty() {
+    // **A model with no triangles is not necessarily an empty model.** 653 of
+    // the 6,500 emitter-carrying models in the archives have no vertices at
+    // all: their entire content is a flame or a spray, and a campfire's fire
+    // is exactly that -- a doodad with a particle emitter and no mesh. This
+    // check refused every one of them, silently, for as long as it has
+    // existed, and nothing said so because "the model failed to load" and "the
+    // model has nothing in it" produce the same empty patch of ground.
+    //
+    // It still refuses a model that genuinely draws nothing, which is the case
+    // it was written for: a parse that produced no batches is a bug worth
+    // hearing about.
+    let emits = !model.particle_emitters().is_empty() || !model.ribbon_emitters().is_empty();
+    if (vertices.is_empty() || indices.is_empty()) && !emits {
         anyhow::bail!("{path} produced no drawable geometry");
     }
 
@@ -366,12 +385,32 @@ pub fn load_dressed(
     let sequence_names = sequence_names(chain, &sequences);
 
     Ok(LoadedModel {
-        mesh: GpuMesh::upload(gpu, &vertices, &indices),
+        // A zero-length GPU buffer is not something wgpu will make, and an
+        // emitter-only model has exactly that. One degenerate vertex costs
+        // nothing and keeps every downstream `set_vertex_buffer` working
+        // without a branch: `draws` is empty, so it is never drawn.
+        mesh: if vertices.is_empty() || indices.is_empty() {
+            GpuMesh::upload(
+                gpu,
+                &[MeshVertex {
+                    position: [0.0; 3],
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0; 2],
+                    bone_indices: [0; 4],
+                    bone_weights: [0; 4],
+                }],
+                &[0, 0, 0],
+            )
+        } else {
+            GpuMesh::upload(gpu, &vertices, &indices)
+        },
         draws,
         textures,
         bones,
         sequences,
         attachments: model.attachments(),
+        particles: model.particle_emitters(),
+        ribbons: model.ribbon_emitters(),
         collision: model.collision_triangles(),
         sequence_names,
         min,

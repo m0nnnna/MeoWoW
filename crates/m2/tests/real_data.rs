@@ -406,3 +406,173 @@ fn sampled_models_parse_and_validate() {
         &failures[..failures.len().min(5)]
     );
 }
+
+/// The torch's flame, field by field.
+///
+/// Pinned against one real record because every constant here was *measured*
+/// off it -- the record stride by byte accounting, the colour range by the
+/// ramp running orange to pale, the `M2PartTrack` timestamps by reading
+/// `0, 16384, 32767`. A regression in any of those still parses cleanly and
+/// produces a plausible-looking wrong flame, which is precisely the failure
+/// this project's rules are about.
+#[test]
+fn a_torch_carries_a_flame_that_reads_as_a_flame() {
+    let mut chain = require_data!();
+    let path = r"ITEM\OBJECTCOMPONENTS\WEAPON\Club_1H_Torch_A_01.m2";
+    let model = load(&mut chain, path);
+
+    let emitters = model.particle_emitters();
+    assert_eq!(emitters.len(), 1, "the torch has exactly one emitter");
+    let flame = &emitters[0];
+
+    // Placement: the tip of the handle, on a bone that exists.
+    assert!((flame.bone as usize) < model.bones().len());
+    assert!(flame.position[0] > 0.5, "at {:?}", flame.position);
+
+    // The texture is a direct index into the model's own list, not through the
+    // combo table -- read through the combos this lands on the handle's
+    // runtime slot instead of the flame sheet.
+    let texture = &model.textures()[flame.texture as usize];
+    assert!(
+        texture.filename.to_uppercase().contains("FLAMELICK"),
+        "the emitter's texture is {:?}",
+        texture.filename
+    );
+
+    assert_eq!(flame.emitter_type, m2::EmitterType::Plane);
+    assert_eq!(flame.blend, 4, "a flame is additive");
+    assert_eq!((flame.rows, flame.columns), (4, 4));
+
+    // Per-sequence tracks, in the units they are documented in.
+    let rate = flame.emission_rate.sample(0, 0).expect("an emission rate");
+    assert!((rate - 20.0).abs() < 0.01, "{rate} particles a second");
+    let life = flame.lifespan.sample(0, 0).expect("a lifespan");
+    assert!((life - 0.8).abs() < 0.01, "{life} seconds");
+    // Exactly one full turn of azimuth, which is what makes a torch's flame
+    // symmetric -- and a number no misread offset produces by accident.
+    let spread = flame.horizontal_range.sample(0, 0).expect("a spread");
+    assert!(
+        (spread - std::f32::consts::TAU).abs() < 1e-4,
+        "horizontal range is {spread}, not a full turn"
+    );
+
+    // **Per-particle tracks run over a lifetime fraction, not milliseconds.**
+    // The first and last keys must be at 0 and 1; read as milliseconds they
+    // would be 0 and 32767.
+    assert_eq!(flame.color.times.first().copied(), Some(0.0));
+    assert!((flame.color.times.last().copied().unwrap() - 1.0).abs() < 1e-4);
+
+    // And the colour is 0..255, running orange to pale. Divided by 255 this is
+    // a plausible dark ramp and nothing says which was meant.
+    let young = flame.color.sample(0.0).expect("a colour at birth");
+    let old = flame.color.sample(1.0).expect("a colour at death");
+    assert!(young[0] > 200.0 && young[2] < 20.0, "young is {young:?}");
+    assert!(old[1] > 200.0 && old[2] > 150.0, "old is {old:?}");
+
+    // Alpha fades to nothing, and scale grows then shrinks -- a flame.
+    assert!(flame.alpha.sample(1.0).unwrap() < 0.01);
+    let mid = flame.scale.sample(0.5).unwrap()[0];
+    assert!(
+        mid > flame.scale.sample(0.0).unwrap()[0] && mid > flame.scale.sample(1.0).unwrap()[0],
+        "the flame does not grow and shrink: {:?}",
+        flame.scale.values
+    );
+
+    assert!(model.ribbon_emitters().is_empty(), "a torch trails nothing");
+}
+
+/// A ribbon, and the one place it disagrees with a particle.
+#[test]
+fn a_ribbon_is_a_trail_with_a_normalised_colour() {
+    let mut chain = require_data!();
+    let path = r"Creature\CelestialDragonWyrm\CelestialDragonWyrm.M2";
+    let model = load(&mut chain, path);
+
+    let ribbons = model.ribbon_emitters();
+    assert_eq!(ribbons.len(), 3);
+    let trail = &ribbons[0];
+    assert!((trail.bone as usize) < model.bones().len());
+    assert!(trail.edges_per_second > 0.0 && trail.edge_lifetime > 0.0);
+    assert!(!trail.textures.is_empty());
+    assert!(trail
+        .textures
+        .iter()
+        .all(|t| (*t as usize) < model.textures().len()));
+
+    // A ribbon's colour is normalised where a particle's is 0..255. Both
+    // halves, because asserting only that the ribbon is under 1.0 passes just
+    // as well if every colour in the file were being read as zero.
+    let colour = trail.color.sample(0, 0).expect("a colour");
+    assert!(
+        colour.iter().all(|c| *c <= 1.001),
+        "a ribbon's colour is not normalised: {colour:?}"
+    );
+    assert!(
+        colour.iter().any(|c| *c > 0.1),
+        "the ribbon's colour read as black: {colour:?}"
+    );
+    let particle = &model.particle_emitters()[0];
+    assert!(
+        particle.color.values.iter().flatten().any(|c| *c > 1.0),
+        "the same model's particle colour is not in 0..255"
+    );
+}
+
+/// Every emitter in the archives names a bone and a texture that exist, and an
+/// emitter type the format defines.
+///
+/// The survey does this over all 22,844 models; this is the sampled version
+/// that runs with the suite. A wrong record stride shows up here as strays in
+/// the hundreds rather than as a parse error, because nothing about an emitter
+/// block is self-describing.
+#[test]
+fn sampled_emitters_name_things_that_exist() {
+    let mut chain = require_data!();
+    let names: Vec<String> = chain
+        .list()
+        .expect("listing")
+        .into_iter()
+        .filter(|n| n.to_lowercase().ends_with(".m2"))
+        .collect();
+
+    let (mut checked, mut emitters, mut strays) = (0usize, 0usize, 0usize);
+    for name in names.iter().step_by(23) {
+        let Ok(bytes) = chain.read(name) else { continue };
+        let Ok(model) = Model::parse(&bytes) else {
+            continue;
+        };
+        let (bones, textures) = (model.bones().len(), model.textures().len());
+        let mut any = false;
+        for p in model.particle_emitters() {
+            any = true;
+            emitters += 1;
+            if p.bone as usize >= bones || p.texture as usize >= textures {
+                strays += 1;
+            }
+            if matches!(p.emitter_type, m2::EmitterType::Unknown(_)) {
+                strays += 1;
+            }
+        }
+        for r in model.ribbon_emitters() {
+            any = true;
+            emitters += 1;
+            if r.bone as usize >= bones
+                || r.textures.iter().any(|t| *t as usize >= textures)
+            {
+                strays += 1;
+            }
+        }
+        if any {
+            checked += 1;
+        }
+    }
+
+    // Both numbers. A sample that found no emitters at all would satisfy
+    // "no strays" perfectly, which is the shape of assertion this project has
+    // been caught by before.
+    assert!(
+        checked > 100 && emitters > 300,
+        "the sample carried almost nothing to check: {checked} models, {emitters} emitters"
+    );
+    assert_eq!(strays, 0, "{strays} of {emitters} emitters name nothing real");
+}

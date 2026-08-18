@@ -67,6 +67,83 @@ impl Keyframe for f32 {
     }
 }
 
+/// A colour, in the 0..255 range the emitter blocks store. Plain arrays rather
+/// than [`Vec3`] so the emitter types stay free of a maths crate in their
+/// public shape, the same way [`crate::Attachment::position`] does.
+impl Keyframe for [f32; 3] {
+    const SIZE: usize = 12;
+    fn read(b: &[u8]) -> Self {
+        [f32_at(b, 0), f32_at(b, 4), f32_at(b, 8)]
+    }
+    fn blend(a: Self, b: Self, t: f32) -> Self {
+        [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+        ]
+    }
+}
+
+impl Keyframe for [f32; 2] {
+    const SIZE: usize = 8;
+    fn read(b: &[u8]) -> Self {
+        [f32_at(b, 0), f32_at(b, 4)]
+    }
+    fn blend(a: Self, b: Self, t: f32) -> Self {
+        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+    }
+}
+
+/// A cell index in a flipbook. Blended, because the head-cell track on a torch
+/// reads `0, 7, 8, 16` over four keys and stepping between them would show
+/// four frames of a sixteen-frame flame.
+impl Keyframe for u16 {
+    const SIZE: usize = 2;
+    fn read(b: &[u8]) -> Self {
+        u16::from_le_bytes([b[0], b[1]])
+    }
+    fn blend(a: Self, b: Self, t: f32) -> Self {
+        (a as f32 + (b as f32 - a as f32) * t).round() as u16
+    }
+}
+
+/// A flag. Never blended -- an emitter is on or off, and half-on would be a
+/// number nothing can act on.
+impl Keyframe for u8 {
+    const SIZE: usize = 1;
+    fn read(b: &[u8]) -> Self {
+        b[0]
+    }
+    fn blend(a: Self, _b: Self, _t: f32) -> Self {
+        a
+    }
+}
+
+/// A 16-bit fixed-point fraction, `32767` meaning one.
+///
+/// The emitter blocks store alpha and every `M2PartTrack` timestamp this way.
+/// Note the divisor is `32767`, not `32768`: `Club_1H_Torch_A_01`'s alpha
+/// track ends on exactly `0x7FFF` and a flame that ends at 0.99997 opacity is
+/// a flame with a seam in it.
+#[inline]
+pub fn fixed16(v: u16) -> f32 {
+    v as f32 / 32767.0
+}
+
+/// [`fixed16`] as a track value, for the alpha curves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fixed16(pub f32);
+
+impl Keyframe for Fixed16 {
+    const SIZE: usize = 2;
+    fn read(b: &[u8]) -> Self {
+        Self(fixed16(u16::from_le_bytes([b[0], b[1]])))
+    }
+    fn blend(a: Self, b: Self, t: f32) -> Self {
+        Self(a.0 + (b.0 - a.0) * t)
+    }
+}
+
 /// Expands one component of a compressed quaternion.
 ///
 /// The 16 bits span `-1..1` with the seam at zero rather than at the numeric

@@ -52,14 +52,20 @@ pub struct CachedModel {
     /// Where things this model carries hang from. Empty for everything that
     /// carries nothing, which is nearly everything.
     pub attachments: Vec<m2::Attachment>,
+    /// What this model burns, sprays and trails. Empty for a WMO, which has no
+    /// emitters of its own -- a brazier inside a building is a doodad placed by
+    /// it, and arrives here as its own model.
+    pub particles: Vec<m2::ParticleEmitter>,
+    pub ribbons: Vec<m2::RibbonEmitter>,
     /// The model's own extent, in its local space. Carried so a replicated
     /// entity can be clicked on: a click needs a volume to test a ray against,
     /// and the model already knows how big it is. `None` for a WMO, which is
     /// never a click target.
     pub bounds: Option<(Vec3, Vec3)>,
-    /// Held because the bind groups reference their views.
-    #[allow(dead_code)]
-    textures: Vec<UploadedTexture>,
+    /// Held because the bind groups reference their views -- and read
+    /// directly by the emitters, whose sprites are bound against a different
+    /// pipeline layout and so cannot reuse `binds`.
+    pub textures: Vec<UploadedTexture>,
     /// Everything solid about this model, in its own space, ready to be
     /// transformed by each placement -- see the `collision` crate. Empty for
     /// the many models that are scenery: a tuft of grass has no collision mesh
@@ -86,6 +92,24 @@ pub struct Group {
     /// case its instance transforms are recomputed every frame from the
     /// wielder's pose. See [`Held`].
     pub held: Option<Held>,
+    /// This group's transforms, on the CPU, and **only when the model has an
+    /// emitter**.
+    ///
+    /// The GPU copy in `instances` cannot answer: a particle is born at the
+    /// emitter's world position and reading a vertex buffer back per frame to
+    /// find out where fifty torches are would be absurd. Kept empty for
+    /// everything else, which is 16,415 of the 22,844 models in the archives,
+    /// so the memory is a rounding error rather than a copy of the scene.
+    pub emitting: Vec<Mat4>,
+    /// A stable identity per entry in [`Group::emitting`].
+    ///
+    /// Entity groups are rebuilt **every frame** and their order changes
+    /// whenever a creature spawns, dies or changes cycle -- so a particle
+    /// system keyed on a position in the vector would jump between creatures
+    /// and restart every plume several times a second. A guid does not move.
+    /// Doodads use a hash of their tile, path and placement index, which is
+    /// equally stable and survives the tile being drawn again.
+    pub emitting_ids: Vec<u64>,
 }
 
 /// A group that hangs off another group's skeleton.
@@ -113,6 +137,53 @@ pub struct Held {
     /// The attachment point, in the wielder's model space. A point, not an
     /// offset -- see [`m2::Attachment`].
     pub offset: Vec3,
+}
+
+/// The transforms worth keeping on the CPU for a group.
+///
+/// Empty unless the model actually emits something, which is the whole point:
+/// a forest of five hundred trees would otherwise carry five hundred matrices
+/// nothing will ever read.
+fn emitting_placements(model: &CachedModel, transforms: &[Mat4]) -> Vec<Mat4> {
+    if model.particles.is_empty() && model.ribbons.is_empty() {
+        return Vec::new();
+    }
+    transforms.to_vec()
+}
+
+/// A stable id for each of a doodad group's placements.
+///
+/// Not the index: two tiles routinely place the same model, and a bare index
+/// would give the fifth torch on one tile the same identity as the fifth on
+/// its neighbour -- one plume for two fires. The tile is in the hash for
+/// exactly that reason.
+fn doodad_ids(model: &CachedModel, tile: (i32, i32), path: &str, count: usize) -> Vec<u64> {
+    if model.particles.is_empty() && model.ribbons.is_empty() {
+        return Vec::new();
+    }
+    use std::hash::{Hash, Hasher};
+    (0..count)
+        .map(|i| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            tile.hash(&mut hasher);
+            path.hash(&mut hasher);
+            i.hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect()
+}
+
+/// A bucket's posed skeleton this frame, with the cycle it was posed from.
+///
+/// The sequence and the time are carried alongside the matrices because an
+/// emitter needs *both*: the bones say where it is and the sequence says how
+/// fast it should be emitting. Deriving the second separately would be two
+/// answers to one question, and a flame running on a different cycle from the
+/// arm it hangs off is the kind of disagreement nothing reports.
+pub struct FramePose {
+    pub bones: Vec<Mat4>,
+    pub sequence: usize,
+    pub time_ms: u32,
 }
 
 /// What is lying over a point on the ground.
@@ -308,6 +379,12 @@ pub struct Stats {
 
 /// One server-placed object waiting to be turned into an instance.
 pub struct EntityPlacement {
+    /// The server's own id for this object.
+    ///
+    /// Carried only so an emitter can be told which creature it belongs to
+    /// between frames -- everything else here is drawn from a bucket and does
+    /// not care which instance is which. See [`Group::emitting_ids`].
+    pub guid: u64,
     pub display_id: u32,
     pub position: Vec3,
     /// Heading in radians, as the server reports it.
@@ -482,6 +559,15 @@ pub struct World {
     /// already-settled bucket re-detect a transition, because settled
     /// buckets never consult this at all.
     last_motion_per_display: RefCell<HashMap<u32, Motion>>,
+    /// This frame's posed skeletons, by animation bucket.
+    ///
+    /// Written by [`World::update_animations`], which already has them, and
+    /// read by the emitters -- a flame on a creature's hand has to hang off
+    /// the same matrix the hand was drawn with. Recomputing it would be the
+    /// exact mistake `poses` was kept to avoid for held items: two derivations
+    /// that agree until one of them is edited, and a fire that trails a frame
+    /// behind the arm carrying it.
+    frame_poses: RefCell<HashMap<(u32, Motion), FramePose>>,
     /// Origin for the animation clock. The server does not say which frame of
     /// a walk cycle a creature is on -- nothing does, since 3.3.5a leaves that
     /// entirely to the client -- so any fixed origin that advances is enough
@@ -550,6 +636,7 @@ impl World {
             active_motion_buckets: RefCell::new(std::collections::HashSet::new()),
             blending: RefCell::new(HashMap::new()),
             last_motion_per_display: RefCell::new(HashMap::new()),
+            frame_poses: RefCell::new(HashMap::new()),
             started: Instant::now(),
             tiles: HashMap::new(),
             pending: VecDeque::new(),
@@ -770,6 +857,8 @@ impl World {
                 .map(|t| Instance::from_cols_array_2d(t.to_cols_array_2d()))
                 .collect();
             built.push(Group {
+                emitting: emitting_placements(&model, &transforms),
+                emitting_ids: doodad_ids(&model, tile, &path, transforms.len()),
                 model,
                 instances: InstanceBuffer::upload(gpu, &raw),
                 count: raw.len() as u32,
@@ -967,6 +1056,8 @@ impl World {
             bones: Vec<m2::AnimatedBone>,
             sequences: Vec<m2::Sequence>,
             attachments: Vec<m2::Attachment>,
+            particles: Vec<m2::ParticleEmitter>,
+            ribbons: Vec<m2::RibbonEmitter>,
             bounds: Option<(Vec3, Vec3)>,
             collision: Vec<[[f32; 3]; 3]>,
         }
@@ -983,6 +1074,8 @@ impl World {
                     bones: Vec::new(),
                     sequences: Vec::new(),
                     attachments: Vec::new(),
+                    particles: Vec::new(),
+                    ribbons: Vec::new(),
                     bounds: None,
                     collision: w.collision,
                 })
@@ -1010,6 +1103,8 @@ impl World {
                         bones: m.bones,
                         sequences: m.sequences,
                         attachments: m.attachments,
+                        particles: m.particles,
+                        ribbons: m.ribbons,
                         bounds: Some((m.min, m.max)),
                         collision: m.collision,
                     }
@@ -1030,6 +1125,8 @@ impl World {
                 bones: b.bones,
                 sequences: b.sequences,
                 attachments: b.attachments,
+                particles: b.particles,
+                ribbons: b.ribbons,
                 bounds: b.bounds,
                 textures: b.textures,
                 collision: b.collision,
@@ -1084,6 +1181,11 @@ impl World {
         let mut kinds: HashMap<u64, ::world::ObjectType> = HashMap::new();
         let mut sheathed: HashMap<u64, bool> = HashMap::new();
         let mut grouped: HashMap<(u32, Motion, u64), Vec<Mat4>> = HashMap::new();
+        // Parallel to `grouped` and pushed in lockstep with it, so entry `i`
+        // of a bucket's transforms and entry `i` of its guids are the same
+        // object. Two vectors rather than a vector of pairs because the
+        // transforms are uploaded wholesale and the guids never are.
+        let mut grouped_guids: HashMap<(u32, Motion, u64), Vec<u64>> = HashMap::new();
         // One clock reading for the whole rebuild, so two units that died in
         // the same frame land in the same bucket and share a pose rather than
         // missing each other by a millisecond.
@@ -1127,10 +1229,9 @@ impl World {
                 (Some(age), Some(rest)) => Some((age, rest)),
                 _ => None,
             };
-            grouped
-                .entry((
-                    placement.display_id,
-                    Motion::resolve(
+            let bucket = (
+                placement.display_id,
+                Motion::resolve(
                         placement.speed,
                         placement.turning,
                         placement.airborne,
@@ -1147,10 +1248,16 @@ impl World {
                         } else {
                             placement.stance
                         },
-                        sheathing,
-                    ),
-                    key,
-                ))
+                    sheathing,
+                ),
+                key,
+            );
+            grouped_guids
+                .entry(bucket)
+                .or_default()
+                .push(placement.guid);
+            grouped
+                .entry(bucket)
                 .or_default()
                 .push(Mat4::from_scale_rotation_translation(
                     Vec3::splat(placement.scale),
@@ -1181,6 +1288,12 @@ impl World {
         let mut undrawable = 0;
         let mut wanted_bones: HashSet<(u32, Motion)> = HashSet::new();
         for ((display_id, motion, look_key), transforms) in grouped {
+            // Taken rather than borrowed: `grouped` was consumed by the loop
+            // and its parallel guids have exactly the same keys, so a missing
+            // entry would be a bug rather than a case to handle.
+            let guids = grouped_guids
+                .remove(&(display_id, motion, look_key))
+                .unwrap_or_default();
             let look = looks.get(&look_key).cloned().flatten();
             let kind = kinds.get(&look_key).copied().unwrap_or(::world::ObjectType::Unit);
             let Some(model) =
@@ -1314,16 +1427,29 @@ impl World {
                 // should still start as something *visible*: a zero matrix
                 // collapses a model to the origin in complete silence, which
                 // this project has already lost a whole feature to once.
-                let bind_pose: Vec<Instance> = transforms
+                let bind_pose_transforms: Vec<Mat4> = transforms
                     .iter()
-                    .map(|t| {
-                        Instance::from_cols_array_2d(
-                            (*t * Mat4::from_translation(Vec3::from(attachment.position)))
-                                .to_cols_array_2d(),
-                        )
-                    })
+                    .map(|t| *t * Mat4::from_translation(Vec3::from(attachment.position)))
+                    .collect();
+                let bind_pose: Vec<Instance> = bind_pose_transforms
+                    .iter()
+                    .map(|t| Instance::from_cols_array_2d(t.to_cols_array_2d()))
                     .collect();
                 built.push(Group {
+                    // A torch in a hand is the case this exists for, and its
+                    // placements are rewritten every frame by
+                    // `update_animations` along with the item's own transform.
+                    emitting: emitting_placements(&held_model, &bind_pose_transforms),
+                    // The wielder's guid, mixed so a torch in a hand and the
+                    // hand's owner do not collide on one key. A held item is
+                    // one per wielder, so the wielder identifies it.
+                    emitting_ids: if held_model.particles.is_empty()
+                        && held_model.ribbons.is_empty()
+                    {
+                        Vec::new()
+                    } else {
+                        guids.iter().map(|g| g ^ 0x4845_4c44).collect()
+                    },
                     model: held_model,
                     instances: InstanceBuffer::upload(gpu, &bind_pose),
                     count: raw.len() as u32,
@@ -1338,6 +1464,12 @@ impl World {
             }
 
             built.push(Group {
+                emitting: emitting_placements(&model, &transforms),
+                emitting_ids: if model.particles.is_empty() && model.ribbons.is_empty() {
+                    Vec::new()
+                } else {
+                    guids.clone()
+                },
                 model,
                 instances: InstanceBuffer::upload(gpu, &raw),
                 count: raw.len() as u32,
@@ -1384,13 +1516,13 @@ impl World {
         // opposite of the rule that says two things which must agree exactly
         // should be derived from one source -- and a hand that disagreed with
         // its own model by a frame is a sword that trails behind the arm.
-        let mut poses: HashMap<(u32, Motion), Vec<Mat4>> = HashMap::new();
+        let mut poses: HashMap<(u32, Motion), (Vec<Mat4>, usize, u32)> = HashMap::new();
         let now_ms = self.started.elapsed().as_millis() as u32;
 
         // Poses a single motion at its own clock -- exactly what this
         // function always computed, pulled out so a transition's outgoing
         // cycle can be posed the same way as its incoming one, below.
-        let pose_for = |model: &CachedModel, motion: Motion| -> Option<Vec<Mat4>> {
+        let pose_for = |model: &CachedModel, motion: Motion| -> Option<(Vec<Mat4>, usize, u32)> {
             let sequence = sequence_for(model, motion)?;
             let duration = model.sequences[sequence].duration_ms.max(1);
             // A loop wraps; a cycle that plays once *holds its last frame*.
@@ -1427,7 +1559,11 @@ impl World {
             } else {
                 now_ms % duration
             };
-            Some(m2::Model::pose_bones(&model.bones, sequence, time_ms))
+            Some((
+                m2::Model::pose_bones(&model.bones, sequence, time_ms),
+                sequence,
+                time_ms,
+            ))
         };
 
         let now = Instant::now();
@@ -1438,7 +1574,7 @@ impl World {
             let Some((display_id, motion)) = group.animation else {
                 continue;
             };
-            let (Some(bones), Some(posed)) = (
+            let (Some(bones), Some((posed, sequence, time_ms))) = (
                 self.entity_bones.get(&(display_id, motion)),
                 pose_for(&group.model, motion),
             ) else {
@@ -1479,7 +1615,7 @@ impl World {
             });
 
             let final_pose = match blend_from.and_then(|(from, elapsed)| {
-                pose_for(&group.model, from).map(|old| (old, elapsed))
+                pose_for(&group.model, from).map(|(old, _, _)| (old, elapsed))
             }) {
                 // A linear blend of the *matrices* would shear a rotating
                 // bone rather than turn it -- `blend_poses` decomposes each
@@ -1493,8 +1629,24 @@ impl World {
             let pose: Vec<[[f32; 4]; 4]> =
                 final_pose.iter().map(|m| m.to_cols_array_2d()).collect();
             meshes.update_bones(gpu, bones, &pose);
-            poses.insert((display_id, motion), final_pose);
+            poses.insert((display_id, motion), (final_pose, sequence, time_ms));
         }
+        // Replaced wholesale, not merged: a bucket that stopped animating this
+        // frame must stop having a pose, or an emitter would keep hanging off
+        // the skeleton of a creature that has despawned.
+        *self.frame_poses.borrow_mut() = poses
+            .iter()
+            .map(|(key, (bones, sequence, time_ms))| {
+                (
+                    *key,
+                    FramePose {
+                        bones: bones.clone(),
+                        sequence: *sequence,
+                        time_ms: *time_ms,
+                    },
+                )
+            })
+            .collect();
         // Replaces last frame's snapshot wholesale rather than being updated
         // bucket-by-bucket above: a bucket absent from `self.entities` this
         // pass (its creature died, despawned, or changed motion) has to
@@ -1515,7 +1667,7 @@ impl World {
             let hand = held
                 .wielder
                 .and_then(|key| poses.get(&key))
-                .and_then(|pose| pose.get(held.bone))
+                .and_then(|(pose, _, _)| pose.get(held.bone))
                 .copied()
                 .unwrap_or(Mat4::IDENTITY);
             let instances: Vec<Instance> = held
@@ -1537,6 +1689,89 @@ impl World {
             }
             group.instances.write(gpu, &instances);
         }
+    }
+
+    /// Steps everything alight in the world and builds this frame's geometry.
+    ///
+    /// Runs **after** [`World::update_animations`], and the order is the whole
+    /// point: a flame on a creature's hand hangs off the very matrix the hand
+    /// was drawn with, and posing afterwards would leave every emitter a frame
+    /// behind the skeleton carrying it. Same reasoning as held items, which
+    /// are placed from the same poses one loop above.
+    pub fn update_emitters(
+        &self,
+        gpu: &Gpu,
+        renderer: &mut render::ParticleRenderer,
+        emitters: &mut crate::emitters::Emitters,
+        dt: f32,
+    ) {
+        let poses = self.frame_poses.borrow();
+        let now_ms = self.started.elapsed().as_millis() as u32;
+
+        let mut sources = Vec::new();
+        for group in self.tiles().flat_map(|t| t.groups.iter()).chain(&self.entities) {
+            if group.emitting.is_empty() {
+                continue;
+            }
+            // A held item's placement is *not* what was stored at build time:
+            // the item follows an animated hand, and `update_animations`
+            // rewrote its instance buffer without touching the CPU copy. It is
+            // recomputed here from the same pose rather than mirrored into
+            // `emitting`, because two copies of a per-frame transform drift
+            // and only one of them is the one being drawn.
+            let (placements, pose) = match &group.held {
+                Some(held) => {
+                    let frame = held.wielder.and_then(|key| poses.get(&key));
+                    let hand = frame
+                        .and_then(|f| f.bones.get(held.bone))
+                        .copied()
+                        .unwrap_or(Mat4::IDENTITY);
+                    (
+                        held.wielders
+                            .iter()
+                            .map(|t| held_transform(*t, hand, held.offset))
+                            .collect::<Vec<_>>(),
+                        // The item's *own* skeleton is rigid and unposed; the
+                        // movement all comes from the hand, which is already
+                        // in the transform above.
+                        None,
+                    )
+                }
+                None => (
+                    group.emitting.clone(),
+                    group.animation.and_then(|key| poses.get(&key)),
+                ),
+            };
+
+            // A doodad has no animation bucket and so no sequence of its own.
+            // Sequence 0 on a running clock is the right answer rather than a
+            // fallback: a torch ships exactly one, and its emitter tracks live
+            // in it.
+            let (sequence, time_ms) = match pose {
+                Some(frame) => (frame.sequence, frame.time_ms),
+                None => (
+                    0,
+                    group
+                        .model
+                        .sequences
+                        .first()
+                        .map(|s| now_ms % s.duration_ms.max(1))
+                        .unwrap_or(0),
+                ),
+            };
+
+            sources.push(crate::emitters::Source {
+                particles: &group.model.particles,
+                ribbons: &group.model.ribbons,
+                textures: &group.model.textures,
+                ids: group.emitting_ids.clone(),
+                placements,
+                pose: pose.map(|f| f.bones.as_slice()),
+                sequence,
+                time_ms,
+            });
+        }
+        emitters.update(gpu, renderer, sources.into_iter(), dt);
     }
 
     /// The animated bone buffer for a `Group::animation` key, if `set_entities`
@@ -1640,6 +1875,8 @@ impl World {
                     bones: loaded.bones,
                     sequences: loaded.sequences,
                     attachments: loaded.attachments,
+                    particles: loaded.particles,
+                    ribbons: loaded.ribbons,
                     // This is the cache click-to-target reads from, so this is
                     // the one that has to carry the model's extent.
                     bounds: Some((loaded.min, loaded.max)),

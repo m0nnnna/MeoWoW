@@ -1042,3 +1042,198 @@ fn an_alpha_keyed_surface_takes_its_colour_from_the_tint() {
          -- this is the reading that made every river in Elwynn black"
     );
 }
+
+/// Renders a list of sprites against black and hands back the pixels.
+///
+/// The camera looks down -X from a distance, so a sprite at the origin sits in
+/// the middle of the frame and its size in world units maps to a predictable
+/// number of pixels.
+fn render_sprites(
+    gpu: &Gpu,
+    sprites: &[render::SpriteInstance],
+    blend: render::particles::Blend,
+    size: (u32, u32),
+) -> Vec<u8> {
+    let (w, h) = size;
+    let target = Offscreen::new(gpu, w, h, FORMAT);
+    let depth = DepthBuffer::new(gpu, w, h);
+    let mut particles = render::ParticleRenderer::new(gpu, FORMAT);
+    particles.begin(gpu, [blend]);
+    particles.reserve(gpu, sprites.len(), 0);
+    particles.upload_sprites(gpu, sprites);
+
+    let eye = glam::Vec3::new(10.0, 0.0, 0.0);
+    let view = glam::camera::rh::view::look_to_mat4(eye, -glam::Vec3::X, glam::Vec3::Z);
+    let proj = glam::camera::rh::proj::directx::perspective(
+        std::f32::consts::FRAC_PI_2,
+        w as f32 / h as f32,
+        0.1,
+        1000.0,
+    );
+    // The camera's own axes, taken from the same view matrix the pass is drawn
+    // with rather than rebuilt -- a billboard widened along a basis that
+    // disagrees with the projection leans, and reads as a bad texture.
+    let right = view.row(0).truncate();
+    let up = view.row(1).truncate();
+    particles.set_camera(gpu, proj * view, right, up);
+
+    let white = solid(gpu, [255, 255, 255, 255]);
+    let sheet = particles.sheet_bind_group(gpu, &white);
+
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            multiview_mask: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        assert!(
+            particles.draw_sprites(&mut pass, &sheet, blend, 0..sprites.len() as u32),
+            "no pipeline for {blend:?} -- `begin` was not told about it"
+        );
+    }
+    gpu.queue.submit([encoder.finish()]);
+    target.read_rgba(gpu).expect("readback")
+}
+
+fn sprite_at(position: [f32; 3], size: f32, color: [f32; 4]) -> render::SpriteInstance {
+    render::SpriteInstance {
+        position: [position[0], position[1], position[2], 0.0],
+        size: [size, size, 0.0, 0.0],
+        color,
+        uv: [0.0, 0.0, 1.0, 1.0],
+    }
+}
+
+/// A sprite is drawn where it was put, at the size it was given.
+///
+/// The pair is the point. Asserting only that something appeared passes just
+/// as well when every sprite is drawn at the origin, which is exactly what a
+/// zeroed instance buffer produces -- and geometry drawn at the wrong place
+/// looks like geometry never drawn.
+#[test]
+fn a_sprite_lands_where_it_is_put() {
+    let gpu = require_gpu!();
+    let (w, h) = (128u32, 128u32);
+
+    let centred = render_sprites(
+        &gpu,
+        &[sprite_at([0.0, 0.0, 0.0], 0.5, [1.0; 4])],
+        render::particles::Blend::Alpha,
+        (w, h),
+    );
+    assert!(
+        centre_pixel(&centred, w, h)[0] > 200,
+        "a sprite at the origin did not cover the middle of the frame"
+    );
+
+    // Well off to one side, and the middle must go dark again.
+    let offset = render_sprites(
+        &gpu,
+        &[sprite_at([0.0, 6.0, 0.0], 0.5, [1.0; 4])],
+        render::particles::Blend::Alpha,
+        (w, h),
+    );
+    assert!(
+        centre_pixel(&offset, w, h)[0] < 20,
+        "a sprite moved sideways still covered the centre: it is being drawn \
+         at a fixed place rather than at its own position"
+    );
+    assert!(
+        mean_value(&offset) > 0.0,
+        "the moved sprite vanished entirely instead of moving"
+    );
+}
+
+/// Additive blending piles up and alpha does not.
+///
+/// Three fully-opaque sprites of a quarter grey in exactly the same place.
+/// Added they come to three quarters; alpha-blended each one *replaces* the
+/// last and the result is a quarter however many there are. 22,347 of the
+/// archives' 26,374 emitters are additive, so getting this backwards makes
+/// every fire in the game a flat grey smudge.
+///
+/// Opaque rather than half-transparent on purpose: at alpha 0.5 both modes
+/// brighten with each sprite -- alpha converges on the source colour instead
+/// of staying put -- and the test would be measuring the *rate* of two curves
+/// that both go up, which sRGB encoding then flattens into a coin flip. This
+/// version has one number that must not move at all.
+#[test]
+fn additive_sprites_accumulate_where_alpha_ones_do_not() {
+    let gpu = require_gpu!();
+    let (w, h) = (64u32, 64u32);
+    let quarter = [0.25, 0.25, 0.25, 1.0];
+    let one = [sprite_at([0.0; 3], 0.5, quarter)];
+    let three = [one[0], one[0], one[0]];
+
+    let sample = |sprites: &[render::SpriteInstance], blend| {
+        centre_pixel(&render_sprites(&gpu, sprites, blend, (w, h)), w, h)[0]
+    };
+    let add_one = sample(&one, render::particles::Blend::Additive);
+    let add_three = sample(&three, render::particles::Blend::Additive);
+    let alpha_one = sample(&one, render::particles::Blend::Alpha);
+    let alpha_three = sample(&three, render::particles::Blend::Alpha);
+
+    assert!(add_one > 0, "one additive sprite drew nothing");
+    assert!(
+        add_three > add_one + 20,
+        "three additive sprites are no brighter than one: {add_one} then {add_three}"
+    );
+    assert_eq!(
+        alpha_one, alpha_three,
+        "three opaque alpha sprites in one place must read as one"
+    );
+}
+
+/// The counters say both numbers.
+///
+/// "Nothing was skipped" and "there was nothing to skip" are different states
+/// and a counter that only speaks on failure cannot tell them apart -- this
+/// project has paid for that twice.
+#[test]
+fn the_sprite_buffer_reports_what_it_dropped_and_what_it_drew() {
+    let gpu = require_gpu!();
+    let mut particles = render::ParticleRenderer::new(&gpu, FORMAT);
+    particles.begin(&gpu, [render::particles::Blend::Additive]);
+
+    let fits = vec![render::SpriteInstance::default(); 16];
+    assert_eq!(particles.upload_sprites(&gpu, &fits), 16);
+    assert_eq!(particles.drawn, 16);
+    assert_eq!(particles.skipped, 0);
+
+    // More than the initial reservation, without reserving.
+    let too_many = vec![render::SpriteInstance::default(); 5000];
+    let fitted = particles.upload_sprites(&gpu, &too_many);
+    assert!(fitted < too_many.len());
+    assert!(
+        particles.skipped > 0,
+        "the buffer overflowed and reported nothing"
+    );
+
+    // ...and reserving makes room, which is the other half: a test asserting
+    // only that overflow is reported passes when nothing ever fits.
+    particles.begin(&gpu, [render::particles::Blend::Additive]);
+    particles.reserve(&gpu, too_many.len(), 0);
+    assert_eq!(particles.upload_sprites(&gpu, &too_many), too_many.len());
+    assert_eq!(particles.skipped, 0);
+}
