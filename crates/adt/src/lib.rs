@@ -12,6 +12,7 @@
 //! of each outer cell. See [`Chunk::vertex_position`].
 
 pub mod liquid;
+pub mod minimap;
 
 pub use liquid::{LiquidInstance, TileLiquid, VertexFormat};
 
@@ -672,6 +673,23 @@ pub fn decode_alpha(mcal: &[u8], layer: &Layer, big_alpha: bool, do_not_fix: boo
         }
     }
     out
+}
+
+
+/// Which tile a world position sits on.
+///
+/// Inverts the tile grid: a tile's origin is at `(32 - y) * TILE_SIZE` on the
+/// world's x axis and `(32 - x) * TILE_SIZE` on its y, with both running
+/// negative, so the axes are **swapped** as well as inverted.
+///
+/// Returns a signed pair on purpose. A position outside the map gives a tile
+/// outside `0..64`, and clamping here would report the edge tile as containing
+/// somewhere it does not.
+pub fn tile_at(x: f32, y: f32) -> (i32, i32) {
+    (
+        (32.0 - y / TILE_SIZE).floor() as i32,
+        (32.0 - x / TILE_SIZE).floor() as i32,
+    )
 }
 
 /// Path of a tile within a map directory.

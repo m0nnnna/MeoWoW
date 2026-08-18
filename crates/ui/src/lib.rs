@@ -41,7 +41,8 @@ pub use frames::combat_text::{CombatTextKind, FloatingText};
 pub use frames::{
     CastBarView, InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
     QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
-    MapMarker, MapPatch, MapView, MarkerKind, QuestgiverView, SpellbookEntry, UnitView,
+    MapMarker, MapPatch, MapView, MarkerKind, MinimapTile, MinimapView, QuestgiverView,
+    SpellbookEntry, UnitView,
 };
 pub use layout::{default_path, CharacterBars, ElementId, Profile};
 pub use style::{Color, PowerType, Style};
@@ -164,6 +165,12 @@ pub struct HudData<'a> {
     /// projection and must not, because a second copy of it would agree with
     /// `dbc::worldmap` right up until one of them changed.
     pub world_map: Option<&'a frames::MapView>,
+    /// The minimap. **Unlike the world map this is never `None` while there
+    /// is a world**: it is one of the frames that is simply there, so the
+    /// caller hands over a view with a `note` in it rather than nothing at
+    /// all when the art will not load -- the same reasoning that keeps the
+    /// world map's markers on an empty page.
+    pub minimap: Option<&'a frames::MinimapView>,
     /// The character's money in copper, drawn along the bottom of the bag
     /// window. Ignored when `bags` is `None`.
     pub copper: u32,
@@ -565,6 +572,7 @@ impl Hud {
             let quest_log_placeholder;
             let questgiver_placeholder;
             let world_map_placeholder;
+            let minimap_placeholder;
             let release_prompt_placeholder;
             let party_placeholder;
             let party_loot_placeholder;
@@ -668,6 +676,25 @@ impl Hud {
                     }
                     None => continue,
                 },
+                // Absent with no world to draw and present in edit mode, the
+                // same rule as every other frame here.
+                //
+                // **A minimap must not blink out between zones**, and that is
+                // the caller's job rather than this arm's: the viewer hands
+                // over a view carrying a `note` when the art will not load,
+                // exactly as the world map draws an empty page with its
+                // markers still on it. Drawing a placeholder here instead
+                // would paint a minimap on the login screen and make the nine
+                // "this frame appears only when it should" tests stop meaning
+                // anything.
+                ElementId::Minimap => match data.minimap {
+                    Some(view) => Content::Minimap(view),
+                    None if editing => {
+                        minimap_placeholder = frames::minimap::placeholder();
+                        Content::Minimap(&minimap_placeholder)
+                    }
+                    None => continue,
+                },
                 // Absent while alive or already a ghost, on the same reasoning
                 // as the loot window: existence is the flag, and drawn in
                 // edit mode so it can be positioned without dying first.
@@ -751,6 +778,10 @@ impl Hud {
                 // The one frame whose size ignores its contents entirely:
                 // the page's shape is fixed by the art, not by what is on it.
                 Content::WorldMap(_) => frames::world_map::size(&style, element.scale),
+                // Square, and its size ignores its contents for the same
+                // reason the world map's does: the disc is a shape, not a
+                // list.
+                Content::Minimap(_) => frames::minimap::size(&style, element.scale),
                 Content::ReleasePrompt(_) => frames::release::size(&style, element.scale),
                 // Sized to the party *and* to what is known about each member
                 // -- a member out of view has no power bar, so the rows are
@@ -932,6 +963,13 @@ impl Hud {
                             element.scale,
                         ),
                         Content::WorldMap(view) => frames::world_map::draw(
+                            &painter,
+                            response.rect,
+                            view,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Minimap(view) => frames::minimap::draw(
                             &painter,
                             response.rect,
                             view,
@@ -1422,6 +1460,7 @@ impl Hud {
                             scale,
                         ),
                         ElementId::WorldMap => frames::world_map::size(&style, scale),
+                        ElementId::Minimap => frames::minimap::size(&style, scale),
                         ElementId::Loot => frames::loot::size(
                             data.loot
                                 .map(|rows| rows.len())
@@ -1510,6 +1549,7 @@ enum Content<'a> {
     QuestLog(&'a [frames::QuestLogEntry]),
     Questgiver(&'a frames::QuestgiverView),
     WorldMap(&'a frames::MapView),
+    Minimap(&'a frames::MinimapView),
     ReleasePrompt(&'a frames::ReleasePromptView),
     Party(&'a [frames::PartyMemberView], &'a Option<frames::LootRuleView>),
     PartyInvite(&'a frames::PartyInviteView),
@@ -2497,6 +2537,132 @@ mod tests {
         assert!(!painted(&mut hud, &HudData::default()).is_empty());
     }
 
+    /// A disc with the player at the middle and one objective off to one
+    /// side, for the minimap tests below.
+    fn minimap_view() -> frames::MinimapView {
+        frames::MinimapView {
+            title: "Northshire Valley".into(),
+            tiles: Vec::new(),
+            markers: vec![
+                frames::MapMarker {
+                    u: 0.62,
+                    v: 0.40,
+                    facing: 0.0,
+                    kind: frames::MarkerKind::Objective,
+                    label: "A Threat Within".into(),
+                    outline: Vec::new(),
+                },
+                frames::MapMarker {
+                    u: 0.5,
+                    v: 0.5,
+                    facing: 0.0,
+                    kind: frames::MarkerKind::Player,
+                    label: String::new(),
+                    outline: Vec::new(),
+                },
+            ],
+            note: None,
+        }
+    }
+
+    /// The minimap is one of the frames that is simply there -- but only once
+    /// there is a world. Absent with nothing to draw, present in edit mode,
+    /// the same asymmetry every other frame here is held to.
+    #[test]
+    fn a_minimap_appears_with_a_world_or_while_editing() {
+        let mut quiet = Hud::default();
+        hide_bars(&mut quiet);
+        assert!(
+            painted(&mut quiet, &HudData::default()).is_empty(),
+            "a minimap was painted with no world to draw"
+        );
+
+        let view = minimap_view();
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        assert!(
+            !painted(
+                &mut hud,
+                &HudData {
+                    minimap: Some(&view),
+                    ..Default::default()
+                }
+            )
+            .is_empty(),
+            "a minimap with a world in it must draw"
+        );
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        hud.toggle_edit();
+        assert!(!painted(&mut hud, &HudData::default()).is_empty());
+    }
+
+    /// **A blip outside the disc is not drawn, and that is the whole rule the
+    /// rim exists to make honest.** egui clips to rectangles, so a marker in
+    /// the corner of the square would be painted over the bezel and outside
+    /// the map -- and a client that clamped it to the rim instead would be
+    /// claiming a direction at an unknown distance.
+    #[test]
+    fn a_blip_outside_the_disc_is_dropped() {
+        fn markers_painted(view: &frames::MinimapView) -> usize {
+            fn walk(shape: &egui::Shape) -> usize {
+                match shape {
+                    egui::Shape::Vec(shapes) => shapes.iter().map(walk).sum(),
+                    egui::Shape::Circle(_) => 1,
+                    _ => 0,
+                }
+            }
+            let mut hud = Hud::default();
+            hide_bars(&mut hud);
+            shapes(
+                &mut hud,
+                &HudData {
+                    minimap: Some(view),
+                    ..Default::default()
+                },
+                None,
+            )
+            .iter()
+            .map(|clipped| walk(&clipped.shape))
+            .sum()
+        }
+
+        let inside = minimap_view();
+        let mut corner = minimap_view();
+        // The top-left corner of the square, which is outside the inscribed
+        // circle by a comfortable margin at any radius.
+        corner.markers[0].u = 0.02;
+        corner.markers[0].v = 0.02;
+        assert!(
+            markers_painted(&corner) < markers_painted(&inside),
+            "a blip in the corner painted as many circles ({}) as one on the disc ({})",
+            markers_painted(&corner),
+            markers_painted(&inside)
+        );
+    }
+
+    /// The header says where the character is, and says it out of the view it
+    /// was handed rather than out of anything this crate knows.
+    #[test]
+    fn the_minimap_names_the_area() {
+        let view = minimap_view();
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let text = painted_text(&shapes(
+            &mut hud,
+            &HudData {
+                minimap: Some(&view),
+                ..Default::default()
+            },
+            None,
+        ));
+        assert!(
+            text.iter().any(|line| line == "Northshire Valley"),
+            "the area name was not painted: {text:?}"
+        );
+    }
+
     /// A page with one pin and one region, for the two map tests below.
     fn map_view() -> frames::MapView {
         frames::MapView {
@@ -3403,6 +3569,7 @@ mod tests {
                 frames::questgiver::size(&frames::questgiver::placeholder(), &profile.style, scale)
             }
             ElementId::WorldMap => frames::world_map::size(&profile.style, scale),
+            ElementId::Minimap => frames::minimap::size(&profile.style, scale),
             ElementId::Loot => {
                 frames::loot::size(frames::loot::placeholder().len(), &profile.style, scale)
             }
@@ -3588,6 +3755,8 @@ mod tests {
             ElementId::ActionBar1,
             ElementId::ActionBar2,
             ElementId::ActionBar3,
+            // Nobody opens a minimap either.
+            ElementId::Minimap,
         ] {
             let rect = profile.get(id).rect(screen, size_of(&profile, id));
             assert!(

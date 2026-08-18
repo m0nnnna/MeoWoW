@@ -3525,9 +3525,13 @@ each rung is a prerequisite for the next, not a preference.
 4.15  NPC interaction     gossip [done], vendors, buying and selling
 4.16  Quests              accept, track, turn in
 4.17  Map                 the world map, and where things are on it
-4.18  Minimap             the same, small, and following the player
-4.19  Questie, natively   what to do, where, and whether you can yet
+4.21  Minimap             the same, small, and following the player
+4.22  Questie, natively   what to do, where, and whether you can yet
 ```
+
+The last two rungs were numbered 4.18 and 4.19 when this was written. Liquids,
+emitters and parties took those numbers on the way past; the *order* is what
+this table is about and it has not changed.
 
 ### Why this order and not another
 
@@ -4797,3 +4801,165 @@ the zone survives.
   headless: sixteen egui tests running the real `Hud::show`, including clicks
   driven through the real event loop and through an open map. The two-client
   run confirmed the protocol and the state, not the picture.
+
+### 4.21: the minimap, and a picture asked which way up it goes
+
+The map that is always there. A disc in the top-right corner showing the ground
+under the character, the character's own arrow at the middle of it, the
+sub-zone's name over it, party members and quest objectives on it, and the
+wheel to zoom. It is the rung between the map and a native Questie: a tracker
+that says "over there" needs somewhere to point *while walking*, and a window
+you stop to open is not it.
+
+#### The art is not stored under its own name
+
+Every terrain tile has a 256x256 picture of itself baked at build time, and
+they all live in `Textures\Minimap\` named by the **MD5 of their own
+contents**. `md5translate.trs` is the only thing that says which hash belongs
+to `Azeroth\map32_48.blp`; without it the art is 18,536 files with nothing to
+distinguish them. `crates/adt/src/minimap.rs` reads it, and
+`docs/formats/minimap.md` records what was measured.
+
+Three facts shaped the reader. The `dir:` header lines are **redundant** --
+every one of the 18,644 entries carries its own directory and agrees with the
+header above it 18,644 times out of 18,644 -- so the parser ignores them and
+cannot desynchronise. One picture can serve many tiles (14,420 distinct files,
+the flat black one named 1,127 times), so the index is one-way and the art
+cache is keyed by the *file* rather than by the tile. And every referenced hash
+resolves in a 12340 install, checked by path resolution rather than by listing
+-- 14,420 of 14,420 -- while 4,116 further hash-named files are referenced by
+nothing at all, so an index built by listing the folder would be a fifth noise
+with no way to place any of it.
+
+#### Which of `map<a>_<b>` is which, settled by the sets rather than by a lookup
+
+Both readings resolve a file for every tile, so no single lookup can separate
+them. The *set* can, because a continent is not symmetric under exchanging the
+pair. Over every map, `wow-cli minimap tiles`:
+
+```
+66 maps, 5744 terrain tiles, 5321 tiles named
+  as written: 5228 tiles land on real terrain, 43 maps exact
+  transposed: 2578 tiles land on real terrain,  6 maps exact
+  46 of 66 maps can tell the two readings apart at all
+```
+
+Azeroth is 687 of 687 as written against 326 transposed; Northrend 1,131 of
+1,131 against 729. The six maps that "match transposed" are the square instance
+maps whose tile sets are symmetric -- they agree with both orders and vote for
+neither, which is why the last line counts the maps that can separate them at
+all. Same population question as the `MH2O` axis survey, where 86,222
+full-chunk ocean sheets transpose to themselves.
+
+#### Which way up the picture is, asked twice and answered twice
+
+A 256x256 tile has **eight plausible readings** -- either axis can run either
+way and they can be exchanged -- and every one of them draws a picture. That is
+the shape this project has paid for before, so it was settled against two
+inputs that share nothing but the tile grid.
+
+**The water.** `MH2O` says which of a tile's 256 chunks are under water, and
+water is drawn blue, so each candidate is scored by whether "this chunk is
+covered" predicts "this 16x16 block is blue". A chunk votes only if it is
+unambiguous -- fully covered or dry, nothing between -- and only if the
+candidates disagree about it, because a tile that is all ocean or all forest
+agrees with every reading and would bury the ones that can answer. Over
+604,772 classified chunks with 102,334 decisive, `as drawn` takes **84.3%**
+against 60.5% for the next best, and the threshold-free column (mean
+`blue - red` over covered chunks minus over dry ones) agrees at 82.0 against
+72.5.
+
+**The seams.** Under the right reading the last column of one tile's art is the
+ground immediately beside the first column of its neighbour's. This reads no
+terrain at all. Over 13,027 seams, `as drawn` scores **19.21** mean absolute
+channel difference against 52.99 for the next best -- and the interesting part
+is not the gap but a **degeneracy that was predicted before the run**: a
+reading flipping only the down axis walks the same across-seam backwards and
+must score *identically* on it. It does, 8.63 against 8.63, and the mirror
+holds for the down column. An experiment whose predicted blind spots land
+exactly where predicted is measuring what it claims to.
+
+Then the hand check with a margin nothing covers. `wow-cli minimap stitch
+--x=-8950 --y=-132 --range 400` composes four tiles around the Northshire
+spawn: the abbey, its road and its bridge, no visible seam, and the centre
+marker on the grass by the abbey door -- which is where a human character logs
+in.
+
+#### The projection lives in `adt`, so the picture is evidence about the frame
+
+`adt::minimap::Viewport` is the whole of it: `project`, `tiles_touching`,
+`tile_rect`. The viewer's frame is built from it and `wow-cli minimap stitch`
+draws its PNG from it, which is the point -- a stitched picture that comes out
+right is evidence about the frame rather than about a second implementation
+that happens to agree today. Same rule as the picking ray being unprojected
+from the matrix the scene was drawn with. `world::tile_at` in the viewer was
+folded into `adt::tile_at` for the same reason: two copies of a grid inversion
+agree until one is touched.
+
+The axis convention is `dbc::worldmap`'s -- `+x` up, `+y` left -- and
+`maps::screen_facing` is reused rather than re-derived, so the two arrows
+cannot end up pointing different ways. The one difference from a page is what
+is nailed down: a page is fixed to the ground and the player crosses it, and
+this is fixed to the player while the ground slides under it.
+
+#### The picture is round and egui clips to rectangles
+
+So the tiles are drawn square and a **rim** -- an annulus from the disc's edge
+out past the corners, clipped back by the frame -- is painted over them. It has
+its own opaque colour rather than the window's background: a rim carrying the
+frame's alpha would show four corners of terrain that is outside the map,
+faintly, which is worse than showing them plainly.
+
+That ordering decides two other things. Objective *regions* are drawn under the
+rim, which is what circle-clips them -- a ring can be larger than the whole
+disc, and one drawn after the rim would trail across the bezel. Blips are drawn
+over it, and **a blip outside the disc is dropped rather than dragged to the
+edge**: a party member pinned to the rim is a claim that they are in that
+direction at an unknown distance, and this project has spent enough on the
+difference between "here" and "somewhere over there". A region gets its ring
+and no pin at all, for the same reason -- on a disc two hundred units across a
+region is routinely bigger than the picture, and a pin at its centroid would
+sit in the middle of the frame whether or not the objective is anywhere near.
+
+#### What the header says, and where it comes from
+
+The **sub-zone** -- `Northshire Valley` rather than `Elwynn Forest` -- read off
+the terrain rather than off a replicated field, because every map chunk names
+its own area and the server replicates only the zone. `area_at` answers `None`
+while the tile under the player streams in, so the last name that resolved is
+held: a header that blanked for those frames would read as walking out of the
+zone and back in, which is the same reason `crate::sound` refuses to treat a
+missing area as silence.
+
+#### Two things the corner cost
+
+**The quest log moved.** It had the top-right corner because nothing else
+claimed it; a minimap's claim is stronger, since a log is opened and closed
+where a minimap is simply there. It moved *sideways* along the top edge rather
+than down, and that is not cosmetic: the right edge below the minimap has the
+spellbook centred on it, and a log pushed down would start 150 pixels clear of
+it and grow *towards* it as quests are taken -- correct on an empty log and
+wrong on a full one, which is the half nobody tests.
+
+**The wheel had two claimants.** The camera's wheel handler has never asked
+where the pointer is, so without an early return a scroll over the disc would
+zoom the map *and* pull the camera in, which reads as the minimap dragging the
+view around with it. The minimap answers first and then nothing else does. The
+zoom itself is live state seeded from `minimap_range` in `ui.toml` and
+deliberately not written back -- exactly what `camera_distance` is, and for the
+same reason: the wheel must not rewrite a saved setting on every notch.
+
+#### What is not done
+
+* **No rotation.** North is up and the arrow turns. A rotating minimap needs
+  the art rotated rather than the blips, and there is nothing here yet that
+  says which the player wants.
+* **No tracking, no ping, no border art.** The bezel is a flat ring, not
+  `UI-MINIMAP-BORDER.blp`.
+* **No WMO interior minimaps.** 382 of the index's 445 directories are per-WMO
+  art for building interiors, parsed and counted and drawn nowhere.
+* **No eviction.** Tile art is cached by file for the session; a walk across
+  the whole of Azeroth would hold about 22MB of BC1, which is small enough not
+  to evict and be wrong about.
+* **Nothing but objectives and party members is on it.** No corpse, no
+  questgivers, no vendors, no dungeon entrances -- 4.22's material.

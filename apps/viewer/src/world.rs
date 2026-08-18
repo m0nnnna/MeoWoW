@@ -597,13 +597,12 @@ fn held_transform(wielder: Mat4, hand: Mat4, offset: Vec3) -> Mat4 {
 
 /// Which tile a world position sits on.
 ///
-/// Inverts the tile grid: a tile's origin is at `(32 - tile_y) * TILE_SIZE` on
-/// x and `(32 - tile_x) * TILE_SIZE` on y, with both axes running negative, so
-/// the axes are swapped as well as inverted.
+/// The arithmetic is [`adt::tile_at`]'s and is deliberately not repeated here:
+/// the minimap's viewport asks the same question from a crate that cannot see
+/// this module, and two copies of a grid inversion agree until one of them is
+/// touched. This is the `Vec3` convenience over it.
 pub fn tile_at(position: Vec3) -> (i32, i32) {
-    let x = (32.0 - position.y / adt::TILE_SIZE).floor() as i32;
-    let y = (32.0 - position.x / adt::TILE_SIZE).floor() as i32;
-    (x, y)
+    adt::tile_at(position.x, position.y)
 }
 
 /// Centre of a tile in world space.

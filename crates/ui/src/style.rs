@@ -257,6 +257,30 @@ pub struct Style {
     /// Radius of a pin, and the reach of the hover test, at scale 1.0.
     pub world_map_pin: f32,
 
+    /// Edge of the minimap's square viewport at scale 1.0. The disc is
+    /// inscribed in it, so this is also the disc's diameter.
+    pub minimap_size: f32,
+    /// World units across that disc: the zoom. Not a level index -- the thing
+    /// a reader actually wants to know is how far they can see, and a level
+    /// is that answer with the units filed off.
+    pub minimap_range: f32,
+    /// The disc under a tile that would not load, so a hole in the mosaic
+    /// reads as missing art rather than as a hole in the window.
+    pub minimap_backing: Color,
+    /// The ring painted over everything outside the disc, which is what makes
+    /// the map round at all.
+    ///
+    /// **Opaque, and not the window's own background colour.** egui clips to
+    /// rectangles, so the art is drawn square and this covers the corners; a
+    /// rim carrying the frame background's alpha would show four triangles of
+    /// terrain that is outside the map, faintly, which is worse than showing
+    /// them plainly.
+    pub minimap_rim: Color,
+    /// Radius of a blip at scale 1.0. Smaller than the world map's pin: the
+    /// disc is a fraction of the size and a pin sized for a page covers a
+    /// street.
+    pub minimap_pin: f32,
+
     /// Whether the `!` and `?` over questgivers are drawn at all.
     pub show_quest_marks: bool,
     /// The bright form: a quest to take, or one ready to hand in.
@@ -463,6 +487,15 @@ impl Default for Style {
             world_map_party: Color::rgb(120, 180, 240),
             world_map_outline: Color::rgba(10, 10, 12, 220),
             world_map_pin: 7.0,
+            minimap_size: 160.0,
+            // Two hundred world units across the disc. A tile is 533, so the
+            // viewport is well under one and usually overlaps two or four --
+            // which is the case the placement has to get right, so it is the
+            // one the default exercises.
+            minimap_range: 200.0,
+            minimap_backing: Color::rgba(28, 24, 18, 245),
+            minimap_rim: Color::rgb(18, 16, 14),
+            minimap_pin: 4.0,
 
             show_quest_marks: true,
             quest_mark_bright: Color::rgb(250, 210, 60),
@@ -574,6 +607,12 @@ impl Style {
         self.questgiver_width = self.questgiver_width.clamp(160.0, 1600.0);
         self.world_map_width = self.world_map_width.clamp(200.0, 2400.0);
         self.world_map_pin = self.world_map_pin.clamp(1.0, 60.0);
+        self.minimap_size = self.minimap_size.clamp(48.0, 800.0);
+        self.minimap_range = self.minimap_range.clamp(
+            crate::frames::minimap::MIN_RANGE,
+            crate::frames::minimap::MAX_RANGE,
+        );
+        self.minimap_pin = self.minimap_pin.clamp(1.0, 40.0);
         self.quest_mark_size = self.quest_mark_size.clamp(6.0, 120.0);
         self.loot_sparkle_size = self.loot_sparkle_size.clamp(2.0, 80.0);
         self.chat_width = self.chat_width.clamp(120.0, 2000.0);

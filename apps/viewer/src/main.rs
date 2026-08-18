@@ -15,6 +15,7 @@ mod items;
 mod liquid;
 mod live;
 mod maps;
+mod minimap;
 mod model;
 mod scene;
 mod sound;
@@ -2441,6 +2442,20 @@ struct App {
     items: items::Items,
     /// World map pages and their art.
     maps: maps::Maps,
+    /// How far the minimap sees, in world units across the disc.
+    ///
+    /// **Live state seeded from the style, and deliberately not written back**
+    /// -- exactly what `camera_distance` is and for the same reason: the wheel
+    /// must not rewrite a saved setting on every notch. `minimap_range` in
+    /// `ui.toml` is where the disc *starts*, which is the thing a person
+    /// editing a config file means.
+    minimap_range: f32,
+    /// The minimap's tile index and the art it has uploaded so far.
+    ///
+    /// **No open flag beside it, unlike the map.** A minimap is one of the
+    /// frames that is simply there, so there is nothing to toggle and nothing
+    /// that could disagree about whether it should be on screen.
+    minimap: minimap::Minimap,
     /// Whether the map is open. Runtime state, like the spellbook: where the
     /// window sits is worth saving and whether it was open at exit is not.
     map_open: bool,
@@ -3099,11 +3114,16 @@ impl App {
         // finished logging in, and the arrow simply has nowhere to be yet.
         let mut chain = chain;
         let maps = maps::Maps::load(&mut chain);
+        // Read at startup for the same reason: 1.5MB of text naming every
+        // tile's picture, which does not depend on the server and would
+        // otherwise be parsed on the frame the player first looks at it.
+        let minimap = minimap::Minimap::load(&mut chain);
         Self {
             // The saved preference, which the wheel then moves from. Kept as
             // live state rather than read from the profile every frame: the
             // wheel must not rewrite a saved setting on every scroll.
             camera_distance: hud.profile.camera.start_distance(),
+            minimap_range: hud.profile.style.minimap_range,
             hud,
             args,
             chain,
@@ -3164,6 +3184,7 @@ impl App {
             spellbook_open: false,
             items: items::Items::default(),
             maps,
+            minimap,
             map_open: false,
             objectives: maps::Objectives::default(),
             quest_marks: std::collections::HashMap::new(),
@@ -3907,6 +3928,15 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
                 };
+                // **The minimap answers the wheel first, and then nothing
+                // else does.** Both this and the camera want the wheel, and
+                // the camera's arm has never asked where the pointer is -- so
+                // without the early return a scroll over the disc would zoom
+                // the map *and* pull the camera in, which reads as the minimap
+                // dragging the view around with it.
+                if self.zoom_minimap(notches) {
+                    return;
+                }
                 // Following a character, the wheel pulls the camera in and
                 // pushes it out, which is what it does in the game. A free
                 // camera has no subject to be a distance from, so there it
@@ -6101,6 +6131,39 @@ impl App {
         })
     }
 
+    /// Zooms the minimap if the pointer is over it, and says whether it did.
+    ///
+    /// The rectangle is computed from the layout rather than read off egui's
+    /// hover state, the same choice the spellbook's wheel scrolling makes:
+    /// the position is already known here, and asking egui would be
+    /// consulting a second opinion about a question this code can answer.
+    fn zoom_minimap(&mut self, notches: f32) -> bool {
+        let element = self.hud.profile.get(ui::ElementId::Minimap);
+        if !element.visible {
+            return false;
+        }
+        let Some(r) = self.renderer.as_ref() else {
+            return false;
+        };
+        let Some(pointer) = r.egui_ctx.input(|i| i.pointer.hover_pos()) else {
+            return false;
+        };
+        let size = ui::frames::minimap::size(&self.hud.profile.style, element.scale);
+        if !element.rect(r.egui_ctx.content_rect(), size).contains(pointer) {
+            return false;
+        }
+        // Multiplicative, like the camera's: a fixed step is coarse at the
+        // near end and useless at the far one. **The same sign as the
+        // camera's, too** -- scrolling up pulls the camera in, so it has to
+        // shrink the range here rather than grow it, or the two zooms fight
+        // each other in the player's hand.
+        self.minimap_range = (self.minimap_range * 0.8f32.powf(notches)).clamp(
+            ui::frames::minimap::MIN_RANGE,
+            ui::frames::minimap::MAX_RANGE,
+        );
+        true
+    }
+
     /// Asks the questgiver for one quest's scroll, and the server for its
     /// text.
     ///
@@ -7626,37 +7689,111 @@ impl App {
         // loot range check that reported fifteen units at a distance of two --
         // and a map is the one window where being wrong about it would look
         // entirely plausible. `live.position` is the walked one.
+        let standing = self.live.as_ref().map(|live| maps::Standing {
+            map_id: live.map_id,
+            x: live.position.x,
+            y: live.position.y,
+            orientation: live.orientation,
+        });
+        // **The title comes from the cache or the marker says a number.**
+        // A reward already reads `item 2224 x1` on this principle: a made
+        // -up name cannot be checked and would be believed, where an id
+        // is checkable and visibly unfinished.
+        let log: Vec<u32> = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.get(live.guid))
+            .map(|player| player.quest_log_ids())
+            .unwrap_or_default();
+        let objectives: Vec<maps::Objective<'_>> = log
+            .iter()
+            .map(|quest| maps::Objective {
+                label: match self.quests.answer(*quest) {
+                    ::world::Answer::Known(info) => info.title.clone(),
+                    // The title is still coming, or never came. Either way
+                    // the marker is real and the id is what is honestly
+                    // known about it.
+                    _ => format!("quest {quest}"),
+                },
+                markers: self.objectives.markers(*quest),
+            })
+            .filter(|objective| !objective.markers.is_empty())
+            .collect();
+        // A member's own zone and position, not the vitals the party
+        // frame reads -- `party_member_vitals` prefers a replicated
+        // entity's position when there is one, but a page is picked by
+        // *zone*, and the entity carries no such field (see
+        // `PartyVitals::zone`'s doc comment). `MemberStats::position` and
+        // `::zone` are read directly so the two always agree with each
+        // other regardless of visibility range.
+        let party_pins: Vec<maps::PartyMemberPin> = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.party.as_ref())
+            .map(|party| {
+                party
+                    .members
+                    .iter()
+                    .filter_map(|member| {
+                        let stats = self.live.as_ref()?.state.party_stats.get(&member.guid)?;
+                        let zone = stats.zone?;
+                        let (x, y) = stats.position?;
+                        Some(maps::PartyMemberPin {
+                            name: member.name.clone(),
+                            zone: zone as u32,
+                            x: x as f32,
+                            y: y as f32,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Which page the player is standing on, for the minimap's party dots.
+        // **The same zone-equality rule the world map's dots use**, and it has
+        // to be: `MemberStats` carries no continent id, so two members a
+        // hundred units apart in `(x, y)` can be on different continents
+        // entirely, and a minimap two hundred units across would draw one on
+        // top of the other. See `maps::PartyMemberPin`.
+        let standing_page = standing
+            .and_then(|at| self.maps.page_at(at.map_id, at.x, at.y))
+            .map(|page| page.id);
+        let near_party: Vec<maps::PartyMemberPin> = party_pins
+            .iter()
+            .filter(|pin| {
+                match (standing_page, self.maps.page_for_zone(pin.zone)) {
+                    (Some(page), Some(theirs)) => theirs.id == page,
+                    // Not "probably here": a member whose zone names no page,
+                    // or a player standing where there is none, is a member
+                    // this frame cannot honestly place.
+                    _ => false,
+                }
+            })
+            .map(|pin| maps::PartyMemberPin {
+                name: pin.name.clone(),
+                zone: pin.zone,
+                x: pin.x,
+                y: pin.y,
+            })
+            .collect();
+        // The sub-zone the ground says the character is in -- `Northshire
+        // Valley` rather than `Elwynn Forest`, which is what a minimap header
+        // has always said. Off the terrain rather than off a replicated field
+        // because the terrain is finer: every chunk names its own area, and
+        // the server replicates only the zone.
+        let area_name = r
+            .scene
+            .as_ref()
+            .and_then(|scene| match scene {
+                Scene::Streaming(world) => world.area_at(
+                    standing.map(|at| at.x).unwrap_or_default(),
+                    standing.map(|at| at.y).unwrap_or_default(),
+                ),
+                _ => None,
+            })
+            .and_then(|area| self.maps.area_name(area));
+
         let map_view = self.map_open.then(|| {
-            let standing = self.live.as_ref().map(|live| maps::Standing {
-                map_id: live.map_id,
-                x: live.position.x,
-                y: live.position.y,
-                orientation: live.orientation,
-            });
-            // **The title comes from the cache or the marker says a number.**
-            // A reward already reads `item 2224 x1` on this principle: a made
-            // -up name cannot be checked and would be believed, where an id
-            // is checkable and visibly unfinished.
-            let log: Vec<u32> = self
-                .live
-                .as_ref()
-                .and_then(|live| live.state.get(live.guid))
-                .map(|player| player.quest_log_ids())
-                .unwrap_or_default();
-            let objectives: Vec<maps::Objective<'_>> = log
-                .iter()
-                .map(|quest| maps::Objective {
-                    label: match self.quests.answer(*quest) {
-                        ::world::Answer::Known(info) => info.title.clone(),
-                        // The title is still coming, or never came. Either way
-                        // the marker is real and the id is what is honestly
-                        // known about it.
-                        _ => format!("quest {quest}"),
-                    },
-                    markers: self.objectives.markers(*quest),
-                })
-                .filter(|objective| !objective.markers.is_empty())
-                .collect();
             // **Exploration comes from the player's own replicated field**,
             // not from anywhere this client could decide for itself. A patch
             // of the page is drawn only where `PLAYER_EXPLORED_ZONES` says the
@@ -7672,35 +7809,6 @@ impl App {
                         .collect()
                 })
                 .unwrap_or_default();
-            // A member's own zone and position, not the vitals the party
-            // frame reads -- `party_member_vitals` prefers a replicated
-            // entity's position when there is one, but a page is picked by
-            // *zone*, and the entity carries no such field (see
-            // `PartyVitals::zone`'s doc comment). `MemberStats::position` and
-            // `::zone` are read directly so the two always agree with each
-            // other regardless of visibility range.
-            let party_pins: Vec<maps::PartyMemberPin> = self
-                .live
-                .as_ref()
-                .and_then(|live| live.state.party.as_ref())
-                .map(|party| {
-                    party
-                        .members
-                        .iter()
-                        .filter_map(|member| {
-                            let stats = self.live.as_ref()?.state.party_stats.get(&member.guid)?;
-                            let zone = stats.zone?;
-                            let (x, y) = stats.position?;
-                            Some(maps::PartyMemberPin {
-                                name: member.name.clone(),
-                                zone: zone as u32,
-                                x: x as f32,
-                                y: y as f32,
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
             maps::build_view(
                 &mut self.maps,
                 &r.gpu,
@@ -7712,6 +7820,25 @@ impl App {
                 &|bit| explored_bits.contains(&bit),
             )
         });
+        // The minimap, built every frame and unconditionally: it is one of
+        // the frames that is simply there, so there is no open flag to test.
+        // The tiles are re-placed each frame rather than cached because the
+        // viewport slides over ground that does not move -- which is the
+        // whole difference between this and a map page.
+        let minimap_view = {
+            let range = self.minimap_range;
+            self.minimap.build_view(
+                &r.gpu,
+                &mut r.egui_renderer,
+                &mut self.chain,
+                standing,
+                self.live.as_ref().map(|live| live.map_directory.as_str()).unwrap_or_default(),
+                area_name.as_deref(),
+                range,
+                &objectives,
+                &near_party,
+            )
+        };
 
         // The bag window, built only while it is open, and rebuilt every frame
         // for the same reasons the spellbook is.
@@ -8036,6 +8163,8 @@ impl App {
                     questgiver: questgiver_view.as_ref(),
                     // `None` when shut, like the spellbook and the log.
                     world_map: map_view.as_ref(),
+                    // No flag: a minimap is never opened or shut.
+                    minimap: Some(&minimap_view),
                     // No flag: the window exists exactly while the server
                     // says a corpse is open.
                     loot: (!loot.is_empty()).then_some(loot.as_slice()),

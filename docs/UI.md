@@ -445,6 +445,65 @@ Without that, a `/leave` sent while not in a group and a `/leave` the server
 declined look identical -- which is the failure mode the whole `world::group`
 block was written to escape.
 
+## The minimap, and a disc drawn with a rectangle clipper
+
+The minimap is the second frame to draw the world's own art (after the map) and
+the first that is **always there and never opened**. That puts it with the unit
+frames and the action bars in [`ElementId::stacking`], not with the panels: a
+window somebody opened must never cover the frame that says where they are.
+
+Everything about its geometry follows from egui clipping to rectangles and a
+minimap being a disc. The tiles are drawn square, and a **rim** -- an annulus
+from the disc's edge out past the corners, cut back by the frame's own clip
+rectangle -- is painted over them. `Style::minimap_rim` carries its own opaque
+colour rather than reusing the window background, because a rim inheriting the
+frame's alpha would show four corners of terrain that is outside the map,
+faintly, which is worse than showing them plainly.
+
+The draw order is the rest of the design:
+
+1. the backing disc, so a tile that would not load is parchment rather than
+   whatever the window was sitting on;
+2. the tiles;
+3. objective **regions**, under the rim -- which is what circle-clips them. A
+   ring can be larger than the whole disc, and one drawn after the rim would
+   trail across the bezel and out of the frame;
+4. the rim and its border;
+5. the blips, over everything.
+
+**A blip outside the disc is dropped, never dragged to the edge.** A party
+member pinned to the rim is a claim that they are in that direction at an
+unknown distance, and this client has spent enough on the difference between
+"here" and "somewhere over there". A region gets its ring and no pin at all for
+the same reason: on a disc two hundred units across a region is routinely
+bigger than the picture, so a pin at its centroid would sit in the middle of
+the frame whether or not the objective is anywhere near.
+
+The header names the **sub-zone** -- `Northshire Valley` rather than `Elwynn
+Forest` -- read off the terrain rather than off a replicated field, because
+every map chunk names its own area and the server replicates only the zone. The
+last name that resolved is held while a tile streams in, or the header would
+blink and read as leaving the zone.
+
+### The wheel had two claimants
+
+The camera's wheel handler has never asked where the pointer is. So the minimap
+answers the wheel first and returns; without that, a scroll over the disc would
+zoom the map *and* pull the camera in, which reads as the minimap dragging the
+view around with it. The zoom is live state seeded from `minimap_range` and
+deliberately not saved on every notch -- the same arrangement `camera_distance`
+has, for the same reason. What `ui.toml` holds is where the disc *starts*,
+which is what a person editing a config file means.
+
+### The quest log gave up the corner
+
+It had the top-right because nothing else claimed it. It moved **sideways**
+along the top edge rather than down, and that is not cosmetic: the right edge
+below the minimap has the spellbook centred on it, and a log pushed down would
+start 150 pixels clear of it and grow *towards* it as quests are taken --
+correct on an empty log and wrong on a full one, which is the half nobody
+tests.
+
 ## What is deliberately not here yet
 
 - **Per-element style overrides.** One `Style` serves every frame. A second

@@ -81,6 +81,9 @@ enum Command {
     /// Inspect world map pages and the world-to-page projection.
     #[command(subcommand)]
     Map(MapCommand),
+    /// Inspect the minimap's hashed tile art.
+    #[command(subcommand)]
+    Minimap(MinimapCommand),
     /// Resolve the lighting that applies at a place and an hour.
     ///
     /// Prints every colour and scalar curve owned by the chosen light, sampled
@@ -810,6 +813,116 @@ enum MapCommand {
     },
 }
 
+/// The minimap's art: the hashed-tile index, and the two things it does not
+/// state.
+#[derive(Subcommand)]
+enum MinimapCommand {
+    /// Read `md5translate.trs` and report what it names.
+    ///
+    /// The art is stored under the MD5 of its own contents, so this file is
+    /// the only thing that says which picture belongs to which tile, and a
+    /// directory listing cannot replace it -- one picture can serve many
+    /// tiles, and a fifth of the files in the folder are referenced by
+    /// nothing at all.
+    Index {
+        /// Resolve every referenced file by path, and report the ones that
+        /// are missing. Resolution, not a listing: an MPQ answers by hash,
+        /// and a listing has answered the wrong question here before.
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Compare a map's minimap tiles against the tiles its `WDT` says exist.
+    ///
+    /// **This is what settles which of `map<a>_<b>` is which.** The two
+    /// numbers could be `(x, y)` or `(y, x)` and both readings resolve a
+    /// file for every tile, so nothing about a single lookup can tell them
+    /// apart. What can is the *set*: a continent's tiles are not symmetric
+    /// under exchanging the pair, so one order matches the terrain's own set
+    /// exactly and the other cannot.
+    Tiles {
+        /// Map directory, e.g. `Azeroth`. Omit to sweep every map.
+        map: Option<String>,
+    },
+    /// Fit the tile's pixel orientation against the water in the terrain.
+    ///
+    /// **The experiment that chose the orientation, kept so it can be re-run.**
+    /// A 256x256 tile has eight plausible readings -- either axis can run
+    /// either way, and they can be exchanged -- and every one of them draws a
+    /// picture. So the art is scored against a fact stated by a different
+    /// file: `MH2O` says which of a tile's 256 chunks are under water, and
+    /// water is drawn blue.
+    ///
+    /// A chunk votes only if it is unambiguous (covered or dry, nothing in
+    /// between) and only if the candidates actually disagree about it -- a
+    /// tile that is all ocean or all forest agrees with every reading and
+    /// would bury the ones that can answer, which is how `Light.dbc`'s storm
+    /// column came back a coin flip.
+    Orient {
+        /// Map directory, e.g. `Azeroth`. Omit to sweep every map.
+        map: Option<String>,
+        /// Stop after this many tiles.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Score the same eight readings by whether the tiles join up.
+    ///
+    /// The companion to `orient`, and deliberately built on a different
+    /// input: it reads no terrain at all. Under the right reading the last
+    /// column of one tile's art is the ground immediately beside the first
+    /// column of its neighbour's, so the seam is invisible; under a flipped
+    /// one it is two pieces of ground five hundred yards apart.
+    ///
+    /// Neither direction settles it alone -- a reading that flips only the
+    /// down axis walks the same across-seam backwards and scores identically
+    /// on it -- so both are reported and it is the pair that separates all
+    /// eight.
+    Seams {
+        /// Map directory, e.g. `Azeroth`. Omit to sweep every map.
+        map: Option<String>,
+        /// Stop after this many tiles.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Draw what the minimap would show at a world position, to a PNG.
+    ///
+    /// **The instrument that lets the composed picture be seen as itself.**
+    /// The frame is assembled from up to four tiles placed by
+    /// `adt::minimap::Viewport`, and this draws from *that same* type rather
+    /// than from a second copy of the arithmetic -- so a picture that comes
+    /// out right is evidence about the frame. Anything assembled in memory
+    /// from a dozen files gets a dump command; this is the minimap's.
+    Stitch {
+        /// Map directory, e.g. `Azeroth`.
+        #[arg(long, default_value = "Azeroth")]
+        map: String,
+        /// Clap reads a bare negative number as a flag, so pass `--x=-8950`.
+        #[arg(long, allow_hyphen_values = true)]
+        x: f32,
+        #[arg(long, allow_hyphen_values = true)]
+        y: f32,
+        /// World units across the picture.
+        #[arg(long, default_value_t = 200.0)]
+        range: f32,
+        /// Edge of the output image, in pixels.
+        #[arg(long, default_value_t = 512)]
+        pixels: u32,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Write one tile's picture to a PNG.
+    Export {
+        /// Map directory, e.g. `Azeroth`.
+        map: String,
+        /// Clap reads a bare negative number as a flag, so pass `--x=32`.
+        #[arg(long)]
+        x: usize,
+        #[arg(long)]
+        y: usize,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
 #[derive(Subcommand)]
 enum WmoCommand {
     /// Show a root file and its groups.
@@ -1215,6 +1328,7 @@ fn main() -> Result<()> {
         Command::Wmo(cmd) => wmo_cmd(&mut chain, cmd),
         Command::Adt(cmd) => adt_cmd(&mut chain, cmd),
         Command::Map(cmd) => map_cmd(&mut chain, cmd),
+        Command::Minimap(cmd) => minimap_cmd(&mut chain, cmd),
         Command::Light {
             map,
             x,
@@ -7575,6 +7689,633 @@ fn adt_survey(chain: &mut Chain, map: Option<&str>, limit: Option<usize>) -> Res
         }
     }
     Ok(())
+}
+
+fn minimap_cmd(chain: &mut Chain, cmd: MinimapCommand) -> Result<()> {
+    match cmd {
+        MinimapCommand::Index { verify } => minimap_index(chain, verify),
+        MinimapCommand::Tiles { map } => minimap_tiles(chain, map.as_deref()),
+        MinimapCommand::Orient { map, limit } => minimap_orient(chain, map.as_deref(), limit),
+        MinimapCommand::Seams { map, limit } => minimap_seams(chain, map.as_deref(), limit),
+        MinimapCommand::Stitch {
+            map,
+            x,
+            y,
+            range,
+            pixels,
+            out,
+        } => minimap_stitch(chain, &map, x, y, range, pixels, out),
+        MinimapCommand::Export { map, x, y, out } => minimap_export(chain, &map, x, y, out),
+    }
+}
+
+fn load_minimap_index(chain: &mut Chain) -> Result<adt::minimap::Translate> {
+    let path = adt::minimap::TRANSLATE_PATH;
+    let bytes = chain.read(path).with_context(|| format!("reading {path}"))?;
+    // Lossy on purpose: the file is ASCII apart from a handful of directory
+    // names, and one unmappable byte must not cost the other 18,643 entries.
+    Ok(adt::minimap::Translate::parse(&String::from_utf8_lossy(
+        &bytes,
+    )))
+}
+
+/// Map directories from `Map.dbc`, optionally narrowed to one.
+///
+/// From the table rather than from the index's own directory list, because
+/// the question this command exists to ask is whether the two agree.
+fn minimap_directories(chain: &mut Chain, only: Option<&str>) -> Result<Vec<String>> {
+    let table = dbc::schema::Map::parse(&chain.read(dbc::schema::Map::PATH)?)?;
+    let mut names: Vec<String> = table
+        .iter()
+        .map(|m| m.directory().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    if let Some(only) = only {
+        names.retain(|d| d.eq_ignore_ascii_case(only));
+        if names.is_empty() {
+            anyhow::bail!("no map directory called {only}");
+        }
+    }
+    Ok(names)
+}
+
+fn minimap_index(chain: &mut Chain, verify: bool) -> Result<()> {
+    use std::collections::{BTreeMap, HashMap};
+
+    let index = load_minimap_index(chain)?;
+    let mut uses: HashMap<&str, usize> = HashMap::new();
+    let (mut terrain, mut other) = (0usize, 0usize);
+    let mut per_map: BTreeMap<String, usize> = BTreeMap::new();
+    for (logical, file) in index.iter() {
+        *uses.entry(file).or_default() += 1;
+        match logical.rsplit_once('\\') {
+            Some((dir, name)) if !dir.contains('\\') && name.starts_with("map") => {
+                terrain += 1;
+                *per_map.entry(dir.to_string()).or_default() += 1;
+            }
+            _ => other += 1,
+        }
+    }
+    let shared: usize = uses.values().filter(|n| **n > 1).count();
+    let mut most: Vec<(&&str, &usize)> = uses.iter().collect();
+    most.sort_by(|a, b| b.1.cmp(a.1));
+
+    println!("{}", adt::minimap::TRANSLATE_PATH);
+    println!("  {} entries naming {} distinct files", index.len(), uses.len());
+    println!("  {terrain} terrain tiles across {} maps, {other} elsewhere (WMO interiors)", per_map.len());
+    println!("  {shared} files serve more than one tile -- so a file name does not identify a tile");
+    for (file, count) in most.iter().take(3) {
+        println!("    {file} is named {count} times");
+    }
+
+    if verify {
+        // Resolution by path, never a listing: an MPQ answers by hash, and a
+        // file absent from `(listfile)` reads perfectly. That distinction has
+        // already sunk one coverage check in this project.
+        let mut checked: Vec<&str> = uses.keys().copied().collect();
+        checked.sort_unstable();
+        let missing: Vec<&str> = checked
+            .iter()
+            .copied()
+            .filter(|file| !chain.contains(&adt::minimap::art_path(file)))
+            .collect();
+        println!(
+            "\n  resolved {} of {} referenced files by path",
+            checked.len() - missing.len(),
+            checked.len()
+        );
+        for file in missing.iter().take(20) {
+            println!("    missing {file}");
+        }
+    }
+
+    println!("\n{:<28} {:>6}", "map", "tiles");
+    for (dir, count) in &per_map {
+        println!("{dir:<28} {count:>6}");
+    }
+    Ok(())
+}
+
+/// Compare each map's minimap tile set against its `WDT`'s, in both orders.
+///
+/// See [`MinimapCommand::Tiles`] for why the *set* is the evidence and a
+/// single successful lookup is not.
+fn minimap_tiles(chain: &mut Chain, map: Option<&str>) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let index = load_minimap_index(chain)?;
+    let directories = minimap_directories(chain, map)?;
+
+    println!(
+        "{:<24} {:>7} {:>7} {:>12} {:>12}",
+        "map", "terrain", "minimap", "as written", "transposed"
+    );
+    let (mut maps, mut separating) = (0usize, 0usize);
+    let (mut exact, mut exact_transposed) = (0usize, 0usize);
+    let (mut total_terrain, mut total_named) = (0u64, 0u64);
+    let (mut total_matched, mut total_matched_transposed) = (0u64, 0u64);
+    for directory in &directories {
+        let named: BTreeSet<(usize, usize)> = index.tiles(directory).into_iter().collect();
+        let Ok(wdt) = load_wdt(chain, directory) else {
+            if !named.is_empty() {
+                println!("{directory:<24} {:>7} {:>7}", "no wdt", named.len());
+            }
+            continue;
+        };
+        let terrain: BTreeSet<(usize, usize)> = wdt.tiles().into_iter().collect();
+        if terrain.is_empty() && named.is_empty() {
+            continue;
+        }
+        maps += 1;
+        let flipped: BTreeSet<(usize, usize)> = named.iter().map(|(a, b)| (*b, *a)).collect();
+        let hit = named.intersection(&terrain).count();
+        let hit_flipped = flipped.intersection(&terrain).count();
+        total_terrain += terrain.len() as u64;
+        total_named += named.len() as u64;
+        total_matched += hit as u64;
+        total_matched_transposed += hit_flipped as u64;
+        // A map whose tile set is symmetric under exchanging the pair agrees
+        // with both orders and votes for neither -- the square instance maps
+        // are all like that. Counting them among the agreements would make a
+        // unanimous result unanimous about nothing.
+        if hit != hit_flipped {
+            separating += 1;
+        }
+        if hit == terrain.len() && hit == named.len() {
+            exact += 1;
+        }
+        if hit_flipped == terrain.len() && hit_flipped == named.len() {
+            exact_transposed += 1;
+        }
+        println!(
+            "{directory:<24} {:>7} {:>7} {:>12} {:>12}",
+            terrain.len(),
+            named.len(),
+            hit,
+            hit_flipped
+        );
+    }
+
+    println!("\n{maps} maps, {total_terrain} terrain tiles, {total_named} tiles named");
+    println!("  as written: {total_matched} tiles land on real terrain, {exact} maps exact");
+    println!(
+        "  transposed: {total_matched_transposed} tiles land on real terrain, \
+         {exact_transposed} maps exact"
+    );
+    println!("  {separating} of {maps} maps can tell the two readings apart at all");
+    Ok(())
+}
+
+/// The eight ways a tile's texels could be laid out over its chunks.
+///
+/// `(row, col)` is the chunk's position in the tile measured from the corner
+/// its own stored world position identifies -- so the terrain half of this
+/// comparison presupposes nothing about the art. The result is `(across,
+/// down)` in chunk-sized blocks.
+type Orientation = fn(usize, usize, usize) -> (usize, usize);
+
+const ORIENTATIONS: [(&str, Orientation); 8] = [
+    ("as drawn", |row, col, _| (col, row)),
+    ("across flipped", |row, col, n| (n - 1 - col, row)),
+    ("down flipped", |row, col, n| (col, n - 1 - row)),
+    ("both flipped", |row, col, n| (n - 1 - col, n - 1 - row)),
+    ("transposed", |row, col, _| (row, col)),
+    ("transposed, across flipped", |row, col, n| (n - 1 - row, col)),
+    ("transposed, down flipped", |row, col, n| (row, n - 1 - col)),
+    ("transposed, both flipped", |row, col, n| (n - 1 - row, n - 1 - col)),
+];
+
+/// How blue a block has to be before it is called water, in 0..255.
+///
+/// Stated once and reported alongside the separation it produces, because a
+/// threshold picked to make an answer come out is not evidence. The
+/// separation between the wet and dry populations is printed so the number
+/// can be seen to be arbitrary within a wide margin rather than load-bearing.
+const BLUE_MARGIN: f32 = 12.0;
+
+fn minimap_orient(chain: &mut Chain, map: Option<&str>, limit: Option<usize>) -> Result<()> {
+    use dbc::schema::{LiquidCategory, LiquidType};
+
+    let index = load_minimap_index(chain)?;
+    let directories = minimap_directories(chain, map)?;
+    // Which liquid ids are blue. Lava and slime are liquid and are not water,
+    // and a chunk under either is excluded rather than counted as dry: its
+    // block is neither blue nor plain ground, so it can only add noise.
+    let liquids = LiquidType::parse(&chain.read(LiquidType::PATH)?)?;
+    let category = |id: u16| -> Option<LiquidCategory> {
+        liquids
+            .iter()
+            .find(|row| row.id() == id as u32)
+            .map(|row| row.kind())
+    };
+
+    // Per candidate: agreements over every classified chunk, and over the
+    // chunks the candidates actually disagree about.
+    let mut agree = [0u64; ORIENTATIONS.len()];
+    let mut agree_decisive = [0u64; ORIENTATIONS.len()];
+    // Mean blueness of the wet and dry populations under each candidate, so
+    // the result is a separation and not only a percentage.
+    let mut wet_blue = [0f64; ORIENTATIONS.len()];
+    let mut dry_blue = [0f64; ORIENTATIONS.len()];
+    let (mut wet_n, mut dry_n) = (0u64, 0u64);
+    let (mut scored, mut decisive) = (0u64, 0u64);
+    let (mut tiles_read, mut tiles_without_art) = (0u64, 0u64);
+    let mut budget = limit.unwrap_or(usize::MAX);
+
+    'maps: for directory in &directories {
+        let Ok(wdt) = load_wdt(chain, directory) else {
+            continue;
+        };
+        for (tx, ty) in wdt.tiles() {
+            if budget == 0 {
+                break 'maps;
+            }
+            let Ok(bytes) = chain.read(&adt::tile_path(directory, tx, ty)) else {
+                continue;
+            };
+            let Ok(tile) = adt::Adt::parse(&bytes, wdt.big_alpha()) else {
+                continue;
+            };
+            // A tile with no water cannot separate anything, and reading its
+            // art costs a megabyte of decode. Skipping it is not a filter on
+            // the result -- it is a filter on chunks that were never going to
+            // vote.
+            if tile.liquid.is_empty() || tile.chunks.len() != adt::CHUNK_COUNT {
+                continue;
+            }
+            let Some(art) = index.tile_path(directory, tx, ty) else {
+                tiles_without_art += 1;
+                continue;
+            };
+            let Ok(art_bytes) = chain.read(&art) else {
+                tiles_without_art += 1;
+                continue;
+            };
+            let Ok(picture) = blp::Blp::parse(&art_bytes) else {
+                tiles_without_art += 1;
+                continue;
+            };
+            let (width, height) = picture.level_size(0);
+            let texels = adt::minimap::TILE_TEXELS as u32;
+            if (width, height) != (texels, texels) {
+                tiles_without_art += 1;
+                continue;
+            }
+            let Some(rgba) = picture.decode_rgba(0) else {
+                tiles_without_art += 1;
+                continue;
+            };
+            budget -= 1;
+            tiles_read += 1;
+
+            // The tile's origin corner, taken from the chunks themselves. Both
+            // axes run inwards from it, so it is the largest of each.
+            let origin_x = tile
+                .chunks
+                .iter()
+                .map(|c| c.position[0])
+                .fold(f32::MIN, f32::max);
+            let origin_y = tile
+                .chunks
+                .iter()
+                .map(|c| c.position[1])
+                .fold(f32::MIN, f32::max);
+
+            // Mean blueness of every one of the 256 blocks, computed once.
+            let mut blueness = [0f32; adt::CHUNK_COUNT];
+            for (block, slot) in blueness.iter_mut().enumerate() {
+                let (bu, bv) = (block % adt::CHUNKS_PER_TILE, block / adt::CHUNKS_PER_TILE);
+                let (mut red, mut blue) = (0f32, 0f32);
+                let step = adt::minimap::TEXELS_PER_CHUNK;
+                for v in bv * step..(bv + 1) * step {
+                    for u in bu * step..(bu + 1) * step {
+                        let at = (v * adt::minimap::TILE_TEXELS + u) * 4;
+                        red += rgba[at] as f32;
+                        blue += rgba[at + 2] as f32;
+                    }
+                }
+                let texels = (step * step) as f32;
+                *slot = (blue - red) / texels;
+            }
+            let block_at = |bu: usize, bv: usize| blueness[bv * adt::CHUNKS_PER_TILE + bu];
+
+            for (chunk_index, chunk) in tile.chunks.iter().enumerate() {
+                let row = ((origin_x - chunk.position[0]) / adt::CHUNK_SIZE).round();
+                let col = ((origin_y - chunk.position[1]) / adt::CHUNK_SIZE).round();
+                if !(0.0..adt::CHUNKS_PER_TILE as f32).contains(&row)
+                    || !(0.0..adt::CHUNKS_PER_TILE as f32).contains(&col)
+                {
+                    continue;
+                }
+                let (row, col) = (row as usize, col as usize);
+
+                // Covered, dry, or neither. A shoreline chunk half under water
+                // is honestly ambiguous and is dropped rather than guessed at.
+                let sheets = tile.liquid.chunk(chunk_index);
+                let mut covered = 0usize;
+                let mut harmful = false;
+                for sheet in sheets {
+                    match category(sheet.liquid_type) {
+                        Some(LiquidCategory::Water) | Some(LiquidCategory::Ocean) => {}
+                        Some(_) => harmful = true,
+                        None => harmful = true,
+                    }
+                    for j in 0..sheet.height as usize {
+                        for i in 0..sheet.width as usize {
+                            if sheet.cell_exists(i, j) {
+                                covered += 1;
+                            }
+                        }
+                    }
+                }
+                if harmful {
+                    continue;
+                }
+                // Eight cells to a chunk edge, so 64 is complete cover.
+                let wet = match covered {
+                    0 => false,
+                    n if n >= 56 => true,
+                    _ => continue,
+                };
+                scored += 1;
+                if wet {
+                    wet_n += 1;
+                } else {
+                    dry_n += 1;
+                }
+
+                let calls: Vec<bool> = ORIENTATIONS
+                    .iter()
+                    .map(|(_, place)| {
+                        let (bu, bv) = place(row, col, adt::CHUNKS_PER_TILE);
+                        block_at(bu, bv) > BLUE_MARGIN
+                    })
+                    .collect();
+                // Only a chunk the candidates disagree about can separate
+                // them. A tile that is all ocean puts the same block under
+                // every reading and votes for all eight equally -- the same
+                // trap the `MH2O` axis survey had to exclude before its vote
+                // meant anything.
+                let separates = calls.iter().any(|c| *c != calls[0]);
+                if separates {
+                    decisive += 1;
+                }
+                for (i, (_, place)) in ORIENTATIONS.iter().enumerate() {
+                    let (bu, bv) = place(row, col, adt::CHUNKS_PER_TILE);
+                    let value = block_at(bu, bv);
+                    if wet {
+                        wet_blue[i] += value as f64;
+                    } else {
+                        dry_blue[i] += value as f64;
+                    }
+                    if calls[i] == wet {
+                        agree[i] += 1;
+                        if separates {
+                            agree_decisive[i] += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!(
+        "{tiles_read} wet tiles read, {tiles_without_art} skipped for art that would not load"
+    );
+    println!("{scored} chunks classified ({wet_n} covered, {dry_n} dry), {decisive} decisive\n");
+    if scored == 0 {
+        anyhow::bail!("nothing was classified, so this measured nothing");
+    }
+    println!(
+        "{:<28} {:>10} {:>10} {:>18}",
+        "reading", "all", "decisive", "wet-dry blueness"
+    );
+    for (i, (name, _)) in ORIENTATIONS.iter().enumerate() {
+        let all = agree[i] as f64 / scored as f64 * 100.0;
+        let dec = if decisive == 0 {
+            f64::NAN
+        } else {
+            agree_decisive[i] as f64 / decisive as f64 * 100.0
+        };
+        let separation = wet_blue[i] / wet_n.max(1) as f64 - dry_blue[i] / dry_n.max(1) as f64;
+        println!("{name:<28} {all:>9.1}% {dec:>9.1}% {separation:>18.1}");
+    }
+    println!(
+        "\nblue margin {BLUE_MARGIN:.0}/255. The separation column is threshold-free: it is the \
+         mean of (blue - red) over covered chunks minus the same over dry ones."
+    );
+    Ok(())
+}
+
+/// Score the eight readings by whether they make neighbouring tiles join up.
+///
+/// See [`MinimapCommand::Seams`] for why this is worth running beside
+/// `minimap orient`: it reads no terrain at all, so the two experiments share
+/// no input but the tile grid.
+fn minimap_seams(chain: &mut Chain, map: Option<&str>, limit: Option<usize>) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let index = load_minimap_index(chain)?;
+    let directories = minimap_directories(chain, map)?;
+    let edge = adt::minimap::TILE_TEXELS;
+
+    // Summed absolute channel difference along each seam, per candidate and
+    // per direction, and how many texel pairs went into each sum.
+    let mut across = [0f64; ORIENTATIONS.len()];
+    let mut down = [0f64; ORIENTATIONS.len()];
+    let (mut across_n, mut down_n) = (0u64, 0u64);
+    let (mut seams_across, mut seams_down) = (0u64, 0u64);
+    let mut budget = limit.unwrap_or(usize::MAX);
+
+    'maps: for directory in &directories {
+        let named = index.tiles(directory);
+        let present: BTreeSet<(usize, usize)> = named.iter().copied().collect();
+        for (x, y) in &named {
+            if budget == 0 {
+                break 'maps;
+            }
+            let Some(here) = minimap_pixels(chain, &index, directory, *x, *y) else {
+                continue;
+            };
+            budget -= 1;
+
+            // A step along `x` continues the direction the in-tile column
+            // index runs, and a step along `y` the row index -- which is what
+            // `minimap tiles` settled. So the ground at column 255 of this
+            // tile abuts the ground at column 0 of the next one along.
+            if present.contains(&(x + 1, *y)) {
+                if let Some(next) = minimap_pixels(chain, &index, directory, x + 1, *y) {
+                    seams_across += 1;
+                    for row in 0..edge {
+                        for (i, (_, place)) in ORIENTATIONS.iter().enumerate() {
+                            let (au, av) = place(row, edge - 1, edge);
+                            let (bu, bv) = place(row, 0, edge);
+                            across[i] += texel_difference(
+                                &here,
+                                av * edge + au,
+                                &next,
+                                bv * edge + bu,
+                            );
+                        }
+                        across_n += 1;
+                    }
+                }
+            }
+            if present.contains(&(*x, y + 1)) {
+                if let Some(next) = minimap_pixels(chain, &index, directory, *x, y + 1) {
+                    seams_down += 1;
+                    for col in 0..edge {
+                        for (i, (_, place)) in ORIENTATIONS.iter().enumerate() {
+                            let (au, av) = place(edge - 1, col, edge);
+                            let (bu, bv) = place(0, col, edge);
+                            down[i] += texel_difference(
+                                &here,
+                                av * edge + au,
+                                &next,
+                                bv * edge + bu,
+                            );
+                        }
+                        down_n += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if across_n == 0 || down_n == 0 {
+        anyhow::bail!("no neighbouring tiles were compared, so this measured nothing");
+    }
+    println!("{seams_across} seams across and {seams_down} down\n");
+    println!("{:<28} {:>10} {:>10} {:>10}", "reading", "across", "down", "sum");
+    for (i, (name, _)) in ORIENTATIONS.iter().enumerate() {
+        let a = across[i] / across_n as f64;
+        let d = down[i] / down_n as f64;
+        println!("{name:<28} {a:>10.2} {d:>10.2} {:>10.2}", a + d);
+    }
+    println!(
+        "\nMean absolute channel difference across a seam, 0..255: lower is a picture that \
+         joins up.\n**Neither column can settle this alone.** A reading that flips only the \
+         down axis walks the\nsame across-seam backwards and scores identically on it; one \
+         that flips only across does the\nsame to the down column. It is the pair together \
+         that separates all eight."
+    );
+    Ok(())
+}
+
+/// One tile's texels, or nothing if anything about it would not load.
+fn minimap_pixels(
+    chain: &mut Chain,
+    index: &adt::minimap::Translate,
+    map: &str,
+    x: usize,
+    y: usize,
+) -> Option<Vec<u8>> {
+    let path = index.tile_path(map, x, y)?;
+    let bytes = chain.read(&path).ok()?;
+    let picture = blp::Blp::parse(&bytes).ok()?;
+    let edge = adt::minimap::TILE_TEXELS as u32;
+    if picture.level_size(0) != (edge, edge) {
+        return None;
+    }
+    picture.decode_rgba(0)
+}
+
+/// Absolute channel difference between two texels, averaged over RGB.
+fn texel_difference(a: &[u8], at_a: usize, b: &[u8], at_b: usize) -> f64 {
+    let (a, b) = (&a[at_a * 4..at_a * 4 + 3], &b[at_b * 4..at_b * 4 + 3]);
+    (0..3)
+        .map(|c| (a[c] as f64 - b[c] as f64).abs())
+        .sum::<f64>()
+        / 3.0
+}
+
+/// Draws the minimap's own composition to a PNG.
+///
+/// Nearest-neighbour, and deliberately: this exists to check *placement*, and
+/// a filter that smoothed the seams would hide the thing being looked for.
+/// The centre pixel is marked, because "the player is in the middle" is the
+/// one claim a picture of a disc cannot make on its own.
+fn minimap_stitch(
+    chain: &mut Chain,
+    map: &str,
+    x: f32,
+    y: f32,
+    range: f32,
+    pixels: u32,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    let index = load_minimap_index(chain)?;
+    let view = adt::minimap::Viewport::new(x, y, range);
+    let pixels = pixels.clamp(16, 4096);
+    let edge = adt::minimap::TILE_TEXELS;
+    let mut canvas = vec![0u8; (pixels * pixels * 4) as usize];
+
+    let touching = view.tiles_touching();
+    let mut drawn = 0usize;
+    for (tx, ty) in &touching {
+        let Some(art) = minimap_pixels(chain, &index, map, *tx, *ty) else {
+            println!("  {map} {tx},{ty}: no art");
+            continue;
+        };
+        drawn += 1;
+        let [u0, v0, u1, v1] = view.tile_rect(*tx, *ty);
+        println!("  {map} {tx},{ty}: u {u0:.3}..{u1:.3}  v {v0:.3}..{v1:.3}");
+        // Walk the output rather than the source, so a tile larger than the
+        // picture is cropped instead of writing outside the canvas.
+        let (px0, px1) = ((u0 * pixels as f32) as i64, (u1 * pixels as f32) as i64);
+        let (py0, py1) = ((v0 * pixels as f32) as i64, (v1 * pixels as f32) as i64);
+        for py in py0.max(0)..py1.min(pixels as i64) {
+            for px in px0.max(0)..px1.min(pixels as i64) {
+                let su = ((px - px0) as f32 / (px1 - px0) as f32 * edge as f32) as usize;
+                let sv = ((py - py0) as f32 / (py1 - py0) as f32 * edge as f32) as usize;
+                let source = (sv.min(edge - 1) * edge + su.min(edge - 1)) * 4;
+                let target = ((py as u32 * pixels + px as u32) * 4) as usize;
+                canvas[target..target + 4].copy_from_slice(&art[source..source + 4]);
+            }
+        }
+    }
+
+    // The centre, in a colour no terrain is.
+    let middle = pixels / 2;
+    for (dx, dy) in [(0i32, 0i32), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+        let px = (middle as i32 + dx).clamp(0, pixels as i32 - 1) as u32;
+        let py = (middle as i32 + dy).clamp(0, pixels as i32 - 1) as u32;
+        let at = ((py * pixels + px) * 4) as usize;
+        canvas[at..at + 4].copy_from_slice(&[255, 0, 255, 255]);
+    }
+
+    let out = out.unwrap_or_else(|| PathBuf::from("minimap.png"));
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(&out)?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), pixels, pixels);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header()?.write_image_data(&canvas)?;
+    println!(
+        "{map} at {x:.0},{y:.0}, {range:.0} units across: {drawn} of {} tiles drawn to {}",
+        touching.len(),
+        out.display()
+    );
+    Ok(())
+}
+
+fn minimap_export(
+    chain: &mut Chain,
+    map: &str,
+    x: usize,
+    y: usize,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    let index = load_minimap_index(chain)?;
+    let path = index
+        .tile_path(map, x, y)
+        .with_context(|| format!("{map} has no minimap tile {x},{y}"))?;
+    println!("{map} {x},{y} -> {path}");
+    blp_export(chain, &path, 0, out)
 }
 
 fn map_cmd(chain: &mut Chain, cmd: MapCommand) -> Result<()> {

@@ -148,6 +148,18 @@ impl Maps {
         None
     }
 
+    /// What to call an `AreaTable` row, for the minimap's header.
+    ///
+    /// A *sub-zone* where the terrain names one -- `Northshire Valley` rather
+    /// than `Elwynn Forest` -- because the caller reads the id off the ground
+    /// and the ground is finer than anything the server replicates. `None`
+    /// for an id the table does not name, which is honest: this is the one
+    /// piece of text on the frame and inventing it would be inventing the
+    /// only thing a reader could check.
+    pub fn area_name(&self, area_id: u32) -> Option<String> {
+        self.zone_names.get(&area_id).cloned()
+    }
+
     /// What to call a page.
     ///
     /// Falls back to the internal directory name rather than to nothing: a

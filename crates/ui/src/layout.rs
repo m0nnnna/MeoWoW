@@ -46,13 +46,14 @@ pub enum ElementId {
     QuestLog,
     Questgiver,
     WorldMap,
+    Minimap,
     ReleasePrompt,
     PartyFrame,
     PartyInvite,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 17] = [
+    pub const ALL: [ElementId; 18] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -67,6 +68,7 @@ impl ElementId {
         ElementId::QuestLog,
         ElementId::Questgiver,
         ElementId::WorldMap,
+        ElementId::Minimap,
         ElementId::ReleasePrompt,
         ElementId::PartyFrame,
         ElementId::PartyInvite,
@@ -110,7 +112,11 @@ impl ElementId {
             // frame is read mid-fight and never opened, so an open window
             // must not sit on top of it -- the same reason the action bars
             // are in this rank.
-            | ElementId::PartyFrame => 2,
+            | ElementId::PartyFrame
+            // And the minimap with them: it is never opened and never
+            // closed, and a panel that covered it would be hiding the
+            // one frame that says where you are.
+            | ElementId::Minimap => 2,
             ElementId::Loot
             | ElementId::Questgiver
             | ElementId::ReleasePrompt
@@ -193,6 +199,7 @@ impl ElementId {
             ElementId::QuestLog => "quest-log",
             ElementId::Questgiver => "questgiver",
             ElementId::WorldMap => "world-map",
+            ElementId::Minimap => "minimap",
             ElementId::ReleasePrompt => "release-prompt",
             ElementId::PartyFrame => "party-frame",
             ElementId::PartyInvite => "party-invite",
@@ -220,6 +227,7 @@ impl ElementId {
             ElementId::QuestLog => "Quest log",
             ElementId::Questgiver => "Questgiver",
             ElementId::WorldMap => "World map",
+            ElementId::Minimap => "Minimap",
             ElementId::ReleasePrompt => "Release-spirit prompt",
             ElementId::PartyFrame => "Party frame",
             ElementId::PartyInvite => "Party invite",
@@ -330,11 +338,25 @@ impl ElementId {
                 offset: [0.0, 60.0],
                 ..Default::default()
             },
-            // Top right, the one edge nothing else claims -- the spellbook is
-            // centred on the right edge and the bags sit in the corner below
-            // it. A quest log is read *while* moving rather than stopped, so
-            // it wants a corner and not the middle of the view.
+            // Along the top edge, just inside the minimap. The quest log had
+            // the corner itself because nothing else claimed it, and the
+            // minimap's claim is stronger: a log is opened and closed where a
+            // minimap is simply *there*, and there is one place every player
+            // of this game already looks for one.
+            //
+            // Sideways rather than downward, which is not a cosmetic choice.
+            // The right edge below the minimap has the spellbook centred on
+            // it, and a log pushed down starts 150 pixels from it and grows
+            // *towards* it as quests are taken -- so the arrangement would be
+            // correct on an empty log and wrong on a full one, which is the
+            // half nobody tests.
             ElementId::QuestLog => Element {
+                anchor: Anchor::TopRight,
+                offset: [-208.0, 24.0],
+                ..Default::default()
+            },
+            // The top-right corner, where this game has always put it.
+            ElementId::Minimap => Element {
                 anchor: Anchor::TopRight,
                 offset: [-24.0, 24.0],
                 ..Default::default()
