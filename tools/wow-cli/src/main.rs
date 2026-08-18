@@ -420,6 +420,34 @@ enum Command {
         /// `--quest-accept`'s note on `0x018F`).
         #[arg(long)]
         quest_turnin: Option<u32>,
+        /// Ask this player, by name, to join a group.
+        ///
+        /// **The one group request that is answered**, which is why it is the
+        /// first one to send. `SMSG_PARTY_COMMAND_RESULT` comes back whether
+        /// it worked or not, so a deliberately misspelt name is a complete
+        /// test of the opcode and the body on its own: the reply echoes the
+        /// name back, which proves the server read the string out of the
+        /// offset this client wrote it to. Everything else in this block is
+        /// silent, and a silent write fails identically whether the number,
+        /// the body or the permission was wrong.
+        #[arg(long)]
+        party_invite: Option<String>,
+        /// Answer an invite that arrives while holding the connection:
+        /// `accept` or `decline`.
+        ///
+        /// Needs `--stay`, and needs the *other* client to be the one running
+        /// `--party-invite`. A party cannot be made by one session, so this is
+        /// half of a two-client rig and useless alone.
+        #[arg(long)]
+        party_answer: Option<PartyAnswer>,
+        /// Leave the group -- or break it up, if this character leads it --
+        /// after everything else has run.
+        #[arg(long)]
+        party_leave: bool,
+        /// Throw this member out, by name. Resolved to a guid against the
+        /// party list, because the kick request names a guid.
+        #[arg(long)]
+        party_kick: Option<String>,
         /// Dump every field of every occupied quest-log slot.
         ///
         /// **A measurement, not a display.** Only the first field of a slot
@@ -1050,6 +1078,10 @@ fn main() -> Result<()> {
             quest_accept,
             quest_turnin,
             quest_sweep,
+            party_invite,
+            party_answer,
+            party_leave,
+            party_kick,
             quest_log,
             quest_poi,
             questgiver_status,
@@ -1104,6 +1136,10 @@ fn main() -> Result<()> {
                 quest_accept: *quest_accept,
                 quest_turnin: *quest_turnin,
                 quest_sweep: *quest_sweep,
+                party_invite: party_invite.as_deref(),
+                party_answer: *party_answer,
+                party_leave: *party_leave,
+                party_kick: party_kick.as_deref(),
                 quest_log: *quest_log,
                 quest_poi: *quest_poi,
                 questgiver_status: *questgiver_status,
@@ -1282,6 +1318,10 @@ struct WorldRequest<'a> {
     quest_accept: Option<u32>,
     quest_turnin: Option<u32>,
     quest_sweep: Option<u32>,
+    party_invite: Option<&'a str>,
+    party_answer: Option<PartyAnswer>,
+    party_leave: bool,
+    party_kick: Option<&'a str>,
     quest_log: bool,
     quest_poi: bool,
     questgiver_status: bool,
@@ -1312,6 +1352,13 @@ struct WorldRequest<'a> {
     /// wearing a network command's clothes -- see the comment in `main`
     /// about why `World` otherwise never demands a data directory.
     data: Option<&'a std::path::Path>,
+}
+
+/// What to do with a party invite that arrives while holding the connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PartyAnswer {
+    Accept,
+    Decline,
 }
 
 /// Which way to sidestep.
@@ -1384,6 +1431,10 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         quest_accept,
         quest_turnin,
         quest_sweep,
+        party_invite,
+        party_answer,
+        party_leave,
+        party_kick,
         quest_log,
         quest_poi,
         questgiver_status,
@@ -2154,6 +2205,12 @@ cast {spell_id} at {} (attempt {attempt})",
             }
         }
 
+        // Before the hold, deliberately: the invitee is the client that is
+        // holding, so the invite has to go out while they are still watching.
+        if let Some(name) = party_invite {
+            invite_to_party(&mut connection, &mut state, name)?;
+        }
+
         if stay > 0 {
             hold_connection(
                 &mut connection,
@@ -2161,7 +2218,54 @@ cast {spell_id} at {} (attempt {attempt})",
                 &mut state,
                 character.guid,
                 capture.as_mut(),
+                party_answer,
             )?;
+        }
+
+        // After the hold, so there is a group to act on: both of these are
+        // silent requests, and their only evidence is the `SMSG_GROUP_LIST`
+        // that follows.
+        if let Some(name) = party_kick {
+            match state
+                .party
+                .as_ref()
+                .and_then(|p| p.members.iter().find(|m| m.name.eq_ignore_ascii_case(name)))
+                .map(|m| m.guid)
+            {
+                Some(guid) => {
+                    println!("\nthrowing {name:?} ({guid:#018x}) out of the group");
+                    connection.group_uninvite(guid)?;
+                    let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+                    dump_party_packets(&batch);
+                    let report = state.replicate(&batch, None);
+                    print_events(&report, &state, character.guid);
+                }
+                // Named rather than guessed at: the kick request takes a
+                // guid, and inventing one from a name the party does not
+                // hold would send a well-formed request about nobody.
+                None => println!(
+                    "\nno party member called {name:?} -- the group holds {:?}",
+                    state
+                        .party
+                        .as_ref()
+                        .map(|p| p.members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                ),
+            }
+        }
+
+        if party_leave {
+            println!("\nleaving the group");
+            connection.group_disband()?;
+            let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+            dump_party_packets(&batch);
+            let report = state.replicate(&batch, None);
+            print_events(&report, &state, character.guid);
+            // The proof, and it is a state read rather than a packet: the
+            // server says "you are in no group" with an empty
+            // `SMSG_GROUP_LIST`, so what settles this is what the party
+            // *is* afterwards, not that anything arrived.
+            report_party(&state);
         }
 
         if let Some(limit) = units {
@@ -2872,6 +2976,162 @@ fn unit_label(state: &world::WorldState, entity: &world::state::Entity) -> Strin
     }
 }
 
+/// Names the operation a `SMSG_PARTY_COMMAND_RESULT` is answering.
+///
+/// Partial on purpose, like everything else here that turns a number into a
+/// sentence: only the operations this tool actually sends are named, and
+/// anything else comes back as its number rather than as a plausible guess.
+fn describe_party_operation(operation: u32) -> String {
+    match operation {
+        world::PartyOperation::INVITE => "invite".to_string(),
+        world::PartyOperation::UNINVITE => "kick".to_string(),
+        world::PartyOperation::LEAVE => "leave".to_string(),
+        other => format!("party operation {other}"),
+    }
+}
+
+/// Prints the group as it currently stands, with whatever is known about each
+/// member and *where that knowledge came from*.
+///
+/// The source is printed because it is the thing under test. A party member in
+/// view is a fully replicated player and every number is exact; a member out
+/// of view exists only as whatever `SMSG_PARTY_MEMBER_STATS` last said. Those
+/// two look identical on a frame and want completely different investigations
+/// when one of them is wrong.
+fn report_party(state: &world::WorldState) {
+    let Some(party) = state.party.as_ref() else {
+        println!("  party: not in a group");
+        return;
+    };
+    println!(
+        "  party: group {:#018x} (type {:#04x}, update #{}), {} other member(s), leader {:#018x}",
+        party.guid,
+        party.group_type,
+        party.counter,
+        party.members.len(),
+        party.leader
+    );
+    for member in &party.members {
+        let vitals = state.party_member_vitals(member.guid);
+        let health = match (vitals.health, vitals.max_health) {
+            (Some(now), Some(max)) => format!("{now}/{max}"),
+            (Some(now), None) => format!("{now}/?"),
+            _ => "?/?".to_string(),
+        };
+        // Printed with its *type*, because the pair is meaningless without
+        // it: `0/1000` is a full rage bar's worth of nothing for a warrior
+        // and an empty mana pool for a mage, and the number that separates
+        // them is the one a client defaulting to zero would have invented.
+        // A `?` here is a real state -- a member out of view whose stats
+        // packet has not arrived has no power fields at all.
+        let power = match (vitals.power, vitals.max_power, vitals.power_type) {
+            (Some(now), Some(max), Some(kind)) => format!("{now}/{max} type {kind}"),
+            (Some(now), Some(max), None) => format!("{now}/{max} type ?"),
+            _ => "?/?".to_string(),
+        };
+        println!(
+            "    {:<14} {:#018x}  status {:#04x}{}{}  hp {health}  power {power}  level {}  zone {}  [{}]",
+            member.name,
+            member.guid,
+            member.status,
+            if member.is_online() { " online" } else { " OFFLINE" },
+            if member.is_dead() { " dead" } else { "" },
+            vitals
+                .level
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            vitals
+                .zone
+                .map(|z| z.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            if vitals.in_view {
+                "replicated"
+            } else {
+                "party packets only"
+            }
+        );
+        if party.is_leader(member.guid) {
+            println!("      (leads the group)");
+        }
+    }
+    if let Some(loot) = party.loot {
+        println!(
+            "    loot: method {}, threshold {}, master {:#018x}, difficulty {}/{}",
+            loot.method, loot.threshold, loot.master, loot.dungeon_difficulty, loot.raid_difficulty
+        );
+    }
+}
+
+/// Prints the raw bytes of anything party-shaped in a batch.
+///
+/// **Bodies, not lengths.** Every layout in `world::group` was measured from a
+/// live capture rather than transcribed, and the moment this stops dumping
+/// them is the moment the next unrecognised shape becomes invisible -- which
+/// is exactly how a 46-byte swing was seen and lost once already.
+fn dump_party_packets(batch: &[world::client::Packet]) {
+    use world::opcode::server;
+    const PARTY_OPCODES: [u16; 9] = [
+        server::GROUP_INVITE,
+        server::GROUP_LIST,
+        server::PARTY_COMMAND_RESULT,
+        server::PARTY_MEMBER_STATS,
+        server::PARTY_MEMBER_STATS_FULL,
+        server::GROUP_UNINVITE,
+        server::GROUP_DESTROYED,
+        server::GROUP_CANCEL,
+        server::GROUP_DECLINE,
+    ];
+    for packet in batch {
+        if !PARTY_OPCODES.contains(&packet.opcode) {
+            continue;
+        }
+        println!(
+            "  raw {} ({:#06x}), {} bytes: {}",
+            world::opcode::describe(packet.opcode),
+            packet.opcode,
+            packet.body.len(),
+            hex_preview(&packet.body, 256)
+        );
+    }
+}
+
+/// Asks a player by name to join the group, and reports what came back.
+///
+/// **The one group request that is answered**, and therefore the one worth
+/// building a probe around. `SMSG_PARTY_COMMAND_RESULT` arrives whether the
+/// invite worked or not, which is what separates the three failures that
+/// otherwise look identical: an opcode the server did not understand, a body
+/// it could not read, and a request it understood and declined. A misspelt
+/// name is a complete test on its own -- the reply echoes the string back, so
+/// getting it at all proves the server read it from the offset written here.
+fn invite_to_party(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    name: &str,
+) -> Result<()> {
+    println!("\ninviting {name:?} to the group");
+    connection.group_invite(name)?;
+    // Give the server time to answer before concluding it ignored us. A
+    // packet sent immediately before a disconnect is often never processed,
+    // and that has been mistaken for a wrong opcode in this tool before.
+    let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+    dump_party_packets(&batch);
+    let report = state.replicate(&batch, None);
+    print_events(&report, state, 0);
+    if report.party_results.is_empty() {
+        println!("  nothing answered. Three things look exactly like this and");
+        println!("  want opposite investigations: the opcode was not understood,");
+        println!("  the body was read at the wrong offsets, or the server is");
+        println!("  taking longer than the drain waited. The first two are");
+        println!("  separable by inviting a name that certainly does not exist --");
+        println!("  a refusal is still an answer.");
+    }
+    for failure in &report.failures {
+        println!("  undecodable {}: {}", world::opcode::describe(failure.0), failure.1);
+    }
+    Ok(())
+}
+
 /// Prints everything a fold *returns* rather than stores: chat and swings.
 ///
 /// One function because there are now three places that drain packets, and
@@ -2880,6 +3140,25 @@ fn unit_label(state: &world::WorldState, entity: &world::state::Entity) -> Strin
 /// summary reading "0 attacks started, 2 stopped" -- impossible, and caused by
 /// the approach loop folding the starts and discarding the report.
 fn print_events(report: &world::Replication, state: &world::WorldState, own_guid: u64) {
+    // First, because it is the only answer any group request gets. Every
+    // outgoing party message but the invite is silent, so a party result
+    // dropped here puts this tool straight back into the failure mode the
+    // whole block was built to escape.
+    for result in &report.party_results {
+        println!(
+            "  party: {} -> {}{}",
+            describe_party_operation(result.operation),
+            world::group::describe_party_result(result.result),
+            if result.member.is_empty() {
+                String::new()
+            } else {
+                format!(" (about {:?})", result.member)
+            }
+        );
+    }
+    if report.party_lists > 0 {
+        report_party(state);
+    }
     for message in &report.chat {
         println!("  {}", describe_chat(message, state));
     }
@@ -6014,6 +6293,11 @@ fn hold_connection(
     state: &mut world::WorldState,
     own_guid: u64,
     mut capture: Option<&mut Capture>,
+    // What to do about a party invite that arrives while holding. This is the
+    // invitee half of the two-client rig, and it has to live inside the hold
+    // rather than beside it: an invite can only be answered while it is open,
+    // and it arrives on the other client's schedule, not this one's.
+    party_answer: Option<PartyAnswer>,
 ) -> Result<()> {
     // Not tunable: pinging faster gets the session killed. See PING_INTERVAL.
     const PING_EVERY: std::time::Duration = world::client::PING_INTERVAL;
@@ -6052,11 +6336,37 @@ fn hold_connection(
             capture.record(&batch)?;
         }
 
+        dump_party_packets(&batch);
+
         let report = state.replicate(&batch, None);
         totals.object_updates += report.object_updates;
         totals.monster_moves += report.monster_moves;
         totals.relayed_moves += report.relayed_moves;
         totals.names += report.names;
+        totals.party_lists += report.party_lists;
+        totals.party_stat_updates += report.party_stat_updates;
+
+        // Answered here, inside the loop, because an invite is only
+        // answerable while it is open. `WorldState` clears it as soon as any
+        // group list arrives, so a check after the hold would find nothing
+        // and report a silence that never happened.
+        if let (Some(answer), Some(invite)) = (party_answer, state.party_invite.as_ref()) {
+            let from = invite.from.clone();
+            match answer {
+                PartyAnswer::Accept => {
+                    println!("  invite from {from:?} -- accepting");
+                    connection.group_accept()?;
+                }
+                PartyAnswer::Decline => {
+                    println!("  invite from {from:?} -- declining");
+                    connection.group_decline()?;
+                }
+            }
+            // Cleared locally too. The accept is silent, and the group list
+            // that confirms it takes a moment to arrive; without this the
+            // next iteration sends a second accept for the same invite.
+            state.party_invite = None;
+        }
         // Printed as it arrives rather than summarised at the end: the whole
         // point of holding the connection is to see whether the other client's
         // line comes through, and a count of two would not say what was said.

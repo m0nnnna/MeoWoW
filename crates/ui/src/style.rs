@@ -353,6 +353,46 @@ pub struct Style {
     /// stand out against `background` rather than blend into the rest of the
     /// frame furniture.
     pub release_prompt_text: Color,
+
+    /// Width of the party frame at scale 1.0. Deliberately narrower than
+    /// `frame_width`: a party row carries a name, a level and two thin bars,
+    /// where a unit frame carries the same thing at a size meant to be read
+    /// mid-fight from the corner of the eye.
+    pub party_width: f32,
+    /// Height of one party bar. Its own dimension rather than `bar_height`,
+    /// because a party frame draws up to eight bars where a unit frame draws
+    /// two, and a height that suits two stacks into a wall.
+    pub party_bar_height: f32,
+    /// The gap between a member's health and power bars, as against `gap`,
+    /// which separates whole members. Two distances doing different jobs:
+    /// with one value the rows run together and the frame reads as eight
+    /// unrelated bars rather than as three or four people.
+    pub party_bar_gap: f32,
+    /// A member who is in the group and not connected.
+    ///
+    /// Distinct from `text_dead` and not a reuse of it, for the same reason
+    /// `text_ghost` is distinct: offline and dead are independent states -- a
+    /// member can be both -- and a shared colour would make the two
+    /// indistinguishable exactly when the difference decides whether waiting
+    /// is worth it.
+    pub party_offline: Color,
+    /// Drawn before the group leader's name. **A mark rather than a colour**:
+    /// a party row already spends colour on offline and dead, and a fourth
+    /// meaning on the same channel would be unreadable. A `char` rather than a
+    /// `String` because [`Style`] is `Copy`.
+    pub party_leader_mark: char,
+
+    /// Width of the invite prompt at scale 1.0.
+    pub party_invite_width: f32,
+    /// Height of its Accept and Decline buttons.
+    pub party_invite_button_height: f32,
+    /// The prompt's outline. Picked to stand out against `background` rather
+    /// than blend in, on the same reasoning as `release_prompt_text`: a prompt
+    /// that has to be answered and is not noticed reads as an invite that was
+    /// never sent.
+    pub party_invite_border: Color,
+    pub party_invite_accept: Color,
+    pub party_invite_decline: Color,
 }
 
 impl Default for Style {
@@ -459,6 +499,18 @@ impl Default for Style {
 
             release_prompt_width: 260.0,
             release_prompt_text: Color::rgb(230, 90, 70),
+
+            party_width: 190.0,
+            party_bar_height: 12.0,
+            party_bar_gap: 2.0,
+            party_offline: Color::rgb(130, 134, 146),
+            party_leader_mark: '\u{2726}',
+
+            party_invite_width: 300.0,
+            party_invite_button_height: 24.0,
+            party_invite_border: Color::rgb(240, 190, 70),
+            party_invite_accept: Color::rgb(90, 200, 110),
+            party_invite_decline: Color::rgb(230, 120, 100),
         }
     }
 }
@@ -521,6 +573,11 @@ impl Style {
         self.combat_text_size = self.combat_text_size.clamp(6.0, 72.0);
         self.combat_text_rise = self.combat_text_rise.clamp(0.0, 400.0);
         self.combat_text_lifetime_ms = self.combat_text_lifetime_ms.clamp(100, 10_000);
+        self.party_width = self.party_width.clamp(60.0, 1200.0);
+        self.party_bar_height = self.party_bar_height.clamp(2.0, 200.0);
+        self.party_bar_gap = self.party_bar_gap.clamp(0.0, 60.0);
+        self.party_invite_width = self.party_invite_width.clamp(120.0, 1200.0);
+        self.party_invite_button_height = self.party_invite_button_height.clamp(8.0, 200.0);
         before != *self
     }
 }

@@ -43,6 +43,46 @@ pub fn unit_view(entity: &::world::state::Entity, name: String) -> ui::UnitView 
     }
 }
 
+/// A target frame for a party member who is not currently a replicated
+/// object -- the case this whole milestone exists for, and the one
+/// [`unit_view`] cannot serve because it reads fields off an `Entity` that
+/// does not exist here.
+///
+/// Built from [`::world::state::WorldState::party_member_vitals`], which is
+/// exactly what the party frame itself reads. The power bar is the one field
+/// that does not simply carry an `Option`'s absence through as zero: **a
+/// known `max_power` with an unknown `power_type` is drawn as no bar at all,
+/// not a mana-coloured guess.** `power_type` is an index, and the party
+/// packet can report a changed maximum before it has ever reported the type
+/// -- see [`::world::state::PartyVitals::power_type`]'s own doc comment,
+/// which is the field this project already found could be silently wrong.
+///
+/// `None` when the guid does not name a current party member, so a stale
+/// target from a group that has since disbanded does not linger as a frame
+/// with nothing behind it.
+pub fn party_target_view(state: &::world::WorldState, guid: u64) -> Option<ui::UnitView> {
+    let party = state.party.as_ref()?;
+    let member = party.member(guid)?;
+    let vitals = state.party_member_vitals(guid);
+    let (power, max_power, power_type) =
+        match (vitals.power, vitals.max_power, vitals.power_type) {
+            (Some(power), Some(max_power), Some(power_type)) => {
+                (power, max_power, ui::PowerType::from_id(power_type))
+            }
+            _ => (0, 0, ui::PowerType::default()),
+        };
+    Some(ui::UnitView {
+        name: member.name.clone(),
+        level: vitals.level,
+        health: vitals.health.unwrap_or(0),
+        max_health: vitals.max_health.unwrap_or(0),
+        power,
+        max_power,
+        power_type,
+        ghost: member.status & ::world::group::MemberStatus::GHOST != 0,
+    })
+}
+
 /// What to call a unit.
 ///
 /// 3.3.5a puts no name in an object update: a player's comes from
@@ -224,6 +264,151 @@ pub fn names_to_ask(
         }
     }
     asking
+}
+
+
+/// Turns the replicated group into the rows the party frame draws.
+///
+/// **Two sources per member, and which one answers is not the caller's
+/// choice.** `world::WorldState::party_member_vitals` prefers the replicated
+/// entity where there is one and falls back to what
+/// `SMSG_PARTY_MEMBER_STATS` last said where there is not -- so a member
+/// standing next to you shows exact, current numbers and a member two zones
+/// away shows a remembered summary rather than a blank. Every one of those
+/// numbers is an `Option` all the way to the screen, because a member who has
+/// never been in view and whose stats packet has not arrived is a real and
+/// common state: a name and a guid and nothing else.
+///
+/// The **name** does not come from the name cache. A group list carries every
+/// member's name in the packet itself, which is the one thing the party
+/// protocol knows that the entity table cannot -- an unreplicated player is
+/// not in the cache at all, and asking for their name by guid would leave the
+/// frame reading `Player 3` until the reply arrived.
+pub fn party_view(state: &::world::WorldState) -> Vec<ui::PartyMemberView> {
+    let Some(party) = state.party.as_ref() else {
+        return Vec::new();
+    };
+    party
+        .members
+        .iter()
+        .map(|member| {
+            let vitals = state.party_member_vitals(member.guid);
+            ui::PartyMemberView {
+                name: member.name.clone(),
+                guid: member.guid,
+                level: vitals.level,
+                health: vitals.health,
+                max_health: vitals.max_health,
+                power: vitals.power,
+                max_power: vitals.max_power,
+                // Mapped only where one arrived. `PowerType::from_id` turns
+                // every number into a variant, so a `unwrap_or_default` here
+                // would silently promote "not known" to mana and paint a
+                // rogue's frame blue with nothing ever saying it was a guess.
+                power_type: vitals.power_type.map(ui::PowerType::from_id),
+                online: member.is_online(),
+                dead: member.is_dead(),
+                leader: party.is_leader(member.guid),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod party_tests {
+    use ::world::group::{MemberStatus, Party, PartyMember};
+
+    fn member(name: &str, guid: u64, status: u8) -> PartyMember {
+        PartyMember {
+            name: name.to_string(),
+            guid,
+            status,
+            subgroup: 0,
+            flags: 0,
+            roles: 0,
+        }
+    }
+
+    fn party(members: Vec<PartyMember>, leader: u64) -> Party {
+        Party {
+            group_type: 0,
+            own_subgroup: 0,
+            own_flags: 0,
+            own_roles: 0,
+            guid: 0x1f50,
+            counter: 1,
+            members,
+            leader,
+            loot: None,
+        }
+    }
+
+    /// A member the client has never seen and never had a stats packet about
+    /// reaches the frame as a row of `None`s -- **not as a row of zeroes**.
+    /// That distinction is the whole reason the vitals are `Option`s, and it
+    /// is invisible one layer down: a `unwrap_or(0)` here would draw a party
+    /// of people who all look dead, and nothing about the picture would say
+    /// the numbers were invented.
+    #[test]
+    fn an_unreplicated_member_carries_no_numbers() {
+        let mut state = ::world::WorldState::default();
+        state.party = Some(party(
+            vec![member("Watcher", 3, MemberStatus::ONLINE)],
+            1,
+        ));
+        let rows = super::party_view(&state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Watcher", "the name comes from the packet");
+        assert_eq!(rows[0].guid, 3);
+        assert_eq!(rows[0].health, None, "an absent health became a zero");
+        assert_eq!(rows[0].max_health, None);
+        assert_eq!(rows[0].level, None);
+        assert_eq!(
+            rows[0].power_type, None,
+            "an absent power type became mana"
+        );
+        assert!(rows[0].online);
+        assert!(!rows[0].dead);
+        assert!(!rows[0].leader, "the leader is guid 1, not this member");
+    }
+
+    /// What the party packet states about a member is drawn from the party
+    /// packet, whatever the entity table does or does not hold: online, dead
+    /// and leader are all in every group list, for every member, on every
+    /// send.
+    #[test]
+    fn status_and_leadership_come_from_the_group_list() {
+        let mut state = ::world::WorldState::default();
+        state.party = Some(party(
+            vec![
+                member("Watcher", 3, MemberStatus::ONLINE),
+                member("Huntertest", 4, MemberStatus::ONLINE | MemberStatus::DEAD),
+                member("Testdruid", 5, 0),
+            ],
+            3,
+        ));
+        let rows = super::party_view(&state);
+        assert!(rows[0].leader, "the leader's own row must say so");
+        assert!(!rows[1].leader);
+
+        assert!(rows[1].dead, "a dead member read as alive");
+        assert!(rows[1].online, "dead is not offline");
+
+        assert!(!rows[2].online, "an offline member read as connected");
+        assert!(
+            !rows[2].dead,
+            "offline is not dead -- a shared flag would make waiting pointless"
+        );
+    }
+
+    /// No group is no rows, and it must not be one blank row: an empty frame
+    /// and a frame with a member nothing is known about would otherwise be
+    /// the same picture.
+    #[test]
+    fn no_group_is_no_rows() {
+        let state = ::world::WorldState::default();
+        assert!(super::party_view(&state).is_empty());
+    }
 }
 
 /// One name query waiting to be sent.
@@ -620,5 +805,98 @@ mod tests {
         assert_eq!(view.max_health, 0);
         assert!(!view.has_power(), "no power type means no power bar");
         assert_eq!(view.health_fraction(), 0.0);
+    }
+
+    fn a_party_of_watcher() -> ::world::state::WorldState {
+        let mut state = ::world::state::WorldState::default();
+        state.party = Some(::world::group::Party {
+            group_type: 0,
+            own_subgroup: 0,
+            own_flags: 0,
+            own_roles: 0,
+            guid: 0x1f50,
+            counter: 1,
+            members: vec![::world::group::PartyMember {
+                name: "Watcher".into(),
+                guid: 3,
+                status: ::world::group::MemberStatus::ONLINE,
+                subgroup: 0,
+                flags: 0,
+                roles: 0,
+            }],
+            leader: 1,
+            loot: None,
+        });
+        state
+    }
+
+    /// Not a party member at all -- an old target from a group that has
+    /// since disbanded, say -- draws nothing rather than an empty frame.
+    #[test]
+    fn party_target_view_is_none_for_a_stranger() {
+        let state = ::world::state::WorldState::default();
+        assert!(party_target_view(&state, 3).is_none());
+    }
+
+    /// The ordinary case: a party member with a full stats packet on file
+    /// gives the target frame everything it needs, unreplicated or not.
+    #[test]
+    fn party_target_view_reads_the_party_packet() {
+        let mut state = a_party_of_watcher();
+        state.party_stats.insert(
+            3,
+            ::world::group::MemberStats {
+                guid: 3,
+                mask: 0,
+                status: None,
+                health: Some(60),
+                max_health: Some(60),
+                power_type: Some(1),
+                power: Some(0),
+                max_power: Some(1000),
+                level: Some(1),
+                zone: Some(12),
+                position: None,
+            },
+        );
+        let view = party_target_view(&state, 3).expect("Watcher is a party member");
+        assert_eq!(view.name, "Watcher");
+        assert_eq!(view.health, 60);
+        assert_eq!(view.max_health, 60);
+        assert_eq!(view.max_power, 1000);
+        assert!(view.has_power());
+        assert_eq!(view.power_type, ui::PowerType::Rage, "type 1 is rage, not mana");
+    }
+
+    /// **The case this function exists to get right.** A `max_power` can
+    /// arrive before the `power_type` that says what it is -- the two are
+    /// independent fields in a mask-driven packet -- and drawing a bar in
+    /// that state would silently colour it mana, which is the exact bug
+    /// `PartyVitals::power_type` was made an `Option` to prevent. No known
+    /// type has to mean no bar, not a guessed one.
+    #[test]
+    fn an_unknown_power_type_draws_no_bar_even_with_a_known_maximum() {
+        let mut state = a_party_of_watcher();
+        state.party_stats.insert(
+            3,
+            ::world::group::MemberStats {
+                guid: 3,
+                mask: 0,
+                status: None,
+                health: Some(60),
+                max_health: Some(60),
+                power_type: None,
+                power: Some(0),
+                max_power: Some(1000),
+                level: Some(1),
+                zone: Some(12),
+                position: None,
+            },
+        );
+        let view = party_target_view(&state, 3).expect("Watcher is a party member");
+        assert!(
+            !view.has_power(),
+            "a maximum with no known type drew a bar anyway"
+        );
     }
 }

@@ -2989,6 +2989,32 @@ struct PendingCombatText {
 /// Sharing the wire type means the scrollback has one thing in it and one way
 /// to render it, rather than an enum whose second arm is easy to forget when
 /// the rendering changes.
+/// One `SMSG_PARTY_COMMAND_RESULT` as a line for the scrollback.
+///
+/// The operation and the code are both named only where this client has
+/// actually seen them, and both fall back to their number -- the same rule
+/// `world::group::describe_party_result` follows and for the same reason: a
+/// wrong offset fails loudly, a wrong *name* for a status code never does.
+///
+/// The member's name is put in only when the packet carried one. The server
+/// echoes back the name that was asked for, which is what makes a refused
+/// invite say *who* it was refused for -- and it is empty for the operations
+/// that are not about anybody.
+fn describe_party_result(result: &::world::PartyCommandResult) -> String {
+    let operation = match result.operation {
+        ::world::PartyOperation::INVITE => "invite",
+        ::world::PartyOperation::UNINVITE => "removal",
+        ::world::PartyOperation::LEAVE => "leaving",
+        _ => "group request",
+    };
+    let outcome = ::world::group::describe_party_result(result.result);
+    if result.member.is_empty() {
+        format!("{operation}: {outcome}")
+    } else {
+        format!("{operation} of {}: {outcome}", result.member)
+    }
+}
+
 fn local_notice(text: String) -> ::world::ChatMessage {
     ::world::ChatMessage {
         chat_type: ::world::ChatType::System,
@@ -4780,8 +4806,227 @@ impl App {
         }
     }
 
+    /// Runs a slash command, or reports that it is not one.
+    ///
+    /// **`/` and not `.`**, and the difference is not cosmetic: a message
+    /// beginning with `.` is a *server* command, parsed by the realm's own
+    /// chat handler, which is how this client sends GM commands today. A
+    /// message beginning with `/` is this client's, handled here and never
+    /// sent. Sharing one prefix would mean guessing which end a line was meant
+    /// for, and guessing wrong sends `/invite Watcher` out loud to everyone
+    /// standing nearby.
+    ///
+    /// Every party request but the invite is **silent** -- the server
+    /// acknowledges none of them -- so each of these says locally what it
+    /// asked for. Without that, a `/leave` sent while not in a group and a
+    /// `/leave` the server declined look identical, which is the failure mode
+    /// the whole `world::group` block was written to escape.
+    ///
+    /// Returns `true` when the line was a command and has been dealt with.
+    fn run_command(&mut self, line: &str) -> bool {
+        let Some(rest) = line.strip_prefix('/') else {
+            return false;
+        };
+        let (word, argument) = match rest.split_once(char::is_whitespace) {
+            Some((word, argument)) => (word, argument.trim()),
+            None => (rest, ""),
+        };
+        let word = word.to_ascii_lowercase();
+
+        // Named rather than derived: a party command sent with no group is a
+        // request the server will refuse in silence, and saying so here is
+        // the difference between "nothing happened" and "you are not in a
+        // group".
+        let in_group = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.party.as_ref())
+            .is_some_and(|party| party.in_group());
+
+        match word.as_str() {
+            "invite" | "i" => {
+                if argument.is_empty() {
+                    self.notice("usage: /invite <name>".into());
+                } else {
+                    self.invite_to_party(argument);
+                }
+            }
+            // One opcode does both, and the server decides which -- see
+            // `ClientOpcode::GroupDisband`. Both spellings are accepted
+            // because a leader typing `/leave` means the same thing.
+            "leave" | "disband" => {
+                if !in_group {
+                    self.notice("you are not in a group.".into());
+                } else {
+                    self.leave_party();
+                }
+            }
+            "kick" | "uninvite" => {
+                if argument.is_empty() {
+                    self.notice("usage: /kick <name>".into());
+                } else {
+                    self.kick_from_party(argument);
+                }
+            }
+            "promote" | "leader" => {
+                if argument.is_empty() {
+                    self.notice("usage: /promote <name>".into());
+                } else {
+                    self.promote_in_party(argument);
+                }
+            }
+            // Said rather than refused: a client that swallowed every
+            // unrecognised slash line would make a typo indistinguishable
+            // from a command that did nothing.
+            other => self.notice(format!("no such command: /{other}")),
+        }
+        true
+    }
+
+    /// A line only this client says, in the scrollback where speaking happens.
+    fn notice(&mut self, text: String) {
+        self.chat.push(Line::Chat(local_notice(text)));
+    }
+
+    /// Asks a player, by name, to join the group.
+    ///
+    /// **The one group request that is answered**, which is why it is the one
+    /// with nothing to report locally: `SMSG_PARTY_COMMAND_RESULT` comes back
+    /// whether it worked or not, and that reply is drawn into the scrollback
+    /// where it arrives. Saying "invited Watcher" here as well would state as
+    /// fact the thing the reply is about to answer.
+    fn invite_to_party(&mut self, name: &str) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.group_invite(name) {
+            tracing::warn!("sending a group invite failed: {e:#}");
+            self.notice(format!("could not invite: {e}"));
+        }
+    }
+
+    /// Leaves the group, or breaks it up if this character leads it.
+    fn leave_party(&mut self) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.group_disband() {
+            tracing::warn!("leaving the group failed: {e:#}");
+            self.notice(format!("could not leave: {e}"));
+            return;
+        }
+        // Nothing local changes here. **The proof a leave worked is the
+        // `SMSG_GROUP_LIST` that follows**, which is the server saying the
+        // character is in no group -- clearing the party here as well would
+        // make a refused request look exactly like an accepted one.
+        self.notice("leaving the group.".into());
+    }
+
+    /// Throws a member out, resolving the name against the group.
+    ///
+    /// **The request names a guid**, so a name that is not in the party is
+    /// refused here rather than sent: inventing a guid from a name the group
+    /// does not hold would produce a well-formed request about nobody, and
+    /// nothing acknowledges a kick.
+    fn kick_from_party(&mut self, name: &str) {
+        match self.party_guid(name) {
+            Some(guid) => {
+                let Some(live) = self.live.as_mut() else {
+                    return;
+                };
+                if let Err(e) = live.connection.group_uninvite(guid) {
+                    tracing::warn!("kicking from the group failed: {e:#}");
+                    self.notice(format!("could not kick: {e}"));
+                } else {
+                    self.notice(format!("removing {name} from the group."));
+                }
+            }
+            None => self.notice(format!("{name} is not in your group.")),
+        }
+    }
+
+    /// Hands leadership to another member, by guid for the same reason.
+    fn promote_in_party(&mut self, name: &str) {
+        match self.party_guid(name) {
+            Some(guid) => {
+                let Some(live) = self.live.as_mut() else {
+                    return;
+                };
+                if let Err(e) = live.connection.group_set_leader(guid) {
+                    tracing::warn!("promoting a group member failed: {e:#}");
+                    self.notice(format!("could not promote: {e}"));
+                } else {
+                    self.notice(format!("making {name} the group leader."));
+                }
+            }
+            None => self.notice(format!("{name} is not in your group.")),
+        }
+    }
+
+    /// A party member's guid, by name, case-insensitively.
+    ///
+    /// Reads the group list rather than the entity table on purpose: a member
+    /// in another zone is not a replicated object at all, and looking them up
+    /// among the things in visibility range would make kicking somebody
+    /// depend on standing next to them.
+    fn party_guid(&self, name: &str) -> Option<u64> {
+        self.live
+            .as_ref()?
+            .state
+            .party
+            .as_ref()?
+            .members
+            .iter()
+            .find(|member| member.name.eq_ignore_ascii_case(name))
+            .map(|member| member.guid)
+    }
+
+    /// Answers the invite currently on screen.
+    ///
+    /// The pending invite is cleared here as well as by the server's reply,
+    /// and that is not belt-and-braces: an accept is **silent**, and the group
+    /// list confirming it takes a moment to arrive. Without clearing it the
+    /// prompt stays up and a second click sends a second answer.
+    fn answer_party_invite(&mut self, answer: ui::InviteAnswer) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let from = live
+            .state
+            .party_invite
+            .as_ref()
+            .map(|invite| invite.from.clone());
+        let sent = match answer {
+            ui::InviteAnswer::Accept => live.connection.group_accept(),
+            ui::InviteAnswer::Decline => live.connection.group_decline(),
+        };
+        live.state.party_invite = None;
+        match sent {
+            Ok(()) => {
+                if let Some(from) = from {
+                    let verb = match answer {
+                        ui::InviteAnswer::Accept => "joining",
+                        ui::InviteAnswer::Decline => "declining",
+                    };
+                    self.notice(format!("{verb} {from}'s group."));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("answering a group invite failed: {e:#}");
+                self.notice(format!("could not answer the invite: {e}"));
+            }
+        }
+    }
+
     /// Sends a line of chat, and says so locally if it cannot be sent.
+    ///
+    /// A line beginning with `/` never reaches the wire -- see
+    /// [`Self::run_command`] for why this client's own commands take a
+    /// different prefix from the server's.
     fn send_chat(&mut self, line: &str) {
+        if self.run_command(line) {
+            return;
+        }
         let Some(live) = self.live.as_mut() else {
             return;
         };
@@ -6116,6 +6361,9 @@ impl App {
         // the same reason: filing them touches `self` as a whole.
         let mut greetings: Vec<::world::Gossip> = Vec::new();
         let mut offered: Vec<u32> = Vec::new();
+        // Same shape again: pushing a line into the scrollback touches
+        // `self.chat`, and `live` is borrowed for the whole drain.
+        let mut party_results: Vec<String> = Vec::new();
         match live.connection.drain(Duration::from_millis(1), 64) {
             // Every batch has to go through all the kinds of change replicate
             // handles -- object updates, relayed movement, monster moves,
@@ -6478,6 +6726,19 @@ impl App {
                         }
                     }
                 }
+                // **The only answer any group request gets**, and it is
+                // returned rather than stored, which is exactly the shape
+                // three separate callers dropped chat in. Every outgoing
+                // party message but the invite is silent, so a result thrown
+                // away here puts the interface back into the failure mode the
+                // whole `world::group` block exists to escape: a send that
+                // fails identically whether the opcode, the body or the
+                // permission was wrong.
+                for result in &report.party_results {
+                    let line = describe_party_result(result);
+                    tracing::info!("party: {line}");
+                    party_results.push(line);
+                }
                 for message in &report.chat {
                     if message.sender != 0 && message.sender_name.is_none() {
                         unknown_speakers.push(message.sender);
@@ -6494,6 +6755,10 @@ impl App {
                 }
             }
             Err(e) => tracing::warn!("draining the live connection failed: {e:#}"),
+        }
+
+        for line in party_results {
+            self.chat.push(Line::Chat(local_notice(line)));
         }
 
         if let Some(questgiver) = self.questgiver.as_mut() {
@@ -6674,7 +6939,15 @@ impl App {
         // indistinguishable from one that had stopped updating. Not sent to
         // the server: it removed the object itself, and cleared its own copy
         // of this selection when it did.
-        if self.target.is_some_and(|guid| live.state.get(guid).is_none()) {
+        //
+        // A party member out of visibility range was often never replicated
+        // to begin with, which `WorldState::still_targetable` treats as a
+        // reason to keep the selection rather than clear it -- see its doc
+        // comment for the bug this used to be.
+        if self
+            .target
+            .is_some_and(|guid| !live.state.still_targetable(guid))
+        {
             self.target = None;
         }
 
@@ -6806,8 +7079,14 @@ impl App {
         });
         let target = self.target.and_then(|guid| {
             let live = self.live.as_ref()?;
-            let entity = live.state.get(guid)?;
-            Some(hud::unit_view(entity, hud::unit_name(&live.state, entity)))
+            match live.state.get(guid) {
+                Some(entity) => Some(hud::unit_view(entity, hud::unit_name(&live.state, entity))),
+                // Out of visibility range is not out of the group: a party
+                // member's frame falls back to the party packet, and the
+                // target frame agreeing with it is the whole point of
+                // targeting one by clicking their row rather than the world.
+                None => hud::party_target_view(&live.state, guid),
+            }
         });
 
         // In egui's points rather than physical pixels, for both the marker
@@ -7449,6 +7728,24 @@ impl App {
 
         let questgiver_view = self.questgiver_view();
 
+        // Both off replicated state, so a party that changed this frame is
+        // drawn this frame. The rows are built from the *group list's* names
+        // rather than the name cache -- an unreplicated member is not in the
+        // cache at all. See `hud::party_view`.
+        let party = self
+            .live
+            .as_ref()
+            .map(|live| hud::party_view(&live.state))
+            .unwrap_or_default();
+        let party_invite = self.live.as_ref().and_then(|live| {
+            live.state
+                .party_invite
+                .as_ref()
+                .map(|invite| ui::PartyInviteView {
+                    from: invite.from.clone(),
+                })
+        });
+
         let mut hud_response = ui::HudResponse::default();
         let spellbook_open = self.spellbook_open;
         let bags_open = self.bags_open;
@@ -7496,6 +7793,11 @@ impl App {
                     // says a corpse is open.
                     loot: (!loot.is_empty()).then_some(loot.as_slice()),
                     release_prompt: release_prompt.as_ref(),
+                    // Emptiness is the flag, like the loot window: there is
+                    // no separate "in a group" boolean that could disagree
+                    // with the list.
+                    party: &party,
+                    party_invite: party_invite.as_ref(),
                 },
             );
 
@@ -7705,6 +8007,25 @@ impl App {
         }
         if hud_response.questgiver.closed {
             self.questgiver = None;
+        }
+
+        // Clicking a party row targets that member. **A guid, not a row** --
+        // and it goes through the same `set_target` a click in the world does,
+        // so the selection the server is told about cannot disagree with the
+        // one the target frame draws.
+        //
+        // Nothing checks whether the member is in visibility range: a
+        // selection is the server's to accept or refuse, and refusing it here
+        // would make targeting a party member depend on standing next to
+        // them, which is the opposite of what a party frame is for.
+        if let Some(guid) = hud_response.party_target {
+            self.set_target(Some(guid));
+            self.pending_sounds.push((sound::INTERFACE_CLICK, false));
+        }
+
+        if let Some(answer) = hud_response.party_invite {
+            self.answer_party_invite(answer);
+            self.pending_sounds.push((sound::INTERFACE_CLICK, false));
         }
 
         if hud_response.layout_changed {

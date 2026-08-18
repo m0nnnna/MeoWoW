@@ -47,10 +47,12 @@ pub enum ElementId {
     Questgiver,
     WorldMap,
     ReleasePrompt,
+    PartyFrame,
+    PartyInvite,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 15] = [
+    pub const ALL: [ElementId; 17] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -66,6 +68,8 @@ impl ElementId {
         ElementId::Questgiver,
         ElementId::WorldMap,
         ElementId::ReleasePrompt,
+        ElementId::PartyFrame,
+        ElementId::PartyInvite,
     ];
 
     /// What order the frames are drawn in, lowest first.
@@ -101,8 +105,19 @@ impl ElementId {
             | ElementId::CastBar
             | ElementId::ActionBar1
             | ElementId::ActionBar2
-            | ElementId::ActionBar3 => 2,
-            ElementId::Loot | ElementId::Questgiver | ElementId::ReleasePrompt => 3,
+            | ElementId::ActionBar3
+            // With the always-there frames, not with the panels: a party
+            // frame is read mid-fight and never opened, so an open window
+            // must not sit on top of it -- the same reason the action bars
+            // are in this rank.
+            | ElementId::PartyFrame => 2,
+            ElementId::Loot
+            | ElementId::Questgiver
+            | ElementId::ReleasePrompt
+            // Top rank, with the other windows that appeared because
+            // something happened and want an answer. An invite times out, so
+            // one sealed under a map is one the player never gets to take.
+            | ElementId::PartyInvite => 3,
         }
     }
 
@@ -179,6 +194,8 @@ impl ElementId {
             ElementId::Questgiver => "questgiver",
             ElementId::WorldMap => "world-map",
             ElementId::ReleasePrompt => "release-prompt",
+            ElementId::PartyFrame => "party-frame",
+            ElementId::PartyInvite => "party-invite",
         }
     }
 
@@ -204,6 +221,8 @@ impl ElementId {
             ElementId::Questgiver => "Questgiver",
             ElementId::WorldMap => "World map",
             ElementId::ReleasePrompt => "Release-spirit prompt",
+            ElementId::PartyFrame => "Party frame",
+            ElementId::PartyInvite => "Party invite",
         }
     }
 
@@ -339,6 +358,27 @@ impl ElementId {
             ElementId::WorldMap => Element {
                 anchor: Anchor::Center,
                 offset: [0.0, 0.0],
+                ..Default::default()
+            },
+            // Under the player frame on the left edge, which is where a party
+            // has lived in every game that has one -- and, more to the point,
+            // beside the frame it is read *with*: the first question a party
+            // frame answers is "who is hurt", and the player's own health is
+            // half of that answer. Far enough down to clear a player frame
+            // with both bars at scale 1.5.
+            ElementId::PartyFrame => Element {
+                anchor: Anchor::TopLeft,
+                offset: [24.0, 120.0],
+                ..Default::default()
+            },
+            // Centred and above the middle, like the loot window: it appears
+            // because somebody else did something rather than because a key
+            // was pressed, so it has to be where the eye already is. Offset up
+            // from the loot window's own spot so the two do not start out on
+            // top of each other.
+            ElementId::PartyInvite => Element {
+                anchor: Anchor::Center,
+                offset: [0.0, -140.0],
                 ..Default::default()
             },
         }

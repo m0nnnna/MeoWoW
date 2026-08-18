@@ -39,7 +39,8 @@ pub use element::{Anchor, Element};
 pub use frames::chat::{ChatEntry, ChatKind};
 pub use frames::combat_text::{CombatTextKind, FloatingText};
 pub use frames::{
-    CastBarView, QuestDetail, QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
+    CastBarView, InviteAnswer, PartyInviteView, PartyMemberView, QuestDetail, QuestLogEntry,
+    QuestgiverAction, QuestgiverClick, QuestgiverRow,
     MapMarker, MapPatch, MapView, MarkerKind, QuestgiverView, SpellbookEntry, UnitView,
 };
 pub use layout::{default_path, CharacterBars, ElementId, Profile};
@@ -166,6 +167,21 @@ pub struct HudData<'a> {
     /// The character's money in copper, drawn along the bottom of the bag
     /// window. Ignored when `bags` is `None`.
     pub copper: u32,
+    /// Everyone in the group but the player, or an empty slice when there is
+    /// no group. **Emptiness is the flag**, as it is for the loot window: the
+    /// caller already decides who is in the party and a second copy of that
+    /// decision here could disagree with it.
+    ///
+    /// The player's own frame is deliberately not in this list -- the server
+    /// leaves the recipient out of `SMSG_GROUP_LIST`, and this client already
+    /// draws them in a frame of their own.
+    pub party: &'a [frames::PartyMemberView],
+    /// A pending group invite, or `None`. Existence is the flag again.
+    ///
+    /// **State rather than an event**, unlike a chat line: an invite stays
+    /// open until it is answered or times out, so a caller that treated it as
+    /// something that arrived once would flash a prompt for a single frame.
+    pub party_invite: Option<&'a frames::PartyInviteView>,
 }
 
 /// What the user did to the interface this frame.
@@ -217,6 +233,18 @@ pub struct HudResponse {
     pub selected_quest: Option<u32>,
     /// What was pressed in the questgiver window.
     pub questgiver: frames::QuestgiverClick,
+    /// A party row was clicked, reported as the member's **guid** rather than
+    /// as the row's position -- the same reasoning as [`Self::selected_quest`]
+    /// carrying a quest id. The list is rebuilt from every group list the
+    /// server sends, and the server resends it in full whenever anything
+    /// changes, so a position is meaningless by the time the caller reads it.
+    pub party_target: Option<u64>,
+    /// How the player answered a group invite, or `None` if they have not.
+    ///
+    /// An enum rather than a `bool`, because the two answers travel by
+    /// different opcodes and a caller reading `true` as "accept" is one
+    /// inverted condition away from declining every invite silently.
+    pub party_invite: Option<frames::InviteAnswer>,
 }
 
 /// What the cursor is currently carrying, picked up from either window that
@@ -524,6 +552,8 @@ impl Hud {
             let questgiver_placeholder;
             let world_map_placeholder;
             let release_prompt_placeholder;
+            let party_placeholder;
+            let party_invite_placeholder;
             let content = match id {
                 ElementId::PlayerFrame | ElementId::TargetFrame => {
                     let live = if id == ElementId::PlayerFrame {
@@ -634,6 +664,31 @@ impl Hud {
                     }
                     None => continue,
                 },
+                // Absent with nobody else in the group, which is the state
+                // a character spends most of its life in -- so emptiness is
+                // the flag, exactly as it is for the loot window. Drawn in
+                // edit mode regardless, because the alternative is that the
+                // frame can only be positioned while two other people are
+                // logged in and stay in the group for the length of a drag.
+                ElementId::PartyFrame => {
+                    if data.party.is_empty() {
+                        if !editing {
+                            continue;
+                        }
+                        party_placeholder = frames::PartyMemberView::placeholder();
+                        Content::Party(&party_placeholder)
+                    } else {
+                        Content::Party(data.party)
+                    }
+                }
+                ElementId::PartyInvite => match data.party_invite {
+                    Some(view) => Content::PartyInvite(view),
+                    None if editing => {
+                        party_invite_placeholder = frames::PartyInviteView::placeholder();
+                        Content::PartyInvite(&party_invite_placeholder)
+                    }
+                    None => continue,
+                },
                 _ => {
                     // An action bar. Unlike the other frames, an empty one
                     // still draws: the slots are where spells get *put*, so
@@ -681,6 +736,11 @@ impl Hud {
                 // the page's shape is fixed by the art, not by what is on it.
                 Content::WorldMap(_) => frames::world_map::size(&style, element.scale),
                 Content::ReleasePrompt(_) => frames::release::size(&style, element.scale),
+                // Sized to the party *and* to what is known about each member
+                // -- a member out of view has no power bar, so the rows are
+                // not all the same height. See `frames::party::size`.
+                Content::Party(members) => frames::party::size(members, &style, element.scale),
+                Content::PartyInvite(_) => frames::party_invite::size(&style, element.scale),
             };
             let rect = element.rect(screen, size);
             self.occupied.push(rect);
@@ -760,6 +820,8 @@ impl Hud {
                             | Content::Questgiver(_)
                             | Content::ReleasePrompt(_)
                             | Content::Bags(_)
+                            | Content::Party(_)
+                            | Content::PartyInvite(_)
                     ) {
                         // The frames you interact with while playing, so they
                         // sense clicks rather than only hover.
@@ -861,6 +923,20 @@ impl Hud {
                             element.scale,
                         ),
                         Content::ReleasePrompt(view) => frames::release::draw(
+                            &painter,
+                            response.rect,
+                            view,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Party(members) => frames::party::draw(
+                            &painter,
+                            response.rect,
+                            members,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::PartyInvite(view) => frames::party_invite::draw(
                             &painter,
                             response.rect,
                             view,
@@ -1035,6 +1111,42 @@ impl Hud {
                             if let Some(marker) = view.markers.get(index) {
                                 frames::world_map::hover_tooltip(&response, &marker.label);
                             }
+                        }
+                    }
+                }
+                (false, Content::Party(members)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            if let Some(row) = frames::party::row_at(
+                                drawn_rect,
+                                members,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                // The member's **guid**, not the row. See
+                                // `HudResponse::party_target`: the list is
+                                // rebuilt from every group list the server
+                                // sends, and it resends the whole group
+                                // whenever anything about it changes.
+                                response_out.party_target =
+                                    members.get(row).map(|member| member.guid);
+                            }
+                        }
+                    }
+                }
+                // The one frame here with *two* opposite answers, which is why
+                // a press that lands between them reports nothing rather than
+                // the nearer of the two. See `frames::party_invite::click_at`.
+                (false, Content::PartyInvite(_)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            response_out.party_invite = frames::party_invite::click_at(
+                                drawn_rect,
+                                &style,
+                                element.scale,
+                                pointer,
+                            );
                         }
                     }
                 }
@@ -1240,6 +1352,7 @@ impl Hud {
             // painted.
             let edit_quest_log = frames::quest_log::placeholder();
             let edit_questgiver = frames::questgiver::placeholder();
+            let edit_party = frames::PartyMemberView::placeholder();
             let sizes: Vec<(ElementId, egui::Vec2)> = ElementId::ALL
                 .into_iter()
                 .map(|id| {
@@ -1285,6 +1398,20 @@ impl Hud {
                             scale,
                         ),
                         ElementId::ReleasePrompt => frames::release::size(&style, scale),
+                        // Same rule as the bags and the loot window: the real
+                        // party where there is one, the placeholder where
+                        // there is not, so re-anchoring measures the frame
+                        // the loop above actually painted.
+                        ElementId::PartyFrame => frames::party::size(
+                            if data.party.is_empty() {
+                                &edit_party
+                            } else {
+                                data.party
+                            },
+                            &style,
+                            scale,
+                        ),
+                        ElementId::PartyInvite => frames::party_invite::size(&style, scale),
                         ElementId::PlayerFrame | ElementId::TargetFrame => {
                             let unit = if id == ElementId::PlayerFrame {
                                 data.player
@@ -1347,6 +1474,8 @@ enum Content<'a> {
     Questgiver(&'a frames::QuestgiverView),
     WorldMap(&'a frames::MapView),
     ReleasePrompt(&'a frames::ReleasePromptView),
+    Party(&'a [frames::PartyMemberView]),
+    PartyInvite(&'a frames::PartyInviteView),
 }
 
 /// The outline and label that mark a frame as draggable.
@@ -3241,6 +3370,12 @@ mod tests {
                 frames::loot::size(frames::loot::placeholder().len(), &profile.style, scale)
             }
             ElementId::ReleasePrompt => frames::release::size(&profile.style, scale),
+            ElementId::PartyFrame => frames::party::size(
+                &frames::PartyMemberView::placeholder(),
+                &profile.style,
+                scale,
+            ),
+            ElementId::PartyInvite => frames::party_invite::size(&profile.style, scale),
             ElementId::PlayerFrame | ElementId::TargetFrame => {
                 frames::unit::size(&profile.style, scale, true)
             }
@@ -3423,5 +3558,235 @@ mod tests {
                 id.label()
             );
         }
+        // The party frame is in that list on purpose: it appears because
+        // somebody grouped up, not because a key was pressed, and a map
+        // covering it would hide who is dying.
+        let party = profile
+            .get(ElementId::PartyFrame)
+            .rect(screen, size_of(&profile, ElementId::PartyFrame));
+        assert!(
+            !map.intersects(party),
+            "the world map at {map:?} covers the party frame at {party:?}"
+        );
+    }
+
+    fn party() -> Vec<frames::PartyMemberView> {
+        frames::PartyMemberView::placeholder()
+    }
+
+    /// The party frame appears with a group and not without one -- emptiness
+    /// is the flag, the same rule the loot window follows. Asserting only that
+    /// it appears with a group would pass just as well if it appeared always,
+    /// which would put an empty box on the screen of every solo player.
+    #[test]
+    fn a_party_frame_appears_only_with_a_group_or_while_editing() {
+        let members = party();
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let with = painted_text(&shapes(
+            &mut hud,
+            &HudData {
+                party: &members,
+                ..Default::default()
+            },
+            None,
+        ))
+        .join(" | ");
+        assert!(with.contains("Watcher"), "{with}");
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let without = painted_text(&shapes(&mut hud, &HudData::default(), None)).join(" | ");
+        assert!(
+            !without.contains("Watcher"),
+            "a party frame drew with nobody in the group: {without}"
+        );
+
+        // ...and in edit mode regardless, or it could only be positioned
+        // while two other people were logged in and stayed grouped for the
+        // length of the drag.
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        hud.edit.active = true;
+        let editing = painted_text(&shapes(&mut hud, &HudData::default(), None)).join(" | ");
+        assert!(
+            editing.contains("Watcher"),
+            "the party frame could not be positioned without a group: {editing}"
+        );
+    }
+
+    /// Clicking a member reports their **guid**, not the row -- and the row
+    /// clicked is the *second*, so a bug that always reported the first would
+    /// fail. Driven through the real event loop, which is also what proves the
+    /// frame is in the `Sense::click()` list: one left out of it draws
+    /// correctly, hit-tests correctly, and never reports a thing.
+    #[test]
+    fn clicking_a_party_member_reports_their_guid() {
+        let members = party();
+        let data = HudData {
+            party: &members,
+            ..Default::default()
+        };
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::PartyFrame);
+        let style = hud.profile.style;
+        let rect = element.rect(
+            screen(),
+            frames::party::size(&members, &style, element.scale),
+        );
+        // The second row's centre, measured the way the frame stacks rows
+        // rather than by dividing the height: the rows are not all the same
+        // height, so an averaged position would test a pixel no player's
+        // click would land on.
+        let row_height = |member: &frames::PartyMemberView| {
+            frames::party::size(std::slice::from_ref(member), &style, element.scale).y
+                - style.padding * 2.0 * element.scale
+        };
+        let top = rect.top()
+            + style.padding * element.scale
+            + row_height(&members[0])
+            + style.gap * element.scale;
+        let point = egui::Pos2::new(rect.center().x, top + row_height(&members[1]) * 0.5);
+
+        let response = drive(
+            &mut hud,
+            &data,
+            &click_script(point, egui::PointerButton::Primary),
+        );
+        assert_eq!(
+            response.party_target,
+            Some(members[1].guid),
+            "clicking the second row must report that member, not the first"
+        );
+    }
+
+    /// **Accept and Decline are opposite answers**, so a hit test that
+    /// disagreed with the drawing would put the character in a group they
+    /// refused. Both are asserted, plus a press between them: a rule that
+    /// answered `Accept` for every pixel would pass a test of Accept alone.
+    #[test]
+    fn the_invite_buttons_answer_separately() {
+        let invite = frames::PartyInviteView::placeholder();
+        let data = HudData {
+            party_invite: Some(&invite),
+            ..Default::default()
+        };
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::PartyInvite);
+        let style = hud.profile.style;
+        let scale = element.scale;
+        let rect = element.rect(screen(), frames::party_invite::size(&style, scale));
+        // The two button centres, derived from the frame the way the drawing
+        // does rather than guessed at: the left and right halves of the strip
+        // along the bottom.
+        let button_y =
+            rect.bottom() - style.padding * scale - style.party_invite_button_height * scale * 0.5;
+        let quarter = rect.width() * 0.25;
+        let accept = egui::Pos2::new(rect.left() + quarter, button_y);
+        let decline = egui::Pos2::new(rect.right() - quarter, button_y);
+
+        let mut accepting = Hud::default();
+        hide_bars(&mut accepting);
+        assert_eq!(
+            drive(
+                &mut accepting,
+                &data,
+                &click_script(accept, egui::PointerButton::Primary)
+            )
+            .party_invite,
+            Some(frames::InviteAnswer::Accept)
+        );
+
+        let mut declining = Hud::default();
+        hide_bars(&mut declining);
+        assert_eq!(
+            drive(
+                &mut declining,
+                &data,
+                &click_script(decline, egui::PointerButton::Primary)
+            )
+            .party_invite,
+            Some(frames::InviteAnswer::Decline)
+        );
+
+        // The text between them answers nothing. An accidental accept has to
+        // be undone by leaving the group; an ignored press costs nothing.
+        let mut missing = Hud::default();
+        hide_bars(&mut missing);
+        let text = egui::Pos2::new(rect.center().x, rect.top() + style.padding * scale + 2.0);
+        assert_eq!(
+            drive(
+                &mut missing,
+                &data,
+                &click_script(text, egui::PointerButton::Primary)
+            )
+            .party_invite,
+            None,
+            "a press on the prompt's text answered the invite"
+        );
+    }
+
+    /// **An invite must not be sealed under the map.** Exactly the failure
+    /// `e9d001c` fixed for the questgiver's Accept button, and an invite is
+    /// the worse case: it times out, so a prompt that cannot be reached is a
+    /// group the player never joins with no error anywhere. The two frames are
+    /// opened at *different moments* against one context, because egui's
+    /// z-order persists between frames and a fresh context hides the bug
+    /// entirely -- which is how the first attempt at the questgiver fix passed
+    /// its own test while changing nothing.
+    #[test]
+    fn the_invite_buttons_work_with_the_map_open_over_them() {
+        let invite = frames::PartyInviteView::placeholder();
+        let map = map_view();
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+
+        let element = hud.profile.get(ElementId::PartyInvite);
+        let style = hud.profile.style;
+        let scale = element.scale;
+        let rect = element.rect(screen(), frames::party_invite::size(&style, scale));
+        let map_element = hud.profile.get(ElementId::WorldMap);
+        let map_rect = map_element.rect(
+            screen(),
+            frames::world_map::size(&style, map_element.scale),
+        );
+        // The premise, asserted rather than assumed: with no overlap this
+        // test proves nothing and would keep passing after a regression.
+        assert!(
+            map_rect.intersects(rect),
+            "the map at {map_rect:?} does not reach the invite prompt at {rect:?}"
+        );
+
+        let accept = egui::Pos2::new(
+            rect.left() + rect.width() * 0.25,
+            rect.bottom() - style.padding * scale - style.party_invite_button_height * scale * 0.5,
+        );
+
+        let ctx = egui::Context::default();
+        let mut last = HudResponse::default();
+        // The invite first, then the map opened over it -- the order that
+        // moves the map to the top of its layer, which is what broke the
+        // questgiver window.
+        let with_invite = HudData {
+            party_invite: Some(&invite),
+            ..Default::default()
+        };
+        let with_both = HudData {
+            party_invite: Some(&invite),
+            world_map: Some(&map),
+            ..Default::default()
+        };
+        pass(&ctx, &mut hud, &with_invite, Vec::new());
+        pass(&ctx, &mut hud, &with_both, Vec::new());
+        for events in click_script(accept, egui::PointerButton::Primary) {
+            last = pass(&ctx, &mut hud, &with_both, events);
+        }
+        assert_eq!(
+            last.party_invite,
+            Some(frames::InviteAnswer::Accept),
+            "the map swallowed the invite's Accept button"
+        );
     }
 }

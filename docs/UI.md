@@ -51,7 +51,7 @@ overlay, and the layout editor. Those are meant to look like tools.
 | `element` | Where a frame sits: anchor, offset, scale, visibility |
 | `style` | Every dimension and colour the frames draw with |
 | `layout` | The whole profile, and the file it lives in |
-| `frames` | The frames themselves: `unit`, `chat`, `action_bar`, `cast_bar`, `spellbook`, `marker`, `combat_text` |
+| `frames` | The frames themselves: `unit`, `party`, `party_invite`, `chat`, `action_bar`, `cast_bar`, `spellbook`, `marker`, `combat_text` |
 | `edit` | Rearranging it from inside the running client |
 | `Hud` | What a caller holds: profile + edit state + the draw call |
 
@@ -358,6 +358,92 @@ The distance range is exported from here (`camera::MIN_DISTANCE` and
 `MAX_DISTANCE`) and the viewer's wheel clamps to those same two constants
 rather than its own copy -- otherwise the slider and the wheel would agree
 until somebody edited one of them.
+
+## The party frame, and where "not known" reaches the screen
+
+The party frame is the first thing in this interface drawn from a source that
+routinely **has no answer**, and that fact shapes the whole of it.
+
+Every other frame draws something replicated. A unit frame's subject is an
+object in visibility range, so its health, power and level are facts; a field
+that has not arrived yet reads zero for a moment and fills in on the next
+update. A party member is not like that. **A member two zones away is not a
+replicated object at all** -- no object, no fields, nothing -- and the only
+thing the server sends about them is `SMSG_PARTY_MEMBER_STATS`, which may not
+have arrived either. A name and a guid, and nothing else, is a real and common
+state.
+
+So `PartyMemberView` carries `Option`s where `UnitView` carries `u32`s, and
+they stay `Option`s all the way to the painter:
+
+- a bar whose maximum is unknown is drawn **empty and unlabelled**, never full;
+- an unknown level prints **nothing**, not `0` and not `??`;
+- a member with no known power *type* gets **no second bar at all**, rather
+  than a mana-coloured one.
+
+That last one is the case worth naming, because it is the one a reasonable
+implementation gets wrong. Health falls back between two sources holding the
+same quantity, so `unwrap_or(0)` there is merely wrong. A power type is an
+**index**: defaulting it to zero does not mean "not known", it means mana, so
+a rogue whose stats packet has not arrived is drawn with a blue bar and nothing
+anywhere says the colour was a guess. Same rule as the tooltip substituter
+passing `$s1` through with its `$` intact -- a visible blank says "not known"
+and a fabricated number says nothing and is believed.
+
+`world::WorldState::party_member_vitals` is where the two sources meet, and the
+order is not a preference: the replicated entity wins where there is one,
+because a member in view is exact and current and the party summary is coarse
+and can be a minute old. It falls back rather than going blank when the party
+spreads out, which is when a party frame is actually for. The one field that
+never falls back is the **zone**, which only the party packet carries -- a
+player you can see is by definition in your zone, so the object has no such
+field to lose it to.
+
+Measured live on 2026-08-18, and kept as the bytes: `Watcher`, 186 units away
+and unreplicated, read `60/60` health, `0/1000` rage, level 1, zone 12 --
+every number from the party packet, and agreeing with what that character's own
+client independently reported about itself. `crates/world/src/state.rs` holds
+that capture and asserts both halves: the fallback, and the entity overriding
+it.
+
+### The rows are not all the same height
+
+A member with a power bar is taller than one without, and a member out of view
+has no power fields at all -- so a mixed party is the normal case, not the edge
+one. `frames::party::row_at` therefore walks the same accumulating heights
+`draw` does instead of dividing by an average. A uniform division puts the
+click on the wrong person, silently, and "silently" is the whole problem: a
+party frame's click *targets* somebody, so the failure is a spell cast on the
+wrong member rather than an error.
+
+### The invite prompt has two answers, which nothing else here does
+
+Every other clickable frame either has rows (`loot`, `quest_log`, `bags`) or is
+one big button (`release`). The invite prompt is neither: Accept and Decline
+are **opposite** and sit side by side, so the geometry is stated once in
+`frames::party_invite::buttons` and both `draw` and `click_at` read it. Two
+separately written copies of the same rectangles agree right up until one of
+them changes -- the same reasoning that makes the picking ray unproject the
+matrix the scene is drawn with rather than rebuild it from the camera's angles.
+
+A press that lands on neither button reports **nothing**, rather than the
+nearer of the two. An accidental accept puts the character in a stranger's
+group and has to be undone by leaving it; an ignored press costs nothing.
+
+### Commands take `/`, the server takes `.`
+
+`/invite`, `/leave`, `/kick` and `/promote` are handled in the viewer and never
+reach the wire. A line beginning with `.` is a *server* command, parsed by the
+realm's own chat handler, which is how this client sends GM commands today.
+Sharing one prefix would mean guessing which end a line was meant for, and
+guessing wrong says `/invite Watcher` out loud to everybody standing nearby.
+
+Only the invite is answered. `SMSG_PARTY_COMMAND_RESULT` comes back whether it
+worked or not, so that one says nothing locally and lets the reply speak;
+every other party request is silent, so each says locally what it asked for.
+Without that, a `/leave` sent while not in a group and a `/leave` the server
+declined look identical -- which is the failure mode the whole `world::group`
+block was written to escape.
 
 ## What is deliberately not here yet
 

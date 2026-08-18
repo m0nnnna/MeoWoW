@@ -439,6 +439,65 @@ pub enum ClientOpcode {
     /// guid, and a graveyard accumulates them. One live run saw seven while
     /// the server had two.
     CorpseQuery = 0x0216,
+
+    /// Ask a player to join this character's group, **by name**.
+    ///
+    /// The one request in this enum that names its subject with a string
+    /// rather than a guid, and that is not an accident of the protocol: an
+    /// invite is the first thing a player does to someone they have only read
+    /// off a chat line, who may be on the other side of the continent and so
+    /// has never been replicated here at all. A guid-taking invite would only
+    /// work on people already on screen.
+    ///
+    /// Body is the name, NUL-terminated, then a `u32` the server reads and
+    /// discards.
+    ///
+    /// **Answered, which is why it is the party opcode to attempt first.**
+    /// Every other request in this block is silent, and a silent write fails
+    /// identically whether the number is wrong, the body is wrong or the
+    /// server declined -- the trap `CMSG_BUY_ITEM` documents. This one
+    /// produces `SMSG_PARTY_COMMAND_RESULT` **whether it succeeds or fails**,
+    /// naming the person asked for, so a single send separates "not
+    /// understood" from "understood and refused".
+    GroupInvite = 0x006E,
+
+    /// Say yes to an invite. Body is a `u32` the server reads and discards --
+    /// there is nothing to identify, because a character can hold only one
+    /// pending invite at a time.
+    ///
+    /// Confirmed by effect: `SMSG_GROUP_LIST` arrives at **both** clients
+    /// afterwards, which is a packet neither of them was receiving before and
+    /// which no misunderstood request could produce.
+    GroupAccept = 0x0072,
+
+    /// Say no to an invite. Empty body.
+    GroupDecline = 0x0073,
+
+    /// Leave the group -- or, as its leader, break it up. **One opcode for
+    /// both**, with an empty body: the server already knows which of the two
+    /// the sender is, and there is nothing for the client to decide.
+    ///
+    /// The name is the server's. What it does for a non-leader is leave.
+    GroupDisband = 0x007B,
+
+    /// Throw a member out, naming them by guid.
+    ///
+    /// The guid form rather than [`Self::GroupUninviteByName`], for the same
+    /// reason a loot slot is the server's index: a party list arrives with
+    /// guids in it, and re-deriving a name to send back is a round trip
+    /// through a string that two players can share.
+    ///
+    /// Body is the guid then a `u32` (a vote-kick reason string length in
+    /// 3.3.5; zero for an ordinary kick).
+    GroupUninviteGuid = 0x0076,
+
+    /// Hand leadership to another member, by guid. Body is the guid alone.
+    GroupSetLeader = 0x0078,
+
+    /// Throw a member out by name. Kept beside the guid form because the
+    /// server accepts both and the two take different bodies; this client
+    /// sends the guid form.
+    GroupUninviteByName = 0x0075,
 }
 
 /// The server-to-client opcodes this client reacts to.
@@ -729,6 +788,35 @@ pub mod server {
     pub const CANCEL_COMBAT: u16 = 0x014E;
     /// Equipment losing durability from dying. Not parsed.
     pub const DURABILITY_DAMAGE_DEATH: u16 = 0x02BD;
+
+    /// Somebody has asked this character to join their group. See
+    /// [`crate::group::parse_group_invite`].
+    pub const GROUP_INVITE: u16 = 0x006F;
+    /// The whole group, as it stands, sent to every member whenever anything
+    /// about it changes. See [`crate::group`] -- this is the packet the party
+    /// interface is drawn from, and the only one that has to be right.
+    pub const GROUP_LIST: u16 = 0x007D;
+    /// The answer to a group *command*: which operation, who it was about,
+    /// and whether it worked. See [`crate::group::parse_party_command_result`].
+    pub const PARTY_COMMAND_RESULT: u16 = 0x007F;
+    /// One member's health, power, level or zone changing while they are out
+    /// of visibility range. See [`crate::group::parse_party_member_stats`].
+    pub const PARTY_MEMBER_STATS: u16 = 0x007E;
+    /// The same fields, sent unprompted when a member first comes into the
+    /// group rather than in response to a change. Same layout, different
+    /// number, and it carries a leading byte the other does not.
+    pub const PARTY_MEMBER_STATS_FULL: u16 = 0x02F2;
+    /// This character has been thrown out of the group. Empty body -- there
+    /// is only one group to be thrown out of.
+    pub const GROUP_UNINVITE: u16 = 0x0077;
+    /// The group is gone. Empty body.
+    pub const GROUP_DESTROYED: u16 = 0x007C;
+    /// An invite this character sent was withdrawn or timed out.
+    pub const GROUP_CANCEL: u16 = 0x0071;
+    /// Somebody declined an invite: the name, NUL-terminated.
+    pub const GROUP_DECLINE: u16 = 0x0074;
+    /// Leadership has moved: the new leader's name.
+    pub const GROUP_SET_LEADER: u16 = 0x0079;
 }
 
 /// Whether this opcode carries `{packed guid, MovementInfo}` from another
@@ -811,6 +899,16 @@ pub fn describe(opcode: u16) -> String {
         server::CANCEL_COMBAT => "SMSG_CANCEL_COMBAT",
         server::DURABILITY_DAMAGE_DEATH => "SMSG_DURABILITY_DAMAGE_DEATH",
         server::GM_MESSAGECHAT => "SMSG_GM_MESSAGECHAT",
+        server::GROUP_INVITE => "SMSG_GROUP_INVITE",
+        server::GROUP_LIST => "SMSG_GROUP_LIST",
+        server::PARTY_COMMAND_RESULT => "SMSG_PARTY_COMMAND_RESULT",
+        server::PARTY_MEMBER_STATS => "SMSG_PARTY_MEMBER_STATS",
+        server::PARTY_MEMBER_STATS_FULL => "SMSG_PARTY_MEMBER_STATS_FULL",
+        server::GROUP_UNINVITE => "SMSG_GROUP_UNINVITE",
+        server::GROUP_DESTROYED => "SMSG_GROUP_DESTROYED",
+        server::GROUP_CANCEL => "SMSG_GROUP_CANCEL",
+        server::GROUP_DECLINE => "SMSG_GROUP_DECLINE",
+        server::GROUP_SET_LEADER => "SMSG_GROUP_SET_LEADER",
         // Understood as movement without this client caring which movement it
         // is: every one of them is a position for a mover, and that is all it
         // does with them. The number stays visible so a log still says which.

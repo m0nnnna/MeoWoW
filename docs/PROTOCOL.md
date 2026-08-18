@@ -955,3 +955,149 @@ said the numbering was right and moved the whole question onto the body.
 
 `CMSG_BUY_ITEM_IN_SLOT`, and buyback. Nothing vendor-related is drawn in the
 interface — the stock list is a CLI printout so far.
+
+## Parties
+
+Five packets in, six requests out. All measured against a live two-client party
+on the local realm and confirmed **from both ends**: each character's own client
+independently reported its guid, name, level, health and position, and the
+packet the *other* client received had to agree with all of it. That is this
+project's strongest shape — the structure goes out through one session, through
+the server, and back in through another, so nothing is checked against itself.
+
+| Opcode | Direction | Body |
+|---|---|---|
+| `CMSG_GROUP_INVITE` `0x006E` | out | name (NUL-terminated), `u32` (read and discarded) |
+| `CMSG_GROUP_ACCEPT` `0x0072` | out | `u32` (read and discarded) |
+| `CMSG_GROUP_DECLINE` `0x0073` | out | empty |
+| `CMSG_GROUP_DISBAND` `0x007B` | out | empty — **leaving and breaking up are one opcode** |
+| `CMSG_GROUP_UNINVITE_GUID` `0x0076` | out | `u64` guid, `u32` (vote-kick reason length; `0`) |
+| `CMSG_GROUP_SET_LEADER` `0x0078` | out | `u64` guid |
+| `SMSG_GROUP_INVITE` `0x006F` | in | `u8` can-accept, inviter's name, three fields this client drops |
+| `SMSG_GROUP_LIST` `0x007D` | in | the whole group, resent in full on every change |
+| `SMSG_PARTY_MEMBER_STATS` `0x007E` | in | packed guid, a mask, and only the fields it names |
+| `SMSG_PARTY_MEMBER_STATS_FULL` `0x02F2` | in | the same, behind one extra leading byte |
+| `SMSG_PARTY_COMMAND_RESULT` `0x007F` | in | operation, member name, result |
+| `SMSG_GROUP_DESTROYED` `0x007C` / `UNINVITE` `0x0077` | in | empty |
+
+### The invite is the only request that talks back, so it went first
+
+Every other outgoing group message is silent, and a silent write fails
+identically whether the opcode is wrong, the body is wrong, or the server
+declined — three investigations behind one silence, the trap `CMSG_BUY_ITEM`
+documents. `CMSG_GROUP_INVITE` produces `SMSG_PARTY_COMMAND_RESULT` **either
+way**, and the reply **echoes the name back**, which is what proves the server
+read the string out of the offset this client wrote it to. So one send with a
+deliberately misspelt name and one with a real name bounded the opcode, the body
+and the reply layout at once, before any packet with a variable-length list in
+it had to be read.
+
+The invite names its subject by **string**, alone among the requests here, and
+that is not an accident of the protocol: an invite is the first thing a player
+does to somebody they have only read off a chat line, who may never have been
+replicated here at all. Every *other* party request names a guid, because by
+then the group list has supplied one.
+
+### `SMSG_GROUP_LIST` is a complete statement, which is why party state needs no accounting
+
+Every other piece of replicated state here has to be *folded*: a dropped update
+is permanent, a merge that overwrites erases fields nothing will resend. A group
+list is resent **in full** to every member whenever anything about the group
+changes, so `WorldState::party` is an assignment. There is no merge to get
+wrong, no partial update to miss, and no way for a dropped packet to leave a
+permanent error — the next one says everything again.
+
+The one thing that does need accounting is `party_stats`, which is keyed by guid
+and accumulates. A member who leaves would otherwise leave a row behind that the
+next member to join could never overwrite, and it is invisible until something
+indexes the map with a guid the party no longer holds.
+
+### The packet that refuted the obvious reading
+
+Forming a group sends the leader a list with **nobody else in it**, one packet
+before the real one. So "no members means no group" reports every group's
+creation as a departure.
+
+What separates the two forms is the **leader guid**: the empty-but-real form
+carries one and the "you are in no group" form carries zero. That is a fact
+about the bytes rather than an interpretation of a flag, which is why
+`Party::in_group` tests it. The leave form *also* sets `0x10` in `group_type` —
+recorded because it was observed, not relied on, since one sample of one flag
+bit is a guess and a leader guid is not.
+
+The loot block is present only when the member count is non-zero, and the
+conditional is gated on the **count** rather than on `members.is_empty()`. They
+are the same number; the point is that reading the block when the server did not
+send it runs off the end, and *not* reading it when the server did send it
+leaves thirteen trailing bytes — and the cursor catches both.
+
+### The dungeon-finder bit has to be read even though nothing uses it
+
+`GROUPTYPE_LFG` `0x08` inserts a saved-dungeon status byte and a dungeon id
+immediately after the header. A reader that ignored the bit would parse every
+field after it five bytes late, and only inside a dungeon-finder group. Both
+fields are read and dropped.
+
+### `SMSG_PARTY_MEMBER_STATS` exists for the case replication cannot cover
+
+A party member in visibility range is an ordinary replicated player. **A party
+member two zones away is not replicated at all** — no object, no fields,
+nothing — and this packet is everything the server says about them.
+
+A mask names which of twenty fields follow, and the server sends only what
+moved: a member taking a hit sends current health alone. So the merge is field
+by field, and overwriting the record wholesale would report a member in another
+zone as level 0 with no mana until the next full update, which is a change
+nothing prompts.
+
+Three widths in it are worth naming because the obvious guess is wrong:
+
+- **status is `u16` here** and `u8` in the group list;
+- **power is `u16`** where health is `u32` — no power pool in 3.3.5 exceeds
+  65535 and health does, so the packet spends its bytes where they are needed;
+- **the position is two *signed* 16-bit words**, and this is the one field where
+  the wrong reading is completely silent. Elwynn is at negative coordinates:
+  `Watcher` at `-8735.9, -67.0` arrives as `0xdde1, 0xffbd`, which read unsigned
+  is `56801, 65469` — a perfectly plausible pair of numbers that puts a map dot
+  in Kalimdor. Read signed it matches the position that client independently
+  reports for itself, to within the truncation, and `Testwolf` at
+  `-8921.1, -119.1` agrees the same way.
+
+**Everything past the fields this client uses is skipped by length, not
+ignored.** The pet block and the aura block are variable-length, so a mask
+naming an aura block moves every field after it. The skip therefore walks the
+same flag order the server writes in and consumes each block properly, and the
+cursor still has to end exactly at the end of the body — which is the check that
+would catch the table being wrong.
+
+### What a live run looked like, 2026-08-18
+
+`Testwolf` (guid 1) and `Watcher` (guid 3) on the local AzerothCore realm, 186
+units apart so **the invitee was never replicated at either end**:
+
+```
+inviting "Watcher" to the group
+  party: invite -> it worked (about "Watcher")
+  party: group 0x1f50000000000003, 1 other member(s), leader 0x1
+    Watcher  0x3  status 0x01 online  hp 60/60  power 0/1000 type 1
+             level 1  zone 12  [party packets only]
+```
+
+Every one of those numbers came from `SMSG_PARTY_MEMBER_STATS`, and `type 1` is
+rage — which is what `Watcher`, a human warrior, actually spends, and which a
+client defaulting an absent power type to zero would have drawn as mana. The
+invitee's own log shows the mirror: `SMSG_GROUP_INVITE` naming `"Testwolf"`, an
+accept, and a group list holding `Testwolf` at `136/136`, level 5.
+
+The 69-byte stats capture is kept in `crates/world/src/state.rs` as its bytes and
+asserts both halves — the fallback carrying every field, and a replicated entity
+overriding it while the zone survives, since no object carries one.
+
+### Not sent yet
+
+Raid conversion and sub-group moves, the loot-rule change, ready checks, role
+assignment, and party chat. `LootRule`, `group_type`, `own_subgroup`,
+`own_flags`, `own_roles` and each member's `subgroup`/`flags`/`roles` all parse
+and are read by nothing: they are `0` in every party, so there is nothing here
+that could be checked against a real raid, and an interface guessed from fields
+that are always zero would be fiction.

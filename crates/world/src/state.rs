@@ -952,6 +952,20 @@ pub struct Replication {
     /// refused this batch. Returned rather than stored for the same reason
     /// `cast_failures` is: an event, not state.
     pub inventory_failures: Vec<crate::inventory::InventoryChangeFailure>,
+    /// `SMSG_GROUP_LIST`s folded into [`WorldState::party`] this batch,
+    /// whether they described a group or said there is none.
+    pub party_lists: usize,
+    /// `SMSG_PARTY_MEMBER_STATS` merges this batch.
+    pub party_stat_updates: usize,
+    /// What the server said about the group commands this client sent.
+    ///
+    /// Handed back rather than stored, because these are events -- and
+    /// because they are the *only* answer any group request gets. Every
+    /// outgoing group message but the invite is silent, so a caller that
+    /// dropped these would be back to the failure mode this whole block was
+    /// built to escape: a send that fails identically whether the opcode, the
+    /// body or the permission was wrong.
+    pub party_results: Vec<crate::group::PartyCommandResult>,
     /// Ticks of drowning, falling, lava or slime damage this batch.
     ///
     /// Returned rather than stored, unlike the mirror timers next to them,
@@ -995,6 +1009,38 @@ pub struct Replication {
     pub attacks_stopped: usize,
     /// Packets that would not decode, with their payload for offline analysis.
     pub failures: Vec<(u16, crate::protocol::Error, Result<Vec<u8>, crate::protocol::Error>)>,
+}
+
+/// What a party frame needs to know about one member, from whichever source
+/// actually knows it.
+///
+/// **Every field is optional and none of them is defaulted**, which is the
+/// whole point. A member who has never been in view and has never sent a stats
+/// packet is a real and common state -- a name and a guid and nothing else --
+/// and a frame that drew a full health bar for them would be inventing a
+/// number nobody can check, which this project treats as worse than a blank.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PartyVitals {
+    pub health: Option<u32>,
+    pub max_health: Option<u32>,
+    pub level: Option<u32>,
+    pub power: Option<u32>,
+    pub max_power: Option<u32>,
+    /// Which pool the two numbers above are of.
+    ///
+    /// **Absent rather than defaulted, and that is the whole reason it is an
+    /// `Option`.** A power type is an *index*, not a quantity: defaulting it
+    /// to zero does not mean "not known", it means mana, so a rogue whose
+    /// stats packet has not arrived would be drawn with a blue bar rather
+    /// than a yellow one and nothing would ever say the colour was a guess.
+    pub power_type: Option<u8>,
+    /// Only ever from the party packet: an entity's zone is not a replicated
+    /// field, because a player you can see is by definition in your zone.
+    pub zone: Option<u16>,
+    /// Whether this member is a replicated object right now, which is the same
+    /// question as whether the numbers above are exact or a remembered
+    /// summary.
+    pub in_view: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1101,6 +1147,47 @@ pub struct WorldState {
     /// table. A second one drifts, and a new opcode wired into one and not the
     /// other freezes whatever it should have moved.
     pub names: crate::names::Names,
+    /// The group this character is in, or `None` for none.
+    ///
+    /// **The one piece of replicated state here that needs no accounting**,
+    /// and the reason is a property of the packet rather than of this code:
+    /// `SMSG_GROUP_LIST` is a *complete* statement of the group, resent in
+    /// full to every member whenever anything about it changes. There is no
+    /// merge to get wrong, no partial update to miss, and no way for a dropped
+    /// packet to leave a permanent error -- the next one says everything
+    /// again. So this is an assignment, where every other field on this struct
+    /// had to be folded.
+    ///
+    /// `None` is set from the same packet: a list with no other members in it
+    /// *is* the server saying this character is in no group. See
+    /// [`crate::group::Party`].
+    pub party: Option<crate::group::Party>,
+    /// What the server last said about each group member's health, power,
+    /// level and zone, keyed by guid.
+    ///
+    /// **Separate from the entity table on purpose, because it covers exactly
+    /// the case the entity table cannot.** A party member standing next to you
+    /// is an ordinary replicated player and every one of these numbers is
+    /// already in their update fields; a party member two zones away is not
+    /// replicated at all, and this is the only thing the server sends about
+    /// them. A client reading party frames out of entities alone looks
+    /// perfectly correct until the party splits up, which is when a party
+    /// frame is for.
+    ///
+    /// Unlike the party itself this *is* folded, field by field: the packet
+    /// carries a mask naming which of twenty fields moved, so an arriving
+    /// health must not erase a level that arrived a minute ago.
+    ///
+    /// Pruned whenever the party changes, so a member who left cannot leave a
+    /// stale row behind -- the one piece of accounting party state needs.
+    pub party_stats: HashMap<u64, crate::group::MemberStats>,
+    /// An invite waiting to be answered, and who sent it.
+    ///
+    /// State rather than an event, unlike chat: an invite stays open until the
+    /// player answers it or it times out, so a caller that treated it as an
+    /// event would flash a dialog for one frame. Cleared when this client
+    /// answers, and when the server withdraws it.
+    pub party_invite: Option<crate::group::GroupInvite>,
 }
 
 impl WorldState {
@@ -1131,6 +1218,132 @@ impl WorldState {
         if self.loot.as_ref().is_some_and(|loot| loot.is_empty()) {
             self.loot = None;
         }
+    }
+
+    /// Replaces the party with what the server just said, and prunes the
+    /// per-member stats to match.
+    ///
+    /// **The pruning is the one piece of accounting party state needs.**
+    /// Everything else about a group is restated in full on every change, so
+    /// there is nothing to merge and nothing to miss -- but
+    /// [`Self::party_stats`] is keyed by guid and accumulates, so a member who
+    /// leaves would otherwise leave a row behind that the next member to join
+    /// could never overwrite. That row is invisible until somebody indexes the
+    /// map by a guid the party no longer holds, which is exactly the shape of
+    /// bug this crate's counters exist to catch.
+    fn set_party(&mut self, party: crate::group::Party) {
+        if party.in_group() {
+            self.party_stats
+                .retain(|guid, _| party.member(*guid).is_some());
+            self.party = Some(party);
+        } else {
+            self.party_stats.clear();
+            self.party = None;
+        }
+        // An invite that has been answered -- by this client or by anyone --
+        // cannot still be pending once a group list arrives.
+        self.party_invite = None;
+    }
+
+    /// Folds one `SMSG_PARTY_MEMBER_STATS` into what is known about a member.
+    ///
+    /// Field by field, and only the fields the packet's mask named: the server
+    /// sends what *moved*, so a member taking a hit sends current health
+    /// alone. Overwriting the whole record would report them as level 0 with
+    /// no mana for as long as it took the next full update to arrive.
+    fn merge_member_stats(&mut self, incoming: crate::group::MemberStats) {
+        let held = self.party_stats.entry(incoming.guid).or_default();
+        held.guid = incoming.guid;
+        held.mask = incoming.mask;
+        if incoming.status.is_some() {
+            held.status = incoming.status;
+        }
+        if incoming.health.is_some() {
+            held.health = incoming.health;
+        }
+        if incoming.max_health.is_some() {
+            held.max_health = incoming.max_health;
+        }
+        if incoming.power_type.is_some() {
+            held.power_type = incoming.power_type;
+        }
+        if incoming.power.is_some() {
+            held.power = incoming.power;
+        }
+        if incoming.max_power.is_some() {
+            held.max_power = incoming.max_power;
+        }
+        if incoming.level.is_some() {
+            held.level = incoming.level;
+        }
+        if incoming.zone.is_some() {
+            held.zone = incoming.zone;
+        }
+        if incoming.position.is_some() {
+            held.position = incoming.position;
+        }
+    }
+
+    /// What is known about one group member, preferring the replicated object
+    /// over the party's own summary.
+    ///
+    /// **The two sources are not equivalent and the order matters.** A member
+    /// in view is a full player object whose health is exact and current; a
+    /// member out of view is only whatever `SMSG_PARTY_MEMBER_STATS` last
+    /// said, which is coarser and can be a minute old. Preferring the entity
+    /// where there is one means a frame shows the better number whenever the
+    /// better number exists, and falls back rather than going blank when the
+    /// party spreads out.
+    pub fn party_member_vitals(&self, guid: u64) -> PartyVitals {
+        let stats = self.party_stats.get(&guid);
+        let entity = self.entities.get(&guid);
+        PartyVitals {
+            health: entity
+                .and_then(Entity::health)
+                .or(stats.and_then(|s| s.health)),
+            max_health: entity
+                .and_then(Entity::max_health)
+                .or(stats.and_then(|s| s.max_health)),
+            level: entity
+                .and_then(|e| e.fields.get(crate::update::fields::UNIT_LEVEL))
+                .or(stats.and_then(|s| s.level.map(u32::from))),
+            power: entity
+                .and_then(Entity::power)
+                .or(stats.and_then(|s| s.power.map(u32::from))),
+            max_power: entity
+                .and_then(Entity::max_power)
+                .or(stats.and_then(|s| s.max_power.map(u32::from))),
+            // **Not `or`-ed with a zero anywhere.** The other fields fall back
+            // between two sources that hold the same quantity; this one falls
+            // back between two sources that hold the same *index*, and an
+            // index has no honest default -- see [`PartyVitals::power_type`].
+            power_type: entity
+                .and_then(Entity::power_type)
+                .or(stats.and_then(|s| s.power_type)),
+            zone: stats.and_then(|s| s.zone),
+            in_view: entity.is_some(),
+        }
+    }
+
+    /// Whether a selection naming `guid` should still be treated as a
+    /// selection, given that the guid is not currently a replicated object.
+    ///
+    /// **Written for one caller and nearly broke a different one.** A target
+    /// that died or walked out of range leaves replicated state and the
+    /// selection should be dropped with it -- but a party member outside
+    /// visibility range was often never replicated to begin with, which is
+    /// the ordinary case this whole milestone exists to handle, not the
+    /// exceptional one. Clicking their row and having the target clear on the
+    /// very next frame is indistinguishable from the click doing nothing.
+    /// `guid` counts as still targetable while it names a current party
+    /// member (`Party::member` already excludes the reader, so this can
+    /// never trivially admit the reader's own guid).
+    pub fn still_targetable(&self, guid: u64) -> bool {
+        self.entities.contains_key(&guid)
+            || self
+                .party
+                .as_ref()
+                .is_some_and(|party| party.member(guid).is_some() || party.is_leader(guid))
     }
 
     pub fn get(&self, guid: u64) -> Option<&Entity> {
@@ -2303,6 +2516,90 @@ impl WorldState {
                         )),
                     }
                 }
+                crate::opcode::server::GROUP_LIST => {
+                    match crate::group::parse_group_list(&packet.body) {
+                        Ok(party) => {
+                            report.party_lists += 1;
+                            self.set_party(party);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::GROUP_INVITE => {
+                    match crate::group::parse_group_invite(&packet.body) {
+                        // Only the form that can actually be accepted opens a
+                        // dialog. The other is the server reporting an invite
+                        // that could not be delivered, and offering an Accept
+                        // button for it would be offering a button that does
+                        // nothing.
+                        Ok(invite) if invite.can_accept => self.party_invite = Some(invite),
+                        Ok(_) => {}
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // Both of these say an invite is no longer answerable -- one
+                // because it was withdrawn, one because this client's own
+                // decline was processed. Neither carries anything worth
+                // keeping, and a dialog left on screen after either would
+                // offer a button the server will refuse.
+                crate::opcode::server::GROUP_CANCEL | crate::opcode::server::GROUP_DECLINE => {
+                    self.party_invite = None;
+                }
+                crate::opcode::server::PARTY_COMMAND_RESULT => {
+                    match crate::group::parse_party_command_result(&packet.body) {
+                        Ok(result) => report.party_results.push(result),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::PARTY_MEMBER_STATS
+                | crate::opcode::server::PARTY_MEMBER_STATS_FULL => {
+                    let parsed = if packet.opcode == crate::opcode::server::PARTY_MEMBER_STATS {
+                        crate::group::parse_party_member_stats(&packet.body)
+                    } else {
+                        crate::group::parse_party_member_stats_full(&packet.body)
+                    };
+                    match parsed {
+                        Ok(stats) => {
+                            report.party_stat_updates += 1;
+                            self.merge_member_stats(stats);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // The group is gone, or this character has been thrown out of
+                // it. Both are stated by an empty `SMSG_GROUP_LIST` as well,
+                // and clearing here too costs nothing and covers the ordering
+                // either way round.
+                crate::opcode::server::GROUP_DESTROYED
+                | crate::opcode::server::GROUP_UNINVITE => {
+                    self.set_party(crate::group::Party {
+                        group_type: 0,
+                        own_subgroup: 0,
+                        own_flags: 0,
+                        own_roles: 0,
+                        guid: 0,
+                        counter: 0,
+                        members: Vec::new(),
+                        leader: 0,
+                        loot: None,
+                    });
+                }
                 _ => {}
             }
         }
@@ -2397,6 +2694,267 @@ mod tests {
             },
             fields: fields(f),
         }
+    }
+
+
+    /// The exact `SMSG_PARTY_MEMBER_STATS` the local realm sent about
+    /// `Watcher` while `Testwolf` stood 186 units away, captured on
+    /// 2026-08-18. Kept as the bytes rather than as a built struct so the
+    /// assertions below are about the wire and not about this test's idea of
+    /// it -- the same reason `world::group`'s own fixtures are hex.
+    const WATCHER_STATS: [u8; 69] = [
+        0x01, 0x03, 0xff, 0xff, 0x07, 0x00, 0x01, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0xe8, 0x03, 0x01, 0x00, 0x0c, 0x00, 0xe1, 0xdd, 0xbd, 0xff, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// **The case a party frame exists for**, and it is the one the entity
+    /// table cannot answer: a member out of visibility range is not a
+    /// replicated object at all, so every number about them comes from this
+    /// packet or from nowhere.
+    ///
+    /// The power pair is the half that would have been missed. Health and
+    /// level are obvious enough that a fallback for them gets written; a
+    /// power *type* is an index, and defaulting it to zero does not read as
+    /// "not known", it reads as mana -- which would draw this warrior a blue
+    /// bar and say nothing about having guessed. Rage at 0/1000 is what
+    /// `Watcher` actually is, and it agrees with what that character's own
+    /// client independently reports about itself.
+    #[test]
+    fn an_out_of_view_member_reads_entirely_from_the_party_packet() {
+        let mut state = WorldState::default();
+        let stats = crate::group::parse_party_member_stats(&WATCHER_STATS).expect("stats parse");
+        state.merge_member_stats(stats);
+
+        let vitals = state.party_member_vitals(3);
+        assert!(
+            !vitals.in_view,
+            "nothing was replicated, so nothing may claim to be"
+        );
+        assert_eq!(vitals.health, Some(60));
+        assert_eq!(vitals.max_health, Some(60));
+        assert_eq!(vitals.level, Some(1));
+        assert_eq!(vitals.zone, Some(12), "a zone has no replicated field at all");
+        assert_eq!(
+            vitals.power_type,
+            Some(1),
+            "rage -- a `None` here would have been drawn as mana"
+        );
+        assert_eq!(vitals.power, Some(0));
+        assert_eq!(vitals.max_power, Some(1000));
+
+        // A guid the party has said nothing about is blank rather than zero.
+        // The whole `Option` layer is pointless if this returns numbers.
+        let unknown = state.party_member_vitals(9);
+        assert_eq!(unknown.health, None);
+        assert_eq!(unknown.power_type, None);
+        assert!(!unknown.in_view);
+    }
+
+    /// And where the member *is* replicated, the entity wins -- **both
+    /// halves**, because a test of either alone passes under the wrong rule.
+    /// A member in view is a full player object whose health is exact and
+    /// current; the party packet is coarser and can be a minute old, so a
+    /// frame preferring it would show a stale number for the person standing
+    /// next to you and nobody would know which source they were reading.
+    #[test]
+    fn a_replicated_member_overrides_the_partys_summary() {
+        let mut state = WorldState::default();
+        let stats = crate::group::parse_party_member_stats(&WATCHER_STATS).expect("stats parse");
+        state.merge_member_stats(stats);
+
+        // The same guid, now in view and hurt: health down, level up, and a
+        // rage pool the party packet also describes -- so every field here
+        // disagrees with the summary above and the disagreement is visible.
+        state.replicate(
+            &[Packet {
+                opcode: crate::opcode::server::UPDATE_OBJECT,
+                body: update_object_body(
+                    3,
+                    &[
+                        (crate::update::fields::UNIT_HEALTH, 12),
+                        (crate::update::fields::UNIT_MAX_HEALTH, 90),
+                        (crate::update::fields::UNIT_LEVEL, 7),
+                        // Power type lives in the top byte of BYTES_0; 1 is
+                        // rage, matching what the party packet says, so the
+                        // power *index* below is read the same way by both.
+                        (crate::update::fields::UNIT_BYTES_0, 1 << 24),
+                        (crate::update::fields::UNIT_POWER1 + 1, 40),
+                        (crate::update::fields::UNIT_MAX_POWER1 + 1, 100),
+                    ],
+                ),
+            }],
+            None,
+        );
+
+        let vitals = state.party_member_vitals(3);
+        assert!(vitals.in_view, "the member is a replicated object now");
+        assert_eq!(vitals.health, Some(12), "the stale 60 won");
+        assert_eq!(vitals.max_health, Some(90));
+        assert_eq!(vitals.level, Some(7));
+        assert_eq!(vitals.power, Some(40), "the stale 0 won");
+        assert_eq!(vitals.max_power, Some(100), "the stale 1000 won");
+
+        // The zone is the exception and stays the party's, because there is
+        // no such replicated field: a player you can see is in your zone, so
+        // the object never carries one. Losing it on the frame a member walks
+        // into view would blank the only line that says where they are.
+        assert_eq!(vitals.zone, Some(12));
+    }
+
+    /// A member who leaves must not leave a row behind in `party_stats`.
+    ///
+    /// **The one piece of accounting party state needs.** Everything else
+    /// about a group is restated in full on every change, so there is nothing
+    /// to merge and nothing to miss -- but this map is keyed by guid and
+    /// accumulates, and a stale row is invisible until somebody indexes it
+    /// with a guid the party no longer holds.
+    #[test]
+    fn stats_are_pruned_when_the_member_leaves() {
+        let mut state = WorldState::default();
+        let stats = crate::group::parse_party_member_stats(&WATCHER_STATS).expect("stats parse");
+        state.merge_member_stats(stats);
+        assert!(state.party_stats.contains_key(&3));
+
+        // A group that still holds them keeps the row...
+        state.set_party(crate::group::Party {
+            group_type: 0,
+            own_subgroup: 0,
+            own_flags: 0,
+            own_roles: 0,
+            guid: 0x1f50,
+            counter: 1,
+            members: vec![crate::group::PartyMember {
+                name: "Watcher".into(),
+                guid: 3,
+                status: crate::group::MemberStatus::ONLINE,
+                subgroup: 0,
+                flags: 0,
+                roles: 0,
+            }],
+            leader: 1,
+            loot: None,
+        });
+        assert!(
+            state.party_stats.contains_key(&3),
+            "a member still in the group lost their stats"
+        );
+
+        // ...and one that does not, drops it. Both halves, because pruning
+        // everything unconditionally would pass a test of the second alone
+        // and blank every party frame on every update.
+        state.set_party(crate::group::Party {
+            group_type: 0x10,
+            own_subgroup: 0,
+            own_flags: 0,
+            own_roles: 0,
+            guid: 0x1f50,
+            counter: 3,
+            members: Vec::new(),
+            leader: 0,
+            loot: None,
+        });
+        assert!(state.party.is_none(), "an empty leader is not a group");
+        assert!(
+            state.party_stats.is_empty(),
+            "a departed member left a stale row"
+        );
+    }
+
+    /// Clicking a party member's row who has never been replicated must not
+    /// have the very next `still_targetable` check undo it.
+    ///
+    /// **Found live**, not by reasoning about the code: an out-of-range
+    /// `Watcher` was clicked in the party frame and the target visibly did
+    /// not take. `entities` never held guid 3 at any point in this test --
+    /// the ordinary state for a party member outside visibility range, which
+    /// is the entire premise of parties needing their own vitals source. The
+    /// old rule ("gone from replicated state means clear it") could not tell
+    /// that case apart from a target that had walked out of range *after*
+    /// being seen, which is the one it was actually written for.
+    #[test]
+    fn a_party_member_never_replicated_stays_targetable() {
+        let mut state = WorldState::default();
+        assert!(
+            !state.still_targetable(3),
+            "a guid nobody has ever heard of is not a target"
+        );
+
+        state.set_party(crate::group::Party {
+            group_type: 0,
+            own_subgroup: 0,
+            own_flags: 0,
+            own_roles: 0,
+            guid: 0x1f50,
+            counter: 1,
+            members: vec![crate::group::PartyMember {
+                name: "Watcher".into(),
+                guid: 3,
+                status: crate::group::MemberStatus::ONLINE,
+                subgroup: 0,
+                flags: 0,
+                roles: 0,
+            }],
+            leader: 1,
+            loot: None,
+        });
+        assert!(
+            state.still_targetable(3),
+            "a current party member with no replicated object was cleared anyway"
+        );
+
+        // And the ordinary case still works: once the group is gone (or this
+        // member leaves it), the same guid is no longer exempt.
+        state.set_party(crate::group::Party {
+            group_type: 0x10,
+            own_subgroup: 0,
+            own_flags: 0,
+            own_roles: 0,
+            guid: 0x1f50,
+            counter: 2,
+            members: Vec::new(),
+            leader: 0,
+            loot: None,
+        });
+        assert!(
+            !state.still_targetable(3),
+            "a guid from a group that has since disbanded stayed targetable forever"
+        );
+    }
+
+    /// The packet sends only what *moved*, so a merge has to be field by
+    /// field. Overwriting the record wholesale would report a party member in
+    /// another zone as level 0 with no mana for as long as it took the next
+    /// full update to arrive -- which is a change nothing prompts.
+    #[test]
+    fn a_partial_update_does_not_erase_what_it_omits() {
+        let mut state = WorldState::default();
+        let full = crate::group::parse_party_member_stats(&WATCHER_STATS).expect("stats parse");
+        state.merge_member_stats(full);
+
+        // Health alone, which is what a member taking a hit sends: the packed
+        // guid, a mask naming one field, and one `u32`.
+        //
+        // **Built from the flag constant rather than from a written-out
+        // number**, and that is not tidiness -- writing `0x04` here by hand
+        // is writing `MAX_HP`, so the packet says the maximum fell to 30 and
+        // every assertion below still passes except the one about health.
+        // That is exactly the mistake this test caught when it was first
+        // written, and a literal would let it back in.
+        let mut hurt = vec![0x01u8, 0x03];
+        hurt.extend_from_slice(&crate::group::flag::CUR_HP.to_le_bytes());
+        hurt.extend_from_slice(&30u32.to_le_bytes());
+        let partial = crate::group::parse_party_member_stats(&hurt).expect("partial parse");
+        state.merge_member_stats(partial);
+
+        let vitals = state.party_member_vitals(3);
+        assert_eq!(vitals.health, Some(30), "the new health did not land");
+        assert_eq!(vitals.max_health, Some(60), "a maximum nothing resent was lost");
+        assert_eq!(vitals.level, Some(1), "a level nothing resent was lost");
+        assert_eq!(vitals.max_power, Some(1000), "a power pool nothing resent was lost");
+        assert_eq!(vitals.zone, Some(12), "a zone nothing resent was lost");
     }
 
     fn at(x: f32, y: f32) -> Position {

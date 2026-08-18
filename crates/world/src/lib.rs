@@ -15,6 +15,7 @@ pub mod crypt;
 pub mod death;
 pub mod environment;
 pub mod gossip;
+pub mod group;
 pub mod inventory;
 pub mod loot;
 pub mod motion;
@@ -35,6 +36,10 @@ pub use chat::{ChatMessage, ChatType};
 pub use client::{Connection, DEFAULT_PORT};
 pub use crypt::HeaderCrypt;
 pub use gossip::{Gossip, GossipOption, GossipQuest};
+pub use group::{
+    GroupInvite, LootRule, MemberStats, MemberStatus, Party, PartyCommandResult, PartyMember,
+    PartyOperation, PartyResult,
+};
 pub use quest::{
     ObjectiveTarget, QuestInfo, QuestItemObjective, QuestObjective, QuestPoi, QuestPoiSet,
     QuestPoint, QuestRewardItem,
@@ -51,7 +56,7 @@ pub use spell::{InitialSpells, KnownSpell};
 pub use protocol::{
     Appearance, AuthResponse, Character, Equipment, WorldPosition, EQUIPMENT_SLOTS,
 };
-pub use state::{Cast, Replication, WorldState};
+pub use state::{Cast, PartyVitals, Replication, WorldState};
 pub use update::{Block, MonsterMove, ObjectType, Position};
 pub use weather::{Precipitation, Weather, WeatherChange};
 

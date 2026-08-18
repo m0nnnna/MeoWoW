@@ -966,6 +966,54 @@ impl Connection {
         self.send(ClientOpcode::SellItem, &body)
     }
 
+    /// Asks a player to join this character's group, naming them by the name
+    /// they type on a chat line rather than by guid.
+    ///
+    /// See [`ClientOpcode::GroupInvite`] for why the name is the right handle
+    /// here and why this is the party request to attempt first. The trailing
+    /// `u32` is read and discarded by the server; zero is what a client with
+    /// nothing to say sends.
+    pub fn group_invite(&mut self, name: &str) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(name.len() + 5);
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        self.send(ClientOpcode::GroupInvite, &body)
+    }
+
+    /// Accepts the pending invite. Nothing identifies *which* invite because a
+    /// character can hold only one.
+    pub fn group_accept(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::GroupAccept, &0u32.to_le_bytes())
+    }
+
+    /// Declines the pending invite.
+    pub fn group_decline(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::GroupDecline, &[])
+    }
+
+    /// Leaves the group, or breaks it up if this character leads it. See
+    /// [`ClientOpcode::GroupDisband`]: one opcode does both, and the server
+    /// decides which.
+    pub fn group_disband(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::GroupDisband, &[])
+    }
+
+    /// Throws a member out by guid. The trailing `u32` is the length of a
+    /// vote-kick reason string; zero means an ordinary kick and no string
+    /// follows.
+    pub fn group_uninvite(&mut self, member: u64) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&member.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        self.send(ClientOpcode::GroupUninviteGuid, &body)
+    }
+
+    /// Hands leadership to another member.
+    pub fn group_set_leader(&mut self, member: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::GroupSetLeader, &member.to_le_bytes())
+    }
+
     /// Acknowledges a teleport within the current map.
     ///
     /// **The server will not finish the move until this arrives, and will

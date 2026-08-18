@@ -4623,3 +4623,177 @@ Scourge fire looks like and is not a colour anything in this client chose.
 * **Not yet confirmed at the window.** Everything above is headless: four
   screenshots, a GPU test that reads pixels back, and the counters in the
   overlay. A live run is the outstanding half.
+
+### 4.20: parties
+
+Five server packets, six client requests, two new frames, and four slash
+commands. A group can be formed, joined, read, left and broken up from the
+window.
+
+**The milestone divides along the project's own two instruments, and the split
+is the reason it is not just an interface job.** `SMSG_GROUP_LIST` is the group
+*as it stands* -- a complete statement, resent in full to every member whenever
+anything changes -- and `SMSG_PARTY_MEMBER_STATS` is a *change* to one member.
+The first is what the frames are drawn from. The second exists for exactly the
+case replicated state cannot cover.
+
+#### The fact the whole thing turns on
+
+A party member within visibility range is an ordinary replicated player. Health,
+power, level and position all arrive in object updates, and this client has read
+them since 4.1. **A party member two zones away is not replicated at all** --
+no object, no fields, nothing -- and `SMSG_PARTY_MEMBER_STATS` is the only thing
+the server sends about them.
+
+So a client drawing party frames out of replicated state alone looks completely
+correct right up until the party splits up, which is when a party frame is for.
+Worse, it looks correct in exactly the test a developer runs first: two clients
+side by side in Northshire, both in view of each other, every field arriving
+twice over.
+
+`WorldState::party_member_vitals` merges the two, preferring the entity where
+there is one -- a member in view is exact and current, a member out of view is
+whatever the last stats packet said and can be a minute old. The one field that
+never falls back is the **zone**, which only the party packet carries: a player
+you can see is by definition in your zone, so the object has no such field.
+
+#### Every vital is an `Option`, and the power type is why
+
+A member who has never been in view and whose stats packet has not arrived is a
+name and a guid and nothing else. That is a real and common state, so
+`PartyVitals` and `PartyMemberView` carry `Option`s all the way to the painter,
+and a bar with no known maximum is drawn **empty and unlabelled** rather than
+full.
+
+Health is the easy half -- two sources holding the same quantity, so a
+`unwrap_or(0)` there is merely wrong. The **power type** is the half that would
+have been missed: it is an *index*, so defaulting it to zero does not read as
+"not known", it reads as mana. A rogue whose stats packet had not arrived would
+be drawn with a blue bar and nothing anywhere would say the colour was invented.
+Same rule as the tooltip substituter passing `$s1` through with its `$` intact:
+a visible blank says "not known", and a fabricated number says nothing and is
+believed.
+
+#### How the layouts were established
+
+`CMSG_GROUP_INVITE` is **answered**, and that is why it is the request this
+milestone attempted first. Every other outgoing group message is silent, and a
+silent write fails identically whether the opcode is wrong, the body is wrong,
+or the server declined -- the trap `CMSG_BUY_ITEM` documents and
+`CMSG_LIST_INVENTORY` was used to escape. An invite produces
+`SMSG_PARTY_COMMAND_RESULT` **either way**, naming the operation, the player
+asked for, and a result code that differs between success and every kind of
+refusal. So one send with a deliberately misspelt name and one with a real name
+bounded the opcode, the body and the reply layout at once, before any packet
+with a variable-length list in it had to be read.
+
+Everything after that was measured against a live two-client party on the local
+realm, from **both ends**, which is this project's strongest shape: the
+structure goes out through one session, through the server, and back in through
+another, so nothing is checked against itself. `Watcher`'s guid, name, level and
+health are what `Watcher`'s own client reported about itself, and they arrive in
+the packet `Testwolf` received.
+
+#### The packet that refuted the obvious reading
+
+Forming a group sends the leader a `SMSG_GROUP_LIST` with **nobody else in it**,
+one packet before the real one. So "no members means no group" reports every
+group's creation as a departure -- for the fraction of a second between the two
+packets, which is long enough for one frame to draw.
+
+What separates the two forms is the **leader guid**: the empty-but-real form
+carries one, the "you are in no group" form carries zero. That is a fact about
+the bytes rather than an interpretation of a flag, which is why `Party::in_group`
+tests it. The leave form also sets `0x10` in `group_type`, recorded because it
+was observed rather than relied on -- one sample of one flag bit is a guess, and
+the leader guid is not.
+
+The test asserts **both** shapes. One that only checked the leave form would
+pass just as well under the wrong rule.
+
+#### Two heights, one hit test
+
+A party member with a power bar takes a taller row than one without, and a
+member out of view has no power fields at all -- so a mixed party is the normal
+case rather than the edge one. `frames::party::row_at` walks the same
+accumulating heights `draw` does instead of dividing by an average.
+
+The failure a uniform division produces is silent: a party row's click
+*targets* somebody, so the symptom is a spell landing on the wrong member, not
+an error.
+
+#### The invite prompt is the first frame here with two answers
+
+Every other clickable frame either has rows (loot, quest log, bags) or is one
+big button (the release prompt). Accept and Decline are **opposite** and sit
+side by side, so the geometry is stated once in `frames::party_invite::buttons`
+and both the drawing and the hit test read it -- two separately written copies
+of the same rectangles agree until one of them changes, the same reasoning that
+makes the picking ray unproject the matrix the scene was drawn with.
+
+A press that lands on neither button reports nothing rather than the nearer of
+the two. An accidental accept has to be undone by leaving the group.
+
+And the prompt is at the **top stacking rank**, with loot and the questgiver
+scroll, because an invite **times out**: one sealed under the map is a group the
+player never joins, with no error anywhere. There is a headless test that opens
+the map over it at a *different moment* and clicks Accept through it -- opened
+in the same pass they are both new and egui's build order wins, which is exactly
+how the first attempt at the questgiver fix passed its own test while changing
+nothing (`e9d001c`).
+
+#### What was confirmed live, 2026-08-18
+
+Two clients on the local AzerothCore realm, `Testwolf` (OWC33) and `Watcher`
+(OWC34), 186 units apart so the invitee was **never replicated**:
+
+- invite → `SMSG_PARTY_COMMAND_RESULT` `it worked (about "Watcher")`;
+- the invitee received `SMSG_GROUP_INVITE` naming `"Testwolf"` and accepted;
+- both clients then received a `SMSG_GROUP_LIST` holding the *other* one, with
+  the same group guid and the same leader, and counters differing because the
+  counter increments per send;
+- `Watcher` read `60/60` health, `0/1000` rage (`type 1`), level 1, zone 12 --
+  every number from `SMSG_PARTY_MEMBER_STATS`, since nothing about them was
+  replicated, and all of it agreeing with what that client reported about
+  itself;
+- leave → `SMSG_PARTY_COMMAND_RESULT`, `SMSG_GROUP_DESTROYED`, and an empty
+  `SMSG_GROUP_LIST` with a zero leader;
+- kick → the same three at both ends.
+
+That capture is now a test. `crates/world/src/state.rs` holds `Watcher`'s stats
+packet as its 69 bytes and asserts both halves -- the fallback carrying every
+field including the power *type*, and a replicated entity overriding it while
+the zone survives.
+
+#### What this deliberately does not do
+
+* **No raids.** `Party::group_type`, `own_subgroup`, `own_flags` and each
+  member's `subgroup`/`flags`/`roles` are all parsed and carried, and nothing
+  reads them. A party is `0` in every one of them, so there is nothing here that
+  could be checked against a real raid, and a raid interface guessed at from
+  fields that are always zero would be four frames of fiction.
+* **No party chat.** `ChatType::Party` already parses and colours; there is no
+  way to *send* to it, because that is a chat-window feature (a channel the
+  composing line is aimed at) rather than a group one, and adding a fifth
+  meaning to the `/` prefix without the window to go with it would be half of
+  something.
+* **No loot rule interface.** `LootRule` parses -- method, threshold, master
+  looter, both difficulties -- and is printed by `wow-cli` and drawn nowhere.
+  Changing it is another opcode, and reading it is worth nothing until there is
+  a loot window that behaves differently under group loot.
+* **No dungeon finder.** The `GROUPTYPE_LFG` bit is honoured *only* so the five
+  extra bytes it inserts do not shift every field after them. The two fields
+  themselves are read and dropped.
+* **No offline handling beyond dimming.** An offline member stays in the list,
+  because the server keeps them there, and is drawn dimmed. Nothing tries to
+  distinguish "logged out" from "connection dropped"; the status byte does not
+  say.
+* **No party markers on the map.** `MemberStats::position` parses -- and its
+  signedness was measured, since Elwynn is at negative coordinates and the
+  unsigned reading lands a dot in Kalimdor -- but nothing draws it. The map
+  page a member is on is a different question from the one the projection
+  answers, and guessing it would put a dot on the wrong continent silently.
+* **Not yet confirmed at the window.** Everything above the live section is
+  headless: sixteen egui tests running the real `Hud::show`, including clicks
+  driven through the real event loop and through an open map. The two-client
+  run confirmed the protocol and the state, not the picture.
