@@ -248,6 +248,10 @@ pub struct Style {
     pub world_map_player: Color,
     /// A quest objective's pin.
     pub world_map_objective: Color,
+    /// A party member's dot. Distinct from both the player's own arrow and
+    /// an objective's pin -- three things a reader might otherwise confuse
+    /// on the same page.
+    pub world_map_party: Color,
     /// Drawn around both, so a pin stays visible over parchment of any shade.
     pub world_map_outline: Color,
     /// Radius of a pin, and the reach of the hover test, at scale 1.0.
@@ -456,6 +460,7 @@ impl Default for Style {
             world_map_backing: Color::rgba(28, 24, 18, 245),
             world_map_player: Color::rgb(240, 220, 90),
             world_map_objective: Color::rgb(230, 90, 70),
+            world_map_party: Color::rgb(120, 180, 240),
             world_map_outline: Color::rgba(10, 10, 12, 220),
             world_map_pin: 7.0,
 

@@ -7672,6 +7672,35 @@ impl App {
                         .collect()
                 })
                 .unwrap_or_default();
+            // A member's own zone and position, not the vitals the party
+            // frame reads -- `party_member_vitals` prefers a replicated
+            // entity's position when there is one, but a page is picked by
+            // *zone*, and the entity carries no such field (see
+            // `PartyVitals::zone`'s doc comment). `MemberStats::position` and
+            // `::zone` are read directly so the two always agree with each
+            // other regardless of visibility range.
+            let party_pins: Vec<maps::PartyMemberPin> = self
+                .live
+                .as_ref()
+                .and_then(|live| live.state.party.as_ref())
+                .map(|party| {
+                    party
+                        .members
+                        .iter()
+                        .filter_map(|member| {
+                            let stats = self.live.as_ref()?.state.party_stats.get(&member.guid)?;
+                            let zone = stats.zone?;
+                            let (x, y) = stats.position?;
+                            Some(maps::PartyMemberPin {
+                                name: member.name.clone(),
+                                zone: zone as u32,
+                                x: x as f32,
+                                y: y as f32,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             maps::build_view(
                 &mut self.maps,
                 &r.gpu,
@@ -7679,6 +7708,7 @@ impl App {
                 &mut self.chain,
                 standing,
                 &objectives,
+                &party_pins,
                 &|bit| explored_bits.contains(&bit),
             )
         });

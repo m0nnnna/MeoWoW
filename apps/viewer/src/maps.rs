@@ -40,6 +40,10 @@ pub struct Maps {
     /// belongs to one row, so treating "no bit" as bit zero would reveal a
     /// patch on the strength of an absent field.
     area_bits: HashMap<u32, u32>,
+    /// `AreaTable` id to its immediate parent -- see [`Self::page_for_zone`]
+    /// for why a party member's zone needs this and the player's own
+    /// position never has.
+    parent_area: HashMap<u32, u32>,
     /// Uploaded tiles per page id. A `None` is a tile that would not load.
     tiles: HashMap<u32, [Option<egui::TextureId>; TILE_COUNT]>,
     /// Uploaded patch tiles, keyed by overlay id and tile number.
@@ -97,6 +101,11 @@ impl Maps {
                     .filter(|row| row.area_bit() != 0)
                     .map(|row| (row.id(), row.area_bit()))
                     .collect();
+                maps.parent_area = table
+                    .iter()
+                    .filter(|row| row.parent_area_id() != 0)
+                    .map(|row| (row.id(), row.parent_area_id()))
+                    .collect();
             }
         }
         tracing::info!(
@@ -112,6 +121,31 @@ impl Maps {
     /// The page to draw for a position, if any covers it.
     pub fn page_at(&self, map_id: u32, x: f32, y: f32) -> Option<&Page> {
         self.atlas.zone_page(map_id, x, y)
+    }
+
+    /// The page a party member's zone belongs to, if any -- for a member
+    /// whose only location is `SMSG_PARTY_MEMBER_STATS`' `(zone, position)`
+    /// pair rather than a world position this client can test against a
+    /// rectangle. `Atlas::page_by_area` is an equality test against a real
+    /// `AreaTable` id, but a member's own zone can be a fine-grained
+    /// sub-area with no page of its own -- `Northshire Valley` rather than
+    /// `Elwynn Forest` -- so this walks `parent_area_id` the same way
+    /// [`crate::sound::resolve_zone_sound`] already does for a different
+    /// table, stopping at the first ancestor (including the zone itself)
+    /// that names a page.
+    pub fn page_for_zone(&self, zone: u32) -> Option<&Page> {
+        const MAX_PARENT_HOPS: u32 = 8;
+        let mut current = zone;
+        for _ in 0..MAX_PARENT_HOPS {
+            if let Some(page) = self.atlas.page_by_area(current) {
+                return Some(page);
+            }
+            match self.parent_area.get(&current) {
+                Some(&parent) if parent != current => current = parent,
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// What to call a page.
@@ -399,6 +433,22 @@ pub struct Standing {
     pub orientation: f32,
 }
 
+/// One party member's coarse location, for [`build_view`].
+///
+/// **Has no `map_id`, unlike [`Standing`] -- see [`Maps::page_for_zone`].**
+/// `SMSG_PARTY_MEMBER_STATS` carries a zone and a position and nothing that
+/// names a continent, so a member is placed by matching `zone` against the
+/// page being drawn rather than by testing `(x, y)` against its rectangle;
+/// `x`/`y` only decide *where on that page* the dot lands. Truncated to a
+/// whole world unit on the wire -- do not expect the dot to track a moving
+/// member smoothly.
+pub struct PartyMemberPin {
+    pub name: String,
+    pub zone: u32,
+    pub x: f32,
+    pub y: f32,
+}
+
 /// Assembles what the map frame draws.
 ///
 /// A free function rather than a method on the viewer because the caller holds
@@ -418,6 +468,7 @@ pub fn build_view(
     chain: &mut Chain,
     standing: Option<Standing>,
     objectives: &[Objective<'_>],
+    party: &[PartyMemberPin],
     explored: &dyn Fn(u32) -> bool,
 ) -> ui::MapView {
     let Some(at) = standing else {
@@ -439,10 +490,31 @@ pub fn build_view(
     };
 
     let (u, v) = page.project(at.x, at.y);
+    // Zone equality, not the position -- see `PartyMemberPin`'s doc comment.
+    // A member whose zone resolves to a *different* page (or to no page at
+    // all) draws nothing, which is deliberate: the refuting half of this
+    // feature is that a member who leaves the zone loses their dot rather
+    // than it landing somewhere plausible on the wrong page.
+    let party_markers: Vec<ui::MapMarker> = party
+        .iter()
+        .filter(|pin| maps.page_for_zone(pin.zone).is_some_and(|p| p.id == page.id))
+        .map(|pin| {
+            let (u, v) = page.project(pin.x, pin.y);
+            ui::MapMarker {
+                u,
+                v,
+                facing: 0.0,
+                kind: ui::MarkerKind::PartyMember,
+                label: pin.name.clone(),
+                outline: Vec::new(),
+            }
+        })
+        .collect();
     let tiles = maps.tiles(gpu, renderer, chain, &page);
     let patches = maps.patches(gpu, renderer, chain, &page, explored);
-    // Objectives first so the player's arrow is painted over them rather than
-    // under: where you are is never the thing to obscure.
+    // Objectives, then party members, then the player's own arrow last so it
+    // is painted over both rather than under: where you are is never the
+    // thing to obscure.
     let mut markers: Vec<ui::MapMarker> = objectives
         .iter()
         .flat_map(|objective| {
@@ -452,6 +524,7 @@ pub fn build_view(
                 .filter_map(|poi| marker(&page, poi, &objective.label))
         })
         .collect();
+    markers.extend(party_markers);
     markers.push(ui::MapMarker {
         u,
         v,
@@ -817,5 +890,51 @@ mod tests {
             "east: {:?}",
             tip(3.0 * FRAC_PI_2)
         );
+    }
+
+    fn maps_with_elwynn() -> Maps {
+        Maps {
+            atlas: Atlas::from_pages(vec![elwynn()]),
+            // 132 is Coldridge Valley in the real table, reused here only as
+            // a sub-area with a parent that has a page -- the same shape
+            // `resolve_zone_sound`'s own test fixture uses.
+            parent_area: [(132, 12)].into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The ordinary case: a member's zone already names a page directly.
+    #[test]
+    fn a_zone_finds_its_page_directly() {
+        assert_eq!(maps_with_elwynn().page_for_zone(12).map(|p| p.id), Some(30));
+    }
+
+    /// **The case this method exists for.** A party member's own zone can be
+    /// a sub-area with no page of its own -- exactly the shape
+    /// `resolve_zone_sound` already had to handle for a different table --
+    /// and the walk has to reach Elwynn's page through Coldridge Valley's
+    /// `parent_area_id` rather than reporting no page at all.
+    #[test]
+    fn a_sub_area_walks_up_to_its_parents_page() {
+        assert_eq!(maps_with_elwynn().page_for_zone(132).map(|p| p.id), Some(30));
+    }
+
+    /// **The refuting half.** A zone with no page anywhere in its ancestry
+    /// finds nothing -- which is what makes a party member's dot vanish when
+    /// they change zones, rather than sticking to whatever page was open.
+    #[test]
+    fn a_zone_with_no_page_in_its_chain_finds_nothing() {
+        assert_eq!(maps_with_elwynn().page_for_zone(9999), None);
+    }
+
+    /// A cycle in `parent_area_id` must terminate rather than hang -- the
+    /// same guard `resolve_zone_sound` needed, and the same reason: bad data
+    /// should read as "no page found", not as the client not responding.
+    #[test]
+    fn a_cycle_in_parent_area_terminates_rather_than_hanging() {
+        let mut maps = maps_with_elwynn();
+        maps.parent_area.insert(50, 51);
+        maps.parent_area.insert(51, 50);
+        assert_eq!(maps.page_for_zone(50), None);
     }
 }

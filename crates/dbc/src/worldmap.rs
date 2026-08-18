@@ -262,6 +262,17 @@ impl Atlas {
         }
     }
 
+    /// Builds an atlas directly from already-constructed pages, with no
+    /// overlays. For a caller (or a test in another crate, where `Atlas`'s
+    /// fields are not visible) that has pages from somewhere other than a
+    /// real `WorldMapArea.dbc` table.
+    pub fn from_pages(pages: Vec<Page>) -> Self {
+        Self {
+            pages,
+            overlays: Vec::new(),
+        }
+    }
+
     /// Adds the patch table, keeping the rows that state a texture and a size.
     pub fn with_overlays(mut self, table: &WorldMapOverlay) -> Self {
         self.overlays = table
@@ -309,6 +320,27 @@ impl Atlas {
     /// The whole-continent page for a map, if it has one.
     pub fn continent_page(&self, map_id: u32) -> Option<&Page> {
         self.pages.iter().find(|p| p.map_id == map_id && p.area_id == 0)
+    }
+
+    /// The zone page whose `area_id` equals this `AreaTable` id -- an
+    /// equality test, the same shape as [`Self::page`] for a
+    /// `WorldMapArea` id rather than a containment test against a
+    /// rectangle. **For a caller with no world position to test against**,
+    /// such as a party member's coarse `(zone, position)` pair rather than a
+    /// live entity: `area_id` is not the fine-grained zone a member may
+    /// actually be standing in (see `Page::area_id`'s own doc comment), so a
+    /// caller resolving a real `AreaTable` id normally needs to walk its
+    /// `parent_area_id` chain until one of the ancestors matches here --
+    /// that walk needs `AreaTable` itself, which this crate does not load,
+    /// so it lives on the caller. Continent pages (`area_id == 0`) never
+    /// match, for the same reason [`Self::zone_page`] excludes them: every
+    /// zone belongs to some continent, and matching an unset field would be
+    /// a coincidence, not an answer.
+    pub fn page_by_area(&self, area_id: u32) -> Option<&Page> {
+        if area_id == 0 {
+            return None;
+        }
+        self.pages.iter().find(|p| p.area_id == area_id)
     }
 }
 
@@ -456,6 +488,33 @@ mod tests {
         // And a point in Elwynn proper is only in the one page.
         let page = atlas.zone_page(0, -9450.0, -1100.0).expect("a page");
         assert_eq!(page.id, 30, "expected Elwynn, got {}", page.directory);
+    }
+
+    /// A party member's zone names a page by equality, not by containment --
+    /// the same shape a quest POI already uses, and the one that answers
+    /// `page_at`/`zone_page` cannot: there is no world position to test a
+    /// rectangle against, only the `AreaTable` id a member's own stats
+    /// packet carries. `area_id` values are the real ones from `elwynn()`
+    /// and `stormwind()` above -- 12 and 1519, matching what `Watcher` and a
+    /// character standing in Stormwind actually reported live.
+    #[test]
+    fn a_zone_finds_its_page_by_equality() {
+        let atlas = Atlas {
+            pages: vec![elwynn(), stormwind()],
+            overlays: Vec::new(),
+        };
+        assert_eq!(atlas.page_by_area(12).map(|p| p.id), Some(30));
+        assert_eq!(atlas.page_by_area(1519).map(|p| p.id), Some(301));
+        assert_eq!(
+            atlas.page_by_area(9999),
+            None,
+            "a zone with no page of its own must not resolve to one anyway"
+        );
+        assert_eq!(
+            atlas.page_by_area(0),
+            None,
+            "a continent's own zero area_id must never match a real zone's lookup"
+        );
     }
 
     fn overlay(texture: &str, width: u32, height: u32, offset: (u32, u32)) -> Overlay {

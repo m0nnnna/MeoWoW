@@ -49,6 +49,13 @@ pub enum MarkerKind {
     Player,
     /// One point of a quest objective, off `SMSG_QUEST_POI_QUERY_RESPONSE`.
     Objective,
+    /// Another party member, drawn only on the page their own zone resolves
+    /// to -- see `maps::PartyMemberPin`'s doc comment for why that is a zone
+    /// match rather than a position inside the page's rectangle. Its
+    /// `label` is always drawn beside the dot, unlike an objective's, which
+    /// only shows on hover: knowing *which* member a dot is is the entire
+    /// point of a party's dots existing at all.
+    PartyMember,
 }
 
 /// Something drawn on top of the page.
@@ -240,7 +247,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MapView, style: &Style, scale:
             art.center(),
             Align2::CENTER_CENTER,
             note,
-            font,
+            font.clone(),
             style.quest_dim.into(),
         );
     }
@@ -276,6 +283,25 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MapView, style: &Style, scale:
                     style.world_map_objective,
                     Stroke::new(scale.max(1.0), style.world_map_outline),
                 );
+            }
+            MarkerKind::PartyMember => {
+                clipped.circle(
+                    at,
+                    pin * 0.5,
+                    style.world_map_party,
+                    Stroke::new(scale.max(1.0), style.world_map_outline),
+                );
+                // Always on, unlike an objective's label -- see
+                // `MarkerKind::PartyMember`'s doc comment for why.
+                if !marker.label.is_empty() {
+                    clipped.text(
+                        at + Vec2::new(pin * 0.8, 0.0),
+                        Align2::LEFT_CENTER,
+                        &marker.label,
+                        font.clone(),
+                        style.world_map_party.into(),
+                    );
+                }
             }
             MarkerKind::Player => {
                 // An arrow rather than a dot: the heading is the half of "you
