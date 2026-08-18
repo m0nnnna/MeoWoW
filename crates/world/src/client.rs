@@ -1014,6 +1014,18 @@ impl Connection {
         self.send(ClientOpcode::GroupSetLeader, &member.to_le_bytes())
     }
 
+    /// Changes the party's loot rule. See [`ClientOpcode::GroupSetLootMethod`]
+    /// for the body layout and why nothing here checks leadership -- the
+    /// server already refuses a non-leader's request in silence, and this
+    /// client's own callers refuse it first using [`crate::group::Party::is_leader`].
+    pub fn set_loot_method(&mut self, method: u32, master: u64, threshold: u32) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&method.to_le_bytes());
+        body.extend_from_slice(&master.to_le_bytes());
+        body.extend_from_slice(&threshold.to_le_bytes());
+        self.send(ClientOpcode::GroupSetLootMethod, &body)
+    }
+
     /// Acknowledges a teleport within the current map.
     ///
     /// **The server will not finish the move until this arrives, and will

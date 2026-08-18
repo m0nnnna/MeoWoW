@@ -21,6 +21,80 @@ use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec
 
 use crate::style::{PowerType, Style};
 
+/// The party's loot rule, as the caller has already rendered it.
+///
+/// **The label is a plain, pre-built string rather than a method/threshold
+/// pair this crate formats itself.** This crate depends on neither `world`
+/// nor a name-guessing rule for a wire enum -- see `world::group::LootRule`'s
+/// doc comment on why a loot method is never named here from memory. The
+/// caller supplies whatever it can stand behind, already resolved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LootRuleView {
+    pub label: String,
+    /// Whether a click on this line should be treated as a request to
+    /// change it -- true only when the caller has already checked
+    /// `Party::is_leader` against the reader's own guid, which this crate
+    /// has no way to know for itself.
+    pub editable: bool,
+}
+
+impl LootRuleView {
+    /// A stand-in so the loot line can be positioned in edit mode, matching
+    /// [`PartyMemberView::placeholder`]'s reasoning: a frame that only
+    /// appears with a real group in it could otherwise never be dragged
+    /// without one.
+    pub fn placeholder() -> Option<Self> {
+        Some(Self {
+            label: "loot: method 3, threshold 2".to_string(),
+            editable: false,
+        })
+    }
+}
+
+/// How tall the loot line is, whether or not one is drawn -- callers that
+/// need to know where the member rows start read this rather than
+/// duplicating the font math.
+fn loot_line_height(style: &Style, scale: f32) -> f32 {
+    style.font_size * 1.3 * scale
+}
+
+/// Where the member rows begin: right under the loot line if there is one,
+/// or at the top of the frame if there is not. The one function both
+/// [`draw`] and [`row_at`] call, so the two cannot disagree about where a
+/// row is by disagreeing about where the list starts.
+fn members_top(rect: Rect, style: &Style, scale: f32, loot: &Option<LootRuleView>) -> f32 {
+    let mut top = rect.top() + style.padding * scale;
+    if loot.is_some() {
+        top += loot_line_height(style, scale) + style.gap * scale;
+    }
+    top
+}
+
+/// The loot line's own rect, for a click to be tested against -- `None` when
+/// there is no rule to show, so a click cannot land on a line that was never
+/// drawn.
+pub fn loot_rect(rect: Rect, style: &Style, scale: f32, loot: &Option<LootRuleView>) -> Option<Rect> {
+    loot.as_ref()?;
+    let inner_left = rect.left() + style.padding * scale;
+    let inner_right = rect.right() - style.padding * scale;
+    let top = rect.top() + style.padding * scale;
+    Some(Rect::from_min_size(
+        Pos2::new(inner_left, top),
+        Vec2::new(inner_right - inner_left, loot_line_height(style, scale)),
+    ))
+}
+
+/// Whether a point lands on the loot line **and** the caller marked it
+/// editable -- both have to hold, or a non-leader's click would read as a
+/// request the server is only going to refuse in silence, which is exactly
+/// the failure a local refusal exists to avoid.
+pub fn loot_clicked(rect: Rect, style: &Style, scale: f32, loot: &Option<LootRuleView>, point: Pos2) -> bool {
+    let Some(editable) = loot.as_ref().map(|l| l.editable) else {
+        return false;
+    };
+    editable && loot_rect(rect, style, scale, loot).is_some_and(|r| r.contains(point))
+}
+
 /// One row of the party frame.
 ///
 /// Every live number is an [`Option`] and none of them is defaulted -- see the
@@ -157,7 +231,7 @@ fn row_height(style: &Style, scale: f32, has_power: bool) -> f32 {
 /// same rule the loot window and the quest log follow. A fixed height would
 /// leave a band of empty frame under a small party, which reads as a window
 /// that failed to fill rather than as a group with two people in it.
-pub fn size(members: &[PartyMemberView], style: &Style, scale: f32) -> Vec2 {
+pub fn size(members: &[PartyMemberView], loot: &Option<LootRuleView>, style: &Style, scale: f32) -> Vec2 {
     if members.is_empty() {
         return Vec2::ZERO;
     }
@@ -166,10 +240,11 @@ pub fn size(members: &[PartyMemberView], style: &Style, scale: f32) -> Vec2 {
         .map(|member| row_height(style, scale, member.has_power()))
         .sum();
     let gaps = style.gap * scale * members.len().saturating_sub(1) as f32;
-    Vec2::new(
-        style.party_width * scale,
-        style.padding * 2.0 * scale + rows + gaps,
-    )
+    let mut height = style.padding * 2.0 * scale + rows + gaps;
+    if loot.is_some() {
+        height += loot_line_height(style, scale) + style.gap * scale;
+    }
+    Vec2::new(style.party_width * scale, height)
 }
 
 /// Which member row a point is in, or `None` between rows and outside the
@@ -183,6 +258,7 @@ pub fn size(members: &[PartyMemberView], style: &Style, scale: f32) -> Vec2 {
 pub fn row_at(
     rect: Rect,
     members: &[PartyMemberView],
+    loot: &Option<LootRuleView>,
     style: &Style,
     scale: f32,
     point: Pos2,
@@ -190,7 +266,7 @@ pub fn row_at(
     if !rect.contains(point) {
         return None;
     }
-    let mut top = rect.top() + style.padding * scale;
+    let mut top = members_top(rect, style, scale, loot);
     for (index, member) in members.iter().enumerate() {
         let height = row_height(style, scale, member.has_power());
         if point.y >= top && point.y < top + height {
@@ -202,7 +278,14 @@ pub fn row_at(
 }
 
 /// Paints the party frame into `rect`.
-pub fn draw(painter: &Painter, rect: Rect, members: &[PartyMemberView], style: &Style, scale: f32) {
+pub fn draw(
+    painter: &Painter,
+    rect: Rect,
+    members: &[PartyMemberView],
+    loot: &Option<LootRuleView>,
+    style: &Style,
+    scale: f32,
+) {
     if members.is_empty() {
         return;
     }
@@ -221,7 +304,17 @@ pub fn draw(painter: &Painter, rect: Rect, members: &[PartyMemberView], style: &
     let painter = painter.with_clip_rect(inner);
     let font = FontId::proportional(style.font_size * scale);
 
-    let mut top = inner.top();
+    if let Some(loot) = loot {
+        painter.text(
+            Pos2::new(inner.left(), inner.top()),
+            Align2::LEFT_TOP,
+            &loot.label,
+            font.clone(),
+            style.text.into(),
+        );
+    }
+
+    let mut top = members_top(rect, style, scale, loot);
     for member in members {
         // Offline is checked before dead and is not an `else` of it. The two
         // are independent -- a member can lose their connection while dead --
@@ -476,14 +569,14 @@ mod tests {
     fn a_click_lands_on_the_row_it_is_over() {
         let style = Style::default();
         let members = vec![known(), unknown(), known()];
-        let rect = Rect::from_min_size(Pos2::ZERO, size(&members, &style, 1.0));
+        let rect = Rect::from_min_size(Pos2::ZERO, size(&members, &None, &style, 1.0));
 
         let mut top = rect.top() + style.padding;
         for (index, member) in members.iter().enumerate() {
             let height = row_height(&style, 1.0, member.has_power());
             let centre = Pos2::new(rect.center().x, top + height * 0.5);
             assert_eq!(
-                row_at(rect, &members, &style, 1.0, centre),
+                row_at(rect, &members, &None, &style, 1.0, centre),
                 Some(index),
                 "row {index} did not answer for its own centre"
             );
@@ -491,7 +584,7 @@ mod tests {
         }
 
         assert_eq!(
-            row_at(rect, &members, &style, 1.0, Pos2::new(-10.0, -10.0)),
+            row_at(rect, &members, &None, &style, 1.0, Pos2::new(-10.0, -10.0)),
             None,
             "a point outside the frame named a row"
         );
@@ -503,20 +596,20 @@ mod tests {
     #[test]
     fn the_frame_grows_with_the_party() {
         let style = Style::default();
-        let two = size(&[known(), known()], &style, 1.0);
-        let three = size(&[known(), known(), known()], &style, 1.0);
+        let two = size(&[known(), known()], &None, &style, 1.0);
+        let three = size(&[known(), known(), known()], &None, &style, 1.0);
         assert!(three.y > two.y);
         assert_eq!(three.x, two.x, "only the height depends on the party");
 
-        let with_power = size(&[known()], &style, 1.0);
-        let without = size(&[unknown()], &style, 1.0);
+        let with_power = size(&[known()], &None, &style, 1.0);
+        let without = size(&[unknown()], &None, &style, 1.0);
         assert!(
             without.y < with_power.y,
             "a member with nothing known took as much room as one with a power bar"
         );
 
         assert_eq!(
-            size(&[], &style, 1.0),
+            size(&[], &None, &style, 1.0),
             Vec2::ZERO,
             "an empty party asked for room"
         );
@@ -528,8 +621,8 @@ mod tests {
     fn scale_multiplies_every_dimension() {
         let style = Style::default();
         let members = vec![known(), unknown()];
-        let single = size(&members, &style, 1.0);
-        let double = size(&members, &style, 2.0);
+        let single = size(&members, &None, &style, 1.0);
+        let double = size(&members, &None, &style, 2.0);
         assert!((double.x - single.x * 2.0).abs() < 0.001);
         assert!((double.y - single.y * 2.0).abs() < 0.001);
     }
@@ -549,8 +642,8 @@ mod tests {
             };
             let output = ctx.run_ui(input, |ctx| {
                 let painter = ctx.layer_painter(egui::LayerId::background());
-                let rect = Rect::from_min_size(Pos2::ZERO, size(members, &style, 1.0));
-                draw(&painter, rect, members, &style, 1.0);
+                let rect = Rect::from_min_size(Pos2::ZERO, size(members, &None, &style, 1.0));
+                draw(&painter, rect, members, &None, &style, 1.0);
             });
             let rendered = format!("{:?}", output.shapes);
             output.drop_without_applying_deltas();
@@ -587,5 +680,111 @@ mod tests {
             ..known()
         }]);
         assert_ne!(alive, leader, "the leader drew the same as an ordinary member");
+    }
+
+    fn loot(editable: bool) -> Option<LootRuleView> {
+        Some(LootRuleView {
+            label: "loot: method 3, threshold 2".into(),
+            editable,
+        })
+    }
+
+    /// The loot line takes its own row's worth of height, on top of the
+    /// members -- not instead of one of them, and not free.
+    #[test]
+    fn the_loot_line_adds_its_own_height() {
+        let style = Style::default();
+        let members = [known()];
+        let without = size(&members, &None, &style, 1.0);
+        let with = size(&members, &loot(true), &style, 1.0);
+        assert!(with.y > without.y, "a loot line took no extra room");
+        assert_eq!(with.x, without.x, "only the height changes");
+    }
+
+    /// **The trap this frame exists to avoid a second time**: the loot line
+    /// sits above the members, so every row's hit-test rect has to shift
+    /// down by exactly the loot line's height, or a click meant for the
+    /// first member lands on -- or through -- the loot line instead. This is
+    /// the same shape of bug as the member rows not all being the same
+    /// height, checked the same way: derive the expected geometry
+    /// independently (`members_top`) and confirm the centre of the first row
+    /// still finds row `0`.
+    #[test]
+    fn a_loot_line_pushes_every_row_down_without_breaking_the_hit_test() {
+        let style = Style::default();
+        let members = vec![known(), unknown()];
+        let loot = loot(true);
+        let rect = Rect::from_min_size(Pos2::ZERO, size(&members, &loot, &style, 1.0));
+
+        let mut top = members_top(rect, &style, 1.0, &loot);
+        for (index, member) in members.iter().enumerate() {
+            let height = row_height(&style, 1.0, member.has_power());
+            let centre = Pos2::new(rect.center().x, top + height * 0.5);
+            assert_eq!(
+                row_at(rect, &members, &loot, &style, 1.0, centre),
+                Some(index),
+                "row {index} did not answer for its own centre once a loot line was added"
+            );
+            top += height + style.gap;
+        }
+
+        // And the loot line's own rect is genuinely above the first row,
+        // not overlapping it.
+        let loot_rect = loot_rect(rect, &style, 1.0, &loot).expect("a loot rule was supplied");
+        assert!(
+            loot_rect.bottom() <= members_top(rect, &style, 1.0, &loot),
+            "the loot line overlapped the member rows"
+        );
+    }
+
+    /// A click on the loot line only counts when the caller already marked
+    /// it editable -- this crate cannot check leadership itself, so it
+    /// trusts the flag rather than always reporting a click as actionable.
+    #[test]
+    fn a_loot_click_is_reported_only_when_editable() {
+        let style = Style::default();
+        let members = [known()];
+
+        let editable = loot(true);
+        let rect = Rect::from_min_size(Pos2::ZERO, size(&members, &editable, &style, 1.0));
+        let centre = loot_rect(rect, &style, 1.0, &editable).unwrap().center();
+        assert!(loot_clicked(rect, &style, 1.0, &editable, centre));
+
+        let read_only = loot(false);
+        assert!(
+            !loot_clicked(rect, &style, 1.0, &read_only, centre),
+            "a non-leader's click on the loot line was reported as actionable"
+        );
+
+        assert!(
+            !loot_clicked(rect, &style, 1.0, &None, centre),
+            "a click landed on a loot line that does not exist"
+        );
+    }
+
+    /// And it has to reach the screen: a party with a loot rule must not
+    /// paint the same as one without, or the whole feature is invisible.
+    #[test]
+    fn what_is_known_about_loot_changes_what_is_drawn() {
+        fn painted(members: &[PartyMemberView], loot: &Option<LootRuleView>) -> String {
+            let ctx = egui::Context::default();
+            let style = Style::default();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                let rect = Rect::from_min_size(Pos2::ZERO, size(members, loot, &style, 1.0));
+                draw(&painter, rect, members, loot, &style, 1.0);
+            });
+            let rendered = format!("{:?}", output.shapes);
+            output.drop_without_applying_deltas();
+            rendered
+        }
+
+        let without = painted(&[known()], &None);
+        let with = painted(&[known()], &loot(true));
+        assert_ne!(without, with, "a loot rule drew the same as having none");
     }
 }

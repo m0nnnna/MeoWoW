@@ -39,8 +39,8 @@ pub use element::{Anchor, Element};
 pub use frames::chat::{ChatEntry, ChatKind};
 pub use frames::combat_text::{CombatTextKind, FloatingText};
 pub use frames::{
-    CastBarView, InviteAnswer, PartyInviteView, PartyMemberView, QuestDetail, QuestLogEntry,
-    QuestgiverAction, QuestgiverClick, QuestgiverRow,
+    CastBarView, InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
+    QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
     MapMarker, MapPatch, MapView, MarkerKind, QuestgiverView, SpellbookEntry, UnitView,
 };
 pub use layout::{default_path, CharacterBars, ElementId, Profile};
@@ -176,6 +176,13 @@ pub struct HudData<'a> {
     /// leaves the recipient out of `SMSG_GROUP_LIST`, and this client already
     /// draws them in a frame of their own.
     pub party: &'a [frames::PartyMemberView],
+    /// The party's current loot rule, already rendered to a label -- see
+    /// [`frames::party::LootRuleView`] for why this crate never builds that
+    /// label itself. `None` draws no loot line at all, which is also what a
+    /// party of nobody-but-the-reader means (the server sends no loot block
+    /// for one), so this and [`Self::party`] being empty are expected to
+    /// agree.
+    pub party_loot: Option<frames::LootRuleView>,
     /// A pending group invite, or `None`. Existence is the flag again.
     ///
     /// **State rather than an event**, unlike a chat line: an invite stays
@@ -245,6 +252,13 @@ pub struct HudResponse {
     /// different opcodes and a caller reading `true` as "accept" is one
     /// inverted condition away from declining every invite silently.
     pub party_invite: Option<frames::InviteAnswer>,
+    /// The loot line was clicked while marked editable. This crate has no
+    /// way to know whether the reader leads the group -- see
+    /// [`frames::party::LootRuleView::editable`] -- so it trusts the flag
+    /// the caller already set from `Party::is_leader` rather than deciding
+    /// for itself, and this is `true` only when that flag was `true` *and*
+    /// the click landed on the line.
+    pub party_loot_clicked: bool,
 }
 
 /// What the cursor is currently carrying, picked up from either window that
@@ -553,6 +567,7 @@ impl Hud {
             let world_map_placeholder;
             let release_prompt_placeholder;
             let party_placeholder;
+            let party_loot_placeholder;
             let party_invite_placeholder;
             let content = match id {
                 ElementId::PlayerFrame | ElementId::TargetFrame => {
@@ -676,9 +691,10 @@ impl Hud {
                             continue;
                         }
                         party_placeholder = frames::PartyMemberView::placeholder();
-                        Content::Party(&party_placeholder)
+                        party_loot_placeholder = frames::party::LootRuleView::placeholder();
+                        Content::Party(&party_placeholder, &party_loot_placeholder)
                     } else {
-                        Content::Party(data.party)
+                        Content::Party(data.party, &data.party_loot)
                     }
                 }
                 ElementId::PartyInvite => match data.party_invite {
@@ -739,7 +755,7 @@ impl Hud {
                 // Sized to the party *and* to what is known about each member
                 // -- a member out of view has no power bar, so the rows are
                 // not all the same height. See `frames::party::size`.
-                Content::Party(members) => frames::party::size(members, &style, element.scale),
+                Content::Party(members, loot) => frames::party::size(members, loot, &style, element.scale),
                 Content::PartyInvite(_) => frames::party_invite::size(&style, element.scale),
             };
             let rect = element.rect(screen, size);
@@ -820,7 +836,7 @@ impl Hud {
                             | Content::Questgiver(_)
                             | Content::ReleasePrompt(_)
                             | Content::Bags(_)
-                            | Content::Party(_)
+                            | Content::Party(..)
                             | Content::PartyInvite(_)
                     ) {
                         // The frames you interact with while playing, so they
@@ -929,10 +945,11 @@ impl Hud {
                             &style,
                             element.scale,
                         ),
-                        Content::Party(members) => frames::party::draw(
+                        Content::Party(members, loot) => frames::party::draw(
                             &painter,
                             response.rect,
                             members,
+                            loot,
                             &style,
                             element.scale,
                         ),
@@ -1114,12 +1131,26 @@ impl Hud {
                         }
                     }
                 }
-                (false, Content::Party(members)) => {
+                (false, Content::Party(members, loot)) => {
                     if response.clicked() {
                         if let Some(pointer) = response.interact_pointer_pos() {
-                            if let Some(row) = frames::party::row_at(
+                            // The loot line sits above the member rows and is
+                            // never itself a row, so the two checks cannot
+                            // both fire for the same click -- see
+                            // `party::members_top`, which both `row_at` and
+                            // `loot_rect` are built from.
+                            if frames::party::loot_clicked(
+                                drawn_rect,
+                                &style,
+                                element.scale,
+                                loot,
+                                pointer,
+                            ) {
+                                response_out.party_loot_clicked = true;
+                            } else if let Some(row) = frames::party::row_at(
                                 drawn_rect,
                                 members,
+                                loot,
                                 &style,
                                 element.scale,
                                 pointer,
@@ -1353,6 +1384,7 @@ impl Hud {
             let edit_quest_log = frames::quest_log::placeholder();
             let edit_questgiver = frames::questgiver::placeholder();
             let edit_party = frames::PartyMemberView::placeholder();
+            let edit_party_loot = frames::party::LootRuleView::placeholder();
             let sizes: Vec<(ElementId, egui::Vec2)> = ElementId::ALL
                 .into_iter()
                 .map(|id| {
@@ -1407,6 +1439,11 @@ impl Hud {
                                 &edit_party
                             } else {
                                 data.party
+                            },
+                            if data.party.is_empty() {
+                                &edit_party_loot
+                            } else {
+                                &data.party_loot
                             },
                             &style,
                             scale,
@@ -1474,7 +1511,7 @@ enum Content<'a> {
     Questgiver(&'a frames::QuestgiverView),
     WorldMap(&'a frames::MapView),
     ReleasePrompt(&'a frames::ReleasePromptView),
-    Party(&'a [frames::PartyMemberView]),
+    Party(&'a [frames::PartyMemberView], &'a Option<frames::LootRuleView>),
     PartyInvite(&'a frames::PartyInviteView),
 }
 
@@ -3372,6 +3409,7 @@ mod tests {
             ElementId::ReleasePrompt => frames::release::size(&profile.style, scale),
             ElementId::PartyFrame => frames::party::size(
                 &frames::PartyMemberView::placeholder(),
+                &frames::party::LootRuleView::placeholder(),
                 &profile.style,
                 scale,
             ),
@@ -3633,14 +3671,14 @@ mod tests {
         let style = hud.profile.style;
         let rect = element.rect(
             screen(),
-            frames::party::size(&members, &style, element.scale),
+            frames::party::size(&members, &None, &style, element.scale),
         );
         // The second row's centre, measured the way the frame stacks rows
         // rather than by dividing the height: the rows are not all the same
         // height, so an averaged position would test a pixel no player's
         // click would land on.
         let row_height = |member: &frames::PartyMemberView| {
-            frames::party::size(std::slice::from_ref(member), &style, element.scale).y
+            frames::party::size(std::slice::from_ref(member), &None, &style, element.scale).y
                 - style.padding * 2.0 * element.scale
         };
         let top = rect.top()

@@ -494,6 +494,16 @@ pub enum ClientOpcode {
     /// Hand leadership to another member, by guid. Body is the guid alone.
     GroupSetLeader = 0x0078,
 
+    /// Changes the party's loot rule. Body is `{u32 method, u64 master
+    /// (raw, not packed -- `AzerothCore`'s handler reads it with the same
+    /// plain `operator>>` as every other guid this client sends unpacked),
+    /// u32 threshold}`. **Silent, like every party request but the invite**:
+    /// the server answers by resending `SMSG_GROUP_LIST` with the new rule
+    /// in it, or not at all if it declined -- refused server-side for
+    /// anyone but the leader, so `Party::is_leader` is checked before this is
+    /// ever sent rather than after nothing comes back.
+    GroupSetLootMethod = 0x007A,
+
     /// Throw a member out by name. Kept beside the guid form because the
     /// server accepts both and the two take different bodies; this client
     /// sends the guid form.

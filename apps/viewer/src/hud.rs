@@ -316,6 +316,26 @@ pub fn party_view(state: &::world::WorldState) -> Vec<ui::PartyMemberView> {
         .collect()
 }
 
+/// The party's current loot rule, or `None` when the group has nobody else
+/// in it -- see `world::group::Party::loot`'s doc comment for why that is a
+/// real state and not a bug to work around. `editable` is set only when
+/// `own_guid` leads the group: the server refuses `CMSG_LOOT_METHOD` from
+/// anyone else in silence, and this client refuses it locally first rather
+/// than sending a request it already knows will be dropped.
+pub fn party_loot_view(state: &::world::WorldState, own_guid: u64) -> Option<ui::LootRuleView> {
+    let party = state.party.as_ref()?;
+    let rule = party.loot.as_ref()?;
+    let master_name = (rule.master != 0)
+        .then(|| state.names.player(rule.master))
+        .flatten()
+        .flatten()
+        .map(str::to_string);
+    Some(ui::LootRuleView {
+        label: ::world::group::describe_loot_rule(rule, master_name.as_deref()),
+        editable: party.is_leader(own_guid),
+    })
+}
+
 #[cfg(test)]
 mod party_tests {
     use ::world::group::{MemberStatus, Party, PartyMember};

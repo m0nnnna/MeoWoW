@@ -2267,6 +2267,13 @@ struct App {
     autorun: bool,
     last_heartbeat: Instant,
     last_ping: Instant,
+    /// When the loot method was last changed. `None` until the first change
+    /// this session -- see `App::cycle_loot_method`'s doc comment for why a
+    /// cooldown exists at all: a realm was observed dropping the connection
+    /// outright after several `CMSG_LOOT_METHOD`s sent in quick succession,
+    /// the same class of failure `PING_INTERVAL` exists to avoid on a
+    /// different opcode.
+    last_loot_method_change: Option<Instant>,
     /// The `undrawable` count last logged, so entity rebuilding (which now
     /// runs every frame) warns once per change instead of every frame for the
     /// rest of the session.
@@ -3129,6 +3136,7 @@ impl App {
             autorun: false,
             last_heartbeat: Instant::now(),
             last_ping: Instant::now(),
+            last_loot_method_change: None,
             last_undrawable_warned: 0,
             own_body_drawn: true,
             own_corpse: None,
@@ -5112,6 +5120,86 @@ impl App {
                 tracing::warn!("answering a group invite failed: {e:#}");
                 self.notice(format!("could not answer the invite: {e}"));
             }
+        }
+    }
+
+    /// Advances the party's loot method by one, wrapping after the fifth --
+    /// the count `AzerothCore`'s own handler enforces (`lootMethod >
+    /// NEED_BEFORE_GREED` is refused), read from its source per rule 2 and
+    /// confirmed live rather than trusted outright: sending each of the five
+    /// in turn produces a `SMSG_GROUP_LIST` carrying it back, and a sixth is
+    /// silently dropped exactly like an invite to a name that does not
+    /// exist. The threshold is left as it is -- this control changes one
+    /// thing at a time.
+    ///
+    /// **Raw value `2` needs a master and got refused until this did
+    /// something about it.** Cycling into it with no master looter set
+    /// produced no reply at all, live -- every other transition answers with
+    /// a fresh group list and this one alone did not, which is what
+    /// distinguished "refused" from "the client never sent it" here. Rather
+    /// than get stuck (the symptom this shipped with: the cycle would climb
+    /// to `1` and then every further click silently did nothing, because `1
+    /// -> 2` was the one transition the server was declining), this defaults
+    /// the master to the reader's own guid the moment it is needed and never
+    /// otherwise touches it -- whoever changes the rule becomes their own
+    /// master looter until something else in this interface lets them pick
+    /// someone.
+    ///
+    /// **Checked again here, not just trusted from the click.** The HUD only
+    /// reports `party_loot_clicked` when it drew the line editable, which
+    /// [`hud::party_loot_view`] sets from [`::world::group::Party::is_leader`]
+    /// -- but that was true as of the *previous* frame's paint, and
+    /// leadership can change between a paint and the click it produced (the
+    /// group disbands, leadership is handed off). Silent, like every party
+    /// request but the invite -- see [`Self::answer_party_invite`] for the
+    /// one that is not, and why.
+    ///
+    /// **Rate-limited.** Clicking this repeatedly in quick succession was
+    /// observed live to get the whole session disconnected -- the realm
+    /// answered `10053` (connection aborted) rather than anything naming
+    /// `CMSG_LOOT_METHOD` specifically, which reads exactly like the
+    /// keepalive-ping punishment documented on [`::world::client::PING_INTERVAL`]
+    /// wearing a different opcode. A fixed cooldown between sends is the same
+    /// fix applied the same way.
+    fn cycle_loot_method(&mut self) {
+        const COOLDOWN: Duration = Duration::from_millis(600);
+        if self
+            .last_loot_method_change
+            .is_some_and(|last| last.elapsed() < COOLDOWN)
+        {
+            return;
+        }
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let Some(party) = live.state.party.as_ref() else {
+            return;
+        };
+        if !party.is_leader(live.guid) {
+            return;
+        }
+        let Some(rule) = party.loot.as_ref() else {
+            return;
+        };
+        const METHOD_COUNT: u32 = 5;
+        // The one raw value observed live to need a member guid alongside
+        // it -- see this method's doc comment.
+        const NEEDS_MASTER: u32 = 2;
+        let next_method = (rule.method as u32 + 1) % METHOD_COUNT;
+        let master = if next_method == NEEDS_MASTER && rule.master == 0 {
+            live.guid
+        } else {
+            rule.master
+        };
+        let threshold = rule.threshold as u32;
+        let sent = live.connection.set_loot_method(next_method, master, threshold);
+        self.last_loot_method_change = Some(Instant::now());
+        if let Err(e) = sent {
+            tracing::warn!("changing the loot method failed: {e:#}");
+            // Locally, so a send that never left this machine is visible
+            // where the click happened rather than only in a log nobody has
+            // open -- the same reasoning as `send_chat`'s failure notice.
+            self.notice(format!("could not change the loot method: {e}"));
         }
     }
 
@@ -7862,6 +7950,10 @@ impl App {
             .as_ref()
             .map(|live| hud::party_view(&live.state))
             .unwrap_or_default();
+        let party_loot = self
+            .live
+            .as_ref()
+            .and_then(|live| hud::party_loot_view(&live.state, live.guid));
         let party_invite = self.live.as_ref().and_then(|live| {
             live.state
                 .party_invite
@@ -7922,6 +8014,7 @@ impl App {
                     // no separate "in a group" boolean that could disagree
                     // with the list.
                     party: &party,
+                    party_loot: party_loot.clone(),
                     party_invite: party_invite.as_ref(),
                 },
             );
@@ -8150,6 +8243,11 @@ impl App {
 
         if let Some(answer) = hud_response.party_invite {
             self.answer_party_invite(answer);
+            self.pending_sounds.push((sound::INTERFACE_CLICK, false));
+        }
+
+        if hud_response.party_loot_clicked {
+            self.cycle_loot_method();
             self.pending_sounds.push((sound::INTERFACE_CLICK, false));
         }
 

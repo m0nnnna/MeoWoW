@@ -38,7 +38,7 @@ pub use loot::{LootRow, Take};
 pub use cast_bar::CastBarView;
 pub use release::ReleasePromptView;
 pub use quest_log::{QuestDetail, QuestLogEntry};
-pub use party::PartyMemberView;
+pub use party::{LootRuleView, PartyMemberView};
 pub use party_invite::{InviteAnswer, PartyInviteView};
 pub use quest_mark::QuestMark;
 pub use questgiver::{QuestgiverAction, QuestgiverClick, QuestgiverRow, QuestgiverView};

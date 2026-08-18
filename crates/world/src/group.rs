@@ -153,6 +153,30 @@ pub struct LootRule {
     pub raid_heroic: u8,
 }
 
+/// Renders a loot rule as a line worth showing, naming nothing this project
+/// has not behaviourally confirmed.
+///
+/// **Every field here is currently a raw number, on purpose.** `method` and
+/// `threshold` are small public-facing enums with well-known names elsewhere
+/// -- but "well known elsewhere" is exactly the trap `describe_cast_failure`
+/// exists to refuse: a name asserts an observation, not a memory, and this
+/// project has only ever watched one number come off a live realm (`3`, on
+/// every party formed here so far) with nothing yet distinguishing what any
+/// of them actually *does* to a loot roll. When a future session tests that
+/// -- forms a master-loot party and confirms only the leader can assign an
+/// item, say -- name it here rather than in the caller, the same way
+/// [`describe_party_result`] is the one place a result code becomes English.
+pub fn describe_loot_rule(rule: &LootRule, master_name: Option<&str>) -> String {
+    let mut line = format!("loot: method {}, threshold {}", rule.method, rule.threshold);
+    if rule.master != 0 {
+        match master_name {
+            Some(name) => line.push_str(&format!(", master {name}")),
+            None => line.push_str(&format!(", master {:#018x}", rule.master)),
+        }
+    }
+    line
+}
+
 /// The whole group, as the server states it.
 ///
 /// **This packet is a complete statement and replaces whatever came before.**
@@ -608,6 +632,50 @@ pub fn describe_party_result(code: u32) -> String {
         PartyResult::NOT_IN_GROUP => "you are not in a group".to_string(),
         PartyResult::NOT_LEADER => "you do not lead this group".to_string(),
         other => format!("party result {other}"),
+    }
+}
+
+#[cfg(test)]
+mod loot_rule_tests {
+    use super::*;
+
+    /// The exact values a live capture on the local realm gave: `method 3,
+    /// threshold 2, master 0x0`. No name for `3`, on purpose -- see
+    /// `describe_loot_rule`'s doc comment.
+    #[test]
+    fn a_captured_rule_prints_its_raw_numbers() {
+        let rule = LootRule {
+            method: 3,
+            master: 0,
+            threshold: 2,
+            dungeon_difficulty: 0,
+            raid_difficulty: 0,
+            raid_heroic: 0,
+        };
+        assert_eq!(describe_loot_rule(&rule, None), "loot: method 3, threshold 2");
+    }
+
+    /// A non-zero master is shown, named if the caller can and by guid if
+    /// not -- either way it is never omitted, since a master looter with an
+    /// invisible name is the harder failure to notice.
+    #[test]
+    fn a_master_is_shown_named_or_by_guid() {
+        let rule = LootRule {
+            method: 2,
+            master: 0x0000_0001,
+            threshold: 2,
+            dungeon_difficulty: 0,
+            raid_difficulty: 0,
+            raid_heroic: 0,
+        };
+        assert_eq!(
+            describe_loot_rule(&rule, None),
+            "loot: method 2, threshold 2, master 0x0000000000000001"
+        );
+        assert_eq!(
+            describe_loot_rule(&rule, Some("Testwolf")),
+            "loot: method 2, threshold 2, master Testwolf"
+        );
     }
 }
 
