@@ -426,6 +426,7 @@ mod tests {
             speed: 0.0,
             turning: 0.0,
             airborne: false,
+            swimming: false,
             dead: false,
             died_ms_ago: None,
             swung_ms_ago: None,

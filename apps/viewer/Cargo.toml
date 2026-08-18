@@ -13,6 +13,7 @@ blp = { path = "../../crates/blp" }
 render = { path = "../../crates/render" }
 
 wgpu.workspace = true
+bytemuck.workspace = true
 winit.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true

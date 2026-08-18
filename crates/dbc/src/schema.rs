@@ -1332,6 +1332,137 @@ dbc_table! {
     }
 }
 
+dbc_table! {
+    /// Every kind of liquid an `MH2O` sheet can name: water, ocean, lava and
+    /// slime, plus the per-instance variants of each.
+    ///
+    /// Small enough -- 26 rows in this build -- that the whole table was read
+    /// rather than sampled, which is what makes the column identifications
+    /// below statements about all of it.
+    LiquidType, LiquidTypeRow, path = r"DBFilesClient\LiquidType.dbc", fields = 45, {
+        0 id: u32,
+        /// Internal name, e.g. `Slow Water`, `Green Lava`, `Naxxramas - Slime`.
+        ///
+        /// **Descriptive, not authoritative.** See [`LiquidTypeRow::category`]:
+        /// one row is called `Orange Slime` and is categorised as water.
+        1 name: str,
+        2 flags: u32,
+        /// What kind of liquid this is -- see [`LiquidCategory`], which is the
+        /// column the whole feature turns on.
+        3 category: u32,
+        /// [`SoundEntries`] row played while in this liquid. 1111-3880 across
+        /// the table, all of them real sound ids.
+        4 sound_id: u32,
+        /// Aura the *server* applies to anyone in this liquid, or 0.
+        ///
+        /// Named because it explains what is otherwise a puzzling zero: the
+        /// ordinary magma rows carry 57634 and the ordinary water rows carry
+        /// nothing, so the damage a lava pool does is a spell the server casts
+        /// rather than anything a client computes. This client never sends it.
+        5 spell_id: u32,
+        /// 1 for the water-like materials, 2 for magma and slime, 3 for the
+        /// procedural water introduced in Wrath.
+        14 material_id: u32,
+        /// Path of the surface art, with `%d` standing for the frame number --
+        /// `XTextures\river\lake_a.%d.blp`, `XTextures\lava\lava.%d.blp`.
+        ///
+        /// The independent witness for [`LiquidTypeRow::category`]: every row
+        /// the category calls magma reaches a file under `lava` or `LavaGreen`,
+        /// and every row it calls slime reaches one under `slime`. Two
+        /// different columns agreeing is evidence; a column agreeing with its
+        /// own name is not.
+        15 texture: str,
+    }
+}
+
+/// What a [`LiquidType`] row actually *is*, which decides whether standing in
+/// it is swimming or dying.
+///
+/// **Identified by the names its rows carry and confirmed by the art they
+/// reach**, which is the same move that named `CreatureSoundData`'s death
+/// column. Field 3 runs 0-3 over the whole 26-row table, and the two readings
+/// agree completely:
+///
+/// | value | rows named | textures they reach |
+/// |---|---|---|
+/// | 0 | `Water`, `Slow Water`, `Fast Water`, `WMO Water` | `XTextures\river\` |
+/// | 1 | `Ocean`, `Slow Ocean`, `Fast Ocean`, `WMO Ocean` | `XTextures\ocean\` |
+/// | 2 | `Magma`, `Green Lava`, `Chamber Magma` | `XTextures\lava\`, `LavaGreen` |
+/// | 3 | `Slime`, `WMO Slime`, `Naxxramas - Slime` | `XTextures\slime\` |
+///
+/// **And the one row where the two disagree is the reason this is a column
+/// rather than a name match.** Row 181 is called `Orange Slime`, draws
+/// `LavaOrange`, and its category is **0 -- water**. A client that decided
+/// what burns you by looking for "slime" or "lava" in a name would set a
+/// player on fire in a pond the server considers harmless, and would do it
+/// silently, because nothing about the resulting damage disagrees with
+/// anything the client can see. The server reads this column
+/// (`LiquidTypeEntry::Type`), so this column is what the client reads too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiquidCategory {
+    /// Rivers, lakes and pools. Swimmable, harmless.
+    Water,
+    /// Sea water. Swimmable, harmless, and darker.
+    Ocean,
+    /// Lava. Swimmable in the sense that a character floats in it, and the
+    /// server burns them for it.
+    Magma,
+    /// Slime. Same again, with a different school of damage.
+    Slime,
+    /// A value this build does not use. Drawn as water and never treated as
+    /// harmful: inventing damage from an unrecognised number is exactly the
+    /// fabrication a raw passthrough exists to refuse.
+    Unknown(u32),
+}
+
+impl LiquidCategory {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0 => Self::Water,
+            1 => Self::Ocean,
+            2 => Self::Magma,
+            3 => Self::Slime,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Whether the *server* damages a character in contact with this.
+    ///
+    /// Advisory only, and deliberately so. Nothing in this client subtracts a
+    /// hit point: health is a replicated field, the server computes
+    /// environmental damage from its own copy of the same terrain, and a
+    /// client that also applied it would be inventing a number that nothing
+    /// can check. This exists so the interface can *warn* -- tinting the
+    /// screen, showing the timer the server starts -- not so it can act.
+    pub fn is_harmful(&self) -> bool {
+        matches!(self, Self::Magma | Self::Slime)
+    }
+
+    /// Whether a character in this floats and swims rather than walking.
+    ///
+    /// True of lava as well as water, which surprises people: a character
+    /// dropped into a lava lake swims in it, and burns while doing so.
+    pub fn is_swimmable(&self) -> bool {
+        !matches!(self, Self::Unknown(_))
+    }
+}
+
+impl LiquidTypeRow<'_> {
+    /// This row's [`LiquidCategory`].
+    pub fn kind(&self) -> LiquidCategory {
+        LiquidCategory::from_raw(self.category())
+    }
+
+    /// The surface art for one animation frame.
+    ///
+    /// The stored path carries a literal `%d`; the frames are numbered from 1.
+    /// Returns the path unchanged when it holds no placeholder, which is how
+    /// the procedural rows store a single reflection map.
+    pub fn texture_frame(&self, frame: u32) -> String {
+        self.texture().replace("%d", &frame.to_string())
+    }
+}
+
 /// The [`SoundEntriesRow::sound_type`] values this client acts on.
 ///
 /// **Measured, not remembered.** The column runs 1-53 across 26 distinct

@@ -685,6 +685,26 @@ enum AdtCommand {
         #[arg(long, allow_hyphen_values = true)]
         y: f32,
     },
+    /// Survey a map's liquid, and check it lies in the low ground.
+    ///
+    /// **This is the experiment that could refute the reader**, not a report on
+    /// it. An `MH2O` instance covers a sub-rectangle of its chunk, and nothing
+    /// in the file says which of the two axes `x_offset` indexes -- both
+    /// readings parse, and both draw an entirely convincing pond, one of them a
+    /// quarter of a chunk from where the pond is.
+    ///
+    /// What separates them is that **water collects in low ground**. Every
+    /// liquid cell is measured against the terrain height beneath it under both
+    /// readings, and the one that puts its water in the valleys is the one this
+    /// client uses. A reading that lands sheets on hillsides shows up as a
+    /// large fraction of cells whose liquid surface is *below* the ground it is
+    /// supposed to be sitting on -- which is not a thing rivers do.
+    Liquid {
+        /// Map directory name, e.g. `Azeroth`. Omit to sweep every map.
+        map: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6772,6 +6792,7 @@ fn adt_cmd(chain: &mut Chain, cmd: AdtCommand) -> Result<()> {
         AdtCommand::Tile { map, x, y, limit } => adt_tile(chain, &map, x, y, limit),
         AdtCommand::Survey { map, limit } => adt_survey(chain, map.as_deref(), limit),
         AdtCommand::Height { map, x, y } => adt_height(chain, &map, x, y),
+        AdtCommand::Liquid { map, limit } => adt_liquid(chain, map.as_deref(), limit),
     }
 }
 
@@ -6923,6 +6944,221 @@ fn adt_tile(chain: &mut Chain, map: &str, x: usize, y: usize, limit: usize) -> R
                 o.path, o.position[0], o.position[1], o.position[2], o.doodad_set
             );
         }
+    }
+    Ok(())
+}
+
+/// Sweeps a map's liquid and asks the one question that can refute the reader.
+///
+/// See [`AdtCommand::Liquid`] for why the question is "is the water in the low
+/// ground" rather than "did it parse". Both axis readings parse every byte of
+/// every file; only one of them puts rivers in valleys.
+fn adt_liquid(chain: &mut Chain, map: Option<&str>, limit: Option<usize>) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    // Names for the type ids, so the tally reads as `Slow Water` rather than
+    // `5`. A missing table is not fatal: the geometry question this answers
+    // does not depend on knowing what the liquid is called.
+    let types = dbc::schema::LiquidType::parse(&chain.read(dbc::schema::LiquidType::PATH)?).ok();
+    let describe = |id: u16| -> String {
+        let Some(table) = types.as_ref() else {
+            return format!("type {id}");
+        };
+        match table.iter().find(|row| row.id() == id as u32) {
+            Some(row) => format!("{id} {} ({:?})", row.name(), row.kind()),
+            None => format!("{id} <not in LiquidType.dbc>"),
+        }
+    };
+
+    let maps: Vec<String> = match map {
+        Some(m) => vec![m.to_string()],
+        None => {
+            let table = dbc::schema::Map::parse(&chain.read(dbc::schema::Map::PATH)?)?;
+            let mut names: Vec<String> = table
+                .iter()
+                .map(|m| m.directory().to_string())
+                .filter(|d| !d.is_empty())
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            names
+        }
+    };
+
+    let mut by_type: BTreeMap<u16, u64> = BTreeMap::new();
+    // One tile per type, so a type that exists somewhere can actually be gone
+    // and looked at. A survey that says "123 sheets of Slow Magma" and cannot
+    // say *where* leaves the only lava in the game untestable.
+    let mut example: BTreeMap<u16, String> = BTreeMap::new();
+    let mut by_format: BTreeMap<String, u64> = BTreeMap::new();
+    let (mut tiles_read, mut tiles_wet, mut chunks_wet, mut instances) = (0u64, 0u64, 0u64, 0u64);
+    // The measurement. `chosen` is the reading the parser uses; `swapped` is
+    // the same rectangle with its two axes exchanged. A cell counts as sane
+    // when its liquid surface sits at or above the terrain under it.
+    //
+    // **The decisive tally is the one that matters.** A full 8x8 sheet lying
+    // flat is symmetric under transposition, so it agrees with both readings
+    // and contributes nothing -- and the open ocean, which is most of the
+    // liquid in the game, is exactly that. Counting every cell buries the few
+    // hundred that can actually answer under a million that cannot, which is
+    // the same way `Light.dbc`'s storm column came back a coin flip.
+    let (mut cells, mut chosen_above, mut swapped_above) = (0u64, 0u64, 0u64);
+    let (mut decisive, mut decisive_chosen, mut decisive_swapped) = (0u64, 0u64, 0u64);
+    let mut budget = limit.unwrap_or(usize::MAX);
+
+    for name in &maps {
+        let Ok(wdt) = load_wdt(chain, name) else {
+            continue;
+        };
+        for (x, y) in wdt.tiles() {
+            if budget == 0 {
+                break;
+            }
+            let Ok(bytes) = chain.read(&adt::tile_path(name, x, y)) else {
+                continue;
+            };
+            budget -= 1;
+            let Ok(tile) = adt::Adt::parse(&bytes, wdt.big_alpha()) else {
+                continue;
+            };
+            tiles_read += 1;
+            if tile.liquid.is_empty() {
+                continue;
+            }
+            tiles_wet += 1;
+            chunks_wet += tile.liquid.chunks_with_liquid() as u64;
+
+            for (index, sheet) in tile.liquid.instances() {
+                instances += 1;
+                *by_type.entry(sheet.liquid_type).or_default() += 1;
+                example
+                    .entry(sheet.liquid_type)
+                    .or_insert_with(|| format!("{name} {x},{y}"));
+                *by_format
+                    .entry(format!("{:?}", sheet.vertex_format))
+                    .or_default() += 1;
+
+                let Some(chunk) = tile.chunks.get(index) else {
+                    continue;
+                };
+                // **Only an asymmetric rectangle can vote.** Transposing a
+                // sheet that covers the whole chunk -- which is what the open
+                // ocean is, 86,222 of the 92,219 sheets in Azeroth -- produces
+                // the identical footprint, so it agrees with both readings
+                // whatever the terrain beneath it does. Letting those in
+                // drowns the few thousand partial rectangles that genuinely
+                // land somewhere else under a million that cannot move.
+                let asymmetric =
+                    (sheet.x_offset, sheet.width) != (sheet.y_offset, sheet.height);
+                for j in 0..sheet.height as usize {
+                    for i in 0..sheet.width as usize {
+                        if !sheet.cell_exists(i, j) {
+                            continue;
+                        }
+                        cells += 1;
+                        // The cell's centre, half a unit in from its corner.
+                        let major = sheet.y_offset as f32 + j as f32 + 0.5;
+                        let minor = sheet.x_offset as f32 + i as f32 + 0.5;
+                        // Corner-relative interpolation of the sheet is the
+                        // parser's business; here the flat level is enough,
+                        // and using it keeps the two readings comparable.
+                        let level = sheet.vertex_height(i, j);
+
+                        let ground = |a: f32, b: f32| -> Option<f32> {
+                            let gx = chunk.position[0] - a * adt::UNIT_SIZE;
+                            let gy = chunk.position[1] - b * adt::UNIT_SIZE;
+                            chunk.height_at(gx, gy)
+                        };
+                        let here = ground(major, minor);
+                        let there = ground(minor, major);
+                        let ok = |g: Option<f32>| g.is_some_and(|g| level >= g);
+                        if ok(here) {
+                            chosen_above += 1;
+                        }
+                        if ok(there) {
+                            swapped_above += 1;
+                        }
+                        // A cell only votes when the two readings sample
+                        // genuinely different ground. Where they land on the
+                        // same height -- a flat sheet, or a symmetric position
+                        // within it -- both are right and neither is evidence.
+                        let differs = match (here, there) {
+                            (Some(a), Some(b)) => (a - b).abs() > 0.05,
+                            (a, b) => a.is_some() != b.is_some(),
+                        };
+                        if asymmetric && differs {
+                            decisive += 1;
+                            if ok(here) {
+                                decisive_chosen += 1;
+                            }
+                            if ok(there) {
+                                decisive_swapped += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("liquid across {} map(s), {tiles_read} tiles read", maps.len());
+    println!("  {tiles_wet} tiles carry liquid, {chunks_wet} chunks, {instances} sheets");
+    println!();
+    println!("  by type:");
+    for (id, count) in &by_type {
+        println!("    {count:>8}  {}", describe(*id));
+        if let Some(where_) = example.get(id) {
+            println!("             first seen on tile {where_}");
+        }
+    }
+    println!("  by vertex format:");
+    for (format, count) in &by_format {
+        println!("    {count:>8}  {format}");
+    }
+    println!();
+    println!("  is the water in the low ground? ({cells} cells with terrain under them)");
+    let percent = |n: u64| if cells == 0 { 0.0 } else { n as f64 * 100.0 / cells as f64 };
+    println!(
+        "    as read      {chosen_above:>8} at or above the ground  ({:.1}%)",
+        percent(chosen_above)
+    );
+    println!(
+        "    axes swapped {swapped_above:>8} at or above the ground  ({:.1}%)",
+        percent(swapped_above)
+    );
+    println!();
+    println!(
+        "  of those, {decisive} cells in a rectangle that transposing actually moves, \
+         over ground that differs -- the only ones that can answer:"
+    );
+    let share = |n: u64| {
+        if decisive == 0 {
+            0.0
+        } else {
+            n as f64 * 100.0 / decisive as f64
+        }
+    };
+    println!(
+        "    as read      {decisive_chosen:>8} above the ground  ({:.1}%)",
+        share(decisive_chosen)
+    );
+    println!(
+        "    axes swapped {decisive_swapped:>8} above the ground  ({:.1}%)",
+        share(decisive_swapped)
+    );
+    println!();
+    if decisive == 0 {
+        println!(
+            "  no cell could tell the two readings apart. This population cannot \
+             answer the question -- sweep a map with rivers rather than open sea."
+        );
+    } else if decisive_swapped > decisive_chosen {
+        println!(
+            "  the swapped reading fits better -- `LiquidInstance::height_at` has \
+             its two axes the wrong way round"
+        );
+    } else {
+        println!("  the reading in use fits best");
     }
     Ok(())
 }
@@ -9864,6 +10100,7 @@ fn dbc_check(chain: &mut Chain) -> Result<()> {
         SoundEntries,
         WorldSafeLocs,
         SpellVisualKit,
+        LiquidType,
     );
     println!();
     if failures == 0 {

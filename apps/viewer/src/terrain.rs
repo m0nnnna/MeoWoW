@@ -23,6 +23,14 @@ pub struct ChunkDraw {
 pub struct LoadedTerrain {
     pub mesh: GpuMesh,
     pub chunks: Vec<ChunkDraw>,
+    /// The water, lava and slime lying on this tile, or `None` for dry land.
+    ///
+    /// Built here rather than by the callers so that **both** render paths get
+    /// it: the streaming world and the offline `--screenshot` scene each build
+    /// their tiles through [`load`], and a liquid pass wired into only one of
+    /// them would leave every headless render showing a dry riverbed -- which
+    /// is exactly the kind of gap `--screenshot` exists to close.
+    pub liquid: Option<crate::liquid::LoadedLiquid>,
     /// Kept alive because the chunk bind groups reference their views.
     pub textures: Vec<UploadedTexture>,
     /// Likewise: dropping these would invalidate the bindings.
@@ -73,9 +81,12 @@ fn emit_chunk_indices(base: u32, chunk: &adt::Chunk, indices: &mut Vec<u32>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn load(
     gpu: &Gpu,
     renderer: &TerrainRenderer,
+    liquid_renderer: &render::LiquidRenderer,
+    liquid_types: &mut crate::liquid::LiquidTypes,
     chain: &mut Chain,
     map: &str,
     x: usize,
@@ -183,9 +194,21 @@ pub fn load(
 
     let triangle_count = indices.len() / 3;
     textures.push(blank);
+    let liquid = crate::liquid::build(gpu, liquid_renderer, chain, liquid_types, &tile);
+    if let Some(built) = &liquid {
+        // Logged because a tile that draws no water and a tile that has none
+        // are indistinguishable from the window, and they want opposite
+        // investigations -- the parser or the pass.
+        tracing::debug!(
+            "tile {x},{y} carries {} liquid sheets in {} triangles",
+            built.draws.len(),
+            built.triangle_count,
+        );
+    }
     Ok(LoadedTerrain {
         mesh: GpuMesh::upload(gpu, &vertices, &indices),
         chunks: chunk_draws,
+        liquid,
         textures,
         blend_maps,
         min,

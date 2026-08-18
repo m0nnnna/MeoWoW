@@ -115,6 +115,21 @@ pub struct Held {
     pub offset: Vec3,
 }
 
+/// What is lying over a point on the ground.
+///
+/// Carries the *category* rather than merely the type id, because the id alone
+/// cannot be acted on: `LiquidType` row 181 is called `Orange Slime` and is
+/// categorised as water, so anything reading the name or guessing from the id
+/// would burn a player in a harmless pond. See `dbc::schema::LiquidCategory`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Liquid {
+    /// Height of the surface, in the same world coordinates as the ground.
+    pub surface: f32,
+    /// Row of `LiquidType.dbc`.
+    pub liquid_type: u16,
+    pub category: dbc::schema::LiquidCategory,
+}
+
 pub struct Tile {
     pub terrain: LoadedTerrain,
     pub groups: Vec<Group>,
@@ -167,10 +182,18 @@ struct ChunkHeights {
     /// Goldshire, the abbey and open forest at once. Keying sound off the tile
     /// would change the music a third of a mile from where the zone does.
     area_id: u32,
+    /// The liquid sheets lying over this chunk, kept for the same reason the
+    /// heights are: the GPU copy cannot be asked how deep the river is under
+    /// one character.
+    ///
+    /// A chunk can carry several -- a pool in a cave beneath a river needs two
+    /// surfaces at one place -- so [`TileHeights::liquid_at`] takes the
+    /// highest one the position falls inside rather than the first.
+    liquid: Vec<adt::LiquidInstance>,
 }
 
 impl TileHeights {
-    fn new(chunks: &[adt::Chunk]) -> Self {
+    fn new(chunks: &[adt::Chunk], liquid: &adt::TileLiquid) -> Self {
         // Both axes run inwards, so the origin corner is the largest of each.
         let origin = chunks.iter().fold((f32::MIN, f32::MIN), |(x, y), chunk| {
             (x.max(chunk.position[0]), y.max(chunk.position[1]))
@@ -178,7 +201,12 @@ impl TileHeights {
 
         let mut grid = Vec::new();
         grid.resize_with(adt::CHUNK_COUNT, || None);
-        for chunk in chunks {
+        // Enumerated, because `TileLiquid` is indexed by a chunk's position in
+        // the *file* while this grid is indexed by where the chunk sits in the
+        // world. The two orderings agree in practice and are not the same
+        // statement, which is the distinction the comment on `chunks` below
+        // was written for.
+        for (file_index, chunk) in chunks.iter().enumerate() {
             let (cx, cy) = (
                 ((origin.0 - chunk.position[0]) / adt::CHUNK_SIZE).round() as i64,
                 ((origin.1 - chunk.position[1]) / adt::CHUNK_SIZE).round() as i64,
@@ -198,6 +226,7 @@ impl TileHeights {
                 holes: chunk.holes,
                 heights: chunk.heights.clone(),
                 area_id: chunk.area_id,
+                liquid: liquid.chunk(file_index).to_vec(),
             });
         }
 
@@ -235,6 +264,33 @@ impl TileHeights {
         // Zero means the chunk names no area, which is a real answer and not
         // a missing one -- plenty of open water and unfinished terrain does.
         (chunk.area_id != 0).then_some(chunk.area_id)
+    }
+
+    /// The liquid surface at a position: how high it is and what it is.
+    ///
+    /// **The highest sheet wins**, not the first. A chunk can carry more than
+    /// one -- a cave pool under a river is exactly that -- and taking whichever
+    /// came first in the file would put a character swimming in the lower of
+    /// two surfaces while standing in the upper one.
+    ///
+    /// `None` means no liquid here, which is different from liquid at some
+    /// height below the character: a river the player is standing beside still
+    /// answers with its surface, and it is the *caller* that decides whether
+    /// being above it means anything.
+    fn liquid_at(&self, x: f32, y: f32) -> Option<(f32, u16)> {
+        let side = adt::CHUNKS_PER_TILE as i64;
+        let cx = (((self.origin.0 - x) / adt::CHUNK_SIZE).floor() as i64).clamp(0, side - 1);
+        let cy = (((self.origin.1 - y) / adt::CHUNK_SIZE).floor() as i64).clamp(0, side - 1);
+        let chunk = self.chunks.get((cy * side + cx) as usize)?.as_ref()?;
+        chunk
+            .liquid
+            .iter()
+            .filter_map(|sheet| {
+                sheet
+                    .height_at(chunk.position, x, y)
+                    .map(|h| (h, sheet.liquid_type))
+            })
+            .max_by(|a, b| a.0.total_cmp(&b.0))
     }
 }
 
@@ -275,6 +331,15 @@ pub struct EntityPlacement {
     /// movement arrives as a path along the surface, and `MOVEFLAG_FALLING` on
     /// a relayed player is not read yet.
     pub airborne: bool,
+    /// In liquid deep enough to swim in.
+    ///
+    /// True for the viewer's own character, decided locally against the `MH2O`
+    /// sheets -- and **true for a replicated player too**, because
+    /// `movement_flags::SWIMMING` travels with their relayed movement, so
+    /// somebody else crossing a river is drawn swimming without this client
+    /// having to sample the water under them. False for creatures: a
+    /// `SMSG_MONSTER_MOVE` carries a path and no flags.
+    pub swimming: bool,
     /// Whether this unit has no health left, so it should be drawn down rather
     /// than standing. Outranks `speed`: a creature killed mid-charge still has
     /// the charge's speed attached to it.
@@ -350,6 +415,14 @@ pub struct World {
     /// in the skin the display row names. Keying by path alone would give the
     /// second character the first one's blade.
     held_cache: HashMap<(String, String), Option<Rc<CachedModel>>>,
+    /// Surface art for every liquid type seen so far, keyed by type id.
+    ///
+    /// Owned by the world rather than by a tile because it is shared across
+    /// all of them: three liquid types cover the whole of Azeroth, and a
+    /// per-tile cache would reload thirty frames of `lake_a` for each of the
+    /// 529 tiles that carry water. It also outlives eviction on purpose --
+    /// walking out of a river's tile and back in must not re-read its art.
+    liquid_types: crate::liquid::LiquidTypes,
     /// Tables for dressing humanoid NPCs, read on first use rather than at
     /// construction: a scene with no replicated entities in it never needs
     /// them, and they are several megabytes of DBC.
@@ -467,6 +540,7 @@ impl World {
             cache: HashMap::new(),
             entity_cache: HashMap::new(),
             held_cache: HashMap::new(),
+            liquid_types: crate::liquid::LiquidTypes::default(),
             npc_looks: None,
             npc_looks_tried: false,
             game_objects: None,
@@ -516,6 +590,7 @@ impl World {
         gpu: &Gpu,
         meshes: &mut MeshRenderer,
         terrain_renderer: &TerrainRenderer,
+        liquid_renderer: &render::LiquidRenderer,
         chain: &mut Chain,
         camera: Vec3,
     ) {
@@ -557,7 +632,7 @@ impl World {
                 break;
             };
             self.queued.remove(&tile);
-            match self.load_tile(gpu, meshes, terrain_renderer, chain, tile) {
+            match self.load_tile(gpu, meshes, terrain_renderer, liquid_renderer, chain, tile) {
                 Ok(loaded) => {
                     self.tiles.insert(tile, loaded);
                 }
@@ -610,11 +685,21 @@ impl World {
         gpu: &Gpu,
         meshes: &mut MeshRenderer,
         terrain_renderer: &TerrainRenderer,
+        liquid_renderer: &render::LiquidRenderer,
         chain: &mut Chain,
         tile: (i32, i32),
     ) -> anyhow::Result<Tile> {
         let (x, y) = (tile.0 as usize, tile.1 as usize);
-        let terrain = crate::terrain::load(gpu, terrain_renderer, chain, &self.map, x, y)?;
+        let terrain = crate::terrain::load(
+            gpu,
+            terrain_renderer,
+            liquid_renderer,
+            &mut self.liquid_types,
+            chain,
+            &self.map,
+            x,
+            y,
+        )?;
         let parsed = adt::Adt::parse(
             &chain.read(&adt::tile_path(&self.map, x, y))?,
             self.wdt.big_alpha(),
@@ -702,7 +787,7 @@ impl World {
         Ok(Tile {
             terrain,
             groups: built,
-            heights: TileHeights::new(&parsed.chunks),
+            heights: TileHeights::new(&parsed.chunks, &parsed.liquid),
             solid,
         })
     }
@@ -723,6 +808,41 @@ impl World {
     pub fn height_at(&self, x: f32, y: f32) -> Option<f32> {
         let tile = tile_at(Vec3::new(x, y, 0.0));
         self.tiles.get(&tile)?.heights.height_at(x, y)
+    }
+
+    /// The liquid surface over a position, and what kind of liquid it is.
+    ///
+    /// `None` for dry ground *and* for a tile that has not streamed in yet,
+    /// and the caller wants the same thing for both: leave the character
+    /// walking. Guessing that an unloaded tile is dry is the safe direction --
+    /// a character who walks on the surface of a river for one frame while its
+    /// tile loads is a smaller wrong than one who starts swimming in a field.
+    ///
+    /// Only terrain liquid. A fountain inside a building is WMO liquid, which
+    /// this cannot answer for -- the same boundary [`World::height_at`] draws
+    /// against building floors.
+    pub fn liquid_at(&self, x: f32, y: f32) -> Option<Liquid> {
+        let tile = tile_at(Vec3::new(x, y, 0.0));
+        let (surface, liquid_type) = self.tiles.get(&tile)?.heights.liquid_at(x, y)?;
+        Some(Liquid {
+            surface,
+            liquid_type,
+            category: self.liquid_types.category(liquid_type),
+        })
+    }
+
+    /// The surface art for the liquids on this world's tiles.
+    ///
+    /// **Exposed so the draw cannot use the wrong cache.** A tile's liquid
+    /// geometry names its type by id and nothing else; the frames that id
+    /// resolves to live here, because this is the cache `load_tile` built them
+    /// into. The renderer keeps a second one for the offline scenes, and
+    /// drawing a streaming tile with *that* one is exactly the bug this
+    /// accessor exists to prevent -- every sheet resolved to no art, every
+    /// draw was skipped, and the water was built, uploaded and never
+    /// submitted. Whoever holds the geometry holds the cache for it.
+    pub fn liquid_types(&self) -> &crate::liquid::LiquidTypes {
+        &self.liquid_types
     }
 
     /// Which `AreaTable` area a position sits in, if its tile is resident.
@@ -1014,6 +1134,7 @@ impl World {
                         placement.speed,
                         placement.turning,
                         placement.airborne,
+                        placement.swimming,
                         placement.dead,
                         placement.died_ms_ago,
                         placement.swung_ms_ago,
@@ -1646,6 +1767,14 @@ const SHUFFLE_RIGHT_ANIMATION_ID: u16 = 12;
 /// that makes transcribing an id out of a model listing a mistake.
 const JUMP_ANIMATION_ID: u16 = 38;
 const FALL_ANIMATION_ID: u16 = 40;
+/// `AnimationData` rows 41, 42 and 45, read from the table the same way the
+/// shuffles were -- `wow-cli dbc dump AnimationData` names them `SwimIdle`,
+/// `Swim` and `SwimBackwards`. Rows 43 and 44 are `SwimLeft`/`SwimRight` and
+/// are deliberately unused: a strafing swimmer is carried by `Swim` with the
+/// body turned, exactly as a strafing runner is carried by the run.
+const SWIM_IDLE_ANIMATION_ID: u16 = 41;
+const SWIM_ANIMATION_ID: u16 = 42;
+const SWIM_BACK_ANIMATION_ID: u16 = 45;
 /// Falling over, and lying still afterwards. Two rows, not one, and the table
 /// says so itself: `Dead` (6) lists `Death` (1) as its *fallback*, which is
 /// exactly the relationship between them -- a model with no settled-corpse
@@ -1752,6 +1881,18 @@ pub enum Motion {
     /// the model carries `Walkbackwards`, and a character reversing at a run
     /// looks like a sprint performed facing the wrong way.
     WalkBack,
+    /// In liquid deep enough to swim in, and whether moving through it.
+    ///
+    /// **Two states rather than one**, because a swimmer treading water and a
+    /// swimmer crossing a lake are as different as standing and running, and
+    /// the table names them separately -- `SwimIdle` is a body held upright and
+    /// `Swim` is one lying flat and stroking. Playing the second while still
+    /// reads as a character swimming on the spot.
+    ///
+    /// Backwards is its own cycle for the same reason `WalkBack` is: the model
+    /// carries `SwimBackwards`, and reversing looks like a sprint performed
+    /// facing the wrong way without it.
+    Swim(Pace),
     /// Off the ground.
     ///
     /// One state for the whole arc rather than the three the table offers.
@@ -1825,6 +1966,19 @@ pub enum RestKind {
 pub enum Side {
     Left,
     Right,
+}
+
+/// Which way a swimmer is going, if anywhere.
+///
+/// Its own enum rather than reusing [`Motion::from_pace`]'s walk/run split,
+/// because swimming has no second gear: the model carries one `Swim` cycle and
+/// a character crossing a lake plays it whether they are dawdling or not.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Pace {
+    /// Treading water.
+    Still,
+    Forward,
+    Backward,
 }
 
 /// Where a walk becomes a run, in world units per second.
@@ -1907,6 +2061,13 @@ impl Motion {
     /// - **A swing only interrupts standing.** A creature chasing you swings
     ///   as it runs, and a swing animation played over a run reads as a
     ///   stumble; the run is the more informative of the two, so it wins.
+    /// - **Swimming sits directly below airborne and above everything else.**
+    ///   A character in deep water is not standing, running or holding a
+    ///   guard, whatever the keys and the weapon say -- and unlike the
+    ///   ready/at-ease question, there is no swimming variant of any of those
+    ///   cycles to fall back to. It loses to airborne only because a jump that
+    ///   ends in water is cleared by the movement code on the frame it lands,
+    ///   so the two are never both true for longer than a frame.
     ///
     /// `now_ms` is the caller's world clock, and the one-shot stamps are
     /// derived from it by subtraction so they land on the same timeline
@@ -1916,6 +2077,7 @@ impl Motion {
         speed: f32,
         lateral: f32,
         airborne: bool,
+        swimming: bool,
         dead: bool,
         died_ms_ago: Option<u32>,
         swung_ms_ago: Option<u32>,
@@ -1937,6 +2099,18 @@ impl Motion {
         // whatever the keys say.
         if airborne {
             return Motion::Airborne;
+        }
+        if swimming {
+            // Forward and backward only: a sidestep in water is carried by the
+            // forward stroke with the body turned, the same choice
+            // `Motion::from_pace` makes for a strafing runner on land.
+            return Motion::Swim(if speed > 0.0 {
+                Pace::Forward
+            } else if speed < 0.0 {
+                Pace::Backward
+            } else {
+                Pace::Still
+            });
         }
         let moving = Motion::from_pace(speed, lateral);
         if moving == Motion::Stand {
@@ -1977,6 +2151,7 @@ impl Motion {
                 | Motion::WalkBack
                 | Motion::Shuffle(_)
                 | Motion::Airborne
+                | Motion::Swim(_)
         )
     }
 
@@ -2017,6 +2192,16 @@ impl Motion {
             // sailing through the air in its idle pose is the same failure as
             // one sliding along the ground in it.
             Motion::Airborne => &[JUMP_ANIMATION_ID, FALL_ANIMATION_ID, RUN_ANIMATION_ID],
+            // Falling back to the *other* swim cycle rather than to standing
+            // or running, for the reason `Airborne` falls back to the run: a
+            // body held upright and walking through a lake is a worse picture
+            // than one stroking while still. Every playable model carries all
+            // three, so the fallbacks are for creatures.
+            Motion::Swim(Pace::Still) => &[SWIM_IDLE_ANIMATION_ID, SWIM_ANIMATION_ID],
+            Motion::Swim(Pace::Forward) => &[SWIM_ANIMATION_ID, SWIM_IDLE_ANIMATION_ID],
+            Motion::Swim(Pace::Backward) => {
+                &[SWIM_BACK_ANIMATION_ID, SWIM_ANIMATION_ID, SWIM_IDLE_ANIMATION_ID]
+            }
             Motion::Shuffle(Side::Left) => {
                 &[SHUFFLE_LEFT_ANIMATION_ID, STAND_ANIMATION_ID]
             }
@@ -2452,19 +2637,76 @@ mod tests {
     fn a_drawn_weapon_is_enough_to_hold_the_guard() {
         // Not fighting, standing still, weapon out.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, None, None, false, 4_000, Stance::TwoHand, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::TwoHand, None),
             Motion::Ready(Stance::TwoHand),
         );
         // And with nothing drawn it still relaxes, which is the half that
         // stops this from simply making everyone stand guard forever.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, None, None, false, 4_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::Unarmed, None),
             Motion::Stand,
         );
         // Moving still outranks it: a character runs, weapon or no weapon.
         assert_eq!(
-            Motion::resolve(7.0, 0.0, false, false, None, None, false, 4_000, Stance::TwoHand, None),
+            Motion::resolve(7.0, 0.0, false, false, false, None, None, false, 4_000, Stance::TwoHand, None),
             Motion::Run,
+        );
+    }
+
+    /// Swimming outranks the ground cycles and loses only to death and to
+    /// being airborne.
+    ///
+    /// **Both halves are asserted, and that is the point.** A test that only
+    /// checked "a swimmer swims" passes just as well under a rule that returns
+    /// `Swim` unconditionally -- which would lay every corpse in the world out
+    /// stroking. So each thing swimming beats and each thing it loses to is
+    /// named, the same shape as the auto-attack exception in 4.3.
+    #[test]
+    fn swimming_sits_between_airborne_and_the_ground_cycles() {
+        let swim = |speed: f32| {
+            Motion::resolve(speed, 0.0, false, true, false, None, None, false, 4_000, Stance::Unarmed, None)
+        };
+        // It beats running, standing and a drawn weapon's guard.
+        assert_eq!(swim(7.0), Motion::Swim(Pace::Forward));
+        assert_eq!(swim(0.0), Motion::Swim(Pace::Still));
+        assert_eq!(swim(-2.5), Motion::Swim(Pace::Backward));
+        assert_eq!(
+            Motion::resolve(0.0, 0.0, false, true, false, None, None, true, 4_000, Stance::TwoHand, None),
+            Motion::Swim(Pace::Still),
+            "a swimmer does not hold a guard"
+        );
+        // A sidestep in water is carried by the forward stroke, not by a
+        // shuffle: the turning input must not reach `from_pace`.
+        assert_eq!(
+            Motion::resolve(0.0, 1.0, false, true, false, None, None, false, 4_000, Stance::Unarmed, None),
+            Motion::Swim(Pace::Still),
+        );
+
+        // And it loses to the two things above it.
+        assert_eq!(
+            Motion::resolve(7.0, 0.0, true, true, false, None, None, false, 4_000, Stance::Unarmed, None),
+            Motion::Airborne,
+            "a jump still in flight outranks the water it is heading for"
+        );
+        assert_eq!(
+            Motion::resolve(7.0, 0.0, false, true, true, None, None, false, 4_000, Stance::Unarmed, None),
+            Motion::Dead,
+            "a drowned corpse does not keep swimming"
+        );
+
+        // The cycles each state reaches for, so a renumbered constant cannot
+        // silently swap the stroke for the tread.
+        assert_eq!(
+            Motion::Swim(Pace::Forward).animation_ids().first(),
+            Some(&SWIM_ANIMATION_ID)
+        );
+        assert_eq!(
+            Motion::Swim(Pace::Still).animation_ids().first(),
+            Some(&SWIM_IDLE_ANIMATION_ID)
+        );
+        assert_eq!(
+            Motion::Swim(Pace::Backward).animation_ids().first(),
+            Some(&SWIM_BACK_ANIMATION_ID)
         );
     }
 
@@ -2529,14 +2771,14 @@ mod tests {
     fn a_recent_sheath_change_plays_the_transition() {
         assert_eq!(
             Motion::resolve(
-                0.0, 0.0, false, false, None, None, false, 4_000, Stance::Unarmed,
+                0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::Unarmed,
                 Some((200, RestKind::Hip)),
             ),
             Motion::Sheathing(3_800, RestKind::Hip)
         );
         assert_eq!(
             Motion::resolve(
-                0.0, 0.0, false, false, None, None, false, 4_000, Stance::Unarmed,
+                0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::Unarmed,
                 Some((200, RestKind::Back)),
             ),
             Motion::Sheathing(3_800, RestKind::Back)
@@ -2551,7 +2793,7 @@ mod tests {
     fn a_swing_outranks_a_sheath_change() {
         assert_eq!(
             Motion::resolve(
-                0.0, 0.0, false, false, None, Some(50), true, 4_000, Stance::OneHand,
+                0.0, 0.0, false, false, false, None, Some(50), true, 4_000, Stance::OneHand,
                 Some((50, RestKind::Hip)),
             ),
             Motion::Attacking(3_900, Stance::OneHand)
@@ -2565,7 +2807,7 @@ mod tests {
     fn a_sheath_transition_lapses_once_it_has_had_time_to_finish() {
         assert_eq!(
             Motion::resolve(
-                0.0, 0.0, false, false, None, None, true, 10_000, Stance::OneHand,
+                0.0, 0.0, false, false, false, None, None, true, 10_000, Stance::OneHand,
                 Some((SHEATH_CEILING_MS + 1, RestKind::Hip)),
             ),
             Motion::Ready(Stance::OneHand),
@@ -2580,7 +2822,7 @@ mod tests {
     fn a_sheath_change_does_not_interrupt_movement() {
         assert_eq!(
             Motion::resolve(
-                7.0, 0.0, false, false, None, None, false, 4_000, Stance::OneHand,
+                7.0, 0.0, false, false, false, None, None, false, 4_000, Stance::OneHand,
                 Some((50, RestKind::Hip)),
             ),
             Motion::Run
@@ -2596,7 +2838,7 @@ mod tests {
     #[test]
     fn death_outranks_a_stale_speed() {
         assert_eq!(
-            Motion::resolve(7.0, 0.0, false, true, None, None, false, 10_000, Stance::Unarmed, None),
+            Motion::resolve(7.0, 0.0, false, false, true, None, None, false, 10_000, Stance::Unarmed, None),
             Motion::Dead,
             "a corpse was drawn running"
         );
@@ -2608,10 +2850,10 @@ mod tests {
     #[test]
     fn only_a_death_we_watched_plays_the_fall() {
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, true, Some(200), None, false, 10_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, true, Some(200), None, false, 10_000, Stance::Unarmed, None),
             Motion::Dying(9_800)
         );
-        assert_eq!(Motion::resolve(0.0, 0.0, false, true, None, None, false, 10_000, Stance::Unarmed, None), Motion::Dead);
+        assert_eq!(Motion::resolve(0.0, 0.0, false, false, true, None, None, false, 10_000, Stance::Unarmed, None), Motion::Dead);
     }
 
     /// And it stops falling eventually, rather than holding a one-shot bucket
@@ -2619,7 +2861,7 @@ mod tests {
     #[test]
     fn a_fall_settles_once_it_has_had_time_to_finish() {
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, true, Some(ONE_SHOT_CEILING_MS + 1), None, false, 10_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, true, Some(ONE_SHOT_CEILING_MS + 1), None, false, 10_000, Stance::Unarmed, None),
             Motion::Dead
         );
     }
@@ -2634,15 +2876,15 @@ mod tests {
     /// play correctly and the cost would be invisible.
     #[test]
     fn a_one_shot_keeps_its_bucket_as_the_clock_advances() {
-        let first = Motion::resolve(0.0, 0.0, false, true, Some(100), None, false, 5_000, Stance::Unarmed, None);
+        let first = Motion::resolve(0.0, 0.0, false, false, true, Some(100), None, false, 5_000, Stance::Unarmed, None);
         // A second later: the death is a second older and the clock a second
         // further on, which is the same death.
-        let later = Motion::resolve(0.0, 0.0, false, true, Some(1_100), None, false, 6_000, Stance::Unarmed, None);
+        let later = Motion::resolve(0.0, 0.0, false, false, true, Some(1_100), None, false, 6_000, Stance::Unarmed, None);
         assert_eq!(first, later, "the bucket moved with the clock");
 
         // Two deaths a second apart must *not* share, or one pops to the
         // other's frame.
-        let other = Motion::resolve(0.0, 0.0, false, true, Some(100), None, false, 6_000, Stance::Unarmed, None);
+        let other = Motion::resolve(0.0, 0.0, false, false, true, Some(100), None, false, 6_000, Stance::Unarmed, None);
         assert_ne!(first, other);
     }
 
@@ -2661,11 +2903,11 @@ mod tests {
     fn a_one_shot_bucket_survives_drift_between_two_clock_reads() {
         // The same swing, seen over eight frames, with the two clock readings
         // drifting a few milliseconds apart each time as they really do.
-        let reference = Motion::resolve(0.0, 0.0, false, false, None, Some(40), true, 8_000, Stance::Unarmed, None);
+        let reference = Motion::resolve(0.0, 0.0, false, false, false, None, Some(40), true, 8_000, Stance::Unarmed, None);
         for frame in 0..8u32 {
             let drift = frame * 3;
             let seen = Motion::resolve(0.0, 0.0, false,
-                false,
+                false, false,
                 None,
                 Some(40 + frame * 16),
                 true,
@@ -2701,7 +2943,7 @@ mod tests {
             "a fighter would be frozen on its follow-through between swings"
         );
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, None, Some(ATTACK_CEILING_MS + 1), true, 9_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, Some(ATTACK_CEILING_MS + 1), true, 9_000, Stance::Unarmed, None),
             Motion::Ready(Stance::Unarmed)
         );
     }
@@ -2712,13 +2954,13 @@ mod tests {
     #[test]
     fn a_swing_interrupts_standing_but_not_running() {
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, None, Some(50), true, 4_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, Some(50), true, 4_000, Stance::Unarmed, None),
             Motion::Attacking(3_900, Stance::Unarmed)
         );
-        assert_eq!(Motion::resolve(7.0, 0.0, false, false, None, Some(50), true, 4_000, Stance::Unarmed, None), Motion::Run);
+        assert_eq!(Motion::resolve(7.0, 0.0, false, false, false, None, Some(50), true, 4_000, Stance::Unarmed, None), Motion::Run);
         // And an old swing has stopped mattering.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, None, Some(ONE_SHOT_CEILING_MS + 1), false, 4_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, Some(ONE_SHOT_CEILING_MS + 1), false, 4_000, Stance::Unarmed, None),
             Motion::Stand
         );
     }
@@ -2734,22 +2976,22 @@ mod tests {
     #[test]
     fn a_fighter_between_swings_keeps_its_guard_up() {
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, None, None, true, 4_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, None, true, 4_000, Stance::Unarmed, None),
             Motion::Ready(Stance::Unarmed)
         );
         // Out of the fight, it relaxes.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, None, None, false, 4_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::Unarmed, None),
             Motion::Stand
         );
         // A swing still beats the guard, and running still beats both.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, None, Some(50), true, 4_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, Some(50), true, 4_000, Stance::Unarmed, None),
             Motion::Attacking(3_900, Stance::Unarmed)
         );
-        assert_eq!(Motion::resolve(7.0, 0.0, false, false, None, None, true, 4_000, Stance::Unarmed, None), Motion::Run);
+        assert_eq!(Motion::resolve(7.0, 0.0, false, false, false, None, None, true, 4_000, Stance::Unarmed, None), Motion::Run);
         // And a corpse is not "in a fight" whatever the map still says.
-        assert_eq!(Motion::resolve(0.0, 0.0, false, true, None, None, true, 4_000, Stance::Unarmed, None), Motion::Dead);
+        assert_eq!(Motion::resolve(0.0, 0.0, false, false, true, None, None, true, 4_000, Stance::Unarmed, None), Motion::Dead);
     }
 
     /// Which cycles hold their last frame is a property of the *animation*,
@@ -2890,7 +3132,85 @@ mod tests {
             }
         }
         chunks.reverse();
-        TileHeights::new(&chunks)
+        // Dry: this fixture exists to pin the chunk *indexing*, which liquid
+        // shares but does not affect. `liquid_at` gets its own test below.
+        TileHeights::new(&chunks, &adt::TileLiquid::default())
+    }
+
+    /// A tile with one sheet of water answers for the ground it covers and
+    /// nowhere else.
+    ///
+    /// The point is the two-step lookup: `TileHeights` places a chunk by its
+    /// recorded *position*, and the sheet then places itself within that chunk
+    /// by an offset rectangle. Either step being wrong puts water in a
+    /// plausible place that is not the right one, which is precisely what
+    /// `wow-cli adt liquid` had to measure over a whole map to rule out.
+    #[test]
+    fn liquid_answers_only_over_the_cells_it_covers() {
+        let tile = (32, 48);
+        let origin = (
+            (32.0 - tile.1 as f32) * adt::TILE_SIZE,
+            (32.0 - tile.0 as f32) * adt::TILE_SIZE,
+        );
+        let mut chunks = Vec::new();
+        for cy in 0..adt::CHUNKS_PER_TILE {
+            for cx in 0..adt::CHUNKS_PER_TILE {
+                chunks.push(adt::Chunk {
+                    index: (cx as u32, cy as u32),
+                    position: [
+                        origin.0 - cx as f32 * adt::CHUNK_SIZE,
+                        origin.1 - cy as f32 * adt::CHUNK_SIZE,
+                        0.0,
+                    ],
+                    area_id: 0,
+                    holes: 0,
+                    heights: vec![0.0; adt::HEIGHTS_PER_CHUNK],
+                    normals: vec![[0, 0, 127]; adt::HEIGHTS_PER_CHUNK],
+                    layers: Vec::new(),
+                    alpha_maps: Vec::new(),
+                    doodad_refs: Vec::new(),
+                    object_refs: Vec::new(),
+                });
+            }
+        }
+
+        // One flat sheet over the first chunk in file order, covering the four
+        // cells nearest its origin corner and standing 5 units up.
+        let mut payload = vec![0u8; adt::CHUNK_COUNT * 12];
+        let instances_at = payload.len();
+        payload[0..4].copy_from_slice(&(instances_at as u32).to_le_bytes());
+        payload[4..8].copy_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&5u16.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&5f32.to_le_bytes());
+        payload.extend_from_slice(&5f32.to_le_bytes());
+        payload.extend_from_slice(&[0, 0, 2, 2]);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+
+        let heights = TileHeights::new(&chunks, &adt::TileLiquid::parse(&payload));
+        // Inside the sheet: chunk 0's corner, one cell in on both axes.
+        let inside = heights.liquid_at(
+            origin.0 - adt::UNIT_SIZE,
+            origin.1 - adt::UNIT_SIZE,
+        );
+        assert_eq!(inside, Some((5.0, 5)), "over the sheet");
+        // Past the rectangle within the same chunk: still dry.
+        assert_eq!(
+            heights.liquid_at(origin.0 - 5.0 * adt::UNIT_SIZE, origin.1 - adt::UNIT_SIZE),
+            None,
+            "past the rectangle's edge"
+        );
+        // A different chunk entirely: dry, and not the first chunk's answer
+        // leaking across because the grid lookup fell back to zero.
+        assert_eq!(
+            heights.liquid_at(
+                origin.0 - 3.0 * adt::CHUNK_SIZE,
+                origin.1 - 3.0 * adt::CHUNK_SIZE
+            ),
+            None,
+            "a chunk with no sheet"
+        );
     }
 
     /// A position resolves to the chunk it is actually standing on.

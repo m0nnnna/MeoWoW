@@ -4325,6 +4325,7 @@ dependencies = [
  "anyhow",
  "auth",
  "blp",
+ "bytemuck",
  "clap",
  "collision",
  "dbc",

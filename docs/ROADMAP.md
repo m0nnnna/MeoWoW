@@ -4284,3 +4284,163 @@ worse than no mark at all.
 same runs and nothing ever came back, so the one-guid form is what this client
 has evidence for. Per-guid asking is capped at six a frame with a retry window,
 the same shape every other query here uses.
+
+### 4.18 Liquids: water, lava and slime
+
+There was no liquid in this client at all. Elwynn's rivers, Northshire's pond
+and the whole coastline were absent, the terrain simply ended, and a character
+walked along the riverbed. This milestone reads the format, draws it, and swims
+in it.
+
+#### `MH2O`, and three sizes the public documentation gets wrong
+
+One `MH2O` chunk serves a whole tile: 256 fixed headers naming where each map
+chunk's liquid *layers* live, then 24-byte instances, an exists bitmap and a
+vertex grid. Every offset is measured from the start of the chunk's **payload**,
+which is the sort of thing that still lands inside the file when read from the
+wrong base.
+
+Three sizes were measured against `Azeroth_32_48` rather than transcribed,
+because the wiki's readings do not fit it:
+
+| | wiki | measured |
+|---|---|---|
+| attribute block | 8 bytes | **16** |
+| exists bitmap, 3x6 rectangle | 6 bytes, one per row | **3**, `ceil(w*h/8)` packed |
+| exists bitmap, 5x8 rectangle | 8 bytes | **5** |
+
+The two rectangles disagree in opposite directions, which is what makes that a
+measurement rather than a coincidence -- a full 8x8 sheet is the one case where
+both readings agree, and so is exactly the sample that cannot settle it. What
+proved the whole layout is that the sizes account for every byte: chunk 13's
+sheet ends precisely where chunk 14's attributes begin, and chunk 14's ends
+precisely where chunk 15's do.
+
+`MCLQ`, the pre-Wrath per-chunk form, is **not** a fallback this reader declines
+to implement. The tile has 256 map chunks and not one of them carries it, while
+its `MH2O` describes 42 chunks of water.
+
+#### The axis reading was fitted, and the first attempt could not answer
+
+An instance covers a sub-rectangle of its chunk and nothing in the file says
+which axis `x_offset` indexes. Both readings parse every byte of every file, and
+both draw an entirely convincing pond -- one of them a quarter of a chunk from
+where the pond is. So `wow-cli adt liquid` measures the thing that can refute
+it: **water lies in low ground.**
+
+Over all 5,660,498 liquid cells in Azeroth the two readings come out **99.2%
+against 98.4%** -- indistinguishable, and it would have been read as
+confirmation. The population was the problem. 86,222 of the 92,219 sheets are
+open ocean covering an entire chunk, and **transposing a full 8x8 rectangle
+produces the identical footprint**, so those sheets agree with both readings
+whatever the seabed does. Restricted to cells in a rectangle that transposing
+actually *moves*, over ground that differs between the two sample points:
+
+| reading | liquid at or above the ground, of 90,346 cells |
+|---|---|
+| as read | 66,299 (**73.4%**) |
+| axes swapped | 33,223 (**36.8%**) |
+
+A factor of two, where the whole-population figure was a rounding error. It is
+not 100% because a shoreline genuinely has cells where the bank rises through
+the water plane; what matters is the ratio.
+
+#### `LiquidType.dbc`, and a row whose name lies
+
+26 rows, 45 fields. Field 3 is the category, identified by the names its rows
+carry *and* independently by the art each one reaches -- every row the column
+calls magma resolves to a file under `lava` or `LavaGreen`, every row it calls
+slime to one under `slime`. Two different columns agreeing is evidence; a column
+agreeing with its own name is not.
+
+**And the one row where the two disagree is why this is read as a column rather
+than matched as a name.** Row 181 is called `Orange Slime`, draws `LavaOrange`,
+and its category is **0 -- water**. A client deciding what burns you by looking
+for "slime" in a name would set a player alight in a harmless pond, and would do
+it silently.
+
+#### The damage is the server's, and that is the whole design
+
+Lava hurting you is not something a client can implement. `Map::GetLiquidData`
+computes liquid state from the server's own copy of the same terrain, runs a
+`FIRE_TIMER`, and applies `DAMAGE_LAVA` itself; health is a replicated field. A
+client that also subtracted hit points would be inventing a number that
+disagrees with the server's the moment either is looked at.
+
+So `crates/world/src/environment.rs` reads four packets and writes none:
+`SMSG_START_MIRROR_TIMER` (`0x01D9`), `PAUSE` (`0x01DA`), `STOP` (`0x01DB`) and
+`SMSG_ENVIRONMENTAL_DAMAGE_LOG` (`0x01FC`). The timers are *state* on
+`WorldState` -- stated once and then silent, like the weather -- and the damage
+is an *event*, one line in the combat log.
+
+#### Three faults, each hiding the next, and none found by a test
+
+The renderer was verified headlessly, declared working, and was wrong twice.
+Both were found by a person at the window, and each report split the problem
+exactly in half.
+
+**"It isn't glitched, it's just not there."** The liquid art is cached per type
+and shared across tiles, and there were two caches: one on `World`, built by
+`load_tile`, and one on the renderer for the offline scenes. `draw_streaming`
+was handed the renderer's, which is empty in streaming mode, so every sheet
+resolved to no art and hit a bare `continue`. 2,398 triangles of Northshire's
+stream were parsed, meshed and uploaded every time that tile loaded, and none of
+it was ever submitted. The fix is that `draw_streaming` no longer *takes* a
+cache -- it reads `world.liquid_types()` -- because a parameter that can be
+passed wrong is worse than no parameter.
+
+**"I see where water should be but nothing blue."** `river\lake_a` and
+`ocean\ocean_h` average RGB **3.6** and **4.1** of 255 across their whole
+256x256: they store no colour at all, and their entire ripple pattern is in the
+alpha channel. `lava` and `slime` are ordinary opaque colour textures.
+`LiquidType.material_id` says which -- 1 is the alpha-keyed pair, 2 the colour
+pair -- and the shader was running the colour rule over both, multiplying the
+tint by about 0.014. A black river, perfectly placed, perfectly animated,
+perfectly depth-faded and perfectly lit.
+
+**And the first "fix confirmed" was not a confirmation.** The skip was checked by
+the *absence* of a warning, which is equally what zero iterated sheets produces
+-- the same ambiguous silence the parser rules warn about, walked into while
+fixing an instance of it. Both counters now print every frame.
+
+#### Swimming, and an ordering bug caught by reading
+
+`MSG_MOVE_START_SWIM` (`0x00CA`) and `STOP_SWIM` (`0x00CB`) were two of the nine
+opcodes `MOVE_RELAYED` recorded as unconfirmed, on the grounds that they "need
+water" -- which this client did not have. The character floats with its head
+clear, dives along the camera pitch, rises on the jump key, and carries
+`movement_flags::SWIMMING`, which brings a **pitch float** with it in every
+packet. Another player's swim state arrives free with their relayed movement.
+The cycles are `AnimationData` 41, 42 and 45, read from the table.
+
+The ground-planting assignment ran unconditionally **before** the buoyancy read
+its own altitude, so every frame reset a swimmer to the riverbed and then rose
+three per cent of the way. That draws as a character walking along the bottom
+with the stroke cycle playing: the feature apparently half-working, rather than
+an ordering mistake. Found by re-reading the code before the test rather than
+after it, which is the one time in this milestone that was cheaper.
+
+#### What this deliberately does not do
+
+No underwater view: `LiquidType` carries `MaxDarkenDepth`, `FogDarkenIntensity`,
+`AmbDarkenIntensity` and `DirDarkenIntensity` and none of them is read, so
+submerging looks like air with a blue ceiling. No breath or fatigue bar drawn,
+though both packets are parsed and stored. No WMO liquid, so fountains and
+indoor pools are dry. No reflection, no refraction, no procedural water
+(material 3).
+
+**There is deliberately no lava bar, because there is no lava timer on the
+wire.** Breath and fatigue call `SendMirrorTimer`; the fire timer counts down
+server-side and sends only the damage. A client waiting for a lava bar before
+believing itself correct would wait forever.
+
+#### Confirmed live
+
+Water and swimming in Elwynn; lava in Searing Gorge. The lava run wanted a
+character that survives it, and the useful trick is `.cheat god` rather than
+`.gm on`: the damage packet is written at `Player.cpp:804` and `Unit::DealDamage`
+-- where `CHEAT_GOD` returns 0 -- is not reached until 806, so the log arrives
+with its real amount while health never moves. `.gm on` instead satisfies
+`IsImmuneToEnvironmentalDamage` and suppresses the packet entirely, which would
+have read as the client failing to parse it. With the cheat off, the same tick
+killed the character, which is the other half of the same claim.

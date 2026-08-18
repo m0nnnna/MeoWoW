@@ -164,6 +164,16 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
+    /// A signed 32-bit word.
+    ///
+    /// Its own accessor rather than a cast at the call site, because the
+    /// difference is not cosmetic: a mirror timer's rate is `-1` while the bar
+    /// drains, and read unsigned that is 4,294,967,295 -- a drowning bar that
+    /// appears to be refilling. The sign has to be in the *read*.
+    pub fn i32(&mut self) -> Result<i32, Error> {
+        Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
     pub fn f32(&mut self) -> Result<f32, Error> {
         Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }

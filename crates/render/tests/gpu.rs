@@ -914,3 +914,131 @@ fn a_setting_sun_hands_over_to_the_moon() {
         "the set sun is still being drawn where it set"
     );
 }
+
+/// The liquid pipeline builds, which is the only thing that compiles its WGSL.
+///
+/// **A shader is not checked by `cargo build`.** It is a string handed to the
+/// driver at pipeline creation, so a syntax error in it -- a `const` between
+/// `@fragment` and its function, an attribute the vertex layout does not
+/// supply -- is a runtime panic in whichever binary happens to draw water
+/// first. The whole render crate can be green with a shader that cannot
+/// compile, which is exactly what happened while this was being written.
+///
+/// Building the pipeline is the check. It costs one device that already
+/// exists and it fails loudly here rather than in front of somebody flying
+/// over a river.
+#[test]
+fn the_liquid_pipeline_compiles() {
+    let Some(gpu) = gpu() else { return };
+    let renderer = render::LiquidRenderer::new(gpu, FORMAT);
+    // And its bind group layout accepts a real texture view, so the surface
+    // binding matches what the shader declares.
+    let view = solid(gpu, [0, 0, 0, 128]);
+    let _ = renderer.bind_surface(gpu, &view);
+}
+
+/// Water and lava are read out of different channels, and the vertex says
+/// which.
+///
+/// Draws one full-screen sheet of each against a black background and reads
+/// the middle pixel. The art is synthetic: a **black RGB with half alpha**,
+/// which is what `lake_a` and `ocean_h` actually are. Read as a colour
+/// texture that multiplies to nothing; read as alpha-keyed it comes out the
+/// tint. So the two readings differ by the whole of the visible result, and
+/// this test fails on the bug that shipped rather than merely describing it.
+#[test]
+fn an_alpha_keyed_surface_takes_its_colour_from_the_tint() {
+    let Some(gpu) = gpu() else { return };
+    let renderer = render::LiquidRenderer::new(gpu, FORMAT);
+    // Black RGB, half alpha: no colour at all, all pattern.
+    let art = solid(gpu, [0, 0, 0, 128]);
+    let bind = renderer.bind_surface(gpu, &art);
+
+    let draw = |alpha_keyed: f32| -> [u8; 4] {
+        let (w, h) = (32u32, 32u32);
+        let target = Offscreen::new(gpu, w, h, FORMAT);
+        let depth = DepthBuffer::new(gpu, w, h);
+        // A full-screen triangle in clip space, opaque, tinted pure red so
+        // any colour reaching the target can only have come from the tint.
+        let corners = [[-3.0f32, -1.0, 0.5], [1.0, -1.0, 0.5], [1.0, 3.0, 0.5]];
+        let vertices: Vec<render::LiquidVertex> = corners
+            .iter()
+            .map(|p| render::LiquidVertex {
+                position: *p,
+                uv_motion: [0.0, 0.0, 0.0, 0.0],
+                tint: [1.0, 0.0, 0.0, 1.0],
+                mode: [1.0, alpha_keyed],
+            })
+            .collect();
+        let buffer = {
+            use wgpu::util::DeviceExt;
+            gpu.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("liquid test"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        };
+
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("liquid test"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                multiview_mask: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            // Emissive, so the sun term cannot muddy what is being measured.
+            renderer.begin(
+                gpu,
+                &mut pass,
+                glam::Mat4::IDENTITY,
+                glam::Vec3::ZERO,
+                glam::Vec3::Z,
+                [1.0; 3],
+                1.0,
+                [1.0; 3],
+                [0.0; 3],
+                (0.0, 0.0),
+                0.0,
+            );
+            pass.set_bind_group(1, &bind, &[]);
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.draw(0..3, 0..1);
+        }
+        gpu.queue.submit([encoder.finish()]);
+        let pixels = target.read_rgba(gpu).expect("readback");
+        centre_pixel(&pixels, w, h)
+    };
+
+    let keyed = draw(1.0);
+    let coloured = draw(0.0);
+    assert!(
+        keyed[0] > 100,
+        "alpha-keyed water should show its tint, got {keyed:?}"
+    );
+    assert!(
+        coloured[0] < 20,
+        "a black colour texture multiplies the tint away, got {coloured:?} \
+         -- this is the reading that made every river in Elwynn black"
+    );
+}

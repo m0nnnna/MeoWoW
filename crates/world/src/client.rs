@@ -1050,15 +1050,10 @@ impl Connection {
                     }
                     collected.push(packet);
                 }
-                // A quiet stream is the expected end of a burst, not a fault.
-                Err(Error::Io { source, .. })
-                    if matches!(
-                        source.kind(),
-                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    break Ok(())
-                }
+                // A quiet stream is the expected end of a burst, not a fault
+                // -- and on Windows "quiet" has three spellings, one of which
+                // has no `ErrorKind`. See [`is_quiet_stream`].
+                Err(Error::Io { source, .. }) if is_quiet_stream(&source) => break Ok(()),
                 Err(error) => break Err(error),
             }
         };
@@ -1131,7 +1126,32 @@ impl Connection {
     pub fn receive(&mut self) -> Result<Packet, Error> {
         let mut header = [0u8; protocol::SERVER_HEADER_LEN_LARGE];
 
+        // **The only read here that may legitimately time out.** Nothing has
+        // been consumed yet, so giving up costs nothing and is how `drain`
+        // learns the stream has gone quiet.
         self.read_exact(&mut header[..1], "a packet header")?;
+
+        // **Past this point the packet must be finished or the connection is
+        // dead.** Reading that byte advanced the TCP stream, and decrypting it
+        // advances the RC4 header cipher; abandoning the packet now leaves the
+        // cipher a byte ahead of the stream forever, and every subsequent
+        // header decrypts to garbage. It does not fail loudly -- it fails as
+        // "packet claims 7099367 bytes", thousands of times, while the client
+        // carries on rendering a world it can no longer hear.
+        //
+        // A caller draining with a 1ms timeout -- which the viewer does, every
+        // frame -- hits this whenever a header straddles two TCP segments. So
+        // the remainder of the packet gets a timeout long enough that only a
+        // genuinely broken connection can trip it.
+        let restore = self.stream.read_timeout().ok().flatten();
+        let _ = self.stream.set_read_timeout(Some(PACKET_COMPLETION_TIMEOUT));
+        let finished = self.receive_after_first_byte(&mut header);
+        let _ = self.stream.set_read_timeout(restore);
+        finished
+    }
+
+    /// The rest of a packet, once its first byte has been committed to.
+    fn receive_after_first_byte(&mut self, header: &mut [u8]) -> Result<Packet, Error> {
         if let Some(crypt) = self.crypt.as_mut() {
             crypt.decrypt(&mut header[..1]);
         }
@@ -1162,6 +1182,29 @@ impl Connection {
             .read_exact(into)
             .map_err(|source| Error::Io { what, source })
     }
+}
+
+/// How long the rest of a packet may take once its first byte has been read.
+///
+/// Generous on purpose. This is not a latency budget -- it is the window in
+/// which abandoning the read would corrupt the cipher, so the only thing that
+/// should ever trip it is a connection that has actually gone away.
+const PACKET_COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether a read error means "no data yet" rather than a broken connection.
+///
+/// **`WouldBlock` and `TimedOut` are not the whole set on Windows.** A socket
+/// with a read timeout there can also surface `ERROR_IO_PENDING` (997,
+/// *"Overlapped I/O operation is in progress"*), which Rust maps to no
+/// `ErrorKind` at all -- so matching on kind alone classifies a perfectly
+/// ordinary quiet stream as a fault. That is exactly what killed a live
+/// session: one 997 during a header read, and the connection spent the next
+/// nine minutes reporting packets of seven megabytes.
+pub(crate) fn is_quiet_stream(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) || matches!(error.raw_os_error(), Some(997) | Some(10035) | Some(10060))
 }
 
 /// Splits a realm list address, supplying the default port when it has none.
@@ -1446,6 +1489,113 @@ mod tests {
         let mut body = vec![0u8; size - 4];
         stream.read_exact(&mut body).expect("client body");
         (opcode, body)
+    }
+
+    /// A quiet stream has three spellings on Windows, and only two have a
+    /// `ErrorKind`.
+    ///
+    /// The third, `ERROR_IO_PENDING` (997), is what a real session actually
+    /// hit: one of them during a header read was classified as a broken
+    /// connection, and the stream never recovered.
+    #[test]
+    fn a_quiet_stream_is_recognised_by_all_its_spellings() {
+        use std::io::{Error as IoError, ErrorKind};
+        assert!(is_quiet_stream(&IoError::from(ErrorKind::WouldBlock)));
+        assert!(is_quiet_stream(&IoError::from(ErrorKind::TimedOut)));
+        // 997 maps to no `ErrorKind` at all, which is the whole problem.
+        assert!(is_quiet_stream(&IoError::from_raw_os_error(997)));
+        assert!(is_quiet_stream(&IoError::from_raw_os_error(10035)));
+        // And a genuinely broken connection is still broken.
+        assert!(!is_quiet_stream(&IoError::from(ErrorKind::ConnectionReset)));
+        assert!(!is_quiet_stream(&IoError::from(ErrorKind::UnexpectedEof)));
+    }
+
+    /// A packet whose header arrives in two pieces is still read whole, even
+    /// when the caller's read timeout is far shorter than the gap.
+    ///
+    /// **This is the bug that killed a live session, and it is silent.** The
+    /// reader takes the first header byte, decrypts it -- advancing the RC4
+    /// header cipher -- and then needs three more. Under the viewer's 1ms
+    /// drain timeout, a header split across two TCP segments used to abandon
+    /// the packet there, leaving the cipher one byte ahead of the stream
+    /// *forever*. Nothing errors at the time; what follows is thousands of
+    /// "packet claims 7099367 bytes" while the client keeps rendering a world
+    /// it can no longer hear.
+    ///
+    /// So the delay here is deliberately much longer than the timeout: on the
+    /// old code the first `receive` fails and the second returns garbage, and
+    /// on the fixed code both packets arrive intact.
+    #[test]
+    fn a_header_split_across_segments_does_not_desynchronise_the_cipher() {
+        use std::io::Write;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut crypt = ServerCrypt::new(&KEY);
+            // Build one packet, then dribble it: one byte, a pause far longer
+            // than the reader's timeout, then the rest.
+            let body = [0xAAu8; 8];
+            let size = body.len() + 2;
+            let mut packet = vec![(size >> 8) as u8, size as u8];
+            packet.extend_from_slice(&0x1234u16.to_le_bytes());
+            crypt.to_client.apply_keystream(&mut packet[..4]);
+            packet.extend_from_slice(&body);
+
+            stream.write_all(&packet[..1]).expect("first byte");
+            stream.flush().ok();
+            std::thread::sleep(Duration::from_millis(120));
+            stream.write_all(&packet[1..]).expect("the rest");
+            stream.flush().ok();
+
+            // A second, whole packet, to prove the cipher is still aligned.
+            write_server_packet(&mut stream, Some(&mut crypt), 0x5678, &[0xBB; 4]);
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let stream = TcpStream::connect(address).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(1)))
+            .expect("timeout");
+        let mut connection = Connection {
+            stream,
+            crypt: Some(HeaderCrypt::new(&KEY)),
+            expansion: 2,
+            started: std::time::Instant::now(),
+            ping_sequence: 0,
+        };
+
+        // Retry the *first byte* until the dribbled packet starts arriving --
+        // that read is allowed to time out, and does. Everything after it must
+        // not.
+        let first = loop {
+            match connection.receive() {
+                Ok(packet) => break packet,
+                Err(Error::Io { source, .. }) if is_quiet_stream(&source) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("split header broke the read: {e}"),
+            }
+        };
+        assert_eq!(first.opcode, 0x1234, "the split packet");
+        assert_eq!(first.body, vec![0xAAu8; 8]);
+
+        let second = loop {
+            match connection.receive() {
+                Ok(packet) => break packet,
+                Err(Error::Io { source, .. }) if is_quiet_stream(&source) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("the cipher desynchronised: {e}"),
+            }
+        };
+        assert_eq!(
+            second.opcode, 0x5678,
+            "the packet after a split header decoded to the wrong opcode,              which is what a desynchronised header cipher looks like"
+        );
+        assert_eq!(second.body, vec![0xBBu8; 4]);
+        server.join().ok();
     }
 
     fn write_server_packet(

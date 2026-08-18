@@ -121,9 +121,12 @@ fn transform(raw_position: [f32; 3], rotation: [f32; 3], scale: f32) -> Mat4 {
 /// `radius` 0 is a single tile, 1 is the 3x3 around it, and so on. Tiles that
 /// do not exist are skipped rather than failing: coastlines are ragged, and a
 /// block near one is mostly ocean.
+#[allow(clippy::too_many_arguments)]
 pub fn load(
     gpu: &Gpu,
     terrain_renderer: &render::TerrainRenderer,
+    liquid_renderer: &render::LiquidRenderer,
+    liquid_types: &mut crate::liquid::LiquidTypes,
     chain: &mut Chain,
     map: &str,
     centre: (usize, usize),
@@ -155,7 +158,16 @@ pub fn load(
             if !wdt.has_tile(x, y) {
                 continue;
             }
-            let terrain = match crate::terrain::load(gpu, terrain_renderer, chain, map, x, y) {
+            let terrain = match crate::terrain::load(
+                gpu,
+                terrain_renderer,
+                liquid_renderer,
+                liquid_types,
+                chain,
+                map,
+                x,
+                y,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     skipped.push(format!("terrain {x},{y}: {e}"));

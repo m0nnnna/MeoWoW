@@ -447,6 +447,25 @@ impl Entity {
     /// For creatures the two coincide, because nothing that is not a player
     /// ever carries the ghost flag -- which is exactly why this was easy to
     /// get wrong and only showed up on a *player* corpse run.
+    /// Whether the last movement this unit reported said it was swimming.
+    ///
+    /// **Read from the replicated flag rather than from the water**, which is
+    /// what makes it work at all for somebody else: this client knows where
+    /// the `MH2O` sheets are, but sampling them under another player would ask
+    /// a question about *their* position that only they can answer -- they may
+    /// be on a bridge over the river, or in a WMO pool this client cannot see.
+    /// The flag is their own client's answer, relayed.
+    ///
+    /// False for a creature, and correctly so rather than as a gap:
+    /// `SMSG_MONSTER_MOVE` carries a path and no flags at all, so nothing on
+    /// the wire says a murloc is swimming. `None` movement is likewise false --
+    /// a unit that has never moved has made no claim, and treating silence as
+    /// "swimming" would put every stationary creature into a stroke cycle.
+    pub fn swimming(&self) -> bool {
+        self.movement
+            .is_some_and(|m| m.flags & crate::update::movement_flags::SWIMMING != 0)
+    }
+
     pub fn is_corpse(&self) -> bool {
         self.is_dead_or_ghost() && !self.is_ghost()
     }
@@ -933,6 +952,14 @@ pub struct Replication {
     /// refused this batch. Returned rather than stored for the same reason
     /// `cast_failures` is: an event, not state.
     pub inventory_failures: Vec<crate::inventory::InventoryChangeFailure>,
+    /// Ticks of drowning, falling, lava or slime damage this batch.
+    ///
+    /// Returned rather than stored, unlike the mirror timers next to them,
+    /// because these are events: each is one line in the combat log and one
+    /// number that has already come off a health field the server replicates
+    /// separately. Storing them would make a client either draw the same tick
+    /// twice or have to remember which ones it had already read.
+    pub environmental_damage: Vec<crate::environment::EnvironmentalDamageLog>,
     /// Chat received this batch.
     ///
     /// Handed back rather than stored: chat is a stream of events, not state,
@@ -1022,6 +1049,22 @@ pub struct WorldState {
     /// the safe direction: ordinary daylight where it should be dim is
     /// unremarkable, the reverse looks broken.
     pub weather: crate::weather::WeatherChange,
+    /// The breath, fatigue and lava bars the server currently wants shown.
+    ///
+    /// **State, not events**, for the same reason the weather above is: the
+    /// server states a bar once and then says nothing until it changes, so a
+    /// caller that treated a start as an event would draw the bar for one frame
+    /// and then leave a drowning character with no warning at all.
+    ///
+    /// Keyed by which bar, because several run at once -- diving to the bottom
+    /// of a lava lake starts the breath timer and the fire timer together, and
+    /// a single slot would have the second overwrite the first.
+    ///
+    /// Cleared entry by entry on `SMSG_STOP_MIRROR_TIMER`. An entry that is
+    /// merely *paused* stays, with its flag set: paused and absent are
+    /// different statements, and collapsing them would make a bar vanish while
+    /// the condition that raised it is still true.
+    pub mirror_timers: HashMap<crate::environment::MirrorTimer, crate::environment::MirrorTimerStart>,
     /// Who each unit is currently swinging at, keyed by attacker.
     /// `SMSG_ATTACKSTART` inserts, `SMSG_ATTACKSTOP` removes.
     ///
@@ -1771,6 +1814,79 @@ impl WorldState {
                             }
                             report.weather_changes += 1;
                             self.weather = change;
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::START_MIRROR_TIMER => {
+                    match crate::environment::MirrorTimerStart::parse(&packet.body) {
+                        Ok(started) => {
+                            tracing::debug!(
+                                "mirror timer {:?}: {}/{}ms at {}{}",
+                                started.timer,
+                                started.value,
+                                started.max_value,
+                                started.scale,
+                                if started.paused { ", paused" } else { "" }
+                            );
+                            self.mirror_timers.insert(started.timer, started);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::PAUSE_MIRROR_TIMER => {
+                    match crate::environment::MirrorTimerPause::parse(&packet.body) {
+                        Ok(pause) => {
+                            // Only touches a bar that exists. A pause for a
+                            // timer never started would otherwise conjure one
+                            // with a zero value, which draws as a bar already
+                            // run out -- the opposite of what a pause means.
+                            if let Some(timer) = self.mirror_timers.get_mut(&pause.timer) {
+                                timer.paused = pause.paused;
+                            }
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::STOP_MIRROR_TIMER => {
+                    match crate::environment::parse_stop_mirror_timer(&packet.body) {
+                        Ok(timer) => {
+                            self.mirror_timers.remove(&timer);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::ENVIRONMENTAL_DAMAGE_LOG => {
+                    match crate::environment::EnvironmentalDamageLog::parse(&packet.body) {
+                        Ok(hit) => {
+                            // Logged as well as returned, which is the lesson
+                            // from chat being produced centrally and dropped by
+                            // three separate callers: a line in the viewer's own
+                            // log separates "the server never sent it" from "it
+                            // arrived and nothing drew it".
+                            tracing::debug!(
+                                "environmental damage: {} from {} to {:#x}",
+                                hit.amount,
+                                hit.cause.describe(),
+                                hit.victim
+                            );
+                            report.environmental_damage.push(hit);
                         }
                         Err(error) => report.failures.push((
                             packet.opcode,

@@ -11,6 +11,7 @@
 mod character;
 mod hud;
 mod items;
+mod liquid;
 mod live;
 mod maps;
 mod model;
@@ -301,9 +302,12 @@ fn main() -> Result<()> {
 /// network; it says where the character is standing and what is around it.
 /// Kept beside the scene rather than inside it because it describes how the
 /// scene was chosen, not what is in it.
+#[allow(clippy::too_many_arguments)]
 fn build_scene(
     gpu: &Gpu,
     terrain_renderer: &TerrainRenderer,
+    liquid_renderer: &render::LiquidRenderer,
+    liquid_types: &mut liquid::LiquidTypes,
     meshes: &mut MeshRenderer,
     chain: &mut Chain,
     args: &Args,
@@ -311,7 +315,8 @@ fn build_scene(
     if args.realm_host.is_some() {
         return build_live_scene(gpu, meshes, chain, args);
     }
-    build_offline_scene(gpu, terrain_renderer, chain, args).map(|scene| (scene, None))
+    build_offline_scene(gpu, terrain_renderer, liquid_renderer, liquid_types, chain, args)
+        .map(|scene| (scene, None))
 }
 
 /// Logs in and builds a streaming world around wherever the character is.
@@ -363,7 +368,9 @@ fn build_live_scene(
         // for icons.
         let items = crate::items::Items::load(chain);
         let placements: Vec<world::EntityPlacement> =
-            drawable_with_own(&live, (0.0, 0.0), 0.0, false)
+            // A headless render has no movement driver to have decided, and
+            // the character is standing still: not swimming.
+            drawable_with_own(&live, (0.0, 0.0), 0.0, false, false)
                 .iter()
                 .map(|entity| {
                     // Same three sources as the windowed path -- see `redraw`.
@@ -391,6 +398,7 @@ fn build_live_scene(
                         speed: entity.speed,
                         turning: entity.turning,
                         airborne: entity.airborne,
+                        swimming: entity.swimming,
                         dead: entity.dead,
                         died_ms_ago: entity.died_ms_ago,
                         swung_ms_ago: entity.swung_ms_ago,
@@ -423,6 +431,8 @@ fn build_live_scene(
 fn build_offline_scene(
     gpu: &Gpu,
     terrain_renderer: &TerrainRenderer,
+    liquid_renderer: &render::LiquidRenderer,
+    liquid_types: &mut liquid::LiquidTypes,
     chain: &mut Chain,
     args: &Args,
 ) -> Result<Scene> {
@@ -469,6 +479,8 @@ fn build_offline_scene(
             let loaded = scene::load(
                 gpu,
                 terrain_renderer,
+                liquid_renderer,
+                liquid_types,
                 chain,
                 map,
                 tile,
@@ -477,7 +489,16 @@ fn build_offline_scene(
             )?;
             return Ok(Scene::World(Box::new(loaded)));
         }
-        let loaded = terrain::load(gpu, terrain_renderer, chain, map, tile.0, tile.1)?;
+        let loaded = terrain::load(
+            gpu,
+            terrain_renderer,
+            liquid_renderer,
+            liquid_types,
+            chain,
+            map,
+            tile.0,
+            tile.1,
+        )?;
         return Ok(Scene::Terrain(Box::new(loaded)));
     }
     let path = args.texture.as_deref().unwrap_or(DEFAULT_TEXTURE);
@@ -698,6 +719,42 @@ const BODY_HEIGHT: f32 = 2.0;
 /// onto without thinking about it -- and it is the number to move, in one
 /// place, if stairs still catch or fences stop catching.
 const STEP_HEIGHT: f32 = 0.8;
+
+/// How far a liquid surface must stand above the bed before a character swims
+/// rather than wades.
+///
+/// Measured against [`BODY_HEIGHT`] rather than chosen freely: chest deep on a
+/// two-unit body. Anything much smaller has a character swimming across a ford
+/// and along every shoreline, where the water is a hand's breadth deep and the
+/// `MH2O` sheet still covers the ground.
+///
+/// **The server does not have to agree, and mostly does not.** AzerothCore
+/// counts a player as in water the moment the surface is above their feet at
+/// all (`Map::GetLiquidData`), which is a different question -- it decides
+/// whether to run a breath timer, not whether to play a swim cycle. The two
+/// only have to agree about the deep middle, and they do.
+const SWIM_DEPTH: f32 = 1.4;
+
+/// How far below the surface a floating character's feet rest.
+///
+/// Not the same as [`SWIM_DEPTH`]: that is when swimming *starts*, this is
+/// where the body sits once it has. Slightly less than the body height, so the
+/// head clears the water.
+const SWIM_FLOAT: f32 = 1.7;
+
+/// Units per second gained by holding the rise key while swimming.
+const SWIM_CLIMB_RATE: f32 = 3.0;
+
+/// How steeply the camera must look down before moving forward dives.
+///
+/// Without a deadzone a character swimming on the level with the camera a
+/// degree below horizontal sinks slowly and forever, which reads as the water
+/// not holding them up.
+const DIVE_PITCH_DEADZONE: f32 = 0.15;
+
+/// Seconds to close most of the gap back to the surface when nothing is
+/// pushing the character down.
+const BUOYANCY_TAU: f32 = 0.45;
 
 /// Radians per second turned by the A/D keys. Not verified against a
 /// reference client -- see the facing note in `docs/RENDERING.md` -- but close
@@ -989,6 +1046,8 @@ fn draw_scene(
     blitter: &Blitter,
     meshes: &MeshRenderer,
     terrain_renderer: &TerrainRenderer,
+    liquid_renderer: &render::LiquidRenderer,
+    liquid_types: &liquid::LiquidTypes,
     // Only the streaming world has a sky: the model and texture views are not
     // places, so there is no hour or position to resolve a gradient for. The
     // same is true of the weather.
@@ -1003,6 +1062,11 @@ fn draw_scene(
     // it for. `None` everywhere else -- a model or texture view has neither,
     // and gets the placeholder headlight.
     lighting: Option<(dbc::light::Sample, f32)>,
+    // Wall clock, which is what scrolls a liquid surface and steps its
+    // animation. Passed in rather than read here so a headless render can pin
+    // it and produce the same picture twice -- the same reason `--screenshot`
+    // hands the precipitation a fixed clock.
+    seconds: f32,
 ) {
     // Terrain has its own pipeline, so both the tile and world scenes route
     // their landscape through here.
@@ -1023,11 +1087,13 @@ fn draw_scene(
             camera,
             meshes,
             terrain_renderer,
+            liquid_renderer,
             sky,
             precipitation,
             falling,
             bones,
             lighting,
+            seconds,
         );
         return;
     }
@@ -1117,6 +1183,24 @@ fn draw_scene(
                     );
                 }
             }
+
+            // The offline scene has no `Light.dbc` sample to hand -- it draws
+            // under the placeholder headlight, which is what `camera.uniform`
+            // above supplies. So the liquid gets the placeholder too, from the
+            // same struct, rather than a set of constants chosen here that
+            // would light the water differently from the shore.
+            let unlit = camera.uniform(size.0 as f32 / size.1.max(1) as f32);
+            draw_liquid(
+                gpu,
+                &mut pass,
+                terrain_parts.iter().filter_map(|t| t.liquid.as_ref()),
+                liquid_renderer,
+                liquid_types,
+                &unlit,
+                camera.view_proj(size.0 as f32 / size.1.max(1) as f32),
+                camera.eye(),
+                seconds,
+            );
         }
         return;
     }
@@ -1251,6 +1335,101 @@ fn scene_states(scene: &Scene) -> Vec<render::mesh::RenderState> {
     }
 }
 
+/// Draws every liquid sheet in a set of tiles.
+///
+/// Free-standing and taking an iterator because **both render paths need it**
+/// -- the streaming world and the offline `--world` scene each hold their
+/// tiles differently and each has to draw the same water. A liquid pass wired
+/// into only one of them would leave every `--screenshot` showing a dry
+/// riverbed, which is the one instrument this project has for checking a
+/// render without a window.
+///
+/// Takes the *already built* camera uniform rather than the lighting sample:
+/// see the note at its construction.
+#[allow(clippy::too_many_arguments)]
+fn draw_liquid<'a>(
+    gpu: &Gpu,
+    pass: &mut wgpu::RenderPass<'a>,
+    tiles: impl Iterator<Item = &'a liquid::LoadedLiquid>,
+    liquid_renderer: &'a render::LiquidRenderer,
+    liquid_types: &'a liquid::LiquidTypes,
+    lit: &render::mesh::CameraUniform,
+    view_proj: glam::Mat4,
+    eye: glam::Vec3,
+    seconds: f32,
+) {
+    let mut began = false;
+    let (mut drawn, mut skipped) = (0usize, 0usize);
+    for sheet in tiles {
+        // Deferred until there is something to draw, so a dry map never
+        // touches the uniform buffer or swaps the pipeline.
+        if !began {
+            began = true;
+            liquid_renderer.begin(
+                gpu,
+                pass,
+                view_proj,
+                eye,
+                glam::Vec3::new(lit.light[0], lit.light[1], lit.light[2]),
+                [lit.sun[0], lit.sun[1], lit.sun[2]],
+                lit.sun[3],
+                [lit.ambient[0], lit.ambient[1], lit.ambient[2]],
+                [lit.fog[0], lit.fog[1], lit.fog[2]],
+                (lit.fog_range[0], lit.fog_range[1]),
+                seconds,
+            );
+        }
+        pass.set_vertex_buffer(0, sheet.vertices.slice(..));
+        pass.set_index_buffer(sheet.indices.slice(..), wgpu::IndexFormat::Uint32);
+        for draw in &sheet.draws {
+            // A type whose art did not resolve is skipped rather than drawn
+            // untextured: a magenta river reads as a bug in the water, and the
+            // warning naming the missing file has already been logged once.
+            //
+            // **But the skip says so.** Silently dropping a draw makes
+            // geometry that was built and never submitted look exactly like
+            // geometry that was never built -- and those want opposite
+            // investigations. This is the line that separated them when the
+            // streaming path drew nothing: the tiles reported 2,398 triangles
+            // of water and every one of them was skipped here.
+            let Some(frame) = liquid_types.frame_at(draw.liquid_type, seconds) else {
+                skipped += 1;
+                continue;
+            };
+            drawn += 1;
+            pass.set_bind_group(1, frame, &[]);
+            pass.draw_indexed(
+                draw.first_index..draw.first_index + draw.index_count,
+                0,
+                0..1,
+            );
+        }
+    }
+    // **Both counters, always.** Warning only when something was skipped left
+    // "nothing was skipped" and "nothing was iterated" as the same silence --
+    // and those are opposite faults: a draw that resolved no art, and a draw
+    // list that was empty because the tiles were never reached. One line
+    // naming both numbers separates them in a single run.
+    if skipped > 0 {
+        tracing::warn!(
+            drawn,
+            skipped,
+            "liquid sheets skipped for want of surface art -- the cache used to              draw is not the one that built this geometry"
+        );
+    } else {
+        // **Only when it changes.** This runs every frame, and at `debug` it
+        // wrote a third of a million lines and 68MB in half an hour -- burying
+        // the once-per-event lines a live test is actually reading, which is
+        // the exact mistake `own_entity` documents and this walked into
+        // anyway. The count is what matters, so log the *transition*.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static LAST: AtomicUsize = AtomicUsize::new(usize::MAX);
+        if LAST.swap(drawn, Ordering::Relaxed) != drawn {
+            tracing::debug!(drawn, "liquid sheets drawn");
+        }
+    }
+}
+
 /// Draws a streaming world: terrain first, then the instanced objects on it.
 #[allow(clippy::too_many_arguments)]
 fn draw_streaming(
@@ -1263,14 +1442,29 @@ fn draw_streaming(
     camera: &Camera,
     meshes: &MeshRenderer,
     terrain_renderer: &TerrainRenderer,
+    liquid_renderer: &render::LiquidRenderer,
+    // **No liquid cache parameter, deliberately.** The streaming world builds
+    // its tiles' liquid into its *own* cache, so that is the only one whose
+    // frames those tiles' type ids resolve against. Taking one from the caller
+    // is what let the renderer's empty cache be passed in, which skipped every
+    // draw and made the water invisible while every diagnostic said it had been
+    // built. A parameter that can be wrong is worse than no parameter.
     sky: &render::SkyRenderer,
     precipitation: &render::PrecipitationRenderer,
     falling: Option<Falling>,
     bones: Option<&BoneBuffer>,
     lighting: Option<(dbc::light::Sample, f32)>,
+    seconds: f32,
 ) {
     let aspect = size.0 as f32 / size.1.max(1) as f32;
-    meshes.update_camera(gpu, &lit_uniform(camera, aspect, sky, lighting));
+    // **The one uniform, kept.** The liquid pass has its own bind group and
+    // therefore its own copy of the sun, the ambient and the fog -- and a
+    // second *derivation* of those would agree with the terrain's only until
+    // somebody edited one of them. Water lit half a stop off the shore it laps
+    // against is a seam nothing would catch but an eye. Same rule as the
+    // picking ray being unprojected from the matrix the scene was drawn with.
+    let lit = lit_uniform(camera, aspect, sky, lighting);
+    meshes.update_camera(gpu, &lit);
     // Built once here and handed to both the sky and the scene, rather than
     // each asking the camera for its own: the sky's horizon has to sit exactly
     // where the ground's does, and two derivations agree only until one of them
@@ -1370,6 +1564,22 @@ fn draw_streaming(
             }
         }
     }
+
+    // **After everything opaque and before the weather.** Liquid blends, so
+    // it has to be drawn over the riverbed it is meant to be seen through --
+    // and a raindrop landing in a river must be drawn over the water, not
+    // under it, which is what puts precipitation after this rather than before.
+    draw_liquid(
+        gpu,
+        &mut pass,
+        world.tiles().filter_map(|t| t.terrain.liquid.as_ref()),
+        liquid_renderer,
+        world.liquid_types(),
+        &lit,
+        view_proj,
+        camera.eye(),
+        seconds,
+    );
 
     // Last, so it falls in front of everything solid -- and inside the same
     // pass, so it can still be depth-tested against the world it is falling
@@ -1641,8 +1851,18 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     let terrain_renderer = TerrainRenderer::new(&gpu, format, meshes.camera_layout());
     let sky = render::SkyRenderer::new(&gpu, format);
     let precipitation = render::PrecipitationRenderer::new(&gpu, format);
+    let liquid_renderer = render::LiquidRenderer::new(&gpu, format);
+    let mut liquid_types = liquid::LiquidTypes::default();
 
-    let (mut scene, live) = build_scene(&gpu, &terrain_renderer, &mut meshes, chain, args)?;
+    let (mut scene, live) = build_scene(
+        &gpu,
+        &terrain_renderer,
+        &liquid_renderer,
+        &mut liquid_types,
+        &mut meshes,
+        chain,
+        args,
+    )?;
     let camera = match (&scene, &live) {
         (_, Some(live)) => live_camera(live, args),
         (Scene::Streaming(w), None) => streaming_camera(w, chain, args)?,
@@ -1656,7 +1876,14 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
             Camera::Orbit(o) => o.eye(),
         };
         for _ in 0..64 {
-            world.update(&gpu, &mut meshes, &terrain_renderer, chain, eye);
+            world.update(
+                &gpu,
+                &mut meshes,
+                &terrain_renderer,
+                &liquid_renderer,
+                chain,
+                eye,
+            );
             if world.stats.tiles_pending == 0 {
                 break;
             }
@@ -1710,6 +1937,8 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
         &blitter,
         &meshes,
         &terrain_renderer,
+        &liquid_renderer,
+        &liquid_types,
         &sky,
         &precipitation,
         // A fixed clock, so two screenshots of the same weather are the same
@@ -1728,6 +1957,11 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
             args.hour,
             camera_eye,
         ),
+        // The same fixed clock the weather gets, and for the same reason: a
+        // river whose surface scrolled with the wall clock would make two
+        // screenshots of one scene differ, which is precisely what
+        // `--screenshot` exists not to do.
+        4.0,
     );
     gpu.queue.submit([encoder.finish()]);
 
@@ -1770,6 +2004,16 @@ struct Renderer {
     terrain_renderer: TerrainRenderer,
     sky: render::SkyRenderer,
     precipitation: render::PrecipitationRenderer,
+    liquid_renderer: render::LiquidRenderer,
+    /// Surface art for the liquid types the offline scenes use.
+    ///
+    /// The streaming world keeps its own -- see `world::World::liquid_types` --
+    /// because it loads and evicts tiles for the whole session, while this one
+    /// serves the single scene `--map`/`--world` built at startup. Two caches
+    /// rather than one shared: the bind groups here are referenced by geometry
+    /// that never changes, and threading one cache through both owners would
+    /// mean a borrow of the world held across every offline draw.
+    liquid_types: liquid::LiquidTypes,
     material_binds: Vec<wgpu::BindGroup>,
     world_binds: Vec<Vec<wgpu::BindGroup>>,
     identity: render::mesh::InstanceBuffer,
@@ -1839,6 +2083,18 @@ struct App {
     /// landing and believes the client in between -- so this is the only copy
     /// of it, and it is why the landing has to be sent explicitly.
     jump: Option<::world::motion::Jump>,
+    /// Whether the character is currently swimming, and in what.
+    ///
+    /// **A remembered state rather than a fresh test each frame**, because the
+    /// server has to be *told* when it changes -- `MSG_MOVE_START_SWIM` and
+    /// `MSG_MOVE_STOP_SWIM` are transitions, not a flag polled from nowhere,
+    /// and a client that recomputed the condition without comparing it to what
+    /// it last reported would either send nothing or send it every frame.
+    ///
+    /// Carries the liquid rather than a bare bool so the interface can say
+    /// *what* is being swum in without asking the world a second time and
+    /// possibly getting a different answer -- the character has moved by then.
+    swimming: Option<world::Liquid>,
     /// Sustained forward movement, toggled rather than held.
     ///
     /// Cleared by pressing a movement key, which is what every game with an
@@ -2222,6 +2478,7 @@ fn drawable_with_own(
     // are computed from.
     lean: f32,
     airborne: bool,
+    swimming: bool,
 ) -> Vec<live::Entity> {
     let mut entities = live::drawable_entities(&live.state, live.guid, live.position);
     if let Some(own) = live::own_entity(
@@ -2232,6 +2489,7 @@ fn drawable_with_own(
         pace.0,
         pace.1,
         airborne,
+        swimming,
     ) {
         entities.push(own);
     }
@@ -2669,6 +2927,7 @@ impl App {
             live: None,
             live_move: ::world::motion::Motion::default(),
             jump: None,
+            swimming: None,
             autorun: false,
             last_heartbeat: Instant::now(),
             last_ping: Instant::now(),
@@ -2799,11 +3058,15 @@ impl ApplicationHandler for App {
         let terrain_renderer = TerrainRenderer::new(&gpu, format, meshes.camera_layout());
         let sky = render::SkyRenderer::new(&gpu, format);
         let precipitation = render::PrecipitationRenderer::new(&gpu, format);
+        let liquid_renderer = render::LiquidRenderer::new(&gpu, format);
+        let mut liquid_types = liquid::LiquidTypes::default();
         let depth = DepthBuffer::new(&gpu, config.width, config.height);
 
         let scene = match build_scene(
             &gpu,
             &terrain_renderer,
+            &liquid_renderer,
+            &mut liquid_types,
             &mut meshes,
             &mut self.chain,
             &self.args,
@@ -2885,6 +3148,8 @@ impl ApplicationHandler for App {
             terrain_renderer,
             sky,
             precipitation,
+            liquid_renderer,
+            liquid_types,
             material_binds,
             world_binds,
             identity,
@@ -3154,7 +3419,18 @@ impl ApplicationHandler for App {
                         // Space jumps in the world and raises a free camera.
                         // Handled before the toggles so it can fall through to
                         // `keys.set` when there is no character to jump.
-                        if code == KeyCode::Space && self.live.is_some() {
+                        // **Except while swimming**, where Space is held to
+                        // rise rather than tapped to leave the ground -- so it
+                        // falls through to `keys.set` and becomes a held
+                        // state. Jumping out of deep water is not a thing a
+                        // character can do, and `begin_jump` refuses it
+                        // independently: this branch decides which *input* the
+                        // key is, and that one decides whether the action is
+                        // legal.
+                        if code == KeyCode::Space
+                            && self.live.is_some()
+                            && self.swimming.is_none()
+                        {
                             self.begin_jump();
                             window.request_redraw();
                             return;
@@ -3513,6 +3789,7 @@ impl App {
                 &r.gpu,
                 &mut r.meshes,
                 &r.terrain_renderer,
+                &r.liquid_renderer,
                 &mut self.chain,
                 eye,
             );
@@ -3547,7 +3824,13 @@ impl App {
                     // player's own body is excluded inside `ease_facings` --
                     // its heading comes from the keys and is already smooth,
                     // and easing it would make the camera lag the character.
-                    let mut drawn = drawable_with_own(live, pace, lean, self.jump.is_some());
+                    let mut drawn = drawable_with_own(
+                        live,
+                        pace,
+                        lean,
+                        self.jump.is_some(),
+                        self.swimming.is_some(),
+                    );
                     // See `App::own_body_drawn`: submitted-and-not-drawn and
                     // never-submitted are the same report from the window.
                     let own_drawn = drawn.iter().any(|entity| entity.guid == live.guid);
@@ -3584,6 +3867,7 @@ impl App {
                                     speed: entity.speed,
                                     turning: entity.turning,
                                     airborne: entity.airborne,
+                                    swimming: entity.swimming,
                                     dead: entity.dead,
                                     died_ms_ago: entity.died_ms_ago,
                                     swung_ms_ago: entity.swung_ms_ago,
@@ -3714,6 +3998,8 @@ impl App {
                 &r.blitter,
                 &r.meshes,
                 &r.terrain_renderer,
+                &r.liquid_renderer,
+                &r.liquid_types,
                 &r.sky,
                 &r.precipitation,
                 resolve_precipitation(weather, self.started.elapsed().as_secs_f32()),
@@ -3722,6 +4008,7 @@ impl App {
                 &r.world_binds,
                 &r.identity,
                 lighting,
+                self.started.elapsed().as_secs_f32(),
             );
         }
 
@@ -3943,6 +4230,12 @@ impl App {
         // character was in the air -- which is the number fall damage is
         // measured from, and is gone the moment the jump is cleared.
         let mut landed: Option<u32> = None;
+        // The ground under the character and the liquid over it, sampled
+        // together while the scene is borrowed. Both are wanted *outside* this
+        // block -- the swim decision needs the pair, since what makes water
+        // swimmable is how far it stands above the bed, not its altitude.
+        let mut stand_at: Option<f32> = None;
+        let mut liquid_here: Option<world::Liquid> = None;
         if let Some(Scene::Streaming(world)) = self.renderer.as_ref().and_then(|r| r.scene.as_ref())
         {
             // A building's floor outranks the terrain under it, which is
@@ -3984,9 +4277,99 @@ impl App {
                         live.position.y,
                     );
                 }
+            }
+            stand_at = stand;
+            liquid_here = world.liquid_at(live.position.x, live.position.y);
+        }
+
+        // **Swimming, and whether this frame changed it.**
+        //
+        // The condition is not "the water is above my feet" -- that is ankle
+        // deep at every shoreline and would have a character swimming across a
+        // ford. It is that the surface stands at least [`SWIM_DEPTH`] above
+        // whatever is holding the character up, which is what "deep enough to
+        // swim in" means and is why the ground had to be sampled too.
+        //
+        // A liquid whose category this client does not recognise is *not*
+        // swum in: `LiquidCategory::Unknown` means the table did not load or
+        // named a value this build does not use, and starting to swim on the
+        // strength of a number nobody could resolve is the fabrication the
+        // category exists to refuse. It still draws.
+        let was_swimming = self.swimming.is_some();
+        self.swimming = liquid_here.filter(|liquid| {
+            liquid.category.is_swimmable()
+                && stand_at.is_some_and(|ground| liquid.surface - ground >= SWIM_DEPTH)
+        });
+        let swim_changed = was_swimming != self.swimming.is_some();
+        if swim_changed {
+            tracing::debug!(
+                swimming = self.swimming.is_some(),
+                category = ?self.swimming.map(|l| l.category),
+                surface = ?self.swimming.map(|l| l.surface),
+                ground = ?stand_at,
+                "swim state changed"
+            );
+        }
+
+        // **Planted on the ground only when not swimming**, and this order is
+        // the whole of it.
+        //
+        // The standing assignment used to run unconditionally, a few lines
+        // earlier, and then the buoyancy below read `live.position.z` -- which
+        // it had just set to the riverbed. Buoyancy closes a *fraction* of the
+        // remaining gap per frame, so each frame started at the bottom, rose
+        // three per cent of the way, and was put back. The character would
+        // have walked along the bed of the river with the swim flag set and
+        // the stroke cycle playing: a failure that looks like the feature
+        // half-working rather than like an ordering mistake.
+        //
+        // Sampling the ground is still unconditional -- the swim test needs it,
+        // since what makes water swimmable is how far it stands above the bed.
+        // It is only the *assignment* that a swimmer opts out of.
+        if self.swimming.is_none() {
+            if let Some(z) = stand_at {
                 live.position.z = z;
             }
         }
+
+        if let Some(liquid) = self.swimming {
+            // A jump does not survive hitting water, and neither does the
+            // fall it would otherwise report. Cleared rather than left to
+            // finish: a character who lands in a lake has landed, and an arc
+            // still running underwater would keep pulling them down through
+            // it.
+            self.jump = None;
+
+            // Where the body floats to with nothing pushing it: head above the
+            // surface, body below.
+            let rest = liquid.surface - SWIM_FLOAT;
+            let floor = stand_at.unwrap_or(live.position.z);
+            let mut z = live.position.z;
+            if self.keys.up {
+                z += SWIM_CLIMB_RATE * dt;
+            } else if desired.is_moving() && self.camera_pitch < -DIVE_PITCH_DEADZONE {
+                // **Diving is steered by the camera, not by a key.** That is
+                // how the original does it, and it is also the only control
+                // already in the player's hands that carries a vertical
+                // direction -- adding a second one would give two ways to sink
+                // that could disagree.
+                z += self.camera_pitch.sin() * live_pace(desired).abs() * dt;
+            } else {
+                // Buoyancy: a fraction of the remaining distance per second
+                // rather than a fixed rise, for the reason the camera's height
+                // easing and the creature turn rate both document -- a rate
+                // cap falls arbitrarily far behind whenever the input moves
+                // faster than the cap, and a character dropped into a deep
+                // lake is exactly that input.
+                z += (rest - z) * (1.0 - (-dt / BUOYANCY_TAU).exp());
+            }
+            // Never above the surface and never through the bed. `max` on the
+            // ceiling because in water shallower than `SWIM_FLOAT` the rest
+            // height is *below* the bed, and clamping to an inverted range
+            // panics.
+            live.position.z = z.clamp(floor, rest.max(floor));
+        }
+
         if let Some(jump) = self.jump.as_mut() {
             let down = jump.advance(dt);
             live.position.z += jump.height;
@@ -4009,6 +4392,15 @@ impl App {
         // computed flags separately per branch, which is precisely how a
         // heartbeat comes to disagree with the start it is continuing.
         let airborne = self.jump.as_ref();
+        // **The swimming bit and the pitch field travel together or not at
+        // all.** `MovementInfo::has_pitch` emits a float whenever this flag is
+        // set, so setting it here is what puts the field in every packet from
+        // now on -- and the pitch that field carries is the camera's, because
+        // while swimming the camera is what steers the dive. Sending the flag
+        // and a stale zero would tell the server a swimmer is permanently
+        // level.
+        let swimming = self.swimming.is_some();
+        let pitch = swimming.then_some(self.camera_pitch);
         let info_now = |live: &live::LiveWorld, extra: u32| MovementInfo {
             flags: desired.flags()
                 | extra
@@ -4016,9 +4408,11 @@ impl App {
                     movement_flags::FALLING
                 } else {
                     0
-                },
+                }
+                | if swimming { movement_flags::SWIMMING } else { 0 },
             time: live.connection.tick(),
             position,
+            pitch,
             fall_time: airborne.map(|j| j.elapsed_ms).unwrap_or(0),
             falling: airborne.map(|j| ::world::movement::Falling {
                 velocity: j.velocity,
@@ -4028,6 +4422,25 @@ impl App {
             }),
             ..MovementInfo::default()
         };
+
+        // **The swim transition goes first and unconditionally**, for exactly
+        // the reason the landing above does: releasing a key on the frame the
+        // water is entered would send the key change and swallow the entry,
+        // leaving the server holding a character it believes is still walking
+        // -- across a lake bed. Two different facts about one frame, and both
+        // have to travel.
+        if swim_changed {
+            let opcode = if swimming {
+                ClientOpcode::MoveStartSwim
+            } else {
+                ClientOpcode::MoveStopSwim
+            };
+            let info = info_now(live, 0);
+            if let Err(e) = live.connection.send_movement(opcode, live.guid, &info) {
+                tracing::warn!("sending swim transition failed: {e:#}");
+            }
+            self.last_heartbeat = Instant::now();
+        }
 
         // The landing goes first and unconditionally.
         //
@@ -4295,10 +4708,16 @@ impl App {
     /// Refused while already airborne. Double-jumping is not a thing the
     /// server accepts, and sending a second take-off mid-arc reports a
     /// velocity from an altitude the server has not seen yet.
+    ///
+    /// Refused while swimming too, for a different reason: there is no ground
+    /// to push off. The key that would jump is bound to rising instead -- see
+    /// the `KeyCode::Space` branch -- so this is the second of two independent
+    /// refusals, and it is here as well as there because a caller that reached
+    /// this from somewhere else would otherwise launch a swimmer out of a lake.
     fn begin_jump(&mut self) {
         use ::world::{ClientOpcode, MovementInfo, Position};
 
-        if self.jump.is_some() {
+        if self.jump.is_some() || self.swimming.is_some() {
             return;
         }
         let moving = self.live_move;
@@ -5419,7 +5838,13 @@ impl App {
         // The speed only chooses an animation, which a click test does not care
         // about -- but the same list has to come out here as the renderer drew,
         // so it is passed the same way rather than left at a default.
-        let entities = drawable_with_own(live, pace, self.strafe_lean(), self.jump.is_some());
+        let entities = drawable_with_own(
+            live,
+            pace,
+            self.strafe_lean(),
+            self.jump.is_some(),
+            self.swimming.is_some(),
+        );
         Some(hud::pick(&ray, &entities, &|display_id| {
             world.entity_bounds(display_id)
         }))
@@ -5606,6 +6031,34 @@ impl App {
                         failure.item_a,
                         failure.item_b
                     );
+                    self.chat.push(Line::Chat(local_notice(text)));
+                }
+                // **Lava, slime, drowning and falling.** The same shape again,
+                // and the fifth chance to parse a category and drop it -- but
+                // this one matters differently: nothing else in the client
+                // would say why a character standing in a lava lake is losing
+                // health, because the *server* decides that entirely from its
+                // own copy of the terrain. The client draws the lava, reports
+                // where it is standing, and is told the cost. Inventing that
+                // cost locally would be a number nobody can check.
+                for hit in &report.environmental_damage {
+                    let ours = hit.victim == live.guid;
+                    let who = if ours {
+                        "You".to_string()
+                    } else {
+                        // Never observed -- the server does not relay other
+                        // people's drowning -- but named from the guid rather
+                        // than assumed to be us, since assuming would put our
+                        // own name on somebody else's death.
+                        live.state
+                            .names
+                            .player(hit.victim)
+                            .flatten()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("{:#x}", hit.victim))
+                    };
+                    let text = hit.describe(&who, ours);
+                    tracing::debug!("environmental damage -- {text}");
                     self.chat.push(Line::Chat(local_notice(text)));
                 }
                 // Fourth category this crate returns rather than stores, and
@@ -7509,5 +7962,108 @@ mod camera_tests {
     fn the_pitch_limit_avoids_the_poles() {
         assert!(FOLLOW_PITCH_LIMIT < std::f32::consts::FRAC_PI_2);
         assert!(FOLLOW_PITCH_LIMIT > 1.0, "the camera can barely tilt");
+    }
+}
+
+/// Buoyancy: where a swimmer's body settles, and how fast.
+///
+/// The integration in `drive_live_movement` is a few lines inside a function
+/// that needs a GPU, a realm and a resident tile, so the arithmetic is mirrored
+/// here rather than driven through it. What is being pinned is not the code but
+/// the *ordering property* it depends on: a swimmer's altitude has to carry
+/// from one frame to the next.
+#[cfg(test)]
+mod swim_tests {
+    use super::*;
+
+    /// Closing a fraction of the remaining gap, exactly as the movement code
+    /// does, starting from `z` and running for `frames` at 60fps.
+    fn float_towards(rest: f32, mut z: f32, frames: usize, reset_each_frame: Option<f32>) -> f32 {
+        let dt = 1.0 / 60.0;
+        for _ in 0..frames {
+            // The bug: the ground assignment ran every frame, before this.
+            if let Some(bed) = reset_each_frame {
+                z = bed;
+            }
+            z += (rest - z) * (1.0 - (-dt / BUOYANCY_TAU).exp());
+        }
+        z
+    }
+
+    /// A swimmer rises to the surface within about a second.
+    ///
+    /// **And the same integration pinned to the riverbed goes nowhere**, which
+    /// is the half that matters: the first version of this code planted the
+    /// character on the ground every frame before the buoyancy read its own
+    /// altitude, so it rose three per cent of the way and was put back. That
+    /// draws as a character walking along the bottom with the swim cycle
+    /// playing -- the feature apparently half-working, rather than an ordering
+    /// mistake. Asserting only that a free body rises would pass under both.
+    #[test]
+    fn a_swimmer_rises_only_if_its_altitude_survives_the_frame() {
+        // The river measured at world -10081, 340: bed at 8.1, surface 21.23.
+        let (bed, surface) = (8.1f32, 21.23f32);
+        let rest = surface - SWIM_FLOAT;
+
+        // Exponential, so it approaches rather than arrives: one time
+        // constant is 63% of the way and a second of it is 89%. The numbers
+        // here are what `BUOYANCY_TAU` actually produces, not a round figure
+        // -- a tolerance picked by eye would either pass a broken curve or
+        // fail this correct one, which it did on the first attempt.
+        let one_second = float_towards(rest, bed, 60, None);
+        let travelled = (one_second - bed) / (rest - bed);
+        assert!(
+            travelled > 0.85,
+            "a second of buoyancy covered only {:.0}% of the way up",
+            travelled * 100.0
+        );
+        let free = float_towards(rest, bed, 120, None);
+        assert!(
+            (free - rest).abs() < 0.5,
+            "two seconds should settle at the surface, got {free:.2} of {rest:.2}"
+        );
+
+        let pinned = float_towards(rest, bed, 120, Some(bed));
+        assert!(
+            pinned < bed + 1.0,
+            "pinned to the bed, a swimmer must not appear to rise: got {pinned:.2}"
+        );
+        assert!(
+            free - pinned > 8.0,
+            "the two orderings have to differ by most of the river's depth, \
+             or this test cannot tell them apart"
+        );
+    }
+
+    /// The swim test is about depth over the bed, not about altitude.
+    ///
+    /// A puddle on a mountain top and a lake at sea level are the same
+    /// question, and asking about the surface height alone answers it wrongly
+    /// for one of them.
+    #[test]
+    fn swimming_starts_at_a_depth_not_at_a_height() {
+        let deep_enough = |surface: f32, ground: f32| surface - ground >= SWIM_DEPTH;
+        // The measured river: thirteen units deep.
+        assert!(deep_enough(21.23, 8.1));
+        // A ford at the same altitude is waded, not swum.
+        assert!(!deep_enough(21.23, 20.5));
+        // And a mountain tarn is swum despite being a thousand units up.
+        assert!(deep_enough(1021.23, 1008.1));
+        // The threshold is chest deep on a two-unit body, not ankle deep.
+        assert!(SWIM_DEPTH > 1.0 && SWIM_DEPTH < BODY_HEIGHT);
+    }
+
+    /// A swimmer floats with their head clear of the surface.
+    #[test]
+    fn the_resting_body_keeps_its_head_out() {
+        let surface = 21.23f32;
+        let feet = surface - SWIM_FLOAT;
+        let head = feet + BODY_HEIGHT;
+        assert!(
+            head > surface,
+            "head at {head:.2} is under a surface at {surface:.2}"
+        );
+        // But not so high the body rides on top of the water like a boat.
+        assert!(head - surface < 0.5, "the character is floating too high");
     }
 }

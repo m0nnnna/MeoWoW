@@ -13,6 +13,7 @@ pub mod combat;
 pub mod client;
 pub mod crypt;
 pub mod death;
+pub mod environment;
 pub mod gossip;
 pub mod inventory;
 pub mod loot;

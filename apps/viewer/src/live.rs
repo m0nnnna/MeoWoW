@@ -46,6 +46,13 @@ pub struct Entity {
     /// Off the ground. Only ever true for the player: this client reads no
     /// falling flag off a relayed movement packet yet.
     pub airborne: bool,
+    /// In liquid deep enough to swim in.
+    ///
+    /// Unlike `airborne` this *is* true for other players: the swimming bit
+    /// travels with their relayed movement, so somebody crossing a river is
+    /// drawn swimming without this client sampling the water beneath them --
+    /// see `world::state::Entity::swimming`.
+    pub swimming: bool,
     /// Whether this unit is lying dead, and so should be drawn face down.
     /// Outranks `speed` when choosing a cycle: a creature killed mid-charge
     /// keeps the charge's speed for a moment after it stops being able to use
@@ -530,6 +537,7 @@ pub fn drawable_entities(
             speed: entity.move_speed(now).unwrap_or(0.0),
             turning: 0.0,
             airborne: false,
+            swimming: entity.swimming(),
             dead: entity.is_corpse(),
             died_ms_ago: entity.dying_for(now).map(|d| d.as_millis() as u32),
             swung_ms_ago: entity.swung_ago(now).map(|d| d.as_millis() as u32),
@@ -660,6 +668,7 @@ pub fn own_entity(
     speed: f32,
     turning: f32,
     airborne: bool,
+    swimming: bool,
 ) -> Option<Entity> {
     use world::update;
 
@@ -696,6 +705,11 @@ pub fn own_entity(
         speed,
         turning,
         airborne,
+        // **Ours comes from the caller, not from `entity.swimming()`.** The
+        // server never relays our own movement back, so replicated state holds
+        // whatever we were doing at login -- the trap documented at length on
+        // the data itself. The movement driver knows, so it is passed in.
+        swimming,
         // The player's own death is read from replicated state like anyone
         // else's -- it is the one part of our own condition the server *does*
         // tell us about, unlike our position.

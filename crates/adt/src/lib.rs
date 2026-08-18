@@ -11,6 +11,10 @@
 //! `9x9 + 8x8`, two interleaved lattices where the inner one sits at the centre
 //! of each outer cell. See [`Chunk::vertex_position`].
 
+pub mod liquid;
+
+pub use liquid::{LiquidInstance, TileLiquid, VertexFormat};
+
 use chunk::{f32_at, string_at, strings, u16_at, u32_at, vec3_at, Chunks};
 
 /// The version a 3.3.5a client ships.
@@ -382,6 +386,12 @@ pub struct Adt {
     pub doodads: Vec<DoodadPlacement>,
     pub objects: Vec<ObjectPlacement>,
     pub chunks: Vec<Chunk>,
+    /// The water, lava and slime lying on this tile.
+    ///
+    /// Always present and usually empty: a tile with no `MH2O` has no liquid,
+    /// which is a fact about the terrain rather than a chunk this reader failed
+    /// to find. Indexed by chunk position in file order, matching `chunks`.
+    pub liquid: TileLiquid,
 }
 
 impl Adt {
@@ -448,6 +458,12 @@ impl Adt {
             return Err(Error::WrongChunkCount { got: chunks.len() });
         }
 
+        // One `MH2O` serves the whole tile, and its absence means dry land
+        // rather than a failed read -- see [`TileLiquid`].
+        let liquid = Chunks::find(data, b"MH2O")
+            .map(TileLiquid::parse)
+            .unwrap_or_default();
+
         Ok(Self {
             textures,
             doodad_models,
@@ -455,6 +471,7 @@ impl Adt {
             doodads,
             objects,
             chunks,
+            liquid,
         })
     }
 

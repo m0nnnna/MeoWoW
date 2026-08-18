@@ -225,6 +225,21 @@ pub enum ClientOpcode {
     /// so a client that jumps and never lands is one the server believes is
     /// still falling.
     MoveFallLand = 0x00C9,
+    /// Entering and leaving liquid deep enough to swim in.
+    ///
+    /// **Two of the nine opcodes `MOVE_RELAYED` records as unconfirmed, and
+    /// the reason it gave was that they "need water" -- which this client did
+    /// not have.** Now it does, so they can be driven: the character's feet
+    /// against the `MH2O` surface above them is the whole condition, and both
+    /// go out carrying `movement_flags::SWIMMING`.
+    ///
+    /// That flag is not decoration. It adds a **pitch float** to every
+    /// `MovementInfo` that carries it -- see `MovementInfo::has_pitch` -- so a
+    /// client that sets the flag without emitting the field, or emits the field
+    /// without the flag, desynchronises the server's reader mid-packet. The
+    /// round trip in `movement.rs` is what keeps the two halves honest.
+    MoveStartSwim = 0x00CA,
+    MoveStopSwim = 0x00CB,
     MoveSetFacing = 0x00DA,
     MoveHeartbeat = 0x00EE,
     /// Confirming a teleport within the same map. The server sends this
@@ -513,6 +528,19 @@ pub mod server {
     /// What the sky is doing: a state, an intensity, and whether it changed
     /// abruptly. Sent on entering a zone and whenever the zone's weather turns.
     pub const WEATHER: u16 = 0x02F4;
+
+    /// The breath, fatigue and lava bars -- see [`crate::environment`].
+    ///
+    /// **These are how a client learns that standing in lava costs anything.**
+    /// The server owns the whole calculation: it reads the liquid under the
+    /// character out of its own copy of the terrain, runs the timer, and sends
+    /// the damage. Nothing this client draws or sends causes any of it, which
+    /// is why the swim code changes no health and this block only reads.
+    pub const START_MIRROR_TIMER: u16 = 0x01D9;
+    pub const PAUSE_MIRROR_TIMER: u16 = 0x01DA;
+    pub const STOP_MIRROR_TIMER: u16 = 0x01DB;
+    /// One tick of drowning, falling, lava or slime damage.
+    pub const ENVIRONMENTAL_DAMAGE_LOG: u16 = 0x01FC;
     pub const CHAR_CREATE: u16 = 0x003A;
     pub const CHAR_DELETE: u16 = 0x003C;
     /// Login refused after the character was chosen, unlike the auth-stage
