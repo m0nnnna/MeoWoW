@@ -28,6 +28,16 @@ pub enum ClientOpcode {
     /// wolf of a kind shares one answer.
     NameQuery = 0x0050,
     CreatureQuery = 0x0060,
+    /// What *is* game object entry N? Body is `{u32 entry, u64 guid}`, the
+    /// same shape as [`Self::CreatureQuery`].
+    ///
+    /// **The first question this client asks about an object's behaviour
+    /// rather than its appearance.** A game object has been drawable since
+    /// Phase 3 from a display id alone, and a display id says nothing about
+    /// what the thing does -- so a mailbox and a mine cart are the same kind
+    /// of fact until this is asked. Mail is the first feature that needs the
+    /// difference.
+    GameObjectQuery = 0x005E,
     /// What is item entry N? `Item.dbc` carries an item's *model*, and this
     /// client already reads it -- but not its **name**, which is server data
     /// and reaches a client only in answer to this. Every bag square,
@@ -660,6 +670,75 @@ pub enum ClientOpcode {
     /// A client that recomputed it from the player's position would be right
     /// almost everywhere and wrong exactly where two factions share a town.
     ActivateTaxi = 0x01AD,
+
+    /// Post a letter. See [`crate::mail::send_mail_body`] for the body, which
+    /// is the longest this client builds.
+    ///
+    /// **Answered either way** by
+    /// [`SEND_MAIL_RESULT`](server::SEND_MAIL_RESULT), which is what makes
+    /// mail cheap to bound after trade was not: a reply that echoes the
+    /// *action* it was for ties itself to its request, so a probe can be wrong
+    /// about the body and still learn that the opcode is right.
+    SendMail = 0x0238,
+
+    /// Ask a mailbox what is in it. Body is the mailbox's guid, unpacked, like
+    /// the vendor's and the trainer's.
+    ///
+    /// **The guid has to be a mailbox the character can reach** -- a game
+    /// object of the mailbox type within interaction range, or an NPC carrying
+    /// the mailbox flag. The server also accepts the *reader's own guid* from
+    /// a game master, which is a trap rather than a shortcut: every fixture
+    /// account on this project's local realm is a game master, so the cheapest
+    /// probe available is the one that would ship a client working only for
+    /// them. See [`crate::mail`].
+    GetMailList = 0x023A,
+
+    /// Take the copper out of one letter. `{u64 mailbox, u32 mail id}`.
+    MailTakeMoney = 0x0245,
+
+    /// Take one attachment. `{u64 mailbox, u32 mail id, u32 item low guid}`.
+    ///
+    /// **The item is named by a bare 32-bit low guid**, which is the third
+    /// way this client addresses an item and the only one available here: a
+    /// mailed item is not a replicated object, so there is no full guid and no
+    /// `(bag, slot)` pair to name it with.
+    MailTakeItem = 0x0246,
+
+    /// Mark a letter as opened. `{u64 mailbox, u32 mail id}`.
+    ///
+    /// **The one request in the mail block that is silent either way**, which
+    /// is worth stating because every other one is answered: the server sets
+    /// the flag and returns. Its effect is visible only in the *next*
+    /// `SMSG_MAIL_LIST_RESULT`, so it is confirmable by re-asking and not at
+    /// all by waiting.
+    MailMarkAsRead = 0x0247,
+
+    /// Send a letter back where it came from.
+    /// `{u64 mailbox, u32 mail id, u64 original sender}` -- and the server
+    /// reads the last field and never uses it, taking the sender off its own
+    /// copy of the letter.
+    MailReturnToSender = 0x0248,
+
+    /// Throw a letter away.
+    /// `{u64 mailbox, u32 mail id, u32 mail template id}`.
+    ///
+    /// **Refused for a letter with cash on delivery on it**, which is the
+    /// server protecting the sender rather than the reader: deleting one would
+    /// destroy goods somebody is owed money for.
+    MailDelete = 0x0249,
+
+    /// Copy a letter's text into a paper item. `{u64 mailbox, u32 mail id}`.
+    MailCreateTextItem = 0x024A,
+
+    /// Ask what is waiting, with **no mailbox involved**.
+    ///
+    /// A `MSG_` opcode: the request and the reply share this number and only
+    /// the direction separates them. The request body is empty.
+    ///
+    /// This is the one thing that stands between "something arrived" and
+    /// "walk to a mailbox" -- and it names at most two senders, because the
+    /// server stops after two. See [`crate::mail::NextMailTime`].
+    QueryNextMailTime = 0x0284,
 }
 
 /// The server-to-client opcodes this client reacts to.
@@ -792,6 +871,41 @@ pub mod server {
     /// **Deliberately unparsed** -- nothing has produced one, and the menu is
     /// re-asked on every visit anyway.
     pub const NEW_TAXI_PATH: u16 = 0x01AF;
+
+    /// What just happened to a mail request. See [`crate::mail::MailResult`].
+    ///
+    /// **Answers nearly every request in the block**, and echoes the action it
+    /// was for -- which is the cheap bounding instrument trade did not have.
+    /// The tail is conditional on the *result* first and the action second, so
+    /// a take that failed on inventory space carries the error instead of the
+    /// item rather than as well as it.
+    pub const SEND_MAIL_RESULT: u16 = 0x0239;
+
+    /// The inbox: a total, a count, and that many variable-length records. See
+    /// [`crate::mail::parse_inbox`].
+    ///
+    /// **The total and the count are different numbers** -- the list is capped
+    /// at fifty letters and again by the packet size -- so a client drawing
+    /// the number of rows it received reports the wrong figure to exactly the
+    /// people whose mailbox is full.
+    pub const MAIL_LIST_RESULT: u16 = 0x023B;
+
+    /// **Mail arrived.** Four bytes, and they are zero.
+    ///
+    /// The first packet this client reads that answers nothing: it exists
+    /// because somebody else acted, at a moment with nothing outstanding to
+    /// correlate it against. It carries no sender, no subject and no count, so
+    /// the only honest thing to draw on receiving one is that something is
+    /// unread. See [`crate::mail`].
+    pub const RECEIVED_MAIL: u16 = 0x0285;
+
+    /// The reply half of [`QueryNextMailTime`](crate::ClientOpcode::QueryNextMailTime),
+    /// sharing its number. See [`crate::mail::NextMailTime`].
+    pub const QUERY_NEXT_MAIL_TIME: u16 = 0x0284;
+
+    /// Which mailbox the server has just opened, when one was reached through
+    /// a gossip menu. Eight bytes, the object's guid.
+    pub const SHOW_MAILBOX: u16 = 0x0297;
 
     /// What mark belongs over one NPC's head, in answer to
     /// [`QuestgiverStatusQuery`](crate::ClientOpcode::QuestgiverStatusQuery).
@@ -938,6 +1052,11 @@ pub mod server {
     /// the name cache has to time requests out rather than wait.
     pub const NAME_QUERY_RESPONSE: u16 = 0x0051;
     pub const CREATURE_QUERY_RESPONSE: u16 = 0x0061;
+    /// The answer to [`ClientOpcode::GameObjectQuery`]. Carries the object's
+    /// **type**, which is the only thing on the wire that separates a mailbox
+    /// from anything else with a model. See
+    /// [`crate::query::parse_gameobject_query_response`].
+    pub const GAMEOBJECT_QUERY_RESPONSE: u16 = 0x005F;
     /// The answer to [`ClientOpcode::ItemQuerySingle`] -- see
     /// [`crate::query::parse_item_query_response`], which parses it whole.
     pub const ITEM_QUERY_SINGLE_RESPONSE: u16 = 0x0058;
@@ -1092,6 +1211,11 @@ pub fn describe(opcode: u16) -> String {
         server::TRAINER_BUY_SUCCEEDED => "SMSG_TRAINER_BUY_SUCCEEDED",
         server::TRADE_STATUS => "SMSG_TRADE_STATUS",
         server::TRADE_STATUS_EXTENDED => "SMSG_TRADE_STATUS_EXTENDED",
+        server::SEND_MAIL_RESULT => "SMSG_SEND_MAIL_RESULT",
+        server::MAIL_LIST_RESULT => "SMSG_MAIL_LIST_RESULT",
+        server::RECEIVED_MAIL => "SMSG_RECEIVED_MAIL",
+        server::QUERY_NEXT_MAIL_TIME => "MSG_QUERY_NEXT_MAIL_TIME",
+        server::SHOW_MAILBOX => "SMSG_SHOW_MAILBOX",
         server::QUESTGIVER_STATUS => "SMSG_QUESTGIVER_STATUS",
         server::QUESTGIVER_STATUS_MULTIPLE => "SMSG_QUESTGIVER_STATUS_MULTIPLE",
         server::QUESTGIVER_QUEST_LIST => "SMSG_QUESTGIVER_QUEST_LIST",
@@ -1117,6 +1241,7 @@ pub fn describe(opcode: u16) -> String {
         server::MOVE_HEARTBEAT => "MSG_MOVE_HEARTBEAT",
         server::NAME_QUERY_RESPONSE => "SMSG_NAME_QUERY_RESPONSE",
         server::CREATURE_QUERY_RESPONSE => "SMSG_CREATURE_QUERY_RESPONSE",
+        server::GAMEOBJECT_QUERY_RESPONSE => "SMSG_GAMEOBJECT_QUERY_RESPONSE",
         server::MESSAGECHAT => "SMSG_MESSAGECHAT",
         server::INVENTORY_CHANGE_FAILURE => "SMSG_INVENTORY_CHANGE_FAILURE",
         server::INITIAL_SPELLS => "SMSG_INITIAL_SPELLS",

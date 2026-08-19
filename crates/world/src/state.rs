@@ -154,6 +154,16 @@ impl Entity {
         self.fields.get(crate::update::fields::UNIT_HEALTH)
     }
 
+    /// Which *kind* of thing this is, as a template id.
+    ///
+    /// The handle every query in [`crate::query`] is keyed by, and -- for a
+    /// game object -- the only way to ask what the thing does. A display id
+    /// says how to draw it and nothing else; see
+    /// [`crate::query::GameObjectInfo`].
+    pub fn entry(&self) -> Option<u32> {
+        self.fields.get(crate::update::fields::OBJECT_ENTRY)
+    }
+
     pub fn max_health(&self) -> Option<u32> {
         self.fields.get(crate::update::fields::UNIT_MAX_HEALTH)
     }
@@ -1028,6 +1038,30 @@ pub struct Replication {
     /// about it. A number that only ever appears on failure cannot tell "none
     /// were wrong" from "there were none".
     pub trade_own_offers: usize,
+    /// `SMSG_RECEIVED_MAIL`s this batch -- **letters that arrived because
+    /// somebody else acted**.
+    ///
+    /// A count and not a list, because there is nothing to list: the body is
+    /// four bytes of zero. This is the first thing in the crate that is
+    /// reported purely as a number of occurrences, and that is the packet's
+    /// own fault rather than a simplification.
+    ///
+    /// Handed back as an event *as well as* folded into
+    /// [`WorldState::mail_waiting`], because the flag cannot distinguish "one
+    /// arrived just now" from "one was already waiting" -- and a chat line
+    /// saying you have new mail is about the transition.
+    pub received_mail: usize,
+    /// What the server said about the mail requests this client sent.
+    ///
+    /// Events, like `party_results`, and for the stronger reason: the result
+    /// echoes the **action** it was for, so this is the only thing that ties a
+    /// reply to a request. Dropping them would collapse a take, a delete and a
+    /// return into one indistinguishable silence.
+    pub mail_results: Vec<crate::mail::MailResult>,
+    /// Inboxes described this batch. Folded into [`WorldState::mail`]; counted
+    /// here so a probe can say "the request was answered" separately from
+    /// "the inbox is empty", which are the same picture and different facts.
+    pub inboxes: usize,
     /// Ticks of drowning, falling, lava or slime damage this batch.
     ///
     /// Returned rather than stored, unlike the mirror timers next to them,
@@ -1263,6 +1297,36 @@ pub struct WorldState {
     /// Set locally by [`Self::note_trade_request`] when this client asks, and
     /// from `SMSG_TRADE_STATUS` when somebody else does.
     pub trade: Option<crate::trade::TradeSession>,
+
+    /// The inbox, as last described by a mailbox.
+    ///
+    /// **A snapshot with no way to keep itself current.** Nothing tells this
+    /// client that a letter was deleted, taken from or read by anything but
+    /// this session, and mail arriving says only that it arrived. So this is
+    /// what the server said the last time it was asked, and every request that
+    /// changes it is followed by asking again -- the same decision the trainer
+    /// list made, for the same reason: editing the local copy after a request
+    /// the server may have declined draws a window that disagrees with the
+    /// realm and says nothing about it.
+    ///
+    /// `None` means *never asked*, which is not the same as an empty mailbox
+    /// and is drawn differently.
+    pub mail: Option<crate::mail::Inbox>,
+
+    /// Whether the server has said something is unread.
+    ///
+    /// **Learned two entirely different ways, and both are needed.** While
+    /// online it is set by `SMSG_RECEIVED_MAIL`, which arrives unprompted; at
+    /// login there is no such packet for mail that was already waiting, and
+    /// the only way to find out is to ask with `MSG_QUERY_NEXT_MAIL_TIME`.
+    /// One fact, one flag, two mechanisms -- and a client implementing only
+    /// the first shows an empty corner to everybody who logged out with mail
+    /// in the box.
+    ///
+    /// Cleared only by reading an inbox that has nothing unread in it, never
+    /// by opening a mailbox: a mailbox with fifty letters in it and one unread
+    /// is still a mailbox with something unread.
+    pub mail_waiting: bool,
 }
 
 impl WorldState {
@@ -1566,6 +1630,16 @@ impl WorldState {
 
     pub fn players(&self) -> impl Iterator<Item = &Entity> {
         self.entities.values().filter(|e| e.is_player())
+    }
+
+    /// Game objects in view -- doors, benches, chests, mailboxes.
+    ///
+    /// Replicated and drawn since Phase 3; **what any of them are** is a
+    /// separate question that only [`crate::query::GameObjectInfo`] answers.
+    pub fn game_objects(&self) -> impl Iterator<Item = &Entity> {
+        self.entities
+            .values()
+            .filter(|e| e.object_type == ObjectType::GameObject)
     }
 
     /// Corpse objects in view.
@@ -2375,6 +2449,19 @@ impl WorldState {
                         )),
                     }
                 }
+                crate::opcode::server::GAMEOBJECT_QUERY_RESPONSE => {
+                    match crate::query::parse_gameobject_query_response(&packet.body) {
+                        Ok(answer) => {
+                            report.names += 1;
+                            self.names.apply_gameobject(&answer);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
                 crate::opcode::server::CREATURE_QUERY_RESPONSE => {
                     match crate::query::parse_creature_query_response(&packet.body) {
                         Ok(answer) => {
@@ -2818,6 +2905,60 @@ impl WorldState {
                             }
                             self.fold_trade_offer(offer);
                         }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::RECEIVED_MAIL => {
+                    // The width is all there is to check, and it is checked --
+                    // a body of another length is not this packet, and the one
+                    // thing worth being sure of here is that something
+                    // arrived.
+                    match crate::mail::parse_received_mail(&packet.body) {
+                        Ok(()) => {
+                            report.received_mail += 1;
+                            self.mail_waiting = true;
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::MAIL_LIST_RESULT => {
+                    match crate::mail::parse_inbox(&packet.body) {
+                        Ok(inbox) => {
+                            report.inboxes += 1;
+                            // The flag is a fact about the inbox and is
+                            // recomputed from it, never merely cleared:
+                            // opening a mailbox does not read its letters.
+                            self.mail_waiting = inbox.unread().next().is_some();
+                            self.mail = Some(inbox);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::SEND_MAIL_RESULT => {
+                    match crate::mail::parse_mail_result(&packet.body) {
+                        Ok(result) => report.mail_results.push(result),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::QUERY_NEXT_MAIL_TIME => {
+                    match crate::mail::parse_next_mail_time(&packet.body) {
+                        Ok(next) => self.mail_waiting = next.has_unread(),
                         Err(error) => report.failures.push((
                             packet.opcode,
                             error,

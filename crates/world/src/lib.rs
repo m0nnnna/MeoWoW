@@ -18,6 +18,7 @@ pub mod gossip;
 pub mod group;
 pub mod inventory;
 pub mod loot;
+pub mod mail;
 pub mod motion;
 pub mod movement;
 pub mod names;
@@ -48,6 +49,7 @@ pub use quest::{
     QuestPoint, QuestRewardItem,
 };
 pub use quest_cache::{Answer, QuestCache};
+pub use mail::{Inbox, Mail, MailAction, MailItem, MailResult, MailSender, NextMailTime};
 pub use taxi::{Flight, TaxiMenu, TaxiReply};
 pub use trade::{TradeItem, TradeOffer, TradeSession, TradeStatus};
 pub use trainer::{TrainerList, TrainerSpell, TrainerSpellState};
@@ -57,7 +59,7 @@ pub use loot::{Loot, LootItem};
 pub use movement::MovementInfo;
 pub use names::Names;
 pub use opcode::ClientOpcode;
-pub use query::{CreatureInfo, PlayerName};
+pub use query::{CreatureInfo, GameObjectInfo, PlayerName};
 pub use spell::{InitialSpells, KnownSpell};
 pub use protocol::{
     Appearance, AuthResponse, Character, Equipment, WorldPosition, EQUIPMENT_SLOTS,

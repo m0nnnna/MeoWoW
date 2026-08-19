@@ -613,6 +613,18 @@ impl Connection {
         )
     }
 
+    /// Asks what a game object entry *is*.
+    ///
+    /// The answer's `kind` is what identifies a mailbox; see
+    /// [`ClientOpcode::GameObjectQuery`]. `guid` may be `0` -- the answer is
+    /// keyed on the entry alone, exactly as for creatures and items.
+    pub fn ask_gameobject(&mut self, entry: u32, guid: u64) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::GameObjectQuery,
+            &crate::query::gameobject_query(entry, guid),
+        )
+    }
+
     /// Asks what an item entry is -- its name, quality and the rest.
     ///
     /// `guid` may be `0`: the server keys the answer on the entry alone, and
@@ -1098,6 +1110,108 @@ impl Connection {
         self.send(ClientOpcode::ActivateTaxi, &body)
     }
 
+    /// Posts a letter.
+    ///
+    /// `mailbox` is the guid of a mailbox this character can reach; see
+    /// [`ClientOpcode::GetMailList`] for why a game master's own guid also
+    /// works and why that is a trap rather than a shortcut. `items` are full
+    /// item guids out of this character's own bags.
+    ///
+    /// **Answered either way** by
+    /// [`SEND_MAIL_RESULT`](crate::opcode::server::SEND_MAIL_RESULT), whose
+    /// action field echoes [`MailAction::Send`](crate::mail::MailAction), so
+    /// one send bounds the opcode, the body and the reply together -- the
+    /// move `CMSG_GROUP_INVITE` made for parties and `CMSG_LIST_INVENTORY`
+    /// made for buying.
+    ///
+    /// The body is built by [`crate::mail::send_mail_body`] rather than here,
+    /// so the one structure in this block that travels outward is defined in
+    /// the same module that reads its consequences.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_mail(
+        &mut self,
+        mailbox: u64,
+        receiver: &str,
+        subject: &str,
+        text: &str,
+        money: u32,
+        cod: u32,
+        items: &[u64],
+    ) -> Result<(), Error> {
+        let body = crate::mail::send_mail_body(mailbox, receiver, subject, text, money, cod, items);
+        self.send(ClientOpcode::SendMail, &body)
+    }
+
+    /// Asks a mailbox for the inbox. See [`ClientOpcode::GetMailList`].
+    pub fn get_mail_list(&mut self, mailbox: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::GetMailList, &mailbox.to_le_bytes())
+    }
+
+    /// Takes the copper out of one letter.
+    pub fn mail_take_money(&mut self, mailbox: u64, mail: u32) -> Result<(), Error> {
+        self.send(ClientOpcode::MailTakeMoney, &mail_request(mailbox, mail))
+    }
+
+    /// Takes one attachment.
+    ///
+    /// `item` is the **32-bit low guid** off
+    /// [`MailItem::guid`](crate::mail::MailItem), which is the only handle a
+    /// mailed item has -- see [`ClientOpcode::MailTakeItem`].
+    pub fn mail_take_item(&mut self, mailbox: u64, mail: u32, item: u32) -> Result<(), Error> {
+        let mut body = mail_request(mailbox, mail);
+        body.extend_from_slice(&item.to_le_bytes());
+        self.send(ClientOpcode::MailTakeItem, &body)
+    }
+
+    /// Marks a letter as opened.
+    ///
+    /// **The one silent request in this block.** Its effect shows up only in
+    /// the next inbox, so a caller that wants to confirm it has to re-ask --
+    /// which is also what the interface does anyway, for the reason the
+    /// trainer list is re-asked rather than edited after a purchase.
+    pub fn mail_mark_as_read(&mut self, mailbox: u64, mail: u32) -> Result<(), Error> {
+        self.send(ClientOpcode::MailMarkAsRead, &mail_request(mailbox, mail))
+    }
+
+    /// Sends a letter back to whoever sent it.
+    ///
+    /// The trailing guid is the field the server reads and ignores, taking the
+    /// sender off its own copy instead. Sent as zero rather than filled in,
+    /// because a value this client would have to guess at and the server never
+    /// consults is a value it should not be inventing.
+    pub fn mail_return_to_sender(&mut self, mailbox: u64, mail: u32) -> Result<(), Error> {
+        let mut body = mail_request(mailbox, mail);
+        body.extend_from_slice(&0u64.to_le_bytes());
+        self.send(ClientOpcode::MailReturnToSender, &body)
+    }
+
+    /// Throws a letter away.
+    ///
+    /// **Refused when there is cash on delivery on it**, and the refusal
+    /// arrives as an ordinary result rather than as silence.
+    pub fn mail_delete(&mut self, mailbox: u64, mail: u32, template: u32) -> Result<(), Error> {
+        let mut body = mail_request(mailbox, mail);
+        body.extend_from_slice(&template.to_le_bytes());
+        self.send(ClientOpcode::MailDelete, &body)
+    }
+
+    /// Copies a letter's text into a paper item.
+    pub fn mail_create_text_item(&mut self, mailbox: u64, mail: u32) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::MailCreateTextItem,
+            &mail_request(mailbox, mail),
+        )
+    }
+
+    /// Asks what is waiting, from anywhere in the world.
+    ///
+    /// The only question about mail that does not need a mailbox, and it
+    /// answers with **at most two senders** -- see
+    /// [`crate::mail::NextMailTime`].
+    pub fn query_next_mail_time(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::QueryNextMailTime, &[])
+    }
+
     /// Sells an item to the open vendor.
     ///
     /// The item is named by **guid** rather than by slot, deliberately: a guid
@@ -1413,6 +1527,20 @@ pub(crate) fn is_quiet_stream(error: &std::io::Error) -> bool {
         error.kind(),
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
     ) || matches!(error.raw_os_error(), Some(997) | Some(10035) | Some(10060))
+}
+
+/// The head every mail request but the send and the list shares:
+/// `{u64 mailbox, u32 mail id}`.
+///
+/// Written once because six requests carry it. Two copies of a shared prefix
+/// drift, and the outgoing half of this protocol has nothing to announce a
+/// drift with -- the standing reason a structure travelling both ways is
+/// defined once and round-tripped.
+fn mail_request(mailbox: u64, mail: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&mailbox.to_le_bytes());
+    body.extend_from_slice(&mail.to_le_bytes());
+    body
 }
 
 /// Splits a realm list address, supplying the default port when it has none.

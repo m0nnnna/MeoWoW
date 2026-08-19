@@ -130,6 +130,62 @@ pub enum Error {
         "SMSG_TRADE_STATUS_EXTENDED: slot record {expected} announced itself as {got} --          the record stride is not what this parser thinks"
     )]
     TradeSlotOutOfOrder { expected: u8, got: u8 },
+
+    /// The inbox count and the body disagree before a single record is read.
+    ///
+    /// Shared by `SMSG_MAIL_LIST_RESULT` and `MSG_QUERY_NEXT_MAIL_TIME`, the
+    /// same guard the vendor and trainer lists carry: a count read at the
+    /// wrong offset asks for records the body cannot possibly hold, and the
+    /// allocation should not be the thing that finds out.
+    #[error(
+        "mail list: {count} records need at least {expected} bytes but the body has {got} left -- \
+         the count is not where this parser thinks"
+    )]
+    MailRowCount {
+        count: u8,
+        expected: usize,
+        got: usize,
+    },
+
+    /// A mail record named a sender kind whose field width nobody has
+    /// observed.
+    ///
+    /// The width is conditional -- eight bytes for a player, four for
+    /// everything else -- so an unknown kind cannot be skipped past, and the
+    /// server's own switch writes *nothing* for one. Copying that would give a
+    /// record that parses and describes a different letter, so it is refused
+    /// by name instead. See [`crate::mail`].
+    #[error(
+        "SMSG_MAIL_LIST_RESULT: mail {id} has sender kind {got}, whose field width has never been \
+         observed -- the record cannot be sized past it"
+    )]
+    MailSenderType { got: u8, id: u32 },
+
+    /// An attachment record did not begin with its own index. The mail
+    /// counterpart of [`Self::TradeSlotOutOfOrder`], and the same use: a
+    /// 118-byte record read at 114 or 122 puts this byte inside a `u32`.
+    #[error(
+        "SMSG_MAIL_LIST_RESULT: attachment {expected} announced itself as {got} -- \
+         the attachment stride is not what this parser thinks"
+    )]
+    MailItemOutOfOrder { expected: u8, got: u8 },
+
+    /// A mail record's own length field disagrees with the parse by something
+    /// other than the fixed overcount this realm writes.
+    ///
+    /// See [`crate::mail::RECORD_SIZE_OVERCOUNT`]. Refusing here is
+    /// deliberate: the number is not used to advance the cursor, so it is
+    /// free as a check, and a realm whose arithmetic differs should say so
+    /// loudly with its body printed rather than be misread quietly.
+    #[error(
+        "SMSG_MAIL_LIST_RESULT: mail {id} announced {announced} bytes and parsed as {actual} -- \
+         expected a {} -byte overcount", crate::mail::RECORD_SIZE_OVERCOUNT
+    )]
+    MailRecordSize {
+        id: u32,
+        announced: u16,
+        actual: usize,
+    },
 }
 
 /// A bounds-checked cursor over a packet body.
@@ -228,6 +284,20 @@ impl<'a> Reader<'a> {
 
     pub fn remaining(&self) -> usize {
         self.data.len() - self.at
+    }
+
+    /// How far into the body the cursor has got.
+    ///
+    /// Exists for records that state their own length: a parser can note the
+    /// offset before a record and again after it and compare the difference
+    /// against what the record claimed. That is a per-record check, which
+    /// localises a stride mistake to the record instead of reporting it as
+    /// leftovers at the end of a packet holding six other ones -- the same job
+    /// the trade slot index and the mail attachment index do by content rather
+    /// than by arithmetic. See [`crate::mail::RECORD_SIZE_OVERCOUNT`], where
+    /// the claim turns out to be wrong by a fixed amount.
+    pub fn offset(&self) -> usize {
+        self.at
     }
 
     /// Takes everything left, for the tail of a packet whose fields are not

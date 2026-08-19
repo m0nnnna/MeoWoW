@@ -467,6 +467,132 @@ pub fn parse_creature_query_response(body: &[u8]) -> Result<CreatureInfo, Error>
     })
 }
 
+/// Words of type-specific data in the game object response.
+///
+/// Twenty-four, and their meaning depends on the object's `type` -- a door's
+/// first word is its opening state, a chest's is a lock id. Read as an opaque
+/// block here: the client needs the *type* and nothing this project has done
+/// yet needs the parameters, and naming twenty-four fields whose meanings are
+/// keyed by a value read four bytes earlier would be twenty-four claims
+/// nothing has checked.
+const GAMEOBJECT_DATA_WORDS: usize = 24;
+/// Quest item ids in the game object response.
+const GAMEOBJECT_QUEST_ITEMS: usize = 6;
+/// Empty name slots that follow the name.
+///
+/// **Three bare zero bytes, not three absent fields.** Same shape as the item
+/// response's, and the same trap: skipping them reads the icon name out of the
+/// middle of the cast-bar caption.
+const GAMEOBJECT_EXTRA_NAMES: usize = 3;
+
+/// `CMSG_GAMEOBJECT_QUERY`'s body: what *is* this game object?
+///
+/// Entry then guid, exactly like [`creature_query`] -- the answer is keyed by
+/// the entry and the server is told which instance asked.
+pub fn gameobject_query(entry: u32, guid: u64) -> Vec<u8> {
+    let mut body = entry.to_le_bytes().to_vec();
+    body.extend_from_slice(&guid.to_le_bytes());
+    body
+}
+
+/// A mailbox. See [`GameObjectInfo::kind`].
+pub const GAMEOBJECT_TYPE_MAILBOX: u32 = 19;
+
+/// What `SMSG_GAMEOBJECT_QUERY_RESPONSE` said about one game object entry.
+///
+/// **This is the first thing in the client that asks what an object *is*
+/// rather than how to draw it.** Doors, benches, chests and ships have been
+/// rendered since Phase 3 off a display id alone, which is enough to put a
+/// model on the ground and says nothing whatever about behaviour. Mail is the
+/// first feature that has to pick one object out of a field of them, and
+/// [`GameObjectInfo::kind`] is the only thing on the wire that separates a
+/// mailbox from a mine cart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameObjectInfo {
+    pub entry: u32,
+    /// `None` when the server has no such entry.
+    pub name: Option<String>,
+    /// What it does -- `GAMEOBJECT_TYPE_*`. See
+    /// [`GAMEOBJECT_TYPE_MAILBOX`], which is the only value named here for
+    /// the standing reason that a transcribed enum producing only text is the
+    /// cheapest way to misexplain something.
+    pub kind: u32,
+    /// The model, which the object update already carried -- read here as a
+    /// cross-check rather than as news.
+    pub display_id: u32,
+    /// The verb the original client puts on the cursor, e.g. `Attack`.
+    pub icon_name: String,
+    /// What appears in the cast bar while it is being used, e.g. `Collecting`.
+    pub cast_bar_caption: String,
+    /// How much bigger or smaller than the model's own scale.
+    pub size: f32,
+}
+
+impl GameObjectInfo {
+    /// Whether this is something a letter can be posted at.
+    pub fn is_mailbox(&self) -> bool {
+        self.kind == GAMEOBJECT_TYPE_MAILBOX
+    }
+}
+
+/// Parses `SMSG_GAMEOBJECT_QUERY_RESPONSE`.
+///
+/// The whole packet, for the reason the creature response is read whole: a
+/// tail that does not line up means an earlier field is the wrong width, and
+/// the type this client actually wants was read before it.
+pub fn parse_gameobject_query_response(body: &[u8]) -> Result<GameObjectInfo, Error> {
+    let mut r = Reader::new(body, "SMSG_GAMEOBJECT_QUERY_RESPONSE");
+    let entry = r.u32()?;
+
+    // The same top-bit convention as the creature response -- and as the
+    // *quest* packet's game object target, found in 4.16. Three unrelated
+    // places in this protocol say "not this" by setting the high bit of an
+    // id, which is worth knowing before reading one as an entry two billion
+    // rows past the end of the table.
+    const NOT_FOUND: u32 = 0x8000_0000;
+    if entry & NOT_FOUND != 0 {
+        r.finish()?;
+        return Ok(GameObjectInfo {
+            entry: entry & !NOT_FOUND,
+            name: None,
+            kind: 0,
+            display_id: 0,
+            icon_name: String::new(),
+            cast_bar_caption: String::new(),
+            size: 0.0,
+        });
+    }
+
+    let kind = r.u32()?;
+    let display_id = r.u32()?;
+    let name = r.cstring()?;
+    for _ in 0..GAMEOBJECT_EXTRA_NAMES {
+        let extra = r.cstring()?;
+        debug_assert!(extra.is_empty());
+    }
+    let icon_name = r.cstring()?;
+    let cast_bar_caption = r.cstring()?;
+    let _unknown = r.cstring()?;
+    for _ in 0..GAMEOBJECT_DATA_WORDS {
+        r.u32()?;
+    }
+    let size = r.f32()?;
+    for _ in 0..GAMEOBJECT_QUEST_ITEMS {
+        r.u32()?;
+    }
+
+    r.finish()?;
+    Ok(GameObjectInfo {
+        entry,
+        name: Some(name).filter(|name| !name.is_empty()),
+        kind,
+        display_id,
+        icon_name,
+        cast_bar_caption,
+        size,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

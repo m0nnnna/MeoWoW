@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::query::{CreatureInfo, ItemInfo, PlayerName};
+use crate::query::{CreatureInfo, GameObjectInfo, ItemInfo, PlayerName};
 
 /// How long an unanswered query stays outstanding before it may be asked
 /// again.
@@ -61,6 +61,14 @@ pub struct Names {
     /// Keyed by entry, like creatures: every Small Dagger in the game shares
     /// one answer, so a bag of twenty stacks costs one query per *kind*.
     items: HashMap<u32, Entry<ItemInfo>>,
+    /// Keyed by entry, like creatures and items.
+    ///
+    /// **What this one is for is different from the other three.** Those
+    /// exist so a frame can say `Young Wolf` instead of `Creature 299`; this
+    /// one exists so the client can tell a mailbox from a mine cart. A game
+    /// object's name is a nicety and its *type* is the whole reason to ask --
+    /// see [`crate::query::GameObjectInfo`].
+    gameobjects: HashMap<u32, Entry<GameObjectInfo>>,
     /// Every answer ever folded in, and every query handed out, so a caller
     /// can see whether the two are diverging without inspecting the maps.
     pub stats: NameStats,
@@ -134,6 +142,10 @@ impl Names {
         Self::claim(&mut self.items, entry, now, &mut self.stats)
     }
 
+    pub fn claim_gameobject(&mut self, entry: u32, now: Instant) -> bool {
+        Self::claim(&mut self.gameobjects, entry, now, &mut self.stats)
+    }
+
     fn claim<K: std::hash::Hash + Eq, T>(
         map: &mut HashMap<K, Entry<T>>,
         key: K,
@@ -177,6 +189,30 @@ impl Names {
         }
         self.creatures
             .insert(answer.entry, Entry::Known(answer.name.clone()));
+    }
+
+    /// Everything the server said about a game object entry.
+    ///
+    /// The same three-state answer as [`Self::item`], and the distinction
+    /// matters more here than anywhere else: `None` means *not asked*, and a
+    /// caller that read it as "not a mailbox" would refuse to open the one
+    /// object it is standing in front of for as long as the query is in
+    /// flight.
+    pub fn gameobject(&self, entry: u32) -> Option<Option<&GameObjectInfo>> {
+        match self.gameobjects.get(&entry)? {
+            Entry::Known(info) => Some(info.as_ref()),
+            Entry::Pending(_) => None,
+        }
+    }
+
+    /// Folds in a `SMSG_GAMEOBJECT_QUERY_RESPONSE`.
+    pub fn apply_gameobject(&mut self, answer: &GameObjectInfo) {
+        self.stats.answers += 1;
+        if !matches!(self.gameobjects.get(&answer.entry), Some(Entry::Pending(_))) {
+            self.stats.unsolicited += 1;
+        }
+        let known = answer.name.as_ref().map(|_| answer.clone());
+        self.gameobjects.insert(answer.entry, Entry::Known(known));
     }
 
     /// Folds in a `SMSG_ITEM_QUERY_SINGLE_RESPONSE`.
