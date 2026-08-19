@@ -30,11 +30,15 @@ never done. Five are done: trainers (4.24, *nothing* new, which is what makes
 it the bound on the rest), flight paths (4.25, the **server moves the
 player**), trade (4.26, **both ends must act**), mail (4.27, an **effect with
 no request**), guild (4.28, **a list of people who are not in the world**).
-**One left: auction (4.29), the first list this client cannot bound.**
+**One left: auction (4.30), the first list this client cannot bound.**
+
+**4.29 stepped out of that order to pay off Phase 2's last debt**: shadows, a
+skybox, clouds and stars. Phase 2 named all four as deliberately deferred until
+there was a character standing in the world; there has been one since 3.5.
 
 Roughly two thirds of the way to something a person could test by playing.
 
-**The destination for the next few milestones is a native Questie (4.30)**, and
+**The destination for the next few milestones is a native Questie (4.31)**, and
 the ladder to it is a dependency chain rather than a preference: NPC
 interaction (4.15) → quests (4.16) → map (4.17) → minimap (4.21) → Questie.
 The rung *numbers* keep moving as things land in between; the *order* never
@@ -47,7 +51,7 @@ Two scoping facts that are already decided:
   offered, so it ships a hand-collected database of the whole game. This client
   can send the query. **Quest data comes from the server and Questie's database
   is not ported**, so quests are never stale and are correct on the custom
-  realm this client is developed against. 4.30 is therefore a *presentation*
+  realm this client is developed against. 4.31 is therefore a *presentation*
   milestone.
 * **`CMSG_QUEST_POI_QUERY` `0x1E3` is what makes that work.** WotLK shipped its
   own tracker, so the server already holds objective markers for 8,953 of 9,464
@@ -73,9 +77,10 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | | State |
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation, timed events, particles/ribbons), WMO, ADT/WDT, MH2O — all done |
-| Renderer | Textures, skinned models, buildings, blended terrain, streaming, liquids, M2 emitters — done. **`--screenshot` renders one frame headless and draws NO HUD** (see the instrument rule below) |
+| Renderer | Textures, skinned models, buildings, blended terrain, streaming, liquids, M2 emitters, sun shadows — done. **`--screenshot` renders one frame headless and draws NO HUD** (see the instrument rule below) |
 | Protocol | 3.1–3.5 done against a live realm, two clients at once. Replicated creatures interpolate, turn and animate; **other players do not** — see the defect below |
-| World | Day/night from `Light.dbc`, a real sky gradient, sun and moon, weather that falls, game objects drawn. No skybox, no clouds, no stars |
+| World | Day/night from `Light.dbc`, a real sky gradient, sun and moon, weather that falls, game objects drawn. **A star dome, a cloud band and the zone skybox `LightSkybox` names** — which on Azeroth and Kalimdor is none, measured. No moon texture, one cloud layer |
+| Shadows | **A directional shadow map from the sun**, cast by terrain, models and alpha-keyed foliage, received by everything but liquid. One cascade around the camera; `--no-shadows` and `--shadow-dump` are the instruments |
 | Appearance | NPCs, other players and the viewer's own character are all dressed from their replicated fields. Weapons draw and sheathe. No shoulders, helms or ranged weapons on others |
 | Interface | Native, fully customisable, **no addons** — see the decision below. Player/target/party frames, click-to-target, chat, spellbook, action bars per character, `F1` to rearrange, saved to `ui.toml` |
 | Game | Melee, spells with real tooltips and a cast bar, cooldowns, combat log, corpse and loot end to end, inventory with slot moves, character panel, quests taken and handed in, quest log with progress counters |
@@ -311,6 +316,12 @@ the full account is in `docs/ROADMAP.md`.
   The guild roster's conditional float had two survivors after every static
   check; clearing an *online* member's public note made a wrong reading run off
   the end. The probe manufactured the decisive sample in the same run.
+- **A colour that is always exactly grey is not a colour.** `Light.dbc`'s band
+  8 is neutral on **3,744 of 3,744 outdoor samples**, where every other band is
+  1-6%; it is a scalar stored in a colour column. The contrast is the evidence,
+  and it stops there: a storm lowers it on 79% of the samples that move, which
+  is the shape of a shadow strength and of several other things, so it is
+  **not named**. `wow-cli light --band-survey`.
 - **Two fields of the same shape in two records need not be in the same
   units.** A particle emitter stores colour in 0..255 and a ribbon in 0..1, in
   the same file, twenty bytes apart. Counted rather than guessed: 77,410 of
@@ -548,6 +559,12 @@ the full account is in `docs/ROADMAP.md`.
 
 ### Looking at a picture
 
+- **A buffer nothing displays needs a dump command more than the others, not
+  less.** A shadow map that is empty, aimed at the sky, depth-reversed or
+  perfectly correct all produce a world that is uniformly lit or uniformly
+  dark. `--shadow-dump` writes it as a PNG, stretched to the range present --
+  raw, a 440-unit box holding a 40-unit landscape prints as a white square --
+  and prints texels drawn *and* texels left at the far plane.
 - **A composite needs a way to be seen as itself.** A dressed character looked
   bare-chested at walking distance; dumping the composed 512x512 skin showed
   all ten regions correct and a white shirt that reads as skin at three hundred
@@ -756,6 +773,20 @@ the full account is in `docs/ROADMAP.md`.
   function's tail, so a flying character was followed by nothing and, because
   streaming follows the camera, the world stopped loading. One cause, three
   symptoms. Placing the camera is its own unconditionally-called method now.
+- **A region of interest centred on the camera is centred in the air.** The
+  shadow frustum was aimed at the eye, the camera was three hundred units above
+  Elwynn, and a box 220 units deep therefore held no landscape at all. Nothing
+  failed: the pass ran, the map filled with the depth of empty air, and every
+  surface was told it was lit. **What said so was the A/B** -- 162 pixels of
+  576,000 differed with the feature switched off -- and the fix was to aim at
+  the ground under the point ahead of the camera.
+- **A fix that changes nothing at all refutes the diagnosis, not the size of
+  the fix.** "Everything is shadowed" looked like acne; multiplying the
+  receiver's normal offset by **fifty** changed the picture by exactly zero
+  pixels, which is not what a bias problem does. What settled it was removing
+  the suspects: `--max-doodads 0` made the shadowed and unshadowed renders
+  *identical*, so terrain was not shadowing itself, and the 09:00 result was a
+  45-degree sun behind a forest of forty-unit trees being right.
 - **A rate limit and a lag are different failure modes, and only one is
   bounded.** Easing creature turns at a fixed maximum rate looks right every
   frame — until a player circling at melee range exceeds the cap, past which

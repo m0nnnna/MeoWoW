@@ -1022,6 +1022,15 @@ There is still **no skybox**, and that is not an omission.
 `LightSkybox.dbc`'s 124 rows are named things like `StratholmeSkybox` and
 `CavernsOfTimeSky` -- special places, not the ordinary outdoor world.
 
+> **4.29 read that table properly and found two things.** The first sharpens
+> the paragraph above into a number: **0 of the 158 `LightParams` rows an
+> outdoor light on Azeroth or Kalimdor can select names a skybox**, while 158
+> of all 850 rows do. The gradient is not standing in for a backdrop; the
+> continents genuinely have none. The second is that **row 4 of the same table
+> is `Environments\Stars\Stars.mdx`** -- the star dome is an entry here like
+> any other, which is why this client draws it. See "The sky's own geometry"
+> below.
+
 #### The sun, and the moon, are one band
 
 Reported as the sky looking *empty*: the gradient was right and there was
@@ -1212,3 +1221,142 @@ on, and everything else falls back to the bare-body rule that was already there.
 Verified by rendering. A Stormwind guard, whose gear is all variant zero, keeps
 his bare hands and plain boots; an NPC wearing real gear comes back with
 flared gauntlet cuffs, armoured boot tops and a cloak.
+
+## The sky's own geometry: stars, clouds and a backdrop
+
+Three things drawn between the gradient and the world, all centred on the
+camera, none of them writing or testing depth. `crates/render/src/celestial.rs`
+owns the pipeline; `apps/viewer/src/sky.rs` owns what goes through it and how
+bright each is this hour.
+
+**Its own pipeline rather than the mesh renderer's**, because every rule the
+mesh pipeline enforces is wrong here. A sky model is unlit -- `Stars.m2`'s seven
+materials all set the M2 unlit flag -- so shading it would dim the stars at the
+one hour they exist for. It is not fogged, because fog is what distance does to
+something in the world. And nothing on it is culled, which is a decision: every
+one of these is a hull seen from the inside, the arrangement that has already
+cost this project a vanished WMO roof and an M2 that read as facing away, and a
+culled sky is not a subtly wrong sky but no sky at all.
+
+The pipeline key is the blend mode and nothing else. No depth axis, because
+nothing writes depth; no winding axis, because nothing is culled.
+
+### Stars
+
+`Environments\Stars\Stars.m2`, found through `LightSkybox.dbc` by **file name**
+rather than by row id. A hemisphere of radius 25, 80 triangles in seven
+batches.
+
+Its textures decide how the fade works. **`Stars.blp` and `Stars2.blp` are pure
+white and keep the entire starfield in their alpha channel** -- 1.88% and 3.85%
+of texels lit. So the tint's *alpha* is the fade; scaling `rgb` would turn white
+stars grey and never make them go away. Same shape as `lake_a.blp`, which
+averages RGB 3.6 of 255 and keeps its ripple in alpha.
+
+The dome turns once per game day, so a player standing still at night sees the
+sky move.
+
+**The fade is the sun's elevation, and that is a choice.** Nothing in
+`Light.dbc` fades a starfield: four of its six scalar curves are constant across
+the day on every outdoor row and the two that move are the fog distances. The
+obvious alternative -- drive it from how dark the sky is overhead -- is
+positively refuted: Azeroth's zenith reads (0,31,73) at noon and (35,74,84) at
+dawn, so more stars would come out at midday than at sunrise.
+
+### Clouds
+
+`Environments\Stars\StarsAndClouds.blp`, 512x256. **The shape of the geometry
+was measured, not chosen**: the texture's alpha is exactly zero along its top
+edge and heaviest low down, and its first and last columns agree to a mean of
+2.7 of 255 where an unrelated column differs by 75. A texture that wraps
+horizontally and fades at both vertical edges is a panorama for a horizon, not
+a sheet for overhead. So it is a band on the dome, four copies round, drifting
+by a texture offset rather than by moving the geometry.
+
+The transparent edge maps to the *high* elevation, because that is the way the
+clouds thicken. Mapping it the other way renders perfectly and is upside down,
+which is the sky-gradient mistake in a different table.
+
+**The colour is derived from two measured bands**: the disc (band 9) and the
+ambient (band 1). A cloud is a white diffuse thing lit by exactly those two.
+The weighting between them is chosen and does one job -- the sun lights a
+cloud's underside when it is low and its top when it is high, which is why
+sunsets are the colourful ones and midday clouds are white. At night the direct
+term is zero, so a cloud takes the ambient and nothing from the disc; without
+that the moon's own band, which is the *brightest* band at every hour, would
+light an overcast midnight as hard as the sun does.
+
+### The zone backdrop
+
+`LightParams.light_skybox_id` into `LightSkybox.dbc`, loaded when the id
+changes and drawn between the stars and the clouds -- a painted wall in front of
+the stars, which hides them where it is opaque. On the two original continents
+the id is always 0 and this draws nothing, and that is the data's answer rather
+than a gap.
+
+## Shadows
+
+`crates/render/src/shadow.rs`. One orthographic frustum following the camera,
+one 2048x2048 depth map, the whole resident world drawn into it, and a 3x3
+comparison filter on every surface that receives.
+
+**Nothing is culled from the caster pass by tile.** That is the obvious
+optimisation and it is the one this project's own notes forbid: a world object
+is filed under the tile containing its *origin*, and Stormwind is one placement
+1,058 units across against a 533-unit tile, so tile culling would make a
+building's shadow vanish when you walked to its far side and only then.
+
+Casters are the opaque and alpha-keyed batches. A blended batch is glass, a
+glow or a spray. Alpha-keyed casters get a fragment stage that discards, which
+is the difference between a tree's shadow and a set of rectangles on the grass.
+
+**The receiver steps along its own normal rather than biasing depth.** A depth
+bias large enough to stop terrain shadowing itself is large enough to detach a
+character's shadow from its feet; moving the sample point out of the surface
+scales with how obliquely the surface faces the sun, which is where acne
+appears. The step is one and a half shadow texels *in world units*, derived
+from the box rather than tuned against one screenshot.
+
+**The shadow multiplies the direct term only.** Ambient is light arriving from
+the whole sky, and the sky is not what the tree is standing in front of;
+darkening it too turns every shadow into a hole.
+
+**The frustum is snapped to whole texels.** A shadow map sliding continuously
+with the camera resamples every edge at a different sub-texel offset each frame
+and the whole world crawls -- invisible in a screenshot, unmissable in motion.
+
+Past the edge of the box the shadow fades out rather than cutting off. Clamping
+the lookup instead draws a hard line across the ground wherever the camera
+happens to be, which reads as a fault rather than as a budget.
+
+### The instruments
+
+Both of this milestone's failures produced a world that looked like the feature
+did not exist, so both instruments are permanent:
+
+* **`--no-shadows`** is the A/B. It is what said that a frustum aimed at the
+  camera's eye -- three hundred units above Elwynn, with a box 220 units deep --
+  had the whole landscape outside it: 162 pixels of 576,000 differed.
+* **`--shadow-dump <png>`** writes the map, which is otherwise the only buffer
+  in the renderer nothing displays. Stretched to the range actually present,
+  because a 440-unit box holding a 40-unit landscape prints raw as a white
+  square; and it reports texels drawn *and* texels left at the far plane,
+  because a counter that only speaks on failure cannot tell "none were wrong"
+  from "there were none".
+
+`--shadow-radius` and `--shadow-size` are exposed because the first is a
+judgement rather than a measurement: one cascade is either sharp and small or
+soft and wide.
+
+### One copy of the shading text
+
+`crates/render/src/shading.rs` holds the camera uniform, the shadow bindings
+and `shadow_factor`, `sky_light` and `fogged`, and both the mesh and terrain
+shaders are built by prepending it.
+
+It exists because `terrain.rs` carried a comment saying its copy was "kept
+identical on purpose" to the mesh shader's, and the two had drifted: the unlit
+fallback read `0.45 + 0.55 * ndl` in one and `0.38 + 0.62 * ndl` in the other.
+Nothing could have caught it -- the fallback only runs where there is no light
+data. **An in-tree comment is a claim with the same evidentiary weight as any
+other.**

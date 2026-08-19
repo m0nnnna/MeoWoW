@@ -6678,3 +6678,277 @@ this section says.
 * **`ChatType::Officer` is still unhandled** and falls through to no tag. It
   is a separate wire type nothing here has sent or received, and labelling it
   `[guild]` would be a wrong claim about who heard it.
+
+## 4.29: the sky, and the shadows under it
+
+Taken out of the city-services order on purpose. Phase 2 closed with four
+things named as deliberately missing — liquid, WMO portal culling, frustum
+culling and shadows — and with the reason for deferring them: "all are easier
+to judge once there is a character standing in the world". There has been one
+since 3.5, and standing in an open field at noon with nothing on the ground
+under it was the loudest thing left in an outdoor render. Liquid was paid off
+at 4.18; this is the rest of that debt, plus the three pieces of sky the state
+table had been listing as absent since the gradient was written: **no skybox,
+no clouds, no stars**.
+
+Four things, in four different relationships to the data, and that is the most
+useful way to read the milestone:
+
+* **The star dome is a transcription.** It is a file, in a table, found by name.
+* **The zone skybox is a lookup** that returns nothing everywhere this client
+  usually stands, and the measurement saying so is the interesting part.
+* **The cloud band is a construction**, and its shape was still measured rather
+  than chosen.
+* **The shadows are a renderer**, with no data behind them at all.
+
+### The star dome was in `LightSkybox.dbc` the whole time
+
+`LightParams.light_skybox_id` has been parsed since the lighting tables were
+transcribed, and `docs/RENDERING.md` has said since then that no skybox is
+drawn and that this is not an omission: the id is 0 on the row that lights
+Elwynn, and `LightSkybox.dbc`'s 124 rows are named `StratholmeSkybox`,
+`CavernsOfTimeSky`, `NetherstormSkyBox` — special places.
+
+That was right, and it was also hiding something. **Row 4 of the same table is
+`Environments\Stars\Stars.mdx`.** The star dome is not a decoration this client
+would have had to invent a place for; it is an entry in the same table as every
+zone's painted backdrop, which makes drawing it a transcription rather than a
+choice. It is looked up by **file name** rather than by id, for the reason this
+project keeps rediscovering: an id is a number that could be anything, and a
+name is the one thing in a table that cannot be a coincidence.
+
+The model is a hemisphere of radius 25 with 80 triangles in seven batches, all
+of them unlit and none writing depth. Its two textures are the tell that they
+were authored for exactly this: **`Stars.blp` and `Stars2.blp` are pure white,
+and the entire starfield is in their alpha channel** — 1.88% and 3.85% of their
+texels are lit. That is the same shape as `lake_a.blp`, which averages RGB 3.6
+of 255 and keeps its whole ripple in alpha, and it decides the fade: scaling
+the tint's **alpha** is what makes stars come out and go in, where scaling
+`rgb` would only turn white stars into grey ones.
+
+### And the skybox is a feature that draws nothing here, measured
+
+`wow-cli light --band-survey` counts it: **158 of the 850 `LightParams` rows
+name a skybox, and 0 of the 158 rows an outdoor light on Azeroth or Kalimdor
+can select do.** Two continents, 715 lights, and not one of them asks for a
+backdrop. The count was checked a second way — grepping the raw column out of
+`dbc dump` gives the same 158 — because the two 158s are a coincidence of
+numbers and looked at first like a bug.
+
+So the zone skybox is implemented, and on the map this client is developed
+against it is a code path that never runs. That is the data's answer rather
+than a gap, and it is written down here because "the skybox does not work" and
+"the skybox is not what this place uses" are the same black screen. The test
+asserts both halves: no outdoor row names one, *and* 158 rows somewhere do.
+
+### The cloud texture told us what shape to make
+
+There is no cloud model and no cloud geometry anywhere in the tables. What
+there is is `Environments\Stars\StarsAndClouds.blp`, and measuring it settles
+the only structural question:
+
+* Its alpha is **exactly zero along the top edge** and heaviest low down, then
+  tapering again at the bottom.
+* Its **first and last columns agree to a mean of 2.7 of 255**, where an
+  unrelated column differs by 75 — a factor of 28.
+
+A texture that wraps horizontally and fades at both vertical edges is a
+panorama authored to go round a horizon, not a sheet to lay overhead. So the
+band is drawn as a ring on the sky dome, the transparent edge of the texture
+mapped to the *high* elevation because that is the way the clouds thicken —
+and a unit test asserts that mapping, because putting it the other way up
+renders perfectly and is upside down.
+
+**The colour is derived, not guessed.** Nothing in the eighteen colour bands
+has been identified as a cloud, and the survey below says why nothing was
+named. What is measured is the disc (band 9, the only band bright at every
+hour) and the ambient (band 1); a cloud is a white diffuse thing lit by exactly
+those two. The weighting between them is the chosen part and it has one job:
+the sun lights the *underside* of a cloud when it is low and the top of it when
+it is high, which is why sunsets are the colourful ones. Same move as making
+fog the horizon's own colour instead of one of the three bands that behave
+plausibly like fog.
+
+### What the eighteen bands are, asked properly for the first time
+
+`wow-cli light --band-survey` samples every band on every hour of every
+`LightParams` row and counts one property: how often the three channels are
+**exactly equal**. The result is not close.
+
+| band | grey, outdoor rows | grey, all rows |
+|---|---|---|
+| **8** | **3,744 of 3,744 — 100%** | **17,592 of 19,536 — 90%** |
+| every other band except 2, 12 and 13 | 1–6% | 1–4% |
+
+Band 2 (15%) is the zenith, which is black at midnight, and band 12 (65%) is
+all zeros on most rows; both are trivially neutral for reasons that are not
+about being a scalar. **Band 8 is a number stored in a colour column**, and the
+100%-against-2% contrast is the same class of evidence as the M2 event
+identifier being four printable ASCII characters on 25,498 of 25,500 records
+and 22–24% everywhere else.
+
+Then the question a count of grey samples cannot answer: *which* number. The
+clear-against-storm pairing that `--weather-check` already uses says it is
+**lower under storm on 1,052 samples and higher on 279** — 79% of the 1,331
+that move at all, mean 0.309 clear against 0.288 storm. A shadow strength has
+that shape. So does several other things.
+
+**It is not named.** "Band 8 is a packed scalar that a storm weakens" is what
+was measured; that it is the shadow opacity is not, and this project's own rule
+is that a wrong *offset* eventually fails loudly while a wrong *name* never
+does. The shadow strength in the renderer is therefore a constant, written down
+as chosen — with the survey beside it so the next person can finish the job.
+
+The scalar bands got the same treatment, and answered a question the stars
+raised: of the six, **band 2 is exactly 1.0 and band 5 exactly 1.0 on every
+outdoor row at every hour**, band 4 never moves within a day, and the only two
+that move are the fog distances. So nothing in `Light.dbc` fades a starfield
+in, and the fade is the sun's own elevation — derived from the arc in
+`sun_direction`, which is itself chosen and has always said so.
+
+The obvious alternative was to drive the star fade from how dark the sky is
+overhead, and **the measurement refutes it**: Azeroth's zenith reads (0,31,73)
+at noon and (35,74,84) at dawn, so a fade on zenith luminance would put more
+stars out at midday than at sunrise.
+
+### One copy of the lighting text, because a comment was not a check
+
+`terrain.rs` carried this, above its own copy of the shading functions:
+
+> The same two functions the mesh shader uses, kept identical on purpose:
+> terrain lit one way and the buildings standing on it lit another is the seam
+> a player notices first.
+
+They were not identical. The unlit fallback read `0.45 + 0.55 * ndl` in the
+terrain shader and `0.38 + 0.62 * ndl` in the mesh shader, and nothing could
+have said so: the fallback only runs where there is no light data, and the
+difference is one shade of grey on an offline model view. **An in-tree comment
+is a claim with the same evidentiary weight as any other**, and this one had
+been false for as long as it had existed.
+
+Both shaders are now built from one string, `render::shading::COMMON`, which
+also carries the camera uniform and the shadow bindings. They cannot disagree
+because there is no second copy to edit — which mattered immediately, since
+adding a shadow term to two copies of a function is exactly how the third one
+would have been written.
+
+### The shadows, and the two ways they failed silently
+
+A single orthographic frustum follows the camera, the whole resident world is
+drawn into a 2048x2048 depth map, and every surface in the world samples it
+with a 3x3 comparison filter. Deliberately the naive arrangement: cascades,
+caster culling and a tighter fit are all optimisations of something that has to
+be correct first.
+
+One thing is *not* naive, and it is a choice this project's own notes
+demanded. **Nothing is culled from the shadow map by tile**, though that is the
+obvious way to stop redrawing the world twice a frame. A world object is filed
+under the tile containing its *origin* — deliberately, so it is neither drawn
+twice nor left behind — and Stormwind is one placement 1,058 units across
+against a 533-unit tile. Culling casters by tile would make a building's shadow
+vanish when you walked to its far side, and *only* then.
+
+Casters are the opaque and alpha-keyed batches. A blended batch is glass, a
+glow or a spray, and a torch flame with a solid shadow is worse than a torch
+flame with none. Alpha-keyed casters get a fragment stage that discards, which
+is what stops a tree's shadow being a set of solid rectangles on the grass.
+
+Both failures on the way were silent, and both looked like the feature not
+existing.
+
+**The box was aimed at the camera's eye, and the camera was three hundred units
+up.** The frustum is 220 units deep along the sun's axis, so the whole
+landscape was outside it. The pass ran, the map filled with the depth of empty
+air, and every surface that asked was told it was lit. What said so was the
+A/B: the same scene with and without `--no-shadows` differed by **162 pixels of
+576,000**. The box is aimed at the ground under the point ahead of the camera
+now.
+
+**Then the opposite.** With the box on the ground, Northshire at 09:00 came
+back uniformly darker — every pixel of open grass included — and the obvious
+diagnosis was acne. It was not: multiplying the receiver's normal offset by
+**fifty** changed the picture by exactly nothing, which is not what a bias
+problem does. Two measurements settled it. `--max-doodads 0` made the
+difference between shadowed and unshadowed **exactly zero**, so the terrain was
+not shadowing itself at all; and at noon the same scene came back bright, with
+a shaped shadow under each tree, the fence casting a line across the road, and
+a small dark patch under the character's own boots. The 09:00 result was a 45°
+sun behind a forest of forty-unit trees, and it was right.
+
+That took an hour, and it took the instrument this project's rules had already
+asked for. **A shadow map is the only buffer in the renderer that is never
+displayed**, and an empty map, a map of the sky, a map with its depth axis
+reversed and a perfectly good map all produce a world that is uniformly lit or
+uniformly dark. `--shadow-dump` writes it to a PNG — stretched to the range
+actually present, because an orthographic box 440 units deep holding a
+landscape 40 units tall prints raw as a white square — and reports **both**
+numbers, texels drawn and texels left at the far plane. The first dump showed
+4,193,422 of 4,194,304 drawn and a legible forest, which ruled out half the
+candidates in one glance.
+
+The frustum is **snapped to whole texels**, which is the other thing that is
+invisible in a screenshot and unmissable in motion: a shadow map sliding
+continuously with the camera resamples every edge at a different sub-texel
+offset each frame, and the whole world crawls. There is a test for it, in the
+only form that can catch it: a sub-texel step must produce the *same* matrix
+and an eight-texel step a different one — because a frustum that never moves at
+all is the opposite failure and looks like shadows that stop existing when you
+walk.
+
+### What is checked without a window
+
+The tests are the answer to 4.24's lesson, which is that `--screenshot` draws
+no HUD and a clean headless render therefore says nothing about an interface.
+**This milestone is the rare one where a headless render says almost
+everything**, because none of it is interface, and it is checked at both
+levels:
+
+* **The geometry, on the CPU.** The cloud band lies on the unit sphere between
+  its two elevations, its transparent edge is at the top, and its seam is a
+  duplicated vertex rather than a wrapped index. The light matrix puts its aim
+  point in the middle of the map, puts a caster overhead nearer the sun than
+  one below, covers its radius and stops, moves in whole texels, and returns
+  `None` for a sun on the horizon rather than a box kilometres long.
+* **The fades, on the CPU.** Stars are out at midnight, gone at noon, half-lit
+  at the moment of sunset and hidden by a storm; a cloud at night takes the
+  ambient and *nothing* from the disc, which is the band that stays bright all
+  night and would otherwise light an overcast midnight.
+* **The pipelines, on a GPU.** A sky object drawn at quarter alpha is dimmer
+  than one at full and one at zero alpha draws nothing — the star fade,
+  asserted at the level it actually happens.
+* **The shadow, end to end and both halves.** A caster above a ground plane
+  darkens the ground under it *and not the ground beside it*, and with the map
+  switched off the two agree. Either assertion alone passes with the other
+  broken: a receiver that shadows everything satisfies the first, a matrix that
+  misses the map entirely satisfies the second. That is precisely the pair of
+  mistakes this milestone made in sequence.
+* **The map itself.** The caster covers about 9% of it and the corners stay at
+  the far plane, which is the check that a matrix stretching one quad across
+  the whole frustum cannot pass — and from the receiver's side that mistake is
+  indistinguishable from a correct map, since both shadow everything.
+* **The table.** `Stars.mdx` is in `LightSkybox`, no outdoor light names a
+  skybox, and 158 rows somewhere do.
+
+### Still not done
+
+* **One cascade.** `--shadow-radius` is 110 units by default and exposed
+  because the right value is a judgement rather than a measurement: small is
+  sharp and small, wide is soft and covers the hill behind you. Past the box
+  the shadow fades out rather than cutting off, which is what stops the
+  boundary drawing a line across the ground.
+* **Nothing is culled from the shadow pass**, so the resident world is drawn
+  twice per frame. That is the first thing to measure if the frame rate is
+  short.
+* **Liquid does not receive shadows.** It has its own uniform and its own
+  bind group by design — the two must not derive the lighting separately — and
+  extending that to the shadow map is a separate change.
+* **The moon is still a coloured disc**, not `Environments\Stars\Moon.blp`,
+  which is a 512x512 texture sitting in the archives. The sky shader draws one
+  disc for whichever body is up, so drawing the real moon means suppressing
+  that disc for half the day, and a half-suppressed disc is worse than a
+  plain one.
+* **The cloud band is one layer.** The table has two cloud-layer colours under
+  the names the community uses for them, and this client has identified
+  neither.
+* **No shadows indoors**, because there is no indoor light. A WMO interior is
+  lit by the outdoor sun here and always has been.
