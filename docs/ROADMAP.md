@@ -5755,12 +5755,30 @@ never builds an egui frame at all. The tell was in the image and was missed on
 the first look: no player frame, no action bar, no minimap. Nothing was wrong
 with the render; it simply could not have shown the subject.
 
-The white screen did not reproduce and cleared on a later launch, so it stays
-**unexplained rather than fixed**. The one benign reading that fits the
-measurements: the headless live run took 19 seconds to clear the login burst
-and 35 to first pixel, so a cold launch sitting white for a while is the
-documented cost of that burst rather than a hang.
+The second half of the checklist is confirmed too: **clicking a dimmed row does
+nothing.** That is the half worth having watched, because it is the one whose
+failure is undiagnosable. `row_at` answers only for rows the list said were
+learnable; a hit test that reported every row would have passed the headless
+test's first assertion on its own, and what it ships is a purchase request the
+server declines in total silence -- which reads as the client being broken at
+every trainer. It is exactly why that test asserts both halves, and it is the
+kind of claim a window can settle in ten seconds and a suite cannot settle at
+all.
 
-Still unlooked-at: **the inert rows refusing a click.** It is asserted
-headlessly, in the test that deliberately checks both halves, and nobody has
-watched it.
+### The white screen: documented and deliberately not pursued
+
+It appeared once at startup, did not reproduce, and cleared on a later launch.
+**Recorded rather than chased, by decision** -- not left open as a bug nobody
+got round to. The one benign reading that fits the measurements taken at the
+time: the headless live run took 19 seconds to clear the login burst and 35 to
+first pixel, so a cold launch sitting white for a while is the documented cost
+of that burst rather than a hang.
+
+Written down because the next occurrence is the one that will be worth
+diagnosing, and it will start from a blank page otherwise. If it returns, the
+things to establish first are the two that want opposite investigations: a
+`thread 'main' panicked` line with a file and line, versus a window that never
+fills in -- and for the second, whether it is still white after a minute, which
+separates slow from hung. What cannot be reused is `--screenshot`: it does not
+draw the HUD, so it will produce a perfect picture of the world no matter how
+broken the interface is.
