@@ -3879,6 +3879,18 @@ impl ApplicationHandler for App {
                                 window.request_redraw();
                                 return;
                             }
+                            // `T` asks the target to trade. The original
+                            // client puts this on a right-click menu, which
+                            // this interface does not have -- right-click in
+                            // the world already means "select and attack",
+                            // and overloading it with a menu would be a
+                            // gesture that sometimes swings and sometimes
+                            // does not.
+                            KeyCode::KeyT => {
+                                self.initiate_trade();
+                                window.request_redraw();
+                                return;
+                            }
                             // `C` for the character panel, as 3.3.5a binds it.
                             KeyCode::KeyC => {
                                 self.character_open = !self.character_open;
@@ -6826,6 +6838,211 @@ impl App {
     /// wrong answers: the server refuses an equip it does not like, where a
     /// silently dropped click reads as the window being broken -- which is
     /// exactly the report this whole area just came out of.
+    /// Asks the current target to trade.
+    ///
+    /// **The one request in this client whose success is invisible to its
+    /// sender.** The server announces a started trade to the *partner* and
+    /// says nothing back here until their client answers, so this opens
+    /// nothing and draws nothing: the window appears when `OPEN_WINDOW`
+    /// arrives, which is after somebody else has pressed a button.
+    ///
+    /// A local note is written all the same, because who was asked is nowhere
+    /// on the wire -- the initiator is never told, and without this the window
+    /// would open with no name in it a second after this client chose the
+    /// name itself.
+    ///
+    /// Refused locally in the two cases this client can actually tell apart,
+    /// and not in any of the others: the server has a dozen preconditions
+    /// (distance, life, stun, faction, logging out) and reimplementing them
+    /// here would be guessing at rules that differ per realm. What is checked
+    /// is only that there *is* a target and that it is a player -- everything
+    /// else is left to the server, which answers a refusal with a reason.
+    fn initiate_trade(&mut self) {
+        let Some(target) = self.target else {
+            self.chat
+                .push(Line::Chat(local_notice("Select somebody to trade with.".into())));
+            return;
+        };
+        let is_player = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.get(target))
+            .is_some_and(|entity| entity.is_player());
+        if !is_player {
+            // Refused here rather than sent: the server answers a trade
+            // request aimed at a creature with `NO_TARGET`, which is a real
+            // reply and would be reported as one -- but "that is not a
+            // person" is something this client knows for itself, and a round
+            // trip to be told so is a round trip that reads as a bug.
+            self.chat.push(Line::Chat(local_notice(
+                "You can only trade with another player.".into(),
+            )));
+            return;
+        }
+        let Some(live) = self.live.as_mut() else { return };
+        tracing::info!("asking {target:#018x} to trade");
+        if let Err(e) = live.connection.initiate_trade(target) {
+            tracing::warn!("asking to trade failed: {e:#}");
+            return;
+        }
+        live.state.note_trade_request(target);
+        // Said out loud, because the send is silent and the window does not
+        // open until the other person's client answers: without this, pressing
+        // the key does nothing observable for as long as they take to notice.
+        let name = live
+            .state
+            .names
+            .player(target)
+            .flatten()
+            .map(str::to_string)
+            .unwrap_or_else(|| "them".into());
+        self.chat.push(Line::Chat(local_notice(format!(
+            "Waiting for {name} to answer."
+        ))));
+    }
+
+    /// Answers an offer of a trade.
+    ///
+    /// Two opcodes rather than one with a flag, because that is what the
+    /// protocol has -- and the server closes the trade on the refusal, so
+    /// exactly one of these goes out per offer.
+    fn answer_trade_offer(&mut self, answer: ui::frames::TradeOfferAnswer) {
+        let Some(live) = self.live.as_mut() else { return };
+        let sent = match answer {
+            ui::frames::TradeOfferAnswer::Accept => live.connection.begin_trade(),
+            ui::frames::TradeOfferAnswer::Decline => live.connection.busy_trade(),
+        };
+        match sent {
+            // Cleared locally on a decline, because the server's own
+            // `TRADE_CANCELED` is what would clear it and there is no reason
+            // to leave a prompt on screen waiting for a packet that confirms a
+            // decision the player has already made.
+            Ok(()) => {
+                if answer == ui::frames::TradeOfferAnswer::Decline {
+                    live.state.trade = None;
+                }
+            }
+            Err(e) => tracing::warn!("answering a trade offer failed: {e:#}"),
+        }
+    }
+
+    /// Puts one carried item on the trade table.
+    ///
+    /// **The whole of the modal rule this milestone adds**, and it is one
+    /// rule in one place: while a trade window is open, a right-click in the
+    /// bag window offers the item rather than equipping or using it. That is
+    /// deliberate and it does swallow the ordinary gesture -- which is the
+    /// shape this project has a rule about -- so it is worth saying why it is
+    /// the right trade here. A trade window is open for seconds and every one
+    /// of them is somebody else waiting; an equip is undoable and a trade is
+    /// not; and the offered item is visible in the window before anything is
+    /// irreversible.
+    ///
+    /// Two things are refused before the send, both because the server
+    /// **cancels the entire trade** rather than declining the request: an item
+    /// already on the table, and a full table. Discovering either by sending
+    /// costs the player the whole trade.
+    fn offer_item(&mut self, at: Option<::world::inventory::Where>) -> bool {
+        // **Every way out of here says which way it went.** A right-click that
+        // offers nothing and a right-click that was never a trade gesture at
+        // all are the same observation otherwise, and they want opposite
+        // investigations -- the standing rule in `CLAUDE.md`, and this
+        // function had four silent refusals when it was written. The first
+        // live test came back "I couldn't give him an item", which is exactly
+        // the sentence that cannot be acted on.
+        let Some(at) = at else {
+            tracing::debug!("right-click: no bag address for that square");
+            return false;
+        };
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        let Some(session) = live.state.trade.as_ref() else {
+            tracing::debug!("right-click at {at:?}: no trade open, so activating instead");
+            return false;
+        };
+        if !session.open {
+            tracing::debug!("right-click at {at:?}: trade offered but not open yet");
+            return false;
+        }
+        let Some(carried) = ::world::inventory::carried(&live.state, live.guid)
+            .into_iter()
+            .find(|carried| carried.at == at)
+        else {
+            tracing::debug!("right-click at {at:?}: nothing carried there");
+            return false;
+        };
+        let item = carried.item.guid;
+
+        if session.already_offered(item) {
+            self.chat.push(Line::Chat(local_notice(
+                "That is already on the table.".into(),
+            )));
+            return true;
+        }
+        let Some(slot) = session.first_free_slot() else {
+            self.chat
+                .push(Line::Chat(local_notice("There is no room left to trade.".into())));
+            return true;
+        };
+
+        let (bag, square) = at.address();
+        let Some(live) = self.live.as_mut() else {
+            return true;
+        };
+        tracing::info!("offering item {item:#x} (bag {bag}, slot {square}) in trade slot {slot}");
+        if let Err(e) = live.connection.set_trade_item(slot, bag, square) {
+            tracing::warn!("offering an item failed: {e:#}");
+            return true;
+        }
+        // Recorded beside the send, because nothing will record it for us:
+        // the server sends the offer to the *other* person and never back
+        // here, so this is the only thing our half of the window is drawn
+        // from. See `world::trade`.
+        live.state.note_trade_item(slot, item);
+        true
+    }
+
+    /// Acts on a click in the trade window.
+    fn act_on_trade(&mut self, click: ui::frames::TradeClick) {
+        let Some(live) = self.live.as_mut() else { return };
+        let Some(session) = live.state.trade.as_ref() else {
+            // Logged rather than ignored: a click that reached the frame and
+            // produced no send is the shape that reads as a broken window.
+            tracing::warn!("the trade window was clicked with no trade open");
+            return;
+        };
+        let token = session.token;
+        match click {
+            ui::frames::TradeClick::Clear(slot) => {
+                if let Err(e) = live.connection.clear_trade_item(slot) {
+                    tracing::warn!("taking an item back failed: {e:#}");
+                    return;
+                }
+                live.state.note_trade_clear(slot);
+            }
+            ui::frames::TradeClick::Accept => {
+                if let Err(e) = live.connection.accept_trade(token) {
+                    tracing::warn!("accepting the trade failed: {e:#}");
+                    return;
+                }
+                // Local: the server reports an accept to the *partner* and
+                // says nothing to whoever made it until the trade completes.
+                live.state.note_trade_accept();
+            }
+            ui::frames::TradeClick::Cancel => {
+                if let Err(e) = live.connection.cancel_trade() {
+                    tracing::warn!("cancelling the trade failed: {e:#}");
+                    return;
+                }
+                // Cleared locally as well as by the `TRADE_CANCELED` that
+                // follows. A window that stayed up until the packet arrived is
+                // one the player has already told to go away.
+                live.state.trade = None;
+            }
+        }
+    }
+
     fn activate_item(&mut self, at: Option<::world::inventory::Where>) {
         let Some(at) = at else { return };
         let Some(live) = self.live.as_ref() else {
@@ -7730,13 +7947,25 @@ impl App {
         // waiting on this.
         const ITEMS_PER_FRAME: usize = 6;
         // An open loot window's rows are on screen without being owned yet,
-        // so they are named here rather than found by walking the bags.
-        let looted: Vec<u32> = live
+        // so they are named here rather than found by walking the bags. **A
+        // trade partner's half of the table is the same case** and had to be
+        // added for the same reason -- those entries belong to somebody else
+        // and appear in nothing this character carries, so a window built off
+        // the bags alone shows the other person's goods as bare numbers.
+        let mut looted: Vec<u32> = live
             .state
             .loot
             .as_ref()
             .map(|loot| loot.items.iter().map(|item| item.entry).collect())
             .unwrap_or_default();
+        looted.extend(
+            live.state
+                .trade
+                .as_ref()
+                .and_then(|session| session.theirs.as_ref())
+                .into_iter()
+                .flat_map(|offer| offer.items.iter().map(|item| item.entry)),
+        );
         let own_guid = live.guid;
         let asking = hud::items_to_ask(&mut live.state, own_guid, &looted, ITEMS_PER_FRAME);
         for entry in asking {
@@ -8348,6 +8577,132 @@ impl App {
         // fact about the game and the same for everybody, while its price and
         // its availability were computed by the server for *this* character
         // and cannot be recomputed here at all.
+        // The trade window, and the prompt that offers one.
+        //
+        // **Built from two different kinds of thing**, which is what makes
+        // this window unlike every other one here. Their half is a packet.
+        // Our half is this client's own record of what it put down, because
+        // the server sends an offer to the *partner* and never back to its
+        // author -- so `session.ours` is item guids, and turning them into
+        // pictures means looking each one up in this character's own
+        // inventory. See `world::trade`.
+        let mut trade_offer: Option<ui::frames::TradeOfferView> = None;
+        let trade: Option<ui::TradeView> = match self.live.as_ref().and_then(|live| {
+            live.state
+                .trade
+                .as_ref()
+                .map(|session| (session.clone(), live.guid))
+        }) {
+            Some((session, own_guid)) => {
+                // The partner's name, or nothing. Never a guid: a window
+                // headed with a hex number is one that says the client has
+                // failed rather than that a query is outstanding.
+                let partner = session
+                    .partner
+                    .and_then(|guid| {
+                        self.live
+                            .as_ref()
+                            .and_then(|live| live.state.names.player(guid).flatten())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+
+                if session.awaiting_our_answer() {
+                    // An offer nobody has answered yet. The window itself is
+                    // not drawn: there is nothing in it, and a table with no
+                    // squares to fill would look like a trade already under
+                    // way.
+                    trade_offer = Some(ui::frames::TradeOfferView { from: partner });
+                    None
+                } else if !session.open {
+                    // **This end asked and is waiting.** Nothing is drawn --
+                    // and specifically *not* the prompt, which is the mistake
+                    // the two ends holding identical state invites: before the
+                    // window opens, the only thing separating "waiting for
+                    // them" from "they are waiting for me" is which end
+                    // pressed the key, and that is nowhere on the wire. A
+                    // prompt here would ask the player whether they accept
+                    // their own request.
+                    None
+                } else {
+                    let mut view = ui::TradeView {
+                        partner,
+                        their_money: session.theirs.as_ref().map(|o| o.money).unwrap_or(0),
+                        our_money: session.our_money,
+                        they_accepted: session.partner_accepted,
+                        we_accepted: session.accepted,
+                        ..Default::default()
+                    };
+
+                    if let Some(offer) = session.theirs.as_ref() {
+                        for item in &offer.items {
+                            let Some(square) = view.theirs.get_mut(item.slot as usize) else {
+                                continue;
+                            };
+                            let name =
+                                Self::item_name(self.live.as_ref(), &self.items, item.entry);
+                            let icon = self.items.icon(
+                                &r.gpu,
+                                &mut r.egui_renderer,
+                                &mut self.chain,
+                                item.entry,
+                            );
+                            square.item = Some(ui::frames::TradeSquareItem {
+                                count: item.count,
+                                label: name,
+                                icon,
+                            });
+                        }
+                    }
+
+                    // Our half, resolved guid by guid against what this
+                    // character is carrying. An item whose object has not
+                    // replicated still draws as occupied -- the same
+                    // distinction the bag window keeps, and for the same
+                    // reason: a replication gap must not read as an empty
+                    // square in a window about who owns what.
+                    let carried = self
+                        .live
+                        .as_ref()
+                        .map(|live| ::world::inventory::held(&live.state, own_guid))
+                        .unwrap_or_default();
+                    for (slot, held) in session.ours.iter().enumerate() {
+                        let Some(guid) = *held else { continue };
+                        let found = carried.iter().find(|item| item.guid == guid);
+                        let entry = found.and_then(|item| item.entry).unwrap_or(0);
+                        let count = found.map(|item| item.count).unwrap_or(1);
+                        let name = if entry == 0 {
+                            // Never blank: an unnamed square and an empty one
+                            // must not look alike in this window.
+                            format!("item {guid:#x}")
+                        } else {
+                            Self::item_name(self.live.as_ref(), &self.items, entry)
+                        };
+                        let icon = (entry != 0)
+                            .then(|| {
+                                self.items.icon(
+                                    &r.gpu,
+                                    &mut r.egui_renderer,
+                                    &mut self.chain,
+                                    entry,
+                                )
+                            })
+                            .flatten();
+                        if let Some(square) = view.ours.get_mut(slot) {
+                            square.item =
+                                Some(ui::frames::TradeSquareItem {
+                                    count,
+                                    label: name,
+                                    icon,
+                                });
+                        }
+                    }
+                    Some(view)
+                }
+            }
+            None => None,
+        };
+
         let trainer: Option<ui::TrainerView> = self.trainer.as_ref().map(|session| {
             let rows = session
                 .list
@@ -8919,6 +9274,8 @@ impl App {
                     // is on screen exactly while a conversation is open.
                     questgiver: questgiver_view.as_ref(),
                     trainer: trainer.as_ref(),
+                    trade: trade.as_ref(),
+                    trade_offer: trade_offer.as_ref(),
                     taxi: taxi_view.as_ref(),
                     // `None` when shut, like the spellbook and the log.
                     world_map: map_view.as_ref(),
@@ -9046,7 +9403,24 @@ impl App {
         // is a square position, not a slot -- resolved back through
         // `bags_where`, built alongside `bags` a moment ago.
         if let Some(index) = hud_response.activate_item {
-            self.activate_item(bags_where.get(index).copied().flatten());
+            let at = bags_where.get(index).copied().flatten();
+            // **Modal, and deliberately so.** While a trade window is open a
+            // right-click puts the item on the table instead of equipping or
+            // using it. `offer_item` returns whether it took the gesture, so
+            // the ordinary path is not also run -- a click that both offered
+            // an item and equipped it would be two requests from one press,
+            // and the second would cancel the trade the first started.
+            if !self.offer_item(at) {
+                self.activate_item(at);
+            }
+        }
+
+        if let Some(click) = hud_response.trade {
+            self.act_on_trade(click);
+        }
+        if let Some(answer) = hud_response.trade_offer {
+            tracing::info!("trade offer answered: {answer:?}");
+            self.answer_trade_offer(answer);
         }
 
         // A completed bag-window drag: both ends are square positions,

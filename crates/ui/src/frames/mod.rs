@@ -31,6 +31,7 @@ pub mod quest_mark;
 pub mod questgiver;
 pub mod spellbook;
 pub mod taxi;
+pub mod trade;
 pub mod trainer;
 pub mod unit;
 pub mod world_map;
@@ -47,6 +48,9 @@ pub use quest_mark::QuestMark;
 pub use questgiver::{QuestgiverAction, QuestgiverClick, QuestgiverRow, QuestgiverView};
 pub use spellbook::SpellbookEntry;
 pub use taxi::{TaxiRow, TaxiView};
+pub use trade::{
+    TradeClick, TradeOfferAnswer, TradeOfferView, TradeSquare, TradeSquareItem, TradeView,
+};
 pub use trainer::{TrainerRow, TrainerRowState, TrainerView};
 pub use unit::UnitView;
 pub use minimap::{MinimapTile, MinimapView};

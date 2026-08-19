@@ -42,7 +42,8 @@ pub use frames::{
     CastBarView, InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
     QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
     MapMarker, MapPatch, MapView, MarkerKind, MinimapTile, MinimapView, QuestgiverView,
-    SpellbookEntry, TaxiRow, TaxiView, TrainerRow, TrainerRowState, TrainerView, UnitView,
+    SpellbookEntry, TaxiRow, TaxiView, TradeClick, TradeOfferAnswer, TradeOfferView,
+    TradeSquare, TradeSquareItem, TradeView, TrainerRow, TrainerRowState, TrainerView, UnitView,
 };
 pub use layout::{default_path, CharacterBars, ElementId, Profile};
 pub use style::{Color, PowerType, Style};
@@ -164,6 +165,22 @@ pub struct HudData<'a> {
     /// The open flight master's list, or `None`. Existence is the flag, like
     /// the trainer and loot windows.
     pub taxi: Option<&'a frames::TaxiView>,
+    /// The open trade window, or `None`. Existence is the flag, as it is for
+    /// every other window that appears because something happened.
+    ///
+    /// **Both halves live in one view**, deliberately, because they are only
+    /// meaningful together: a window showing one person's goods twice is the
+    /// mistake this whole frame is shaped around, and handing the two halves
+    /// over separately would put the chance to make it in this crate as well
+    /// as in the caller.
+    pub trade: Option<&'a frames::TradeView>,
+    /// An offer of a trade waiting to be answered, or `None`.
+    ///
+    /// Separate from [`Self::trade`] rather than a state inside it: the
+    /// prompt and the window are different sizes, want different positions,
+    /// and are never on screen at once, so making them one element would give
+    /// the player one rectangle to place for two unrelated things.
+    pub trade_offer: Option<&'a frames::TradeOfferView>,
     /// The world map, or `None` when it is shut. Existence is the flag, as it
     /// is for the spellbook and the bag window.
     ///
@@ -289,6 +306,19 @@ pub struct HudResponse {
     /// for itself, and this is `true` only when that flag was `true` *and*
     /// the click landed on the line.
     pub party_loot_clicked: bool,
+    /// What was pressed in the trade window.
+    ///
+    /// Carries the **trade slot** for a clear, not a row position -- the
+    /// seven squares are the server's own numbering and the seventh is the
+    /// one that is not traded, so a list-position reading would take an item
+    /// out of a different square than the one clicked.
+    pub trade: Option<frames::TradeClick>,
+    /// How the player answered an offer to trade, or `None`.
+    ///
+    /// An enum for the same reason [`Self::party_invite`] is one: the two
+    /// answers travel by different opcodes, and a caller reading a `bool` the
+    /// wrong way round declines every offer in silence.
+    pub trade_offer: Option<frames::TradeOfferAnswer>,
 }
 
 /// What the cursor is currently carrying, picked up from either window that
@@ -602,6 +632,8 @@ impl Hud {
             let party_placeholder;
             let party_loot_placeholder;
             let party_invite_placeholder;
+            let trade_placeholder;
+            let trade_offer_placeholder;
             let content = match id {
                 ElementId::PlayerFrame | ElementId::TargetFrame => {
                     let live = if id == ElementId::PlayerFrame {
@@ -703,6 +735,22 @@ impl Hud {
                     None if editing => {
                         trainer_placeholder = frames::trainer::placeholder();
                         Content::Trainer(&trainer_placeholder)
+                    }
+                    None => continue,
+                },
+                ElementId::Trade => match data.trade {
+                    Some(view) => Content::Trade(view),
+                    None if editing => {
+                        trade_placeholder = frames::trade::placeholder();
+                        Content::Trade(&trade_placeholder)
+                    }
+                    None => continue,
+                },
+                ElementId::TradeOffer => match data.trade_offer {
+                    Some(view) => Content::TradeOffer(view),
+                    None if editing => {
+                        trade_offer_placeholder = frames::TradeOfferView::placeholder();
+                        Content::TradeOffer(&trade_offer_placeholder)
                     }
                     None => continue,
                 },
@@ -822,6 +870,12 @@ impl Hud {
                 Content::Taxi(view) => {
                     frames::taxi::size(view.rows.len(), &style, element.scale)
                 }
+                // Fixed, and its contents ignored: seven squares a side is
+                // seven squares a side whether they are full or empty, and a
+                // window that shrank as items came off the table would move
+                // its own Cancel button out from under the cursor.
+                Content::Trade(_) => frames::trade::size(&style, element.scale),
+                Content::TradeOffer(_) => frames::trade::offer_size(&style, element.scale),
                 // The one frame whose size ignores its contents entirely:
                 // the page's shape is fixed by the art, not by what is on it.
                 Content::WorldMap(_) => frames::world_map::size(&style, element.scale),
@@ -914,6 +968,8 @@ impl Hud {
                             | Content::Questgiver(_)
                             | Content::Trainer(_)
                             | Content::Taxi(_)
+                            | Content::Trade(_)
+                            | Content::TradeOffer(_)
                             | Content::ReleasePrompt(_)
                             | Content::Bags(_)
                             | Content::Party(..)
@@ -1020,6 +1076,20 @@ impl Hud {
                             element.scale,
                         ),
                         Content::Taxi(view) => frames::taxi::draw(
+                            &painter,
+                            response.rect,
+                            view,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Trade(view) => frames::trade::draw(
+                            &painter,
+                            response.rect,
+                            view,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::TradeOffer(view) => frames::trade::draw_offer(
                             &painter,
                             response.rect,
                             view,
@@ -1175,6 +1245,42 @@ impl Hud {
                                 // acknowledges the request.
                                 response_out.take_loot = rows.get(row).map(|row| row.take);
                             }
+                        }
+                    }
+                }
+                (false, Content::Trade(view)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            // `click_at` answers only for squares a request is
+                            // legal for -- ours, and occupied. Their column is
+                            // drawn and never hit-tested: taking an item off
+                            // the table is a request only its owner may make,
+                            // and one sent for their square is declined in
+                            // silence, which is the failure this client cannot
+                            // diagnose. Same shape as the trainer's inert rows.
+                            response_out.trade = frames::trade::click_at(
+                                drawn_rect,
+                                view,
+                                &style,
+                                element.scale,
+                                pointer,
+                            );
+                        }
+                    }
+                }
+                (false, Content::TradeOffer(_)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            // `None` for a press between the buttons, which is
+                            // deliberate: the two answers are opposite, and an
+                            // accidental accept opens a window a stranger can
+                            // put things in.
+                            response_out.trade_offer = frames::trade::offer_click_at(
+                                drawn_rect,
+                                &style,
+                                element.scale,
+                                pointer,
+                            );
                         }
                     }
                 }
@@ -1585,6 +1691,10 @@ impl Hud {
                             &style,
                             scale,
                         ),
+                        // Its size ignores its contents, so there is nothing
+                        // to fall back to a placeholder for.
+                        ElementId::Trade => frames::trade::size(&style, scale),
+                        ElementId::TradeOffer => frames::trade::offer_size(&style, scale),
                         ElementId::Trainer => frames::trainer::size(
                             data.trainer
                                 .map(|view| view.rows.len())
@@ -1680,6 +1790,8 @@ enum Content<'a> {
     QuestLog(&'a [frames::QuestLogEntry]),
     Questgiver(&'a frames::QuestgiverView),
     Trainer(&'a frames::TrainerView),
+    Trade(&'a frames::TradeView),
+    TradeOffer(&'a frames::TradeOfferView),
     Taxi(&'a frames::TaxiView),
     WorldMap(&'a frames::MapView),
     Minimap(&'a frames::MinimapView),
@@ -2654,6 +2766,125 @@ mod tests {
                 response.learn_spell, None,
                 "a click on the {what} row must send nothing"
             );
+        }
+    }
+
+    /// **Clicking our own trade square asks to clear it; clicking theirs asks
+    /// for nothing.**
+    ///
+    /// The `Sense::click()` check every window here needs -- a frame left out
+    /// of that one `matches!` draws, hit-tests and silently never reports --
+    /// plus the half specific to this window.
+    ///
+    /// Both halves are asserted, because a hit test that answered for every
+    /// square would pass the first alone and would ship a request naming
+    /// somebody else's item, which the server declines **in silence**. That is
+    /// the failure this client cannot diagnose, and it is why the clickability
+    /// test lives in `click_at` rather than in the caller.
+    ///
+    /// The two squares tested are at the *same position within their columns*,
+    /// so a frame that mixed the halves up would still answer -- with the
+    /// right slot number and the wrong owner.
+    #[test]
+    fn clicking_our_trade_square_clears_it_and_clicking_theirs_does_nothing() {
+        let mut view = frames::TradeView {
+            partner: "Watcher".into(),
+            ..Default::default()
+        };
+        let item = frames::TradeSquareItem {
+            count: 5,
+            label: "Darnassian Bleu".into(),
+            icon: None,
+        };
+        view.ours[2].item = Some(item.clone());
+        view.theirs[2].item = Some(item);
+        let data = HudData {
+            trade: Some(&view),
+            ..Default::default()
+        };
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::Trade);
+        let rect = element.rect(
+            screen(),
+            frames::trade::size(&hud.profile.style, element.scale),
+        );
+        let ours = frames::trade::square_rects(rect, false, &hud.profile.style, element.scale)
+            .nth(2)
+            .unwrap();
+        let theirs = frames::trade::square_rects(rect, true, &hud.profile.style, element.scale)
+            .nth(2)
+            .unwrap();
+
+        let response = drive(
+            &mut hud,
+            &data,
+            &click_script(ours.center(), egui::PointerButton::Primary),
+        );
+        assert_eq!(
+            response.trade,
+            Some(frames::TradeClick::Clear(2)),
+            "a click on our own occupied square must ask to clear slot 2"
+        );
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let response = drive(
+            &mut hud,
+            &data,
+            &click_script(theirs.center(), egui::PointerButton::Primary),
+        );
+        assert_eq!(
+            response.trade, None,
+            "a click on the partner's square must send nothing at all"
+        );
+    }
+
+    /// **The offer prompt's two answers are separate**, and the gap between
+    /// them answers nothing.
+    ///
+    /// The same assertion the party invite carries, and for the same reason:
+    /// the two answers travel by different opcodes, an accidental accept opens
+    /// a window a stranger can put things in, and neither is undoable by
+    /// pressing the button again.
+    #[test]
+    fn the_trade_offer_buttons_answer_separately() {
+        let view = frames::TradeOfferView {
+            from: "Watcher".into(),
+        };
+        let data = HudData {
+            trade_offer: Some(&view),
+            ..Default::default()
+        };
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::TradeOffer);
+        let rect = element.rect(
+            screen(),
+            frames::trade::offer_size(&hud.profile.style, element.scale),
+        );
+
+        for (point, expected) in [
+            (
+                rect.left_bottom() + egui::Vec2::new(rect.width() * 0.25, -14.0),
+                Some(frames::TradeOfferAnswer::Accept),
+            ),
+            (
+                rect.left_bottom() + egui::Vec2::new(rect.width() * 0.75, -14.0),
+                Some(frames::TradeOfferAnswer::Decline),
+            ),
+            (rect.center(), None),
+        ] {
+            let mut hud = Hud::default();
+            hide_bars(&mut hud);
+            let response = drive(
+                &mut hud,
+                &data,
+                &click_script(point, egui::PointerButton::Primary),
+            );
+            assert_eq!(response.trade_offer, expected, "at {point:?}");
         }
     }
 
@@ -3798,6 +4029,8 @@ mod tests {
                 &profile.style,
                 scale,
             ),
+            ElementId::Trade => frames::trade::size(&profile.style, scale),
+            ElementId::TradeOffer => frames::trade::offer_size(&profile.style, scale),
             ElementId::Trainer => frames::trainer::size(
                 frames::trainer::placeholder().rows.len(),
                 &profile.style,

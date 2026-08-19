@@ -52,10 +52,12 @@ pub enum ElementId {
     PartyInvite,
     Trainer,
     Taxi,
+    Trade,
+    TradeOffer,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 20] = [
+    pub const ALL: [ElementId; 22] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -76,6 +78,8 @@ impl ElementId {
         ElementId::PartyInvite,
         ElementId::Trainer,
         ElementId::Taxi,
+        ElementId::Trade,
+        ElementId::TradeOffer,
     ];
 
     /// What order the frames are drawn in, lowest first.
@@ -130,11 +134,21 @@ impl ElementId {
             // bug the questgiver's Accept button had.
             | ElementId::Trainer
             | ElementId::Taxi
+            // With them, and for the same reason: a trade window is open for
+            // seconds and every second of it is somebody else waiting. One
+            // sealed under a panel is a trade the player cannot cancel, which
+            // is worse than one they cannot accept -- the items are already
+            // on the table.
+            | ElementId::Trade
             | ElementId::ReleasePrompt
             // Top rank, with the other windows that appeared because
             // something happened and want an answer. An invite times out, so
             // one sealed under a map is one the player never gets to take.
-            | ElementId::PartyInvite => 3,
+            | ElementId::PartyInvite
+            // Top rank with the invite, and for the identical reason: an
+            // offer to trade times out, and the person who sent it is stood
+            // there waiting for an answer that a covered prompt never gives.
+            | ElementId::TradeOffer => 3,
         }
     }
 
@@ -216,6 +230,8 @@ impl ElementId {
             ElementId::PartyInvite => "party-invite",
             ElementId::Trainer => "trainer",
             ElementId::Taxi => "taxi",
+            ElementId::Trade => "trade",
+            ElementId::TradeOffer => "trade-offer",
         }
     }
 
@@ -246,6 +262,8 @@ impl ElementId {
             ElementId::PartyInvite => "Party invite",
             ElementId::Trainer => "Trainer",
             ElementId::Taxi => "Flight master",
+            ElementId::Trade => "Trade",
+            ElementId::TradeOffer => "Trade offer",
         }
     }
 
@@ -455,6 +473,26 @@ impl ElementId {
             ElementId::PartyInvite => Element {
                 anchor: Anchor::Center,
                 offset: [0.0, -140.0],
+                ..Default::default()
+            },
+            // Right of centre, clear of the loot window and of the party
+            // invite above it. A trade window is read *alongside* the bag
+            // window -- picking what to offer means looking at both -- and
+            // the bags are anchored bottom-right, so this sits above and
+            // inboard of them rather than on top.
+            ElementId::Trade => Element {
+                anchor: Anchor::Center,
+                offset: [260.0, -40.0],
+                ..Default::default()
+            },
+            // With the party invite's kind of interruption but not on top of
+            // it: both are prompts that appear because another player did
+            // something, and both can be waiting at once -- a group invite
+            // and a trade offer from the same person is an ordinary thing to
+            // happen.
+            ElementId::TradeOffer => Element {
+                anchor: Anchor::Center,
+                offset: [0.0, -220.0],
                 ..Default::default()
             },
         }
