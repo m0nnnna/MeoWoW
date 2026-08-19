@@ -7,20 +7,25 @@
 pub mod blit;
 pub mod camera;
 pub mod capture;
+pub mod celestial;
 pub mod liquid;
 pub mod mesh;
 pub mod particles;
 pub mod precipitation;
+pub mod shading;
+pub mod shadow;
 pub mod sky;
 pub mod terrain;
 pub mod texture;
 
 pub use blit::Blitter;
 pub use camera::{Camera, Fly, Orbit};
+pub use celestial::CelestialRenderer;
 pub use liquid::{LiquidRenderer, LiquidVertex};
 pub use mesh::{GpuMesh, MeshRenderer, MeshVertex};
 pub use particles::{ParticleRenderer, RibbonVertex, SpriteInstance};
 pub use precipitation::PrecipitationRenderer;
+pub use shadow::ShadowMap;
 pub use sky::SkyRenderer;
 pub use terrain::TerrainRenderer;
 pub use texture::UploadedTexture;

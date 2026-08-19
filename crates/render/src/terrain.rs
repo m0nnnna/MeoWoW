@@ -12,19 +12,10 @@ use crate::Gpu;
 /// Layers a chunk may carry. The first is opaque and the rest blend over it.
 pub const MAX_LAYERS: usize = 4;
 
+/// Appended to [`crate::shading::COMMON`]. **Terrain and the buildings
+/// standing on it now share one copy of the lighting text rather than two that
+/// were meant to be identical** -- they were not; see that module.
 const SHADER: &str = r#"
-struct Camera {
-    view_proj: mat4x4<f32>,
-    eye: vec4<f32>,
-    light: vec4<f32>,
-    sun: vec4<f32>,
-    ambient: vec4<f32>,
-    fog: vec4<f32>,
-    fog_range: vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> camera: Camera;
-
 @group(1) @binding(0) var layer0: texture_2d<f32>;
 @group(1) @binding(1) var layer1: texture_2d<f32>;
 @group(1) @binding(2) var layer2: texture_2d<f32>;
@@ -76,24 +67,11 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     color = mix(color, textureSample(layer2, tile_sampler, tiled).rgb, a.g);
     color = mix(color, textureSample(layer3, tile_sampler, tiled).rgb, a.b);
 
-    // The same two functions the mesh shader uses, kept identical on purpose:
-    // terrain lit one way and the buildings standing on it lit another is the
-    // seam a player notices first. `sun.w` of zero means no light data, and
-    // falls back to the fixed headlight this had before.
-    let n = normalize(in.normal);
-    let ndl = max(dot(n, normalize(camera.light.xyz)), 0.0);
-    var lit: vec3<f32>;
-    if (camera.sun.w <= 0.0) {
-        lit = color * (0.45 + 0.55 * ndl);
-    } else {
-        lit = color * (camera.ambient.rgb + camera.sun.rgb * ndl * camera.sun.w);
-    }
-    if (camera.fog_range.y > 0.0) {
-        let distance = length(in.world - camera.eye.xyz);
-        let t = clamp((distance - camera.fog_range.x) / max(camera.fog_range.y - camera.fog_range.x, 1.0), 0.0, 1.0);
-        lit = mix(lit, camera.fog.rgb, t);
-    }
-    return vec4<f32>(lit, 1.0);
+    // The very functions the mesh shader calls, from the very string it was
+    // built from. Terrain lit one way and the buildings standing on it lit
+    // another is the seam a player notices first -- and the two had already
+    // drifted while a comment said they had not.
+    return vec4<f32>(fogged(color * sky_light(in.normal, in.world), in.world), 1.0);
 }
 "#;
 
@@ -111,7 +89,9 @@ impl TerrainRenderer {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("terrain"),
-                source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!("{}{SHADER}", crate::shading::COMMON).into(),
+                ),
             });
 
         let texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {

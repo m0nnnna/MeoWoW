@@ -129,6 +129,10 @@ fn identity_camera() -> CameraUniform {
         ambient: [0.0; 4],
         fog: [0.0; 4],
         fog_range: [0.0; 4],
+        light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+        // Unshadowed as well as unlit: with no world there is no shadow map,
+        // and the placeholder one bound by `MeshRenderer` is never read.
+        shadow: CameraUniform::NO_SHADOW,
     }
 }
 
@@ -1236,4 +1240,341 @@ fn the_sprite_buffer_reports_what_it_dropped_and_what_it_drew() {
     particles.reserve(&gpu, too_many.len(), 0);
     assert_eq!(particles.upload_sprites(&gpu, &too_many), too_many.len());
     assert_eq!(particles.skipped, 0);
+}
+
+// ------------------------------------------------------- sky and shadows
+
+/// Draws the cloud band with one tint and reads the frame back.
+///
+/// Geometry is on the unit sphere and the view matrix is the identity, so the
+/// band lands in clip space as an annulus -- which is all this needs. What is
+/// under test is the pipeline and the tint, not the placement.
+fn render_cloud_band(gpu: &Gpu, tint: [f32; 4]) -> Vec<u8> {
+    let (w, h) = (64u32, 64u32);
+    let target = Offscreen::new(gpu, w, h, FORMAT);
+    let depth = DepthBuffer::new(gpu, w, h);
+    let mut celestial = render::CelestialRenderer::new(gpu, FORMAT);
+    celestial.prepare(gpu, [BlendMode::Blend]);
+
+    // Elevations both positive, so every vertex lands with a positive clip
+    // `z`: this projection is the identity, and clip space rejects anything
+    // behind the near plane. A band straddling zero draws half of itself and
+    // reads as a pipeline that half works.
+    let (vertices, indices) = render::celestial::cloud_band(48, 0.05, 0.6, 1.0);
+    let mesh = GpuMesh::upload(gpu, &vertices, &indices);
+    let placement = celestial.placement(gpu);
+    celestial.set(
+        gpu,
+        &placement,
+        glam::Mat4::IDENTITY,
+        glam::Mat4::IDENTITY,
+        tint,
+        [0.0, 0.0],
+    );
+    let material = celestial.material_bind_group(gpu, &solid(gpu, [255, 255, 255, 255]));
+
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            multiview_mask: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(celestial.get(BlendMode::Blend).expect("sky pipeline"));
+        pass.set_bind_group(0, placement.bind_group(), &[]);
+        pass.set_bind_group(1, &material, &[]);
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+    }
+    gpu.queue.submit([encoder.finish()]);
+    target.read_rgba(gpu).expect("readback")
+}
+
+/// The sky's own pipeline draws, and its tint's **alpha** is what fades it.
+///
+/// That last part is the whole mechanism behind the stars: `Stars.blp` is pure
+/// white with the entire starfield in its alpha channel, so a fade that scaled
+/// `rgb` would turn white stars into grey ones and never make them go away.
+#[test]
+fn a_sky_object_is_faded_by_its_tint_alpha() {
+    let gpu = require_gpu!();
+    let full = mean_value(&render_cloud_band(gpu, [1.0, 1.0, 1.0, 1.0]));
+    let quarter = mean_value(&render_cloud_band(gpu, [1.0, 1.0, 1.0, 0.25]));
+    let none = mean_value(&render_cloud_band(gpu, [1.0, 1.0, 1.0, 0.0]));
+    assert!(full > 0.0, "the sky pipeline drew nothing at all");
+    assert!(
+        quarter < full,
+        "a quarter-alpha tint must be dimmer: {quarter} against {full}"
+    );
+    assert!(
+        none < 0.01,
+        "a zero-alpha tint must draw nothing, got {none}"
+    );
+}
+
+/// A caster, the map it writes, and the ground that reads it -- in one pass
+/// each, with the matrix shared between them.
+///
+/// Returns the frame. The camera looks straight down at a ground plane; the
+/// caster is drawn **only** into the shadow map, so anything dark in the
+/// picture is a shadow rather than the caster itself.
+fn render_shadowed_ground(gpu: &Gpu, shadowed: bool) -> Vec<u8> {
+    let (w, h) = (64u32, 64u32);
+    let target = Offscreen::new(gpu, w, h, FORMAT);
+    let depth = DepthBuffer::new(gpu, w, h);
+    let mut meshes = MeshRenderer::new(gpu, FORMAT);
+    let map = render::ShadowMap::new(gpu, 256, meshes.bone_layout(), meshes.material_layout());
+    meshes.attach_shadow_map(gpu, map.view());
+
+    let radius = 10.0f32;
+    let texels = map.size();
+    let sun = glam::Vec3::Z;
+    let light = render::shadow::light_view_proj(glam::Vec3::ZERO, sun, radius, texels)
+        .expect("a sun overhead casts");
+
+    // A square of ground at z = 0, and a small square five units above the
+    // middle of it.
+    let plate = |half: f32, z: f32| {
+        let vertex = |x: f32, y: f32| MeshVertex {
+            position: [x, y, z],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 0.0],
+            bone_indices: [0; 4],
+            bone_weights: [0; 4],
+        };
+        (
+            [
+                vertex(-half, -half),
+                vertex(half, -half),
+                vertex(half, half),
+                vertex(-half, half),
+            ],
+            [0u32, 1, 2, 0, 2, 3],
+        )
+    };
+    let (ground_v, ground_i) = plate(9.0, 0.0);
+    let (caster_v, caster_i) = plate(3.0, 5.0);
+    let ground = GpuMesh::upload(gpu, &ground_v, &ground_i);
+    let caster = GpuMesh::upload(gpu, &caster_v, &caster_i);
+    let instances = InstanceBuffer::upload(gpu, &[Instance::IDENTITY]);
+    let bones = bones_with(gpu, &meshes, &[glam::Mat4::IDENTITY]);
+    let white = meshes.material_bind_group(gpu, &solid(gpu, [255, 255, 255, 255]));
+
+    // Straight down, so the picture is a plan of the ground.
+    let view_proj = glam::camera::rh::proj::directx::orthographic(-10.0, 10.0, -10.0, 10.0, 0.0, 100.0)
+        * glam::camera::rh::view::look_at_mat4(
+            glam::vec3(0.0, 0.0, 50.0),
+            glam::Vec3::ZERO,
+            glam::Vec3::Y,
+        );
+    let mut camera = identity_camera();
+    camera.view_proj = view_proj.to_cols_array_2d();
+    camera.light = [sun.x, sun.y, sun.z, 0.0];
+    // Half the light from the sun and half from the sky, so a shadow shows as
+    // a difference rather than as black.
+    camera.sun = [1.0, 1.0, 1.0, 1.0];
+    camera.ambient = [0.2, 0.2, 0.2, 0.0];
+    camera.light_view_proj = light.to_cols_array_2d();
+    camera.shadow = if shadowed {
+        [
+            1.0,
+            1.0 / texels as f32,
+            render::shadow::texel_size(radius, texels) * 1.5,
+            0.0,
+        ]
+    } else {
+        CameraUniform::NO_SHADOW
+    };
+    meshes.update_camera(gpu, &camera);
+
+    let state = RenderState {
+        blend: BlendMode::Opaque,
+        two_sided: true,
+        depth_write: true,
+        winding: Winding::Clockwise,
+    };
+    meshes.prepare(gpu, [state]);
+
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        map.set_matrix(gpu, light);
+        let mut pass = map.begin(&mut encoder);
+        pass.set_pipeline(map.mesh_pipeline());
+        pass.set_bind_group(1, &bones.bind_group, &[]);
+        pass.set_vertex_buffer(0, caster.vertices.slice(..));
+        pass.set_vertex_buffer(1, instances.buffer.slice(..));
+        pass.set_index_buffer(caster.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..caster_i.len() as u32, 0, 0..1);
+    }
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            multiview_mask: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(meshes.get(state).expect("pipeline"));
+        pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
+        pass.set_bind_group(1, &white, &[]);
+        pass.set_bind_group(2, &bones.bind_group, &[]);
+        pass.set_vertex_buffer(0, ground.vertices.slice(..));
+        pass.set_vertex_buffer(1, instances.buffer.slice(..));
+        pass.set_index_buffer(ground.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..ground_i.len() as u32, 0, 0..1);
+    }
+    gpu.queue.submit([encoder.finish()]);
+    target.read_rgba(gpu).expect("readback")
+}
+
+/// The end-to-end shadow: a thing above the ground darkens the ground under
+/// it, and only under it.
+///
+/// **Both halves, because either alone passes with the other broken.** A
+/// receiver that shadows everything it looks at satisfies "the middle is
+/// darker than nothing"; a matrix that misses the map entirely satisfies "the
+/// corner is lit". This milestone spent an hour on exactly the first of those
+/// with a person reading two screenshots, which is what a test is for.
+#[test]
+fn a_caster_darkens_the_ground_under_it_and_not_the_ground_beside_it() {
+    let gpu = require_gpu!();
+    let (w, h) = (64u32, 64u32);
+    let lit = |px: &[u8], x: u32, y: u32| {
+        let o = ((y * w + x) * 4) as usize;
+        px[o] as u32
+    };
+
+    let shadowed = render_shadowed_ground(gpu, true);
+    let middle = lit(&shadowed, w / 2, h / 2);
+    // Nine units of ground, three of caster, so the corners are well clear.
+    let corner = lit(&shadowed, 4, 4);
+    assert!(
+        corner > 200,
+        "open ground should be fully lit, got {corner}"
+    );
+    assert!(
+        middle + 40 < corner,
+        "the ground under the caster should be darker: {middle} against {corner}"
+    );
+
+    // And the control, which is the `--no-shadows` switch a person uses at the
+    // window: with the map turned off the two agree.
+    let plain = render_shadowed_ground(gpu, false);
+    assert_eq!(
+        lit(&plain, w / 2, h / 2),
+        lit(&plain, 4, 4),
+        "with shadows off the ground must be evenly lit"
+    );
+}
+
+/// The map holds what was drawn into it, and nothing where nothing was.
+///
+/// The counterpart to the test above: that one would still pass if the map
+/// were half empty and the receiver half wrong in a compensating way. This one
+/// looks at the buffer itself, which is the thing nothing displays.
+#[test]
+fn the_shadow_map_holds_the_caster_and_leaves_the_rest_at_the_far_plane() {
+    let gpu = require_gpu!();
+    let meshes = MeshRenderer::new(gpu, FORMAT);
+    let map = render::ShadowMap::new(gpu, 128, meshes.bone_layout(), meshes.material_layout());
+    let radius = 10.0f32;
+    let light = render::shadow::light_view_proj(glam::Vec3::ZERO, glam::Vec3::Z, radius, map.size())
+        .expect("a sun overhead casts");
+
+    let vertex = |x: f32, y: f32| MeshVertex {
+        position: [x, y, 5.0],
+        normal: [0.0, 0.0, 1.0],
+        uv: [0.0, 0.0],
+        bone_indices: [0; 4],
+        bone_weights: [0; 4],
+    };
+    let quad = [
+        vertex(-3.0, -3.0),
+        vertex(3.0, -3.0),
+        vertex(3.0, 3.0),
+        vertex(-3.0, 3.0),
+    ];
+    let mesh = GpuMesh::upload(gpu, &quad, &[0u32, 1, 2, 0, 2, 3]);
+    let instances = InstanceBuffer::upload(gpu, &[Instance::IDENTITY]);
+    let bones = bones_with(gpu, &meshes, &[glam::Mat4::IDENTITY]);
+
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        map.set_matrix(gpu, light);
+        let mut pass = map.begin(&mut encoder);
+        pass.set_pipeline(map.mesh_pipeline());
+        pass.set_bind_group(1, &bones.bind_group, &[]);
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_vertex_buffer(1, instances.buffer.slice(..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..6, 0, 0..1);
+    }
+    gpu.queue.submit([encoder.finish()]);
+
+    let depth = map.read_depth(gpu).expect("readback");
+    let size = map.size() as usize;
+    let at = |x: usize, y: usize| depth[y * size + x];
+    let centre = at(size / 2, size / 2);
+    assert!(
+        centre < 1.0,
+        "the caster left nothing in the middle of the map: {centre}"
+    );
+    assert!(
+        at(2, 2) >= 1.0,
+        "a corner the caster does not cover should still be at the far plane, got {}",
+        at(2, 2)
+    );
+    // Three units of nine, so the covered fraction is (6/20)^2 = 9%. A map
+    // that came back entirely full would mean the caster was drawn stretched
+    // across the whole frustum, which is what a wrong matrix looks like from
+    // the receiver's side -- and is indistinguishable there from a correct
+    // one, since both shadow everything.
+    let drawn = depth.iter().filter(|d| **d < 1.0).count();
+    let fraction = drawn as f32 / depth.len() as f32;
+    assert!(
+        (0.05..0.15).contains(&fraction),
+        "the caster should cover about 9% of the map, covered {:.1}%",
+        fraction * 100.0
+    );
 }

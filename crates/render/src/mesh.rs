@@ -74,6 +74,14 @@ pub struct CameraUniform {
     /// `x` where fog begins, `y` where it is total, both in world units. `y`
     /// of zero disables fog.
     pub fog_range: [f32; 4],
+    /// The matrix the shadow map was rendered with.
+    pub light_view_proj: [[f32; 4]; 4],
+    /// `x` how dark a shadow is, and **zero is the switch**: it means there is
+    /// no usable shadow map this frame, which is the ordinary state at night,
+    /// under a storm, and in every offline model view. `y` is one shadow texel
+    /// in texture coordinates and `z` how far along its own normal a surface
+    /// steps before asking.
+    pub shadow: [f32; 4],
 }
 
 impl CameraUniform {
@@ -85,6 +93,12 @@ impl CameraUniform {
         [0.0; 4],
         [0.0; 4],
     );
+
+    /// What to put in [`CameraUniform::shadow`] when there is no shadow map to
+    /// read. Named rather than written as `[0.0; 4]` at each call site because
+    /// the zero in `x` is a *switch*, and a reader should not have to know
+    /// which lane carries it.
+    pub const NO_SHADOW: [f32; 4] = [0.0; 4];
 }
 
 /// How a batch's material maps onto fixed-function state.
@@ -157,7 +171,9 @@ pub enum Winding {
 }
 
 impl Winding {
-    fn to_wgpu(self) -> wgpu::FrontFace {
+    /// Public because the celestial pipelines pick a front face the same way
+    /// and a second copy of the mapping would be a second thing to get wrong.
+    pub fn to_wgpu(self) -> wgpu::FrontFace {
         match self {
             Self::Clockwise => wgpu::FrontFace::Cw,
             Self::CounterClockwise => wgpu::FrontFace::Ccw,
@@ -174,18 +190,10 @@ pub struct RenderState {
     pub winding: Winding,
 }
 
+/// Appended to [`crate::shading::COMMON`], which declares the camera uniform,
+/// the shadow bindings and the three shading functions used below. One string
+/// rather than a copy per shader -- see that module for the drift that caused.
 const SHADER: &str = r#"
-struct Camera {
-    view_proj: mat4x4<f32>,
-    eye: vec4<f32>,
-    light: vec4<f32>,
-    sun: vec4<f32>,
-    ambient: vec4<f32>,
-    fog: vec4<f32>,
-    fog_range: vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(1) @binding(1) var samp: sampler;
 // Storage rather than uniform: bone counts are per-model and reach 315, which
@@ -258,37 +266,9 @@ fn vs(in: VsIn) -> VsOut {
     return out;
 }
 
-// Placeholder lighting: a single directional term plus ambient, enough to read
-// shape. Real lighting comes from the light DBCs much later.
-// Lighting from the world's own tables when there is any, and the old fixed
-// headlight when there is not -- an offline model view has no hour and no
-// place, and must still read as shape rather than going black. `sun.w` is the
-// switch: zero means no data. Shared verbatim with the terrain shader, because
-// terrain and the things standing on it disagreeing about what noon looks like
-// is exactly the seam a player would notice first.
-fn sky_light(normal: vec3<f32>) -> vec3<f32> {
-    let n = normalize(normal);
-    if (camera.sun.w <= 0.0) {
-        let ndl = max(dot(n, normalize(camera.light.xyz)), 0.0);
-        return vec3<f32>(0.38 + 0.62 * ndl);
-    }
-    let ndl = max(dot(n, normalize(camera.light.xyz)), 0.0);
-    return camera.ambient.rgb + camera.sun.rgb * ndl * camera.sun.w;
-}
-
-// Distance fog, applied after lighting. `fog_range.y` of zero disables it.
-fn fogged(colour: vec3<f32>, world: vec3<f32>) -> vec3<f32> {
-    if (camera.fog_range.y <= 0.0) {
-        return colour;
-    }
-    let distance = length(world - camera.eye.xyz);
-    let t = clamp((distance - camera.fog_range.x) / max(camera.fog_range.y - camera.fog_range.x, 1.0), 0.0, 1.0);
-    return mix(colour, camera.fog.rgb, t);
-}
-
 fn shade(normal: vec3<f32>, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
     let texel = textureSample(tex, samp, uv);
-    return vec4<f32>(fogged(texel.rgb * sky_light(normal), world), texel.a);
+    return vec4<f32>(fogged(texel.rgb * sky_light(normal, world), world), texel.a);
 }
 
 @fragment
@@ -375,6 +355,41 @@ pub struct MeshRenderer {
     material_layout: wgpu::BindGroupLayout,
     bone_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    /// Kept so the camera binding can be rebuilt when a shadow map is
+    /// attached, and so it is not dropped while a bind group still names it.
+    blank_shadow: wgpu::TextureView,
+    shadow_sampler: wgpu::Sampler,
+}
+
+/// The one place the camera bind group is assembled. Two copies of this would
+/// be two chances to bind the placeholder map to a renderer that has a real
+/// one -- and a shadow map that is never read looks exactly like a shadow map
+/// that is never filled.
+fn camera_bind_group(
+    gpu: &Gpu,
+    layout: &wgpu::BindGroupLayout,
+    camera: &wgpu::Buffer,
+    shadow: &wgpu::TextureView,
+    shadow_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("camera"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(shadow),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(shadow_sampler),
+            },
+        ],
+    })
 }
 
 /// Bone matrices for one model, plus the binding that exposes them.
@@ -390,23 +405,49 @@ impl MeshRenderer {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("mesh"),
-                source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!("{}{SHADER}", crate::shading::COMMON).into(),
+                ),
             });
 
         let camera_layout =
             gpu.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("camera"),
-                    entries: &[wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    }],
+                        // **The shadow map lives in group 0 because that is
+                        // the group terrain already shares.** Putting it
+                        // anywhere else would mean the ground and the
+                        // buildings standing on it reading their shadows from
+                        // two different bindings, which is the same seam the
+                        // shading code was unified to close.
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Depth,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                            count: None,
+                        },
+                    ],
                 });
 
         let material_layout =
@@ -444,14 +485,48 @@ impl MeshRenderer {
             mapped_at_creation: false,
         });
 
-        let camera_bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera"),
-            layout: &camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+        // **A 1x1 depth texture stands in until a real map is attached**, so
+        // there is exactly one camera bind group rather than one per "are
+        // shadows on" state. Everything that draws a model without a shadow
+        // pass -- the offline model view, every GPU test, `--screenshot`
+        // before the world exists -- binds this and reads `shadow.x` of zero,
+        // which says do not ask.
+        let blank = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("no shadow map"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::shadow::SHADOW_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
         });
+        let blank_shadow = blank.create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            // The comparison is what makes this a shadow sampler: the hardware
+            // does the depth test per tap, so a linear filter blends the
+            // *results* and one fetch is already four-tap soft.
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+
+        let camera_bind = camera_bind_group(
+            gpu,
+            &camera_layout,
+            &camera_buffer,
+            &blank_shadow,
+            &shadow_sampler,
+        );
 
         let bone_layout =
             gpu.device
@@ -492,7 +567,49 @@ impl MeshRenderer {
             material_layout,
             bone_layout,
             sampler: crate::texture::default_sampler(gpu),
+            blank_shadow,
+            shadow_sampler,
         }
+    }
+
+    /// Points the camera binding at a real shadow map.
+    ///
+    /// Separate from the constructor because the shadow pipelines need this
+    /// renderer's bone and material layouts to bind a model's existing pose
+    /// and texture -- so the map cannot exist before the renderer does, and
+    /// the renderer must be able to draw before the map exists.
+    pub fn attach_shadow_map(&mut self, gpu: &Gpu, view: &wgpu::TextureView) {
+        self.camera_bind = camera_bind_group(
+            gpu,
+            &self.camera_layout,
+            &self.camera_buffer,
+            view,
+            &self.shadow_sampler,
+        );
+    }
+
+    /// Puts the placeholder back, so a renderer whose shadow map has gone away
+    /// keeps drawing rather than holding a view of a dead texture.
+    pub fn detach_shadow_map(&mut self, gpu: &Gpu) {
+        self.camera_bind = camera_bind_group(
+            gpu,
+            &self.camera_layout,
+            &self.camera_buffer,
+            &self.blank_shadow,
+            &self.shadow_sampler,
+        );
+    }
+
+    /// The bone binding's layout, so the shadow pass can skin with the very
+    /// pose the visible pass does.
+    pub fn bone_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.bone_layout
+    }
+
+    /// The material binding's layout, so the shadow pass can alpha-test with
+    /// the very texture the visible pass draws.
+    pub fn material_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.material_layout
     }
 
     /// Allocates a bone palette. Always at least one matrix, because a storage

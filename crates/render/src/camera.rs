@@ -107,6 +107,10 @@ impl Orbit {
             ambient: [0.0; 4],
             fog: [0.0; 4],
             fog_range: [0.0; 4],
+            // A camera does not know where the sun is either, and a shadow
+            // strength of zero is what tells the shaders not to ask.
+            light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            shadow: CameraUniform::NO_SHADOW,
         }
     }
 }
@@ -305,6 +309,10 @@ impl Fly {
             ambient: [0.0; 4],
             fog: [0.0; 4],
             fog_range: [0.0; 4],
+            // A camera does not know where the sun is either, and a shadow
+            // strength of zero is what tells the shaders not to ask.
+            light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            shadow: CameraUniform::NO_SHADOW,
         }
     }
 }
@@ -384,6 +392,18 @@ impl Camera {
         match self {
             Self::Orbit(c) => c.eye(),
             Self::Fly(c) => c.position,
+        }
+    }
+
+    /// Where the camera is looking, as a unit vector.
+    ///
+    /// Used to aim the shadow box ahead of the viewer rather than around
+    /// them -- half a shadow map spent behind the player is half a shadow map
+    /// nobody will ever see.
+    pub fn forward(&self) -> Vec3 {
+        match self {
+            Self::Orbit(c) => (c.target - c.eye()).normalize_or_zero(),
+            Self::Fly(c) => c.forward(),
         }
     }
 

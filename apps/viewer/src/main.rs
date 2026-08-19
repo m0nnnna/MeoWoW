@@ -18,6 +18,7 @@ mod maps;
 mod minimap;
 mod model;
 mod scene;
+mod sky;
 mod sound;
 mod spells;
 mod taxi;
@@ -169,6 +170,38 @@ struct Args {
     /// How hard the `--weather` state is coming down, 0 to 1.
     #[arg(long, default_value_t = 1.0)]
     weather_intensity: f32,
+
+    /// Draw no shadows at all.
+    ///
+    /// **The A/B is the point.** A shadow is the one thing in this renderer
+    /// whose absence and whose failure look the same from a distance, and the
+    /// cheapest way to tell "the map is empty" from "the map is fine and the
+    /// scene is dark" is to turn it off and look again.
+    #[arg(long)]
+    no_shadows: bool,
+
+    /// How wide the shadowed region around the camera is, in world units.
+    ///
+    /// Exposed because it is the only number here whose right value is a
+    /// judgement: small is sharp and small, wide is soft and covers the hill
+    /// behind you. One cascade, so it is one or the other.
+    #[arg(long, default_value_t = 110.0)]
+    shadow_radius: f32,
+
+    /// How many texels across the shadow map is.
+    #[arg(long, default_value_t = 2048)]
+    shadow_size: u32,
+
+    /// Write the sun's depth map to this PNG, after rendering.
+    ///
+    /// `--screenshot` only, and the reason it exists is the reason every
+    /// format here has a dump command: a shadow map is the one buffer nothing
+    /// displays, and an empty one, a map of the sky and a map with its depth
+    /// axis reversed all come out as a world that is uniformly lit or
+    /// uniformly dark. Near the sun is dark, the far plane is white, and
+    /// anything the pass never drew is pure white.
+    #[arg(long)]
+    shadow_dump: Option<PathBuf>,
 
     /// Write the logged-in character's composed skin to this PNG.
     ///
@@ -1061,6 +1094,74 @@ fn streaming_camera(world: &world::World, chain: &mut Chain, args: &Args) -> Res
     Ok(Camera::Fly(fly))
 }
 
+/// How dark a shadow gets, as a fraction of the direct light it removes.
+///
+/// **Chosen, and not from `Light.dbc`.** Band 8 of the eighteen is the only
+/// one that is exactly neutral on every sample of every outdoor row -- 3,744
+/// of 3,744, against one to six percent for every other band -- so it is a
+/// scalar stored in a colour column rather than a colour, and a storm lowers
+/// it on 1,052 of the 1,331 samples where it moves at all. That is the
+/// shape a shadow strength would have. It is *not* named as one here: "band 8
+/// is a packed scalar the weather weakens" is what was measured, and which
+/// scalar it is has not been, and a wrong name for it would never fail
+/// loudly. See `wow-cli light --band-survey`.
+///
+/// Not 1.0, because ambient light is not the only thing that reaches a
+/// shadow: bounced light does too, and this renderer has no term for it.
+const SHADOW_STRENGTH: f32 = 0.72;
+
+/// The sky's own geometry and the sun's shadow map: everything a *place* has
+/// and a model viewer does not.
+///
+/// A struct rather than five more arguments, and for a reason this project
+/// has already paid for once -- `draw_streaming` takes no liquid cache
+/// because a cache that can be passed wrong is worse than no parameter. These
+/// five have to agree with each other (the map's size decides the receiver's
+/// filter width, the radius decides its normal offset), so they travel
+/// together or they drift.
+struct Atmosphere<'a> {
+    celestial: &'a render::CelestialRenderer,
+    sky: &'a sky::SkyScene,
+    /// `None` when shadows are switched off, which is a real state rather than
+    /// a failure: `--no-shadows` is the A/B this milestone is judged by.
+    shadow: Option<&'a render::ShadowMap>,
+    /// Half the width of the shadow box, in world units.
+    radius: f32,
+    /// How dark a shadow gets, before the weather is applied.
+    strength: f32,
+}
+
+/// Where to aim the shadow box.
+///
+/// **Ahead of the camera rather than on it.** A box centred on the eye spends
+/// half its texels on ground behind the viewer, and the whole reason the box
+/// is small is that its texels are precious. Two thirds forward is the usual
+/// compromise and it is a choice, not a measurement.
+///
+/// **And on the ground rather than at eye height, which is the half that was
+/// wrong first.** The box is 220 units deep along the sun's axis; a camera
+/// three hundred units up over Elwynn therefore had the whole landscape
+/// *outside* it, and the render came back with 162 pixels of 576,000
+/// different from the same scene drawn with `--no-shadows`. Nothing failed:
+/// the pass ran, the map filled with the depth of empty air, and every
+/// surface that asked was told it was lit. A shadow box aimed at nothing and
+/// a shadow feature that does not exist are the same picture, which is
+/// exactly why the A/B was worth taking before believing the first one.
+fn shadow_centre(world: &world::World, camera: &Camera, radius: f32) -> glam::Vec3 {
+    let ahead = camera.forward();
+    // Flattened, because the box is aimed along the ground: following the
+    // camera's pitch would swing the whole shadowed region into the sky the
+    // moment somebody looked up.
+    let flat = glam::Vec3::new(ahead.x, ahead.y, 0.0).normalize_or_zero();
+    let at = camera.eye() + flat * radius * 0.6;
+    // The ground under the aim point, or the eye's own height for a tile that
+    // has not streamed in -- which is the same fallback every other height
+    // query here makes, and is wrong in the direction that costs a shadow
+    // rather than a crash.
+    let ground = world.height_at(at.x, at.y).unwrap_or(at.z);
+    glam::Vec3::new(at.x, at.y, ground)
+}
+
 /// Records one frame. Shared by the windowed and headless paths so the two
 /// cannot drift apart.
 #[allow(clippy::too_many_arguments)]
@@ -1101,6 +1202,10 @@ fn draw_scene(
     // it and produce the same picture twice -- the same reason `--screenshot`
     // hands the precipitation a fixed clock.
     seconds: f32,
+    // The sky's geometry and the sun's shadow map. `None` for the offline
+    // scenes, which have no place and therefore no sky -- the same reason
+    // they get no gradient and no weather.
+    atmosphere: Option<&Atmosphere<'_>>,
 ) {
     // Terrain has its own pipeline, so both the tile and world scenes route
     // their landscape through here.
@@ -1130,6 +1235,7 @@ fn draw_scene(
             bones,
             lighting,
             seconds,
+            atmosphere,
         );
         return;
     }
@@ -1549,6 +1655,7 @@ fn draw_streaming(
     bones: Option<&BoneBuffer>,
     lighting: Option<(dbc::light::Sample, f32)>,
     seconds: f32,
+    atmosphere: Option<&Atmosphere<'_>>,
 ) {
     let aspect = size.0 as f32 / size.1.max(1) as f32;
     // **The one uniform, kept.** The liquid pass has its own bind group and
@@ -1557,8 +1664,107 @@ fn draw_streaming(
     // somebody edited one of them. Water lit half a stop off the shore it laps
     // against is a seam nothing would catch but an eye. Same rule as the
     // picking ray being unprojected from the matrix the scene was drawn with.
-    let lit = lit_uniform(camera, aspect, sky, lighting);
+    // **Where the sun is, decided once.** The gradient's disc, the world's
+    // diffuse term and the shadow box all take this one vector, so a sun the
+    // shadows disagree with is not a state that exists.
+    let sun = lighting.map_or(glam::Vec3::Z, |(_, hour)| sun_direction(hour));
+    // A storm both hides the sun and softens what it casts, and the same
+    // number does both -- see the gradient's `visibility` below.
+    let clear = 1.0 - falling.map_or(0.0, |f| f.intensity);
+    // `None` at night, under a storm, with shadows switched off, and wherever
+    // there is no light data to put a sun in the sky. Each of those is a
+    // reason for no shadows rather than a failure to produce any.
+    let cast = atmosphere
+        .filter(|_| lighting.is_some())
+        .and_then(|a| a.shadow.map(|map| (a, map)))
+        .and_then(|(a, map)| {
+            let centre = shadow_centre(world, camera, a.radius);
+            render::shadow::light_view_proj(centre, sun, a.radius, map.size())
+                .map(|matrix| (a, map, matrix))
+        })
+        .filter(|(a, _, _)| a.strength * clear > 0.0);
+
+    let lit = lit_uniform(
+        camera,
+        aspect,
+        sky,
+        lighting,
+        cast.map(|(a, map, matrix)| ShadowTerms {
+            matrix,
+            radius: a.radius,
+            texels: map.size(),
+            strength: a.strength * clear,
+        }),
+    );
     meshes.update_camera(gpu, &lit);
+
+    // **Before the world's pass, and in its own.** A depth-only pass with no
+    // colour attachment cannot share the scene's, and the scene's fragments
+    // read the map this one writes -- so the order is not a preference.
+    if let Some((_, map, matrix)) = cast {
+        map.set_matrix(gpu, matrix);
+        let mut pass = map.begin(encoder);
+        pass.set_pipeline(map.terrain_pipeline());
+        for tile in world.tiles() {
+            pass.set_vertex_buffer(0, tile.terrain.mesh.vertices.slice(..));
+            pass.set_index_buffer(
+                tile.terrain.mesh.indices.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            for chunk in &tile.terrain.chunks {
+                pass.draw_indexed(
+                    chunk.first_index..chunk.first_index + chunk.index_count,
+                    0,
+                    0..1,
+                );
+            }
+        }
+        for group in world.tiles().flat_map(|t| t.groups.iter()).chain(world.entities()) {
+            // The pose the visible pass will use, not a second evaluation of
+            // it: a shadow computed from the bind pose while the creature runs
+            // is a silhouette standing beside its own model.
+            let Some(group_bones) = group
+                .animation
+                .and_then(|key| world.entity_bone_buffer(key))
+                .or(bones)
+            else {
+                continue;
+            };
+            pass.set_bind_group(1, &group_bones.bind_group, &[]);
+            pass.set_vertex_buffer(0, group.model.mesh.vertices.slice(..));
+            pass.set_vertex_buffer(1, group.instances.buffer.slice(..));
+            pass.set_index_buffer(
+                group.model.mesh.indices.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            for draw in &group.model.draws {
+                // Glass, glows and sprays cast nothing. A torch flame with a
+                // solid shadow is worse than a torch flame with none.
+                if draw.state.blend.is_transparent() {
+                    continue;
+                }
+                let Some(bind) = group.model.binds.get(draw.texture) else {
+                    continue;
+                };
+                pass.set_pipeline(
+                    if draw.state.blend == render::mesh::BlendMode::AlphaKey {
+                        map.mesh_alpha_pipeline()
+                    } else {
+                        map.mesh_pipeline()
+                    },
+                );
+                // Bound for both pipelines even though only the alpha one
+                // reads it: a pipeline layout declares the group, so leaving
+                // it unset is a validation error rather than a saved bind.
+                pass.set_bind_group(2, bind, &[]);
+                pass.draw_indexed(
+                    draw.first_index..draw.first_index + draw.index_count,
+                    0,
+                    0..group.count,
+                );
+            }
+        }
+    }
     // Built once here and handed to both the sky and the scene, rather than
     // each asking the camera for its own: the sky's horizon has to sit exactly
     // where the ground's does, and two derivations agree only until one of them
@@ -1600,12 +1806,29 @@ fn draw_streaming(
         &sky_gradient(lighting.as_ref()),
         // The same arc the world is lit by, so the shadows and the disc agree
         // about where the sun is -- one function, not two copies of an angle.
-        lighting.map_or(glam::Vec3::Z, |(_, hour)| sun_direction(hour)),
+        sun,
         sky.encode(lighting.map_or([1.0; 3], |(sample, _)| sample.disc)),
         // A storm hides the sun. `Light.dbc` has nothing to say about this,
         // but the alternative is a sun burning through an overcast sky.
-        1.0 - falling.map_or(0.0, |f| f.intensity),
+        clear,
     );
+
+    // Then everything that is *on* the sky, over the gradient and under the
+    // world. See `sky::SkyScene::draw` for why the three are in this order.
+    if let Some(a) = atmosphere {
+        a.sky.draw(
+            gpu,
+            &mut pass,
+            a.celestial,
+            view_proj,
+            camera.eye(),
+            sun,
+            lighting.as_ref().map(|(sample, _)| sample),
+            lighting.map_or(12.0, |(_, hour)| hour),
+            falling.map_or(0.0, |f| f.intensity),
+            seconds,
+        );
+    }
 
     pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
     pass.set_pipeline(terrain_renderer.pipeline());
@@ -1956,8 +2179,20 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     let depth = DepthBuffer::new(&gpu, args.width, args.height);
     let blitter = Blitter::new(&gpu, format);
     let mut meshes = MeshRenderer::new(&gpu, format);
+    let shadow = (!args.no_shadows).then(|| {
+        render::ShadowMap::new(
+            &gpu,
+            args.shadow_size,
+            meshes.bone_layout(),
+            meshes.material_layout(),
+        )
+    });
+    if let Some(map) = &shadow {
+        meshes.attach_shadow_map(&gpu, map.view());
+    }
     let terrain_renderer = TerrainRenderer::new(&gpu, format, meshes.camera_layout());
     let sky = render::SkyRenderer::new(&gpu, format);
+    let mut celestial = render::CelestialRenderer::new(&gpu, format);
     let precipitation = render::PrecipitationRenderer::new(&gpu, format);
     let liquid_renderer = render::LiquidRenderer::new(&gpu, format);
     let mut liquid_types = liquid::LiquidTypes::default();
@@ -2029,6 +2264,29 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     };
     let weather = frame_weather(live.as_ref(), args);
 
+    // After the lighting tables, because the star dome is found through them.
+    // **A headless render draws the sky and the shadows and still draws no
+    // HUD** -- which is the distinction 4.24 had to learn the hard way, and is
+    // why this milestone is one of the few whose picture half a screenshot
+    // really can confirm.
+    let mut sky_scene = sky::SkyScene::load(&gpu, chain, &mut celestial, lighting.as_ref());
+    let frame_lighting = resolve_lighting(
+        lighting.as_ref(),
+        live.as_ref(),
+        weather,
+        offline_map,
+        args.hour,
+        camera_eye,
+    );
+    sky_scene.set_skybox(
+        &gpu,
+        chain,
+        &mut celestial,
+        lighting.as_ref(),
+        frame_lighting.map_or(0, |(sample, _)| sample.skybox_id),
+    );
+    tracing::info!("{}", sky_scene.describe());
+
     // **Stepped before the encoder opens, and stepped several times.** A
     // headless render draws one frame, and one frame of a particle system is
     // an emitter that has just been switched on: no fire, a few sparks at the
@@ -2091,21 +2349,55 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
         bones.as_ref(),
         &world_binds,
         &identity,
-        resolve_lighting(
-            lighting.as_ref(),
-            live.as_ref(),
-            weather,
-            offline_map,
-            args.hour,
-            camera_eye,
-        ),
+        frame_lighting,
         // The same fixed clock the weather gets, and for the same reason: a
         // river whose surface scrolled with the wall clock would make two
         // screenshots of one scene differ, which is precisely what
         // `--screenshot` exists not to do.
         4.0,
+        Some(&Atmosphere {
+            celestial: &celestial,
+            sky: &sky_scene,
+            shadow: shadow.as_ref(),
+            radius: args.shadow_radius,
+            strength: SHADOW_STRENGTH,
+        }),
     );
     gpu.queue.submit([encoder.finish()]);
+
+    if let (Some(path), Some(map)) = (&args.shadow_dump, &shadow) {
+        let depth = map.read_depth(&gpu)?;
+        // Stretched to the range actually present rather than shown raw. An
+        // orthographic box 440 units deep holding a landscape 40 units tall
+        // uses a tenth of its range, and printed raw that is a white square
+        // with a slightly-less-white square in it -- a picture that says
+        // "empty" about a map that is full.
+        let (lo, hi) = depth
+            .iter()
+            .filter(|d| **d < 1.0)
+            .fold((1.0f32, 0.0f32), |(lo, hi), d| (lo.min(*d), hi.max(*d)));
+        let span = (hi - lo).max(1e-6);
+        let rgba: Vec<u8> = depth
+            .iter()
+            .flat_map(|d| {
+                let v = if *d >= 1.0 {
+                    255
+                } else {
+                    (((d - lo) / span) * 224.0) as u8
+                };
+                [v, v, v, 255]
+            })
+            .collect();
+        write_png(path, &rgba, map.size(), map.size())?;
+        let drawn = depth.iter().filter(|d| **d < 1.0).count();
+        // Both numbers, always. "Nothing warned" is not "nothing was wrong".
+        println!(
+            "shadow map {0}x{0}: {drawn} texels drawn, {1} left at the far plane, depth {lo:.4}..{hi:.4} -> {2}",
+            map.size(),
+            depth.len() - drawn,
+            path.display()
+        );
+    }
 
     let rgba = target.read_rgba(&gpu)?;
     write_png(out, &rgba, target.width, target.height)?;
@@ -2145,6 +2437,14 @@ struct Renderer {
     meshes: MeshRenderer,
     terrain_renderer: TerrainRenderer,
     sky: render::SkyRenderer,
+    /// The pipelines for what is drawn *on* the sky, and the three things
+    /// drawn there. Two objects for the same reason the particles are: one is
+    /// grown before the pass opens and the other only read once it has.
+    celestial: render::CelestialRenderer,
+    sky_scene: sky::SkyScene,
+    /// The sun's depth map. `None` under `--no-shadows`, which exists because
+    /// the honest way to judge a shadow is to be able to turn it off.
+    shadow: Option<render::ShadowMap>,
     precipitation: render::PrecipitationRenderer,
     /// The pipelines and buffers for everything alight, and the live emitter
     /// state that feeds them.
@@ -2989,6 +3289,19 @@ fn sun_direction(hour: f32) -> glam::Vec3 {
     glam::Vec3::new(0.0, -t.cos(), t.sin()).normalize_or_zero()
 }
 
+/// What a frame's shadow map is, for the surfaces that will read it.
+///
+/// Five numbers that have to agree: the matrix decides where a surface looks
+/// in the map, the radius and the texel count decide how far it steps off its
+/// own normal first, and the strength decides how much notice it takes.
+#[derive(Clone, Copy)]
+struct ShadowTerms {
+    matrix: glam::Mat4,
+    radius: f32,
+    texels: u32,
+    strength: f32,
+}
+
 /// The camera uniform with real lighting folded in, or the placeholder when
 /// there is none.
 fn lit_uniform(
@@ -2997,6 +3310,7 @@ fn lit_uniform(
     // Only for its colour conversion -- see the fog term below.
     sky: &render::SkyRenderer,
     lighting: Option<(dbc::light::Sample, f32)>,
+    shadow: Option<ShadowTerms>,
 ) -> render::mesh::CameraUniform {
     let mut uniform = camera.uniform(aspect);
     let Some((sample, hour)) = lighting else {
@@ -3034,6 +3348,21 @@ fn lit_uniform(
     let fog = sky.encode(sample.fog());
     uniform.fog = [fog[0], fog[1], fog[2], 0.0];
     uniform.fog_range = [sample.fog_start, sample.fog_end, 0.0, 0.0];
+    if let Some(shadow) = shadow {
+        uniform.light_view_proj = shadow.matrix.to_cols_array_2d();
+        uniform.shadow = [
+            shadow.strength,
+            // One texel, in the map's own texture coordinates: the PCF step.
+            1.0 / shadow.texels.max(1) as f32,
+            // And one texel in *world* units, which is what a surface steps
+            // along its normal before asking. A shorter step leaves acne and a
+            // longer one detaches a shadow from the thing casting it, and both
+            // scale with the same number -- so this is derived from the box
+            // rather than tuned against one screenshot.
+            render::shadow::texel_size(shadow.radius, shadow.texels) * 1.5,
+            0.0,
+        ];
+    }
     uniform
 }
 
@@ -3497,8 +3826,26 @@ impl ApplicationHandler for App {
 
         let blitter = Blitter::new(&gpu, format);
         let mut meshes = MeshRenderer::new(&gpu, format);
+        // **The shadow map is built from the mesh renderer's own layouts and
+        // then handed back to it.** The two need each other: the shadow pass
+        // binds a model's existing pose and texture, and the visible pass
+        // reads the map the shadow pass wrote. Neither can be constructed
+        // holding the other, so the mesh renderer starts with a 1x1
+        // placeholder map and is pointed at the real one here.
+        let shadow = (!self.args.no_shadows).then(|| {
+            render::ShadowMap::new(
+                &gpu,
+                self.args.shadow_size,
+                meshes.bone_layout(),
+                meshes.material_layout(),
+            )
+        });
+        if let Some(map) = &shadow {
+            meshes.attach_shadow_map(&gpu, map.view());
+        }
         let terrain_renderer = TerrainRenderer::new(&gpu, format, meshes.camera_layout());
         let sky = render::SkyRenderer::new(&gpu, format);
+        let mut celestial = render::CelestialRenderer::new(&gpu, format);
         let precipitation = render::PrecipitationRenderer::new(&gpu, format);
         let particles = render::ParticleRenderer::new(&gpu, format);
         let emitters = emitters::Emitters::new();
@@ -3571,6 +3918,17 @@ impl ApplicationHandler for App {
                 self.anim = self.args.anim.or_else(|| (!m.sequences.is_empty()).then_some(0));
             }
         }
+        // After the lighting tables, because the star dome is a row of
+        // `LightSkybox` and is found through them rather than by a path
+        // written here.
+        let sky_scene = sky::SkyScene::load(
+            &gpu,
+            &mut self.chain,
+            &mut celestial,
+            self.lighting.as_ref(),
+        );
+        tracing::info!("{}", sky_scene.describe());
+
         let world_binds = scene
             .as_ref()
             .map(|s| world_bind_groups(&gpu, &meshes, s))
@@ -3591,6 +3949,9 @@ impl ApplicationHandler for App {
             meshes,
             terrain_renderer,
             sky,
+            celestial,
+            sky_scene,
+            shadow,
             precipitation,
             particles,
             emitters,
@@ -4511,6 +4872,17 @@ impl App {
             self.args.hour,
             eye,
         );
+        // Before the pass, because loading a backdrop builds pipelines and
+        // bind groups and a render pass has already taken the encoder. On
+        // Azeroth and Kalimdor this is always id 0 and does nothing at all --
+        // no outdoor light on either continent names a skybox.
+        r.sky_scene.set_skybox(
+            &r.gpu,
+            &mut self.chain,
+            &mut r.celestial,
+            self.lighting.as_ref(),
+            lighting.map_or(0, |(sample, _)| sample.skybox_id),
+        );
         if let Some(scene) = &r.scene {
             draw_scene(
                 &r.gpu,
@@ -4536,6 +4908,13 @@ impl App {
                 &r.identity,
                 lighting,
                 self.started.elapsed().as_secs_f32(),
+                Some(&Atmosphere {
+                    celestial: &r.celestial,
+                    sky: &r.sky_scene,
+                    shadow: r.shadow.as_ref(),
+                    radius: self.args.shadow_radius,
+                    strength: SHADOW_STRENGTH,
+                }),
             );
         }
 
