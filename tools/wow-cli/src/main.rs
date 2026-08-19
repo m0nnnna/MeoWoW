@@ -426,6 +426,81 @@ enum Command {
         /// the first time the server has ever moved this character.
         #[arg(long)]
         fly_to: Option<u32>,
+        /// Ask the nearest reachable mailbox what is in the inbox, and print
+        /// every record with **its announced length beside its real one**.
+        ///
+        /// The mailbox is found by asking what each replicated game object in
+        /// range *is* -- `CMSG_GAMEOBJECT_QUERY` -- because a display id says
+        /// how to draw a thing and nothing about what it does. Spawn one with
+        /// `.gobject add 142075` if there is none nearby; Northshire has no
+        /// mailbox and the closest is 537 units away in Goldshire.
+        #[arg(long)]
+        mail_list: bool,
+        /// Post a letter to this character by name.
+        ///
+        /// **The bounding send for the whole block**: it is answered either
+        /// way by `SMSG_SEND_MAIL_RESULT`, whose action field echoes the
+        /// request, so one send confirms the opcode, the body and the reply
+        /// layout together. Trade had no such neighbour and had to be bounded
+        /// by its own refusal; mail does, and this is it.
+        #[arg(long)]
+        mail_to: Option<String>,
+        /// The subject line. Also the thing that makes a letter findable in
+        /// the realm's own database afterwards.
+        #[arg(long, default_value = "probe")]
+        mail_subject: String,
+        /// The body text. An empty body is a *different* letter as far as the
+        /// check mask is concerned -- the server sets `HAS_BODY` only when
+        /// there is one -- which is worth varying deliberately.
+        #[arg(long, default_value = "")]
+        mail_text: String,
+        /// Enclose this many copper. The server charges thirty on top.
+        #[arg(long, default_value_t = 0)]
+        mail_money: u32,
+        /// Attach the carried item with this **entry**.
+        ///
+        /// The delivery delay is the thing this varies: the server applies an
+        /// hour's wait only to mail that **carries items** and only when the
+        /// recipient is on another account, so item mail to a character on the
+        /// same account should arrive at once. That claim comes from the
+        /// server's source and is unconfirmed until this has been run both
+        /// ways.
+        #[arg(long)]
+        mail_item: Option<u32>,
+        /// Take everything out of the first letter that has anything in it,
+        /// then re-ask the inbox.
+        ///
+        /// Re-asking rather than editing the local copy, for the reason the
+        /// trainer list is re-asked after a purchase: a request the server may
+        /// have declined must not be drawn as though it went through.
+        #[arg(long)]
+        mail_take: bool,
+        /// Sit still for this many seconds and report every `SMSG_RECEIVED_MAIL`
+        /// that lands.
+        ///
+        /// **The measurement this milestone is really about.** Nothing is sent
+        /// during the wait, so anything that arrives arrived because somebody
+        /// else acted -- which no other packet this client reads has ever done.
+        /// Drive it from a second session or from `.send mail` at the console.
+        #[arg(long, default_value_t = 0)]
+        mail_wait: u64,
+        /// Throw away every letter that has nothing left in it, then re-ask.
+        ///
+        /// Exercises `CMSG_MAIL_DELETE`, which is answered like the rest of
+        /// the block -- and it is worth sending once deliberately rather than
+        /// leaving implemented and never used, which is how a request nobody
+        /// has confirmed ends up documented as though it worked.
+        #[arg(long)]
+        mail_clear: bool,
+        /// Ask `CMSG_GET_MAIL_LIST` with the **reader's own guid** as the
+        /// mailbox.
+        ///
+        /// The server accepts that from a game master and from nobody else,
+        /// and every fixture account on this realm is one -- so this is
+        /// measured deliberately in order to be ruled out. A client built on
+        /// it would work for the person who wrote it and for no player.
+        #[arg(long)]
+        mail_own_guid: bool,
         /// Ask this **player**, by name, to trade -- then drive the whole
         /// exchange and report every packet.
         ///
@@ -1372,6 +1447,16 @@ fn main() -> Result<()> {
             learn,
             taxi,
             fly_to,
+            mail_list,
+            mail_to,
+            mail_subject,
+            mail_text,
+            mail_money,
+            mail_item,
+            mail_take,
+            mail_clear,
+            mail_wait,
+            mail_own_guid,
             trade,
             trade_wait,
             trade_decline,
@@ -1442,6 +1527,16 @@ fn main() -> Result<()> {
                 learn: *learn,
                 taxi: *taxi,
                 fly_to: *fly_to,
+                mail_list: *mail_list,
+                mail_to: mail_to.as_deref(),
+                mail_subject,
+                mail_text,
+                mail_money: *mail_money,
+                mail_item: *mail_item,
+                mail_take: *mail_take,
+                mail_clear: *mail_clear,
+                mail_wait: *mail_wait,
+                mail_own_guid: *mail_own_guid,
                 trade: trade.as_deref(),
                 trade_wait: *trade_wait,
                 trade_decline: *trade_decline,
@@ -1638,6 +1733,16 @@ struct WorldRequest<'a> {
     learn: Option<u32>,
     taxi: Option<u32>,
     fly_to: Option<u32>,
+    mail_list: bool,
+    mail_to: Option<&'a str>,
+    mail_subject: &'a str,
+    mail_text: &'a str,
+    mail_money: u32,
+    mail_item: Option<u32>,
+    mail_take: bool,
+    mail_clear: bool,
+    mail_wait: u64,
+    mail_own_guid: bool,
     trade: Option<&'a str>,
     trade_wait: bool,
     trade_decline: bool,
@@ -1763,6 +1868,16 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         learn,
         taxi,
         fly_to,
+        mail_list,
+        mail_to,
+        mail_subject,
+        mail_text,
+        mail_money,
+        mail_item,
+        mail_take,
+        mail_clear,
+        mail_wait,
+        mail_own_guid,
         trade,
         trade_wait,
         trade_decline,
@@ -2684,6 +2799,33 @@ cast {spell_id} at {} (attempt {attempt})",
                 &mut here,
                 prefer,
                 fly_to,
+            )?;
+        }
+
+        if mail_list
+            || mail_to.is_some()
+            || mail_take
+            || mail_clear
+            || mail_wait > 0
+            || mail_own_guid
+        {
+            survey_mail(
+                &mut connection,
+                &mut state,
+                character.guid,
+                &mut here,
+                MailDrive {
+                    list: mail_list,
+                    to: mail_to,
+                    subject: mail_subject,
+                    text: mail_text,
+                    money: mail_money,
+                    item: mail_item,
+                    take: mail_take,
+                    clear: mail_clear,
+                    wait: mail_wait,
+                    own_guid: mail_own_guid,
+                },
             )?;
         }
 
@@ -14138,6 +14280,508 @@ the SMSG_MONSTER_MOVE naming this character, {} bytes:", packet.body.len());
     Ok(())
 }
 
+
+/// What a `--mail-*` run should do.
+struct MailDrive<'a> {
+    list: bool,
+    to: Option<&'a str>,
+    subject: &'a str,
+    text: &'a str,
+    money: u32,
+    item: Option<u32>,
+    take: bool,
+    clear: bool,
+    wait: u64,
+    own_guid: bool,
+}
+
+/// Drives the mail block and reports every packet in it.
+///
+/// **The novelty this probe exists to measure is an absence of a request.**
+/// Everything else here sends something and reads the answer; `--mail-wait`
+/// sends *nothing at all* and reports what arrives anyway, which is a shape
+/// no other probe in this tree has needed.
+///
+/// The rest is the ordinary bounding move, and mail supplies it where trade
+/// could not: `CMSG_SEND_MAIL` is answered either way, and the answer echoes
+/// the **action** it was for, so a single send confirms the opcode number, the
+/// body and the reply layout together. Everything silent in this block is sent
+/// only after that has come back.
+fn survey_mail(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    // Written back, like every walking probe here: replicated state holds our
+    // login position forever, and four callers have already had to relearn it.
+    here: &mut world::Position,
+    drive: MailDrive<'_>,
+) -> Result<()> {
+    // The server logs "maximal 10 is allowed" and checks with its own
+    // model-aware box test, so the approach aims comfortably inside -- the
+    // same two-distance rule `approach_talker` documents at length.
+    const REACH: f32 = 5.0;
+    const APPROACH_TO: f32 = 3.0;
+    const RUN_SPEED: f32 = 7.0;
+
+    // ---------------------------------------------------------------- mailbox
+    //
+    // **A display id says how to draw a thing and nothing about what it is.**
+    // Game objects have been replicated and drawn since Phase 3 and this is
+    // the first feature that has to pick one *kind* out of a field of them, so
+    // it is also the first send of `CMSG_GAMEOBJECT_QUERY` this client has
+    // ever made.
+    let entries: std::collections::BTreeSet<u32> =
+        state.game_objects().filter_map(|go| go.entry()).collect();
+    println!(
+        "\ngame objects in view: {} objects, {} distinct entries",
+        state.game_objects().count(),
+        entries.len()
+    );
+    if !entries.is_empty() {
+        println!("  asking what each one *is* -- a display id cannot answer that.");
+        for entry in &entries {
+            connection.ask_gameobject(*entry, 0)?;
+        }
+        let batch = connection.drain(std::time::Duration::from_millis(1200), 128)?;
+        state.replicate(&batch, None);
+    }
+
+    let mut mailbox: Option<(u64, world::Position)> = None;
+    for object in state.game_objects() {
+        let Some(entry) = object.entry() else { continue };
+        let info = state.names.gameobject(entry).flatten();
+        let (name, kind) = match info {
+            Some(info) => (info.name.clone().unwrap_or_default(), info.kind),
+            None => (String::new(), u32::MAX),
+        };
+        let distance = object.position.map(|at| {
+            ((at.x - here.x).powi(2) + (at.y - here.y).powi(2) + (at.z - here.z).powi(2)).sqrt()
+        });
+        let is_mailbox = info.is_some_and(|info| info.is_mailbox());
+        println!(
+            "  {:#018x}  entry {entry:<7} type {:<6} {:<28} {}{}",
+            object.guid,
+            if kind == u32::MAX {
+                "?".to_string()
+            } else {
+                kind.to_string()
+            },
+            name,
+            distance
+                .map(|d| format!("{d:.1} units"))
+                .unwrap_or_else(|| "(no position)".into()),
+            if is_mailbox { "   <- MAILBOX" } else { "" }
+        );
+        if is_mailbox {
+            if let Some(at) = object.position {
+                let better = mailbox
+                    .map(|(_, best): (u64, world::Position)| {
+                        let d = |p: world::Position| {
+                            ((p.x - here.x).powi(2) + (p.y - here.y).powi(2)).sqrt()
+                        };
+                        d(at) < d(best)
+                    })
+                    .unwrap_or(true);
+                if better {
+                    mailbox = Some((object.guid, at));
+                }
+            }
+        }
+    }
+
+    // --------------------------------------------------- the game master trap
+    //
+    // Measured deliberately in order to be **ruled out**. The server accepts
+    // the reader's own guid as a mailbox from anybody at moderator rank or
+    // above, and every fixture account on this realm is a game master -- so
+    // the cheapest probe available is the one that would ship a client working
+    // only for its author. The same shape as "a refusal is a fact about the
+    // actor", with the sign reversed: an *acceptance* can be one too.
+    if drive.own_guid {
+        println!("\n--mail-own-guid: CMSG_GET_MAIL_LIST naming this character's own guid.");
+        println!("  The server accepts that from a game master and from nobody else.");
+        connection.get_mail_list(own_guid)?;
+        let batch = connection.drain(std::time::Duration::from_millis(1500), 128)?;
+        let answered = batch
+            .iter()
+            .any(|p| p.opcode == world::opcode::server::MAIL_LIST_RESULT);
+        let report = state.replicate(&batch, None);
+        println!(
+            "  -> {}",
+            if answered {
+                "ANSWERED. This works here and would not work for a player."
+            } else {
+                "no answer, which is what a non-GM would see."
+            }
+        );
+        for (opcode, error, body) in &report.failures {
+            println!("  undecodable {}: {error}", world::opcode::describe(*opcode));
+            if let Ok(body) = body {
+                println!("    {} bytes: {}", body.len(), hex_preview(body, 128));
+            }
+        }
+    }
+
+    let Some((mailbox_guid, at)) = mailbox else {
+        println!("\nNo mailbox in view, so nothing below can run.");
+        println!("  Northshire has none -- the nearest is 537 units away in Goldshire.");
+        println!("  `.gobject add 142075` puts one at the character's feet.");
+        return Ok(());
+    };
+
+    let distance = ((at.x - here.x).powi(2) + (at.y - here.y).powi(2)).sqrt();
+    println!("\nusing mailbox {mailbox_guid:#018x}, {distance:.1} units away");
+    if distance > REACH {
+        let heading = (at.y - here.y).atan2(at.x - here.x);
+        let close = distance - APPROACH_TO;
+        println!("  closing {close:.1} units -- the server refuses past about {REACH:.0}");
+        let (arrived, _) = connection.walk(own_guid, *here, heading, close, RUN_SPEED)?;
+        *here = arrived;
+        here.orientation = heading;
+        let batch = connection.drain(std::time::Duration::from_millis(400), 128)?;
+        state.replicate(&batch, None);
+    }
+
+    // ------------------------------------------------------------ the sending
+    //
+    // **The bounding send.** Answered either way, and the answer names the
+    // action it was for -- so this one packet coming back settles the opcode
+    // number, the body layout and the reply layout together. Nothing silent in
+    // this block is sent before it has.
+    if let Some(receiver) = drive.to {
+        let mut attached = Vec::new();
+        if let Some(entry) = drive.item {
+            match world::inventory::carried(state, own_guid)
+                .into_iter()
+                .find(|carried| carried.item.entry == Some(entry))
+            {
+                Some(carried) => {
+                    println!("\nattaching entry {entry}, item {:#018x}", carried.item.guid);
+                    attached.push(carried.item.guid);
+                }
+                None => println!("\nnothing with entry {entry} is in the bags -- sending without."),
+            }
+        }
+        println!(
+            "\nposting to {receiver:?}: subject {:?}, {} copper, {} attachment(s)",
+            drive.subject,
+            drive.money,
+            attached.len()
+        );
+        println!("  The server charges 30 copper for the stamp on top of the enclosure.");
+        connection.send_mail(
+            mailbox_guid,
+            receiver,
+            drive.subject,
+            drive.text,
+            drive.money,
+            0,
+            &attached,
+        )?;
+        let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+        let report = state.replicate(&batch, None);
+        report_mail_results(&report);
+        if report.mail_results.is_empty() {
+            println!("\n  NOTHING came back, and that is the informative failure: this is the");
+            println!("  one request in the block that is answered either way, so silence");
+            println!("  means the opcode number is wrong rather than that the send was");
+            println!("  declined. Everything that did arrive:");
+            for packet in &batch {
+                println!(
+                    "    {} ({:#06x}), {} bytes",
+                    world::opcode::describe(packet.opcode),
+                    packet.opcode,
+                    packet.body.len()
+                );
+            }
+        }
+        for (opcode, error, body) in &report.failures {
+            println!("  undecodable {}: {error}", world::opcode::describe(*opcode));
+            if let Ok(body) = body {
+                println!("    {} bytes: {}", body.len(), hex_preview(body, 128));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------- the inbox
+    if drive.list || drive.take || drive.clear {
+        // Asked from anywhere first, because it is the only mail question that
+        // does not need a mailbox and it is what a client has at login.
+        println!("\nMSG_QUERY_NEXT_MAIL_TIME -- the one mail question with no mailbox in it.");
+        connection.query_next_mail_time()?;
+        let batch = connection.drain(std::time::Duration::from_millis(1200), 128)?;
+        for packet in &batch {
+            if packet.opcode == world::opcode::server::QUERY_NEXT_MAIL_TIME {
+                println!(
+                    "  {} bytes: {}",
+                    packet.body.len(),
+                    hex_preview(&packet.body, 96)
+                );
+                match world::mail::parse_next_mail_time(&packet.body) {
+                    Ok(next) => {
+                        println!(
+                            "  -> marker {:.1} ({}), {} sender(s) named -- the server stops at two",
+                            next.marker,
+                            if next.has_unread() {
+                                "something unread"
+                            } else {
+                                "nothing unread"
+                            },
+                            next.pending.len()
+                        );
+                        for pending in &next.pending {
+                            println!(
+                                "     player {:#018x} entry {} kind {} in {:.0}s",
+                                pending.player, pending.entry, pending.kind, pending.delay
+                            );
+                        }
+                    }
+                    Err(error) => println!("  -> WILL NOT PARSE: {error}"),
+                }
+            }
+        }
+        state.replicate(&batch, None);
+
+        ask_inbox(connection, state, mailbox_guid)?;
+        print_inbox(state);
+    }
+
+    // ------------------------------------------------------------- collecting
+    if drive.take {
+        let target = state
+            .mail
+            .as_ref()
+            .and_then(|inbox| inbox.mails.iter().find(|mail| mail.has_anything()))
+            .cloned();
+        match target {
+            None => println!("\n--mail-take: nothing in the inbox has anything in it."),
+            Some(mail) => {
+                println!("\ntaking from mail {} ({:?})", mail.id, mail.subject);
+                if mail.money > 0 {
+                    println!("  {} copper", mail.money);
+                    connection.mail_take_money(mailbox_guid, mail.id)?;
+                    let batch = connection.drain(std::time::Duration::from_millis(1200), 64)?;
+                    report_mail_results(&state.replicate(&batch, None));
+                }
+                for item in &mail.items {
+                    println!("  attachment {} (entry {})", item.guid, item.entry);
+                    connection.mail_take_item(mailbox_guid, mail.id, item.guid)?;
+                    let batch = connection.drain(std::time::Duration::from_millis(1200), 64)?;
+                    report_mail_results(&state.replicate(&batch, None));
+                }
+                // Marking read is the one silent request here, so it is sent
+                // and then *confirmed by re-asking* -- the only confirmation
+                // available.
+                println!("  marking it read (the one silent request in this block)");
+                connection.mail_mark_as_read(mailbox_guid, mail.id)?;
+                let batch = connection.drain(std::time::Duration::from_millis(800), 64)?;
+                state.replicate(&batch, None);
+
+                println!("\nre-asking the inbox rather than editing the local copy:");
+                ask_inbox(connection, state, mailbox_guid)?;
+                print_inbox(state);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------- discarding
+    if drive.clear {
+        let empties: Vec<(u32, u32)> = state
+            .mail
+            .as_ref()
+            .map(|inbox| {
+                inbox
+                    .mails
+                    .iter()
+                    .filter(|mail| !mail.has_anything())
+                    .map(|mail| (mail.id, mail.template_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        println!("
+--mail-clear: {} letter(s) with nothing left in them.", empties.len());
+        println!("  Answered like everything else here, so a refusal is legible: a letter");
+        println!("  with cash on delivery on it is declined rather than destroyed.");
+        for (id, template) in empties {
+            connection.mail_delete(mailbox_guid, id, template)?;
+            let batch = connection.drain(std::time::Duration::from_millis(900), 64)?;
+            report_mail_results(&state.replicate(&batch, None));
+        }
+        ask_inbox(connection, state, mailbox_guid)?;
+        print_inbox(state);
+    }
+
+    // --------------------------------------------- the effect with no request
+    if drive.wait > 0 {
+        println!("\nwaiting {}s and sending NOTHING.", drive.wait);
+        println!("  Anything that arrives arrived because somebody else acted, which is");
+        println!("  what no other packet this client reads has ever done. Drive it with");
+        println!("  `.send mail <name> \"subject\" \"text\"` at the worldserver console, or");
+        println!("  from a second session.");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(drive.wait);
+        let mut arrivals = 0usize;
+        // **Every opcode seen, decoded or not.** The cheapest instrument in
+        // this box, and its absence made the first run of this probe
+        // ambiguous: zero arrivals could mean the server never sent one *or*
+        // that it sent one under a number this client does not recognise, and
+        // those want opposite investigations. Three earlier milestones learnt
+        // that and this loop was written without it anyway.
+        let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+        while std::time::Instant::now() < deadline {
+            let batch = connection.drain(std::time::Duration::from_millis(500), 64)?;
+            for packet in &batch {
+                *seen.entry(packet.opcode).or_default() += 1;
+            }
+            let report = state.replicate(&batch, None);
+            if report.received_mail > 0 {
+                arrivals += report.received_mail;
+                println!(
+                    "  <- SMSG_RECEIVED_MAIL x{} at {:.0}s. Four bytes, and they are zero:",
+                    report.received_mail,
+                    (drive.wait as f64)
+                        - deadline
+                            .saturating_duration_since(std::time::Instant::now())
+                            .as_secs_f64()
+                );
+                for packet in &batch {
+                    if packet.opcode == world::opcode::server::RECEIVED_MAIL {
+                        println!("     body: {}", hex_preview(&packet.body, 32));
+                    }
+                }
+                println!("     no sender, no subject, no count. The only honest thing to draw");
+                println!("     is that something is unread -- and finding out what needs a");
+                println!("     mailbox, which may be a continent away.");
+            }
+            report_mail_results(&report);
+        }
+        println!(
+            "\n  {arrivals} arrival(s) in {}s. mail_waiting is now {}.",
+            drive.wait, state.mail_waiting
+        );
+        println!("  every opcode seen while sending nothing:");
+        for (opcode, count) in &seen {
+            println!(
+                "    {:<34} ({opcode:#06x}) x{count}",
+                world::opcode::describe(*opcode)
+            );
+        }
+        if arrivals > 0 {
+            println!("  Asking the inbox now, to see what the arrival would not say:");
+            ask_inbox(connection, state, mailbox_guid)?;
+            print_inbox(state);
+        }
+    }
+
+    Ok(())
+}
+
+/// Asks a mailbox for the inbox and folds the answer in.
+fn ask_inbox(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    mailbox: u64,
+) -> Result<()> {
+    connection.get_mail_list(mailbox)?;
+    let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+    let report = state.replicate(&batch, None);
+    for (opcode, error, body) in &report.failures {
+        println!("  undecodable {}: {error}", world::opcode::describe(*opcode));
+        if let Ok(body) = body {
+            println!("    {} bytes: {}", body.len(), hex_preview(body, 256));
+        }
+    }
+    // Two counts, not one. "the request was answered" and "the inbox is
+    // empty" draw the same picture and are different facts -- the same
+    // reason the trade probe printed two halves rather than one.
+    println!(
+        "  {} inbox packet(s) answered CMSG_GET_MAIL_LIST",
+        report.inboxes
+    );
+    Ok(())
+}
+
+/// Prints the inbox, **with each record's announced length beside its real
+/// one**.
+///
+/// That pair is the measurement: a `u16` at the head of every record says how
+/// long the record is, and this server's number is four too many on every one
+/// of them. Printing both is what turns a reading of the server's source into
+/// an observation.
+fn print_inbox(state: &world::WorldState) {
+    let Some(inbox) = state.mail.as_ref() else {
+        println!("  no inbox has been described.");
+        return;
+    };
+    println!(
+        "\ninbox: server counted {}, sent {}{}",
+        inbox.total,
+        inbox.mails.len(),
+        if inbox.withheld() > 0 {
+            format!(" -- {} withheld and named nowhere", inbox.withheld())
+        } else {
+            String::new()
+        }
+    );
+    for mail in &inbox.mails {
+        println!(
+            "  #{:<7} {:<24} from {:<28} {}c  cod {}  flags {:#04x}{}  {:.1} days",
+            mail.id,
+            format!("{:?}", mail.subject),
+            match mail.sender {
+                world::MailSender::Player(guid) => format!("player {guid:#018x}"),
+                other => format!("{other:?}"),
+            },
+            mail.money,
+            mail.cod,
+            mail.flags,
+            if mail.is_read() { " read" } else { "" },
+            mail.days_left,
+        );
+        println!(
+            "          announced {} bytes, parsed {} -- a {} overcount",
+            mail.announced_bytes,
+            mail.actual_bytes,
+            mail.announced_bytes as i64 - mail.actual_bytes as i64
+        );
+        if !mail.body.is_empty() {
+            println!("          body: {:?}", mail.body);
+        }
+        for item in &mail.items {
+            println!(
+                "          attachment {}: low guid {} entry {} x{} durability {}/{}",
+                item.index, item.guid, item.entry, item.count, item.durability, item.max_durability
+            );
+        }
+    }
+}
+
+/// Prints every `SMSG_SEND_MAIL_RESULT` in a batch.
+///
+/// The action is printed as well as the result because **the action is what
+/// ties a reply to a request**: several mail requests can be in flight and the
+/// echo is the only thing that says which answer belongs to which.
+fn report_mail_results(report: &world::state::Replication) {
+    for result in &report.mail_results {
+        println!(
+            "  <- SMSG_SEND_MAIL_RESULT: mail {} {:?} -> {}{}{}",
+            result.id,
+            result.action,
+            if result.result == world::mail::MAIL_OK {
+                "OK".to_string()
+            } else {
+                format!("refused, code {}", result.result)
+            },
+            result
+                .equip_error
+                .map(|e| format!(" (inventory error {e})"))
+                .unwrap_or_default(),
+            result
+                .taken
+                .map(|(guid, count)| format!(" (took item {guid} x{count})"))
+                .unwrap_or_default(),
+        );
+    }
+}
 
 /// What a `--trade` run should do.
 ///
