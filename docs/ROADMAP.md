@@ -6436,6 +6436,34 @@ timing had simply missed the window:
 SMSG_RECEIVED_MAIL                 (0x0285) x5
 ```
 
+### Confirmed at the window
+
+The whole loop runs from the viewer, against a mailbox spawned at the
+character's feet and three letters chosen so that every row state is on screen
+at once: one holding money, one holding two stacks, one already empty.
+Right-click opens it, a click takes what a letter holds, and the bags fill.
+
+**Two halves of that could only be checked here**, and they are the two the
+milestone was shaped around.
+
+The first is the **inert row**. A letter with nothing left in it is drawn and
+refuses a click, and nothing but a person clicking it can tell that apart from
+a hit test that quietly answers for every row. The headless test asserts both
+halves for the same reason the trainer window's does -- but the trainer's
+version of this shipped a request the server declines in silence, and this
+one's would delete somebody's mail.
+
+The second is the window **closing itself**. The server re-checks the reach on
+every mail request and refuses by doing nothing at all, so a window that
+outlived the walk away would be one whose clicks vanish. Walking off closes it.
+
+Unlike 4.26, the first live run found nothing. That is not extra care -- it is
+that 4.26's lesson was applied before the test rather than after it: the
+gesture is named on screen in a line under the list, and the room for that line
+is reserved whether or not it is drawn. A gesture nobody can find is not a
+gesture, and the way to learn that twice is to not write it down the first
+time.
+
 ### Still not done
 
 * **No sending from the interface.** `CMSG_SEND_MAIL` is confirmed and driven
