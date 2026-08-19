@@ -7232,6 +7232,35 @@ The window closes when the auctioneer goes out of reach, for the same reason
 the mailbox does: every request in the block resolves its NPC through the same
 five-unit check, silently.
 
+### Confirmed at the window
+
+*"open tested and used and all buttons and all options worked."* The window was
+opened at the auctioneer, every control was pressed and every one of them did
+what it says.
+
+**That is the half the suite could not reach, and saying so precisely is the
+point.** 1,155 tests and every headless render in this repository say nothing
+about this milestone's interface: `--screenshot` draws no HUD, and each of the
+sixteen auction-window tests drives a fresh `Hud::default()` in a synthetic
+egui context. What is outside all of it is a saved `ui.toml`, egui's
+cross-frame layer ordering, window-only input routing — and, specific to this
+frame, whether a control that `control_live` says is dead actually declines the
+click rather than merely drawing grey.
+
+So the two halves were confirmed by two different instruments and neither
+covers the other:
+
+* **The protocol half, against the realm's own database**, in both directions.
+  A bid of 2,625 copper went out and came back as `lastbid = 2625` in
+  `acore_characters.auctionhouse`; cancelling auction 1129 removed the row and
+  delivered mail 21 carrying item 159 ×5 — the exact stack that had been on it.
+* **The interface half, by a person pressing everything.** Tabs, paging, row
+  selection, bid, buyout and cancel.
+
+What remains is absence rather than defect, and it is listed below: no sell
+window, no search box, no sort control. None of those is something this
+milestone believes is broken.
+
 ### Still not done
 
 * **No sell path in the interface.** `CMSG_AUCTION_SELL_ITEM` is implemented,

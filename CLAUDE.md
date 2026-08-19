@@ -87,7 +87,7 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | Map | `M` opens the zone page with the character and quest objectives on it; fills in as explored. **Minimap** in the corner with party dots and objective rings. No zoom, panning, continent view or rotation |
 | Sound | Zone music and ambience by area and hour, creature voices, weapon impacts, **footsteps that know what they are standing on** — terrain and building floors both. No attenuation, no spell sounds |
 | NPCs | Gossip, vendors (buy and sell), quests, questgiver `!`/`?` marks, trainers, auctioneers |
-| City services | **All six done: trainers, flight paths, trade, mail, guilds and the auction house.** Browsing, paging, bidding and cancelling; no sell window and no search box |
+| City services | **All six done and confirmed at the window: trainers, flight paths, trade, mail, guilds and the auction house.** Browsing, paging, bidding and cancelling; no sell window, no search box, no sort control |
 | Collision | Walls stop you, floors and stairs hold you up, M2 collision meshes are obstacles. Tiles are selected by the **bounds of what they hold**, not by where the character is — Stormwind is one placement covering nine tiles. Transitions cut rather than blend; a stair stutter is instrumented, not solved |
 
 ### At the window
