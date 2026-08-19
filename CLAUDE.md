@@ -11,327 +11,140 @@ layout still lives in `%APPDATA%\open-wow\ui.toml` — renaming that last one
 would orphan every existing arrangement of bars and frames for nothing. What
 changed is what a person sees: the window, the README, this file.
 
+**This file holds the rules, the setup and the current state. The reasoning
+behind every milestone — what was measured, what refuted what, what is
+deliberately not done — lives in `docs/ROADMAP.md`, one section per rung.**
+When a row below says "done", the *why* is there and nowhere else. Keep it
+that way: this file grows past its usefulness if each milestone narrates
+itself here too.
+
 ## Where the project is
 
 Phases 1, 2 and 3 are complete: every data format reads, the world renders and
-streams, and the protocol reaches a live realm. Phase 4 has started.
+streams, and the protocol reaches a live realm.
 
-**4.24 through 4.27 open a six-part block, the biggest thing left in
-Phase 4.**
-Flight paths, trainers, mail, auction, guild and trade — the services a city
-offers — taken as six milestones rather than one push, in an order set by what
-each one introduces. Trainers went first because they introduce *nothing*: no
-new format, no new interface mechanism, and a request the server **answers**,
-which is what bounds the silent ones after it. **Flight paths (4.25) followed
-and are done** -- three DBCs, and the first time the *server* has ever moved
-this character — **trade (4.26) is done**, the first time **both
-ends must act** rather than one watching — **and mail (4.27) is done**, the
-first **effect with no request**. What each of the rest
-brings that this client has never done is the real cost — flight paths are the
-first time the **server moves the player** (done); trade is the first time
-**both ends must act** rather than one watching (done); mail is the first
-**effect with no request** (done); auction is the first **list this client
-cannot bound**. **Two of six left: guild and auction.** Questie —
-the destination of the 4.15→4.21 ladder — slides to 4.30 behind them, which the
-ladder note below already explains is the normal thing to happen to a rung
-number here.
+**Phase 4 is in the six-part city-services block** — flight paths, trainers,
+mail, auction, guild, trade — the services a city offers, taken as six
+milestones in an order set by what each one introduces that this client has
+never done. Five are done: trainers (4.24, *nothing* new, which is what makes
+it the bound on the rest), flight paths (4.25, the **server moves the
+player**), trade (4.26, **both ends must act**), mail (4.27, an **effect with
+no request**), guild (4.28, **a list of people who are not in the world**).
+**One left: auction (4.29), the first list this client cannot bound.**
 
-**4.27's own find is that the packet saying mail arrived carries nothing but
-the fact.** `SMSG_RECEIVED_MAIL` is **four bytes and they are zero** — no
-sender, no subject, no count — and it is the first thing this client reads that
-answers nothing it sent. The follow-up is not available either: the contents of
-a mailbox are reachable only from within a few units of a physical object, so
-an arrival is knowable anywhere and *what arrived* is knowable in one place.
-That is why the arrival becomes a **line of chat** rather than a widget: a
-sentence is exactly as much as the packet says. The one thing in between is
-`MSG_QUERY_NEXT_MAIL_TIME`, which names senders with no mailbox involved and
-names **at most two**, because the server stops after two. **The secondary find
-is that a mail record announces its own length and the number is four too
-many**, on every record, measured over sixteen letters of thirteen different
-lengths — so the field is *checked* and never seeked by, because seeking would
-land four bytes into the next record on the first letter read. And the third:
-**a mailed item is not an object**, having left one inventory and not entered
-another, so its record carries entry, count, charges, durability and seven
-enchantment slots inline (118 bytes against a trade slot's 73) and is named by
-a bare **32-bit low guid** — the third way this client addresses an item, and
-the only one available for a thing with nothing to query. Mail is also the
-first feature that needs to know what a **game object is** rather than how to
-draw it: a display id draws a mailbox and a bench with equal confidence, and
-`CMSG_GAMEOBJECT_QUERY`'s type is the only thing that separates them.
+Roughly two thirds of the way to something a person could test by playing.
 
-**4.26's own find is that the server tells the other person what you offered
-and never tells you.** `SMSG_TRADE_STATUS_EXTENDED` is one *side* of a trade,
-and the obvious design -- draw each half of the window from the packet that
-describes it -- is wrong: putting an item or money down sends the offer to the
-**partner** and nothing at all to whoever did it. Across three complete
-two-client trades, every extended packet described the partner's half and none
-the reader's own. So this client's own half of the trade window is **the only
-thing in the whole six-part block it has to remember for itself**, and what
-makes that safe is that *no refusal here is quiet*: every way
-`CMSG_SET_TRADE_ITEM` can fail cancels the entire trade rather than declining
-the request, so an open window and a disputed item are not a state that exists.
-The own-half form does exist -- along one path, a spell applied to the
-non-traded slot -- and could not have replaced the local record anyway, because
-it carries an entry and a count and nowhere an item **guid**.
+**The destination for the next few milestones is a native Questie (4.30)**, and
+the ladder to it is a dependency chain rather than a preference: NPC
+interaction (4.15) → quests (4.16) → map (4.17) → minimap (4.21) → Questie.
+The rung *numbers* keep moving as things land in between; the *order* never
+has, which is the point worth reading.
 
-**4.24's own find is that a database schema is not evidence about a wire.** The
-`SMSG_TRAINER_LIST` record stride was predicted at 30 bytes from the realm's
-own modern trainer tables and is **38**: the schema was modernised and the
-packet builder was not. What settled it was a **name** at the end of the body —
-of four candidate strides exactly one leaves the trainer's greeting there — and
-the probe then reported its own blind spot, that a six-row packet cannot tell 38
-from 42 because the overshoot lands *inside* a 41-character sentence. A
-133-spell trainer settles it, `16 + 133*38 + 42` to the byte.
+Two scoping facts that are already decided:
 
-**4.23 is the milestone that had to open a block nobody had ever parsed.**
-Footsteps need two facts and neither is a number this client may choose: *when*
-a foot lands and *what it lands on*. The first is in the M2's timed-event block,
-which had gone unread for four milestones -- and 4.14 had already paid for that,
-since the weapon-impact delay is a constant a person dialled in by watching a
-sword precisely because the frame a blade connects on lives in that block. The
-identifier in an event record is a **name**, which made the record stride the
-easiest measurement in this project so far: 100.0% of records have four
-printable identifier bytes at 36, and every neighbouring stride manages 22%. The
-harder question was *which* event is the footfall, because two families both
-fire twice in a human's walk cycle -- and it was settled by a **wolf**, whose
-`$FSD` fires four times, once per paw. Buildings followed the live report and
-turned up the sharpest instance yet of a rule this file already had: `MOMT`'s
-`ground_type` and `GroundEffectTexture`'s terrain column mean the same thing
-and have **opposite conventions for silence** -- 0 outside, 10 inside -- so the
-same reading applied to both would have every wall in the game claiming to be
-dirt.
+* **Most of Questie's bulk is a workaround for a restriction this client does
+  not have.** An addon cannot ask the server about a quest it has not been
+  offered, so it ships a hand-collected database of the whole game. This client
+  can send the query. **Quest data comes from the server and Questie's database
+  is not ported**, so quests are never stale and are correct on the custom
+  realm this client is developed against. 4.30 is therefore a *presentation*
+  milestone.
+* **`CMSG_QUEST_POI_QUERY` `0x1E3` is what makes that work.** WotLK shipped its
+  own tracker, so the server already holds objective markers for 8,953 of 9,464
+  quests and hands over a map id, an area id and a polygon per objective. It
+  answers only for quests **in the log**, 25 ids per request, and there is **no
+  enumerate-all opcode** — so no bulk prefetch at login, which would repeat the
+  37-second burst. What the wire cannot answer is where things are before you
+  have seen them; that is solved by recording what the client already streams,
+  keyed by realm, starting empty.
 
-**4.22 is the milestone that had to open a table to fix an interface.** The two
-tickets on it were about drawing -- a cast that plays nothing, a second weapon
-that never swings -- and both answers were in files nobody had read: which
-animation a spell poses its caster in is `SpellVisualKit`'s column 2, and which
-arm swung is a bit in `hit_info`. The third fix was not on the board at all and
-came out of the same table: two animation constants had been transcribed from a
-*sequence listing* rather than from `AnimationData`, so the sheath transition
-had been playing `EmoteTalkQuestion` for as long as it had existed. A wrong
-animation id never errors -- it plays a different, plausible cycle, or none --
-which is why the guard for it is a test that checks every hardcoded id against
-the **name** of the row it claims.
+**Reading the realm's MySQL is a verification oracle, not a client
+capability** — a player on someone else's server has no DB access, so anything
+built on it works only for realm operators.
 
-**4.20 is the first milestone about more than one player.** Everything before
-it described the world or this character's place in it; a party describes
-*other people*, and the difference is a fact rather than a framing -- a party
-member outside visibility range is not replicated at all, so the interface has
-a second and much thinner source of truth for the first time, and it has to be
-honest about which one it is reading. That is why every party vital is an
-`Option` and why a bar with no known maximum is drawn empty rather than full.
+Reference addons live in the **gitignored `addons-to-port/`**, are read rather
+than vendored, and each one's licence is checked and recorded *before* a port
+starts; see `docs/REUSE-POLICY.md`.
 
-**4.15 has begun and it changes the method.** NPC interaction — gossip, quests,
-shops — is a *protocol* milestone, not a format one: quest text, menu options
-and vendor stock live in the server's world database and reach the client only
-when asked for, so "transcribe a table and check a property it must have" mostly
-does not apply. Send, watch, confirm by effect. On a test realm the world
-database *is* readable and is a source the client is never sent, which makes it
-the same class of evidence as `Item.dbc`, and it is what every gossip field was
-checked against.
+## State
 
-**4.17 turns the method back the other way.** The map is a *format* milestone
-sitting on top of a protocol one: the pages, their bounds and their art come
-out of `WorldMapArea.dbc` and the archives, and what goes on them comes off the
-wire. Which means both instruments apply again — a property test over the whole
-table, and a live run against the realm — and the map row below records which
-claim rests on which.
+Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 
 | | State |
 |---|---|
-| Data formats | MPQ, DBC, BLP, M2 (+animation), WMO, ADT/WDT — all done |
-| Renderer | Textures, skinned models, buildings, blended terrain, streaming — done |
-| Protocol | **3.1–3.5 done**, all confirmed against a live realm including one client watching another move. Replicated *creatures* slide along their actual path, turn to face it, and play the model's own walk/stand cycles. **Other players do not** — see the known defect below |
-| Interface | **4.1 and 4.2 done.** Native, fully customisable, no addons — see the decision below. Player and target unit frames, click-to-target with an in-world bracket, a chat window you can type in, real names, a spellbook you arrange the bars from, `F1` to rearrange, saved to `ui.toml` |
-| World | Lighting and the day/night cycle come from `Light.dbc`'s curves and the realm's own clock. **The sky is a real gradient**: bands 2–6 are the sky from zenith to horizon, identified by the one hour that could refute it — at dawn the warm/cool crossing lands on the horizon side, once. Fog is *derived* from the horizon band rather than named, so distant terrain meets the sky it is drawn against. **The sun and the moon are drawn**: band 9 is the one band that stays bright while the sky goes black, so it is the disc rather than a light — cool white all night, warm at dawn — and one band serves both because only one is ever up. **Weather works and now falls**: `SMSG_WEATHER` blends towards the stormy curves *and* rain or snow comes down, as camera-relative billboards with no particle buffer at all, and a storm puts the sun out. Still no skybox (Elwynn names none), no clouds, no stars. **M2 emitters are drawn now** -- see the row below. Game objects — doors, benches, chests, ships — are drawn |
-| Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components. **Other players are dressed too now (`foss-wow#23`)**: their visible-item fields carry item *entries*, not display ids, so `Item.dbc` bridges the two — `PLAYER_VISIBLE_ITEM_ENTRY_HEAD + 2 * slot`, measured the same way `PLAYER_BYTES` was, against two characters wearing five and seventeen items respectively, and confirmed live: a second account's distinctly-dressed character renders in a different outfit from the viewer's own. **The player's weapon is drawn**, and now so is another player's, off the same path: the M2 attachment table parses, and a sword or shield hangs off the hand's animated bone and swings with it. Shoulders, helms and ranged weapons are not, and there is no sheathed state for anyone but the viewer's own character — see below |
-| Game | **4.3 done**: three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. **A spellbook panel** (`P`) now lists what the character can do and puts it on a bar by click, auto-attack included -- see the note below on why the seeding filter had to reject it. Threat and the corpse *interface* remain (the corpse protocol is done). Quests follow |
-| Loot | **Works end to end.** Right-click a body to open it, click a row to take money or an item, and the corpse releases itself once empty -- a client that never releases leaves the body locked to it for everyone else. `CMSG_LOOT` `0x15D`, `CMSG_LOOT_MONEY` `0x15E`, `CMSG_AUTOSTORE_LOOT_ITEM` `0x108`, `SMSG_LOOT_RESPONSE` `0x160`, `SMSG_LOOT_REMOVED` `0x162`, `SMSG_LOOT_CLEAR_MONEY` `0x165` -- every one confirmed by content or by effect. A loot slot is the **server's** index and never a row position: the numbers do not close up when one is taken |
-| Sound | **4.14 done.** Zone music and ambience by area and hour, creature attack/wound/death/aggro voices, and weapon impacts -- all from the tables. `SoundEntries`' layout is checked by its filenames resolving in the archive (93%); the zone tables by their ids landing on a sound of the **right type** (99.1%), which validity alone cannot show. `CreatureSoundData`'s 38 columns identified themselves through the *names* of the sounds they reach. No distance attenuation, no crossfade, no spell sounds. **Footsteps landed in 4.23** -- see the row below |
-| Footsteps | **4.23 done: the ground is heard.** The model says *when* -- the `$FSD` timed event, identified against a **wolf**, whose walk carries four of them (one per paw) where a human's carries two, each preceding its matching per-foot marker by exactly 33ms, four times of four. The ground says *what*: `MCLY.effect_id` -> `GroundEffectTexture` -> a `TerrainType` row -> its `sound_id` -> `FootstepTerrainLookup(creature group, terrain)`. **The terrain column is a `sound_id` and not a row id** -- off by one all the way down a twelve-row table, so both readings parse, and the sound *names* separate them 25 of 50 against 9 of 50 with `Snow` and `Wood` unanimous. `GroundEffectTexture`'s own terrain column identified itself by the **filenames** of the textures reaching it (`Snow` x14,484 of 14,972 layers named `snow`), over 387,009 of Azeroth's 390,011 layers, all resolving. Which of four blended layers is underfoot is computed with the **terrain shader's own weights** and its axes taken from the renderer's UVs, because a footing rotated against the picture is a road that sounds like grass. **Buildings too**: a WMO material's `ground_type` is a `TerrainType` **row id**, identified by the same filename evidence and scored against row 10 (`None`) as the baseline -- `Sand` x469, `Grass` x305, `Dirt` x15.9, `Wood` x7.1, `Metallic` x6.6. **The conventions for "nothing" are opposite between the two tables**: outside it is row 0 (which is also `Dirt`), in here it is row 10, and reading this one as 0 would have every wall claiming to be dirt. Only **622 of 1,985** buildings label anything, and Northshire Abbey is not one of them -- the Elwynn lake bridge is (`Wood` planks, `Stone` piers). The surface rides with the collision triangle, and the floor-or-terrain choice is read off **the same comparison that decides where the character stands**. `sound::Footing` is an enum because a `GroundEffectTexture` row and a `TerrainType` row are both small integers that both resolve. **Confirmed at the window**: grass, dirt and roads all sound different. The player's own only -- there is no distance attenuation anywhere here, and a starting zone has ninety-five creatures in it. No spray |
-| NPCs | **4.15 started: they answer.** `CMSG_GOSSIP_HELLO` `0x017B` → `SMSG_GOSSIP_MESSAGE` `0x017D`, parsed whole — menu id, greeting text id, a list of clickable options and a list of quests offered. Confirmed on **three** NPCs picked so the two counts differ (3 options/0 quests, 0/0, 0 options/1 quest), because one sample is nearly all zeroes and any reading survives it. Every field then agreed with the server's own database independently: menu ids equal `creature_template.gossip_menu_id`, the options match `gossip_menu_option` in text *and* icon, quest 783 came with title `A Threat Within`, level 1 and flags 524296. **An option index is the server's id, never a row position** — menu 1291 has four rows and three arrived, numbered 1,2,3 with 0 filtered out and the numbering *not* closed up, exactly like a loot slot. **A menu can now be chosen and a vendor lists its stock**: `CMSG_GOSSIP_SELECT_OPTION` `0x017C` (`{guid, menu id, option index}`) is confirmed by effect -- choosing an innkeeper's `I want to browse your goods.` produces `SMSG_LIST_INVENTORY` `0x019F`, a different opcode carrying stock, which no misunderstood request would cause. Twelve rows of 32 bytes, `8 + 1 + 12*32 = 393` exactly, matching `npc_vendor` in order, each entry paired with the display id `Item.dbc` gives it -- and one of those pairs (2070/6353) was independently confirmed by `SMSG_LOOT_RESPONSE` in 4.13. **The price on the wire is not `Item.dbc`'s `BuyPrice`**: the server applies the buyer's reputation discount first (25→23, 500→475, 2000→1900, i.e. `*0.95` truncated), so a client showing the table's number is silently wrong for everyone not at neutral. The wire is authoritative for price. **Buying and selling work**: `CMSG_LIST_INVENTORY` `0x019E`, `CMSG_BUY_ITEM` `0x01A2` (`{u64 vendor, u32 entry, u32 slot, u32 count, u8 bag}` -- entry *before* slot, counts are `u32`), `CMSG_SELL_ITEM` `0x01A0` (item named by **guid**, not slot, so a request racing an inventory change refuses rather than selling the wrong thing). Both confirmed by effect, and the buy checks the stock list too: a row quoted at 23 took exactly 23 from `PLAYER_FIELD_COINAGE` where the table says 25, and delivered a stack of exactly `buy_count`. Nothing vendor-related is drawn yet. **One `UNIT_NPC_FLAGS` bit is named as of 4.24** — see the Trainers row |
-| Trade | **4.26 done, confirmed at the window and by the server's own database.** Third rung of the six-part block, and the first exchange in this client where the far end is **another person's client** rather than the server. Twelve opcodes, ten out and two in. **Every request in the block is silent on success**, so the usual bounding move has nothing inside it to work with -- and what talks back is the **failure**: `CMSG_INITIATE_TRADE` `0x0116` aimed at a guid that is not a player is answered *immediately, at the sender, with nobody else logged in*, which confirms the opcode, the eight-byte unpacked body and `SMSG_TRADE_STATUS` `0x0120`'s layout in one send. **The first one reported a fact about the character rather than the packet** -- status `17`, because `Testwolf` was lying dead in Elwynn from 4.25's flight -- and a `.revive` plus the *identical* send returned `6`, naming two codes by one change at a time. **The status word is a length as well as a reason**: `BEGIN` is 12 bytes and carries the initiator's guid (checked against `1`, `Testwolf`'s, known at the other end), `OPEN_WINDOW` 8, the rest 4 -- a conditional layout like 4.25's spline flags, but one that *cannot* fail silently, because the branches differ in length and the trailing-byte rule refuses a misreading. **`BUSY` does two unrelated jobs and the packet does not say which**: before the window opens it is "already trading" and the session is over, after it opens it is "you have not got that much money" and closing on it throws away a live trade. **The finding: `SMSG_TRADE_STATUS_EXTENDED` `0x0121` goes to the *other* person and never back to its author.** Putting an item or money down sends the offer to the partner and nothing at all here; across three two-client runs, every extended packet described the partner's half and **none** the reader's own -- the own-half form exists but only along the trade-spell path. So **this client's own half of the window is the only thing in the whole six-part block it must remember for itself**, which is safe only because *no refusal here is quiet* (every way `CMSG_SET_TRADE_ITEM` can fail cancels the trade outright) and because the own-half packet carries no item **guid** and so could not replace the record anyway. The body is a fixed **532** bytes, `21 + 7*73`, with no trailing string to land on -- so what stands in for the trainer's greeting is that **each slot record begins with its own index**, redundant as information and the entire confirmation as evidence. Entry/display pairs agree with `Item.dbc` (2070/6353, the pair 4.13 and 4.15 already produced). **Which end asked is not on the wire**: before the window opens both ends hold identical state -- a partner guid and a closed window -- so an interface deciding "is somebody asking me?" from closed alone shows *the person who pressed the key* a prompt asking whether they accept their own request. `TradeSession::we_asked` is the one local bit that separates them, and the test asserts both directions. **The window is the first frame here that draws two people**: ours on the left always, only our own occupied squares answer a click (theirs is drawn and never hit-tested), and the seventh square -- the one that does not change hands -- is drawn apart from the six. `T` asks the target; while a trade is open a bag right-click puts the item on the table. **Verified by the server's database**: the stacks swapped exactly and 4,321 copper moved each way to the copper. **Confirmed at the window**: `T` asks the target, the window opens when their client answers, a right-click offers, Accept completes -- and the partner's log is the proof, since the offer arrives at *their* session and nowhere else. **The first live run failed on discoverability rather than on code**: "I couldn't give him an item", with the partner receiving zero extended packets and the trade *not* cancelling, which excludes a refusal (every decline of `CMSG_SET_TRADE_ITEM` cancels the whole trade). Offering is a modal right-click and nothing on screen said so, and all four refusal paths in `offer_item` were silent. Both fixed. Not done: no un-accept button, no ignore, no trade spell, no drag into the window, and enchant/gem/suffix/lock fields parsed and drawn by nothing |
-| Mail | **4.27 done, confirmed at the window. The first effect with no request**, and the fourth rung of the six-part block. `SMSG_RECEIVED_MAIL` `0x0285` arrives because *somebody else posted a letter*, at a moment with nothing outstanding to correlate it against — and it is **four bytes of zero**: no sender, no subject, no count. Confirmed by sending **nothing at all** for two minutes while a script posted a letter every twenty-two seconds; five arrived, each `00 00 00 00`. **The contents need a mailbox and the arrival does not**, so a mail interface is two frames and no protocol work collapses them: the arrival is a chat line (`You have new mail.`) because a sentence is all the packet supports, and `MSG_QUERY_NEXT_MAIL_TIME` `0x0284` — the one mail question with no mailbox in it — names **at most two** senders because the server stops after two, with a leading float that is a **sentinel and not a time** (`0.0` unread, `-86400.0` nothing). **Mail is not trade**: nearly every request is answered by `SMSG_SEND_MAIL_RESULT` `0x0239` and the reply **echoes the action**, which is what ties an answer to a question — so the bounding move is back after trade had to be bounded by its own refusal. `CMSG_MAIL_MARK_AS_READ` `0x0247` is the one silent one and is confirmed by re-asking. **The result's tail branches on the result before the action**: a take that failed on inventory space carries the error *instead of* the item pair, so a parser branching on the action first is right on every success and wrong on exactly the case it exists to explain — 12, 16 and 20 bytes, and the length is independent evidence. **Each record announces its own length and this server's number is four too many**, predicted from the size expression counting eight words where the writer writes seven and then measured on `68/64`, `73/69`, `78/74`, `79/75`, `86/82`: checked and **never seeked by**, with a test asserting the odd half — a record whose announced size *equals* its real one is refused. **A mailed item is not an object**, so the 118-byte attachment record carries everything inline and `CMSG_MAIL_TAKE_ITEM` `0x0246` names a bare **32-bit low guid**, the third item-addressing scheme here. **The total is not the row count** — the list caps at fifty and again at a packet — and the surplus is named nowhere else, so a client drawing its own row count tells the person with a full mailbox that it is not full. **The delivery delay is narrower than it looks and both halves were measured**: same-account item mail delivered at the send time exactly, cross-account item mail 3,296 seconds later. **`CanOpenMailBox` accepts the reader's own guid from a game master**, which every fixture account here is — measured deliberately in order to be ruled out, and the mirror of "a refusal is a fact about the actor" with the sign reversed. **Confirmed at the window**: right-click a mailbox, click a letter to take what is in it, money first then attachments, and the bags fill. Two halves only a person at the window can check, and they are the two this milestone was shaped around -- an emptied letter is drawn and **refuses a click**, because the only other thing a click could mean there is a delete nothing confirms and a hit test answering for every row is indistinguishable from a correct one until somebody clicks the wrong letter; and the window **closes itself** when the character walks away, since the server re-checks reach on every request and refuses by doing nothing. **The first live run found nothing**, which is 4.26's lesson applied before the test rather than after it: the gesture is named on screen and the room for that line is reserved whether or not it is drawn. Not done: no compose form, no delete or return gesture, no cash-on-delivery anywhere, `Stationery.dbc` and `MailTemplate.dbc` untranscribed, and the unread mark is a chat line rather than anything on the minimap |
-| Flight paths | **4.25 done, confirmed at the window: the server moves the player.** The first time anything but this client's own key handling has decided where the character is -- every position it ever held it computed itself, and `MSG_MOVE_*` only *reported* it. Three DBCs transcribed (`TaxiNodes` 364, `TaxiPath` 915, `TaxiPathNode` 22,586). **`TaxiPath`'s endpoint columns were identified geometrically**, because both are node ids and validity separates them not at all: a route's first waypoint must sit on the node it departs from and its last on the node it arrives at, which comes out of a *third* table. 847 of 900 as written against 20 swapped -- and the 53 misses name themselves, 43 being boats, zeppelins, dev-land and quest scripts rather than passenger flights. **The mount columns cost three wrong answers**: eight hand-picked cities showed no node filling both (the full table has 95), then the id sets overlapped in 30 places (neutral mounts both sides ride) -- and what settled it was **names**, column A being `Wind Rider` x75 and `Riding Bat` x20 against B's `Riding Gryphon` x73 and `Riding Hippogryph` x25. The same resolution caught the column being a `creature_template` **entry** and not a display id: read as a display id it gives `NightElfFemale.mdx` for a Wind Rider, obvious nonsense only because the check produced a name. `CMSG_TAXIQUERYAVAILABLENODES` `0x1AC` -> `SMSG_SHOWTAXINODES` `0x1A9`, a **fixed 72-byte** body whose fixed size is its own confirmation; `CMSG_ACTIVATETAXI` `0x1AD` is answered **either way** by `0x1AE`, so one send bounds opcode, body and reply together. Known nodes are a 14-word bit array, the `PLAYER_EXPLORED_ZONES` shape, and a zero word is *none known* rather than unknown. **The departure node is the server's and must not be recomputed** -- live it named a node 573 units away where one sat 150 off. **The bug that hid the whole feature was one bit**: `FLYING` was `0x0200`, which is the server's `Falling`; the real bit is `0x2000`. The two spline encodings are a *conditional layout*, so a wrong flag does not fail -- it takes the other branch and loses the route. Confirmed on the wire: `flags = 0x2000`, 27 points, 81,050ms, 356 bytes = 32 + 27*12 exactly. Not done: **no mount and no flight animation** (the display id is in the replicated `UNIT_FIELD_MOUNTDISPLAYID`, unread), no route on the map, no scrolling, the price shown is the table's rather than the wire's, and only `TaxiReply::Ok` is named |
-| Trainers | **4.24 done: they teach, and the schema lied about the wire.** First rung of the six-part block (flight paths, trainers, mail, auction, guild, trade) and deliberately the cheapest: no new format, no new interface mechanism, and the one request in the block that is **answered**, which is what bounds the other five. `CMSG_TRAINER_LIST` `0x01B0` → `SMSG_TRAINER_LIST` `0x01B1`; `CMSG_TRAINER_BUY_SPELL` `0x01B2` (`{u64 trainer, u32 spell}`) → `SMSG_TRAINER_BUY_SUCCEEDED` `0x01B3` **on success and nothing at all on refusal**, so the reply's arrival is the confirmation. **The record stride is 38 and this project predicted 30**: the realm's database carries the *modern* trainer tables (`trainer`, `trainer_spell`, `creature_default_trainer`, `ReqAbility1..3`, no profession columns) and the packet builder was never modernised with them — **a schema is a fact about storage and not about a wire**, the sibling of "a grep that finds the field names is not a grep that finds the structure". What settled it was a **name**: `trainer.Greeting` sits at the end of the body, and of four candidate strides exactly one leaves `Hello, warrior!  Ready for some training?` there while the rest leave binary. **The probe reported its own blind spot** — an overshooting stride skips `count * delta` bytes, and 6 rows × 4 bytes is 24 into a 41-character greeting, so 38 and 42 both "fit" Llane's packet and it says so rather than picking one. Ander Germaine's **133** spells settle it: 5,112 bytes is `16 + 133*38 + 42` to the byte, the overshoot is 532, and 38 stands alone. **The availability byte was produced one change at a time across three readers** — level 1 splits 1/5, level 5 splits 3/3, level 26 is 6 of 6 available, over the same six rows at levels 1,4,4,6,6,6 — and `2` (already known) needed level 26 specifically, where "too low" cannot be the explanation: a `.learn 6673` between two runs moved exactly that one row. **`1` is "cannot" and `2` is "known", the way round that surprises.** Price is `floor(cost * 0.95)` — 10→9, 100→95 — the identical vendor finding, free the second time, and confirmed by exactly 9 copper leaving a purse. **A purchase names the spell id, the one place this block escapes the index trap** — and it matters more than usual, since the server filters the list per character so a row position names a different spell to two readers at one NPC. **`UNIT_NPC_FLAGS` bit `0x10` is bounded from both sides**: an innkeeper (`0x10283`, every bit but this one) answers the identical request with *nothing* from zero units on the same character — the refuting half — while a Grand Master profession trainer carries `0x10` and also answers nothing to a warrior lacking its skill. **Necessary, not sufficient**, and the server's preconditions say why: alive, the flag, not charmed, reaction above unfriendly, within five units, and class matching for a class trainer — **six ways to get silence**. **Confirmed at the window**: six rows drawn, `Battle Shout` quoted at 9 copper, clicked, and the row came back **`known`** — which is the one thing no headless test reaches, because it exercises egui's click routing in a real window *and* the decision to **re-ask the whole list rather than edit the clicked row**. Note what the headless suite could not have caught and still has not: `--screenshot` never touches the HUD at all, so every "1,004 tests green, live render clean" claim about this milestone was evidence about the parser and the world, not about the interface coming up. Not done: no `SMSG_TRAINER_BUY_FAILED` (nothing has produced one), trainer `kind` left a number, the two profession `u32`s left an opaque pair, no talent reset, no scrolling. **The inert rows refusing a click is confirmed at the window too**, which is the half worth having watched: `row_at` answers only for learnable rows, and a hit test that reported every row would have passed the headless test's first half alone and shipped a request the server declines in **silence** — the one failure this client cannot diagnose |
-| Quests | **4.16: a quest can be taken, finished and paid for.** The whole loop runs against the live realm on a character created from nothing. **Accepting is confirmed**: `CMSG_QUESTGIVER_ACCEPT_QUEST` `0x0189` put quest 333 into field `0x00a3` — `PLAYER_QUEST_LOG + 1 * QUEST_LOG_STRIDE`, exactly where the measured base and stride say slot 1 goes. **Turning in works**: `CMSG_QUESTGIVER_COMPLETE_QUEST` `0x018A` (`{u64 npc, u32 quest}`) is *answered* — `SMSG_QUESTGIVER_OFFER_REWARD` `0x018D`, 525 bytes of real completion text — and so it bounds the silent `CMSG_QUESTGIVER_CHOOSE_REWARD` `0x018E` (`{u64 npc, u32 quest, u32 reward}`) that follows, the same move that bounded `CMSG_BUY_ITEM`. Which reply arrives is the diagnosis: `SMSG_QUESTGIVER_REQUEST_ITEMS` `0x018B` says the send was understood and the quest is not finished, silence says the opcode, the body or an NPC that does not end it. **The verdict is the log, never a packet**: 783 left `PLAYER_QUEST_LOG` and quest 7 — McBride's follow-up, `PrevQuestID` 783 — appeared in its place, a chain step no misread packet could fake; `character_queststatus_rewarded` and `xp` 0→40 agree independently. **The trap: asking to *read* a quest's scroll can accept it.** `CMSG_QUESTGIVER_QUERY_QUEST` adds a quest carrying `QUEST_FLAGS_AUTO_ACCEPT` `0x80000` to the log before the accept is ever sent, and `quest_template_addon.SpecialFlags & 0x4` ORs that flag in at load time, which is how the entire Northshire chain has it. Only **179 of 9,464** quests do — rare enough to look like a bug, common enough to cover the zone a first end-to-end test reaches for. **`SMSG_QUEST_QUERY_RESPONSE` `0x005D` parses**, and it is the backbone: it answers for *any* quest id with no NPC and no log entry, which is what a tracker and a map need. A 260-byte fixed head, five strings, then two more arrays -- so nothing past byte 260 is at a fixed offset. Measured against eight quests picked so every array count disagrees, then confirmed by **sweeping the whole table: 9,464 answered, 9,464 parsed whole**, bodies 381-1438 bytes. Two things the wire does that the table does not: **a game object target arrives with the top bit set** (`|id| | 0x80000000`, stored as a *negative* creature id -- reading the sign gives a valid creature id pointing somewhere else), and **`Flags` arrives as `Flags & 0xFFFF`**, so `QUEST_FLAGS_AUTO_ACCEPT` `0x80000` *cannot* travel and a client testing this field to decide whether an accept is needed would wait forever. **A per-realm cache** (`world::quest_cache`) holds packet **bodies, not parsed structs** -- a struct cache freezes a parse, a body cache freezes an observation, so a parser that learns a new field upgrades every cached quest with no migration. **A missing answer is `unknown`, never `nothing`**: there is deliberately no `get() -> Option<&QuestInfo>`, and an id asked about but never answered is not written to disk, because "no such quest" and "the reply was lost" are indistinguishable and only one is permanent. **A quest log panel (`L`)** shows titles, levels, objectives and `(Complete)`, all off the wire. Completion is `PLAYER_QUEST_LOG + 1` bit 0, measured against two quests in opposite states -- and the first two attempts could not have answered it, because quest 783 has no objectives (complete on accept) and quest 333's `StartItem` *is* its own `RequiredItemId1` (also complete on accept). Quest 38, wanting twelve items, gave the `0` that named the column. **Quests can be taken and handed in from the viewer**: right-click a questgiver, read what it says, press Accept; walk to the ender, right-click, press Complete Quest. Right-clicking a talker greets instead of swinging -- `UNIT_NPC_FLAGS` is replicated, so it is the one interaction test the client can make locally, and before this an innkeeper got a swing the server silently refused. **The window shows the cache's text, not the questgiver's**: `SMSG_QUESTGIVER_QUEST_DETAILS` `0x0188` is read for twenty bytes (npc guid + quest id, offset confirmed on two captures) and `SMSG_QUESTGIVER_OFFER_REWARD` `0x018D` is not parsed at all -- its *arrival* is the server saying the hand-in is legal, which is the one thing the query cannot say. Two parses of the same strings would drift. **`SMSG_QUESTGIVER_QUEST_LIST` `0x0185` is deliberately unparsed**: nothing has captured one, every fixture NPC has a gossip menu, and `SMSG_GOSSIP_MESSAGE`'s quest block is what arrives. Known limits, all recorded rather than hidden: reward *names* need `CMSG_ITEM_QUERY_SINGLE` so a reward reads `item 2224 x1`; `choose_quest_reward` sends index `0`, correct only where there is nothing to choose; no `!`/`?` markers; no map |
-| Inventory | **4.13 done including slot moves; `foss-wow#55` closed.** A **single combined bag window** (`B`) covering the backpack *and every equipped bag's contents* -- deliberately unlike the original's one frame per bag -- with real icons, stack counts and money; a separate **character panel** (`C`) with the nineteen worn slots, all nineteen named. The slot array, coinage, stack count, container capacity, container contents and the owner/contained pair were all measured against the live realm. Right-click **auto-equips** a backpack item, sending the already-confirmed `CMSG_AUTOEQUIP_ITEM`. **Left-click picks a square up and drops it on another, and the drop now sends and moves the item** -- a genuine two-way swap, confirmed live: two backpack items landed at each other's slots. The mystery result code **59** was the wrong question -- **the opcode was off by one.** `0x010B` is a real, different request (`CMSG_AUTOSTORE_BAG_ITEM`, a 3-byte `{src_bag, src_slot, dst_bag}` body that auto-stores into *any* free slot); this client's 4-byte body happened to line its first three bytes up with that shape, with the fourth silently unread, which is what made it look like a swap opcode being coy about a refusal. Sent against two slots the item is already validly in, the auto-store is a no-op and the answer is `EQUIP_ERR_NONE` (59) -- "nothing needed to happen," not a refusal. Sent with an equipped source it is *not* a no-op: the item was live-observed leaving its equipped slot and landing in the first free backpack square, not at the requested destination, which is what named the bug -- a real swap honours a *chosen* destination and this didn't. The genuine `CMSG_SWAP_ITEM` sits one number up at `0x010C`, wants exactly the four-byte body already built here, and was confirmed the same way: a chosen pair landed at each other's positions, nothing in between. See `SwapItemCandidate`'s doc comment in `crates/world/src/opcode.rs`. `AzerothCore`'s own source supplied the hypothesis (rule 2 permits reading it); a live realm confirmed it, the same division of labour as everywhere else in this project. |
-| Map | **4.17: `M` opens the zone's page, with the character on it and the log's objectives marked.** The projection has four plausible readings and all four draw a picture, so it was fitted rather than chosen: `wow-cli map calibrate` regresses `WorldMapOverlay`'s pixel positions against the centroids of the terrain chunks carrying each area id — two files by different tools — and the reading this client uses fits **+984 horizontally and +633 vertically at r² 0.986/0.972 over 296 overlays**, where each flipped axis fits the same slope *negative*. That is an experiment that could have refuted it, which is the same move as asking the one hour that could refute the sky. **A page is bigger than its picture**: twelve 256x256 tiles make 1024x768 and the art stops at **1002x668** — measured from the tiles' own alpha, unanimous across all 91 pages that load — so the grid is drawn larger than the frame and clipped, and a fit-to-frame layout would be 2% off horizontally and 15% off vertically without ever failing. **A POI marker names its own page** (`quest_poi.WorldMapAreaId` is a `WorldMapArea` row), so page selection is an equality and never a containment test: `Testwolf`'s log has three quests marking Elwynn and one marking Westfall, and standing in Northshire the Westfall marker is correctly absent. Live: 4 quests, **18 markers, 126 points, every one inside its own page** and matching `quest_poi_points` exactly — which checks the page and the scale, *not* the orientation, since a flipped axis also lands inside. **A third of markers are polygons** (5,974 of 18,768 on this realm), drawn as the ring the server sent with the pin only as a label anchor. **Nothing POI is cached to disk**: the query answers only for quests in the log and gives the same empty list for "not in your log" as for "no markers", so writing one down would make a temporary absence permanent. **The map fills in as it is explored**, which is the half the first version got wrong: the twelve base tiles are the *unexplored* picture and every road, building and name is a `WorldMapOverlay` patch drawn only where the player has been. Patches tile like pages (`<TEXTURE><n>.blp`, across before down) — **886 patches, 1,524 of 1,524 tile files resolved by path** — and a tile is stored *larger* than the piece of map it carries (`FORESTSEDGE` is 341 tall, its second tile a 256x128 file holding 85 rows), so the rectangle and the texture coordinates are cropped together. The 76 patches with a file past the computed count are offcuts, not a miscount: the grid covers the stated rectangle exactly, and `MarshlightLake2` exports as nearly blank beside a complete `MarshlightLake1`. Exploration is `PLAYER_EXPLORED_ZONES` `0x0411`, 128 words of one bit per `AreaTable.area_bit`, **measured against two characters whose set bits sit in different words** — `Watcher` bit 125 (word 3) at `0x0414` and `Huntertest` bit 212 (word 6) at `0x0417`, the same base from either, agreeing with `characters.exploredZones`. An absent word is a zero, never an unknown, or the plainest characters get a fully-revealed map. Not done: zoom, panning, any page but the one you stand on, a continent view, and markers for anything but quest objectives |
-| Minimap | **4.21 done: the map that is always there.** A disc in the top-right corner, the character's arrow at the middle, the sub-zone's name over it, party dots and objective rings on it, and the wheel to zoom. The art is one 256x256 picture per terrain tile and **none of it is stored under its own name** -- the files are named by the MD5 of their contents and `Textures\Minimap\md5translate.trs` is the only thing that maps a tile to a hash. Three things were measured about that index: the `dir:` header lines are **redundant** (all 18,644 entries carry their own directory and agree with the header above them, 18,644 of 18,644), so the parser ignores them and cannot desynchronise; **one picture serves many tiles** (14,420 distinct files, the flat black one named 1,127 times), so the index is one-way and the cache is keyed by file rather than by tile; and **every referenced hash resolves** (14,420 of 14,420, by path resolution rather than by listing) while 4,116 further hash-named files are referenced by nothing, so an index built by listing the folder would be a fifth noise with no way to place any of it. **Which of `map<a>_<b>` is which was settled by the tile *sets*, not by a lookup**: both readings resolve a file for every tile, but a continent is not symmetric under exchanging the pair -- Azeroth 687 of 687 as written against 326 transposed, 5,228 against 2,578 over every map, and the six maps that "match transposed" are the square instances that agree with both and vote for neither. **Which way up the picture is has eight readings and all eight draw a picture**, so it was asked twice against inputs that share nothing. `wow-cli minimap orient` scores each against the water `MH2O` says is there -- 604,772 chunks classified, 102,334 decisive, `as drawn` **84.3%** against 60.5% for the next best, and the threshold-free separation agreeing at 82.0 against 72.5. `wow-cli minimap seams` reads **no terrain at all** and asks only whether neighbours join up -- 13,027 seams, **19.21** against 52.99, and its **predicted degeneracy landed exactly where predicted**: a reading flipping only the down axis walks the same across-seam backwards and scores identically on it (8.63 against 8.63), which is what says the experiment measures what it claims. `wow-cli minimap stitch` then composes four tiles around the Northshire spawn -- abbey, road and bridge, no visible seam, centre marker on the grass by the door. **The projection lives in `adt::minimap::Viewport`** and both the frame and the stitch draw from it, so the picture is evidence about the frame rather than about a second implementation that agrees today; `world::tile_at` folded into `adt::tile_at` for the same reason. **The disc is drawn with a rectangle clipper**: tiles square, then an opaque **rim** annulus painted over the corners -- its own colour, never the window's, because a rim carrying the frame's alpha shows four corners of off-map terrain faintly, which is worse than plainly. Regions draw *under* the rim (that is what circle-clips them) and blips over it, and **a blip off the disc is dropped rather than dragged to the edge**. The header is the **sub-zone** off the terrain, held while a tile streams in. Two things the corner cost: the quest log moved **sideways** rather than down (down would start clear of the spellbook and grow towards it as quests are taken -- right on an empty log, wrong on a full one), and **the wheel had two claimants** -- the camera's handler never asks where the pointer is, so the minimap answers first and returns. Not done: no rotation, no tracking or ping, no border art, no WMO interiors, no eviction, and nothing on it but objectives and party members |
-| Liquids | **4.18 done: rivers, lakes, the sea and lava are drawn, and you swim in them.** `MH2O` parses, and three block sizes were *measured* against `Azeroth_32_48` rather than transcribed, because the public docs do not fit it: the attribute block is **16** bytes and the exists bitmap is **`ceil(w*h/8)` packed**, giving 3 bytes for a 3x6 rectangle and 5 for a 5x8 where one-byte-per-row predicts 6 and 8 — two rectangles disagreeing in opposite directions. The layout is proved by accounting for every byte: each sheet's vertex block ends exactly where the next chunk's attributes begin. **`MCLQ` is absent, not unimplemented** — the tile has 256 map chunks and none carries one. **The axis reading was fitted and the obvious measurement could not answer it**: over all 5,660,498 cells in Azeroth the two readings score 99.2% against 98.4%, because 86,222 of 92,219 sheets are ocean covering a whole chunk and *transposing a full 8x8 rectangle produces the identical footprint*. Restricted to rectangles transposing actually moves, over ground that differs, 90,346 cells vote **73.4% against 36.8%**. `LiquidType.dbc` (26 rows x 45 fields) supplies the category, identified by its rows' names *and* independently by the art they reach — and **row 181 is called `Orange Slime` with category 0, water**, so a client keying damage off a name would burn a player in a harmless pond. **Water's texture stores no colour at all**: `lake_a` and `ocean_h` average RGB 3.6 and 4.1 of 255 with their whole ripple pattern in the alpha channel, while `lava` and `slime` are ordinary opaque colour textures — `material_id` 1 against 2 — and running the colour rule over both multiplies the tint by 0.014 and draws a black river that is otherwise perfectly placed, animated, depth-faded and lit. Animation is 30 frames picked by the clock, not blended. **Swimming works**: `MSG_MOVE_START_SWIM` `0x00CA`/`STOP_SWIM` `0x00CB`, two of the nine opcodes `MOVE_RELAYED` recorded as unconfirmed for needing water this client did not have; the body floats head-clear, dives along the camera pitch, and carries `SWIMMING` with the pitch float it obliges. Another player's swim state arrives free with their relayed movement. **The damage is the server's and the client never computes it**: `Map::GetLiquidData` runs a `FIRE_TIMER` and applies `DAMAGE_LAVA` from its own copy of the terrain, so `world::environment` reads `SMSG_START_MIRROR_TIMER` `0x01D9`, `PAUSE` `0x01DA`, `STOP` `0x01DB` and `SMSG_ENVIRONMENTAL_DAMAGE_LOG` `0x01FC` and writes nothing. Not done: no underwater view at all (`MaxDarkenDepth` and the three darkening columns are unread), no mirror-timer bars drawn, no WMO liquid, no reflection or refraction |
-| Emitters | **4.19 done: things burn.** M2 particle and ribbon emitters — torches, campfires, braziers, spell trails — the first thing this renderer draws that has no geometry in any file. **Both record strides were measured, not transcribed**, by accounting for every byte: every `(count, offset)` in a record must point past the end of the block and inside the file, with the nearest landing inside one 16-byte alignment pad. 476 fits **6,429 of 6,429** models and every neighbouring stride fits **1,739** — which is exactly the number of models with a *single* record, where only the block's end moves and padding hides a word either way. Ribbons repeat it: 176 fits all 317, neighbours fit 68, and 317 − 249 multi-ribbon models = 68. The probe reads the bytes itself rather than calling the parser, because the parser is what is under test. **Two kinds of track and they are not interchangeable**: the ordinary `M2Track` is per-sequence in milliseconds, while `M2PartTrack` is 16 bytes of two arrays whose timestamps are a *fraction of one particle's life* as a `u16` over `0..=32767` — the torch reads `0, 16384, 32767`, which is what identified it, and reading one as the other parses cleanly and holds the last key forever. **A particle's colour is 0..255 and a ribbon's is 0..1**: 77,410 of 78,377 particle keys exceed 1.0 and **0 of 1,572** ribbon keys do. Also measured: `texture` is a direct index into the model's list (the torch names `FLAMELICKSMALL`), `emitterType` takes only 1/2/3 with no strays over 26,374 emitters, `lifespanVary` is a float and not the integer the docs give (1,133 set, none decoding to a denormal), and 0 emitters name a bone or texture that does not exist. **653 models are nothing but an emitter** — `UndeadFireLarge.m2` is 2,208 bytes with a 48-byte skin — and the loader had bailed on `produced no drawable geometry` for every one of them since it was written, silently, because "failed to load" and "has nothing in it" are the same empty patch of ground. Simulation is CPU-side and lives in `m2::particles` (no GPU, so it is testable): **a particle is born where its bone was at that instant and never moves with it again**, or a carried torch drags its whole plume along like a sticker. A system is keyed by **guid** for entities and by a tile/path/index hash for doodads, never by a position in a vector — entity groups are rebuilt every frame and reorder whenever anything spawns or dies. Not done: no sorting, no spin/tumble/wind/`zSource`, no geometry sub-models, spline emitters drawn as planes, a ribbon's material unresolved (additive assumed), and **not yet confirmed at the window** |
-| Parties | **4.20 done: a group can be formed, joined, read, left and broken up.** Five server packets and six requests, all measured against a live two-client party on the local realm and confirmed **from both ends** -- each character's own client reported its level, health and position, and the packet the *other* client received had to agree. **The reason this is not just an interface milestone**: a party member in visibility range is an ordinary replicated player and every field has been readable since 4.1, but a member **two zones away is not replicated at all** -- no object, no fields -- and `SMSG_PARTY_MEMBER_STATS` is the only thing the server sends about them, so a client drawing frames from replicated state alone looks perfect right up until the party splits up, which is when a party frame is for. `WorldState::party_member_vitals` prefers the entity where there is one and falls back to the summary where there is not; the **zone** never falls back, because a player you can see is by definition in your zone and the object carries no such field. **Every vital is an `Option` all the way to the painter** and a bar with no known maximum is drawn empty and unlabelled, never full -- and the field that would have been missed is the **power type**, which is an *index*: defaulting it to zero does not read as "not known", it reads as mana, so a rogue whose stats packet had not arrived would get a blue bar with nothing saying the colour was invented. Live, `Watcher` at 186 units read `60/60` health, `0/1000` **rage**, level 1, zone 12, entirely from the party packet. **`CMSG_GROUP_INVITE` `0x006E` is the one request that is answered**, which is why it was attempted first: `SMSG_PARTY_COMMAND_RESULT` `0x007F` arrives whether it worked or not, so a misspelt name and a real one bounded the opcode, the body and the reply layout at once -- the same move that bounded `CMSG_BUY_ITEM`. Everything else (`GroupAccept` `0x0072`, `Decline` `0x0073`, `Disband` `0x007B` -- one opcode for both leaving and breaking up -- `UninviteGuid` `0x0076`, `SetLeader` `0x0078`) is silent, so each says locally what it asked for. **The packet that refuted the obvious reading**: forming a group sends the leader a `SMSG_GROUP_LIST` with *nobody else in it* one packet before the real one, so "no members means no group" reports every group's creation as a departure -- what separates the two is the **leader guid**, zero only in the "you are in no group" form, and both shapes are asserted because a test of either alone passes under the wrong rule. **The rows are not all the same height** (a member out of view has no power bar), so the hit test walks the same accumulating heights the drawing does -- an averaged division targets the wrong member, silently. The invite prompt is the first frame here with **two opposite answers**: the geometry is stated once and read by both the drawing and the hit test, a press between the buttons answers nothing, and it sits at the top stacking rank because an invite **times out** -- one sealed under the map is a group nobody joins with no error anywhere. Commands take `/` and never reach the wire, because `.` is the *server's* prefix. **Confirmed at the window**, two clients on the local realm, and it found one bug the headless suite could not have: clicking an out-of-range party member's row set `App::target` and then a per-frame check cleared it again on the very next frame, because that check's rule -- gone from replicated state means the selection is gone too -- was written for a target that *had been* in view and left, not for the ordinary party case of a member who was never replicated at all. `WorldState::still_targetable` now exempts a current party member, and the target frame itself gained a fallback to the party packet (`hud::party_target_view`) so clicking one out of range shows their name and bars instead of nothing -- with the same zero-means-unknown convention as everywhere else, except the power bar specifically: a known maximum with no known power type still draws no bar, because a defaulted type reads as mana. **Party chat works, and finding out why it silently did not surfaced a bug older than this milestone.** A sticky channel (`/p`, `/s`, `/y`, `/w <name>` -- no argument switches it, an argument sends one line without touching it) is shown as a `[party]`/`[to Name]` tag on the composing line, because a client that switched silently would say a private line out loud. Sending refuses locally with a notice when not in a group, checked both where `/p` is typed and again on every ordinary line, since the sticky channel can outlive the group it was switched for. **The first live send vanished with no error**, and the cause was not the new code: AzerothCore answers chat from *any GM-flagged account* on a separate opcode, `SMSG_GM_MESSAGECHAT`, and a comment already in this codebase claimed "a GM's line shares the body, so it shares the parser" -- untested until `Testwolf`, GM level 3 on the local realm, sent the first party line this project ever sent from a GM account. It does not share the body: a GM line carries the sender's name inline, exactly like a monster's, regardless of what `ChatType` it is. `parse_gm_message_chat` is now its own parser, proven against the exact captured bytes (`0x02 0x07000000 <guid> 0x00000000 0x09000000 "Testwolf\0" <8 zero bytes> 0x05000000 "test\0" 0x00`) with a test asserting the *ordinary* parser refuses that same body rather than silently misreading it. **The loot rule is drawn and the leader can change it, and both live bugs found doing so were the server, not the client.** `world::group::LootRule` already parsed; the party frame now shows a line above the members (`hud::party_loot_view`) built by `describe_loot_rule`, which **names nothing**: `method` and `threshold` are small enums with well-known public names, and this project's own rule refuses to print one it has not behaviourally confirmed, so every value prints raw until a session actually tests what it does. Clicking the line (leader only, checked twice -- once to draw it editable, once again in `App::cycle_loot_method` in case leadership changed between the paint and the click) cycles `CMSG_LOOT_METHOD` `0x007A` through the five values `AzerothCore`'s handler accepts. **Two things needed live confirmation before the control actually worked.** First, cycling climbed to `1` and then stopped, silently, on every further click -- raw value `2` needs a member guid alongside it or the server declines the whole request with no reply, so the fix defaults the master looter to the reader's own guid the moment that value is reached rather than leaving it `0`. Second, clicking the line repeatedly disconnected the whole session outright (`OS error 10053`) -- the same class of failure `PING_INTERVAL` exists to avoid on a different opcode -- so the control now enforces a 600ms cooldown between sends. **Party members are dots on the map now, matched by zone rather than by position.** `MemberStats` carries a `(zone, position)` pair and no continent id, so the page a dot belongs to cannot be decided the way the player's own marker is -- by testing a world position against a page's rectangle (`Atlas::zone_page`). Instead `Maps::page_for_zone` matches the member's zone against a page's `area_id` by **equality**, the same shape `quest_poi.WorldMapAreaId` already uses for objective pins, walking `AreaTable`'s `parent_area_id` chain when the zone itself is a sub-area with no page of its own -- reusing the exact shape `sound::resolve_zone_sound` already needed for zone music, just against `WorldMapArea.dbc` instead of `ZoneMusic.dbc`. Getting this wrong would be silent in the usual way: a geometric guess lands the dot *somewhere plausible on the wrong page*, so the walk is an equality test the whole way rather than a fallback to containment. Confirmed live, two clients in the local realm's Northshire spawn: `Watcher`'s dot showed with their name beside it, and walking `Testwolf` into a different zone made it vanish rather than reappearing anywhere -- the refuting half, since a client that skipped page selection would still pass the same-zone case. Not done: no raids (`group_type`, `subgroup`, `flags` and `roles` all parse, are always `0` in a party, and are read by nothing -- a raid interface guessed from constant zeroes would be fiction), no way to pick a master looter other than yourself, no dungeon finder beyond honouring the five bytes its flag inserts |
-| Animation | **4.22 done: the three remaining gaps, one of which was not on the board.** `foss-wow#75` (casting plays nothing) and `#76` (a dual-wielder swings one arm) were the brief; the third was found by opening the table the other two needed. **The sheath transition had been playing the wrong cycle since it was written**: `SHEATH_ANIMATION_ID` was 32 and `HIP_SHEATH_ANIMATION_ID` 65, which are the human male's *sequence indices* for those cycles, lifted out of a `wow-cli m2 anims` listing whose first column is a position in the model. The real ids are **89 and 90**, and the two wrong numbers failed in opposite ways: id 32 is `SpellCast`, which no character model carries, so a back-slung weapon's stow silently fell through to `Stand` and never played; id 65 is `EmoteTalkQuestion`, which the human male *does* carry (sequence 55, 1800ms), so stowing a one-hander played a character gesturing a question for two seconds. The guard is a test that checks **every** hardcoded animation constant against the *name* of its `AnimationData` row -- a name cannot be arrived at by a coincidence of small integers -- plus one asserting that fewer than a quarter of a model's sequences sit at their own id. **The off hand comes off the wire, not off the inventory**: `hit_info` bit `0x4` (`HITINFO_OFFHAND` in AzerothCore, which supplied the hypothesis) marked **exactly 10 of 20** swings from a dual-wielding rogue, **0 of 10** from the same rogue with the off-hand dagger moved to the backpack, and **0 of 46** from creatures -- and the ten carrying it landed for 2 where the others landed 4-5, the off-hand penalty, measured independently. A client reading the equipped slots instead would be guessing: both weapons are replicated, but which one just landed is not. `AttackOff` (87) chains to `AttackOffPierce` (88) to `AttackUnarmed` (16) to `Stand`, the table's own column. **A cast's animation is `SpellVisualKit` column 2**, identified by what it *varies with* rather than by validity -- `AnimationData` is 506 dense rows, so two other columns in the same table also resolve 100% and are not animations. Grouped by the `SpellVisual` slot naming the kit: precast reaches `ReadySpell*`, casting `SpellCast*`, channel `ChannelCast*`, and **impact reaches `CombatWound`/`Knockdown`, which is the *victim's* flinch** -- so three of the six slots are read and impact is not, or a mage would recoil from their own fireball. Named spells say the same thing: Fireball, Frostbolt and Shadow Bolt wind up in `ReadySpellDirected` and release in `SpellCastDirected`, Sinister Strike releases in `Attack1H` because it *is* a swing, Eviscerate and Heroic Strike in `Special1H`. `Motion::Casting` is the wind-up (a **state**, held while the server says a cast is in flight, carrying no stamp) and `Motion::CastRelease` the one-shot off `SMSG_SPELL_GO` -- the only cast animation an instant spell ever gets, which is most of what a melee class casts. Both outrank the swing, and the wind-up outranks the release or every cast after the first has its wind-up eaten by the last one's follow-through. Two costs: `animation_ids` could no longer be a `&'static [u16]` (a spell's chain is data, so `Cycle` carries it inside the motion key -- sound because a chain is determined by its head), and `plays_once` had to be re-asked from the other side, since the *looping* cycles are the closed known set and anything a `SpellVisual` names is a gesture. Confirmed at the window. Not done: no channelled cast (the kit is transcribed, nothing parses a channel start), no upper-body blending so nothing plays while moving, `AttackUnarmedOff` unreachable |
-| Quest progress | **The log counts what you have done.** A log entry is five fields -- id, state, **two fields of counters**, timer -- and the counters are **sixteen bits, two to a field**, measured with the one sample that separates three readings: quest 837 wants four kills of each of *four* creatures, and completed it reads `+2` and `+3` as `0x0004_0004` with `+4` zero. Eight-bit quarters would have put `0x04040404` in `+2` alone; a `u32` each needs three fields and leaves nowhere for the timer. Quest 7 agrees independently -- four kobolds killed read `4` in the low half of `+2` while `character_queststatus.mobcount1` said `4`. **Kills and items are counted from different places and that is correct**: `.additem` moves nothing in those fields, because the client counts item objectives in its own bags and the server only checks at hand-in. **The objective's *wire* slot indexes the counter**, never its position in the parsed list, which is pruned -- a quest whose only objective sits in slot 2 would otherwise read a permanent zero |
-| Action bars | **Per character, since 4.17.** One shared set meant a rogue logged in holding a warrior's bar: every icon drew, every key pressed, every cast was refused, and it read as "the bars are broken". `ui.toml` keeps a set per character name, and a leftover bar is **adopted** by the first character who can cast all of it and discarded for one who cannot -- a spellbook is the only evidence available about whose bar it was |
-| Questgiver marks | **`!` and `?` float over NPCs, and the enum behind them was measured.** `CMSG_QUESTGIVER_STATUS_QUERY` `0x0182` → `SMSG_QUESTGIVER_STATUS` `0x0183`, nine bytes (guid + one status byte), confirmed because twenty-nine requests each came back naming the NPC they were about. The byte's values were produced deliberately on one character, one change at a time: **0** an innkeeper or a gated questgiver, **2** the same quest after `.levelup 25` (grey `!`), **5** quest 7 in the log with none of its kobolds killed, asked at its ender (grey `?`), **8** quest 783 offered to a fresh level-one human (yellow `!`), **10** 783 in the log and finished, at its ender (yellow `?`). Anything else is `Unknown(n)`, draws nothing, and logs once. **Asking beats deriving**: eligibility depends on level, race, class, reputation and every prerequisite in a chain, so a client deciding for itself reimplements the server's rules and is wrong on custom realms. **Every mark is discarded when the quest log changes** -- taking a quest silently invalidates two NPCs' marks and the server volunteers neither. `SMSG_QUESTGIVER_STATUS_MULTIPLE` never answered, so only the per-guid form is used |
-| Frame stacking | **Interface frames draw in an explicit order, and it decides which window a click reaches.** The map is centred and 760x520; a questgiver's scroll grows down into the same space, and with both open the Accept button was drawn, hit-tested and unreachable. Ranked by how much answering them matters: map at the bottom, then panels, then the always-there frames (no window may eat a click meant for an action bar), then the windows that want an answer -- loot, questgiver, release. The live bug is a headless test that asserts the overlap before asserting the click |
-| Cursor | **A drag holds the pointer.** Hidden, confined to the window, and warped back to the press position after every movement, so turning the camera never runs out of desk. That broke the click test, which was press-and-release-in-the-same-place -- exactly what a pinned pointer produces for every drag -- so it is now distance *travelled* since the press |
+| Data formats | MPQ, DBC, BLP, M2 (+animation, timed events, particles/ribbons), WMO, ADT/WDT, MH2O — all done |
+| Renderer | Textures, skinned models, buildings, blended terrain, streaming, liquids, M2 emitters — done. **`--screenshot` renders one frame headless and draws NO HUD** (see the instrument rule below) |
+| Protocol | 3.1–3.5 done against a live realm, two clients at once. Replicated creatures interpolate, turn and animate; **other players do not** — see the defect below |
+| World | Day/night from `Light.dbc`, a real sky gradient, sun and moon, weather that falls, game objects drawn. No skybox, no clouds, no stars |
+| Appearance | NPCs, other players and the viewer's own character are all dressed from their replicated fields. Weapons draw and sheathe. No shoulders, helms or ranged weapons on others |
+| Interface | Native, fully customisable, **no addons** — see the decision below. Player/target/party frames, click-to-target, chat, spellbook, action bars per character, `F1` to rearrange, saved to `ui.toml` |
+| Game | Melee, spells with real tooltips and a cast bar, cooldowns, combat log, corpse and loot end to end, inventory with slot moves, character panel, quests taken and handed in, quest log with progress counters |
+| Map | `M` opens the zone page with the character and quest objectives on it; fills in as explored. **Minimap** in the corner with party dots and objective rings. No zoom, panning, continent view or rotation |
+| Sound | Zone music and ambience by area and hour, creature voices, weapon impacts, **footsteps that know what they are standing on** — terrain and building floors both. No attenuation, no spell sounds |
+| NPCs | Gossip, vendors (buy and sell), quests, questgiver `!`/`?` marks, trainers |
+| City services | **Trainers, flight paths, trade, mail and guilds all done.** Auction is the last rung |
+| Collision | Walls stop you, floors and stairs hold you up, M2 collision meshes are obstacles. Tiles are selected by the **bounds of what they hold**, not by where the character is — Stormwind is one placement covering nine tiles. Transitions cut rather than blend; a stair stutter is instrumented, not solved |
 
-Roughly 63% of the way to something a person could test by playing. See
-`docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
+### At the window
 
-**The destination for the next few milestones is a native Questie**, and the
-ladder to it is a dependency chain rather than a preference: NPC interaction
-(4.15) → quests (4.16) → map (4.17) → minimap (4.21) → Questie's features
-(**4.30**). The last two rungs were numbered 4.18 and 4.19 when that was
-written; liquids, emitters, parties, the animation gaps, footsteps and now the
-six-part city-services block took those numbers on the way past and the order is
-unchanged. The number keeps moving
-and the *order* never has, which is the point worth reading: this ladder is a
-dependency chain, so anything that lands in between renumbers the rungs
-without reordering them. A quest tracker is a map feature — its whole value is "the thing you
-need is over there", and there is no *there* until a map exists. The scoping
-fact that matters: **most of Questie's bulk is a workaround for a restriction
-this client does not have.** An addon cannot ask the server about a quest it has
-not been offered, so it ships a hand-collected database of the entire game. This
-client can send the query. **Decided: quest data comes from the server and
-Questie's database is not ported** — so quests are never out of date, and are
-correct on a private realm with custom content, which is what this client is
-developed against. 4.30 is therefore a *presentation* milestone — pins, tracker,
-availability colouring — with facts off the wire wherever the wire will answer.
-The cost lands on **4.16**, which must build the query layer (`CMSG_QUEST_QUERY`
-`0x05C`, the questgiver-status queries, and a cache that treats a missing answer
-as *unknown* rather than as *nothing*) because the map has nothing to draw
-without it. Doing only what a quest log needs there means writing it twice.
+`wow-viewer --realm-host <host> --user <account> --character <name>` logs in,
+enters the world and streams the map around where the server says the character
+is. **W/S** walk, **A/D** turn, **Q/E** strafe, **Space** jumps, **Num Lock**
+is autorun; **right-drag** steers the character, **left-drag** swings the
+camera, the **wheel** zooms. Each is a real `MSG_MOVE_*` stream, with the
+opcode naming the axis that changed. **Left-click selects, right-click selects
+and attacks** — hostility is not yet known (`FactionTemplate.dbc` is
+untranscribed), so the client rules out only what is never a fight and lets the
+server refuse the rest.
 
-**`CMSG_QUEST_POI_QUERY` `0x1E3` is the find that makes this work.** WotLK
-shipped its own quest tracker, so the server already holds the objective map
-markers — **8,953 of 9,464 quests (94.6%)** on this realm — and hands over a map
-id, an area id and a polygon of points per objective. That is the thing Questie
-exists to draw, on the wire, always matching the realm played on. Its constraint
-shapes the design: it answers only for quests **in the player's log**, 25 ids per
-request. **Reading the realm's MySQL is a verification oracle, not a client
-capability** — a player on someone else's server has no DB access, so anything
-built on it works only for realm operators. What the wire genuinely cannot
-answer is where things are before you have seen them; that is solved by
-*recording what the client already streams* (every creature in range, with entry
-and position), keyed by realm, which starts empty and fills as you explore. There
-is **no enumerate-all opcode**, so no bulk prefetch at launch — and a mass query
-at login would repeat the 37-second burst. See `docs/ROADMAP.md`. Reference addons live in the **gitignored `addons-to-port/`**, are read
-rather than vendored, and each one's licence is checked and recorded *before* a
-port starts; see `docs/REUSE-POLICY.md`'s addon section.
+Panels: **B** bags, **C** character, **P** spellbook, **L** quest log, **M**
+map, **G** guild, **T** trade, **Z** sheathe, **Enter** chat, **F1** to drag
+the layout around and save it.
 
-**Buildings are solid.** Walls stop you, floors and stairs hold you up, and
-doodads with a collision mesh are obstacles rather than scenery — from the WMO
-triangles (including the invisible collision-only ones) and the M2 collision
-mesh, which is a separate and far coarser thing than the drawn geometry.
-Collision is entirely the client's job: a character walked through the abbey
-wall and a *second* client drew it happening, so nothing server-side corrects
-it. Known gaps: animation transitions cut rather than blend, and a residual
-stutter on stairs that is instrumented but not yet solved.
+**Chat commands take `/` and never reach the wire; `.` is the *server's*
+prefix**, which is how a GM command travels as ordinary chat.
 
-**Weapons are drawn, and they sheathe.** `Z` draws and stows, attacking draws
-automatically, and a stowed weapon goes where `Item.dbc`'s `sheathe_type` says
-— a greatsword on the back, a one-hander at the hip. **The server never draws a
-weapon for you**: sheathing is a client decision reported with
-`CMSG_SET_SHEATHED`, and a whole fight passes without the state moving on its
-own. With a weapon out the character holds the matching ready stance rather
-than the at-ease idle.
+`wow-cli world <host> --enter <character>` is the CLI-driven equivalent —
+**the host is positional and the character is `--enter`**, where the viewer
+takes `--character`. `--walk 20`, `--say`, `--units` and the per-milestone
+probes hang off it.
+
+**Known defect: replicated *players* do not interpolate.** A creature moves by
+`SMSG_MONSTER_MOVE`, which carries a start, an end and a duration; a player
+moves by relayed `MSG_MOVE_*`, which carries a position and no path, so
+`update_movement` stores it and clears any prediction. The player snaps
+between packets and, having no duration, reads as `speed: 0.0` and never leaves
+the stand cycle. **Why 3.5's two-client test missed it is the useful half**:
+both clients were *this* client, which heartbeats every 100ms, and a hundred
+milliseconds of snap between nearby points reads as movement. A real client
+sends every ~500ms. See `foss-wow#22`.
 
 **The UI question is answered: this client draws its own interface and does not
-run addons.** Reimplementing `FrameXML` faithfully enough for third-party addons
-means reproducing a whole Lua/XML widget system before the first health bar
-appears. Instead the interface *is* the customisation surface: every position,
-size and colour lives in `%APPDATA%\open-wow\ui.toml`, editable by hand or by
-dragging frames in-game. egui is the drawing substrate only — frames are painted
-from explicit geometry, so `scale` multiplies every dimension and the appearance
-is a function of our `Style` alone. See `docs/UI.md`.
+run addons.** Reimplementing `FrameXML` faithfully enough for third-party
+addons means reproducing a whole Lua/XML widget system before the first health
+bar appears. Instead the interface *is* the customisation surface: every
+position, size and colour lives in `%APPDATA%\open-wow\ui.toml`, editable by
+hand or by dragging frames in-game. egui is the drawing substrate only. See
+`docs/UI.md`.
 
-**The two halves have met, the viewer drives movement, and it draws the
-replicated world moving.** `wow-viewer --realm-host <host> --user <account>
---character <name>` logs in, enters the world, and streams the map the server
-chose around the position it reported. W/S walk, A/D turn, **Q/E strafe, Space
-jumps, right-drag steers the character while left-drag swings the camera, the
-wheel zooms and Num Lock is autorun** — each sent as a real `MSG_MOVE_*` stream,
-with the opcode naming the axis that changed and the flags carrying the whole
-state. The camera follows behind rather than flying freely. **Left-click
-selects; right-click selects and attacks** — hostility is not yet known
-(`FactionTemplate.dbc` is untranscribed), so the client rules out only what is
-never a fight and lets the server refuse the rest. Altitude follows the terrain — the keys drive the
-two horizontal axes and Z is read back out of the height field the ground is
-drawn from, so the character walks over hills rather than into them. `LiveWorld` keeps a `world::WorldState` alongside
-the connection and folds every drained packet into it, so creatures slide along
-their actual path instead of jumping between snapshots or standing wherever they
-were at login — turning to face the way they're moving, playing the model's own
-walk cycle in motion and its stand cycle at rest, all re-evaluated every frame.
-
-**Known defect: this is true of creatures and not of other players.** A creature
-moves by `SMSG_MONSTER_MOVE`, which carries a start, an end and a duration, and
-that is what `interpolated_position` was built for. A player moves by relayed
-`MSG_MOVE_*`, which carries a position and no path at all, so
-`update_movement` stores it and clears any prediction — the player snaps from
-packet to packet and, having no duration, reads as `speed: 0.0` and never leaves
-the stand cycle. Two symptoms, one cause, and a live report was what surfaced
-it.
-
-**Why 3.5's two-client test missed it is the more useful half.** Both clients in
-that test were *this* client, which heartbeats every 100ms; a hundred
-milliseconds of snap between two nearby points reads as movement. A real client
-sends roughly every 500ms, and at that spacing the same bug is unmistakable —
-which is exactly how it was reported. Two copies of our own client agreeing is
-the weakest form of the two-client rig, and this is the first time that has cost
-anything: the rig proves a *format* travels both ways, and proves nothing about
-timing that both copies share. See `foss-wow#22`. Verified with two clients, one walking while the
-other, running the real viewer, drew it happen; four real bugs in that
-drawing path (an animation that never went idle, a whole species animating
-because one instance of it moved, entities facing a constant wrong direction,
-motion that stuttered once animation ran faster than position updates) were
-only found by watching it live — see `docs/ROADMAP.md`'s 3.5 section.
-`wow-cli world --enter X --walk 20` remains the CLI-driven equivalent, useful
-when no window is available.
-
-On top of that there is now an interface: a player frame and a target frame
-drawn from replicated fields, a left click that casts a ray through the cursor
-and sends `CMSG_SET_SELECTION` for whatever it hits, and `F1` to drag the whole
-layout around and save it. The fields those frames read are confirmed against
-the live realm via `wow-cli world --units` — `Testwolf` reads as a rage user
-with `0/1000`, not the `0/0` mana a mis-indexed power array would give, and a
-second account's player replicates the same way. Watched live too: overlapping
-creatures each select deliberately, a bracket of corner ticks marks the
-selection out in the world, and left-drag swings the camera around the
-character. Two bugs came out of that look and out of nothing else — no
-in-world selection marker at all, and a camera whose yaw was written by a drag
-and overwritten by the follow code a millisecond later.
-
-4.2 added chat and names on top: `Enter` opens a line to type in (and takes the
-keyboard away from movement while it is open), the scrollback colours by kind,
-and frames say `Young Wolf` rather than `Creature 299`. Verified across two
-clients — `Watcher` on `ACCOUNT34` whispered `Testwolf` on `ACCOUNT33` and it
-arrived — plus 50 names resolved from 50 queries with none unanswered. Watched
-live, and for the first time in this phase the look found **nothing**: the
-typed line went out and came back exactly once, typing did not walk the
-character, and a whisper from a player who was never in visibility range
-resolved from a bare guid to their name retroactively. That is not extra care;
-it is that 4.1's live bugs had been converted into headless checks (a paint
-assertion, and received chat logged as well as drawn), and the one bug 4.2 did
-have was caught by reading the viewer's own log rather than by looking at it.
+**Frames draw in an explicit stacking order and it decides which window a click
+reaches**: map at the bottom, then panels, then the always-there frames (no
+window may eat a click meant for an action bar), then the windows that want an
+answer — loot, questgiver, release.
 
 ## Orientation
-
-**All nineteen equipment slots are named, and a bag's contents are readable.**
-Both were open gaps and both closed the same way — see the note below on
-changing the character rather than the technique. Wearing one item of each kind
-and recording where the *server* put it named slots 0–16 and 18, two of which
-independently agree with the starting-gear prediction that identified the array's
-base. Slot 17 held out because every ranged item is refused to a warrior; a
-**dwarf hunter** is created wearing a gun *and* an ammo pouch with shot in it,
-which named it `Ranged` and produced the first non-empty container this project
-had ever seen. A bag's contents live at `CONTAINER_FIELD_SLOT_1 = 0x42`, guid
-pairs at stride two, and `ITEM_FIELD_CONTAINED = 0x08` distinguishes an item in
-a bag from one held directly.
 
 - `crates/` — one library per concern: `chunk` (shared chunked container),
   `mpq`, `dbc`, `blp`, `m2`, `wmo`, `adt`, `render`, `auth`, `world`, `ui`
   (the player's interface; depends on neither `world` nor `render`, so it is
-  testable without a connection or a GPU) and `collision` (solid-world
-  queries; pure geometry, so likewise testable with a hand-built box)
+  testable without a connection or a GPU) and `collision` (pure geometry,
+  likewise testable with a hand-built box)
 - `tools/wow-cli` — inspection CLI. **Every format gets a dump command here
   before it is wired into the renderer**, and a `survey` command that parses the
   whole archive set. Those surveys have caught every systematic parser bug so
   far.
 - `apps/viewer` — windowed viewer. `--screenshot` renders one frame headless to
-  a PNG, which is how render output is checked without a display.
+  a PNG.
 - `docs/` — `ROADMAP.md`, `RENDERING.md`, `PROTOCOL.md`, `UI.md`,
   `REUSE-POLICY.md`, and `formats/*.md` recording what each format actually
   does and where it bit us.
@@ -345,84 +158,80 @@ a bag from one held directly.
   enUS, 17 archives, 203,949 paths). 1.12.1 and 2.4.3 are also on disk for
   format-evolution comparison.
 - `WOW_DATA` supplies `--data` to `wow-cli` and gates the integration tests.
-- Test realm: **`wow1.nekos.farm`** (auth 3724, world 8085), realm `NekoCore`
-  at `108.174.48.199:8085`, realm id 1. Accounts `TESTER`, `ACCOUNT33` and
-  `ACCOUNT34` exist. **Passwords are deliberately not recorded here** — this
-  file is committed. Ask the user, and pass the password via `WOW_PASSWORD`
-  rather than an argument. A wrong password and a missing account are hard to
-  tell apart, so guessing wastes real time.
-- **Three NPCs are deliberately left standing at `Testwolf`'s login spot** on
-  the local realm: an Innkeeper Farley (entry 295, npcflag 66179), a Marshal
-  McBride (197, flag 3) whose quest chain is gated behind a prerequisite, and a
-  Deputy Willem (823, flag 3) whose is not. That combination is what made the
-  gossip packet's two variable blocks separable — one NPC with options and no
-  quests, one with neither, one with a quest and no options — and it is the
-  fixture the rest of 4.15 reads from. `.npc add <entry>` rebuilds it.
-- Two accounts exist so that **two clients can be online at once**, which is the
-  only way to test anything about one player observing another — relayed
-  movement, entity replication. A single account cannot prove any of it.
-- `ACCOUNT33` also has `Facetest` (human warrior), created deliberately with
-  **five different non-zero appearance values** — skin 3, face 5, hairstyle 7,
-  hair colour 2, facial hair 4. Every other character here was made with the
-  all-zero default, and an all-zero appearance makes any search for it match
-  every zero field in the object, which is how two attempts at locating
-  `PLAYER_BYTES` settled nothing. Keep it: it is the only character on either
-  account that can distinguish a field from its neighbours, or show hair at all.
-- `ACCOUNT33` has two characters, `Testwolf` (human warrior) and `Testdruid`
-  (night elf druid), created to give `SMSG_CHAR_ENUM` real data to parse. An
-  account with no characters exercises none of that packet's field offsets.
-  `ACCOUNT34` has `Watcher` (human warrior), deliberately a human so it spawns
-  in Northshire within view range of `Testwolf` — two clients in different
-  starting zones cannot see each other and prove nothing.
+- Remote test realm: **`wow1.nekos.farm`** (auth 3724, world 8085), realm
+  `NekoCore` at `108.174.48.199:8085`, realm id 1. Accounts `TESTER`,
+  `ACCOUNT33`, `ACCOUNT34`. **Passwords are deliberately not recorded here** —
+  this file is committed. Ask the user, and pass the password via
+  `WOW_PASSWORD` rather than an argument. A wrong password and a missing
+  account are hard to tell apart, so guessing wastes real time.
+- Two accounts exist so **two clients can be online at once**, which is the
+  only way to test anything about one player observing another. `ACCOUNT33` has
+  `Testwolf` (human warrior), `Testdruid` (night elf druid) and `Facetest`;
+  `ACCOUNT34` has `Watcher`, deliberately human so it spawns within view of
+  `Testwolf`.
+- **`Facetest` was created with five different non-zero appearance values** —
+  skin 3, face 5, hairstyle 7, hair colour 2, facial hair 4. Every other
+  character here is the all-zero default, and an all-zero appearance makes any
+  search for it match every zero field in the object. Keep it: it is the only
+  character that can distinguish an appearance field from its neighbours.
 
 ### Local AzerothCore realm (127.0.0.1)
 
 A second realm runs entirely on this machine, from `C:\azerothcore-wotlk`
 (`docker compose up -d`). **Prefer this over `wow1.nekos.farm` for anything
-needing a specific game state** — against the remote realm every death cost a
-five-minute fight and permanently consumed a character's state; locally a
-death and a resurrection are each one GM command, so the same scenario runs
-twenty times.
+needing a specific game state** — remotely every death cost a five-minute fight
+and permanently consumed a character's state; locally a death and a
+resurrection are each one GM command, so the same scenario runs twenty times.
 
-- Auth `3724`, world `8085`, MySQL `3306`, SOAP `7878`. Realm `AzerothCore` at
-  `127.0.0.1`.
+- Auth `3724`, world `8085`, MySQL `3306`, SOAP `7878`. Realm `AzerothCore`.
 - Accounts, all GM level 3: `OWC33`/`owc33` (`Testwolf`, `Facetest`,
   `Questtest`, `Questtwo`), `OWC34`/`owc34` (`Watcher`, `Huntertest`),
-  `OWCADMIN`/`owcadmin`.
-- **A quest test needs a character that has never held the quest, and one is
-  not reusable.** `Questtest` has completed 783 and cannot retake it —
-  `.quest remove` clears the log but *not*
-  `character_queststatus_rewarded`, so the server keeps declining to offer it.
-  `Questtwo` is virgin and shows the auto-accept path (log `[]` at login,
-  `[783]` after the scroll alone). Creating another is one `--create` and is
-  the right move rather than trying to reset one; the same lesson as the dwarf
-  hunter that closed two gaps a whole milestone of cleverness could not.
-- **Quest 333 "Harlan Needs a Resupply" (questgiver entry 1427) is the
-  accept fixture**, because its `Flags` and `SpecialFlags` are both zero, so
-  nothing but `CMSG_QUESTGIVER_ACCEPT_QUEST` can put it in the log.
-  `.npc add 1427` puts the questgiver at your feet.
-- **Unlike `wow1.nekos.farm` above, these passwords are fine to commit.** The
-  server is local, disposable, and reachable only from this machine, which is
-  the opposite of the remote realm's rule two paragraphs up — a reader needs
-  to know which one applies before typing a password into a file.
-- **GM commands travel as ordinary chat.** `--say ".die"` works from our own
-  client for a GM account — `ChatHandler.cpp` parses any message starting
-  with `.`. `.die` additionally needs a target, hence `--select-self`.
-- **SOAP on `7878`** drives the server from a script with no game session at
-  all, for setup that should not depend on a client being logged in.
-- Reading the AzerothCore source in that tree is authorised, and rule 2 below
-  already permits it — source makes a hypothesis about a packet or a table
-  cheap to form, but observation still has to confirm it.
-- Two setup failures already cost time and are worth not re-diagnosing: a
-  stale cached `:master` image expecting `VMAP_4.7` against `VMAP_4.8` data
-  (fix: `docker compose pull`), and an old database missing the RBAC tables
-  (fix: a fresh volume — `AC_UPDATES_ENABLE_DATABASES=0` is baked into the
-  image on purpose, because `ac-db-import` owns migrations and the two must
-  not race).
+  `OWCADMIN`/`owcadmin`. **Unlike the remote realm above, these passwords are
+  fine to commit** — the server is local, disposable and reachable only from
+  this machine.
+- **Every fixture account here is a game master**, which changes what some
+  requests do. See the "an acceptance is a fact about the actor" rule below.
+- **GM commands travel as ordinary chat**: `--say ".die"` works from our own
+  client, and `.die` needs a target, hence `--select-self`. **SOAP on `7878`**
+  drives the server with no game session at all.
+- Reading the AzerothCore source in that tree is authorised (rule 2 permits
+  it): source makes a hypothesis cheap, observation still has to confirm it.
+
+**The fixtures, and why each one exists:**
+
+- **Three NPCs stand at `Testwolf`'s login spot**: Innkeeper Farley (295,
+  npcflag 66179), Marshal McBride (197, flag 3) whose quest chain is gated
+  behind a prerequisite, and Deputy Willem (823, flag 3) whose is not. That
+  combination is what made `SMSG_GOSSIP_MESSAGE`'s two variable blocks
+  separable — one NPC with options and no quests, one with neither, one with a
+  quest and no options. `.npc add <entry>` rebuilds it.
+- **Quest 333 "Harlan Needs a Resupply" (questgiver 1427) is the accept
+  fixture**, because its `Flags` and `SpecialFlags` are both zero, so nothing
+  but `CMSG_QUESTGIVER_ACCEPT_QUEST` can put it in the log.
+- **`Questtwo` is virgin and `Questtest` is spent.** A quest test needs a
+  character that has never held the quest and one is not reusable: `.quest
+  remove` clears the log but *not* `character_queststatus_rewarded`. Creating
+  another is one `--create` and is the right move.
+- **`Huntertest` (dwarf hunter on `OWC34`) is the most valuable character in
+  the project — do not delete it.** A dwarf hunter is *created wearing* a gun
+  and an ammo pouch with shot in it, which named equipment slot 17 and produced
+  the first non-empty container this project had ever seen. Both gaps had
+  survived a whole milestone of protocol cleverness.
+- **Guild id 1, "Cat Herders"**, leader `Testwolf`, six members at ranks
+  0/1/2/4/4/4 with both note columns varying independently and a distinct
+  emblem. `Testwolf`'s **public note is deliberately empty** — that is the
+  record that makes the roster self-refuting. `.guild create <player> "<name>"`
+  needs the player online; `.guild invite` and `.guild rank` work offline over
+  SOAP.
+- Two setup failures worth not re-diagnosing: a stale cached `:master` image
+  expecting `VMAP_4.7` against `VMAP_4.8` data (fix: `docker compose pull`),
+  and an old database missing the RBAC tables (fix: a fresh volume —
+  `AC_UPDATES_ENABLE_DATABASES=0` is baked in on purpose, because
+  `ac-db-import` owns migrations and the two must not race).
 - A cold snapshot of the previous database lives at
   `C:\azerothcore-wotlk\var\db-snapshot\ac-database-cold-2026-08-13.tar.gz`.
-  **Do not delete it** — the live database was deliberately recreated fresh
-  and that file is the only remaining copy of what was in it.
+  **Do not delete it** — the live database was deliberately recreated fresh and
+  that file is the only remaining copy.
 
 ## Rules that matter
 
@@ -440,1088 +249,610 @@ twenty times.
 
 ## How this project finds bugs
 
-Worth reading before debugging anything, because the same shapes keep recurring.
+The same shapes keep recurring. Each rule names the instance that produced it;
+the full account is in `docs/ROADMAP.md`.
+
+### Measuring a format
 
 - **A wrong field offset parses perfectly and returns nonsense.** Check
-  properties the data must have, not just that it decoded: M2 normals are unit
-  vectors, SRP6 rotation keys are unit quaternions, terrain chunks must meet at
-  their edges. Each of those caught a real bug that size checks missed.
+  properties the data *must* have, not just that it decoded: M2 normals are
+  unit vectors, SRP6 rotation keys are unit quaternions, terrain chunks meet at
+  their edges.
 - **"Could this column mean X" is the wrong question; "is it set *because* of
-  X" is the right one.** Finding which of `Spell.dbc`'s 234 columns holds a
-  duration by asking which one contains a valid `SpellDuration` id gave a
-  99.6% match — on the wrong column. Any column of small integers points
-  somewhere inside a 130-row table, so validity is nearly free and proves
-  nothing. Comparing the spells whose description says `$d` against those that
-  do not immediately separated the real column: non-zero 98.5% of the time
-  versus 39.0%. The same reframing found every other column here, and the one
-  test that came back flat had been asked the sloppy version of its question
-  (every description *mentioning* `$m1`, rather than only those quoting a
-  range, which is when a die is actually needed). A property test is only as
-  good as the population you run it against.
-- **A number nobody can check is worse than a blank.** A wrong field offset
-  eventually fails loudly; a wrong *number* on a tooltip never does. So the
-  description substituter resolves only the tokens whose columns were
-  confirmed against the data and passes everything else through with its `$`
-  intact — a visible `$s1` says "not implemented", a fabricated `47` says
-  nothing and is believed. Same rule as `describe_cast_failure` naming one
-  status code, one layer up.
+  X" is the right one.** Any column of small integers points somewhere inside a
+  small table, so validity is nearly free. Which of `Spell.dbc`'s 234 columns
+  holds a duration matched 99.6% — on the wrong column. Comparing spells whose
+  description says `$d` against those that do not separated it immediately,
+  98.5% against 39.0%.
+- **Validity is nearly free; *variation* is the discriminator.** Two update
+  fields both resolved 100% to real `GameObjectDisplayInfo` rows; one was the
+  constant 33. Ask whether the candidate *varies the way the thing it names
+  varies* — the same move that separated `ITEM_FIELD_OWNER` from
+  `ITEM_FIELD_CONTAINED`, which hold the identical guid on every item a
+  starting character carries.
+- **A property test is only as good as the population.** `Light.dbc`'s storm
+  column came back a coin flip because most positioned lights are decorative;
+  the row that matters is the one lighting a zone, where it is unambiguous. A
+  loot capture came back empty three times because a GM `.die` generates no
+  loot at all. Before believing a flat result, check the population can answer
+  the question.
+- **Ask the question that can refute you.** Five sky bands look plausible at
+  noon under almost any ordering; at dawn the warm/cool crossing has a *side*.
+  A test that cannot come out the other way is not evidence.
+- **Assert a property at the point where it exists.** "A storm is greyer than
+  clear weather" fails at noon, where clear light is already neutral grey. The
+  property is real at dawn.
+- **An error that scales with the value hides in the half of the range you look
+  at.** `Light.dbc`'s colour bands were double-encoded to sRGB for as long as
+  lighting existed and no daylight render showed it, because the curve is
+  nearly flat near the top. Midnight over Elwynn came out afternoon blue.
+- **Correcting half of a matched pair is worse than correcting neither.** The
+  same double-encode applied to sky, fog and diffuse light; fixing only the
+  certain half left the world bright under a dusk sky, and the report that came
+  back complained about the half that was *correct*.
+- **A name is the one thing in a binary format that cannot be a coincidence.**
+  The M2 event stride fit 4,265 of 4,265 models by byte accounting and every
+  neighbouring stride fit 1,343; the identifier being four printable ASCII
+  characters fit **25,498 of 25,500 records at 36 and 22–24% everywhere else**.
+  Same move: `CreatureSoundData`'s columns naming themselves through
+  `SoundEntries` labels, `GroundEffectTexture`'s terrain column naming itself
+  through the *filenames* reaching it, the trainer's greeting at the end of a
+  body, and the guard test checking hardcoded animation ids against the **name**
+  of the row they claim.
+- **Work out in advance which samples are *incapable* of separating your
+  candidates.** 476 fit 6,429 of 6,429 M2 particle records and every neighbour
+  fit 1,739 — exactly the number of single-emitter models, where padding hides
+  a word. 86,222 full-chunk ocean sheets transpose to themselves and had to be
+  excluded before the `MH2O` axis vote meant anything. A six-row trainer packet
+  cannot tell stride 38 from 42, because the overshoot lands *inside* the
+  greeting; a 133-row one can. **When the probe reports a tie, that is the
+  honest answer** — go and find a better sample.
+- **When a population cannot separate two readings, change the population.**
+  The guild roster's conditional float had two survivors after every static
+  check; clearing an *online* member's public note made a wrong reading run off
+  the end. The probe manufactured the decisive sample in the same run.
+- **Two fields of the same shape in two records need not be in the same
+  units.** A particle emitter stores colour in 0..255 and a ribbon in 0..1, in
+  the same file, twenty bytes apart. Counted rather than guessed: 77,410 of
+  78,377 particle keys exceed 1.0 and **0 of 1,572** ribbon keys do.
+- **A column can be named correctly and still not mean what its name says
+  here.** Every held item stores geometry in `ItemDisplayInfo.model_left` and
+  leaves `model_right` empty — but shoulders fill both with `LShoulder_` and
+  `RShoulder_`, which proves the names. The pair is "first model, second
+  model". Find the rows where the name is unambiguous and let those define it.
+- **A column that is an override is not the column most rows use.**
+  `CreatureDisplayInfo.sound_id` found voices for 1,205 displays of 24,262; the
+  real one lives on the *model*, and every creature in a starting zone was in
+  the silent majority. When a lookup works for a minority, ask whether the
+  field is a default or an exception.
+- **A field set on every row and resolving most of the time can still not be
+  the id.** `CreatureSoundData` column 0 resolves 935 of 1,306 — and only 102
+  to *creature* sounds, where every genuine column is near 100%.
+- **Two tables can mean the same thing and disagree about which value means
+  "nothing".** `GroundEffectTexture`'s terrain column defaults to row **0**
+  (also `Dirt`); a WMO material's `ground_type` defaults to row **10**
+  (`None`). Carrying the outdoor reading indoors makes every wall claim to be
+  dirt. Ask each table separately what its default is — and note the survey's
+  own headline counted "not zero" as "labelled" and reported 1,981 of 1,985
+  buildings as saying something where the real number is **622**.
+- **A schema is a fact about storage, not about a wire.** The
+  `SMSG_TRAINER_LIST` stride was predicted at 30 from the realm's own modern
+  trainer tables and is **38**: the schema was modernised and the packet
+  builder was not, inside one running server. Sibling of "a grep that finds the
+  field names is not a grep that finds the structure" — reading
+  AzerothCore for the jump block's field order turned up a *different packet's*
+  handler, and "fixing" the correct one would have been silent.
+- **A number copied out of a tool's output carries that tool's frame of
+  reference.** Two animation constants were transcribed from `wow-cli m2
+  anims`' *index* column as if it were the `AnimationData` id. Both were silent
+  and silent in opposite ways: one named a cycle no character model carries, so
+  it fell through to `Stand`; the other named `EmoteTalkQuestion`, which plays.
+- **Listing a directory and reading a path are different questions.** An MPQ
+  resolves by hash, so a file absent from `(listfile)` still reads perfectly —
+  a coverage check built on `wow-cli ls` said 0.1% of the baked NPC textures
+  shipped, and forty random names by path got forty hits. **A tool's own
+  default limit is the same trap**: `m2 anims` lists thirty of 156 sequences,
+  and the sidestep cycles are rows 38 and 39.
+
+### Reading a wire
+
+- **Assert the parse consumed the whole record.** Four separate
+  world-protocol bugs were invisible field by field and obvious the moment a
+  cursor reported leftovers. Parse through a cursor; make running out of input
+  *and* having input left over both errors.
+- **…and know where that instrument is blind.** It cannot see a conditional
+  field followed by null-terminated strings, because **a string scan
+  re-synchronises**: all three readings of the guild roster consumed 703 bytes
+  exactly. What refuted one was a note that is *not text*.
+- **A record that states its own length can be lying, so check it and never
+  seek by it.** Every `SMSG_MAIL_LIST_RESULT` record announces a size four
+  bytes too large, on every record, because the server counts eight words where
+  the writer writes seven. Seeking lands inside the next record; ignoring
+  throws away a per-record check; **checking** localises the mistake. The test
+  asserts the odd half — a record whose announced size *equals* its real one is
+  refused.
+- **One sample of a variable-length packet is nearly free; a sample where the
+  *counts differ* is the evidence.** `SMSG_GOSSIP_MESSAGE` has two
+  variable blocks back to back, and a wrong reading parses an innkeeper's
+  three-option/no-quest packet perfectly. Three NPCs were greeted so the counts
+  would disagree, and the test asserts *both* shapes.
+- **A filtered list is the cheapest proof that an index is an id.** Menu 1291
+  has four options and three arrived, numbered 1,2,3 with the numbering **not
+  closing up**. Same for loot slots, trainer rows and gossip options: **an
+  index is the server's own id, never a row position.**
 - **Print the body, not the length, of anything you refuse.** A parser that
   declines an unconfirmed shape is only useful if the shape survives the
-  refusal. `SMSG_ATTACKERSTATEUPDATE` arrived four bytes longer than any packet
-  seen before, the cursor caught it as trailing bytes -- and the tool logged
-  the *length* and dropped the bytes, so the one packet that could have
-  answered the question was seen and lost. Two separate tools here had the same
-  hole. If a parser's own doc comment says "a capture would settle this", then
-  something has to be keeping captures.
+  refusal. `SMSG_ATTACKERSTATEUPDATE` arrived four bytes long, and two separate
+  tools logged the *length* and dropped the bytes.
+- **Print every opcode seen, decoded or not.** "The server never sent it" and
+  "it arrived and we could not read it" are the same observation until
+  something separates them, and they want opposite investigations. This is the
+  cheapest instrument in the box and it has been needed **four** times: three
+  failed attempts at chat, an equip sweep reporting `nothing moved`, and a mail
+  arrival loop that reported zero while the database showed the letter
+  delivered. The loop that needs it is always the one somebody is writing now.
+- **"Nothing happened" is two findings wearing one sentence.** An opcode the
+  server never understood and a correct opcode deliberately declined have
+  identical printouts and opposite investigations.
+- **A diagnosis that names one cause for two situations sends the reader in a
+  circle.** "Already in the log, clear it first" is right for a stale character
+  and useless for an auto-accept quest. The tell is advice that would not
+  change if the other cause were true.
+- **Bound a silent send with an answered one from the same block.** A write
+  nothing acknowledges fails identically whether the opcode, the body or the
+  request was wrong. `CMSG_LIST_INVENTORY` bounded `CMSG_BUY_ITEM`;
+  `CMSG_GROUP_INVITE` bounded the party block; `CMSG_TRAINER_LIST` bounded the
+  city-services block; `CMSG_GUILD_ROSTER` is answered even for a character in
+  no guild, so it needs no fixture at all.
+- **When every request in a block is silent, the bounding instrument is a
+  refusal.** All ten of trade's client opcodes are silent on success and the
+  reply to a successful initiate arrives at *somebody else's* client. Aimed at
+  a guid that is not a player it answers immediately, at the sender, with
+  nobody else logged in. **A refusal that names a reason is a reply.**
+- **A refusal that resolves a guid is proof the body parsed.** The strongest
+  evidence in a rejection is what the server had to *understand* to produce it.
+  `foss-wow#55`'s refusal carried a real item guid, and reversing the two slots
+  reversed which guid came back — the opcode and body were right the whole
+  time.
 - **A reply you cannot get is not the same as a reply you did not earn.**
-  `CMSG_ATTACKSWING` could not be read off a capture -- nothing acknowledges an
-  opcode, and an outgoing number that is wrong gets read as some *other* valid
-  request rather than refused. Sent from out of range and facing the wrong way
-  it produced two empty-bodied refusals and no damage, which looks exactly like
-  a wrong opcode. The proof was not that a reply came, but that the reply
-  *changed when the conditions did*: closing to melee and turning to face
-  turned those same refusals into an attack-start and fifteen swings. When
-  nothing can confirm a send directly, find the input you can vary and check
-  the output varies with it.
+  `CMSG_ATTACKSWING` from out of range produced two empty refusals, which looks
+  exactly like a wrong opcode. The proof was not that a reply came but that it
+  **changed when the conditions did**. When nothing confirms a send directly,
+  find the input you can vary and check the output varies with it.
+- **A design premise can be wrong in a way that fails as an empty rectangle.**
+  `SMSG_TRADE_STATUS_EXTENDED` describes one side of a trade and is sent to the
+  *partner*, never to its author — so the obvious design draws its own column
+  permanently empty, which reads as half-finished rather than as false. What
+  caught it was the probe printing **two counts**: "3 describing the partner's
+  half, 0 describing our own" is a measurement; "our half never printed" is
+  not.
+- **A silent request may be believed only when every refusal is loud.** This
+  client draws its own half of a trade window from memory, which breaks the
+  standing rule — the licence is that *every* way `CMSG_SET_TRADE_ITEM` can
+  fail cancels the trade outright, so an open window and a disputed item is not
+  a state that exists. Before trusting a local record, enumerate the refusals
+  and check none of them is quiet.
+- **Two things can share one number.** Trade's `BUSY` means "already trading"
+  before the window opens and "not enough money" after it;
+  `ERR_GUILD_PERMISSIONS` and `ERR_GUILD_LEADER_LEAVE` are both `8`. Leave such
+  a value as a number rather than naming one meaning and being confidently
+  wrong half the time.
+- **Do not transcribe a table you have not verified — especially one that only
+  produces text.** A wrong offset eventually fails loudly; a wrong *name* for a
+  status code never does. `describe_cast_failure` names exactly one reason, the
+  one observed, and returns the raw number for everything else.
+- **A number nobody can check is worse than a blank.** The description
+  substituter resolves only tokens whose columns were confirmed and passes the
+  rest through with the `$` intact: a visible `$s1` says "not implemented", a
+  fabricated `47` says nothing and is believed.
+- **A packet is a statement made once; a field is a statement that stays
+  true.** Creature facing driven off `SMSG_MONSTER_MOVE`'s facing block turned
+  only when the player moved. `UNIT_FIELD_TARGET` says who a unit is fighting
+  for as long as it is fighting them.
+- **An absent update field is a zero, not an unknown.** A create block carries
+  only non-zero values, so a player with the default appearance has no
+  `PLAYER_BYTES` at all and the guild master has no `PLAYER_GUILDRANK`. Only a
+  dropped *object* means unknown.
+- **…but a missing *answer* is unknown, never nothing.** There is deliberately
+  no `quest_cache::get() -> Option<&QuestInfo>`: "no such quest" and "the reply
+  was lost" are indistinguishable and only one is permanent. The cache holds
+  packet **bodies, not parsed structs**, so a parser that learns a new field
+  upgrades every cached quest with no migration. Nothing POI is cached at all,
+  because the query gives the same empty list for "not in your log" as for "no
+  markers".
+- **The absence of a field and the absence of a feature look identical.** A
+  container announces its capacity and nothing naming its contents — which
+  proves nothing, because every bag observed was empty, a create block omits
+  zeros, and an empty slot *is* a zero. Check whether the sample could have
+  shown it.
+- **The step before the one under test can already have done it.** Accepting a
+  quest looked confirmed for a milestone: the request went out and the quest
+  was in the log. The *scroll request* had taken it — `CMSG_QUESTGIVER_QUERY_
+  QUEST` adds an auto-accept quest server-side. Only 179 of 9,464 quests behave
+  that way and the starting-zone chain is all of them. **Before believing a
+  positive result, check nothing else in the run could have produced it.**
 - **State that persists needs accounting, not just parsing.** Every parser here
-  is memoryless: a bad packet gives one wrong answer and the next is unaffected.
-  Replicated world state is not — a dropped update is permanent, a merge that
-  overwrites erases fields nothing will resend, a missed removal leaves a ghost.
-  None of it errors and all of it compounds. Count every change, tally updates
-  naming unknown objects instead of inventing them, and check the books balance
-  (`created - removed == held`). Those counters catch replication bugs long
-  before the world looks wrong, and none of them assert anything about layout.
-- **Assert the parse consumed the whole record.** The corollary to the above,
-  and cheaper than any of it. Four separate world-protocol bugs — a packet
-  sixteen bytes longer than expected, three missing equipment slots, a
-  result-code enum off by one, a position block read as nine floats instead of
-  eight — were invisible field by field and obvious the moment a cursor reported
-  leftovers. Parse through a cursor and make running out of input *and* having
-  input left over both errors.
+  is memoryless; replicated world state is not. A dropped update is permanent,
+  a merge that overwrites erases fields nothing will resend, a missed removal
+  leaves a ghost. None of it errors and all of it compounds. Count every
+  change, tally updates naming unknown objects, check `created - removed ==
+  held`.
+- **When the wire and the database disagree, the wire is the client's
+  business.** A bag hand-placed into an equipped slot by editing
+  `character_inventory` came back in the backpack: the server's loader silently
+  relocates a bag it declines to equip, and a session that ends by closing the
+  socket never saves. A fixture built behind the server's back is not a
+  fixture; `.additem` needs `.save` for the same reason.
+- **When the data will not produce a case, change the *character*, not the
+  technique.** Equipment slot 17 could not be named because every ranged weapon
+  offered to a warrior was refused, and no non-empty bag had ever been
+  observed. Both were attacked as *protocol* problems, with better items and
+  cleverer fixtures, for a whole milestone. A dwarf hunter is created wearing a
+  gun and an ammo pouch with shot in it — a fixture the server builds itself —
+  and one login answered both. **Creating a test character is cheap and was not
+  tried for far too long.**
+- **A refusal is a fact about the actor — and so is an acceptance.** When a
+  request keeps being declined, ask who is allowed to make it (the dwarf
+  hunter). The mirror costs more: `CanOpenMailBox` accepts the reader's **own
+  guid** from anybody at moderator rank, and every account on this realm is a
+  game master, so the cheapest possible probe works here and for no player at
+  all. A refusal sends somebody looking; an acceptance sends them home.
+  **Anything that works suspiciously easily on a GM account gets measured in
+  order to be ruled out.**
+- **A corpse keeps every flag it had in life.** `UNIT_NPC_FLAGS` is unchanged
+  on a dead NPC, so "will it talk" and "will it answer" are different
+  questions. And the server has **six** interaction preconditions that each
+  fail in silence — alive, the flag, not charmed, reaction above unfriendly,
+  within five units, class matching for a class trainer — so a fixture standing
+  in a field of kobolds is not a fixture.
+- **A display id says how to draw a thing and nothing about what it is.** A
+  mailbox and a bench are both a model at a position; `CMSG_GAMEOBJECT_QUERY`'s
+  type is the only thing on the wire that separates them. The cache keeps
+  **three** states — not asked, answered "no such thing", answered — because
+  reading "not asked yet" as "not a mailbox" refuses the object the player is
+  standing in front of, and only on the first click.
+- **Give the other end time to act before concluding it ignored you.** A single
+  packet sent immediately before disconnecting is often never processed.
+- **Not every failure is a bug, and a rate limit is not a refusal.** Three
+  keepalives dropped the world connection because the server enforces a
+  *minimum* ping interval. Clicking the loot-method control repeatedly
+  disconnected the socket outright (`10053`) rather than producing refusals.
+  Before shipping anything a player can click repeatedly, ask what happens to
+  the **connection** under a burst.
+- **A limit that bounds packets does not bound time.** The login burst drained
+  until quiet *or* 512 packets; Northshire emits a monster move fourteen times
+  a second and is never quiet, so it ran **thirty-seven seconds** before the
+  first frame. The same bug reappeared in the next loop somebody wrote, and was
+  worse for being **silent** — with no progress output a stuck run and a slow
+  one look identical. Any loop draining a live stream needs a wall clock *and*
+  something printed per round. A 150-second guild wait then died at `failed to
+  fill whole buffer` for the mirror reason: **no keepalive**.
+- **Measure the thing, not the thing next to it.** That same delay presented
+  as the action bar filling half a minute after login, and the confident
+  diagnosis was a slow `Spell.dbc` read blocking the render thread — with a
+  plausible argument attached, since two runs agreed to the second. The DBC
+  load takes 185ms. One timing log around the suspected culprit settled in one
+  run what reasoning had got backwards.
+- **Writing a format is riskier than reading it.** A bad read fails loudly at a
+  known offset; a bad write is accepted as some other valid message. Where a
+  structure travels both ways, define it once and round-trip it.
 - **The hard-looking part is rarely the expensive one.** SRP6, the RC4 header
   cipher and the update-field bit-packing all worked close to first time: they
   are precisely specified and fail loudly. Every hour actually lost went to
-  ordinary struct layout, where a wrong guess parses perfectly. Budget for the
-  boring parts.
-- **A number copied out of a tool's output carries that tool's frame of
-  reference.** `wow-cli m2 anims` lists a model's sequences with the *index* in
-  the first column and the name beside it, and two animation constants were
-  transcribed from that column as if it were the `AnimationData` id. They are
-  different numberings, and on a character model they disagree for nearly every
-  cycle. Both wrong numbers were silent and silent in *opposite* ways: one
-  named an animation no character model carries, so the state fell through to
-  `Stand` and never played at all; the other named `EmoteTalkQuestion`, which
-  the human male does carry, so stowing a one-hander played a two-second hand
-  gesture -- a wrong picture that reads as a slightly odd right one. The
-  comment warning against exactly this was already eleven lines above, on a
-  different pair of constants, and the doc comment on the wrong ones claimed
-  they had been *confirmed against the listing* -- which they had been, and
-  which is the misreading. What generalises is not more care: it is a test
-  checking every hardcoded id against the **name** of the row it claims,
-  because a name is the one thing in a table of small integers that cannot be
-  hit by coincidence.
-- **Check that your check is current.** The first walk was declared a failure
-  because the character list still showed the old position — but the character
-  list reports the last *saved* position, which lands tens of seconds after a
-  disconnect, while `SMSG_LOGIN_VERIFY_WORLD` reports the live one. The movement
-  had worked all along. When a change appears not to have taken, confirm the
-  thing being read is the thing being written. **The same rule reaches the
-  binary.** 4.22's three animation fixes came back reported as still broken --
-  accurately, in detail, and against a `wow-viewer.exe` built four hours before
-  any of them existed. A live report is evidence about whatever was actually
-  running, and one `ls` on the executable's timestamp settled it before a line
-  of code was re-read.
-- **Give the other end time to act before concluding it ignored you.** A single
-  packet sent immediately before disconnecting is often never processed, and the
-  result is indistinguishable from having sent the wrong thing. A facing opcode
-  was briefly written off as wrong on exactly this evidence; half a second of
-  waiting made it work every time.
-- **Writing a format is riskier than reading it.** A bad read fails loudly at a
-  known offset; a bad write is accepted as some other valid message and shows up
-  as wrong behaviour far away. Where a structure travels both ways, define it
-  once and round-trip it — two copies of a conditional layout can drift, and the
-  outgoing copy has nothing to announce the drift.
-- **When a send produces no reply at all, inventory what *did* arrive before
-  improving your guess.** Sending chat failed silently three times and looked
-  identical every time: packet out, session alive, nothing back. The causes were
-  a language an ordinary account may not speak, an enum where `0` is `SYSTEM`
-  and `1` is `SAY`, and — twice — our own tooling receiving the reply and
-  discarding it. Each round of guessing at the layout was wasted; the moment
-  `wow-cli world --stay` printed every opcode seen, decoded or not, the answer
-  took one run. "The server never sent it" and "it arrived and we could not read
-  it" are the same observation until something separates them, and they want
-  opposite investigations.
-- **Convert every live-only bug into a check that runs without a window.**
-  3.5 and 4.1 each cost a handful of bugs that no test could have caught. 4.2
-  cost none, and the difference was not care: 4.1's failures had been turned
-  into a headless egui pass asserting a frame painted where the layout put it,
-  and into logging received chat as well as drawing it. 4.2's one real bug —
-  a chat line stamped with a guid before its name resolved — was then found by
-  *reading the viewer's log*, a step earlier than looking. Live testing does not
-  stop mattering; each live bug just stops recurring for free.
-- **A limit that bounds packets does not bound time.** The login burst drained
-  until the stream went quiet *or* 512 packets arrived. Northshire emits a
-  monster move fourteen times a second and is never quiet, so the drain ran
-  until it had its 512 -- **thirty-seven seconds**, before the client drew a
-  single frame. Nothing was wrong with the drain; its contract simply had no
-  clock in it. Any "read until N or until idle" loop against a live stream
-  wants a wall-clock budget too, and the chunk size then sets how far past that
-  budget it can overshoot.
-- **Measure the thing, not the thing next to it.** That same delay presented as
-  the action bar filling half a minute after login, and the confident diagnosis
-  was a slow `Spell.dbc` read blocking the render thread -- with a plausible
-  argument attached (two runs agreed to the second, so it must be a fixed cost
-  rather than network jitter). It was wrong. The DBC load takes 185ms; the
-  spellbook had been sitting at the end of a burst that took 37 seconds to
-  finish collecting. One timing log around the suspected culprit settled in one
-  run what reasoning had got backwards.
-- **Do not transcribe a table you have not verified — especially one that only
-  produces text.** A wrong field offset eventually fails loudly; a wrong *name*
-  for a status code never does. It confidently misexplains what happened and
-  sends the next reader somewhere else. `describe_cast_failure` therefore names
-  exactly one reason, the one actually observed against the realm, and returns
-  the raw number for everything else. The urge to fill in the whole enum from
-  memory is the same urge that produced `CHAT_MSG_SAY = 0x00`.
-- **One dispatch table does not save a caller from ignoring what it produces.**
-  `WorldState::replicate` is deliberately the only place opcodes are dispatched,
-  and that is still right — but chat is *returned* rather than stored, and three
-  separate callers quietly dropped it. A two-client test then showed chat never
-  being delivered when it had arrived and been thrown away. Centralising the
-  producer does not centralise the consumers.
-- **Not every failure is a bug.** The world connection dropping after three
-  keepalives was the server enforcing a *minimum* ping interval — pinging too
-  eagerly is punished harder than not pinging. It surfaced as an unexpected end
-  of stream, which is indistinguishable from a desynchronised cipher. Before
-  suspecting corruption, ask whether a rate limit or anti-abuse rule was tripped.
-- **But derive from the *same* source when two things must agree exactly.**
-  The opposite-sounding rule, and both are right about different situations.
-  Independence is evidence when you are checking whether something is
-  *correct*. It is a liability when two things must *stay* consistent: the
-  picking ray is unprojected from the very matrix the scene is drawn with, not
-  rebuilt from the camera's angles, because those two agree only until someone
-  changes the projection — and a ray that is off by a little lands clicks on
-  the creature *beside* the one under the cursor, which reads as the server
-  disagreeing about positions rather than as a stale copy of a matrix. Same
-  reasoning as defining a both-ways structure once and round-tripping it.
-- **Two copies of your own client are not two independent derivations.** The
-  two-client rig is this project's strongest shape *for formats*: a structure
-  goes out through one client and back in through another, so the write and read
-  halves are confirmed via a third party. It proves nothing about behaviour the
-  two copies share. 3.5 declared replicated players smooth on exactly that
-  evidence, and they were not — both clients heartbeat every 100ms, and a
-  hundred milliseconds of snap between nearby points reads as movement. A real
-  client sends every ~500ms and the same missing interpolation is obvious. When
-  the thing under test is *timing* rather than layout, one of the two ends has
-  to be something you did not write.
-- **Compare against something derived independently.** The SRP6 tests carry a
-  server written from the protocol, not from the client. Agreement between two
-  separate derivations is evidence; a thing checked against itself is not.
-  The strongest version of this available here is the two-client movement test:
-  the structure goes out through one client, through the server, and back in
-  through another, so the write and read halves are confirmed against each other
-  *via a third party* that had to understand both. Reach for that shape whenever
-  a format travels in both directions.
-- **Two bugs can share one symptom, and you will fix the innocent one.**
-  M2 geometry drawn with the wrong winding culls front faces, which does not
-  look like missing geometry -- it looks like a model *facing away from you*,
-  because what survives is the interior of its far surface. On that reading a
-  half turn was added to entity facing, then the same wrong reasoning was
-  propagated to doodads. Neither rotation was ever wrong. What separated them
-  was fixing the winding first and then A/B-ing the rotation live, one
-  variable at a time, with the person at the window pressing the key. When a
-  symptom persists across a fix that should have worked, suspect that it has
-  two causes rather than that the fix was too small.
-- **And one bug can produce several unrelated-looking reports.** The mirror of
-  the rule above, and it costs the same way. A character sinking into the
-  ground, a click marker landing off-centre, hills that could not be walked up,
-  and another client seeing this one twitch were four separate complaints, none
-  of which said "altitude" — and they were one missing feature. The click
-  marker in particular reads as a picking-ray bug, because the ray starts at
-  the eye and the eye is a fixed offset above a position whose Z was wrong.
-  Before opening the second investigation, check whether the first cause
-  reaches it.
+  ordinary struct layout, where a wrong guess parses perfectly.
+
+### Looking at a picture
+
 - **A composite needs a way to be seen as itself.** A dressed character looked
-  bare-chested at walking distance and the obvious diagnosis was that the torso
-  region was wrong. Dumping the composed 512x512 skin to a PNG showed all ten
-  regions correct and the torso wearing a white shirt that simply reads as skin
-  at three hundred pixels. The render was right and the *look* at it was wrong,
-  which is the inverse of the usual failure here and just as expensive. Anything
-  assembled in memory from a dozen files gets a dump command.
-- **A trap documented at one call site does not protect the next one.** That
-  the server never relays our own movement back — so replicated state holds
-  our *login* position forever — is written up at length in
-  `live::drawable_entities`, which is the function that **draws** the player.
-  It was then walked into immediately by a function that **aims at** the
-  player: resolving "face this guid" through replicated state made every
-  creature attack the spot the character logged in at, drifting further wrong
-  the further they walked, until the player could stand behind a creature
-  supposedly fighting them. Same fact, different consumer, and the comment was
-  in the wrong place to help. When a fact about the data is surprising enough
-  to document, put it on the *data* — an accessor or a type — not on the first
-  caller that tripped over it.
-- **A rule written for the exceptional case can silently swallow the ordinary
-  one.** `App::target` was cleared whenever its guid held no replicated
-  object, correctly for a target that had been seen and then died or walked
-  out of range. Parties made "no replicated object" the *common* case for a
-  perfectly good selection — a member outside visibility range was often
-  never replicated at all, which is the entire premise of 4.20 — so clicking
-  their row set the target and a per-frame check cleared it again one frame
-  later. It read as the click doing nothing, live, and no headless test
-  caught it because none had reason to click a target that could not be
-  found in replicated state to begin with. The fix is a positive exemption
-  (`WorldState::still_targetable`, checking the party list) rather than a
-  narrower negative condition — the milestone that changes which case is
-  common is the one that has to teach the old rule about the new one.
-- **A packet is a statement made once; a field is a statement that stays
-  true.** Creature facing was first driven off `SMSG_MONSTER_MOVE`'s facing
-  block, which the server sends only when it decides a creature has turned.
-  The result was a wolf that turned *only when the player moved*, because that
-  is what prompts the server to re-issue one. `UNIT_FIELD_TARGET` says who a
-  unit is fighting for as long as it is fighting them, so deriving the heading
-  from it tracks continuously and for free. When behaviour should be
-  continuous, prefer the replicated field over the event that last changed it.
-- **A rate limit and a lag are different failure modes, and only one of them
-  is bounded.** Easing creature turns at a fixed maximum rate looks right in
-  every single frame, and is fine while the target's angular speed stays under
-  the cap. Angular speed is `v / r`, so a player circling at melee range
-  exceeds any cap chosen to look unhurried — and past that point the error does
-  not settle at "somewhat behind", it grows without limit until the creature
-  faces nowhere near its victim. Closing a *fraction* of the remaining error
-  instead bounds the lag at `omega * tau` for any `omega` at all. Whenever a
-  smoothing constant is a maximum speed, ask what happens when the input
-  exceeds it.
-- **A fallback can invalidate the rule that was written beside it.** Combat
-  animations fall back to plain `Stand` on a model with no attack or ready
-  cycle — which a wolf genuinely lacks. That fallback then broke the
-  *clamping* rule sitting next to it: "plays once, so hold the last frame" was
-  keyed on the state that asked, and a Stand frozen at its final frame is a
-  statue. The same fallback broke it the other way too — `Dead` resolves to
-  the *fall* on those models, which must hold rather than loop, while carrying
-  no start time to clamp against. Holding had to become a property of the
-  animation that resolved rather than of the state that requested it. When a
-  fallback is added, re-ask every question that was answered in terms of the
-  thing being fallen back from.
-- **Copying a mechanism is the cheapest way to audit it.** Right-click needed
-  the same press/release distance test the left button had used since 4.1, so
-  it was written by mirroring it — and mirroring it surfaced a bug four
-  milestones old. The left button cleared `last_cursor` on release, and the
-  *next* press reads its own start position out of that same field, so a
-  second click at the same pixel was silently discarded. It survived because a
-  selection is not a gesture anyone repeats; right-click-to-attack is, and
-  exactly when it appears not to have worked. Reusing a mechanism in a second
-  place asks questions of it that the first place never did.
-- **A grep that finds the field names is not a grep that finds the
-  structure.** Reading AzerothCore for the jump block's field order turned up
-  `sinAngle, cosAngle, xyspeed, zspeed` in `MovementHandler.cpp` — a different
-  order from this project's `Falling`, and it looked exactly like a bug worth
-  fixing. It was a different packet. The canonical `MovementInfo` codec in
-  `WorldSession.cpp` reads `zspeed, sinAngle, cosAngle, xyspeed`, which is what
-  we already had. "Fixing" the correct one would have been silent, and the
-  source would have been blamed for it. When source makes a hypothesis cheap,
-  confirm you are reading the *definition* and not one of its users.
-- **A rule can be right and still exclude the one thing you need — and then
-  the test has to assert both halves.** 4.3 established that a spell earns a
-  bar slot by belonging to the character's own skill line, because every
-  internal effect (`Opening`, `Duel`, `Honorless Target`) sits on
-  `SkillLineAbility`'s generic line 183 with a class mask of zero. `Auto
-  Attack` sits on line 183 with a class mask of zero. So the mechanism that
-  correctly keeps the junk off a bar necessarily hid the one ability every
-  character uses, and the rule was not wrong — merely complete. Two fixes
-  present themselves and only one is right: widening the rule to admit line
-  183 readmits all the junk, where naming the single spell admits exactly what
-  was checked. The trap is in the *test*: asserting only that auto-attack is
-  admitted passes just as well under the wrong fix, so the check has to assert
-  the junk beside it is still refused. Whenever an exception is carved into a
-  filter, test the exception **and** the thing it is indistinguishable from.
-- **A column can be named correctly and still not mean what its name says
-  here.** Every held item in the game -- main-hand swords included -- stores
-  its geometry in `ItemDisplayInfo.model_left`, and `model_right` is empty.
-  The obvious conclusion is that the two columns are swapped, and it is wrong:
-  shoulders fill both and put `LShoulder_...` in one and `RShoulder_...` in
-  the other, which proves the names. The pair is really "first model, second
-  model", and only a genuinely *paired* item uses both, so a single-model item
-  sits in the first column whichever hand it belongs in. Reading the column as
-  the hand would have put every weapon in the game in the wrong one, silently.
-  When a column's name suggests an answer, find the rows where the name is
-  unambiguous -- the pairs, the extremes -- and let those define it.
-- **An error that scales with the value hides in the half of the range you
-  look at.** `Light.dbc`'s colour bands are *display* bytes and an sRGB render
-  target re-encodes whatever a shader writes to it, so every one of them was
-  brightened on the way to the screen — 49 arriving as 123. It had been true
-  since lighting existed and no daylight render ever showed it, because near
-  the top of the range the curve is nearly flat. What showed it was **midnight
-  over Elwynn coming out a bright afternoon blue**. When a transform's error
-  vanishes at one end, testing at that end proves nothing; go to the other.
-- **Correcting half of a matched pair is worse than correcting neither.** The
-  same double-encode applied to the sky, the fog and the diffuse light. The
-  sky's fix was unarguable — it is written straight to the target — and the
-  diffuse's was not, because it multiplies textures already decoded to linear,
-  so what space it belongs in is a real question rather than a slip. Fixing
-  only the certain half left the world bright under a dusk sky, and the report
-  that came back was not "the lighting is wrong" but *"the sky looks like
-  night even if it is bright"* — a complaint about the half that was correct.
-  The derivation then settled it and both answers agreed. If two values are
-  compared by eye, they must be converted together or not at all.
-- **Ask the hour that can refute you.** Five sky bands look like a plausible
-  gradient at noon under almost any ordering, so agreeing with one is nearly
-  free. At dawn a sky is not a ramp: the warm half arrives at a definite height
-  and the crossing has a *side*. That is what identified the bands, and it is
-  the same move as comparing `$d` descriptions against the rest rather than
-  asking whether a column contains valid ids. A test that cannot come out the
-  other way is not evidence.
-- **An instrument that fails quietly costs more than one that fails.**
-  `--hour` parsed, promised in its help text, and did nothing without a realm —
-  an offline screenshot silently got the fallback gradient, which is a
-  perfectly plausible sky. Several minutes went into studying a picture that
-  had never consulted the tables. A flag that cannot act should say so, not
-  render something believable.
-- **A green suite is a claim with a date on it.** `cargo test` was not green at
-  `HEAD` despite a handoff saying so: 4.8's global-sequence fix had invalidated
-  a test's premise ("a sequence index past the end has no keys anywhere" — a
-  global track has no sequence to be outside of). The behaviour was right and
-  the test was describing the old bug. Run it before believing it, and when a
-  fix invalidates a test, the rewrite has to assert **both** halves — that the
-  ordinary case still holds *and* that the exception genuinely differs — or it
-  passes just as well after a regression to the original bug.
-- **And the suite can fail without any test failing.** The sequel, one
-  milestone later, and it cost sixteen minutes before it was even recognised as
-  a hang. `cargo test --release` stalled at `HEAD` on a tree whose handoff again
-  said it was green: the eleven GPU tests each built their own `wgpu` device,
-  the harness runs them on separate threads, and eleven concurrent DX12 device
-  creations deadlocked — thirty-seven threads with six seconds of CPU between
-  them, indefinitely. Single-threaded the same eleven pass in under six seconds.
-  A shared `OnceLock` device fixed it *and* made them eight times faster. Two
-  things worth keeping: it is a **race**, so the previous green run was luck
-  rather than evidence — and the tempting fix, `RUST_TEST_THREADS=1`, is a
-  workaround living in an environment variable, which is precisely where nobody
-  applies it on the run that matters. When a test needs a process-wide
-  resource, build it once for the binary. Also: a hang is not a slow run, and
-  the tell is CPU time — six seconds across thirty-seven threads in sixteen
-  minutes is a deadlock, not work.
-- **A property test is only as good as the population, and 200 irrelevant rows
-  will bury two decisive ones.** Asking whether `Light.dbc`'s storm column is
-  really the storm column across every outdoor light came back flat: darker 55%
-  of the time, foggier 47%, a coin flip that read as a refutation. Most
-  positioned lights are decorative — a glowing crater, a haunted wood — and
-  their weather columns are authored for effect. The row that *matters* is the
-  one that lights a zone, and there the answer is unambiguous: map 0's default
-  storm row is a flat neutral grey at every hour of the day with the fog
-  distance nearly halved. Before believing a flat result, check that the
-  population can answer the question.
-- **Assert a property at the point where it exists.** The same weather work
-  asserted that a storm is *greyer* than clear weather and failed — at noon,
-  where clear light is already a perfectly neutral 0.71/0.71/0.71 and nothing
-  can be greyer than grey. The property is real at dawn, where the sun has a
-  colour for the storm to take away. The test was wrong, not the data.
-- **A field can be parsed, documented, and then ignored by the one function
-  that had to act on it.** `Track::global_sequence` was read off the wire and
-  carried a doc comment saying it "runs on a shared global timer rather than
-  the current sequence" — and `sample` indexed `sequences[sequence]` anyway.
-  Global tracks hold one keyframe list, so they resolved only when the sequence
-  index happened to be zero, which is `Stand`; every other cycle silently fell
-  back to bind pose. Invisible for four milestones, because a body bone
-  snapping to bind in one cycle is nothing anyone would spot. It took a
-  *sheathed sword flying off a character's back* to make a bone's orientation
-  something you could see. When a struct field exists to change behaviour,
-  check that something reads it.
-- **When a measurement contradicts a conclusion you trust, suspect the
-  instrument.** The attachment points chosen for stowed weapons came back as
-  the *least* stable of all thirty-nine across animations — which looked like
-  proof the identification was wrong, and nearly caused it to be redone. The
-  identification was right; the sampler was broken. Two independent arguments
-  had already agreed on those points, and a third measurement disagreeing with
-  both is evidence about the third.
-- **When looking cannot settle it, find the thing that moves.** A greatsword
-  slung across a back has two mirror images, and *both* look exactly like a
-  greatsword slung across a back — the placement-rotation trap over again, and
-  a render was never going to break the tie. What was asymmetric was not the
-  picture but the **animation**: character models carry a cycle named `Sheath`
-  in which the hand travels to wherever the weapon is stowed, and tracing that
-  hand showed it passing two to three times closer to one candidate than the
-  other, on three races. When two static candidates look equally right, ask
-  what *moves* between them.
-- **A wrong constant is right for whatever it was written against.** The
-  attachment sanity check capped offsets at 100 units, which is generous for a
-  character and absurd for a hundred-and-fifty-unit falling tree whose
-  perfectly good attachment sits at Z=127. The check was not too strict or too
-  loose; it was measured against the wrong thing. A threshold that scales with
-  its subject — here the model's own declared extent — cannot make that
-  mistake, and this is the second time a fixed limit has been the bug (see the
-  turn-rate cap above).
-- **When every measurement says it is right, stop measuring and move.** A
-  weapon that would not appear on screen produced four clean diagnostics in a
-  row: the item resolved, the group was built, the transform put it exactly at
-  the hand, the model rendered fine alone. Nothing was wrong. The camera sits
-  behind the character and a blade held forward at hip height is entirely
-  behind its owner from there. One render from the side settled it. The
-  sibling of "a composite needs a way to be seen as itself", and the tell is
-  the *pattern*: diagnostics that keep coming back correct are evidence about
-  the observer, not the code.
-- **Validity is nearly free; *variation* is the discriminator.** Two update
-  fields both resolved 100% to real `GameObjectDisplayInfo` rows, because the
-  table is 39% dense and any small integer lands in it. One was the constant 33
-  -- the type mask -- and would have drawn thirty-two identical powder kegs;
-  the other took seven values that came out as inn benches in the abbey the
-  player was standing in. When a candidate column and a control both look
-  valid, ask whether the candidate *varies the way the thing it names varies*.
-- **Listing a directory and reading a path are different questions.** An MPQ
-  resolves by hash, so a file absent from `(listfile)` still reads perfectly.
-  A coverage check for the baked NPC textures built on `wow-cli ls` concluded
-  0.1% of them shipped and would have sunk the approach; resolving forty random
-  names by path got forty hits. When a cheap check says a whole feature is
-  impossible, confirm it answered the question you asked. **A tool's own
-  default limit is the same trap wearing a different hat**: `m2 anims` lists
-  thirty of a hundred and fifty-six sequences, and a search for the sidestep
-  cycles came back empty from a list that stopped at index 29 — concluding that
-  no character model had one and that the bug was not a bug. They are rows 38
-  and 39.
-- **An absent update field is a zero, not an unknown.** An object-create block
-  carries only non-zero values, so a player with the default appearance has no
-  `PLAYER_BYTES` field at all. Treating absence as "not known" left exactly the
-  plainest-looking players white -- the bug the field had just been added to
-  fix. The rule generalises: for a sparse field set, missing and default are the
-  same statement, and only a dropped *object* means unknown.
-- **When geometry is missing rather than wrong, suspect culling before data.**
-  WMO winds counter-clockwise, M2 and terrain clockwise. Guessing from a
-  neighbouring format culled a roof and looked like a hole in the mesh.
-- **Geometry drawn at zero size looks exactly like geometry never drawn.**
-  This one recurred, in a second place, years of commits later. A bone palette
-  is a fresh GPU buffer, and a fresh GPU buffer is zeroed, and a zero matrix
-  multiplies every vertex to the origin -- so a palette created and never posed
-  collapses its model to a point in total silence. `--screenshot` placed every
-  replicated creature and never called `update_animations`, so a headless
-  render of a zone with ninety-five creatures in it came back as empty grass,
-  and had done since the feature was written. Nobody noticed because 3.5 was
-  verified by watching a *window*, where the frame loop does pose them. The
-  buffer now initialises to identity, so the same mistake draws a bind pose --
-  visibly wrong instead of invisibly absent. **Anything that must be written
-  before it is read should start as something you can see.** A
-  bone index past the end of the palette reads zero on the GPU, collapsing the
-  model to the origin with no error anywhere. Creatures were invisible while
-  doodads rendered, and the obvious reading — that the entities were never
-  placed — sent the search to the protocol instead of the renderer. When
-  something is missing, confirm whether it was *submitted* before asking whether
-  it was produced.
+  bare-chested at walking distance; dumping the composed 512x512 skin showed
+  all ten regions correct and a white shirt that reads as skin at three hundred
+  pixels. Anything assembled in memory from a dozen files gets a dump command.
+- **Measure the asset, not the channel you expected it to use.**
+  `lake_a.blp` averages **RGB 3.6 of 255** and keeps its whole ripple pattern
+  in alpha, while `lava` and `slime` are ordinary opaque colour textures
+  (`material_id` 1 against 2). A shader multiplying `texel.rgb * tint` over
+  both draws a river that looks like a shadow. Dump and *measure* the input
+  before doubting the output.
 - **Comparing two candidates tells you which is nicer, not which is right.**
   The ADT placement offset shipped at `-90`, was "fixed" to `+90` because a
-  render of Northshire Abbey looked better that way, and both were 90 degrees
-  wrong -- every fence in Elwynn lay across its own line the whole time. A
-  building has four sides and every rotation shows a door to somebody, so the
-  test could never fail. What settled it was measuring something that could
-  not move: fence *runs* give a direction from positions alone with no
-  rotation involved, and the lamp pillars beside the abbey steps are doodads
-  whose world positions are fixed however the building is turned. **A movable
-  thing checked against another movable thing proves nothing.** And when a
-  user says a second thing is still wrong, that is data about the *first* fix.
+  render looked better, and both were 90 degrees wrong. A building has four
+  sides and every rotation shows a door to somebody. **A movable thing checked
+  against another movable thing proves nothing** — what settled it was fence
+  *runs*, which give a direction from positions alone.
+- **When looking cannot settle it, find the thing that moves.** A greatsword on
+  a back has two mirror images and both look right. What was asymmetric was the
+  `Sheath` **animation**: the hand travels two to three times closer to one
+  candidate, on three races.
 - **A value with nothing to compare it against is not verified by looking at
-  it.** Entity facing was applied raw for four milestones under a comment
-  claiming an M2's forward is +X, and every creature in the world was turned
-  exactly backwards the whole time. Watching it live could not catch it: the
+  it.** Entity facing was applied backwards for four milestones under a comment
+  claiming an M2's forward is +X. Watching it live could not catch it — the
   only heading this client *knows* is the player's own, and the player's body
-  was not drawn, while a creature's heading comes from the server with nothing
-  to check it against. It fell out the moment the player appeared on screen --
-  turn the character to a heading the server confirms, put the camera at the
-  matching yaw, and whether you see a face or a back is no longer a matter of
-  opinion. Before trusting a value because it "looks right", ask what it is
-  being compared *to*.
-- **Some rules can only be found by looking.** Geoset selection -- which of a
-  character model's seventeen haircuts and six beards to draw -- took four
-  attempts, and each wrong one was a *reasonable* reading of the same table.
-  Drawing everything gave every haircut at once; drawing only what the
-  character's own numbers name took the forearms, hands and legs off with the
-  phantom cloak, because variant one of an equipment group is the bare body
-  part. No amount of staring at `CharHairGeosets` distinguishes those. One
-  screenshot each did. When a rule is about what a *model file* contains rather
-  than what a table says, render it.
-- **An odd-looking render is often the camera.** A gnoll looked scrambled and a
-  building looked misplaced; both were framing, not geometry. Render canonical
-  angles before doubting the parser.
-- **Bound a silent send with an answered one from the same block.** A write
-  nothing acknowledges fails identically whether the opcode is wrong, the body
-  is wrong, or the request was declined — three investigations behind one
-  silence. `CMSG_BUY_ITEM` produced exactly that. What collapsed it in one run
-  was sending `CMSG_LIST_INVENTORY`, four opcodes below it, *first*: that one
-  is answered, and its reply layout was already known, so 393 bytes of stock
-  coming back said the numbering was right and moved the whole question onto
-  the body — which was indeed wrong three separate ways. Before improving a
-  guess at a silent request, look for a neighbouring one that talks back.
-- **A refusal that resolves a guid is proof the body parsed.** The strongest
-  evidence in a rejection is usually not the rejection — it is whatever the
-  server had to *understand* in order to produce it. `foss-wow#55` was written
-  off as "the wrong opcode or body shape" because a slot swap kept being
-  refused; but the refusal is eighteen bytes carrying a **real item guid**, and
-  reversing the two slots in the request reverses which guid comes back. A
-  server that could not parse the body could not have resolved bytes 0 and 1 to
-  an item, let alone tracked the argument order. The opcode and the body were
-  right the whole time and the open question was the status code. Before
-  concluding a send is malformed, ask what the reply proves the far end already
-  worked out.
-- **"It fails identically under every condition" is a claim to re-run, not to
-  build on.** The same ticket rested on the failure being state-independent —
-  the argument being that a real handler would treat an empty destination
-  differently from an occupied one, so identical behaviour meant no handler.
-  The premise did not reproduce: two occupied slots get the refusal and an
-  empty destination gets **silence**. The conclusion was sound reasoning from
-  an observation that was wrong, which is the expensive combination, because
-  the reasoning is what gets scrutinised and the observation is what gets
-  believed. A negative result that closes off a line of work earns one
-  reproduction before it is written down.
-- **"Nothing happened" is two findings wearing one sentence.** An equip sweep
-  reported three items as `nothing moved`, which conflates an opcode the server
-  never understood with a correct opcode it deliberately declined -- opposite
-  investigations, identical printout. Printing every opcode that arrived,
-  decoded or not, separated them in one run: the failures each carried a single
-  `0x0112` and the twelve successes carried none. This is the same move that
-  turned three failed attempts at chat into a one-run answer, and it keeps
-  being the cheapest instrument in the box.
-- **When the wire and the database disagree, the wire is the client's
-  business.** A bag hand-placed into an equipped slot by editing
-  `character_inventory` came back on the wire sitting in the backpack, and the
-  database still said otherwise afterwards. Both statements were true: the
-  server's loader silently relocates a bag it declines to equip, and a session
-  that ends by closing the socket never saves, so nothing wrote the correction
-  back. Time went into "why is my edit being reverted" when the answer was that
-  it never took. A test fixture built behind the server's back is not a
-  fixture; and `.additem` needs `.save` for the same reason.
-- **A substring filter in a test rig will eventually match a person.**
-  `--target Wolf` matched `Testwolf` -- a character belonging to the person
-  running the test, logged in on the other account at that moment -- and the
-  `.die` behind it killed them. Nothing malfunctioned: the selection registered
-  correctly, on exactly what was asked for. This is the mirror of the
-  documented `.die`-falls-back-to-self trap and is worse, because it looks like
-  it worked. It cannot be fixed by choosing better search words, since a
-  creature's name being a substring of somebody's character name is *how people
-  name characters*. The selection helpers now refuse players outright, which is
-  also just correct: everything they exist to find is something to walk to,
-  swing at, or loot.
-- **The same trap in a new caller, for the third time.** That replicated state
-  holds our *login* position forever is documented on the data and in two
-  previous incident write-ups -- and a new loot command still measured a
-  corpse's distance from it, reported 15 units, and refused a request that
-  would have worked at 1.8. Anything downstream of a walk must be handed the
-  walked position, not look one up. When a fact keeps being rediscovered,
-  making it a *parameter* beats documenting it again: a caller cannot forget to
-  pass an argument.
-- **The absence of a field and the absence of a feature look identical.** A
-  container announces its capacity but carries nothing naming its contents --
-  which proves nothing either way, because every bag observed was empty, a
-  create block omits zero fields, and an empty slot *is* a zero. An empty bag
-  and a bag whose contents array we cannot find are the same bytes. Before
-  concluding a structure does not exist, check whether the sample could have
-  shown it.
-- **State mirroring a physical input must be corrected from the input's end,
-  not from the path that usually handles it.** The camera's drag flags were
-  cleared in the branch handling a mouse release -- which sits *after* the
-  check that offers the event to egui first and returns if egui consumed it.
-  The loot window opens *on* a right-click and appears under the cursor, so it
-  swallowed the very release that ends the gesture, and the camera then turned
-  with every mouse movement with no button held and no way to stop it. Not a
-  rare race: any frame that appears mid-gesture strands the flag. Clearing
-  happens before anything can consume the event now, and on focus loss too,
-  since alt-tabbing with a button down never delivers a release at all.
+  was not drawn.
+- **When geometry is missing rather than wrong, suspect culling before data.**
+  WMO winds counter-clockwise, M2 and terrain clockwise.
+- **Geometry drawn at zero size looks exactly like geometry never drawn.** A
+  fresh bone palette is zeroed and a zero matrix collapses a model to the
+  origin, silently; a bone index past the end reads zero on the GPU and does
+  the same. `--screenshot` never called `update_animations`, so a zone with
+  ninety-five creatures rendered as empty grass and had since the feature was
+  written. **Anything that must be written before it is read should start as
+  something you can see** — the palette initialises to identity now, so the
+  same mistake draws a bind pose.
+- **An absent capability and an absent thing produce the same picture.** The
+  model loader had refused `produced no drawable geometry` since it was
+  written, and 653 models are *nothing but* an emitter. **A guard meaning
+  "nothing to draw" has to be re-asked every time the renderer learns to draw a
+  new kind of thing.**
+- **A still frame is the wrong instrument for anything with a history.** A
+  headless render of a particle system draws an emitter just switched on; a
+  ribbon at one frozen instant lays every edge in the same place and draws
+  nothing. The headless path warms up sixty steps *with the clock running*.
+- **An instrument that fails quietly costs more than one that fails.**
+  `--hour` parsed, was promised in the help text, and did nothing without a
+  realm — an offline screenshot silently got the fallback gradient, which is a
+  perfectly plausible sky, and several minutes went into studying a picture
+  that had never consulted the tables. A flag that cannot act should say so.
+- **When every measurement says it is right, stop measuring and move.** A
+  weapon that would not appear produced four clean diagnostics; the camera sits
+  behind the character and a blade held forward at hip height is entirely
+  behind its owner. One render from the side settled it. **The tell is the
+  pattern**: diagnostics that keep coming back correct are evidence about the
+  observer.
+- **When a measurement contradicts a conclusion you trust, suspect the
+  instrument.** The stowed-weapon attachment points came back the *least*
+  stable of thirty-nine, which looked like proof the identification was wrong.
+  The sampler was broken.
+- **An instrument that cannot move cannot measure, and it says so with a
+  straight line rather than an error.** Two attempts to find the footfall event
+  produced perfectly readable output that meant nothing: the first traced a
+  bone with no animation track (a flat line for all thirty-seven events), the
+  second read `matrix.transform_point3(ZERO)` when a posed matrix is a
+  deformation about the bone's *pivot*. Only pivot-through-matrix showed two
+  feet planted in antiphase, which is what a walk is. **Before reading a
+  measurement, ask what it would look like if the probe were aimed at
+  nothing.**
+- **An odd-looking render is often the camera.** Render canonical angles before
+  doubting the parser.
+- **Some rules can only be found by looking.** Geoset selection took four
+  attempts and each wrong one was a *reasonable* reading of the same table —
+  drawing only what the character's numbers name takes the forearms, hands and
+  legs off, because variant one of an equipment group is the bare body part.
+  When a rule is about what a *model file* contains rather than what a table
+  says, render it.
+
+### Building an interface
+
+- **`--screenshot` does not draw the HUD, so a clean headless render says
+  nothing about the interface.** 4.24 shipped on "1,004 tests green plus a
+  clean live render", a white-screen report came back, and the reproduction
+  produced a perfect picture of Elwynn — because it could not have produced
+  anything else. The tell was in the image: **no player frame, no action bar,
+  no minimap.** Every headless UI test also drives a fresh `Hud::default()` in
+  a synthetic egui context, so a saved `ui.toml`, egui's cross-frame layer
+  ordering and window-only input routing are outside what any of it covers.
+  **When claiming a milestone is verified, say which instrument saw which
+  half.**
+- **Convert every live-only bug into a check that runs without a window.** 3.5
+  and 4.1 each cost a handful of bugs no test could have caught; 4.2 cost none,
+  and the difference was not care — 4.1's failures had become a headless egui
+  pass asserting a frame painted where the layout put it, and received chat
+  logged as well as drawn.
+- **A modal gesture with nothing on screen naming it is not a gesture.** Trade
+  offering is a right-click in the bag window meaning something different while
+  a trade is open, and the first live test came back *"I couldn't give him an
+  item"* with every line correct. **The first live report of a new interaction
+  tests discoverability as much as correctness.** And all four refusal paths in
+  `offer_item` returned silently, so three causes shared one sentence — they
+  each log now.
 - **A frame that never receives clicks looks exactly like one whose handler is
   broken.** Frames opt into `Sense::click()` by appearing in one `matches!`,
-  and a frame left out of it draws correctly, hit-tests correctly, and never
-  reports a click -- so the arm handling that click is dead code that reads as
-  live. The loot window opened and did nothing. Anything that reads
-  `response.clicked()` has to appear in that list, and there is now a headless
-  test that clicks a row and asserts what comes back.
-- **A column that is an override is not the column most rows use.** Combat was
-  silent because `CreatureDisplayInfo.sound_id` was read as *the* creature's
-  sound, and it is an override that most displays leave at zero -- the real one
-  lives on the **model**. It found voices for 1,205 displays of 24,262, and
-  every creature in a starting zone was in the silent majority, so the feature
-  looked broken rather than partial. Falling back to the model took it to
-  24,220. When a lookup works for a minority, check whether the field is a
-  default or an exception.
-- **Names are data too, and they identify columns nothing else can.**
-  `CreatureSoundData` is 38 columns of sound ids with nothing saying which is
-  the death cry, and every one holds ids from the same range -- so validity
-  separates none of them. But `SoundEntries` carries a *label* per sound, and a
-  column whose entries are called `WolfDeath`, `BearDeath` and `KoboldDeath` is
-  the death column. The same move named `WeaponImpactSounds`' flesh, chain and
-  plate columns. Where a table points at labelled rows, read the labels.
-- **A field that is set on every row and resolves most of the time can still be
-  the id.** `CreatureSoundData`'s column 0 is set on all 1,306 rows and 935 of
-  those land on a real sound, which reads as a well-populated sound column --
-  until you notice only 102 of them are *creature* sounds where every genuine
-  column is near 100%. Ids overlapping a table's id range is a coincidence of
-  magnitude.
-- **A sample that cannot exhibit the thing you are looking for is not
-  evidence.** Three attempts to capture a loot response came back empty and
-  each looked like a protocol problem. A GM `.die` kill generates no loot at
-  all, and an ordinary creature killed with `.damage` usually rolls nothing --
-  so every run was sampling a population that could not answer the question.
-  `creature_loot_template` names creatures with a 100% drop, and spawning one
-  with `.npc add` produced a populated packet on the first try. Same rule as
-  the `Light.dbc` storm column coming back a coin flip because most positioned
-  lights are decorative: **check the population before believing the result.**
-- **When the data will not produce a case, change the *character*, not the
-  technique.** Two gaps survived a whole milestone and looked unrelated:
-  equipment slot 17 could not be named because every ranged weapon offered to
-  a warrior came back refused, and a bag's contents could not be located
-  because no non-empty bag had ever been observed — `.additem` never puts a bag
-  in a bag slot and a hand-edited database does not survive the server's
-  loader. Both were attacked as *protocol* problems, with better items and
-  cleverer fixtures, and neither moved. A **dwarf hunter is created wearing a
-  gun and an ammo pouch with shot already in it** — a fixture the server builds
-  itself — and one login answered both. The generalisation: a refusal is a fact
-  about the actor, not about the thing being asked for, so when a request keeps
-  being declined, ask who is allowed to make it. Creating a test character is
-  cheap and was not tried for far too long.
-- **One sample of a variable-length packet is nearly free; a sample where the
-  *counts differ* is the evidence.** `SMSG_GOSSIP_MESSAGE` carries two
-  variable-length blocks back to back, and most of a real menu is zeroes — so a
-  reading with the quest block in the wrong place parses an innkeeper's
-  three-option, no-quest packet perfectly. What breaks it is a questgiver whose
-  packet has no options and one quest. Three NPCs were greeted specifically so
-  the two counts would disagree, and the test asserts *both* shapes rather than
-  either. The same move as testing an exception beside the thing it is
-  indistinguishable from, and as asking the one hour that could refute the sky.
-- **A filtered list is the cheapest proof that an index is an id.** Menu 1291
-  has four options in the database and three arrived — the missing one is a
-  seasonal line the server declines to send — and the three carried indices 1,
-  2 and 3, with the numbering *not* closing up. That single observation
-  converts "the index is probably the server's own id" from a guess into a
-  finding, and the failure it prevents is nasty: a client that replied with a
-  row position would work at every NPC except the conditional ones. Whenever a
-  list arrives with per-item indices, look for a sample where something was
-  filtered out.
-- **A limit that bounds packets does not bound time -- and the second time it
-  bit, it was a new loop.** A quest sweep drained with a 4,096-packet bound and
-  no clock, against Northshire, which emits a monster move fourteen times a
-  second and is *never* quiet; every block collected four thousand packets of
-  background traffic to find two hundred answers, and a seven-minute job had not
-  finished after twenty. The login-burst bug, written up two milestones ago,
-  reappeared in the next loop somebody wrote with a limit and no deadline.
-  Worse, it was **silent**: with no progress output, a stuck run and a slow one
-  look identical, which is what turned a two-minute diagnosis into twenty. Any
-  loop draining a live stream needs a wall clock *and* something printed per
-  round.
-- **The step before the one under test can already have done it.** Accepting a
-  quest looked confirmed for a whole milestone: the request went out and the
-  quest was in the log afterwards. It was the *scroll request* that took it —
-  `CMSG_QUESTGIVER_QUERY_QUEST` adds an auto-accept quest server-side — so the
-  accept was a no-op against a log that already held it, and every effect
-  measured had happened one send earlier. Nothing about the observation was
-  wrong; the population was. Only 179 of 9,464 quests behave that way, and the
-  starting-zone chain a first end-to-end test naturally picks is all of them.
-  Same rule as the loot capture that could not roll a drop and the storm column
-  drowned in decorative lights: **before believing a positive result, check
-  that something else in the run could not have produced it.** The fix is a
-  sample where only the step under test can be the cause — a quest without the
-  flag, which put the id in the log for the first time.
-- **A diagnosis that names one cause for two situations sends the reader in a
-  circle.** The probe reported "already in the log, clear it first", which is
-  correct advice for a stale character and useless for an auto-accept quest,
-  since the next run's scroll request re-takes it. Distinguishing them cost one
-  extra read — sample the log *before* the greeting as well as after the scroll
-  — and the two halves then want opposite next steps. Third instance of
-  "nothing happened is two findings wearing one sentence", and the tell is
-  always the same: advice that would not change if the other cause were true.
-- **Two fields holding the same constant cannot be told apart, and the fix is
-  a sample where they differ.** `ITEM_FIELD_OWNER` and `ITEM_FIELD_CONTAINED`
-  are both the player's guid on every item a starting character carries — `1`
-  on one character, `4` on another, matching each one's own guid, which looks
-  like solid confirmation of *either* reading. The hunter's pouch separates
-  them in a single dump: of ten items, the seven held directly have both fields
-  equal to the player and the three inside the bag have one field holding the
-  *bag's* guid. The field that changes when the containment changes is the
-  containment field. Same move as the storm column and the game-object display
-  id: ask which candidate varies the way the thing it names varies.
-- **Measure the asset, not the channel you expected it to use.** Water drew as
-  a black river for a whole session while every diagnostic said it was fine --
-  built, uploaded, submitted, animated, depth-faded, lit. `XTextures\river\
-  lake_a.blp` averages **RGB 3.6 of 255**: it stores no colour whatsoever and
-  its entire ripple pattern lives in the alpha channel, while `lava` and
-  `slime` are ordinary opaque colour textures. `LiquidType.material_id` says
-  which, 1 against 2. A shader doing `texel.rgb * tint` over both multiplies
-  the tint by 0.014, and the result is not a *wrong-looking* river, it is a
-  river that looks like a shadow. Exporting the texture and averaging it took
-  one command and would have been the first thing to try; instead the search
-  went to lighting, blending and depth. Anything assembled from a file gets its
-  input dumped and *measured* before its output is doubted.
-- **When one thing resolves another's ids, they have to come from the same
-  owner.** Liquid geometry names its type as a bare number and the frames that
-  number resolves to live in a cache. There were two caches -- one on the
-  streaming world, one on the renderer for offline scenes -- and the streaming
-  draw was handed the renderer's, which is empty. Every sheet resolved to no
-  art and hit a bare `continue`: 2,398 triangles parsed, meshed and uploaded
-  per tile, and never submitted. Note the failure mode: not a crash, not a
-  wrong picture, but *nothing*, indistinguishable from the feature not
-  existing. The fix was to delete the parameter -- the draw now reads the cache
-  off the world it is drawing -- because **a parameter that can be passed wrong
-  is worse than no parameter**.
-- **A per-frame assignment silently destroys state that has to survive the
-  frame.** Standing on the ground is `position.z = ground`, computed every
-  frame and correct for four milestones. Swimming is an altitude that
-  *accumulates* -- buoyancy closes a fraction of the remaining gap per frame --
-  and the two were written next to each other with the assignment first. Every
-  frame reset the swimmer to the riverbed and then rose three per cent of the
-  way, forever. That draws as a character walking along the bottom with the
-  stroke cycle playing and the swim flag set: the feature apparently
-  half-implemented rather than mis-ordered, which is the reading that sends the
-  next hour into the animation code. Whenever a new value has to persist
-  between frames, find every unconditional write to the field it lives in.
-- **The absence of a warning is not the presence of success.** A skipped draw
-  was made to log, the log stayed quiet, and that was read as the fix landing.
-  But silence is equally what *zero iterated items* produces -- the same
-  ambiguity as "nothing happened", walked into while fixing an instance of it.
-  A counter that only speaks on failure cannot distinguish "none were wrong"
-  from "there were none". Print both numbers, always.
-- **The models that agree with every candidate are the ones that cannot vote.**
-  Scoring six candidate strides for the M2 particle record gave 476 a perfect
-  6,429 of 6,429 and *every neighbour* 1,739 — and 1,739 is exactly the number
-  of models carrying a single emitter, where only the block's end moves and
-  16-byte alignment padding hides a word either way. The number that made the
-  result trustworthy was not the 100%; it was the 27% matching an independently
-  known count. When a probe scores candidates, work out in advance which
-  samples are *incapable* of separating them and check the failures land
-  exactly there. Same shape as the `MH2O` axis survey, where 86,222 full-chunk
-  ocean sheets transpose to themselves and had to be excluded before the vote
-  meant anything.
-- **Two fields of the same shape in two records need not be in the same
-  units.** A particle emitter stores colour as three floats in 0..255 and a
-  ribbon stores it as three floats in 0..1, in the same file, twenty bytes
-  apart. Nothing marks the difference and both readings render: the wrong way
-  round gives a plausible dark ramp one way and a blown-out white trail the
-  other. Two samples is a guess, so it was counted — keys with any component
-  above 1.0, which no normalised colour can have, are 77,410 of 78,377 particle
-  keys and **0 of 1,572** ribbon keys. Ask the population, not the pair.
-- **An absent capability and an absent thing produce the same picture, and only
-  one of them is a bug.** The model loader had bailed on `produced no drawable
-  geometry` since it was written, and 653 of the 6,500 emitter-carrying models
-  in the archives have no vertices at all — a campfire's flame is a doodad with
-  an emitter and no mesh. Every one of them was refused, silently, for four
-  milestones, because "the model failed to load" and "the model has nothing in
-  it" are the same empty patch of ground. It surfaced the instant there was
-  something to draw for one of them: the first render of `UndeadFireLarge` was
-  an error message rather than a picture. A guard that means "nothing to draw"
-  has to be re-asked every time the renderer learns to draw a new kind of
-  thing.
-- **A rate below one per frame rounds to a feature that never runs.** A torch
-  emits twenty particles a second; at 60fps that is a third of a particle per
-  frame, and a system that truncates each frame's share independently emits
-  *nothing, ever*. The carried remainder is three lines and its absence would
-  have killed every emitter under sixty per second — which is most of them —
-  while looking exactly like the emitter block being misparsed. Any per-frame
-  budget derived from a per-second rate needs its remainder kept.
-- **A still frame is the wrong instrument for anything with a history.** A
-  headless render of a particle system draws an emitter that has just been
-  switched on: a few sparks at the nozzle and no fire, which reads as the
-  feature not working. Worse for a ribbon, whose whole content is where a bone
-  *has been* — sixty simulation steps at one frozen animation instant lay every
-  edge in the same place and draw nothing at all. The headless path therefore
-  warms up over sixty steps *with the clock running*, and both halves were
-  needed before a screenshot said anything true. `--screenshot` is this
-  project's main instrument; whenever it is pointed at something stateful, ask
-  what state it is being asked to show and whether one frame can be in it.
-- **An in-tree comment is a claim with the same evidentiary weight as any
-  other -- check whether it was ever tested.** `SMSG_GM_MESSAGECHAT` had
-  carried a comment, since before this milestone, saying it shares
-  `SMSG_MESSAGECHAT`'s body and exists only so a client can style a GM's line
-  differently. It does not: a GM line names its sender inline, exactly like a
-  monster's, whatever `ChatType` it carries. The claim was never wrong in a
-  way anything caught, because nothing had ever sent chat from a GM-flagged
-  account before this session sent the first live party line from `Testwolf`
-  (GM level 3, local realm) and it vanished with no error. A comment
-  describing a packet's shape is a hypothesis, not a fact, until something has
-  actually exercised the path it describes -- and every fixture account on
-  this project's own local realm is GM level 3, which is exactly the
-  population that could have refuted it far earlier if any outgoing chat test
-  had run there instead of on the non-GM remote realm.
-- **"The number changed on the wire and the number changed in the log" is
-  not "the control works" -- confirm the exact screen the player looks at.**
-  The party loot control looked finished from every angle but one: a debug
-  notice proved the send succeeded, the other client's log proved the server
-  broadcast the change, and the control still read as broken, because the
-  *sender's own* on-screen number climbed to one raw value and then silently
-  refused to move again. The bug was neither the send nor the receive --
-  raw method `2` needs a member guid alongside it, and the control had never
-  supplied one, so the server declined that one transition with no reply at
-  all while every other transition worked. A live capture that never puts a
-  person in front of the exact frame the report is about will keep declaring
-  victory one layer short of it.
-- **Rapid identical requests can get the whole session dropped, not just
-  refused.** Clicking the loot-method control several times quickly did not
-  produce a string of refusals -- it disconnected the socket outright,
-  `10053`, with nothing naming the opcode responsible. Same shape as "Not
-  every failure is a bug" above (the world connection punishing an
-  over-eager ping harder than a missing one), on a control this project had
-  not yet built: before shipping anything a player can click repeatedly, ask
-  what happens to the *connection* under a burst, not only whether one send
-  is answered correctly.
-- **An instrument that cannot move cannot measure, and it says so with a
-  straight line rather than an error.** Which of an M2's timed events marks a
-  footfall was asked by posing the model and watching heights, and the first two
-  attempts both produced perfectly readable output that meant nothing. The first
-  traced the *event's own* point through the walk cycle: every event on a
-  character hangs off a bone with no animation track at all, so the answer was a
-  flat line for all thirty-seven of them -- a zero-variance result that reads as
-  "these all sit still" rather than as "this probe is pointed at the wrong
-  thing". The second posed the skeleton and read
-  `matrix.transform_point3(ZERO)`, which for every bone in a walk gives a small
-  plausible wobble; a posed matrix is a **deformation about the bone's pivot**,
-  so where a bone ends up is its own pivot pushed through its own matrix, and
-  the origin's displacement is a different quantity that happens to look like a
-  curve. Only the third reading -- pivot through matrix -- showed two feet
-  planted for a third of the cycle each, in antiphase, which is what a walk is.
-  The tell for both was the same and was available immediately: **the numbers
-  had no shape the subject must have.** Before reading a measurement, ask what
-  it would look like if the probe were aimed at nothing.
-- **A name is the one thing in a binary format that cannot be a coincidence.**
-  The M2 event stride was settled by two independent checks and only one of them
-  was informative. Byte accounting fit 4,265 of 4,265 models at 36 -- which is
-  what every measurement in this project hopes for, and neighbouring strides
-  still fit 1,343 apiece. The identifier being four printable ASCII characters
-  fit **25,498 of 25,500 records at 36 and 22-24% at every neighbour**, because
-  a stride a word out shifts the name into the middle of a float. Where a format
-  stores a `FourCC`, a label or a filename, that field is worth more than any
-  amount of range-checking: the same move as `CreatureSoundData`'s columns
-  naming themselves through `SoundEntries` labels, as `GroundEffectTexture`'s
-  terrain column naming itself through the *filenames* of the textures that
-  reach it, and as the guard test that checks hardcoded animation ids against
-  the name of the row they claim.
-- **A modal gesture with nothing on screen naming it is not a gesture.** Trade
-  offering is a right-click in the bag window that means something different
-  while a trade is open, and the first live test came back *"I couldn't give him
-  an item"* with the code entirely correct. The log proved the request had never
-  been sent -- the partner received no offer and the trade did not cancel, which
-  excludes a refusal -- and measurement excluded the two windows overlapping at
-  any realistic size. What was left was that nobody could find the gesture. The
-  window says how now. Two things generalise: **the first live report of a new
-  interaction tests discoverability as much as correctness**, so "I couldn't do
-  X" from the person at the window is a real bug report even when every line is
-  right; and **a refusal path that returns silently makes three causes into one
-  sentence** -- all four ways out of `offer_item` were quiet, so "the click
-  never reached the bags", "no trade is open" and "nothing is carried there"
-  were indistinguishable. They each log now. Sibling of "nothing happened is two
-  findings wearing one sentence", one layer up in the interface.
-- **When every request in a block is silent, the bounding instrument is a
-  refusal.** The standing move is to send an *answered* request first and let it
-  bound the silent ones -- `CMSG_LIST_INVENTORY` for `CMSG_BUY_ITEM`,
-  `CMSG_GROUP_INVITE` for the party block, `CMSG_TRAINER_LIST` for the whole
-  city-services block. Trade has no such neighbour: all ten of its client
-  opcodes are silent on success, and a successful `CMSG_INITIATE_TRADE` is
-  answered by a packet at **somebody else's client**. What bounds it is its own
-  *failure* -- aimed at a guid that is not a player it answers immediately, at
-  the sender, with nobody else logged in, confirming the opcode number, the body
-  and the reply layout in one send. **A refusal that names a reason is a reply**,
-  and it is often the only one available. The corollary is worth having too: the
-  very first such send came back naming a fact about the *character* rather than
-  about the packet -- the sender was dead -- and reviving and repeating the
-  identical send changed the value. The probe answered about the fixture, and
-  answering about the fixture is what proved the protocol was understood.
-- **A design premise can be wrong in a way that fails as an empty rectangle.**
-  `SMSG_TRADE_STATUS_EXTENDED` describes one *side* of a trade and says which in
-  its first byte, so the obvious design is to draw each half of the window from
-  the packet that describes it. The own-half form is never sent in ordinary
-  play: the server tells the **partner** what you offered and tells you nothing.
-  A client built on the obvious reading does not error, does not misparse, and
-  does not draw anything wrong -- it draws its own column permanently empty,
-  which reads as a feature that is half finished rather than as a premise that
-  is false. What caught it was the probe printing **two counts** rather than one:
-  "3 describing the partner's half, 0 describing our own" is a measurement, and
-  "our half never printed" is not. Same rule as the skipped draw whose silence
-  was read as success -- a number that only speaks on failure cannot tell "none
-  were wrong" from "there were none".
-- **A silent request may be believed when every refusal is loud.** The standing
-  rule is that a client must not draw its own intentions, because a silent send
-  that was declined leaves the picture and the server disagreeing.
-  `CMSG_SET_TRADE_ITEM` is silent and this client draws its own half from
-  memory anyway, and the licence is specific rather than general: *every* way
-  that request can fail -- a slot past the seventh, an untradeable item, an item
-  already in another slot -- answers `TRADE_CANCELED` and ends the trade
-  outright. There is no state in which the window is open and the two ends
-  disagree about what is on the table. Before trusting a local record, enumerate
-  the refusals and check that none of them is quiet.
-- **A database schema is a fact about storage, not about a wire.** The
-  `SMSG_TRAINER_LIST` record stride was predicted at 30 bytes from a genuinely
-  good argument: the realm's own database carries the *modern* trainer tables
-  -- `trainer`, `trainer_spell`, `creature_default_trainer`, with
-  `ReqAbility1..3` columns and no primary-profession columns at all -- and a
-  server storing the new shape may reasonably be expected to send it. The wire
-  said **38**. The schema had been modernised and the packet builder had not,
-  and the two disagree inside one running server. This is the sibling of "a
-  grep that finds the field names is not a grep that finds the structure":
-  source and schema both make a hypothesis cheap, and neither settles one.
-  Note also which check caught it -- the cursor insisting on finishing empty
-  reported `89 trailing bytes` rather than returning a confident-looking list
-  with a rubbish greeting.
-- **A probe's candidate set decides what it is capable of refuting, and that
-  has to be worked out before the result is read.** Scoring record strides
-  against a trainer's packet returned exactly one winner -- from a list that
-  did not contain the one confusable value. Adding it produced **two**, because
-  an *overshooting* stride skips `count * delta` bytes and, when that is
-  shorter than the trailing string, lands inside it and returns a perfectly
-  printable **suffix**: six rows overshooting by four is 24 bytes into a
-  41-character greeting, so 42 scored exactly as well as 38. The fix was not a
-  cleverer check but a bigger sample -- a 133-row trainer, where the overshoot
-  is 532 bytes and only 38 survives. Third instance of the same shape, after
-  the M2 particle stride (1,739 single-emitter models that could not vote) and
-  the `MH2O` axis survey (86,222 full-chunk sheets that transpose to
-  themselves). **Ask in advance which samples are incapable of separating your
-  candidates; if your only sample is one of them, go and find another** -- and
-  when the probe reports a tie, that is the honest answer, not a failure.
-- **Two tables can mean the same thing and disagree about which value means
-  "nothing".** `GroundEffectTexture`'s terrain column and a WMO material's
-  `ground_type` are both `TerrainType` row ids, and both are dominated by one
-  value -- but outside it is **row 0**, which is also `Dirt`, and inside it is
-  **row 10, `None`**. Carrying the outdoor reading indoors makes every wall in
-  the game claim to be dirt, and carrying the indoor one outdoors throws away
-  four tenths of the world. Neither errors. The tell was available cheaply and
-  was nearly missed: the survey's own headline counted "not zero" as "labelled"
-  and reported **1,981 of 1,985** buildings as saying something, where the real
-  number is **622**. That one-character difference is the gap between "this
-  works everywhere" and "this works where somebody bothered" -- and it is the
-  number that decides what a live test will show, because Northshire Abbey is
-  in the silent majority and would have read as the feature failing. When a
-  column's meaning is shared between two tables, ask each table separately what
-  its *default* is.
-- **`--screenshot` does not draw the HUD, so a clean headless render says
-  nothing about the interface.** This project's main instrument renders the
-  world, the models, the lighting and the streaming, and never builds an egui
-  frame at all. 4.24 shipped on "1,004 tests green plus a clean live render",
-  a white-screen report came back, and the reproduction attempt produced a
-  perfect picture of Elwynn -- because it could not have produced anything
-  else. The tell was in the image: **no player frame, no action bar, no
-  minimap.** An instrument that omits the subject fails by looking correct,
-  which is the same shape as the emitter screenshot that drew a freshly
-  switched-on system and the composed skin that had to be dumped to be seen.
-  Every headless UI test here also drives a fresh `Hud::default()` in a
-  synthetic egui context, so a saved `ui.toml`, egui's cross-frame layer
-  ordering, and window-only input routing are all outside what any of it
-  covers. **When claiming a milestone is verified, say which instrument saw
-  which half** -- and the interface half currently has no headless instrument
-  that starts the real thing.
-- **An early return skips more than it was written to skip.** A taxi flight
-  replaces `drive_live_movement` wholesale rather than adding a condition to
-  each of its writes -- which is right, and is the lesson 4.18's swimming bug
-  taught: a set of position writes that must all be skipped together should
-  not be guarded one at a time, because one of them gets missed. But the
-  *camera placement* lived in the tail of that same function, so a flying
-  character was followed by nothing: the view stayed where they took off, and
-  because the streaming centre follows the camera the world stopped loading
-  too. One cause, three symptoms. **A wholesale replacement is the right shape
-  for writes that must all be skipped together, and the wrong shape for
-  anything that merely happened to share the function** -- so placing the
-  camera is its own method now, called unconditionally, correct by
-  construction for whatever state replaces the movement path next rather than
-  by somebody remembering.
-- **A streaming radius of zero is not a small world, it is a broken one.** The
-  live viewer streamed with `radius = 0`, so only the tile under the camera
-  was ever queued and the tile a character walks *towards* is by construction
-  not there yet. It survived four milestones because `EVICT_MARGIN` retains a
-  3x3: walking back the way you came looked fine, and walking somewhere new
-  did not. Kake named it exactly -- "you enter the void for a second then it
-  renders the missing chunk" -- which is worth recording as the second time a
-  live report has been a better diagnosis than the session's own theory. It is
-  a **floor** in the constructor now rather than a default, so `--radius 0`
-  cannot quietly reintroduce it.
-- **A thing's *owner* and a thing's *extent* are different, and an ownership
-  rule written for drawing can silently break every query that is not
-  drawing.** A world object is filed under the single terrain tile containing
-  its **origin** -- correctly, and for a stated reason: so it is neither drawn
-  twice nor left behind when a neighbour is evicted. Collision queries then
-  chose which tiles to ask by looking at *where the character was*, which is
-  right only if a tile's geometry stays inside the tile. It does not.
-  **Stormwind is one WMO placement, 1,058 by 1,060 units against a 533-unit
-  tile: it covers a three-by-three block and every triangle of it is filed
-  under one.** Standing over any of the other eight, the floor query asked
-  tiles that hold nothing and the character fell through a city drawn
-  perfectly around them. **It had been true since collision existed and cost
-  nothing for four milestones, because every building in Elwynn is a fraction
-  of a tile and nobody had walked into a capital.** That is the part worth
-  remembering: the bug was not in the new feature that exposed it, and what
-  exposed it was new *ground* rather than new code -- the first fixture ever
-  placed in a city. Tiles are now selected by the bounds of what they hold.
-  It also produced four unrelated-looking symptoms from one cause -- falling
-  through the ground, walking on nothing, NPCs sunk into the floor (they are
-  standing on it; the viewer is underneath), and ending up stuck below the
-  world -- which is the "one bug can produce several unrelated-looking
-  reports" rule over again.
-- **`cargo build --release` does not compile test targets, so "zero warnings"
-  has never covered them.** An unused import sat in
-  `crates/dbc/tests/real_data.rs` for two milestones under a green
-  zero-warning claim. `cargo test --release --no-run` is what sees those, and
-  a milestone-end check wants both. Small, and the same shape as
-  `--screenshot` not drawing the HUD: an instrument that omits part of the
-  subject reports success for the part it can see.
-- **A corpse keeps every flag it had in life, so "will it talk" and "will it
-  answer" are different questions.** `Entity::will_talk` reads only the
-  `UNIT_NPC_FLAGS` word, which a dead NPC carries unchanged -- so a CLI probe
-  selects a dead trainer exactly as readily as a living one, sends to it, and
-  gets the total silence a wrong opcode gives. Two runs were lost to that
-  before the printout was made to say it. The viewer had it right already
-  (`is_talk_candidate` tests `is_dead_or_ghost`), which is the useful half of
-  the lesson: the same fact had been established in one consumer and the other
-  never learned it -- the "trap documented at one call site" rule again. And
-  the actual cause that time was a *third* thing: the trainer was alive, in
-  combat, and had drifted past the five-unit interaction reach between the
-  distance being measured and the request being sent. **Every one of the
-  server's six interaction preconditions fails in silence** -- alive, the flag,
-  not charmed, reaction above unfriendly, within range, and class matching for
-  a class trainer -- so a fixture standing in a field of kobolds is not a
-  fixture.
-- **A record that states its own length can be lying, so check it and never
-  seek by it.** Every letter in `SMSG_MAIL_LIST_RESULT` begins with a `u16`
-  size, which is exactly the field this project reaches for -- the redundant
-  trade slot index, the redundant `dir:` lines in `md5translate.trs` -- because
-  a length agreeing with the parse is confirmation for free. It does not agree.
-  The server computes it from an expression counting **eight** four-byte fields
-  where the writer writes **seven**, so it is four bytes too many on every
-  record, measured over sixteen letters of thirteen different lengths. Three
-  behaviours were available and only one is right: **seeking** by the field
-  lands four bytes into the second record on the first letter read and turns
-  the rest of a packet into plausible garbage; **ignoring** it throws away a
-  per-record check and reports a stride error as a length at the end of a body
-  holding twelve other letters; **checking** it localises the mistake to the
-  record. The test that documents this asserts the odd half -- a record whose
-  announced size *equals* its real one is **refused**, because that is not what
-  this realm writes and a parser tolerant of both has no check at all.
-- **A refusal is a fact about the actor, and so is an acceptance -- and the
-  acceptance is the dangerous direction.** The rule already here says that when
-  a request keeps being declined, ask who is allowed to make it. The mirror
-  costs more: `CanOpenMailBox` accepts the reader's **own guid** as a mailbox
-  from anybody at moderator rank, and every fixture account on this project's
-  local realm is a game master. So the cheapest possible probe -- ask for the
-  inbox with no mailbox anywhere in the world -- works here and would work for
-  no player at all, and nothing about the result says so. A refusal sends
-  somebody looking; an acceptance sends them home. Anything that works
-  suspiciously easily on a GM account gets measured **in order to be ruled
-  out**, not skipped.
-- **A display id says how to draw a thing and nothing about what it is.** Game
-  objects have been replicated and drawn since Phase 3 -- doors, benches,
-  chests, ships -- and every one of them was a model at a position and no more.
-  Mail is the first feature that has to pick one *kind* out of a field of them,
-  and there is nothing in the object update that separates a mailbox from a
-  bench: `CMSG_GAMEOBJECT_QUERY`'s type is the only thing on the wire that
-  does. The generalisable half is the three-state answer the cache has to keep:
-  **not asked**, **answered "no such thing"**, and **answered** -- because a
-  window that read "not asked yet" as "not a mailbox" would refuse to open the
-  one object the player is standing in front of, and would do it only on the
-  first click, which is the hardest kind of bug to reproduce.
-- **Print every opcode seen, decoded or not -- and this is the fourth time.**
-  A wait loop that reported five arrivals and one that reported none look
-  identical when the count is zero: either the server never sent one, or it
-  sent one under a number this client does not recognise, and those want
-  opposite investigations. The first mail-arrival run came back **zero** while
-  the realm's own database showed the letter delivered, and the loop had been
-  written with no opcode tally -- the cheapest instrument in this box, the one
-  that turned three failed attempts at chat into a one-run answer, and the one
-  this file already names twice. Adding six lines settled it in one run. A
-  rule being written down is not the same as it being applied; the loop that
-  needs it is always the one somebody is writing now.
+  and one left out draws correctly, hit-tests correctly, and never reports a
+  click. Anything reading `response.clicked()` has to appear in that list.
+- **A hit test that answers for every row is indistinguishable from a correct
+  one until somebody clicks the wrong one.** `row_at` answers only for rows
+  that can act — learnable trainer spells, unemptied letters, online guild
+  members — because the alternative ships a request the server declines in
+  **silence**.
+- **The rows are not all the same height**, so the hit test walks the same
+  accumulating heights the drawing does. An averaged division targets the wrong
+  member, silently.
+- **State geometry once and read it from both the drawing and the hit test.**
+  The invite prompt has two opposite answers a few pixels apart; a press
+  between the buttons answers nothing.
+- **State mirroring a physical input must be corrected from the input's end.**
+  The camera's drag flags were cleared in the mouse-release branch, which sits
+  *after* the check that offers the event to egui — and the loot window opens
+  *on* a right-click, so it swallowed the release that ends the gesture. Any
+  frame appearing mid-gesture strands the flag. Cleared before anything can
+  consume the event now, and on focus loss too.
+- **A line that renders as a plausible *different* line never errors.** Guild
+  chat parsed correctly the whole time and both maps from the wire type to the
+  interface's own `ChatKind` had no arm for it, so it drew with no tag in
+  `Other`'s grey — against `Say`'s near-white, a difference nobody can see. The
+  report that came back named the *sticky channel*, which is the wrong half of
+  the system. Assert the tag and the colour separately: either alone passes
+  with the other broken.
+- **"The number changed on the wire and in the log" is not "the control
+  works".** The party loot control had a debug notice proving the send, another
+  client's log proving the broadcast, and a number on the sender's own screen
+  that silently refused to move past one value. A live capture that never puts
+  a person in front of the exact frame the report is about will declare victory
+  one layer short of it.
+- **A drag holds the pointer** — hidden, confined, warped back to the press
+  position — which broke the click test, since press-and-release-in-the-same-
+  place is what a pinned pointer produces for *every* drag. It is distance
+  travelled now.
+- **Copying a mechanism is the cheapest way to audit it.** Right-click's
+  press/release distance test was written by mirroring left-click's, and
+  mirroring it surfaced a four-milestone-old bug: the left button cleared
+  `last_cursor` on release, so a second click at the same pixel was discarded.
+  A selection is not a gesture anyone repeats; right-click-to-attack is.
+- **The wheel had two claimants** — the camera's handler never asks where the
+  pointer is, so the minimap answers first and returns.
+- **Per character, not per client.** One shared action-bar set meant a rogue
+  logged in holding a warrior's bar: every icon drew, every key pressed, every
+  cast was refused, and it read as "the bars are broken".
 
-- **A live report closes the loop and names the next thing; take the second
-  half as seriously as the first.** The footstep milestone shipped with "no WMO
-  floors" on its own not-done list, and the report that came back was *"grass
-  dirt roads all sound different but the steps don't respect buildings"* --
-  confirmation and the next ticket in one sentence. The other half of the same
-  report, *"I honestly can't remember if you can hear anyone else's footsteps,
-  it's so minor I never listened"*, is worth as much: it is a scoping decision
-  that no amount of measurement could have produced, and it is recorded rather
-  than guessed at.
+### Writing the code around it
+
+- **A trap documented at one call site does not protect the next one.** That
+  replicated state holds our *login* position forever is written up at length
+  in the function that **draws** the player, and was walked into immediately by
+  one that **aims at** the player — and then a third time by a loot command
+  that measured a corpse's distance from it. **When a fact keeps being
+  rediscovered, making it a *parameter* beats documenting it again**: a caller
+  cannot forget to pass an argument. Same shape: `Entity::will_talk` knew
+  nothing about dead NPCs while the viewer's `is_talk_candidate` already did.
+- **A comment describing a check is not a check.** `/g`'s doc comment claimed
+  guild membership was re-checked in `send_on_channel` the way `/p` is, from
+  the day it was written. It was not.
+- **An in-tree comment is a claim with the same evidentiary weight as any
+  other.** `SMSG_GM_MESSAGECHAT` carried a comment saying it shares the
+  ordinary body and exists only for styling. It does not — a GM line names its
+  sender inline, whatever `ChatType` it carries — and nothing had ever
+  exercised the path, because every earlier chat test ran on the non-GM remote
+  realm.
+- **A rule written for the exceptional case can silently swallow the ordinary
+  one.** `App::target` was cleared whenever its guid held no replicated object,
+  correctly for a target that died or walked away. Parties made "no replicated
+  object" the *common* case for a good selection. The fix is a positive
+  exemption (`still_targetable`), not a narrower negative condition — **the
+  milestone that changes which case is common is the one that has to teach the
+  old rule about the new one.**
+- **A rule can be right and still exclude the one thing you need — and then the
+  test has to assert both halves.** `Auto Attack` sits on `SkillLineAbility`'s
+  generic line 183 with a class mask of zero, exactly like the junk the seeding
+  filter correctly rejects. Widening the rule readmits the junk; naming the
+  single spell does not. **Test the exception *and* the thing it is
+  indistinguishable from.**
+- **A fallback can invalidate the rule written beside it.** Combat animations
+  fall back to `Stand` on a wolf, which broke "plays once, so hold the last
+  frame" — a Stand frozen at its final frame is a statue — and broke it the
+  other way for `Dead`, which resolves to the fall and must hold. Holding had
+  to become a property of the animation that *resolved*, not of the state that
+  asked. **When a fallback is added, re-ask every question that was answered in
+  terms of the thing being fallen back from.**
+- **A field can be parsed, documented, and then ignored by the one function
+  that had to act on it.** `Track::global_sequence` had a doc comment saying it
+  runs on a shared timer, and `sample` indexed `sequences[sequence]` anyway —
+  so global tracks resolved only when the index happened to be zero, which is
+  `Stand`. Invisible for four milestones, until a sheathed sword flew off a
+  character's back.
+- **A per-frame assignment silently destroys state that has to survive the
+  frame.** `position.z = ground` was correct for four milestones; swimming
+  *accumulates*, and the two were written next to each other with the
+  assignment first, so every frame reset the swimmer to the riverbed and rose
+  3% of the way. That draws as a character walking along the bottom with the
+  stroke cycle playing — the feature apparently half-implemented rather than
+  mis-ordered.
+- **An early return skips more than it was written to skip.** A taxi flight
+  replaces `drive_live_movement` wholesale, which is right for writes that must
+  all be skipped together — but the *camera placement* lived in the same
+  function's tail, so a flying character was followed by nothing and, because
+  streaming follows the camera, the world stopped loading. One cause, three
+  symptoms. Placing the camera is its own unconditionally-called method now.
+- **A rate limit and a lag are different failure modes, and only one is
+  bounded.** Easing creature turns at a fixed maximum rate looks right every
+  frame — until a player circling at melee range exceeds the cap, past which
+  the error grows without limit. Closing a *fraction* of the remaining error
+  bounds the lag at `omega * tau` for any `omega`.
+- **A wrong constant is right for whatever it was written against.** The
+  attachment sanity check capped offsets at 100 units, generous for a character
+  and absurd for a 150-unit falling tree whose attachment sits at Z=127. A
+  threshold that scales with its subject cannot make that mistake.
+- **A rate below one per frame rounds to a feature that never runs.** A torch
+  emits twenty particles a second; at 60fps that is a third per frame, and
+  truncating each frame's share independently emits *nothing, ever*. Any
+  per-frame budget derived from a per-second rate needs its remainder kept.
+- **A streaming radius of zero is not a small world, it is a broken one.** It
+  survived four milestones because `EVICT_MARGIN` retains a 3x3, so walking
+  back the way you came looked fine. It is a **floor** in the constructor now
+  rather than a default.
+- **A thing's *owner* and a thing's *extent* are different.** A world object is
+  filed under the tile containing its **origin**, correctly, so it is neither
+  drawn twice nor left behind. Collision then chose tiles by where the
+  *character* was — and Stormwind is one WMO placement 1,058 units across
+  against a 533-unit tile, so standing over eight of its nine tiles the floor
+  query asked tiles holding nothing. **The bug was not in the new feature that
+  exposed it; what exposed it was new *ground*.** Tiles are selected by the
+  bounds of what they hold now.
+- **When one thing resolves another's ids, they have to come from the same
+  owner.** Liquid frames resolved against the renderer's cache while the
+  streaming draw needed the world's, so 2,398 triangles per tile were parsed,
+  meshed, uploaded and never submitted — nothing, indistinguishable from the
+  feature not existing. **A parameter that can be passed wrong is worse than no
+  parameter**; the draw reads the cache off the world it is drawing.
+- **Derive from the *same* source when two things must agree exactly.** The
+  picking ray is unprojected from the very matrix the scene is drawn with, not
+  rebuilt from the camera's angles — a ray off by a little lands clicks on the
+  creature *beside* the one under the cursor, which reads as the server
+  disagreeing about positions.
+- **…but compare against something derived *independently* when checking
+  whether something is correct.** The SRP6 tests carry a server written from
+  the protocol, not from the client. The strongest version available here is
+  the two-client rig: a structure goes out through one client and back in
+  through another, confirmed via a third party that had to understand both.
+- **Two copies of your own client are not two independent derivations.** That
+  rig proves a *format* travels both ways and proves nothing about behaviour
+  the two copies share. 3.5 declared replicated players smooth on exactly that
+  evidence. **When the thing under test is timing rather than layout, one end
+  has to be something you did not write.**
+- **One dispatch table does not save a caller from ignoring what it produces.**
+  `WorldState::replicate` is deliberately the only place opcodes are
+  dispatched, and chat is *returned* rather than stored — three separate
+  callers quietly dropped it.
+- **A substring filter in a test rig will eventually match a person.**
+  `--target Wolf` matched `Testwolf`, a character belonging to the person
+  running the test, and the `.die` behind it killed them. Nothing
+  malfunctioned. It cannot be fixed by choosing better search words, since a
+  creature's name being a substring of somebody's character name is *how people
+  name characters* — the selection helpers refuse players outright.
+- **A green suite is a claim with a date on it.** `cargo test` was not green at
+  `HEAD` despite a handoff saying so. And **the suite can fail without any test
+  failing**: eleven GPU tests each built their own `wgpu` device and eleven
+  concurrent DX12 creations deadlocked — thirty-seven threads with six seconds
+  of CPU between them. It is a **race**, so the previous green run was luck; a
+  shared `OnceLock` device fixed it and made them eight times faster.
+  `RUST_TEST_THREADS=1` is a workaround living in an environment variable,
+  which is precisely where nobody applies it on the run that matters. **A hang
+  is not a slow run, and the tell is CPU time.**
+- **`cargo build --release` does not compile test targets**, so "zero warnings"
+  has never covered them. `cargo test --release --no-run` is what sees those,
+  and a milestone-end check wants both.
+- **Check that your check is current.** The first walk was declared a failure
+  against the character list, which reports the last *saved* position; the
+  movement had worked all along. **The same rule reaches the binary**: 4.22's
+  three animation fixes came back reported as still broken, accurately, against
+  a `wow-viewer.exe` built four hours before any of them existed. One `ls` on
+  the timestamp settled it.
+- **"It fails identically under every condition" is a claim to re-run, not to
+  build on.** `foss-wow#55` rested on the failure being state-independent, and
+  the premise did not reproduce: two occupied slots get a refusal and an empty
+  destination gets **silence**. Sound reasoning from a wrong observation is the
+  expensive combination, because the reasoning is what gets scrutinised and the
+  observation is what gets believed. **A negative result that closes off a line
+  of work earns one reproduction before it is written down.**
+- **The absence of a warning is not the presence of success.** A counter that
+  only speaks on failure cannot distinguish "none were wrong" from "there were
+  none". Print both numbers, always.
+- **Two bugs can share one symptom, and you will fix the innocent one.** M2
+  geometry with the wrong winding culls front faces, which looks like a model
+  *facing away from you* — so a half turn was added to entity facing and then
+  propagated to doodads. Neither rotation was ever wrong. What separated them
+  was fixing the winding first and then A/B-ing the rotation live, one variable
+  at a time. **When a symptom persists across a fix that should have worked,
+  suspect two causes rather than too small a fix.**
+- **And one bug can produce several unrelated-looking reports.** A character
+  sinking into the ground, a click marker landing off-centre, hills that could
+  not be walked up, and another client seeing this one twitch were four
+  complaints, none of which said "altitude", and one missing feature. **Before
+  opening the second investigation, check whether the first cause reaches it.**
+- **A live report closes the loop and names the next thing.** "Grass dirt roads
+  all sound different but the steps don't respect buildings" is confirmation
+  and the next ticket in one sentence. So is *"I honestly can't remember if you
+  can hear anyone else's footsteps, it's so minor I never listened"* — a
+  scoping decision no measurement could have produced. Take the second half as
+  seriously as the first.
 
 ## Traps already hit
 
@@ -1530,24 +861,19 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   truncated `docs/ROADMAP.md` to zero bytes. Prefer the editing tools; if a
   script must write, write UTF-8 explicitly.
 - **And a script that writes cleanly can still rewrite every line.** This tree
-  is LF; Python's `io.open(p, 'w')` on Windows is *text* mode, which translates
-  every `\n` to `\r\n` on the way out. Five files edited that way came back
-  byte-different on every line, and the commit went from a 1,400-line diff to a
-  26,000-line one that no reviewer could read. The build and the tests are
-  entirely happy, so nothing catches it but `git show --stat`. Use the editing
-  tools; if a script must write, open in **binary** mode. Check the stat before
-  committing — a file you changed three lines of has no business showing
-  thousands.
-- **Do not run `cargo fmt` on this tree.** It is not rustfmt-clean and never has
-  been: much of it is hand-wrapped in ways rustfmt disagrees with. One run turned
-  a 190-line change into a 1,500-line one across thirteen files nobody had
-  touched, and the build and the tests are entirely happy with it -- exactly the
-  shape of the CRLF trap above, and caught the same way, by reading
-  `git diff --stat` before committing. Format the lines you write to match their
-  neighbours instead.
-- `wgpu`/`egui`/`egui-wgpu`/`egui-winit` versions are coupled, and the `windows`
-  crate needs a pin to build the DX12 backend at all — see `docs/RENDERING.md`
-  before touching any of them.
+  is LF; Python's `io.open(p, 'w')` on Windows is *text* mode and translates
+  every `\n` to `\r\n`. Five files edited that way came back byte-different on
+  every line, turning a 1,400-line diff into a 26,000-line one. The build and
+  the tests are entirely happy, so nothing catches it but `git show --stat`.
+  Open in **binary** mode, and read the stat before committing.
+- **Do not run `cargo fmt` on this tree.** It is not rustfmt-clean and never
+  has been: much of it is hand-wrapped in ways rustfmt disagrees with. One run
+  turned a 190-line change into a 1,500-line one across thirteen files nobody
+  had touched — the same shape as the CRLF trap, caught the same way. Format
+  the lines you write to match their neighbours.
+- `wgpu`/`egui`/`egui-wgpu`/`egui-winit` versions are coupled, and the
+  `windows` crate needs a pin to build the DX12 backend at all — see
+  `docs/RENDERING.md` before touching any of them.
 - Windows refuses to execute a test binary whose filename looks like an
   installer, so integration tests are `tests/real_data.rs`, never
   `real_install.rs`.
@@ -1562,7 +888,8 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   those are the notes that stop a bug being reintroduced.
 - Byte-level parsing gets a unit test with a known-good constant wherever one
   exists (e.g. the MPQ crypt table keys).
-- Commit messages explain the reasoning and record dead ends, so a later session
-  does not repeat them. `git log` is part of the documentation.
-- Every milestone ends with a clean `cargo build --release` (zero warnings) and
-  a full `cargo test --release` run.
+- Commit messages explain the reasoning and record dead ends, so a later
+  session does not repeat them. `git log` is part of the documentation, and
+  **it is where the milestone narration that used to live in this file went**.
+- Every milestone ends with a clean `cargo build --release` (zero warnings), a
+  clean `cargo test --release --no-run`, and a full `cargo test --release` run.
