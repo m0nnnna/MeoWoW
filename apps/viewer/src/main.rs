@@ -96,8 +96,14 @@ struct Args {
     #[arg(long)]
     stream: bool,
 
-    /// Radius in tiles around the chosen one: 0 is a single tile, 1 a 3x3.
-    #[arg(long, default_value_t = 0)]
+    /// Radius in tiles around the chosen one: 1 is a 3x3, 2 a 5x5.
+    ///
+    /// **A streaming world raises this to at least 1 whatever is asked**, so
+    /// the tile a character is walking towards has already arrived -- see
+    /// `world::MIN_STREAM_RADIUS`. The old default of 0 meant only the tile
+    /// under the camera was ever loaded, and crossing a boundary put the
+    /// character in the void until the next one caught up.
+    #[arg(long, default_value_t = 1)]
     radius: usize,
 
     /// Cap on doodad placements, since a dense tile has hundreds.

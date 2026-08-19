@@ -31,6 +31,24 @@ use crate::model::Draw;
 use crate::scene::{object_rotation, placement_position, placement_rotation};
 use crate::terrain::LoadedTerrain;
 
+/// The smallest radius a *streaming* world may run at.
+///
+/// **Radius zero is not a small world, it is a broken one**, and the
+/// difference is worth stating because zero was the default. Only the tile
+/// under the camera is queued, so the tile a character is about to walk into
+/// is by construction not there yet: they cross the boundary, spend a moment
+/// in the void, and the ground appears underneath them a frame or two later.
+/// Kake described exactly that -- "the next chunk won't load until the player
+/// crosses into that chunk so you enter the void for a second".
+///
+/// One is the minimum that can be correct: at 3x3 the eight neighbours are
+/// admitted while the character is still on the middle tile, so the ground
+/// they are walking onto has already arrived. It is a floor rather than a
+/// default so that `--radius 0` cannot quietly reintroduce it; a caller
+/// wanting a single tile wants the non-streaming scene, which is a different
+/// path entirely.
+const MIN_STREAM_RADIUS: i32 = 1;
+
 /// Tiles kept beyond the load radius before being evicted.
 ///
 /// Without this margin a camera sitting on a tile boundary reloads the same
@@ -701,12 +719,14 @@ pub fn tile_centre(tile: (i32, i32)) -> Vec3 {
 }
 
 impl World {
+    /// `radius` is in tiles around the one the camera is on, and is raised to
+    /// [`MIN_STREAM_RADIUS`] however low it is asked for -- see there.
     pub fn new(chain: &mut Chain, map: &str, radius: i32, max_doodads: usize) -> anyhow::Result<Self> {
         let wdt = adt::Wdt::parse(&chain.read(&adt::wdt_path(map))?)?;
         Ok(Self {
             map: map.to_string(),
             wdt,
-            radius: radius.max(0),
+            radius: radius.max(MIN_STREAM_RADIUS),
             max_doodads,
             cache: HashMap::new(),
             entity_cache: HashMap::new(),
