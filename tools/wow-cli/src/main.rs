@@ -14987,7 +14987,23 @@ fn survey_guild(
         println!("  Reaches every member online and nobody else, so only a second session can");
         println!("  confirm it -- a guildless character's line is dropped by the server in");
         println!("  silence, which is what makes a one-client test of this worthless.");
-        connection.say(world::ChatType::Guild, 0, "", text)?;
+        // **The character's own language, never zero.** This send was
+        // written with a hardcoded `0` -- Universal -- which the server
+        // refuses with no reply at all, and the first two-client run of it
+        // came back with the listening session reporting `0 chat line(s)` and
+        // no chat opcode in its tally at all. That is precisely the failure
+        // `CLAUDE.md` records against three earlier attempts at chat, walked
+        // into again by a probe written after the rule, and it is invisible
+        // from the sending end: the request goes out, the session stays up,
+        // and nothing comes back either way.
+        let language = world::chat::language_for_race(
+            state
+                .get(own_guid)
+                .and_then(|entity| entity.race())
+                .unwrap_or(1),
+        );
+        println!("  sent in language {language} -- zero is Universal and is refused in silence.");
+        connection.say(world::ChatType::Guild, language, "", text)?;
         let batch = connection.drain(std::time::Duration::from_millis(1500), 128)?;
         let report = state.replicate(&batch, None);
         for line in &report.chat {
@@ -15009,8 +15025,18 @@ fn survey_guild(
         // not pinging at all.
         let mut last_ping = std::time::Instant::now();
         let mut chat_seen = 0usize;
+        // **Every opcode seen, decoded or not** -- the same instrument
+        // `--mail-wait` carries and for the same reason, which this loop was
+        // written without anyway. Zero events could mean the server never
+        // pushed one *or* that it pushed one under a number this client does
+        // not recognise, and those want opposite investigations. Nothing else
+        // in this loop can tell them apart.
+        let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
         while std::time::Instant::now() < deadline {
             let batch = connection.drain(std::time::Duration::from_millis(1000), 128)?;
+            for packet in &batch {
+                *seen.entry(packet.opcode).or_default() += 1;
+            }
             let report = state.replicate(&batch, None);
             for event in &report.guild_events {
                 events += 1;
@@ -15033,6 +15059,13 @@ fn survey_guild(
         }
         println!("  {chat_seen} chat line(s) heard while waiting.");
         println!("  {events} event(s) in {}s.", drive.wait);
+        println!("  every opcode seen while waiting:");
+        for (opcode, count) in &seen {
+            println!(
+                "    {:<34} ({opcode:#06x}) x{count}",
+                world::opcode::describe(*opcode)
+            );
+        }
     }
 
     let _ = drive.roster;

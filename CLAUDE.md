@@ -387,10 +387,14 @@ the full account is in `docs/ROADMAP.md`.
 - **Print every opcode seen, decoded or not.** "The server never sent it" and
   "it arrived and we could not read it" are the same observation until
   something separates them, and they want opposite investigations. This is the
-  cheapest instrument in the box and it has been needed **four** times: three
-  failed attempts at chat, an equip sweep reporting `nothing moved`, and a mail
+  cheapest instrument in the box and it has been needed **five** times: three
+  failed attempts at chat, an equip sweep reporting `nothing moved`, a mail
   arrival loop that reported zero while the database showed the letter
-  delivered. The loop that needs it is always the one somebody is writing now.
+  delivered, and a guild-chat probe sending in **language `0`** — Universal,
+  refused with no reply at all — where zero chat lines *and* no chat opcode of
+  any number is what separated "never sent" from "arrived unreadable". **The
+  loop that needs it is always the one somebody is writing now**, and four of
+  those five were written after the rule.
 - **"Nothing happened" is two findings wearing one sentence.** An opcode the
   server never understood and a correct opcode deliberately declined have
   identical printouts and opposite investigations.
@@ -526,7 +530,8 @@ the full account is in `docs/ROADMAP.md`.
   worse for being **silent** — with no progress output a stuck run and a slow
   one look identical. Any loop draining a live stream needs a wall clock *and*
   something printed per round. A 150-second guild wait then died at `failed to
-  fill whole buffer` for the mirror reason: **no keepalive**.
+  fill whole buffer` for the mirror reason: **no keepalive**. A loop that sends
+  nothing on purpose is exactly the one the server drops.
 - **Measure the thing, not the thing next to it.** That same delay presented
   as the action bar filling half a minute after login, and the confident
   diagnosis was a slow `Spell.dbc` read blocking the render thread — with a

@@ -6629,13 +6629,43 @@ membership was re-checked in `send_on_channel` on every ordinary line, the way
 `/p` is, and it was not — so a sticky `Guild` outliving its guild sent lines the
 server dropped in silence. **A comment describing a check is not a check.**
 
+### The push, and the two probe bugs between it and being seen
+
+**`SMSG_GUILD_EVENT` is confirmed live**: with `Testwolf` sitting still and
+`Watcher` logging in on the second account, `kind 12 params ["Watcher"] guid
+Some(3)` arrived, the guid agreeing with the roster row. It is the only push in
+the block and the reason a roster is not polled.
+
+Getting there cost two bugs in the probe and neither was in the guild code.
+
+The first was the documented one: the first `--guild-wait` run died at `failed
+to fill whole buffer` partway through a 150-second wait, because **the loop
+sent no keepalive**. That is the ping trap this project has recorded since the
+world connection was written, walked into by a loop whose entire job is to send
+nothing. It pings at `PING_INTERVAL` now, and a 220-second wait survives with
+five `SMSG_PONG`s in the tally.
+
+The second was quieter and needed the instrument this project keeps
+rediscovering. `--guild-say` sent guild chat with a hardcoded language **`0`**
+— Universal, which the server refuses with **no reply at all**, and which
+`CLAUDE.md` records against three separate earlier attempts at chat. From the
+sending end it is invisible: the request goes out, the session stays up, and
+nothing comes back either way. What said so was the listening session's
+**opcode tally** — zero chat lines *and* no chat opcode of any number, which
+separates "the server never sent it" from "it arrived unreadable". The tally
+had to be added to this loop first; `--mail-wait` already carried one, and this
+loop was written without it in the same session that wrote the rule down again.
+With `language_for_race`, the line crosses.
+
+And the tally then answered the standing hypothesis about the chat frame for
+free. The line arrived as **`SMSG_GM_MESSAGECHAT` `0x03b3`** — both fixture
+accounts are game masters, so the GM transport really was in play — and it
+**parsed and printed correctly**. So the GM path was never the fault; the fault
+was two missing match arms in the interface, which is what the window half of
+this section says.
+
 ### Still not done
 
-* **`SMSG_GUILD_EVENT` is unconfirmed live.** It parses and is dispatched;
-  nothing has watched one arrive. The first `--guild-wait` run died at
-  `failed to fill whole buffer` because the loop sent **no keepalive** — the
-  documented ping trap, walked into by a loop written in the same session that
-  wrote the rule down again. The keepalive is in; the run is owed.
 * **No guild creation, no disband, no rank editing from the interface.**
   `CMSG_GUILD_DISBAND` is implemented and deliberately unreachable: it is
   irreversible and there is no confirmation gesture here yet.
