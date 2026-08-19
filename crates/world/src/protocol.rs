@@ -104,6 +104,19 @@ pub enum Error {
         expected: usize,
         got: usize,
     },
+
+    /// The trainer row count is a `u32` rather than the vendor's `u8`, so a
+    /// header read at the wrong offset asks for gigabytes. Checked before the
+    /// allocation, not after it.
+    #[error(
+        "SMSG_TRAINER_LIST: {count} spells need at least {expected} bytes but the body has {got} \
+         left -- the row count and the body disagree, so the header is not where this parser thinks"
+    )]
+    TrainerRowCount {
+        count: u32,
+        expected: usize,
+        got: usize,
+    },
 }
 
 /// A bounds-checked cursor over a packet body.

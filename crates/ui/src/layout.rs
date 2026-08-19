@@ -50,10 +50,11 @@ pub enum ElementId {
     ReleasePrompt,
     PartyFrame,
     PartyInvite,
+    Trainer,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 18] = [
+    pub const ALL: [ElementId; 19] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -72,6 +73,7 @@ impl ElementId {
         ElementId::ReleasePrompt,
         ElementId::PartyFrame,
         ElementId::PartyInvite,
+        ElementId::Trainer,
     ];
 
     /// What order the frames are drawn in, lowest first.
@@ -119,6 +121,12 @@ impl ElementId {
             | ElementId::Minimap => 2,
             ElementId::Loot
             | ElementId::Questgiver
+            // With the questgiver rather than with the panels, and for the
+            // same reason: it appeared because the player clicked an NPC and
+            // it is the answer to that click. A trainer window sealed under
+            // the map is one the player cannot buy from, which is exactly the
+            // bug the questgiver's Accept button had.
+            | ElementId::Trainer
             | ElementId::ReleasePrompt
             // Top rank, with the other windows that appeared because
             // something happened and want an answer. An invite times out, so
@@ -203,6 +211,7 @@ impl ElementId {
             ElementId::ReleasePrompt => "release-prompt",
             ElementId::PartyFrame => "party-frame",
             ElementId::PartyInvite => "party-invite",
+            ElementId::Trainer => "trainer",
         }
     }
 
@@ -231,6 +240,7 @@ impl ElementId {
             ElementId::ReleasePrompt => "Release-spirit prompt",
             ElementId::PartyFrame => "Party frame",
             ElementId::PartyInvite => "Party invite",
+            ElementId::Trainer => "Trainer",
         }
     }
 
@@ -371,6 +381,28 @@ impl ElementId {
             ElementId::Questgiver => Element {
                 anchor: Anchor::Top,
                 offset: [0.0, 16.0],
+                ..Default::default()
+            },
+            // **Clear of the questgiver's scroll, which is the constraint
+            // that decided this.** The two come from the same click at the
+            // same NPC -- a class trainer is usually a questgiver too, and
+            // Llane Beshere carries both bits -- so they are genuinely open
+            // together and neither may cover the other.
+            //
+            // Beside it along the top is where it wants to go and there is no
+            // room: the scroll runs 750 to 1170, the quest log starts at 1392
+            // and the target frame ends at 516, leaving gaps of 222 and 234
+            // for a 320-wide window. Below it does not work either, because
+            // the scroll's height is its *text* and a real one is several
+            // times the placeholder's.
+            //
+            // So it takes the left edge at mid-height, in the band between
+            // the party frame and the chat box, outboard of the character
+            // panel. `the_default_frames_do_not_overlap` is what turned that
+            // from an eyeballed guess into a checked one.
+            ElementId::Trainer => Element {
+                anchor: Anchor::Left,
+                offset: [270.0, -60.0],
                 ..Default::default()
             },
             // Dead centre, and the only window here that wants to be: a map

@@ -359,6 +359,40 @@ enum Command {
         /// sale price.
         #[arg(long)]
         sell_back: bool,
+        /// Walk to the nearest trainer, ask what it teaches, and report the
+        /// whole reply -- including the stride measurement that says the
+        /// record layout is right.
+        ///
+        /// **The reply is what makes this the cheap one.** `CMSG_TRAINER_LIST`
+        /// is answered, so a body coming back at all confirms the opcode and
+        /// the request body together, with none of the three-way ambiguity a
+        /// silent send leaves. Everything else in the trainer/mail/auction
+        /// block is then bounded by this one, the same way
+        /// `CMSG_LIST_INVENTORY` bounded `CMSG_BUY_ITEM`.
+        ///
+        /// Takes an optional **creature entry** to prefer, like `--gossip`.
+        /// `--trainer 911` is Llane Beshere, the Northshire warrior trainer:
+        /// six spells at required levels 1, 4, 4, 6, 6, 6, which is a
+        /// population that can actually separate the availability states
+        /// instead of showing one value six times. `.npc add 911` puts him at
+        /// the caller's feet.
+        #[arg(long, num_args = 0..=1, default_missing_value = "0")]
+        trainer: Option<u32>,
+        /// After a trainer list arrives, learn this **spell id** and report
+        /// the effect.
+        ///
+        /// The number is a spell id from the list and never a row position --
+        /// the server filters the list per character, so a position means
+        /// different things to two readers standing at the same NPC while an
+        /// id does not.
+        ///
+        /// Confirmed two ways at once, which is worth having because they fail
+        /// differently: `SMSG_TRAINER_BUY_SUCCEEDED` echoes the spell id back,
+        /// and `PLAYER_FIELD_COINAGE` drops by the **quoted** price -- so the
+        /// money check tests `trainer::TrainerSpell::cost` being the
+        /// discounted figure rather than only that the purchase worked.
+        #[arg(long)]
+        learn: Option<u32>,
         /// Ask the server what these item entries are, and check the answers
         /// against `Item.dbc`.
         ///
@@ -1233,6 +1267,8 @@ fn main() -> Result<()> {
             gossip_select,
             buy,
             sell_back,
+            trainer,
+            learn,
             quest,
             item_query,
             use_item,
@@ -1291,6 +1327,8 @@ fn main() -> Result<()> {
                 gossip_select: *gossip_select,
                 buy: *buy,
                 sell_back: *sell_back,
+                trainer: *trainer,
+                learn: *learn,
                 quest: *quest,
                 item_query: item_query.as_deref(),
                 use_item: *use_item,
@@ -1474,6 +1512,8 @@ struct WorldRequest<'a> {
     gossip_select: Option<u32>,
     buy: Option<u32>,
     sell_back: bool,
+    trainer: Option<u32>,
+    learn: Option<u32>,
     quest: Option<u32>,
     item_query: Option<&'a [u32]>,
     use_item: Option<u32>,
@@ -1587,6 +1627,8 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         gossip_select,
         buy,
         sell_back,
+        trainer,
+        learn,
         quest,
         item_query,
         use_item,
@@ -2476,6 +2518,18 @@ cast {spell_id} at {} (attempt {attempt})",
                 gossip_select,
                 buy,
                 sell_back,
+            )?;
+        }
+
+        if let Some(entry) = trainer {
+            let prefer = (entry != 0).then_some(entry);
+            survey_trainer(
+                &mut connection,
+                &mut state,
+                character.guid,
+                &mut here,
+                prefer,
+                learn,
             )?;
         }
 
@@ -5117,6 +5171,30 @@ fn approach_talker(
         ),
         None => (0, 0),
     };
+
+    // **A dead NPC answers nothing, and nothing is the one reply that means
+    // nothing.** `Entity::will_talk` reads only the flag word, so a corpse
+    // keeps every bit it had in life and is selected exactly as readily as
+    // the living -- and the server then declines the greeting in total
+    // silence, which is what a wrong opcode looks like.
+    //
+    // This cost two runs. A trainer spawned at a character's feet in
+    // Northshire was killed by the wildlife between one run and the next; the
+    // same request that had come back with 286 bytes came back with nothing
+    // twice, from the same character at the same distance to the same
+    // creature entry, and the printout said only that no reply arrived. Said
+    // rather than refused, deliberately: a greeting to a corpse is still an
+    // observation worth having as long as the report names what it is.
+    if state
+        .get(chosen)
+        .is_some_and(|npc| npc.is_dead_or_ghost())
+    {
+        println!("\n  WARNING: {chosen:#018x} is DEAD. Its flag word is unchanged -- a corpse");
+        println!("  keeps every npcflag bit it had alive -- but the server declines to");
+        println!("  interact with it, in silence. Any silence below is explained by this");
+        println!("  and says nothing about the opcode. Respawn it with `.npc add {entry}`.");
+    }
+
     Ok(Some(Talker {
         guid: chosen,
         entry,
@@ -5438,6 +5516,299 @@ fn survey_gossip(
             );
         }
         state.replicate(&after, None);
+    }
+    Ok(())
+}
+
+/// Asks a trainer what it teaches, measures the record stride against the
+/// reply, and optionally learns one spell.
+///
+/// **The stride measurement is the reason this prints more than a list.** Two
+/// record layouts are plausible for `SMSG_TRAINER_LIST` -- 30 bytes and 38 --
+/// and both parse a real body without complaining, because every field in the
+/// record is a small integer that reads as a plausible spell id, price or
+/// level at either. So the probe reads the bytes *itself*, without going
+/// through [`world::trainer::parse_trainer_list`], for the same reason
+/// `m2 events --strides` does: the parser is what is under test.
+///
+/// What separates them is the **greeting** at the end of the body. A stride
+/// out by a word leaves the reader inside a number, and the bytes of a small
+/// integer are not printable. Same evidence as the M2 event identifier being
+/// four printable characters, and stronger than any amount of range-checking:
+/// a name cannot be arrived at by a coincidence of small integers.
+fn survey_trainer(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    // Written back, like every other walking probe here: replicated state
+    // holds our login position forever and three callers have now had to
+    // relearn it.
+    here: &mut world::Position,
+    prefer: Option<u32>,
+    // Which spell to learn afterwards, by **spell id** and never a row
+    // position -- the list is filtered per character.
+    learn: Option<u32>,
+) -> Result<()> {
+    use world::trainer;
+
+    let Some(npc) = approach_talker(connection, state, own_guid, here, prefer)? else {
+        return Ok(());
+    };
+    let (chosen, entry, flags, distance) = (npc.guid, npc.entry, npc.flags, npc.distance);
+
+    connection.set_selection(chosen)?;
+    println!(
+        "\nasking {chosen:#018x} entry {entry} at {distance:.1} units, npcflag {flags} ({flags:#x})"
+    );
+    // **Say what the flag word claims before sending**, so a refusal has
+    // somewhere to be explained. The bit map is a hypothesis from the
+    // server's own header and is confirmed here by *combination*: an NPC
+    // whose name says "Warrior Trainer" carries 0x10 and 0x20 and no vendor
+    // bit, and an innkeeper carries the vendor and innkeeper bits and neither
+    // trainer bit. Two flag words that differ, each agreeing with a role
+    // known independently of the wire.
+    const TRAINER_BIT: u32 = 0x10;
+    if flags & TRAINER_BIT == 0 {
+        println!("  note: bit 0x10 is NOT set on this unit, so the server will refuse.");
+        println!("  Sending anyway, because a refusal from a unit that admits it is");
+        println!("  not a trainer is a *different* observation from silence at one");
+        println!("  that is -- and only the pair says the bit means what it claims.");
+    }
+
+    connection.trainer_list(chosen)?;
+
+    // Generously long, and for the reason a packet sent immediately before a
+    // disconnect is often never processed: half a second of waiting once
+    // turned a facing opcode from "wrong" into "works every time".
+    let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+
+    let Some(reply) = batch
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::TRAINER_LIST)
+    else {
+        println!("\nNO SMSG_TRAINER_LIST came back. Everything that did arrive:");
+        for packet in &batch {
+            println!(
+                "  {} ({:#06x}), {} bytes",
+                world::opcode::describe(packet.opcode),
+                packet.opcode,
+                packet.body.len()
+            );
+        }
+        println!("\nThis is the informative failure: an *answered* opcode that did not");
+        println!("answer means the number is wrong, or this unit does not train. The");
+        println!("npcflag printed above says which -- that is what it is printed for.");
+        state.replicate(&batch, None);
+        return Ok(());
+    };
+
+    // **The body, not the length.** A parser that declines an unconfirmed
+    // shape is only useful if the shape survives the refusal, and two tools
+    // in this tree have already logged a length and dropped the one packet
+    // that could have answered the question.
+    println!("\nSMSG_TRAINER_LIST, {} bytes:", reply.body.len());
+    println!("  {}", hex_preview(&reply.body, 512));
+
+    println!("\nrecord stride, measured against the greeting:");
+    let fits = trainer::measure_stride(
+        &reply.body,
+        &[
+            trainer::SHORT_SPELL_BYTES,
+            trainer::SPELL_BYTES - 4,
+            trainer::SPELL_BYTES,
+            trainer::SPELL_BYTES + 4,
+        ],
+    );
+    for fit in &fits {
+        println!(
+            "  {:>3} bytes: {} body, greeting {} {:?}",
+            fit.stride,
+            if fit.accounts_for_body { "accounts for" } else { "does NOT account for" },
+            if fit.greeting_is_printable { "READABLE" } else { "binary" },
+            fit.greeting.as_deref().unwrap_or("<none>"),
+        );
+    }
+    let winners: Vec<usize> = fits
+        .iter()
+        .filter(|f| f.accounts_for_body && f.greeting_is_printable)
+        .map(|f| f.stride)
+        .collect();
+    match winners.as_slice() {
+        [only] => println!("  -> exactly one stride leaves a sentence where the greeting is: {only}"),
+        [] => println!("  -> NONE fit. The header is not where this thinks it is."),
+        many => println!("  -> {many:?} all fit, so this packet cannot separate them. Needs a\n     trainer with more rows, or one whose greeting is longer."),
+    }
+
+    match trainer::parse_trainer_list(&reply.body) {
+        Ok(list) => {
+            println!(
+                "\ntrainer {:#018x}, kind {}, {} spell(s):",
+                list.trainer,
+                list.kind,
+                list.spells.len()
+            );
+            println!("  greeting: {:?}", list.greeting);
+            for spell in &list.spells {
+                println!(
+                    "  spell {:>6}  {:<12} {:>6} copper  level {:>2}{}{}",
+                    spell.spell,
+                    match spell.state {
+                        trainer::TrainerSpellState::Available => "available".to_string(),
+                        trainer::TrainerSpellState::Unavailable => "cannot yet".to_string(),
+                        trainer::TrainerSpellState::Known => "known".to_string(),
+                        trainer::TrainerSpellState::Unknown(n) => format!("UNKNOWN({n})"),
+                    },
+                    spell.cost,
+                    spell.required_level,
+                    match spell.required_skill {
+                        Some(skill) => format!(", skill {skill} at {}", spell.required_skill_value),
+                        None => String::new(),
+                    },
+                    if spell.required_spells.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", needs {:?}", spell.required_spells)
+                    },
+                );
+            }
+
+            // **The cross-check is a relationship, not an equality.** Somebody
+            // comparing these prices to the table and finding them lower
+            // should find the explanation here rather than file a bug -- the
+            // same note the vendor probe carries, for the same reason.
+            println!("\n  cross-check, against the server's own tables:");
+            println!("    SELECT TrainerId FROM creature_default_trainer WHERE CreatureId={entry};");
+            println!("    SELECT SpellId,MoneyCost,ReqLevel,ReqSkillLine,ReqSkillRank");
+            println!("      FROM trainer_spell WHERE TrainerId=<that>;");
+            println!("    SELECT Greeting FROM trainer WHERE Id=<that>;");
+            println!("  note: costs above are AFTER the reader's reputation discount, so they");
+            println!("        are *below* trainer_spell.MoneyCost. That is correct, and it is");
+            println!("        the same finding the vendor price made -- the wire is");
+            println!("        authoritative for price and the table is not.");
+
+            // **The state byte is the one field a single packet can only
+            // half-confirm**, so say what would refute it rather than
+            // declaring it right. Availability depends on the reader's level,
+            // and a list where every row agrees proves nothing.
+            let levels: Vec<u8> = list.spells.iter().map(|s| s.required_level).collect();
+            let mut distinct: Vec<world::TrainerSpellState> = Vec::new();
+            for spell in &list.spells {
+                if !distinct.contains(&spell.state) {
+                    distinct.push(spell.state);
+                }
+            }
+            println!("\n  state column: {} distinct value(s) over required levels {levels:?}", distinct.len());
+            if distinct.len() < 2 {
+                println!("    ONE value across every row, which cannot separate a state column");
+                println!("    from a constant. Run again on a character whose level falls");
+                println!("    *between* the required levels above -- that is the population");
+                println!("    that can refute this, and a list that all agrees is not evidence.");
+            } else {
+                println!("    More than one, so this list can and does distinguish them. Check");
+                println!("    the split falls exactly on the reader's level in the rows above.");
+            }
+
+            if let Some(wanted) = learn {
+                learn_and_report(connection, state, own_guid, &list, wanted)?;
+            }
+        }
+        Err(error) => println!("\nSMSG_TRAINER_LIST did not parse: {error}"),
+    }
+
+    println!("\nevery opcode seen:");
+    let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+    for packet in &batch {
+        *seen.entry(packet.opcode).or_default() += 1;
+    }
+    for (opcode, count) in &seen {
+        println!(
+            "  {:<34} ({opcode:#06x}) x{count}",
+            world::opcode::describe(*opcode)
+        );
+    }
+    state.replicate(&batch, None);
+    Ok(())
+}
+
+/// Learns one spell from an open trainer and reports both effects.
+///
+/// **Two independent confirmations, and they fail differently**, which is why
+/// both are checked rather than either: `SMSG_TRAINER_BUY_SUCCEEDED` echoes
+/// the spell id back, and `PLAYER_FIELD_COINAGE` drops by the price the list
+/// quoted. The reply says the request was understood; the money says the
+/// *quoted* price was the real one, which is a statement about
+/// [`world::trainer::TrainerSpell::cost`] rather than about the purchase.
+fn learn_and_report(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    list: &world::TrainerList,
+    wanted: u32,
+) -> Result<()> {
+    use world::inventory;
+
+    // Looked up in the list rather than trusted from the command line, so the
+    // state can be checked before a send that cannot report its own failure.
+    let Some(spell) = list.spells.iter().find(|s| s.spell == wanted) else {
+        println!("\nthis trainer does not teach spell {wanted}. It offers: {:?}",
+            list.spells.iter().map(|s| s.spell).collect::<Vec<_>>());
+        println!("Those are spell ids, not row numbers -- the list is filtered per");
+        println!("character, so a row number means different things to two readers.");
+        return Ok(());
+    };
+
+    // **Refuse locally rather than spending an unanswerable send.** Every
+    // failure path in the server's handler returns without sending anything,
+    // so a refusal and a wrong opcode look identical -- and this client has
+    // already paid for that confusion once, on `CMSG_BUY_ITEM`.
+    if !spell.state.is_learnable() {
+        println!("\nspell {wanted} is not learnable by this character right now ({:?}).", spell.state);
+        println!("Not sending: the server declines this in *silence*, which is");
+        println!("indistinguishable from a wrong opcode, so the send would tell us");
+        println!("nothing while looking exactly like a protocol failure.");
+        return Ok(());
+    }
+
+    let money_before = inventory::coinage(state, own_guid);
+    println!(
+        "\nlearning spell {} at {} copper; purse holds {money_before}",
+        spell.spell, spell.cost
+    );
+    connection.trainer_buy_spell(list.trainer, spell.spell)?;
+
+    let after = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+    state.replicate(&after, None);
+
+    let echoed = after
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::TRAINER_BUY_SUCCEEDED)
+        .and_then(|p| {
+            (p.body.len() >= 12).then(|| {
+                u32::from_le_bytes([p.body[8], p.body[9], p.body[10], p.body[11]])
+            })
+        });
+    match echoed {
+        Some(id) if id == spell.spell => {
+            println!("  SMSG_TRAINER_BUY_SUCCEEDED echoed spell {id} -- the same one asked for.")
+        }
+        Some(id) => println!("  SMSG_TRAINER_BUY_SUCCEEDED echoed spell {id}, NOT the {} sent.", spell.spell),
+        None => {
+            println!("  no SMSG_TRAINER_BUY_SUCCEEDED. The server declines in silence, so");
+            println!("  this is either a refusal it did not explain or a request it did");
+            println!("  not understand -- and CMSG_TRAINER_LIST answering above says the");
+            println!("  opcode block is numbered right, which leaves the body.");
+        }
+    }
+
+    let money_after = inventory::coinage(state, own_guid);
+    let spent = money_before.saturating_sub(money_after);
+    println!("  purse {money_before} -> {money_after} (spent {spent}, quoted {})", spell.cost);
+    if spent == spell.cost && spell.cost > 0 {
+        println!("  exactly the quoted price left the purse, so the cost field is the");
+        println!("  discounted one the server actually charges and not the table's.");
+    } else if money_after == money_before {
+        println!("  nothing left the purse. Either the coinage field has not been");
+        println!("  resent yet or nothing was bought -- the echo above says which.");
     }
     Ok(())
 }

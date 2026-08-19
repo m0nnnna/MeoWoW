@@ -30,6 +30,7 @@ pub mod quest_log;
 pub mod quest_mark;
 pub mod questgiver;
 pub mod spellbook;
+pub mod trainer;
 pub mod unit;
 pub mod world_map;
 
@@ -44,6 +45,7 @@ pub use party_invite::{InviteAnswer, PartyInviteView};
 pub use quest_mark::QuestMark;
 pub use questgiver::{QuestgiverAction, QuestgiverClick, QuestgiverRow, QuestgiverView};
 pub use spellbook::SpellbookEntry;
+pub use trainer::{TrainerRow, TrainerRowState, TrainerView};
 pub use unit::UnitView;
 pub use minimap::{MinimapTile, MinimapView};
 pub use world_map::{MapMarker, MapPatch, MapView, MarkerKind};

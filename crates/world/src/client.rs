@@ -950,6 +950,34 @@ impl Connection {
         self.send(ClientOpcode::BuyItem, &body)
     }
 
+    /// Asks a trainer what it will teach this character.
+    ///
+    /// The guid goes out unpacked, like the vendor's. See
+    /// [`ClientOpcode::TrainerList`] -- this one is *answered*, which is why
+    /// it is the first thing sent at a trainer and the thing that bounds the
+    /// silent purchase below it.
+    pub fn trainer_list(&mut self, trainer: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::TrainerList, &trainer.to_le_bytes())
+    }
+
+    /// Learns one spell from the open trainer.
+    ///
+    /// `spell` is the id from [`TrainerSpell::spell`](crate::TrainerSpell) and
+    /// **not** a row position -- the server's list is filtered per character,
+    /// so a position means different things to different readers while an id
+    /// does not.
+    ///
+    /// Answered by `SMSG_TRAINER_BUY_SUCCEEDED` on success and by **nothing at
+    /// all** on refusal, so a caller should check
+    /// [`TrainerSpellState::is_learnable`](crate::TrainerSpellState::is_learnable)
+    /// before spending a send it cannot interpret the failure of.
+    pub fn trainer_buy_spell(&mut self, trainer: u64, spell: u32) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&trainer.to_le_bytes());
+        body.extend_from_slice(&spell.to_le_bytes());
+        self.send(ClientOpcode::TrainerBuySpell, &body)
+    }
+
     /// Sells an item to the open vendor.
     ///
     /// The item is named by **guid** rather than by slot, deliberately: a guid

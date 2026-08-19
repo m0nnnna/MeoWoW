@@ -508,6 +508,41 @@ pub enum ClientOpcode {
     /// server accepts both and the two take different bodies; this client
     /// sends the guid form.
     GroupUninviteByName = 0x0075,
+
+    /// Ask a trainer what it will teach. Body is the trainer's guid, unpacked.
+    ///
+    /// The reply is [`TRAINER_LIST`](server::TRAINER_LIST), so this is an
+    /// *answered* request -- the cheap kind, and the reason trainers were
+    /// taken before the other five services in this block. A reply that
+    /// parses says the opcode and the body were both understood, with none of
+    /// the three-way ambiguity a silent send leaves behind.
+    ///
+    /// Reachable two ways, exactly like [`ClientOpcode::ListInventory`]: a
+    /// gossip option meaning "train me" produces the same packet, and an NPC
+    /// with no gossip menu still trains.
+    TrainerList = 0x01B0,
+
+    /// Learn one spell from the open trainer. Body is `{u64 trainer guid,
+    /// u32 spell id}` -- twelve bytes.
+    ///
+    /// **The spell is named by its id and never by a row position**, which is
+    /// the one place this block escapes the trap that loot slots, gossip
+    /// option indices and vendor slots all sit in: the server's list is
+    /// filtered per character (by class, by race, and by a prerequisite spell
+    /// the reader may not have), so a row number would mean different things
+    /// to two characters standing at the same NPC. Here there is nothing to
+    /// get wrong -- the id travels.
+    ///
+    /// **Answered on success and silent on refusal**, which is an unusually
+    /// good diagnostic shape and worth stating: every failure path in the
+    /// server's handler returns without sending anything at all, so the
+    /// arrival of [`TRAINER_BUY_SUCCEEDED`](server::TRAINER_BUY_SUCCEEDED)
+    /// naming the same spell id is the confirmation, and its absence is a
+    /// refusal rather than a misunderstanding. That does mean a wrong opcode
+    /// and a declined purchase look alike -- which is why this one is sent
+    /// only after [`ClientOpcode::TrainerList`] has already answered from the
+    /// same block, the same bounding move that rescued `CMSG_BUY_ITEM`.
+    TrainerBuySpell = 0x01B2,
 }
 
 /// The server-to-client opcodes this client reacts to.
@@ -568,6 +603,29 @@ pub mod server {
     /// creature, in order, each pairing an item entry with the display id
     /// `Item.dbc` independently gives it.
     pub const LIST_INVENTORY: u16 = 0x019F;
+
+    /// What a trainer will teach: a list of spells with a price, a level and
+    /// a per-character availability state, followed by the trainer's greeting.
+    /// See [`crate::trainer`] for the layout and how the record stride was
+    /// measured.
+    ///
+    /// **Identified by the greeting**, which is the strongest kind of evidence
+    /// available in a binary format and the same move that settled the M2
+    /// event stride: the string at the end of this body is the *name* of
+    /// something, and a wrong record stride puts the reader in the middle of a
+    /// number instead of at the start of a sentence.
+    pub const TRAINER_LIST: u16 = 0x01B1;
+
+    /// One spell has been learned, in answer to
+    /// [`TrainerBuySpell`](crate::ClientOpcode::TrainerBuySpell). Body is
+    /// `{u64 trainer guid, u32 spell id}`, echoing back what was asked for.
+    ///
+    /// **This is the only reply the purchase gets.** The server's handler
+    /// returns silently on every refusal -- no such spell, not enough money,
+    /// already known, level too low -- so the presence of this packet is the
+    /// success and its absence is the failure. See
+    /// [`TrainerBuySpell`](crate::ClientOpcode::TrainerBuySpell).
+    pub const TRAINER_BUY_SUCCEEDED: u16 = 0x01B3;
 
     /// What mark belongs over one NPC's head, in answer to
     /// [`QuestgiverStatusQuery`](crate::ClientOpcode::QuestgiverStatusQuery).
@@ -861,6 +919,8 @@ pub fn describe(opcode: u16) -> String {
         server::LOOT_CLEAR_MONEY => "SMSG_LOOT_CLEAR_MONEY",
         server::GOSSIP_MESSAGE => "SMSG_GOSSIP_MESSAGE",
         server::LIST_INVENTORY => "SMSG_LIST_INVENTORY",
+        server::TRAINER_LIST => "SMSG_TRAINER_LIST",
+        server::TRAINER_BUY_SUCCEEDED => "SMSG_TRAINER_BUY_SUCCEEDED",
         server::QUESTGIVER_STATUS => "SMSG_QUESTGIVER_STATUS",
         server::QUESTGIVER_STATUS_MULTIPLE => "SMSG_QUESTGIVER_STATUS_MULTIPLE",
         server::QUESTGIVER_QUEST_LIST => "SMSG_QUESTGIVER_QUEST_LIST",

@@ -5507,3 +5507,229 @@ shared `u32` would accept in silence.
   original client plays other people's footsteps at all. It needs a distance
   curve before it needs a decision.
 * **No spray**, and `$HIT`/`$CAH` still parsed and unused.
+
+## 4.24: trainers, and a schema that lied about its own wire
+
+The first rung of a six-part block -- flight paths, trainers, mail, auction,
+guild, trade -- and deliberately the cheapest one, for two reasons. It is the
+only one that needs no new format and no new interface mechanism: a gossip
+option opening a sub-window is already proved by `SMSG_LIST_INVENTORY`, and a
+spell learned lands in a spellbook panel that has existed since 4.3. And it is
+the one whose request is **answered**, which makes it the natural thing to bound
+the other five against -- the same move `CMSG_LIST_INVENTORY` made for
+`CMSG_BUY_ITEM`, one block over.
+
+Two opcodes each way. `CMSG_TRAINER_LIST` `0x01B0` takes the trainer's guid
+unpacked and is answered by `SMSG_TRAINER_LIST` `0x01B1`.
+`CMSG_TRAINER_BUY_SPELL` `0x01B2` takes `{u64 trainer, u32 spell}` and is
+answered by `SMSG_TRAINER_BUY_SUCCEEDED` `0x01B3` **on success and by nothing at
+all on refusal** -- every failure path in the server's handler returns without
+sending, so the reply's arrival is the confirmation and its absence is a
+decline.
+
+### The record stride, and the source that predicted the wrong one
+
+The body is a guid, a trainer type, a count, `count` fixed-size records, and a
+NUL-terminated greeting. The whole question is the stride, and two candidates
+are live: the WotLK-era record carries two extra `u32`s for a
+primary-profession learn dialog, giving **38** bytes; a later one drops them,
+giving 30. Nothing in the header distinguishes them, and **every field in the
+record is a small integer that reads as a plausible spell id, price or level at
+either**.
+
+**This project predicted 30 and the wire said 38.** The prediction was not
+idle. The realm's database carries the *modern* trainer tables -- `trainer`,
+`trainer_spell`, `creature_default_trainer`, with `ReqAbility1..3` columns and
+no profession columns at all -- and a server storing the new shape sending the
+new shape is the obvious inference. It does not. The schema was modernised and
+the packet builder was not, and the two disagree inside one running server.
+
+The generalisation is worth more than the number: **a database schema is a fact
+about storage and not about a wire.** It belongs beside "a grep that finds the
+field names is not a grep that finds the structure" -- source and schema both
+make a hypothesis cheap and neither settles one.
+
+### What settled it was a name
+
+`trainer.Greeting` for trainer id 2 is `Hello, warrior!  Ready for some
+training?`, and it sits at the end of the body. A stride wrong by four bytes
+leaves the reader in the middle of a number rather than at the start of a
+sentence, and the bytes of a small integer are overwhelmingly not printable. Of
+the four strides scored against Llane Beshere's packet, exactly one left that
+sentence there.
+
+Fourth instance of the same shape: the M2 event identifier being four printable
+bytes, `GroundEffectTexture`'s terrain column naming itself through texture
+filenames, `CreatureSoundData`'s columns naming themselves through
+`SoundEntries` labels, and now this. **A name in a binary format cannot be
+arrived at by a coincidence of small integers.**
+
+#### The probe reported its own blind spot, which is the part worth keeping
+
+The first candidate set was 26, 30, 34, 38 and returned a clean single winner --
+and it could not have done otherwise, because 42 was not in it. Adding 42
+produced **two** winners, and the probe said so rather than picking one:
+
+```
+   38 bytes: accounts for body, greeting READABLE "Hello, warrior!  Ready for some training?"
+   42 bytes: accounts for body, greeting READABLE "or some training?"
+  -> [38, 42] all fit, so this packet cannot separate them.
+```
+
+The arithmetic is the finding. An **undershooting** stride leaves the reader
+inside a record and is caught at once. An **overshooting** one skips
+`count * delta` bytes, and when that is shorter than the greeting it lands
+*inside* the greeting and returns a perfectly printable **suffix of it**. Six
+rows overshooting by four is 24 bytes into a 41-character sentence, so 42 looks
+exactly as good as 38.
+
+The fix is not a cleverer check, it is a bigger packet. Ander Germaine teaches
+**133** spells with the same 41-character greeting, and his body is **5,112
+bytes**, which is `16 + 133 * 38 + 42` to the byte. There the overshoot is 532
+bytes, 42 runs off the end, and 38 stands alone.
+
+Same lesson as the M2 particle stride, where 1,739 single-emitter models scored
+every candidate identically and the *27%* was what made the 100% trustworthy:
+**work out which samples are incapable of separating the candidates before
+reading the result, and if the first sample is one of them, go and find
+another.** The test that asserts 38 keeps the reduced candidate list *and*
+carries a second test asserting that this packet genuinely cannot tell 38 from
+42, so nobody later reads the first as a claim it never made.
+
+### The availability byte, produced one change at a time
+
+Three states, and a wrong name here never errors -- it draws a confident,
+plausible, wrong colour. So each value was produced deliberately, the same
+method that named `SMSG_QUESTGIVER_STATUS`'s byte, and the population was
+chosen so the other explanations are ruled out.
+
+Llane's six spells want levels 1, 4, 4, 6, 6, 6. Three readers, three splits:
+
+| reader | level | result |
+|---|---|---|
+| `Facetest` | 1 | **1** available, **5** refused -- the split falls at level 1 |
+| `Testwolf` | 5 | **3** available, **3** refused -- the split falls at level 5 |
+| `Statustest` | 26 | **6** available -- nothing is out of reach |
+
+The state column tracks the reader's level across three levels, in the same six
+rows, with no exceptions and no near-misses. Each is a prediction that could
+have come out the other way.
+
+The third value needed a sample where the level *cannot* be the explanation,
+because at level 5 "already known" and "too low" are both live for different
+rows. `Statustest` at level 26 reads `0` on all six; a `.learn 6673` between
+two runs made exactly that one row read `2`, with the other five unmoved.
+
+**`1` is "cannot" and `2` is "already known", which is the way round that
+surprises.** The natural guess orders them by how far along the character is --
+learnable, learned, out of reach -- and the server does not. Reading them that
+way greys out everything learnable and offers everything already learned, with
+no error anywhere.
+
+### The price is the discounted one, again
+
+`floor(cost * 0.95)`: the table says 10 and 100, the wire says 9 and 95. The
+identical finding the vendor stock list made in 4.15, and it cost nothing the
+second time -- which is the entire point of having written it down. Confirmed
+by consequence as well as by arithmetic: buying the row quoted at 9 took
+**exactly 9** copper out of a purse, where `trainer_spell.MoneyCost` says 10.
+
+### The one place this block escapes the index trap
+
+Loot slots, gossip option indices and vendor slots are all the server's own
+numbering and never a row position, and every one of them cost a paragraph to
+establish. A trainer purchase names the **spell id**, so there is nothing here
+to get wrong -- and there is an extra reason it would have been worse than
+usual: the server filters the list per character, by class, by race and by a
+prerequisite spell the reader may not have, so position *n* names a different
+spell to two people standing at the same NPC.
+
+### `UNIT_NPC_FLAGS` bit `0x10`, bounded from both sides
+
+The flag word has been replicated and read since 4.15 and its bits deliberately
+unnamed. One bit is named now, and the claim is stated exactly as far as the
+evidence goes: **necessary, not sufficient.**
+
+* **Necessary.** An Innkeeper Farley -- `0x10283`, every bit but this one --
+  answers the identical request with *nothing*, from zero units away, on the
+  same character that got 286 bytes out of Llane. That is the refuting half,
+  and without it `0x10` merely correlates.
+* **Not sufficient.** A Grand Master Blacksmithing trainer carries `0x10` and
+  `0x40` and answers nothing at all to a warrior with none of its skill.
+
+The server's own preconditions say why, and they matter because **every one of
+them fails in silence**: alive, the flag, not charmed, a reaction above
+unfriendly, within five units, and -- for a class trainer -- the reader's class
+matching the trainer's. Six ways to get nothing back.
+
+Three flag words also agree with roles known independently of the wire, which
+is the combination test: Llane Beshere, a "Warrior Trainer", is `0x33`; an
+innkeeper is `0x10283`; a spirit healer standing over a corpse is `0x4001`.
+
+### A dead NPC and a wrong opcode are the same silence
+
+Two runs came back with no reply from an NPC that had answered twice before --
+same entry, same character, same zero distance. `Entity::will_talk` reads only
+the flag word, and **a corpse keeps every npcflag bit it had in life**, so a
+dead trainer is selected exactly as readily as a living one and the server then
+declines in total silence.
+
+The cause here turned out to be neither death nor the opcode: the trainer had
+been spawned in a field, was *in combat* and moving, and had drifted past the
+five-unit reach between the distance being measured and the request being sent.
+`approach_talker` now says when its chosen NPC is dead, so that silence at least
+names itself, and the real Llane Beshere -- who stands indoors in Northshire
+Abbey and is never in a fight -- is the fixture rather than a spawned copy in a
+field of kobolds.
+
+### The window
+
+A list sized to its contents, like the loot window, with one difference that
+shapes the frame: **most rows are not clickable and that is normal.** A corpse
+holds only what you may take; a trainer's list is mostly ranks above your level
+and spells you already know. Those are drawn dimmed *with their level*, because
+"come back at 6" is the content, and a list that hid them would read as a
+trainer with nothing to teach.
+
+`row_at` answers only for rows that can actually be bought, and the test asserts
+**both halves** -- the learnable row reports its spell id, the known and
+out-of-reach rows report nothing. A hit test returning every row passes the
+first half alone, and what it ships is a request the server declines in silence.
+
+Two smaller decisions:
+
+* **The list is kept, not rebuilt per frame** -- the opposite of the questgiver
+  window, and for a reason. A questgiver's view is rebuilt because its inputs
+  (the quest cache, the log) change underneath it. Every field of a trainer's
+  list was computed by the *server* for this character at the moment it was
+  asked, including the availability and the discounted price, and this client
+  cannot recompute any of it.
+* **Learning re-asks the whole list** rather than editing the row that was
+  bought. Learning one spell can change *other* rows -- a rank whose
+  prerequisite this was becomes available -- and only the server knows which. A
+  list right about one line and stale about the rest is worse than one briefly
+  empty.
+
+The default position was decided by the overlap test rather than by eye. Beside
+the questgiver's scroll is where it wants to go and there is no room: the scroll
+runs 750 to 1170, the quest log starts at 1392, the target frame ends at 516,
+leaving gaps of 222 and 234 for a 320-wide window. Below it does not work
+either, because the scroll's height is its *text* and a real one is several
+times the placeholder's. So it takes the left edge at mid-height.
+
+### Still not done
+
+* **No `SMSG_TRAINER_BUY_FAILED`.** The opcode is numbered and nothing has ever
+  produced one -- the handler this realm runs returns silently on every refusal
+  -- so it is not parsed and its result codes are not named.
+* **Trainer `kind` is a number**, `0` on everything captured. Naming the other
+  values would be transcribing an enum nothing here has produced.
+* **The two profession `u32`s are one opaque pair.** The source calls them the
+  learn-confirmation dialog and its enabled state; both are `0` on every record
+  captured, because a warrior trainer teaches no professions. A profession
+  trainer produces the first non-zero one and names them then.
+* **No talent reset, no dual spec, no pet or mount trainers.**
+* **No scrolling**, so a 133-spell city trainer overflows its window; no
+  tooltips; no coin icons; and the window has no close control of its own --
+  the questgiver's Close button shuts both, which is right only because the
+  same right-click opened both.

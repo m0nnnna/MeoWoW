@@ -2588,6 +2588,18 @@ struct App {
     /// when a greeting is sent and cleared when the player closes it or walks
     /// out of range, and there is no separate boolean that could disagree.
     questgiver: Option<Questgiver>,
+    /// The trainer list currently open, or `None`.
+    ///
+    /// **Existence is the flag**, like the questgiver above it -- and it is a
+    /// *separate* field rather than a variant of one "NPC window" state,
+    /// because a class trainer is usually a questgiver too. Llane Beshere
+    /// carries both bits, so one right-click legitimately opens both windows,
+    /// and folding them into one state would make the second arrival close
+    /// the first.
+    ///
+    /// Cleared by the questgiver window's Close button, since the same click
+    /// opened both, and replaced whenever another NPC is greeted.
+    trainer: Option<TrainerSession>,
     /// When the quest cache was last written.
     ///
     /// **Saving only on a clean exit is not enough**, and the failure is
@@ -3035,6 +3047,30 @@ enum Line {
 /// client rather than two that could disagree. See
 /// `world::quest::parse_questgiver_details` for why the questgiver's own text
 /// packets are read for their quest id and nothing else.
+/// An open conversation with a trainer.
+///
+/// Holds the **parsed list as sent** rather than a rebuilt view, which is the
+/// opposite of what [`Questgiver`] does and deliberately so. A questgiver's
+/// window is rebuilt every frame because its inputs -- the quest cache and the
+/// log -- change underneath it. A trainer's list cannot: every field in it,
+/// including the per-row availability and the discounted price, was computed
+/// by the *server* for this character at the moment it was asked, and this
+/// client has no way to recompute any of it. So it is kept, and re-asked when
+/// something might have changed it.
+struct TrainerSession {
+    npc: u64,
+    /// Resolved at request time, like the questgiver's: an NPC's name cannot
+    /// change while you are talking to it.
+    name: String,
+    /// `None` between the request and the reply.
+    ///
+    /// Drawn as an empty window rather than as nothing, for the reason the
+    /// questgiver window opens on the send: a window that appeared only once
+    /// the reply arrived would make a slow realm look like a click that did
+    /// not register.
+    list: Option<::world::TrainerList>,
+}
+
 struct Questgiver {
     npc: u64,
     /// Resolved at greeting time rather than per frame: an NPC's name cannot
@@ -3254,6 +3290,7 @@ impl App {
             quest_asked_at: std::collections::HashMap::new(),
             quest_saved_at: Instant::now(),
             questgiver: None,
+            trainer: None,
             looting: None,
             own_corpse_query_sent: false,
             modifiers: Default::default(),
@@ -6418,10 +6455,70 @@ impl App {
         }
         self.questgiver = Some(Questgiver {
             npc: guid,
-            name,
+            name: name.clone(),
             offered: Vec::new(),
             showing: None,
         });
+        // **Cleared before the new one is decided, not overwritten after.**
+        // Greeting a plain NPC while a trainer's list is open would otherwise
+        // leave that list on screen belonging to somebody the player has
+        // stopped talking to, and its purchases would go to an NPC the server
+        // no longer considers open -- refused in silence, which is the one
+        // failure this client cannot diagnose.
+        self.trainer = None;
+
+        // **A trainer is asked in the same breath as it is greeted**, and the
+        // flag is what decides. `UNIT_NPC_FLAGS` bit `0x10` is replicated, so
+        // this is the same class of local decision `is_talk_candidate` already
+        // makes -- and it is worth making rather than always sending, because
+        // an ordinary NPC would answer a trainer request with nothing at all
+        // and nothing is the one reply this client cannot interpret.
+        //
+        // The bit is **necessary and not sufficient**, and both halves were
+        // measured. An Innkeeper Farley -- `0x10283`, every bit but this one
+        // -- answers the identical request with *nothing*, from zero units
+        // away, on the same character; that is the half saying the bit means
+        // something rather than merely correlating with it. And a Grand
+        // Master profession trainer carries `0x10` and still answers nothing
+        // to a warrior who has none of its skill; that is the half saying it
+        // does not mean enough. So an unanswered request leaves the window
+        // open and empty rather than counting as an error, and the window
+        // says which silence it is showing.
+        if self.offers_training(guid) {
+            if let Some(live) = self.live.as_mut() {
+                match live.connection.trainer_list(guid) {
+                    Ok(()) => {
+                        self.trainer = Some(TrainerSession {
+                            npc: guid,
+                            name,
+                            list: None,
+                        })
+                    }
+                    Err(e) => tracing::warn!("asking {guid:#x} for a trainer list failed: {e:#}"),
+                }
+            }
+        }
+    }
+
+    /// Whether this unit's replicated flags say it trains.
+    ///
+    /// Deliberately its own predicate beside [`Self::is_talk_candidate`]
+    /// rather than an inline bit test, so the one place that names bit `0x10`
+    /// is the place carrying the evidence for what it means. Confirmed by
+    /// combination on three NPCs whose roles are known independently of the
+    /// wire: Llane Beshere, a "Warrior Trainer", carries `0x33` -- gossip,
+    /// questgiver, trainer, class trainer -- and answers a trainer request;
+    /// an Innkeeper Farley carries `0x10283` with no trainer bit; a spirit
+    /// healer standing over a corpse carries `0x4001`. Three flag words that
+    /// differ, each agreeing with a role known from the creature's own name.
+    fn offers_training(&self, guid: u64) -> bool {
+        /// `UNIT_NPC_FLAG_TRAINER`. See [`App::offers_training`].
+        const TRAINER: u32 = 0x10;
+        self.live
+            .as_ref()
+            .and_then(|live| live.state.get(guid))
+            .and_then(|entity| entity.npc_flags())
+            .is_some_and(|flags| flags & TRAINER != 0)
     }
 
     /// Whether right-clicking this thing should open its loot.
@@ -6761,6 +6858,15 @@ impl App {
         // the same reason: filing them touches `self` as a whole.
         let mut greetings: Vec<::world::Gossip> = Vec::new();
         let mut offered: Vec<u32> = Vec::new();
+        // Collected during the drain and filed after it, the same shape the
+        // gossip messages above use -- the connection is borrowed for the
+        // whole loop, so nothing inside it may touch `self` again.
+        let mut trainer_lists: Vec<::world::TrainerList> = Vec::new();
+        // Whether a spell was learned this drain, so the list can be re-asked
+        // once the packet loop is done with the connection. A `bool` rather
+        // than a count: several successes in one drain still want exactly one
+        // re-ask.
+        let mut learned_a_spell = false;
         // Same shape again: pushing a line into the scrollback touches
         // `self.chat`, and `live` is borrowed for the whole drain.
         let mut party_results: Vec<String> = Vec::new();
@@ -7034,6 +7140,40 @@ impl App {
                                 }
                             }
                         }
+                        // What a trainer teaches. Kept whole rather than
+                        // rebuilt per frame: every field in it -- the
+                        // availability of each row, and the price after this
+                        // character's reputation discount -- was decided by
+                        // the server for this character at this moment, and
+                        // the client cannot recompute any of it.
+                        ::world::opcode::server::TRAINER_LIST => {
+                            match ::world::trainer::parse_trainer_list(&packet.body) {
+                                Ok(list) => {
+                                    tracing::debug!(
+                                        "trainer {:#018x} teaches {} spell(s): {:?}",
+                                        list.trainer,
+                                        list.spells.len(),
+                                        list.greeting
+                                    );
+                                    trainer_lists.push(list);
+                                }
+                                Err(error) => {
+                                    tracing::warn!("a trainer list would not parse: {error}")
+                                }
+                            }
+                        }
+                        // One spell learned. **The only reply a purchase
+                        // gets**: the server declines every failure in
+                        // silence, so this arriving is the success and its
+                        // absence is a refusal. The list is re-asked rather
+                        // than edited in place, because learning a spell can
+                        // change *other* rows -- a rank whose prerequisite
+                        // this was becomes available -- and only the server
+                        // knows which.
+                        ::world::opcode::server::TRAINER_BUY_SUCCEEDED => {
+                            tracing::debug!("a spell was learned");
+                            learned_a_spell = true;
+                        }
                         // The reward screen. Its body is not read: the quest
                         // it is about is the one already on screen, and its
                         // text and rewards are in the cache. What matters is
@@ -7159,6 +7299,42 @@ impl App {
 
         for line in party_results {
             self.chat.push(Line::Chat(local_notice(line)));
+        }
+
+        // **Filed by guid, never accepted blindly.** Two trainers can be
+        // within reach at once -- `.npc add` stacks spawns at a foot, and a
+        // city's trainers stand in one room -- and a list filed against the
+        // wrong session would offer purchases to an NPC that does not teach
+        // them, which the server refuses in silence.
+        for list in trainer_lists {
+            match self
+                .trainer
+                .as_mut()
+                .filter(|session| session.npc == list.trainer)
+            {
+                Some(session) => session.list = Some(list),
+                None => tracing::debug!(
+                    "a trainer list for {:#018x} arrived with no window open for it",
+                    list.trainer
+                ),
+            }
+        }
+
+        // **The list is re-asked rather than edited in place.** Learning one
+        // spell can change *other* rows -- a rank whose prerequisite this was
+        // becomes available, and the row just bought turns from green to grey
+        // -- and only the server knows which. Editing the row that was
+        // clicked would leave a list that is right about one line and stale
+        // about the rest, which is worse than one that is briefly empty.
+        if learned_a_spell {
+            // Through the `live` already borrowed above rather than a fresh
+            // `self.live.as_mut()`: that borrow is still alive here, and
+            // `self.trainer` is a different field so reading it is fine.
+            if let Some(npc) = self.trainer.as_ref().map(|session| session.npc) {
+                if let Err(e) = live.connection.trainer_list(npc) {
+                    tracing::warn!("re-asking the trainer failed: {e:#}");
+                }
+            }
         }
 
         if let Some(questgiver) = self.questgiver.as_mut() {
@@ -7809,6 +7985,75 @@ impl App {
             Vec::new()
         };
 
+        // The trainer window, built here for the same reason the spellbook is:
+        // it resolves icons, and that borrows the renderer and the archive
+        // chain, so it has to finish before anything reads `self` whole.
+        //
+        // **Names and icons come from `Spell.dbc`; everything else comes off
+        // the wire.** The split is not a convenience -- a spell's name is a
+        // fact about the game and the same for everybody, while its price and
+        // its availability were computed by the server for *this* character
+        // and cannot be recomputed here at all.
+        let trainer: Option<ui::TrainerView> = self.trainer.as_ref().map(|session| {
+            let rows = session
+                .list
+                .as_ref()
+                .map(|list| {
+                    list.spells
+                        .iter()
+                        .map(|spell| {
+                            let icon = self.spells.icon(
+                                &r.gpu,
+                                &mut r.egui_renderer,
+                                &mut self.chain,
+                                spell.spell,
+                            );
+                            ui::TrainerRow {
+                                spell: spell.spell,
+                                name: self.spells.name(spell.spell),
+                                cost: spell.cost,
+                                required_level: spell.required_level,
+                                state: match spell.state {
+                                    ::world::TrainerSpellState::Available => {
+                                        ui::TrainerRowState::Available
+                                    }
+                                    ::world::TrainerSpellState::Known => {
+                                        ui::TrainerRowState::Known
+                                    }
+                                    // **Everything unrecognised is drawn as
+                                    // out of reach, never as available.** The
+                                    // two errors are not symmetric: an
+                                    // unknown state drawn grey costs the
+                                    // player a row they might have been able
+                                    // to buy, and drawn green it sends a
+                                    // request the server refuses in silence,
+                                    // which reads as the client being broken.
+                                    _ => ui::TrainerRowState::Unavailable,
+                                },
+                                icon,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            ui::TrainerView {
+                // Between the request and the reply the window is open and
+                // empty, and it says which of the two silences that is -- a
+                // reply still coming, or a trainer that answered nothing.
+                // They are genuinely different: a profession trainer with the
+                // trainer bit set answers *nothing at all* to a character who
+                // has none of its skill.
+                greeting: match session.list.as_ref() {
+                    Some(list) if list.is_empty() => {
+                        format!("{} has nothing to teach you.", session.name)
+                    }
+                    Some(list) => list.greeting.clone(),
+                    None => format!("Asking {}...", session.name),
+                },
+                rows,
+            }
+        });
+
         // Built here rather than beside the other windows below because it
         // needs the renderer to upload its tiles, and the borrow of that has
         // to end before anything reads `self` whole.
@@ -8292,6 +8537,7 @@ impl App {
                     // Existence is the flag, like the loot window: the window
                     // is on screen exactly while a conversation is open.
                     questgiver: questgiver_view.as_ref(),
+                    trainer: trainer.as_ref(),
                     // `None` when shut, like the spellbook and the log.
                     world_map: map_view.as_ref(),
                     // No flag: a minimap is never opened or shut.
@@ -8486,6 +8732,31 @@ impl App {
             self.selected_quest = (self.selected_quest != Some(quest)).then_some(quest);
         }
 
+        // A trainer row was clicked. The window only reports rows it said were
+        // learnable, so nothing here re-checks that -- and nothing here
+        // *invents* a spell id either: it is carried from the row, because the
+        // server filters the list per character and a row position names a
+        // different spell to two people at the same NPC.
+        if let Some(spell) = hud_response.learn_spell {
+            // The NPC is the one the open window belongs to, not the current
+            // target. A player who clicked away between opening the window and
+            // clicking a row would otherwise send a purchase to whatever is
+            // selected, which the server refuses in silence.
+            let npc = self.trainer.as_ref().map(|session| session.npc);
+            match (npc, self.live.as_mut()) {
+                (Some(npc), Some(live)) => {
+                    tracing::debug!("learning spell {spell} from {npc:#018x}");
+                    if let Err(e) = live.connection.trainer_buy_spell(npc, spell) {
+                        tracing::warn!("learning spell {spell} failed: {e:#}");
+                    }
+                }
+                // Logged rather than ignored: a click that reached the frame
+                // and produced no send is exactly the shape that reads as the
+                // window being broken.
+                _ => tracing::warn!("a trainer row was clicked with no trainer open"),
+            }
+        }
+
         // **Logged whenever the window reports anything at all**, so a click
         // that reached the frame and one that never did can be told apart
         // from the log alone. Rare -- a press of a button, not a frame event.
@@ -8515,6 +8786,15 @@ impl App {
         }
         if hud_response.questgiver.closed {
             self.questgiver = None;
+            // **The trainer window closes with it, because one right-click
+            // opened both.** `greet` always opens a conversation and opens a
+            // trainer list beside it when the flags say so, so the Close
+            // button is the only thing the player pressed and it has to mean
+            // "done with this NPC" rather than "done with half of it". A
+            // trainer list left behind would sit there offering purchases to
+            // an NPC the player has walked away from -- which the server
+            // refuses in silence, the one failure this client cannot explain.
+            self.trainer = None;
         }
 
         // Clicking a party row targets that member. **A guid, not a row** --

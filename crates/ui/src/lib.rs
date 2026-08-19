@@ -42,7 +42,7 @@ pub use frames::{
     CastBarView, InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
     QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
     MapMarker, MapPatch, MapView, MarkerKind, MinimapTile, MinimapView, QuestgiverView,
-    SpellbookEntry, UnitView,
+    SpellbookEntry, TrainerRow, TrainerRowState, TrainerView, UnitView,
 };
 pub use layout::{default_path, CharacterBars, ElementId, Profile};
 pub use style::{Color, PowerType, Style};
@@ -157,6 +157,10 @@ pub struct HudData<'a> {
     /// flag, as it is for the loot window: the caller already decides when a
     /// conversation is open and a second copy here could disagree.
     pub questgiver: Option<&'a frames::QuestgiverView>,
+    /// The open trainer list, or `None`. Existence is the flag, like the loot
+    /// and questgiver windows -- and unlike them it can be open *beside* a
+    /// questgiver's scroll, because a class trainer usually carries both bits.
+    pub trainer: Option<&'a frames::TrainerView>,
     /// The world map, or `None` when it is shut. Existence is the flag, as it
     /// is for the spellbook and the bag window.
     ///
@@ -247,6 +251,17 @@ pub struct HudResponse {
     pub selected_quest: Option<u32>,
     /// What was pressed in the questgiver window.
     pub questgiver: frames::QuestgiverClick,
+    /// A trainer row was clicked, reported as the **spell id** rather than as
+    /// the row's position -- the same reasoning as [`Self::selected_quest`]
+    /// and [`Self::take_loot`], and with an extra reason on top: the server
+    /// filters a trainer's list per character, so position *n* names a
+    /// different spell to two people at the same NPC.
+    ///
+    /// Only ever set for a row the list said was learnable. The server
+    /// declines the rest **in silence**, which this client cannot tell from a
+    /// malformed request, so an inert row reports nothing at all rather than
+    /// reporting a click the caller would have to remember to ignore.
+    pub learn_spell: Option<u32>,
     /// A party row was clicked, reported as the member's **guid** rather than
     /// as the row's position -- the same reasoning as [`Self::selected_quest`]
     /// carrying a quest id. The list is rebuilt from every group list the
@@ -571,6 +586,7 @@ impl Hud {
             let loot_placeholder;
             let quest_log_placeholder;
             let questgiver_placeholder;
+            let trainer_placeholder;
             let world_map_placeholder;
             let minimap_placeholder;
             let release_prompt_placeholder;
@@ -662,6 +678,14 @@ impl Hud {
                     None if editing => {
                         questgiver_placeholder = frames::questgiver::placeholder();
                         Content::Questgiver(&questgiver_placeholder)
+                    }
+                    None => continue,
+                },
+                ElementId::Trainer => match data.trainer {
+                    Some(view) => Content::Trainer(view),
+                    None if editing => {
+                        trainer_placeholder = frames::trainer::placeholder();
+                        Content::Trainer(&trainer_placeholder)
                     }
                     None => continue,
                 },
@@ -775,6 +799,9 @@ impl Hud {
                 Content::Questgiver(view) => {
                     frames::questgiver::size(view, &style, element.scale)
                 }
+                Content::Trainer(view) => {
+                    frames::trainer::size(view.rows.len(), &style, element.scale)
+                }
                 // The one frame whose size ignores its contents entirely:
                 // the page's shape is fixed by the art, not by what is on it.
                 Content::WorldMap(_) => frames::world_map::size(&style, element.scale),
@@ -865,6 +892,7 @@ impl Hud {
                             | Content::Loot(_)
                             | Content::QuestLog(_)
                             | Content::Questgiver(_)
+                            | Content::Trainer(_)
                             | Content::ReleasePrompt(_)
                             | Content::Bags(_)
                             | Content::Party(..)
@@ -959,6 +987,14 @@ impl Hud {
                             &painter,
                             response.rect,
                             view,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Trainer(view) => frames::trainer::draw(
+                            &painter,
+                            response.rect,
+                            &view.greeting,
+                            &view.rows,
                             &style,
                             element.scale,
                         ),
@@ -1110,6 +1146,33 @@ impl Hud {
                                 // wrong item -- silently, since nothing
                                 // acknowledges the request.
                                 response_out.take_loot = rows.get(row).map(|row| row.take);
+                            }
+                        }
+                    }
+                }
+                (false, Content::Trainer(view)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            // **The row carries the spell id; this does not
+                            // derive it.** The server filters a trainer's
+                            // list per character, so a row number names a
+                            // different spell to two people at the same NPC.
+                            //
+                            // `row_at` answers only for rows that can
+                            // actually be bought, which is deliberate: the
+                            // server declines an unlearnable spell in
+                            // *silence*, and this client cannot tell that
+                            // from a malformed request. A refusal has to
+                            // happen here, where the reason is still known.
+                            if let Some(row) = frames::trainer::row_at(
+                                drawn_rect,
+                                &view.rows,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                response_out.learn_spell =
+                                    view.rows.get(row).map(|row| row.spell);
                             }
                         }
                     }
@@ -1461,6 +1524,18 @@ impl Hud {
                         ),
                         ElementId::WorldMap => frames::world_map::size(&style, scale),
                         ElementId::Minimap => frames::minimap::size(&style, scale),
+                        // Same rule as the bags, the loot window and the
+                        // party frame: measure what is actually being drawn
+                        // where there is one, and the placeholder otherwise,
+                        // so re-anchoring cannot size a frame differently
+                        // from how the loop above painted it.
+                        ElementId::Trainer => frames::trainer::size(
+                            data.trainer
+                                .map(|view| view.rows.len())
+                                .unwrap_or_else(|| frames::trainer::placeholder().rows.len()),
+                            &style,
+                            scale,
+                        ),
                         ElementId::Loot => frames::loot::size(
                             data.loot
                                 .map(|rows| rows.len())
@@ -1548,6 +1623,7 @@ enum Content<'a> {
     Loot(&'a [frames::LootRow]),
     QuestLog(&'a [frames::QuestLogEntry]),
     Questgiver(&'a frames::QuestgiverView),
+    Trainer(&'a frames::TrainerView),
     WorldMap(&'a frames::MapView),
     Minimap(&'a frames::MinimapView),
     ReleasePrompt(&'a frames::ReleasePromptView),
@@ -2430,6 +2506,98 @@ mod tests {
             &click_script(centres[0], egui::PointerButton::Primary),
         );
         assert_eq!(response.take_loot, Some(frames::Take::Money));
+    }
+
+    /// **Clicking a trainer row reports the spell, and an inert row reports
+    /// nothing.**
+    ///
+    /// The same silent-failure check the loot test above makes -- a frame left
+    /// out of the `Sense::click()` list draws, hit-tests and never reports --
+    /// plus the half that is specific to this window and matters more.
+    ///
+    /// A trainer's list is *mostly rows you cannot buy*, and the server
+    /// declines a purchase for one **in silence**, which this client cannot
+    /// tell from a malformed request. So both halves are asserted: the
+    /// learnable row answers with its spell id, and the known and
+    /// out-of-reach rows answer with nothing at all. A hit test that reported
+    /// every row would pass the first half alone, and the bug it ships is a
+    /// client that looks broken at every trainer.
+    ///
+    /// And the id is carried, not counted. The learnable row here sits at
+    /// position 1 and holds spell 100, so a window reporting its position
+    /// would ask to learn spell 1.
+    #[test]
+    fn clicking_a_trainer_row_reports_the_spell_and_only_when_learnable() {
+        let view = frames::TrainerView {
+            greeting: "Hello, warrior!  Ready for some training?".into(),
+            rows: vec![
+                frames::TrainerRow {
+                    spell: 6673,
+                    name: "Battle Shout".into(),
+                    cost: 9,
+                    required_level: 1,
+                    state: frames::TrainerRowState::Known,
+                    icon: None,
+                },
+                frames::TrainerRow {
+                    spell: 100,
+                    name: "Charge".into(),
+                    cost: 95,
+                    required_level: 4,
+                    state: frames::TrainerRowState::Available,
+                    icon: None,
+                },
+                frames::TrainerRow {
+                    spell: 3127,
+                    name: "Parry".into(),
+                    cost: 95,
+                    required_level: 6,
+                    state: frames::TrainerRowState::Unavailable,
+                    icon: None,
+                },
+            ],
+        };
+        let data = HudData {
+            trainer: Some(&view),
+            ..Default::default()
+        };
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::Trainer);
+        let rect = element.rect(
+            screen(),
+            frames::trainer::size(view.rows.len(), &hud.profile.style, element.scale),
+        );
+        let centres: Vec<egui::Pos2> =
+            frames::trainer::row_rects(rect, view.rows.len(), &hud.profile.style, element.scale)
+                .map(|row| row.center())
+                .collect();
+
+        let learnable = drive(
+            &mut hud,
+            &data,
+            &click_script(centres[1], egui::PointerButton::Primary),
+        );
+        assert_eq!(
+            learnable.learn_spell,
+            Some(100),
+            "a click on the learnable row must ask for spell 100, not row 1"
+        );
+
+        for (index, what) in [(0usize, "already known"), (2, "out of reach")] {
+            let mut hud = Hud::default();
+            hide_bars(&mut hud);
+            let response = drive(
+                &mut hud,
+                &data,
+                &click_script(centres[index], egui::PointerButton::Primary),
+            );
+            assert_eq!(
+                response.learn_spell, None,
+                "a click on the {what} row must send nothing"
+            );
+        }
     }
 
     fn log_entries() -> Vec<frames::QuestLogEntry> {
@@ -3568,6 +3736,11 @@ mod tests {
             ElementId::Questgiver => {
                 frames::questgiver::size(&frames::questgiver::placeholder(), &profile.style, scale)
             }
+            ElementId::Trainer => frames::trainer::size(
+                frames::trainer::placeholder().rows.len(),
+                &profile.style,
+                scale,
+            ),
             ElementId::WorldMap => frames::world_map::size(&profile.style, scale),
             ElementId::Minimap => frames::minimap::size(&profile.style, scale),
             ElementId::Loot => {
