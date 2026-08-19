@@ -28,6 +28,12 @@ use glam::{Vec2, Vec3};
 /// vertical component than this is climbed *around* rather than up.
 const FLOOR_NORMAL_Z: f32 = 0.5;
 
+/// The tag of a triangle nobody labelled.
+///
+/// See [`World::add_tagged`]. `add` uses it, so a caller that has no opinion
+/// about surfaces does not have to have one.
+pub const UNTAGGED: u8 = u8::MAX;
+
 /// A triangle in world space.
 ///
 /// Stored as three points rather than a point and two edges because the
@@ -239,6 +245,18 @@ const CELL: f32 = 8.0;
 #[derive(Default)]
 pub struct World {
     triangles: Vec<Triangle>,
+    /// One opaque label per triangle, parallel to [`Self::triangles`].
+    ///
+    /// **This crate does not know what a tag means**, deliberately: it is pure
+    /// geometry, and the meaning is the caller's. The viewer puts a WMO
+    /// material's terrain row here so a footstep on a wooden floor can sound
+    /// like wood, and puts nothing at all on an M2's collision mesh, which
+    /// carries no such field.
+    ///
+    /// Parallel rather than a field on [`Triangle`] because `Triangle` is the
+    /// type every query takes and returns by value, and widening it would put
+    /// a byte nobody reads into every intersection test.
+    tags: Vec<u8>,
     /// Cell coordinate to the triangles overlapping it. A triangle spanning
     /// several cells appears in each, which is what makes a lookup a lookup
     /// rather than a search.
@@ -260,6 +278,14 @@ impl World {
 
     /// Adds a triangle, skipping degenerate ones.
     pub fn add(&mut self, triangle: Triangle) {
+        self.add_tagged(triangle, UNTAGGED);
+    }
+
+    /// Adds a triangle carrying an opaque per-surface label.
+    ///
+    /// The label comes back from [`Self::floor_under_tagged`], and means
+    /// whatever the caller decided it means -- see [`Self::tags`].
+    pub fn add_tagged(&mut self, triangle: Triangle, tag: u8) {
         if triangle.normal().is_none() {
             return;
         }
@@ -271,6 +297,7 @@ impl World {
             }
         }
         self.triangles.push(triangle);
+        self.tags.push(tag);
     }
 
     /// Every triangle whose cell touches the given square, without repeats.
@@ -300,8 +327,24 @@ impl World {
     /// common case outdoors -- the caller falls back to the terrain height
     /// field, which is a different and much cheaper structure.
     pub fn floor_under(&self, at: Vec2, from_z: f32, step: f32) -> Option<f32> {
+        self.floor_under_tagged(at, from_z, step).map(|(z, _)| z)
+    }
+
+    /// [`Self::floor_under`], and which surface it landed on.
+    ///
+    /// **One search, two answers, deliberately.** Asking for the height and
+    /// then asking separately what is under the same point is two derivations
+    /// of the same fact, and they agree only until a tie breaks differently --
+    /// at which point a character stands on the floorboards and hears the
+    /// flagstone beside them. Same reasoning as unprojecting the picking ray
+    /// from the matrix the scene is drawn with.
+    ///
+    /// The tag is `None` where the winning triangle was added untagged, which
+    /// is every M2 collision mesh and the whole world before something chose
+    /// to label a surface.
+    pub fn floor_under_tagged(&self, at: Vec2, from_z: f32, step: f32) -> Option<(f32, Option<u8>)> {
         let ceiling = from_z + step;
-        let mut best: Option<f32> = None;
+        let mut best: Option<(f32, Option<u8>)> = None;
         for index in self.near(at, 0.0) {
             let triangle = self.triangles[index as usize];
             let Some(z) = triangle.floor_hit(at) else {
@@ -310,8 +353,13 @@ impl World {
             if z > ceiling {
                 continue;
             }
-            if best.is_none_or(|b| z > b) {
-                best = Some(z);
+            if best.is_none_or(|(b, _)| z > b) {
+                let tag = self
+                    .tags
+                    .get(index as usize)
+                    .copied()
+                    .filter(|t| *t != UNTAGGED);
+                best = Some((z, tag));
             }
         }
         best
@@ -469,6 +517,70 @@ fn cell_of(v: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tagged surface reports its tag, an untagged one reports none, and the
+    /// tag belongs to the triangle that actually won.
+    ///
+    /// The last part is what the test exists for: two floors at different
+    /// heights under one point is exactly a building's floorboards over its
+    /// cellar, and reporting the tag of the wrong one is a wrong sound with a
+    /// right height, which nothing else here would catch.
+    #[test]
+    fn a_floor_reports_the_tag_of_the_surface_that_won() {
+        let mut world = World::new();
+        let flat = |z: f32| {
+            Triangle::new(
+                Vec3::new(-5.0, -5.0, z),
+                Vec3::new(5.0, -5.0, z),
+                Vec3::new(0.0, 5.0, z),
+            )
+        };
+        world.add_tagged(flat(0.0), 4);
+        world.add_tagged(flat(2.0), 2);
+        world.add(flat(-3.0));
+
+        // Standing above both: the higher one wins and brings its own tag.
+        assert_eq!(
+            world.floor_under_tagged(Vec2::new(0.0, 0.0), 3.0, 0.5),
+            Some((2.0, Some(2)))
+        );
+        // Below the upper floor: the lower one wins, with its own.
+        assert_eq!(
+            world.floor_under_tagged(Vec2::new(0.0, 0.0), 0.2, 0.5),
+            Some((0.0, Some(4)))
+        );
+        // The untagged one answers `None` rather than a made-up value.
+        assert_eq!(
+            world.floor_under_tagged(Vec2::new(0.0, 0.0), -2.9, 0.5),
+            Some((-3.0, None))
+        );
+        // And the untagged view agrees with the tagged one about the height,
+        // which is the property that lets both exist.
+        assert_eq!(world.floor_under(Vec2::new(0.0, 0.0), 3.0, 0.5), Some(2.0));
+    }
+
+    /// A degenerate triangle is skipped, and skipping it must not slide every
+    /// later triangle's tag by one. The tags are a parallel array, so this is
+    /// the failure it can have.
+    #[test]
+    fn a_skipped_triangle_does_not_shift_the_tags() {
+        let mut world = World::new();
+        let zero = Vec3::ZERO;
+        world.add_tagged(Triangle::new(zero, zero, zero), 9);
+        world.add_tagged(
+            Triangle::new(
+                Vec3::new(-5.0, -5.0, 1.0),
+                Vec3::new(5.0, -5.0, 1.0),
+                Vec3::new(0.0, 5.0, 1.0),
+            ),
+            7,
+        );
+        assert_eq!(world.triangle_count(), 1);
+        assert_eq!(
+            world.floor_under_tagged(Vec2::new(0.0, 0.0), 2.0, 0.5),
+            Some((1.0, Some(7)))
+        );
+    }
 
     /// An axis-aligned box, as twelve triangles, from `min` to `max`.
     fn box_at(min: Vec3, max: Vec3) -> Vec<Triangle> {

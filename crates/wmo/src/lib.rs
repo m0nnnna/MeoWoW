@@ -91,6 +91,28 @@ pub struct Material {
     pub texture1: u32,
     pub texture2: u32,
     pub diffuse_color: u32,
+    /// What this surface is made of, as a `TerrainType` **row id** -- the same
+    /// currency `GroundEffectTexture` uses for the ground outside.
+    ///
+    /// **Measured, and it inverts the convention of the outdoor table.** Out
+    /// on the terrain, row 0 (`Dirt`) is what a texture says when it says
+    /// nothing, and 22,708 of 24,981 rows carry it. In here the "says nothing"
+    /// value is row **10 (`None`)**, which 22,893 of 25,034 materials carry,
+    /// while row 0 is a rare and genuine `Dirt` -- 118 materials, whose
+    /// textures are called `dirt` sixteen times as often as `None`'s are. Two
+    /// tables, one column meaning, opposite conventions for silence.
+    ///
+    /// Identified the way every column here is: by the **names of the texture
+    /// files** the materials carrying it are painted with, scored against row
+    /// 10 as the baseline, because rock and wood turn up everywhere and a raw
+    /// share proves nothing. Every value with a material word of its own comes
+    /// back enriched -- `Sand` x469, `Grass` x305, `Dirt` x15.9, `Snow` x12.1,
+    /// `Wood` x7.1, `Metallic` x6.6, `Stone` x2.0 -- over all 1,985 root WMOs.
+    /// `Leaves` (2 materials) and `DustyGrass` (6) are too small to vote and
+    /// are not claimed. `wow-cli wmo footing` is that measurement.
+    ///
+    /// `Stone` is the weak one at x2.0, and for a readable reason: a stone
+    /// floor is usually filed under `rock` rather than `stone`.
     pub ground_type: u32,
 }
 

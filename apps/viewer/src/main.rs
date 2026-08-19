@@ -2271,6 +2271,17 @@ struct App {
     /// `None` for both a character on dry land and one wading a ford -- and
     /// those want opposite footstep sounds. `FootstepTerrainLookup` carries a
     /// splash column beside every ordinary one for exactly this.
+    /// What the surface holding the character up is made of, as a
+    /// `TerrainType` row id, when that surface is a building's floor.
+    ///
+    /// `None` outdoors, which is most of the time -- and then the footstep
+    /// falls back to asking the terrain. Kept as state rather than queried
+    /// where it is needed, because it has to be decided by **the same
+    /// comparison that decides where the character stands**: floor and terrain
+    /// are compared once, and asking again later could break the tie the other
+    /// way and put a character on the floorboards hearing the ground beneath
+    /// them.
+    floor_material: Option<u8>,
     wading: bool,
     /// Where the player's own cycle was last time footsteps were checked, as
     /// `(sequence, milliseconds into it)`.
@@ -3176,6 +3187,7 @@ impl App {
             live_move: ::world::motion::Motion::default(),
             jump: None,
             swimming: None,
+            floor_material: None,
             wading: false,
             footstep_phase: None,
             autorun: false,
@@ -4551,13 +4563,24 @@ impl App {
             // most of the world is open ground, and the height field answers
             // for it far more cheaply than a triangle query ever could.
             let ground = world.height_at(live.position.x, live.position.y);
-            let floor = world.floor_under(live.position, STEP_HEIGHT);
+            let underfoot = world.floor_under_footing(live.position, STEP_HEIGHT);
+            let floor = underfoot.map(|(z, _)| z);
             // The higher of the two, so a floor laid over ground holds the
             // character up -- but only a floor at or below head height, which
             // `floor_under` has already enforced.
             let stand = match (ground, floor) {
                 (Some(g), Some(f)) => Some(g.max(f)),
                 (some, None) | (None, some) => some,
+            };
+            // **Read off the very comparison above**, not asked again. The
+            // character is on the building's floor exactly when the floor won
+            // that `max`, so deriving the surface from a second test would be
+            // two answers to one question -- and the frame they disagree on is
+            // a footstep that sounds like the ground under the floorboards.
+            self.floor_material = match (ground, underfoot) {
+                (Some(g), Some((f, surface))) if f >= g => surface,
+                (None, Some((_, surface))) => surface,
+                _ => None,
             };
             // **Logged because the alternative is guessing.** A character
             // that judders going up steps has at least three candidate causes
@@ -5667,7 +5690,18 @@ impl App {
                 }
             };
             if crossed > 0 {
-                let footing = world.footing_at(live.position.x, live.position.y);
+                // **A floor outranks the ground under it**, which is the
+                // whole point: a character on the abbey's flagstones is not
+                // standing on Elwynn's grass, however directly above it they
+                // are. `floor_material` is `None` outdoors and for the 91% of
+                // WMO materials that name no terrain, and then the ground
+                // answers as before.
+                let footing = match self.floor_material {
+                    Some(row) => Some(sound::Footing::Surface(row as u32)),
+                    None => world
+                        .footing_at(live.position.x, live.position.y)
+                        .map(sound::Footing::Ground),
+                };
                 if let Some(id) = live
                     .state
                     .get(live.guid)

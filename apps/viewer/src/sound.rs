@@ -249,6 +249,27 @@ pub fn footfalls_crossed(
     }
 }
 
+/// What a character is standing on, from whichever of the two sources knows.
+///
+/// **An enum rather than a bare number, because the two are not the same
+/// currency and one of them has already caught this project out.** The ground
+/// outside names a `GroundEffectTexture` row, which has to be resolved to a
+/// terrain and *then* to that terrain's sound id. A building's floor names the
+/// `TerrainType` row directly. Both are small integers in overlapping ranges,
+/// both resolve to something, and passing one where the other belongs plays a
+/// plausible wrong sound -- exactly the shape of the `sound_id`-versus-row-id
+/// trap in `FootstepTerrainLookup` that this milestone spent its evidence on.
+/// Making them different variants means the compiler refuses the mix-up that
+/// a shared `u32` would accept in silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Footing {
+    /// Open terrain, named by the `GroundEffectTexture` id of the texture
+    /// layer that wins at this point.
+    Ground(u32),
+    /// A building's floor, named by the `TerrainType` row its material gives.
+    Surface(u32),
+}
+
 /// Every table this needs, read once.
 #[derive(Default)]
 pub struct Sounds {
@@ -284,6 +305,12 @@ pub struct Sounds {
     /// on. Absent means the ground says nothing about its surface, which is
     /// most of it -- see [`Sounds::footstep`].
     footing_terrain: std::collections::HashMap<u32, u32>,
+    /// `TerrainType` row id to the terrain [`FootstepTerrainLookup`] keys on.
+    ///
+    /// The other half of the same hop, kept separately because a building's
+    /// floor arrives already resolved to a row and must not be sent through
+    /// the ground effect table -- see [`Footing`].
+    terrain_sound: std::collections::HashMap<u32, u32>,
     /// `(creature footstep group, terrain)` to `(footstep, splash)`.
     footsteps: std::collections::HashMap<(u32, u32), (u32, Option<u32>)>,
     /// Creature display id to the footstep group its feet use. Keyed by
@@ -488,6 +515,7 @@ impl Sounds {
         {
             let sound_of_row: std::collections::HashMap<u32, u32> =
                 terrain.iter().map(|r| (r.id(), r.sound_id())).collect();
+            sounds.terrain_sound = sound_of_row.clone();
             if let Some(textures) = chain
                 .read(GroundEffectTexture::PATH)
                 .ok()
@@ -637,13 +665,12 @@ impl Sounds {
 
     /// What a creature's foot sounds like landing on a patch of ground.
     ///
-    /// `footing` is a `GroundEffectTexture` id from
-    /// [`crate::world::World::footing_at`], and `None` -- a tile still
-    /// streaming, a chunk with no layers, or ground whose texture says nothing
-    /// about its surface -- falls through to the lookup's **own** terrain 0,
-    /// which is a real row rather than an invention: seventeen of its rows
-    /// carry it, they reach dirt sounds, and that is what a client should play
-    /// when it does not know what it is standing on.
+    /// `footing` is `None` -- a tile still streaming, a chunk with no layers,
+    /// ground whose texture says nothing, or a floor whose material declines
+    /// to -- and falls through to the lookup's **own** terrain 0, which is a
+    /// real row rather than an invention: seventeen of its rows carry it, they
+    /// reach dirt sounds, and that is what a client should play when it does
+    /// not know what it is standing on.
     ///
     /// Splashing is the same row's other column, and it is `None` on 92 of 217
     /// rows -- a spider has no splash sound and gets its ordinary step rather
@@ -652,10 +679,18 @@ impl Sounds {
     /// `None` overall means this display has no feet the tables know about,
     /// which is 568 of the 1,306 `CreatureSoundData` rows and every model that
     /// floats, swims or hovers.
-    pub fn footstep(&self, display_id: u32, footing: Option<u32>, splashing: bool) -> Option<u32> {
+    pub fn footstep(
+        &self,
+        display_id: u32,
+        footing: Option<Footing>,
+        splashing: bool,
+    ) -> Option<u32> {
         let group = self.footstep_groups.get(&display_id).copied()?;
         let terrain = footing
-            .and_then(|id| self.footing_terrain.get(&id).copied())
+            .and_then(|footing| match footing {
+                Footing::Ground(id) => self.footing_terrain.get(&id).copied(),
+                Footing::Surface(row) => self.terrain_sound.get(&row).copied(),
+            })
             .unwrap_or(0);
         // Falls back to the fallback: a group that has no row for this terrain
         // still has one for terrain 0, because every group in the table does.
@@ -938,6 +973,38 @@ impl Effects {
 mod tests {
     use super::*;
 
+    /// A building's floor and the ground outside are different currencies and
+    /// resolve through different tables, and the enum is what keeps them
+    /// apart. Both halves asserted, because a rule that sent everything
+    /// through one table would still answer plausibly for the other.
+    #[test]
+    fn a_floor_and_the_ground_resolve_through_different_tables() {
+        let sounds = footed();
+        // Ground effect 42 says terrain 3 -- the stone step.
+        assert_eq!(
+            sounds.footstep(1, Some(Footing::Ground(42)), false),
+            Some(653)
+        );
+        // `TerrainType` row 2 is `Stone`, whose sound id is 3: the same step,
+        // reached the other way.
+        assert_eq!(
+            sounds.footstep(1, Some(Footing::Surface(2)), false),
+            Some(653)
+        );
+        // And the numbers are genuinely not interchangeable: row 42 is not a
+        // terrain at all, and ground effect 2 is not one this fixture knows,
+        // so both fall through to the fallback rather than to each other's
+        // answer.
+        assert_eq!(
+            sounds.footstep(1, Some(Footing::Surface(42)), false),
+            Some(650)
+        );
+        assert_eq!(
+            sounds.footstep(1, Some(Footing::Ground(2)), false),
+            Some(650)
+        );
+    }
+
     /// The ordinary case, and the one that only shows up at the end of a
     /// cycle. Asserted together because a rule that ignores the wrap passes
     /// the first on its own and drops every other step in play.
@@ -998,6 +1065,9 @@ mod tests {
         sounds.footsteps.insert((8, 3), (653, None));
         // Ground effect 42 is stone; 99 is a texture that names no terrain.
         sounds.footing_terrain.insert(42, 3);
+        // And `TerrainType` row 2 (`Stone`) has sound id 3, which is the
+        // off-by-one this whole feature turns on.
+        sounds.terrain_sound.insert(2, 3);
         sounds
     }
 
@@ -1009,8 +1079,8 @@ mod tests {
     #[test]
     fn a_footstep_takes_the_terrain_it_lands_on() {
         let sounds = footed();
-        assert_eq!(sounds.footstep(1, Some(42), false), Some(653));
-        assert_eq!(sounds.footstep(1, Some(99), false), Some(650));
+        assert_eq!(sounds.footstep(1, Some(Footing::Ground(42)), false), Some(653));
+        assert_eq!(sounds.footstep(1, Some(Footing::Ground(99)), false), Some(650));
         assert_eq!(sounds.footstep(1, None, false), Some(650));
     }
 
@@ -1021,14 +1091,14 @@ mod tests {
     fn wading_splashes_only_where_the_row_says_so() {
         let sounds = footed();
         assert_eq!(sounds.footstep(1, None, true), Some(1054));
-        assert_eq!(sounds.footstep(1, Some(42), true), Some(653));
+        assert_eq!(sounds.footstep(1, Some(Footing::Ground(42)), true), Some(653));
     }
 
     /// A display with no footstep group has no footsteps, rather than borrowing
     /// somebody else's. Most models are in this case.
     #[test]
     fn a_display_with_no_feet_is_silent() {
-        assert_eq!(footed().footstep(2, Some(42), false), None);
+        assert_eq!(footed().footstep(2, Some(Footing::Ground(42)), false), None);
     }
 
     fn entry(files: &[(&str, u32)]) -> Entry {

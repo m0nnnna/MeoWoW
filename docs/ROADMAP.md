@@ -5406,13 +5406,104 @@ no splash sound and gets its ordinary step rather than silence.
 * **No footstep spray.** `TerrainType` carries `FootstepSprayRun` and
   `FootstepSprayWalk`, only `Snow` sets them in this build, and nothing draws
   either.
-* **No WMO floors.** A character on the abbey's flagstones is asked about the
-  terrain underneath the building, because a WMO's own material is a different
-  lookup this client has not opened.
 * **The other event families are parsed and ignored.** `$HIT` and `$CAH` mark
   the frame a weapon connects, which is the number 4.14's hand-dialled 625ms
   stands in for; `$DTH` marks a body hitting the ground; `$CSD` carries an emote
   sound id. All read, none acted on -- and the weapon-impact one is the obvious
   next thing, now that the block it lives in parses.
-* **Not yet confirmed at the window.** Everything above is measured against the
-  files and against a live tile; nobody has heard it.
+* **WMO floors** were the one report that came back from the live run, and are
+  closed in the section below.
+
+#### 4.23 continued: buildings, and a table that inverts the outdoor convention
+
+Confirmed at the window first: *"grass dirt roads all sound different"*. The
+report that came back with it was the gap this section closes -- **the steps
+don't respect buildings** -- and it was already on the not-done list, because a
+character on the abbey's flagstones was being asked about the terrain
+underneath the building.
+
+A WMO material carries a `ground_type`, and it is the **same currency the
+ground outside uses**: a `TerrainType` row id. So the tail of the chain is
+already built and only the head is new.
+
+**The column identified itself the same way `GroundEffectTexture`'s did, and
+needed a baseline to do it.** Rock and wood turn up in this game's art
+everywhere, so "half the `Wood` materials are painted with something called
+wood" means nothing on its own. Row 10 (`None`) is 91% of the table and is by
+construction the materials that decline to say anything, which makes it the
+control:
+
+| row | materials | own word | share | in `None` | enrichment |
+|---|---|---|---|---|---|
+| 0 `Dirt` | 118 | dirt | 7.6% | 0.5% | **x15.9** |
+| 1 `Metallic` | 575 | metal | 21.4% | 3.2% | **x6.6** |
+| 2 `Stone` | 808 | stone | 7.4% | 3.7% | x2.0 |
+| 3 `Snow` | 78 | snow | 24.4% | 2.0% | **x12.1** |
+| 4 `Wood` | 490 | wood | 47.3% | 6.6% | **x7.1** |
+| 5 `Grass` | 10 | grass | 60.0% | 0.2% | **x305** |
+| 7 `Sand` | 9 | sand | 77.8% | 0.2% | **x469** |
+
+over all 1,985 root WMOs. `Stone` is the weak one at x2.0 for a readable
+reason: a stone floor is usually filed under `rock` rather than `stone`.
+`Leaves` (2 materials) and `DustyGrass` (6) are too small to vote and are not
+claimed.
+
+**The conventions for "nothing" are opposite, and getting it backwards is
+silent.** Outside, row 0 (`Dirt`) is what a texture says when it says nothing,
+and 22,708 of 24,981 `GroundEffectTexture` rows carry it. In here the silent
+value is row **10 (`None`)**, which 22,893 of 25,034 materials carry, while row
+0 is a rare and genuine `Dirt`. Two tables, one column meaning, opposite
+defaults -- and reading this one as 0 would have every wall in the game
+claiming to be dirt.
+
+**A measurement that came back flat, recorded so nobody builds it twice.**
+Filing art under a `floor` directory looked like it ought to separate a surface
+from a wall. It does not: `None` is 5% floor art and so is `Metallic`, because
+most WMO floor art lives under `rock` and `stone` instead. The enrichment above
+is what worked.
+
+#### The scoping fact, which is about Blizzard rather than about this client
+
+**Only 622 of 1,985 buildings label any surface at all**, and the first draft of
+this survey said 1,981 -- because it counted "not zero" as "labelled", and the
+silent value here is 10. That one-character difference is the gap between "this
+works everywhere" and "this works where somebody bothered", and it decides what
+a live test will show.
+
+**Northshire Abbey is in the silent majority**: all 130 of `NSabbey.wmo`'s
+materials are `None`, so walking its floor still asks the terrain and still
+sounds like the ground outside. That is correct behaviour on the data, and it
+would read exactly like the feature not working. The **Elwynn lake bridge** is
+labelled -- material 0 is `Wood` (`lakebridgewood01.blp`) and material 1
+`Stone` (`lakebridgestone01.blp`) -- so that is where it can be heard.
+
+#### The plumbing, and one rule it turns on
+
+The surface has to ride with the triangle. By the time a character is standing
+on something, the model it came from is one of hundreds and the only thing
+identifying the triangle is the triangle -- so `collision::World` gained an
+opaque per-triangle tag, set from the WMO material and absent on every M2
+collision mesh, which carries no such field.
+
+**The height and the surface come out of one search.** `floor_under_tagged`
+returns both, and the caller picks between floor and terrain with **the same
+comparison that decides where the character stands** -- the floor wins the
+`max(ground, floor)` or it does not. Asking twice would be two derivations of
+one fact, agreeing until a tie broke differently, and the frame they disagree
+on is a character on the floorboards hearing the ground beneath them. Same rule
+as unprojecting the picking ray from the matrix the scene is drawn with.
+
+**`Footing` is an enum rather than a number**, and that is this milestone's own
+evidence applied to its own code: the ground names a `GroundEffectTexture` row
+and a floor names a `TerrainType` row, both small integers in overlapping
+ranges, both resolving to something plausible. The `sound_id`-versus-row-id
+trap that cost this milestone its longest measurement is exactly the mix-up a
+shared `u32` would accept in silence.
+
+#### Still not done
+
+* **No footsteps for anyone but the player.** Unchanged, and Kake's read on it
+  is recorded rather than guessed at: they could not remember whether the
+  original client plays other people's footsteps at all. It needs a distance
+  curve before it needs a decision.
+* **No spray**, and `$HIT`/`$CAH` still parsed and unused.

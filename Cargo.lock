@@ -4279,6 +4279,7 @@ name = "wmo"
 version = "0.0.1"
 dependencies = [
  "chunk",
+ "dbc",
  "mpq",
  "thiserror 2.0.20",
  "tracing",

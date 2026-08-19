@@ -81,6 +81,14 @@ pub struct CachedModel {
     /// the many models that are scenery: a tuft of grass has no collision mesh
     /// and the original lets you walk through it too.
     pub collision: Vec<[[f32; 3]; 3]>,
+    /// What each collision triangle is made of, as a `TerrainType` row id,
+    /// parallel to [`Self::collision`] and `u8::MAX` where nothing says.
+    ///
+    /// **Empty for an M2**, and that is the honest answer rather than a gap: a
+    /// model's collision mesh carries no material at all, so a footbridge's
+    /// planks and a boulder are the same silence. Only a WMO's materials name
+    /// a surface. See `wmo::Material::ground_type`.
+    pub collision_footing: Vec<u8>,
 }
 
 /// One model and the transforms it takes on a single tile.
@@ -904,13 +912,26 @@ impl World {
             // sixty times a second, and the grid can only index what has a
             // world position.
             for transform in &transforms {
-                for triangle in &model.collision {
+                for (index, triangle) in model.collision.iter().enumerate() {
                     let p = |v: [f32; 3]| transform.transform_point3(Vec3::from(v));
-                    solid.add(collision::Triangle::new(
-                        p(triangle[0]),
-                        p(triangle[1]),
-                        p(triangle[2]),
-                    ));
+                    // The surface travels with the triangle rather than being
+                    // looked up again later: by the time a character is
+                    // standing on this, the model it came from is one of
+                    // hundreds and the only thing identifying the triangle is
+                    // the triangle. An M2's list is empty and every one of its
+                    // triangles is untagged, which is what `add` already does.
+                    solid.add_tagged(
+                        collision::Triangle::new(
+                            p(triangle[0]),
+                            p(triangle[1]),
+                            p(triangle[2]),
+                        ),
+                        model
+                            .collision_footing
+                            .get(index)
+                            .copied()
+                            .unwrap_or(collision::UNTAGGED),
+                    );
                 }
             }
             meshes.prepare(gpu, model.draws.iter().map(|d| d.state));
@@ -1092,12 +1113,16 @@ impl World {
         at
     }
 
-    /// The height of any building floor under a point, or `None` for open
-    /// ground where the terrain height field is the answer.
-    pub fn floor_under(&self, at: Vec3, step: f32) -> Option<f32> {
+    /// What is holding a character up under a point: how high it is, and what
+    /// it is made of as a `TerrainType` row id.
+    ///
+    /// `None` overall for open ground, where the terrain height field is the
+    /// answer. `None` for the *surface* where the floor came from an M2, or
+    /// from a WMO material that names no terrain -- which is 91% of them,
+    /// because most of a building is walls and roof.
+    pub fn floor_under_footing(&self, at: Vec3, step: f32) -> Option<(f32, Option<u8>)> {
         let tile = self.tiles.get(&tile_at(at))?;
-        tile.solid
-            .floor_under(at.truncate(), at.z, step)
+        tile.solid.floor_under_tagged(at.truncate(), at.z, step)
     }
 
     /// Every resident tile a straight move between two points could touch.
@@ -1162,6 +1187,7 @@ impl World {
             footfalls: Vec<Vec<u32>>,
             bounds: Option<(Vec3, Vec3)>,
             collision: Vec<[[f32; 3]; 3]>,
+            collision_footing: Vec<u8>,
         }
 
         let lower = path.to_lowercase();
@@ -1181,6 +1207,7 @@ impl World {
                     footfalls: Vec::new(),
                     bounds: None,
                     collision: w.collision,
+                    collision_footing: w.collision_footing,
                 })
                 .ok()
         } else {
@@ -1211,6 +1238,8 @@ impl World {
                         footfalls: m.footfalls,
                         bounds: Some((m.min, m.max)),
                         collision: m.collision,
+                        // An M2 names no surface; see `CachedModel`.
+                        collision_footing: Vec::new(),
                     }
                 })
                 .ok()
@@ -1235,6 +1264,7 @@ impl World {
                 bounds: b.bounds,
                 textures: b.textures,
                 collision: b.collision,
+                collision_footing: b.collision_footing,
             })
         })
     }
@@ -2003,6 +2033,7 @@ impl World {
                     // them is a different feature from colliding with the
                     // world. Left empty rather than filled in unused.
                     collision: Vec::new(),
+                    collision_footing: Vec::new(),
                 })
             })
             .map_err(|e| tracing::debug!("display id {display_id}: {e}"))

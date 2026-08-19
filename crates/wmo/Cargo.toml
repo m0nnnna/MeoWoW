@@ -13,4 +13,5 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+dbc = { path = "../dbc" }
 mpq = { path = "../mpq" }

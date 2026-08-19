@@ -207,3 +207,105 @@ fn sampled_objects_parse_and_validate() {
         &failures[..failures.len().min(5)]
     );
 }
+
+/// A WMO material's `ground_type` names a `TerrainType` row, and it names the
+/// *right* one -- checked against the filenames of the textures painted with
+/// it.
+///
+/// **The baseline is what makes this a measurement.** Rock and wood turn up
+/// everywhere in this game's art, so "half the `Wood` materials are painted
+/// with something called wood" says nothing on its own. Row 10 (`None`) is 91%
+/// of the table and is by construction the materials that decline to say what
+/// they are, so it is the control: a real column is *enriched* against it.
+///
+/// Two rows are asserted and they are two of the few with enough materials to
+/// be worth asserting. `Leaves` has two in the whole game and `DustyGrass`
+/// six; they are excluded rather than allowed to fail noisily on a sample that
+/// could never have answered either way.
+#[test]
+fn wmo_ground_types_name_the_material_their_textures_are_called() {
+    let mut chain = require_data!();
+    let terrain = dbc::schema::TerrainType::parse(
+        &chain.read(dbc::schema::TerrainType::PATH).expect("terrain"),
+    )
+    .expect("parsing TerrainType");
+    let rows: std::collections::HashSet<u32> = terrain.iter().map(|r| r.id()).collect();
+
+    // Root files only. A group file repeats its root's materials, so counting
+    // them would weight every tally by how many pieces a building is cut into.
+    let roots: Vec<String> = chain
+        .list()
+        .expect("listing")
+        .into_iter()
+        .filter(|n| n.to_lowercase().ends_with(".wmo") && !wmo::is_group_path(n))
+        .collect();
+
+    const NONE_ROW: u32 = 10;
+    const WORDS: [&str; 4] = ["metal", "stone", "snow", "wood"];
+    // (terrain row, word) -> how many materials with that row are painted with
+    // a texture whose name carries that word.
+    let mut hits: std::collections::HashMap<(u32, &str), usize> = std::collections::HashMap::new();
+    let mut carrying: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let (mut parsed, mut materials, mut labelled) = (0usize, 0usize, 0usize);
+
+    for path in &roots {
+        let Ok(bytes) = chain.read(path) else { continue };
+        let Ok(root) = wmo::Root::parse(&bytes) else {
+            continue;
+        };
+        parsed += 1;
+        for material in &root.materials {
+            materials += 1;
+            assert!(
+                rows.contains(&material.ground_type),
+                "{path}: ground type {} is not a TerrainType row",
+                material.ground_type
+            );
+            if material.ground_type != NONE_ROW {
+                labelled += 1;
+            }
+            *carrying.entry(material.ground_type).or_default() += 1;
+            let texture = root.texture(material.texture1).to_lowercase();
+            for word in WORDS {
+                if texture.contains(word) {
+                    *hits.entry((material.ground_type, word)).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    assert!(parsed > 1_000, "only {parsed} root WMOs parsed");
+    assert!(materials > 20_000, "only {materials} materials seen");
+    // Roughly a third of buildings label something, which is a fact about
+    // Blizzard's authoring rather than about this parser -- stated as a floor.
+    // If it ever reads as zero, the column stopped being read.
+    assert!(
+        labelled > materials / 100,
+        "only {labelled} of {materials} materials label a surface"
+    );
+
+    let share = |row: u32, word: &str| -> f32 {
+        let total = carrying.get(&row).copied().unwrap_or(0).max(1);
+        100.0 * hits.get(&(row, word)).copied().unwrap_or(0) as f32 / total as f32
+    };
+
+    for (row, word, least) in [(4u32, "wood", 3.0f32), (1, "metal", 3.0)] {
+        let total = carrying.get(&row).copied().unwrap_or(0);
+        assert!(total > 100, "only {total} materials name terrain {row}");
+        let mine = share(row, word);
+        let baseline = share(NONE_ROW, word);
+        assert!(
+            baseline > 0.0 && mine / baseline >= least,
+            "terrain {row} should be enriched in textures called `{word}`: \
+             {mine:.1}% against the `None` baseline of {baseline:.1}%"
+        );
+        // And the control in the other direction: the row must not be equally
+        // enriched in a word belonging to a different material, or the tally
+        // is measuring "these are floors" rather than "these are wood".
+        let other = if word == "wood" { "metal" } else { "wood" };
+        assert!(
+            mine / baseline > share(row, other) / share(NONE_ROW, other).max(0.001),
+            "terrain {row} is no more `{word}` than it is `{other}`"
+        );
+    }
+}

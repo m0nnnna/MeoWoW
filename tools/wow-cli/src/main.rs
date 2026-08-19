@@ -938,6 +938,13 @@ enum WmoCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Ask what a material's `ground_type` holds, and whether the floor inside
+    /// a building can be told from the wall beside it.
+    Footing {
+        filter: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -8915,7 +8922,202 @@ fn wmo_cmd(chain: &mut Chain, cmd: WmoCommand) -> Result<()> {
     match cmd {
         WmoCommand::Info { path, limit } => wmo_info(chain, &path, limit),
         WmoCommand::Survey { filter, limit } => wmo_survey(chain, filter.as_deref(), limit),
+        WmoCommand::Footing { filter, limit } => wmo_footing(chain, filter.as_deref(), limit),
     }
+}
+
+/// Asks what a WMO material's `ground_type` column actually holds, and
+/// whether the surfaces underfoot inside a building can be told apart by it.
+///
+/// **The same question `GroundEffectTexture`'s terrain column had, in the same
+/// shape.** It is a bare small integer with nothing in the file to confirm it,
+/// pointing -- supposedly -- into a twelve-row table. What can confirm it is
+/// one step out: a material also names a **texture file**, and those names are
+/// authored English. A column whose `Wood` rows are reached by materials
+/// painted with files called `..._wood_...` is the terrain column.
+///
+/// The control that matters is the *other* direction: most materials in the
+/// game are walls, roofs and windows, which are not underfoot and have no
+/// reason to say anything. A column that is zero nearly everywhere and
+/// meaningful on floors is the right shape; one that is uniformly zero says
+/// this cannot be done at all.
+fn wmo_footing(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let terrain = dbc::schema::TerrainType::parse(&chain.read(dbc::schema::TerrainType::PATH)?)?;
+    let named: BTreeMap<u32, String> = terrain
+        .iter()
+        .map(|r| (r.id(), r.name().to_string()))
+        .collect();
+
+    let needle = filter.map(str::to_lowercase);
+    let roots: Vec<String> = chain
+        .list()?
+        .into_iter()
+        .filter(|n| {
+            let l = n.to_lowercase();
+            l.ends_with(".wmo")
+                // Group files repeat the root's materials; counting them would
+                // weight every tally by how many pieces a building is cut into.
+                && !l
+                    .trim_end_matches(".wmo")
+                    .rsplit('_')
+                    .next()
+                    .is_some_and(|tail| tail.len() == 3 && tail.chars().all(|c| c.is_ascii_digit()))
+                && needle.as_ref().is_none_or(|f| l.contains(f.as_str()))
+        })
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+
+    let mut values: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut words: BTreeMap<u32, BTreeMap<&str, usize>> = BTreeMap::new();
+    let mut examples: BTreeMap<u32, String> = BTreeMap::new();
+    let mut floors: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+    let (mut roots_ok, mut materials, mut out_of_range) = (0usize, 0usize, 0usize);
+    let mut with_any = 0usize;
+
+    const MATERIALS: [&str; 12] = [
+        "dirt", "metal", "stone", "snow", "wood", "grass", "leaf", "sand", "water", "rock",
+        "brick", "carpet",
+    ];
+
+    for path in &roots {
+        let Ok(bytes) = chain.read(path) else { continue };
+        let Ok(root) = wmo::Root::parse(&bytes) else {
+            continue;
+        };
+        roots_ok += 1;
+        let mut any = false;
+        for (index, material) in root.materials.iter().enumerate() {
+            materials += 1;
+            *values.entry(material.ground_type).or_default() += 1;
+            // **Not `!= 0`.** Row 0 is `Dirt`, a real answer; the value
+            // meaning "this says nothing" is row 10, `None`. Counting it as a
+            // label reports 1,981 of 1,985 buildings as labelled when the
+            // truth is a small minority, which is the difference between "this
+            // works everywhere" and "this works where Blizzard bothered".
+            if material.ground_type != 10 {
+                any = true;
+            }
+            if !named.contains_key(&material.ground_type) {
+                out_of_range += 1;
+                continue;
+            }
+            let texture = root.texture(material.texture1).to_lowercase();
+            for word in MATERIALS {
+                if texture.contains(word) {
+                    *words
+                        .entry(material.ground_type)
+                        .or_default()
+                        .entry(word)
+                        .or_default() += 1;
+                }
+            }
+            // **The strongest signal in the whole table**, and it is one word
+            // long. Blizzard file their art by what it is *for*, so a material
+            // painted from a texture under a `floor` directory is a surface
+            // somebody walks on. If the non-`None` values are floors and
+            // `None` is everything else, this column is what a foot lands on
+            // rather than a decoration.
+            let entry = floors.entry(material.ground_type).or_default();
+            entry.1 += 1;
+            if texture.contains(r"\floor\") {
+                entry.0 += 1;
+            }
+            if material.ground_type != 10 {
+                examples
+                    .entry(material.ground_type)
+                    .or_insert_with(|| format!("{path} material {index}: {texture}"));
+            }
+        }
+        if any {
+            with_any += 1;
+        }
+    }
+
+    println!("{roots_ok} root WMOs, {materials} materials");
+    println!(
+        "  {with_any} label at least one surface (a row other than `None`), {out_of_range} materials name a \
+         value that is not a TerrainType row"
+    );
+    // **The discriminating statistic is enrichment, not share.** Most WMO art
+    // is walls and roofs, and rock and wood turn up everywhere, so "half the
+    // `Wood` materials are painted with something called wood" only means
+    // something beside how often `None`'s are. Row 10 is the baseline: it is
+    // 91% of the table and is by construction the rows that say nothing.
+    let stem = |name: &str| -> Option<&'static str> {
+        // The terrain's own name, clipped to the stem a filename would use.
+        // `Soggy` has no material word of its own and cannot vote.
+        Some(match name {
+            "Dirt" => "dirt",
+            "Metallic" => "metal",
+            "Stone" => "stone",
+            "Snow" => "snow",
+            "Wood" => "wood",
+            "Grass" | "DustyGrass" => "grass",
+            "Leaves" => "leaf",
+            "Sand" => "sand",
+            _ => return None,
+        })
+    };
+    const NONE_ROW: u32 = 10;
+    let share = |value: u32, word: &str| -> f32 {
+        let hits = words
+            .get(&value)
+            .and_then(|w| w.get(word))
+            .copied()
+            .unwrap_or(0);
+        let total = values.get(&value).copied().unwrap_or(0);
+        100.0 * hits as f32 / total.max(1) as f32
+    };
+    println!(
+        "\n  {:>5} {:<12} {:>9} {:>6} {:>7} {:>8} {:>8}  {}",
+        "value", "name", "materials", "word", "share", "in None", "vs None", "textures called"
+    );
+    for (value, count) in &values {
+        let mut tally: Vec<(&&str, &usize)> = words
+            .get(value)
+            .map(|w| w.iter().collect())
+            .unwrap_or_default();
+        tally.sort_by(|a, b| b.1.cmp(a.1));
+        let listed: Vec<String> = tally
+            .iter()
+            .take(4)
+            .map(|(w, n)| format!("{w} x{n}"))
+            .collect();
+        let name = named.get(value).map(String::as_str).unwrap_or("?");
+        let (word, mine, baseline) = match stem(name) {
+            Some(word) => (word, share(*value, word), share(NONE_ROW, word)),
+            None => ("--", 0.0, 0.0),
+        };
+        let ratio = if baseline > 0.0 {
+            format!("x{:.1}", mine / baseline)
+        } else {
+            "--".to_string()
+        };
+        println!(
+            "  {value:>5} {name:<12} {count:>9} {word:>6} {mine:>6.1}% {baseline:>7.1}% \
+             {ratio:>8}  {}",
+            listed.join(", "),
+        );
+    }
+    // **Reported because it came back flat, not despite it.** Filing art under
+    // a `floor` directory looked like it ought to separate a surface from a
+    // wall, and does not: `None` is 5% floor art and so is `Metallic`. Most WMO
+    // floor art lives under `rock` and `stone` instead. An instrument that
+    // answers nothing is worth one line, so nobody builds it a second time.
+    println!("\n  share of each value's materials filed under a `floor` directory:");
+    let filed: Vec<String> = floors
+        .iter()
+        .map(|(value, (on_floor, total))| format!("{value}: {}%", 100 * on_floor / total.max(&1)))
+        .collect();
+    println!("    {}", filed.join("  "));
+
+    println!("\n  one example of each non-zero value:");
+    for (value, example) in &examples {
+        println!("  {value:>5}  {example}");
+    }
+    Ok(())
 }
 
 fn wmo_info(chain: &mut Chain, path: &str, limit: usize) -> Result<()> {

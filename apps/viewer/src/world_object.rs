@@ -34,9 +34,27 @@ pub struct LoadedWmo {
     /// counted and dropped. Keeping the drawn ones as well is what makes the
     /// abbey's actual walls stop anybody.
     pub collision: Vec<[[f32; 3]; 3]>,
+    /// What each collision triangle is made of, as a `TerrainType` row id,
+    /// parallel to [`Self::collision`].
+    ///
+    /// `u8::MAX` where the triangle has no material at all (the `0xFF`
+    /// collision-only marker) or its material says `None` -- and those two are
+    /// deliberately the same answer, because "an invisible barrier" and "a
+    /// wall that declines to say" both mean this client must not claim to know
+    /// what a foot landed on. See [`wmo::Material::ground_type`].
+    pub collision_footing: Vec<u8>,
     pub doodad_sets: Vec<String>,
     pub missing_textures: Vec<String>,
 }
+
+/// The `TerrainType` row a WMO material names when it declines to say what
+/// its surface is made of.
+///
+/// **Row 10, `None` -- not row 0.** Out on the terrain the silent value is 0
+/// and row 0 is also `Dirt`; in here they are different rows and 91% of
+/// materials are the silent one. Reading this as 0 would make every wall in
+/// the game claim to be dirt. See [`wmo::Material::ground_type`].
+const NO_TERRAIN: u32 = 10;
 
 /// Maps a WMO material onto pipeline state.
 ///
@@ -109,6 +127,7 @@ pub fn load(
     let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     let (mut group_count, mut collision_triangles) = (0usize, 0usize);
     let mut collision: Vec<[[f32; 3]; 3]> = Vec::new();
+    let mut collision_footing: Vec<u8> = Vec::new();
 
     for gi in 0..root.header.group_count as usize {
         if only_group.is_some_and(|want| want != gi) {
@@ -152,12 +171,28 @@ pub fn load(
         // Straight off `MOVI`, not off the render batches: a batch list omits
         // exactly the collision-only triangles, which are the ones most
         // deliberately placed to stop somebody.
-        for triangle in group.indices.chunks_exact(3) {
+        for (index, triangle) in group.indices.chunks_exact(3).enumerate() {
             let point = |i: u16| group.vertices.get(i as usize).copied();
             if let (Some(a), Some(b), Some(c)) =
                 (point(triangle[0]), point(triangle[1]), point(triangle[2]))
             {
                 collision.push([a, b, c]);
+                // `MOPY` is parallel to `MOVI`'s triples, and the group's own
+                // validation asserts exactly that -- `wow-cli wmo survey` runs
+                // it over every group in the archives, so the index below is
+                // checked rather than assumed.
+                collision_footing.push(
+                    group
+                        .triangle_materials
+                        .get(index)
+                        .filter(|t| !t.is_collision_only())
+                        .and_then(|t| root.materials.get(t.material_id as usize))
+                        .map(|m| m.ground_type)
+                        // A row id is 0..=11, so it fits a byte with room to
+                        // spare for the "nothing" marker.
+                        .filter(|row| *row != NO_TERRAIN && *row < u8::MAX as u32)
+                        .map_or(u8::MAX, |row| row as u8),
+                );
             }
         }
 
@@ -213,6 +248,7 @@ pub fn load(
         group_count,
         collision_triangles,
         collision,
+        collision_footing,
         doodad_sets: root
             .doodad_sets
             .iter()

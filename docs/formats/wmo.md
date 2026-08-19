@@ -103,6 +103,51 @@ no failures
 `--wmo-group <n>` in the viewer draws a single group, which is how the roof was
 isolated from the walls while chasing the winding bug.
 
+
+## What a surface is made of
+
+`MOMT` carries a `ground_type`, and it is the same currency the terrain outside
+uses: a **`TerrainType` row id**. With `MOPY` giving a material per triangle --
+and the group's own validation asserting `MOPY` is parallel to `MOVI`'s triples,
+checked archive-wide by `wmo survey` -- that is enough to ask what a character
+standing on a particular triangle is standing on.
+
+**Identified by the filenames of the textures the materials are painted with,
+scored against a baseline.** Rock and wood are everywhere in this game's art, so
+a raw share proves nothing. Row 10 (`None`) is 91% of the table and is by
+construction the materials that decline to say anything, which makes it the
+control:
+
+| row | materials | own word | share | in `None` | enrichment |
+|---|---|---|---|---|---|
+| 0 `Dirt` | 118 | dirt | 7.6% | 0.5% | x15.9 |
+| 1 `Metallic` | 575 | metal | 21.4% | 3.2% | x6.6 |
+| 2 `Stone` | 808 | stone | 7.4% | 3.7% | x2.0 |
+| 3 `Snow` | 78 | snow | 24.4% | 2.0% | x12.1 |
+| 4 `Wood` | 490 | wood | 47.3% | 6.6% | x7.1 |
+| 5 `Grass` | 10 | grass | 60.0% | 0.2% | x305 |
+| 7 `Sand` | 9 | sand | 77.8% | 0.2% | x469 |
+
+over all 1,985 root WMOs. `Stone` is weakest for a readable reason -- a stone
+floor is usually filed under `rock`. `Leaves` (2 materials) and `DustyGrass`
+(6) are too small to vote.
+
+**The "nothing" value is row 10, not row 0.** Outside, `GroundEffectTexture`
+uses 0 (which is also `Dirt`) for a texture that says nothing, on 22,708 of
+24,981 rows. In here it is row 10 (`None`), on 22,893 of 25,034 materials, and
+row 0 is a rare genuine `Dirt`. One column meaning, two opposite defaults;
+reading this one as 0 would have every wall claiming to be dirt.
+
+**Most buildings say nothing.** Only **622 of 1,985** label any surface at all.
+Northshire Abbey is not one of them -- all 130 of `NSabbey.wmo`'s materials are
+`None` -- while the Elwynn lake bridge is, with `Wood` planks over `Stone`
+piers. A feature built on this is correct and silent in two buildings out of
+three, which is a fact about the authoring rather than about the reader.
+
+`wow-cli wmo footing` is that measurement. One thing it also records is a test
+that came back **flat**: filing art under a `floor` directory does not separate
+a surface from a wall, because `None` is 5% floor art and so is `Metallic`.
+
 ## Not parsed yet
 
 Portals (`MOPV`/`MOPT`/`MOPR`), lights (`MOLT`), fog (`MFOG`), liquid (`MLIQ`),
