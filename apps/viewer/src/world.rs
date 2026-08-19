@@ -67,7 +67,7 @@ pub struct CachedModel {
     /// though only replicated entities currently animate. Doodads and
     /// buildings are always drawn in the bind pose regardless, so carrying
     /// this costs them nothing and keeps one loader path instead of two.
-    pub bones: Vec<m2::AnimatedBone>,
+    pub bones: std::rc::Rc<Vec<m2::AnimatedBone>>,
     pub sequences: Vec<m2::Sequence>,
     /// Where things this model carries hang from. Empty for everything that
     /// carries nothing, which is nearly everything.
@@ -84,7 +84,7 @@ pub struct CachedModel {
     /// carries the measurement that identified them. Empty for everything with
     /// no legs, which is most models, and empty *per sequence* for the cycles
     /// a creature does not walk in.
-    pub footfalls: Vec<Vec<u32>>,
+    pub footfalls: std::rc::Rc<Vec<Vec<u32>>>,
     /// The model's own extent, in its local space. Carried so a replicated
     /// entity can be clicked on: a click needs a volume to test a ray against,
     /// and the model already knows how big it is. `None` for a WMO, which is
@@ -586,6 +586,14 @@ pub struct World {
     /// in the skin the display row names. Keying by path alone would give the
     /// second character the first one's blade.
     held_cache: HashMap<(String, String), Option<Rc<CachedModel>>>,
+    /// The archive bytes and skeletons behind those three caches, keyed by
+    /// file rather than by display id.
+    ///
+    /// Sits beside them rather than inside any one of them because it is what
+    /// they have in common: every humanoid NPC in the game is one `.m2` and
+    /// forty-seven `.anim` files, and the caches above are keyed by costume.
+    /// See [`crate::model::Sources`] for the measurement.
+    sources: crate::model::Sources,
     /// Surface art for every liquid type seen so far, keyed by type id.
     ///
     /// Owned by the world rather than by a tile because it is shared across
@@ -731,6 +739,7 @@ impl World {
             cache: HashMap::new(),
             entity_cache: HashMap::new(),
             held_cache: HashMap::new(),
+            sources: crate::model::Sources::default(),
             liquid_types: crate::liquid::LiquidTypes::default(),
             npc_looks: None,
             npc_looks_tried: false,
@@ -1298,12 +1307,12 @@ impl World {
             mesh: render::mesh::GpuMesh,
             draws: Vec<Draw>,
             textures: Vec<UploadedTexture>,
-            bones: Vec<m2::AnimatedBone>,
+            bones: std::rc::Rc<Vec<m2::AnimatedBone>>,
             sequences: Vec<m2::Sequence>,
             attachments: Vec<m2::Attachment>,
             particles: Vec<m2::ParticleEmitter>,
             ribbons: Vec<m2::RibbonEmitter>,
-            footfalls: Vec<Vec<u32>>,
+            footfalls: std::rc::Rc<Vec<Vec<u32>>>,
             bounds: Option<(Vec3, Vec3)>,
             collision: Vec<[[f32; 3]; 3]>,
             collision_footing: Vec<u8>,
@@ -1318,12 +1327,12 @@ impl World {
                     mesh: w.mesh,
                     draws: w.draws,
                     textures: w.textures,
-                    bones: Vec::new(),
+                    bones: Default::default(),
                     sequences: Vec::new(),
                     attachments: Vec::new(),
                     particles: Vec::new(),
                     ribbons: Vec::new(),
-                    footfalls: Vec::new(),
+                    footfalls: Default::default(),
                     bounds: None,
                     collision: w.collision,
                     collision_footing: w.collision_footing,
@@ -2104,13 +2113,35 @@ impl World {
         // function of the display id, so `(display_id, 0)` already
         // distinguishes it from every other. A key that included it would
         // reload one model per creature *instance*.
+        //
+        // Everything from here down is a *miss*, and a miss is synchronous on
+        // the render thread the first time each new display comes into view.
+        // That is the whole of the stutter this instrument exists to price.
+        let began = Instant::now();
         let npc_look = look.is_none().then(|| self.npc_look(chain, display_id)).flatten();
+        let looked_up = began.elapsed();
         let look = look.or(npc_look.as_ref());
 
-        let entry = crate::model::creature(chain, display_id)
-            .and_then(|(path, variations)| {
-                crate::model::load_dressed(gpu, chain, &path, &variations, 0, look)
-            })
+        // Two statements rather than one chain: both halves want the cache
+        // mutably, and the model path is owned by the time the second runs.
+        let resolved = crate::model::creature(&mut self.sources, chain, display_id);
+        let loaded = resolved.and_then(|(path, variations)| {
+            crate::model::load_dressed_with(
+                gpu,
+                chain,
+                &mut self.sources,
+                &path,
+                &variations,
+                0,
+                look,
+            )
+        });
+        // Read out here rather than inside the closure below: the load holds
+        // the only mutable borrow of the cache, and this is the first point
+        // after it where anything may look at the cache at all.
+        let (hits, misses) = self.sources.counts();
+
+        let entry = loaded
             .map(|loaded| {
                 // A texture that failed to load is a *white* creature, not a
                 // missing one, and white is the one failure that looks
@@ -2128,6 +2159,28 @@ impl World {
                         loaded.missing_textures.join(", ")
                     );
                 }
+                // One line per first-time load, naming the display id and
+                // where the milliseconds went.
+                //
+                // **This is a measurement, not a symptom.** The placeholder
+                // warning above coincides with every stutter, which is exactly
+                // why it was mistaken for a cause twice: it is a marker that a
+                // load just *finished*. A cost that nobody has timed is how
+                // this project once spent an afternoon blaming a `Spell.dbc`
+                // read that takes 185ms for a thirty-seven-second login. Kept
+                // at info, and kept per-load rather than aggregated, because
+                // the question a frozen frame asks is "which creature", and an
+                // average cannot answer it.
+                // Both cache numbers on every line, deliberately. A hit count
+                // alone cannot separate "the shared cache is working" from
+                // "nothing has been loaded twice yet", and the second is what
+                // a regression here would look like.
+                tracing::info!(
+                    "display {display_id} loaded in {:?} \
+                     (look {looked_up:?}, {}) [source cache {hits} hit / {misses} miss]",
+                    began.elapsed(),
+                    loaded.timings.summary(),
+                );
                 let binds = loaded
                     .textures
                     .iter()
@@ -2155,7 +2208,11 @@ impl World {
                     collision_footing: Vec::new(),
                 })
             })
-            .map_err(|e| tracing::debug!("display id {display_id}: {e}"))
+            // Timed on this side too: a load that *fails* still reads the
+            // archives, so an undrawable creature costs a frame exactly like a
+            // drawn one and would otherwise be the one stutter with no line
+            // against it.
+            .map_err(|e| tracing::debug!("display id {display_id}: {e} (after {:?})", began.elapsed()))
             .ok();
 
         self.entity_cache.insert((display_id, look_key), entry.clone());

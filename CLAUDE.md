@@ -77,7 +77,7 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | | State |
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation, timed events, particles/ribbons), WMO, ADT/WDT, MH2O — all done |
-| Renderer | Textures, skinned models, buildings, blended terrain, streaming, liquids, M2 emitters, sun shadows — done. **`--screenshot` renders one frame headless and draws NO HUD** (see the instrument rule below) |
+| Renderer | Textures, skinned models, buildings, blended terrain, streaming, liquids, M2 emitters, sun shadows — done. **`--screenshot` renders one frame headless and draws NO HUD** (see the instrument rule below). Model files, skeletons and the creature tables are cached **per file** as well as per display id, so a zone of humanoids loads one `HumanMale.m2` rather than one per NPC; every load prints its own cost breakdown |
 | Protocol | 3.1–3.5 done against a live realm, two clients at once. Replicated creatures interpolate, turn and animate; **other players do not** — see the defect below |
 | World | Day/night from `Light.dbc`, a real sky gradient, sun and moon, weather that falls, game objects drawn. **A star dome, a cloud band and the zone skybox `LightSkybox` names** — which on Azeroth and Kalimdor is none, measured. No moon texture, one cloud layer |
 | Shadows | **A directional shadow map from the sun**, cast by terrain, models and alpha-keyed foliage, received by everything but liquid. One cascade around the camera; `--no-shadows` and `--shadow-dump` are the instruments |
@@ -111,6 +111,13 @@ check and fails in silence past it.
 
 **Chat commands take `/` and never reach the wire; `.` is the *server's*
 prefix**, which is how a GM command travels as ordinary chat.
+
+**`--log-file <path>` tees every log line, and any panic with its backtrace,
+to a file** — the console scrollback dies with the window, which is why no
+crash report so far has reached the moment of death. A panic hook forces the
+backtrace, so `RUST_BACKTRACE` does not have to have been remembered on the run
+that crashed. A log ending in a panic and a log ending mid-frame are different
+findings: the second one is not a Rust fault at all.
 
 `wow-cli world <host> --enter <character>` is the CLI-driven equivalent —
 **the host is positional and the character is `--enter`**, where the viewer
@@ -592,6 +599,34 @@ the full account is in `docs/ROADMAP.md`.
   plausible argument attached, since two runs agreed to the second. The DBC
   load takes 185ms. One timing log around the suspected culprit settled in one
   run what reasoning had got backwards.
+- **A marker that a slow thing finished looks exactly like its cause.** Every
+  visible stutter carried a `drew with N placeholder texture(s)` warning, and
+  the correlation is perfect -- because the warning is printed at the *end* of
+  the load that cost the frame. Two guesses were spent on it. A log line
+  emitted by the expensive thing is evidence about *when*, never about *what*.
+- **A breakdown whose parts do not sum to its total is not a breakdown.** The
+  first load timings named six phases summing to 36ms of a 58ms load, and the
+  missing third was where the next wrong guess would have gone. Every phase is
+  measured rather than attributed now and the line prints what none of them
+  claimed -- which is how `model::creature` was caught re-parsing 24,262 rows
+  of `CreatureDisplayInfo` *per creature*, outside everything being timed.
+- **Split a cost before choosing its fix, because the halves have different
+  ones.** Reading the `.m2` and parsing it were one number until they were
+  two, and they came out 10.2ms against 0.4ms: a byte cache removes nearly all
+  of it and a parsed-object cache removes nothing. Timed together, either fix
+  looked equally reasonable.
+- **A cache keyed by what varies will re-load what does not.** Creature models
+  are keyed by display id, correctly -- a display id supplies the skins. But
+  every humanoid in the game is one `.m2` and forty-seven `.anim` files, so the
+  key that distinguishes costumes re-read the *costume-independent* file once
+  per NPC. The fix is a second cache keyed by file, not a wider key. **The tell
+  is a per-item cost that does not fall as more items are loaded.**
+- **A negative is an answer and gets cached like one.** Five of a character
+  model's `.anim` paths do not exist -- alias sequences, entirely ordinary --
+  and only the file cache's own hit/miss counters said they were being asked
+  for again on every costume. The regression test asserts a *count of archive
+  reads* rather than elapsed time, and that is what caught it: a timing
+  assertion would have passed and a timing assertion is flaky anyway.
 - **Writing a format is riskier than reading it.** A bad read fails loudly at a
   known offset; a bad write is accepted as some other valid message. Where a
   structure travels both ways, define it once and round-trip it.

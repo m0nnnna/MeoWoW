@@ -192,6 +192,21 @@ struct Args {
     #[arg(long, default_value_t = 2048)]
     shadow_size: u32,
 
+    /// Also write every log line, and any panic, to this file.
+    ///
+    /// **A crash is the one failure that destroys its own evidence.** The
+    /// window goes, and with it the console scrollback that held the last
+    /// thing the client said -- so every report of one so far has arrived with
+    /// logs that stop well short of the moment of death. Shell redirection
+    /// would do the same job, except that it is remembered on the runs that do
+    /// not crash and forgotten on the one that does.
+    ///
+    /// Opened for append and *checked* at startup rather than on first write:
+    /// a log file that silently went nowhere is worse than none, because it is
+    /// believed. See the panic hook in `main`.
+    #[arg(long)]
+    log_file: Option<PathBuf>,
+
     /// Write the sun's depth map to this PNG, after rendering.
     ///
     /// `--screenshot` only, and the reason it exists is the reason every
@@ -330,16 +345,71 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .with_target(false)
-        .init();
+/// Sends every panic to the log before the process goes, backtrace included.
+///
+/// **`RUST_BACKTRACE` is forced rather than consulted.** A crash that is only
+/// diagnosable when somebody remembered to set an environment variable is
+/// diagnosable on the runs that did not crash; `force_capture` costs nothing
+/// on a run that never panics, because it only runs when one does.
+///
+/// The default hook is kept and called afterwards, so stderr still says what
+/// it always said. This one exists to put the same words *in the log stream*,
+/// which is the half that survives the window closing.
+///
+/// It cannot catch everything, and saying so is the point: a driver fault, a
+/// wgpu device loss that aborts, or an out-of-memory kill are not panics and
+/// leave nothing here. A log that ends with a panic and one that ends
+/// mid-frame are therefore different findings -- the second says to look
+/// outside Rust.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(
+            "panic at {}: {}\n{}",
+            info.location().map(|l| l.to_string()).unwrap_or_else(|| "?".into()),
+            info.payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string payload>".into()),
+            std::backtrace::Backtrace::force_capture(),
+        );
+        default(info);
+    }));
+}
 
+fn main() -> Result<()> {
     let args = Args::parse();
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+    match &args.log_file {
+        // Opened here, so a path that cannot be written fails the run instead
+        // of producing a client that looks instrumented and is not.
+        Some(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("opening log file {}", path.display()))?;
+            use tracing_subscriber::fmt::writer::MakeWriterExt;
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(std::io::stdout.and(std::sync::Arc::new(file)))
+                .init();
+            tracing::info!("logging to {}", path.display());
+        }
+        None => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .init();
+        }
+    }
+    install_panic_hook();
+
     let mut chain = Chain::open_wow_data(&args.data, &args.locale)
         .with_context(|| format!("opening archives under {}", args.data.display()))?;
 
@@ -501,7 +571,8 @@ fn build_offline_scene(
     args: &Args,
 ) -> Result<Scene> {
     if let Some(display_id) = args.creature {
-        let (path, variations) = model::creature(chain, display_id)?;
+        let mut sources = model::Sources::default();
+        let (path, variations) = model::creature(&mut sources, chain, display_id)?;
         // Dressed the same way the streaming world dresses it, so a screenshot
         // of a display id shows what a player standing next to that creature
         // would see. Rendering it undressed here instead would make this the
@@ -523,6 +594,19 @@ fn build_offline_scene(
         }
         let loaded =
             model::load_dressed(gpu, chain, &path, &variations, args.lod, look.as_ref())?;
+        // What this display costs the first time it comes into view, with no
+        // realm and no window in the way.
+        //
+        // The same numbers the streaming path prints, from the same struct --
+        // and reachable offline, which is what makes `--creature` a probe for
+        // the load hitch rather than only a picture of one creature. A cost
+        // measured against a live realm carries the realm's own latency; this
+        // one carries nothing but the archives.
+        tracing::info!(
+            "display {display_id} ({path}) loaded in {:?} ({})",
+            loaded.timings.total,
+            loaded.timings.summary(),
+        );
         return Ok(Scene::Model(Box::new(loaded)));
     }
     if let Some(path) = &args.model {
