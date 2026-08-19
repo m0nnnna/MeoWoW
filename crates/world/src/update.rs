@@ -849,13 +849,48 @@ mod monster_move_type {
 }
 
 /// Spline flags that add fields to a monster-move packet.
+/// Spline flags, from `SMSG_MONSTER_MOVE`.
+///
+/// **Two of these were wrong for four milestones and neither ever errored.**
+/// A wrong flag bit does not fail a parse: it steers the reader down the
+/// other branch of a conditional layout, which then consumes a plausible
+/// number of bytes and produces plausible-looking values. This is the
+/// "a wrong field offset parses perfectly and returns nonsense" rule with a
+/// conditional instead of an offset.
+///
+/// What surfaced them was a taxi flight going nowhere. The server sends a
+/// flight as a spline with every point written out; this client read it as
+/// the *packed-offset* shape and lost the route.
+///
+/// **How loudly that fails depends on arithmetic, which is worth knowing
+/// before trusting either outcome.** The packed branch consumes twelve bytes
+/// for a destination and four per remaining point, against twelve per point
+/// for the real one -- so on the captured 27-point flight it consumed 116 of
+/// 324 bytes and the cursor's trailing-byte rule refused the packet outright.
+/// That is the good case: the discipline caught it, and what was missing was
+/// somebody reading the log. On a route whose count makes the two arithmetics
+/// coincide it would instead have parsed cleanly, kept a plausible
+/// destination, and produced no path at all -- which the flight detector
+/// declines in silence. Both were live; only the first happened to be the one
+/// observed.
 mod monster_spline_flags {
-    pub const ANIMATION: u32 = 0x0000_0008;
+    /// **`0x0020_0000`, not `0x8`.** The low byte of the flag word holds an
+    /// *animation id* rather than flags (`Mask_Animations = 0xFF`), so the
+    /// old value was reading one bit of an id as a flag and skipping five
+    /// bytes whenever that bit happened to be set. Latent rather than
+    /// harmless: it desynchronises the rest of the packet when it fires.
+    pub const ANIMATION: u32 = 0x0020_0000;
     pub const PARABOLIC: u32 = 0x0000_0800;
     pub const CATMULLROM: u32 = 0x0004_0000;
     pub const CYCLIC: u32 = 0x0008_0000;
     /// Paths that carry every point rather than packed offsets.
-    pub const FLYING: u32 = 0x0000_0200;
+    ///
+    /// **`0x0000_2000`, not `0x0000_0200`.** The old value is `Falling`, one
+    /// bit position down -- which is why it never matched a real flight and
+    /// never matched anything else either. A taxi flight is the only thing in
+    /// this game that reliably sets it, so nothing before flight paths could
+    /// have noticed.
+    pub const FLYING: u32 = 0x0000_2000;
 }
 
 /// Whether a `SMSG_MONSTER_MOVE` body is about `guid`, without parsing it.
@@ -1924,6 +1959,89 @@ mod tests {
         body.push(move_type);
         body.extend_from_slice(extra);
         body
+    }
+
+    /// **A flying spline keeps every point, and the flag bit that decides
+    /// that was wrong for four milestones.**
+    ///
+    /// The two encodings are a conditional layout, and a wrong flag constant
+    /// does not fail -- it steers the reader down the other branch, which
+    /// consumes a plausible number of bytes and yields a plausible
+    /// destination. The old `FLYING` was `0x0200`, which is the server's
+    /// `Falling`, one bit position down. So a taxi flight took the
+    /// packed-offset branch, arrived with an empty point list, and the
+    /// viewer's flight detection -- which needs two points to describe a
+    /// route -- declined it in silence. The character stayed on the ground
+    /// while the server flew them to Westfall.
+    ///
+    /// This asserts the *whole path*, not just the destination: reading only
+    /// `to` is exactly what the broken version did successfully.
+    #[test]
+    fn a_flying_spline_keeps_every_point() {
+        const FLYING: u32 = 0x0000_2000;
+        let route = [
+            [10.0f32, 20.0, 30.0],
+            [40.0, 50.0, 60.0],
+            [70.0, 80.0, 90.0],
+        ];
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&FLYING.to_le_bytes());
+        extra.extend_from_slice(&4200u32.to_le_bytes()); // duration
+        extra.extend_from_slice(&(route.len() as u32).to_le_bytes());
+        for point in route {
+            for value in point {
+                extra.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let body = monster_move_body(monster_move_type::NORMAL, &extra);
+
+        let parsed = parse_monster_move(&body).expect("a flying spline parses");
+        assert_eq!(parsed.duration, 4200);
+        assert_eq!(parsed.path.len(), 3, "every point is kept, not just the last");
+        for (got, want) in parsed.path.iter().zip(route.iter()) {
+            assert_eq!((got.x, got.y, got.z), (want[0], want[1], want[2]));
+        }
+        let to = parsed.to.expect("a flying spline has a destination");
+        assert_eq!((to.x, to.y, to.z), (70.0, 80.0, 90.0));
+    }
+
+    /// The old constant, asserted to be the wrong branch rather than merely
+    /// unused -- so the regression is named rather than absent.
+    ///
+    /// `0x0200` is the server's `Falling`, one bit down. A body written with
+    /// it takes the packed-offset branch: twelve bytes for a destination,
+    /// four per remaining point. Against the real twelve-per-point that
+    /// leaves a surplus, and the cursor refuses it -- which is what actually
+    /// happened to the captured 27-point flight, 116 bytes consumed of 324.
+    ///
+    /// The count here is chosen so the two arithmetics **coincide**, which is
+    /// the nastier case and the one worth pinning: three points is 36 bytes
+    /// the real way and 12 + 2*4 = 20 the packed way, so filling the
+    /// difference makes the packet parse *cleanly* while losing the entire
+    /// route. A test that only showed the loud failure would suggest this
+    /// bug always announces itself, and it does not.
+    #[test]
+    fn the_old_flying_bit_reads_a_route_as_packed_offsets() {
+        const WRONG: u32 = 0x0000_0200;
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&WRONG.to_le_bytes());
+        extra.extend_from_slice(&4200u32.to_le_bytes());
+        extra.extend_from_slice(&3u32.to_le_bytes());
+        // A destination, then two words that a full-point reading would have
+        // taken as the rest of the route.
+        for value in [70.0f32, 80.0, 90.0] {
+            extra.extend_from_slice(&value.to_le_bytes());
+        }
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        let body = monster_move_body(monster_move_type::NORMAL, &extra);
+
+        let parsed = parse_monster_move(&body).expect("it parses -- that is the problem");
+        assert!(
+            parsed.path.is_empty(),
+            "the packed branch spells out no route, which is why the flight was declined"
+        );
+        assert!(parsed.to.is_some(), "and it still yields a plausible destination");
     }
 
     /// The two facing modes that used to be skipped as padding.

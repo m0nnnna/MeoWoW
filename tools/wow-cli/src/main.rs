@@ -13975,8 +13975,12 @@ the SMSG_MONSTER_MOVE naming this character, {} bytes:", packet.body.len());
                     mv.to.map(|t| (t.x, t.y, t.z)),
                     mv.duration
                 );
-                println!("  NOTE: the parser keeps only the LAST point. A flight's route is");
-                println!("  its intermediates, so this is the field that has to grow.");
+                println!("  {} point(s) of route kept", mv.path.len());
+                if mv.path.len() < 2 {
+                    println!("  FEWER THAN TWO. The spline flag is being read wrong: a flight");
+                    println!("  takes the full-point encoding, and the packed-offset branch");
+                    println!("  keeps only a destination. See monster_spline_flags::FLYING.");
+                }
             }
             Err(error) => println!("  did not parse: {error}"),
         }
