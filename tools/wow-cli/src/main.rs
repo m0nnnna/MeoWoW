@@ -4489,7 +4489,7 @@ fn survey_loot(
     // summarised rather than dumped -- but nothing is *hidden*: the histogram
     // below lists everything, and only the bodies are filtered.
     const NOISE: [u16; 6] = [0x00DD, 0x00A9, 0x01F6, 0x0390, 0x0085, 0x0086];
-    println!("\nbodies of everything unexpected:");
+    println!("\nevery packet that came back, routine traffic aside:");
     let mut shown = 0;
     for packet in &batch {
         if NOISE.contains(&packet.opcode) {
@@ -5667,9 +5667,19 @@ fn own_fields_snapshot(
 /// Shared by the quest steps because each one wants the same thing and a
 /// second copy would drift. Bodies rather than lengths: a packet that is seen
 /// and dropped is the one packet that could have answered the question.
+/// Prints every packet in a batch, decoded or not, minus the routine traffic.
+///
+/// **It is not a filter for surprises and must not say that it is.** It has
+/// always printed everything that is not movement or time-sync, so the
+/// questgiver probe's own `SMSG_QUESTGIVER_STATUS` replies were listed under
+/// a heading calling them unexpected -- which sends a reader looking for a
+/// fault in the twenty-one packets that arrived exactly as asked for. The
+/// instrument being served is "print every opcode seen, decoded or not",
+/// which this project has needed five times; a heading that misdescribes it
+/// costs the next person that same look.
 fn dump_unexpected(batch: &[world::client::Packet], what: &str) {
     const NOISE: [u16; 6] = [0x00DD, 0x00A9, 0x01F6, 0x0390, 0x0085, 0x0086];
-    println!("\nbodies of everything unexpected {what}:");
+    println!("\nevery packet that came back {what}, routine traffic aside:");
     let mut shown = 0;
     for packet in batch {
         if NOISE.contains(&packet.opcode) {
@@ -5997,7 +6007,7 @@ fn survey_gossip(
     // histogram below lists every opcode that arrived, and only the bodies of
     // the constant traffic are filtered out so the answer is not buried.
     const NOISE: [u16; 6] = [0x00DD, 0x00A9, 0x01F6, 0x0390, 0x0085, 0x0086];
-    println!("\nbodies of everything unexpected:");
+    println!("\nevery packet that came back, routine traffic aside:");
     let mut shown = 0;
     for packet in &batch {
         if NOISE.contains(&packet.opcode) {

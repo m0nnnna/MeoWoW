@@ -7286,3 +7286,198 @@ milestone believes is broken.
   rows in one packet and the original client rate-limits it to once every
   fifteen minutes; a request that can return a multi-megabyte packet is not
   something to attach to a button somebody can lean on.
+
+## 4.31: Questie, natively, and the one pin that is not a server answer
+
+The destination the ladder has pointed at since NPC interaction. Every rung
+below it — gossip, quests, the map, the minimap — existed partly to make this
+one possible, and the order never changed even as the numbers did.
+
+**It is a presentation milestone and that was settled long before it started**,
+in "the road to a native Questie" above: quest data comes off the wire, and
+Questie's own database is not ported. So the interesting question here is not
+where the facts come from. It is *which* facts an interface may state as facts,
+and what it owes the player about the rest.
+
+Three things landed, and only the third had to invent anything.
+
+### The tracker: a second view, never a second copy
+
+A quest log is a thing you open, read and close. A tracker is a thing that is
+simply there, and the difference is not cosmetic. That is the whole reason an
+addon like Questie exists — *"what am I supposed to be doing"* is asked
+constantly, and an answer that costs a keypress is an answer nobody reads.
+
+`ui::frames::tracker` owns no facts. Titles and levels come from the quest
+cache, counters from the player's own log fields and bags, distance from the
+polygons `CMSG_QUEST_POI_QUERY` already answered. `App::tracker_view` assembles
+it out of the same three sources the quest log's rows come from, which is
+deliberate: **two copies agree until one of them changes**, and this project
+has already paid for that rule with the picking ray, which is unprojected from
+the very matrix the scene is drawn with rather than rebuilt from the camera's
+angles.
+
+**It is a window onto a longer list and says so in every state.** A log holds
+twenty-five; the tracker draws five. `TrackerView` therefore carries `total`
+separately from `quests.len()`, and the header states both even when they are
+equal. That is 4.30's rule, paid for by the auction window: fifty real rows out
+of 1,284 real rows look exactly like the whole answer, and a line that appears
+only when there is a surplus is a line nobody has learned to read.
+
+**The sort is where the honesty shows.** Finished quests first — "go and hand
+this in" outranks anything still in progress — then by distance, nearest first.
+**A quest the realm gave no markers for sorts last rather than as zero.**
+Sorting it as zero puts it at the top of a list ordered by nearness, which
+reads as *"you are standing on it"*, and that is not the same sentence as *"the
+realm did not say"*. Same call for the number itself: no marker, no distance,
+and no guess from the objective text. An honest absence beats a plausible wrong
+answer — the call `describe_cast_failure` makes about naming a status code, and
+the one the auction window makes about sorting fifty rows of 1,284.
+
+### The difficulty bands, split along the line where the evidence stops
+
+The original interface colours a quest five ways by how its level compares to
+the player's. Four of those boundaries are presentation and one is not.
+
+**The grey band is the server's word.** `SMSG_QUESTGIVER_STATUS` distinguishes
+a bright exclamation from a trivial one — `QuestgiverMark::AvailableTrivial` —
+so *where a quest stops being worth doing* is a judgement the realm has already
+made and this client can simply report.
+
+The other four thresholds are not on the wire, not in any DBC this project has
+read, and not verifiable here. So `Difficulty::of` states them in one place, in
+one function, named as a presentation choice — rather than transcribed from
+memory and presented as measurement. This is the rule about not transcribing a
+table you have not verified, especially one that only produces text; what makes
+it acceptable at all is that **a colour is not a number**. A wrong band is
+misleading and visibly a choice. A fabricated `47` is believed.
+
+`Difficulty::of` also refuses to answer where it cannot: a quest level of `-1`
+(scales to the player) or `0` (never described) returns `Unknown` and draws in
+the ordinary text colour, which says nothing.
+
+### The remembered questgivers, which are the only invention here
+
+`crates/world/src/spawns.rs`, and it argues with itself at length because it
+should.
+
+Everything else 4.31 draws is a server answer about something the player is
+already carrying or already standing near. **Nothing on the wire answers "where
+is there a quest I have not found yet."** The server streams the creatures in
+visibility range and nothing more; this realm's `creature` table holds 149,996
+spawns and none of it is reachable by a client. An addon solves that by
+shipping a hand-collected database of the whole game.
+
+This client remembers what it was **already being sent** — keyed by realm *and
+character*, starting empty, filling as the player explores. Strictly less than
+a shipped database on day one and strictly better afterwards: it cannot be
+stale, cannot be wrong about a realm with custom content, and needs nobody's
+licence.
+
+Four decisions inside it are worth not re-deriving.
+
+**The mark is three-state.** `Some(QuestgiverMark::None)` is "the server said
+there is nothing here"; `None` is "nobody has asked yet". A cache that stored
+only the interesting answers would keep drawing yesterday's `!` over an NPC
+whose quest has been taken while claiming to be current — and flattening the
+two would make a questgiver nobody has got round to querying look exactly like
+one with nothing left to give. That is the absent-versus-default trap, in the
+one module whose entire job is remembering.
+
+**The key is a guid, not an entry.** An entry names a *kind* of creature and a
+guid names one spawn; a pin is a claim about a place. Innkeeper Farley's entry
+stands in a dozen inns. The probe demonstrated this without being asked to —
+`0xf1300000c500021b` and `0xf1300000c500030b` are both entry **197**, Marshal
+McBride, at two different positions, because the fixtures were built with `.npc
+add`. An entry-keyed cache would have had one of them overwrite the other.
+
+A guid in 3.3.5 is built from the creature's row in the server's table, so the
+key survives a restart. **A temporary summon's is not** — it comes off a
+counter — so `Questgivers::see` carries the entry as well and drops a record
+whose entry no longer matches what stands there.
+
+**`forget_offering` is the precise version of the live set's sledgehammer.**
+The viewer discards every *live* mark whenever the quest log changes, correctly:
+those NPCs are in range and get re-asked. The remembered set cannot do that,
+because most of it is miles away and unaskable, so it would empty itself every
+time the player accepted anything. So gossip's quest block is recorded whether
+or not a window is open, and only givers known to offer a now-carried quest
+lose their mark.
+
+**Every pin from it is a memory and the interface is obliged to say so.**
+`MarkerKind::Questgiver` carries two flags rather than none: `turn_in`
+separates a `?` from a `!` — the same place for opposite reasons — and `live`
+separates a mark refreshed this frame from one out of the cache. Remembered
+pins draw dimmer. They are diamonds rather than circles, because they are not
+objectives, and not the literal `!` the world uses, because a glyph at map-pin
+size is unreadable.
+
+### What was measured
+
+`wow-cli world 127.0.0.1 --user OWC34 --enter Watcher --questgivers` is the
+bounding instrument, and the round trip is part of the probe rather than a unit
+test's business: a disagreement there is a cache a real session would have
+lost.
+
+```
+21 talkable NPC(s) in range on map 0
+21 of 21 answered; 21 recorded, 3 worth drawing
+  0xf13000059300030c  entry   1427  (-8950.0, -132.5, 83.5)  Some(Available)
+  0xf1300000c500021b  entry    197  (-8902.6, -162.6, 82.0)  Some(Complete)
+  0xf1300000c500030b  entry    197  (-8950.0, -132.5, 83.5)  Some(Complete)
+cache round trip: 873 bytes, 21 of 21 records identical, 0 differed
+```
+
+**Both numbers on every line, always.** "21 recorded, 3 worth drawing" is the
+useful shape: eighteen of the twenty-one answered `None`, which is a fact worth
+storing and not worth drawing — and a probe printing only the drawable three
+could not tell that from eighteen queries nobody answered.
+
+The round trip checks one thing asymmetrically on purpose: **`live` must not
+survive a save.** A loaded record is a memory by definition, and that field is
+the only thing keeping a remembered pin from being drawn as a fact. The probe
+fails a record that comes back marked live even when every other field matches.
+
+`QuestgiverMark::to_status` exists because the mark now travels both ways, and
+a structure that does gets defined once and round-tripped — writing a format is
+riskier than reading it. `Unknown` carries its byte for the same reason: a mark
+this client cannot name survives a save unchanged rather than being flattened
+into a plausible different one, which is exactly what guild chat did when it
+drew in `Other`'s grey.
+
+### The layout collision, stated rather than solved
+
+The tracker took the guild window's default spot — top right, under the minimap
+— on the argument that already moved the quest log out of the corner: a frame
+that is simply there outranks one somebody opens. Guild moved to `[-280, 185]`,
+because `the_default_frames_do_not_overlap` forces the question and egui counts
+*touching* rectangles as intersecting.
+
+It grows downward and **reaches the spellbook's default at five quests**. That
+is written into the layout rather than fixed, because there is no free
+340-pixel column anywhere on a 1280-wide window, and a default nobody can find
+is worse than one that overlaps a window somebody opened. The explicit stacking
+order is what makes it safe: panels draw under the always-there frames, so the
+spellbook cannot eat a click meant for the tracker.
+
+### Still not done
+
+* **A tracker row opens the quest log, and nothing else.** The click is wired
+  and deliberately does *not* toggle: a click in the log toggles a highlight,
+  a click on the tracker is a request to go and read the thing, and making the
+  second toggle too would have clicking a tracked quest shut an open log. What
+  it does not do is open the **map** at that quest's markers, which is the
+  gesture a player would reach for next.
+* **No untracking.** Every quest in the log is on the tracker, capped at five
+  by `style.tracker_quests`. There is no way to pin one or hide one.
+* **No arrow and no direction.** A distance is a number the realm supplied; a
+  bearing would have to be computed against a facing, and the tracker
+  deliberately states nothing it was not given.
+* **The remembered set has no eviction and no age limit.** It grows with
+  exploration, which is the point, but nothing prunes a record for an NPC not
+  seen in months. The timestamp is stored and only ever shown to a person.
+* **Objective rings still come only from the log.** `CMSG_QUEST_POI_QUERY`
+  answers for quests in the player's log and there is no enumerate-all opcode,
+  so a quest not yet accepted has a questgiver pin and no objective ring. That
+  is the wire's limit rather than this client's, and it is the exact boundary
+  the shipped-database decision drew.

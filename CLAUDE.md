@@ -36,15 +36,18 @@ first list this client cannot bound**).
 skybox, clouds and stars. Phase 2 named all four as deliberately deferred until
 there was a character standing in the world; there has been one since 3.5.
 
-Roughly two thirds of the way to something a person could test by playing.
+Roughly two thirds of the way to something a person could test by playing, and
+**4.31 is the rung that makes the playing legible** — a tracker, questgiver
+pins and difficulty colouring, all of it a second view of things already on the
+wire.
 
-**The destination for the next few milestones is a native Questie (4.31)**, and
-the ladder to it is a dependency chain rather than a preference: NPC
-interaction (4.15) → quests (4.16) → map (4.17) → minimap (4.21) → Questie.
-The rung *numbers* keep moving as things land in between; the *order* never
-has, which is the point worth reading.
+**4.31 is a native Questie, and it is built** — the destination the ladder has
+pointed at since NPC interaction. That ladder was a dependency chain rather
+than a preference: NPC interaction (4.15) → quests (4.16) → map (4.17) →
+minimap (4.21) → Questie. The rung *numbers* kept moving as things landed in
+between; the *order* never did, which is the point worth reading.
 
-Two scoping facts that are already decided:
+Two scoping facts that were decided before it started, and held:
 
 * **Most of Questie's bulk is a workaround for a restriction this client does
   not have.** An addon cannot ask the server about a quest it has not been
@@ -84,7 +87,8 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | Appearance | NPCs, other players and the viewer's own character are all dressed from their replicated fields. Weapons draw and sheathe. No shoulders, helms or ranged weapons on others |
 | Interface | Native, fully customisable, **no addons** — see the decision below. Player/target/party frames, click-to-target, chat, spellbook, action bars per character, `F1` to rearrange, saved to `ui.toml` |
 | Game | Melee, spells with real tooltips and a cast bar, cooldowns, combat log, corpse and loot end to end, inventory with slot moves, character panel, quests taken and handed in, quest log with progress counters |
-| Map | `M` opens the zone page with the character and quest objectives on it; fills in as explored. **Minimap** in the corner with party dots and objective rings. No zoom, panning, continent view or rotation |
+| Map | `M` opens the zone page with the character and quest objectives on it; fills in as explored. **Minimap** in the corner with party dots and objective rings. **Questgiver pins** as diamonds — `!` and `?` told apart, and a *remembered* one drawn faded, because it is a fact about the past. No zoom, panning, continent view or rotation |
+| Tracker | **Always on, no key**, top right under the minimap: five quests of however many, by distance with the finished ones first, each with its objective counters and yards to the nearest marker. States the count in every state. A quest the realm gave no markers for sorts **last, not as zero**, and shows no distance at all |
 | Sound | Zone music and ambience by area and hour, creature voices, weapon impacts, **footsteps that know what they are standing on** — terrain and building floors both. No attenuation, no spell sounds |
 | NPCs | Gossip, vendors (buy and sell), quests, questgiver `!`/`?` marks, trainers, auctioneers |
 | City services | **All six done and confirmed at the window: trainers, flight paths, trade, mail, guilds and the auction house.** Browsing, paging, bidding and cancelling; no sell window, no search box, no sort control |
@@ -107,7 +111,9 @@ map, **G** guild, **T** trade, **Z** sheathe, **Enter** chat, **F1** to drag
 the layout around and save it. **The auction window has no key** — it opens by
 right-clicking an auctioneer and closes when you walk out of range, because
 every request in that block resolves its NPC through the server's five-unit
-check and fails in silence past it.
+check and fails in silence past it. **The objective tracker has no key
+either**, for the opposite reason: it is never opened and never closed, because
+a log is a thing you open and a tracker is a thing that is simply there.
 
 **Chat commands take `/` and never reach the wire; `.` is the *server's*
 prefix**, which is how a GM command travels as ordinary chat.
@@ -521,6 +527,22 @@ the full account is in `docs/ROADMAP.md`.
   upgrades every cached quest with no migration. Nothing POI is cached at all,
   because the query gives the same empty list for "not in your log" as for "no
   markers".
+- **A cache that records only the answers worth acting on cannot say why it is
+  silent.** The remembered questgivers store `Some(QuestgiverMark::None)` --
+  "the server said there is nothing here" -- as carefully as they store an
+  exclamation, because the alternative makes an NPC nobody has got round to
+  querying indistinguishable from one with nothing left to give. Same trap as
+  the two rules above, in the one module whose entire job is remembering, which
+  is where it is hardest to see: **the interesting answers are not the only
+  answers.**
+- **A pin is a claim about a place, so it is keyed by the spawn and not the
+  kind.** An entry names a *sort* of creature -- Innkeeper Farley's stands in a
+  dozen inns -- and a guid names one of them. The probe demonstrated it without
+  being asked to: two guids came back both holding entry 197, Marshal McBride,
+  at two different positions, and an entry-keyed cache would have had one
+  overwrite the other. The cost is that a **temporary summon's guid comes off a
+  counter** and can later name something else, so the record carries its entry
+  too and is dropped when the two disagree.
 - **The absence of a field and the absence of a feature look identical.** A
   container announces its capacity and nothing naming its contents — which
   proves nothing, because every bag observed was empty, a create block omits
@@ -754,6 +776,13 @@ the full account is in `docs/ROADMAP.md`.
   rendering bug: the fifty rows are real and their prices are real, and the
   person reading them believes they are the market. A line that appeared only
   when there was a surplus is a line nobody has learned to read.
+- **Sorting an absence as zero states a fact nobody supplied.** The tracker
+  orders quests by distance to the nearest objective marker, and a quest the
+  realm gave no markers for has no distance. Sorted as zero it goes to the
+  *top* of a nearest-first list, which reads as "you are standing on it" --
+  a different sentence from "the realm did not say". It sorts last and shows no
+  number at all. **A default value inside a comparison is an assertion**, and
+  the comparison is where nobody looks for one.
 - **A control that sorts what is on screen answers a different question from
   the one it appears to answer.** Sorting fifty rows of 1,284 by price gives
   the cheapest of *those fifty*, in price order, looking exactly like the
