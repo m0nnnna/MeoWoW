@@ -501,6 +501,65 @@ enum Command {
         /// it would work for the person who wrote it and for no player.
         #[arg(long)]
         mail_own_guid: bool,
+        /// Ask for the guild roster, and **score the record layout** rather
+        /// than parse it and believe the answer.
+        ///
+        /// The roster's member record carries four bytes that exist only for
+        /// members who are *offline*, which is a conditional layout in the
+        /// middle of a variable-length record inside a list -- so a wrong
+        /// reading desynchronises everything after it rather than leaving
+        /// bytes at the end. Two other readings also draw a picture, and this
+        /// reports which of the three the body is consistent with **and
+        /// whether the body is capable of separating them at all**: a roster
+        /// where everybody is offline cannot, and neither can one where
+        /// everybody is online.
+        ///
+        /// It is also the cheapest bound in the whole city-services block. A
+        /// character in no guild is answered by `SMSG_GUILD_COMMAND_RESULT`
+        /// rather than by silence, so this confirms the opcode and the result
+        /// layout with no fixture whatsoever.
+        #[arg(long)]
+        guild: bool,
+        /// Ask this player, by name, to join the guild.
+        ///
+        /// Half of a two-client rig: the invitation arrives at *their*
+        /// session and nothing comes back here but a command result.
+        #[arg(long)]
+        guild_invite: Option<String>,
+        /// Wait for a guild invitation and accept it with an **empty body**.
+        ///
+        /// The other half. Worth running because the accept identifies
+        /// nothing at all -- the server resolves which guild from the
+        /// invitation it recorded when the invite went out.
+        #[arg(long)]
+        guild_accept: bool,
+        /// Set a member's public note as `Name=text`, then **re-ask the
+        /// roster** and report whether it took.
+        ///
+        /// The request is silent on success, so this is confirmed by effect
+        /// and never by drawing the intention.
+        #[arg(long)]
+        guild_note: Option<String>,
+        /// Set the message of the day, and report the event the change is
+        /// pushed as.
+        #[arg(long)]
+        guild_motd: Option<String>,
+        /// Sit still for this many seconds and report every
+        /// `SMSG_GUILD_EVENT`.
+        ///
+        /// The only push in the block, and the reason a roster is not polled.
+        /// Drive it from a second session by logging a guild member in or out.
+        #[arg(long, default_value_t = 0)]
+        guild_wait: u64,
+        /// Say this on guild chat.
+        ///
+        /// Half of a two-client rig: guild chat reaches every member who is
+        /// online and nobody else, so the only way to know it went out is for
+        /// a *second* session to print it. A guildless character's guild line
+        /// is dropped by the server in silence, which is exactly the failure
+        /// this pairs with `--guild-wait` to rule out.
+        #[arg(long)]
+        guild_say: Option<String>,
         /// Ask this **player**, by name, to trade -- then drive the whole
         /// exchange and report every packet.
         ///
@@ -1457,6 +1516,13 @@ fn main() -> Result<()> {
             mail_clear,
             mail_wait,
             mail_own_guid,
+            guild,
+            guild_invite,
+            guild_accept,
+            guild_note,
+            guild_motd,
+            guild_wait,
+            guild_say,
             trade,
             trade_wait,
             trade_decline,
@@ -1537,6 +1603,13 @@ fn main() -> Result<()> {
                 mail_clear: *mail_clear,
                 mail_wait: *mail_wait,
                 mail_own_guid: *mail_own_guid,
+                guild: *guild,
+                guild_invite: guild_invite.as_deref(),
+                guild_accept: *guild_accept,
+                guild_note: guild_note.as_deref(),
+                guild_motd: guild_motd.as_deref(),
+                guild_wait: *guild_wait,
+                guild_say: guild_say.as_deref(),
                 trade: trade.as_deref(),
                 trade_wait: *trade_wait,
                 trade_decline: *trade_decline,
@@ -1743,6 +1816,13 @@ struct WorldRequest<'a> {
     mail_clear: bool,
     mail_wait: u64,
     mail_own_guid: bool,
+    guild: bool,
+    guild_invite: Option<&'a str>,
+    guild_accept: bool,
+    guild_note: Option<&'a str>,
+    guild_motd: Option<&'a str>,
+    guild_wait: u64,
+    guild_say: Option<&'a str>,
     trade: Option<&'a str>,
     trade_wait: bool,
     trade_decline: bool,
@@ -1878,6 +1958,13 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         mail_clear,
         mail_wait,
         mail_own_guid,
+        guild,
+        guild_invite,
+        guild_accept,
+        guild_note,
+        guild_motd,
+        guild_wait,
+        guild_say,
         trade,
         trade_wait,
         trade_decline,
@@ -2825,6 +2912,30 @@ cast {spell_id} at {} (attempt {attempt})",
                     clear: mail_clear,
                     wait: mail_wait,
                     own_guid: mail_own_guid,
+                },
+            )?;
+        }
+
+        if guild
+            || guild_invite.is_some()
+            || guild_accept
+            || guild_note.is_some()
+            || guild_motd.is_some()
+            || guild_wait > 0
+            || guild_say.is_some()
+        {
+            survey_guild(
+                &mut connection,
+                &mut state,
+                character.guid,
+                GuildDrive {
+                    roster: guild,
+                    invite: guild_invite,
+                    accept: guild_accept,
+                    note: guild_note,
+                    motd: guild_motd,
+                    wait: guild_wait,
+                    say: guild_say,
                 },
             )?;
         }
@@ -14282,6 +14393,652 @@ the SMSG_MONSTER_MOVE naming this character, {} bytes:", packet.body.len());
 
 
 /// What a `--mail-*` run should do.
+/// What `--guild*` asks for.
+struct GuildDrive<'a> {
+    roster: bool,
+    invite: Option<&'a str>,
+    accept: bool,
+    note: Option<&'a str>,
+    motd: Option<&'a str>,
+    wait: u64,
+    say: Option<&'a str>,
+}
+
+/// Which readings of the roster's conditional field a body is consistent with.
+///
+/// Three candidates, and the whole point of scoring rather than parsing is
+/// that **two of them agree on most rosters**. A roster where every member is
+/// offline cannot separate `WhenOffline` from `Always`; one where everybody is
+/// online cannot separate it from `Never`. Working that out in advance and
+/// saying so is the lesson 4.24's trainer stride cost -- a probe that reports a
+/// tie is telling the truth, and one that picks a winner from a sample that
+/// cannot separate them is not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OfflineFloat {
+    WhenOffline,
+    Always,
+    Never,
+}
+
+impl OfflineFloat {
+    fn name(self) -> &'static str {
+        match self {
+            OfflineFloat::WhenOffline => "float when status == 0",
+            OfflineFloat::Always => "float on every record",
+            OfflineFloat::Never => "no float at all",
+        }
+    }
+}
+
+/// Walk a roster body under one reading and say whether it fits.
+///
+/// **This project's usual instrument does not work here, and finding that out
+/// is most of what the probe is for.** "Assert the parse consumed the whole
+/// record" has caught four separate world-protocol bugs, and it cannot catch
+/// this one: the fields *after* the conditional float are null-terminated
+/// strings, and a string scan **re-synchronises**. Reading four bytes that are
+/// not there simply makes the following note start four bytes later and end at
+/// the same terminator, so the record occupies the same span and the cursor
+/// finishes exactly empty under every reading.
+///
+/// What is left is the content. A note that begins with four bytes of a float
+/// is not printable, which is the same move as the trainer greeting and the M2
+/// event's `FourCC`: where a format stores text, the text is the evidence.
+///
+/// It is still not always decisive, and the probe says so rather than
+/// pretending. See the tie report in [`survey_guild`].
+fn roster_fits(body: &[u8], reading: OfflineFloat) -> Result<usize, String> {
+    let mut at = 0usize;
+    let u32_at = |at: &mut usize| -> Result<u32, String> {
+        if *at + 4 > body.len() {
+            return Err(format!("ran out at {at}"));
+        }
+        let v = u32::from_le_bytes(body[*at..*at + 4].try_into().unwrap());
+        *at += 4;
+        Ok(v)
+    };
+    let members = u32_at(&mut at)?;
+    let ranks_at = |at: &mut usize| -> Result<(), String> {
+        // two cstrings
+        for _ in 0..2 {
+            let end = body[*at..]
+                .iter()
+                .position(|b| *b == 0)
+                .ok_or_else(|| "unterminated string".to_string())?;
+            *at += end + 1;
+        }
+        Ok(())
+    };
+    ranks_at(&mut at)?;
+    let rank_count = u32_at(&mut at)?;
+    at += rank_count as usize * world::guild::RANK_BYTES;
+    if at > body.len() {
+        return Err("rank block overruns the body".into());
+    }
+
+    let mut named = 0usize;
+    for _ in 0..members {
+        if at + 9 > body.len() {
+            return Err(format!("ran out at {at}"));
+        }
+        at += 8;
+        let status = body[at];
+        at += 1;
+        let end = body[at..]
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or_else(|| "unterminated name".to_string())?;
+        let name = &body[at..at + end];
+        if !name.is_empty() && name.iter().all(|b| b.is_ascii_alphanumeric()) {
+            named += 1;
+        }
+        at += end + 1;
+        at += 4 + 1 + 1 + 1 + 4;
+        let float = match reading {
+            OfflineFloat::WhenOffline => status == 0,
+            OfflineFloat::Always => true,
+            OfflineFloat::Never => false,
+        };
+        if float {
+            at += 4;
+        }
+        for _ in 0..2 {
+            if at >= body.len() {
+                return Err(format!("ran out at {at}"));
+            }
+            let end = body[at..]
+                .iter()
+                .position(|b| *b == 0)
+                .ok_or_else(|| "unterminated note".to_string())?;
+            // The discriminator. A note is text somebody typed or it is
+            // nothing; four bytes of a float in front of it is neither.
+            if !body[at..at + end]
+                .iter()
+                .all(|b| b.is_ascii_graphic() || *b == b' ')
+            {
+                return Err(format!("note at {at} is not text"));
+            }
+            at += end + 1;
+        }
+    }
+    if at != body.len() {
+        return Err(format!("finished at {at} of {}", body.len()));
+    }
+    Ok(named)
+}
+
+/// The same walk with the text check removed, so the probe can say how much
+/// of its verdict came from the length and how much from the content.
+///
+/// Worth having as its own function rather than a flag: the difference between
+/// the two numbers *is* the finding, and a flag would let a later reader
+/// assume they always agree.
+fn roster_length_fits(body: &[u8], reading: OfflineFloat) -> Result<usize, String> {
+    let mut at = 0usize;
+    let u32_at = |at: &mut usize| -> Result<u32, String> {
+        if *at + 4 > body.len() {
+            return Err(format!("ran out at {at}"));
+        }
+        let v = u32::from_le_bytes(body[*at..*at + 4].try_into().unwrap());
+        *at += 4;
+        Ok(v)
+    };
+    let members = u32_at(&mut at)?;
+    for _ in 0..2 {
+        let end = body
+            .get(at..)
+            .and_then(|r| r.iter().position(|b| *b == 0))
+            .ok_or_else(|| format!("ran out at {at}"))?;
+        at += end + 1;
+    }
+    let rank_count = u32_at(&mut at)?;
+    at += rank_count as usize * world::guild::RANK_BYTES;
+    if at > body.len() {
+        return Err(format!("ran out at {at}"));
+    }
+    for _ in 0..members {
+        if at + 9 > body.len() {
+            return Err(format!("ran out at {at}"));
+        }
+        let status = body[at + 8];
+        at += 9;
+        for _ in 0..1 {
+            let end = body
+                .get(at..)
+                .and_then(|r| r.iter().position(|b| *b == 0))
+                .ok_or_else(|| format!("ran out at {at}"))?;
+            at += end + 1;
+        }
+        at += 11;
+        let float = match reading {
+            OfflineFloat::WhenOffline => status == 0,
+            OfflineFloat::Always => true,
+            OfflineFloat::Never => false,
+        };
+        if float {
+            at += 4;
+        }
+        for _ in 0..2 {
+            let end = body
+                .get(at..)
+                .and_then(|r| r.iter().position(|b| *b == 0))
+                .ok_or_else(|| format!("ran out at {at}"))?;
+            at += end + 1;
+        }
+    }
+    if at != body.len() {
+        return Err(format!("finished at {at} of {}", body.len()));
+    }
+    Ok(members as usize)
+}
+
+/// Score a roster body against the three readings of its conditional field,
+/// and say what the sample is *capable of* separating.
+///
+/// Two things are reported that a bare parse would not. First, whether the
+/// body can separate the candidates at all: an all-offline roster cannot tell
+/// "float when offline" from "float always", and an all-online one cannot tell
+/// it from "no float at all". Second, and less obvious, that the cursor is not
+/// the instrument here -- see [`roster_fits`].
+fn score_roster(body: &[u8], state: &world::WorldState) {
+    println!("\n--- SMSG_GUILD_ROSTER: {} bytes", body.len());
+    let roster = state.guild_roster.as_ref();
+    let (online, offline) = roster
+        .map(|r| (r.online(), r.members.len() - r.online()))
+        .unwrap_or((0, 0));
+    println!("  {online} member(s) online, {offline} offline");
+    if online == 0 {
+        println!("  ** every member is offline: this body CANNOT separate \"float when offline\"");
+        println!("     from \"float on every record\". Log a second character in and re-run.");
+    }
+    if offline == 0 {
+        println!("  ** every member is online: this body CANNOT separate \"float when offline\"");
+        println!("     from \"no float at all\". Log a character out and re-run.");
+    }
+    let mut fitting = Vec::new();
+    for reading in [
+        OfflineFloat::WhenOffline,
+        OfflineFloat::Always,
+        OfflineFloat::Never,
+    ] {
+        match roster_fits(body, reading) {
+            Ok(names) => {
+                println!("  {:<28} FITS ({names} printable name(s))", reading.name());
+                fitting.push(reading);
+            }
+            Err(why) => println!("  {:<28} refuted: {why}", reading.name()),
+        }
+    }
+    // A reading that survives on length alone is worth naming separately from
+    // one that survives the text check, because the length check is this
+    // project's first instrument and it is **blind here**: the two notes at
+    // the end of a record are null-terminated, so a string scan
+    // re-synchronises and a reading four bytes out occupies the same span.
+    let by_length = [
+        OfflineFloat::WhenOffline,
+        OfflineFloat::Always,
+        OfflineFloat::Never,
+    ]
+    .into_iter()
+    .filter(|r| !matches!(roster_length_fits(body, *r), Err(ref why) if why.starts_with("ran out")))
+    .count();
+    println!(
+        "  {by_length} of 3 survive on length alone -- the trailing-bytes rule is nearly blind"
+    );
+    println!("  here, because the notes are null-terminated and a string scan re-synchronises.");
+    if fitting.len() > 1 {
+        println!("  ** {} readings survive. The sample is not decisive.", fitting.len());
+        println!("     An online member with an EMPTY public note settles it: reading a float");
+        println!("     there eats the terminator and runs into the next record. Clear one with");
+        println!("     --guild-note '<Name>=' and this probe re-scores the roster it comes back");
+        println!("     with.");
+    }
+}
+
+/// Drives the guild block and reports every packet in it.
+///
+/// **The first list of people who are not in the world.** A party summary
+/// describes somebody logged in two zones away; a roster is mostly characters
+/// who logged out days ago, and every field about them is whatever this one
+/// packet chose to carry.
+///
+/// The bounding move is unusually cheap here and is made first: `CMSG_GUILD_
+/// ROSTER` is answered *either way*, so a character in no guild gets a
+/// `SMSG_GUILD_COMMAND_RESULT` rather than the silence every other request in
+/// this block returns on success. One send, no fixture.
+fn survey_guild(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    drive: GuildDrive<'_>,
+) -> Result<()> {
+    // ------------------------------------------------------------- the bound
+    println!("\n--- CMSG_GUILD_ROSTER (the one request here that is answered either way)");
+    connection.guild_roster()?;
+    let batch = connection.drain(std::time::Duration::from_millis(1500), 256)?;
+    let roster_body = batch
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::GUILD_ROSTER)
+        .map(|p| p.body.clone());
+    // Count *every* opcode, decoded or not. Four separate investigations in
+    // this project have been shortened by exactly this, and the loop that
+    // needs it is always the one somebody is writing now.
+    let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+    for packet in &batch {
+        *seen.entry(packet.opcode).or_default() += 1;
+    }
+    let report = state.replicate(&batch, None);
+    for (opcode, count) in &seen {
+        if matches!(
+            *opcode,
+            world::opcode::server::GUILD_ROSTER
+                | world::opcode::server::GUILD_COMMAND_RESULT
+                | world::opcode::server::GUILD_EVENT
+        ) {
+            println!("  {} x{count}", world::opcode::describe(*opcode));
+        }
+    }
+    for result in &report.guild_results {
+        println!(
+            "  command {} name {:?} result {} -- {}",
+            result.command,
+            result.name,
+            result.result,
+            world::guild::describe_command_result(result.command, result.result, &result.name)
+        );
+    }
+    for (opcode, error, body) in &report.failures {
+        println!("  undecodable {}: {error}", world::opcode::describe(*opcode));
+        if let Ok(body) = body {
+            println!("    {} bytes: {}", body.len(), hex_preview(body, 160));
+        }
+    }
+
+    let Some(body) = roster_body else {
+        println!("\n  No roster. If a command result came back naming command 5, the opcode and");
+        println!("  the result layout are both confirmed and this character is simply in no guild.");
+        return Ok(());
+    };
+
+    // ------------------------------------------- the conditional, scored
+    //
+    // Not parsed and believed -- scored against the two readings that would
+    // also draw a picture, with the sample's own ability to separate them
+    // stated first.
+    score_roster(&body, state);
+
+    if let Some(roster) = state.guild_roster.clone().as_ref() {
+        println!("\n  motd  {:?}", roster.motd);
+        println!("  info  {:?}", roster.info);
+        let visible = roster.officer_notes_visible(own_guid);
+        println!(
+            "  officer notes: {}",
+            match visible {
+                Some(true) => "visible to this reader (the rank carries 0x4000)",
+                Some(false) => "HIDDEN -- an empty column here means \"not allowed\", not \"none\"",
+                None => "unknown: this reader is not on their own roster",
+            }
+        );
+        println!("  {} rank record(s) of {} bytes each", roster.ranks.len(), world::guild::RANK_BYTES);
+        for (index, rank) in roster.ranks.iter().enumerate() {
+            println!(
+                "    rank {index}  rights {:#010x}  gold/day {}",
+                rank.rights, rank.withdraw_gold_limit
+            );
+        }
+        println!("\n  {} member(s):", roster.members.len());
+        for member in &roster.members {
+            println!(
+                "    {:#018x}  {:<14} rank {}  level {:<3} class {:<2} area {:<5} {}",
+                member.guid,
+                member.name,
+                member.rank,
+                member.level,
+                member.class,
+                member.area,
+                match member.offline_days {
+                    // A duration, not an instant -- the server divides by a
+                    // day at the moment it builds the packet.
+                    Some(days) => format!("offline {days:.4} days"),
+                    None => "ONLINE (no float in this record)".to_string(),
+                }
+            );
+            println!(
+                "        public {:?}  officer {:?}",
+                member.public_note, member.officer_note
+            );
+        }
+        // The guild id is not on the roster at all, which is worth saying out
+        // loud: the packet that lists a guild's members does not name the
+        // guild. It comes off the player's own replicated fields.
+        // The predicted index, measured here: the value has to agree with
+        // the realm's own `guild_member` table, and the rank beside it has to
+        // agree with this reader's own row on the roster above.
+        let guild_id = state
+            .get(own_guid)
+            .and_then(|e| e.fields.get(world::update::fields::PLAYER_GUILDID));
+        let guild_rank = state
+            .get(own_guid)
+            .and_then(|e| e.fields.get(world::update::fields::PLAYER_GUILDRANK));
+        let own_row_rank = roster.member(own_guid).map(|m| m.rank);
+        println!(
+            "
+  PLAYER_GUILDID {:?}  PLAYER_GUILDRANK {:?}  (this reader's roster row says rank {:?})",
+            guild_id, guild_rank, own_row_rank
+        );
+        // **An absent update field is a zero, not an unknown** -- a create
+        // block carries only non-zero values, so the guild master, whose rank
+        // is 0, has no rank field at all. Reading the absence as "not known"
+        // would leave exactly the one member whose rank matters unlabelled.
+        let field_rank = guild_rank.unwrap_or(0);
+        match own_row_rank {
+            Some(row) if row == field_rank => println!(
+                "  rank {field_rank} agrees by two unrelated routes{}.",
+                if guild_rank.is_none() {
+                    " (the field is absent, which is a zero and not an unknown)"
+                } else {
+                    ""
+                }
+            ),
+            Some(row) => println!("  DISAGREE: field says {field_rank}, roster row says {row}."),
+            None => println!("  this reader is not on their own roster."),
+        }
+        match guild_id {
+            Some(id) => {
+                println!("\n--- CMSG_GUILD_QUERY {id} (the roster does not carry the guild id)");
+                connection.guild_query(id)?;
+                connection.guild_info()?;
+                let batch = connection.drain(std::time::Duration::from_millis(1500), 128)?;
+                let query_body = batch
+                    .iter()
+                    .find(|p| p.opcode == world::opcode::server::GUILD_QUERY_RESPONSE)
+                    .map(|p| p.body.clone());
+                let info_body = batch
+                    .iter()
+                    .find(|p| p.opcode == world::opcode::server::GUILD_INFO)
+                    .map(|p| p.body.clone());
+                let report = state.replicate(&batch, None);
+                for (opcode, error, body) in &report.failures {
+                    println!("  undecodable {}: {error}", world::opcode::describe(*opcode));
+                    if let Ok(body) = body {
+                        println!("    {} bytes: {}", body.len(), hex_preview(body, 160));
+                    }
+                }
+                if let Some(info) = state.guilds.get(&id) {
+                    println!("  {:?}  id {}", info.name, info.id);
+                    println!(
+                        "  {} rank name(s): {:?}",
+                        info.ranks.len(),
+                        info.ranks
+                    );
+                    println!("  emblem {:?}", info.emblem);
+                }
+                if let Some(body) = query_body {
+                    // **Ten names always travel**, and this is the measurement
+                    // that says so rather than the assertion. Reading `n`
+                    // names for every plausible `n` and asking which leaves
+                    // the cursor exactly empty is the same shape as the
+                    // trainer stride probe -- and unlike the roster above, the
+                    // cursor *is* decisive here, because what follows the
+                    // strings is six fixed words rather than more strings.
+                    println!("\n  how many rank names does the body actually hold?");
+                    for names in 0..=world::guild::MAX_RANKS + 2 {
+                        let mut at = 4usize;
+                        let mut ok = true;
+                        for _ in 0..names + 1 {
+                            match body.get(at..).and_then(|r| r.iter().position(|b| *b == 0)) {
+                                Some(end) => at += end + 1,
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        let fits = ok && at + 6 * 4 == body.len();
+                        if fits {
+                            println!("    {names:>2} names + 6 words = {} bytes: FITS", body.len());
+                        }
+                    }
+                    println!(
+                        "    (anything else leaves the cursor short or long; {} bytes total)",
+                        body.len()
+                    );
+                }
+                if let Some(body) = info_body {
+                    match world::guild::parse_guild_summary(&body) {
+                        Ok(summary) => {
+                            let d = summary.founded;
+                            println!(
+                                "\n--- SMSG_GUILD_INFO: {:?}, {} member(s) on {} account(s)",
+                                summary.name, summary.members, summary.accounts
+                            );
+                            println!(
+                                "  founded {:04}-{:02}-{:02} {:02}:{:02} (raw {:#010x})",
+                                d.year, d.month, d.day, d.hour, d.minute, d.raw
+                            );
+                            // Three redundant bits, checked. Every plausible
+                            // mis-shift moves the date without moving the
+                            // weekday.
+                            println!(
+                                "  weekday field {} {} the date -- packing {}",
+                                d.weekday,
+                                if d.weekday_agrees() { "agrees with" } else { "DISAGREES with" },
+                                if d.weekday_agrees() { "confirmed" } else { "REFUTED" }
+                            );
+                            println!(
+                                "  no seconds and no timezone: this is the server's wall clock, not an instant."
+                            );
+                        }
+                        Err(error) => println!("  SMSG_GUILD_INFO: {error}"),
+                    }
+                }
+            }
+            None => println!("\n  PLAYER_GUILDID is not replicated on this character."),
+        }
+    }
+
+    // ------------------------------------------------- the silent requests
+    if let Some(note) = drive.note {
+        let (member, text) = note.split_once('=').unwrap_or((note, ""));
+        println!("\n--- CMSG_GUILD_SET_PUBLIC_NOTE {member:?} = {text:?} (silent on success)");
+        connection.guild_set_public_note(member, text)?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Confirmed by effect and by re-asking, never by drawing the
+        // intention: a silent send that was declined leaves the picture and
+        // the realm disagreeing.
+        connection.guild_roster()?;
+        let batch = connection.drain(std::time::Duration::from_millis(1500), 256)?;
+        state.replicate(&batch, None);
+        if let Some(body) = batch
+            .iter()
+            .find(|p| p.opcode == world::opcode::server::GUILD_ROSTER)
+            .map(|p| p.body.clone())
+        {
+            // Re-scored, not merely re-read: clearing an online member's note
+            // is the change that makes the sample decisive, so the whole
+            // three-way comparison is worth running again on the body it
+            // produced.
+            score_roster(&body, state);
+        }
+        match state
+            .guild_roster
+            .as_ref()
+            .and_then(|r| r.members.iter().find(|m| m.name == member))
+        {
+            Some(m) if m.public_note == text => {
+                println!("  -> the re-asked roster reads {:?}. Confirmed by effect.", m.public_note)
+            }
+            Some(m) => println!("  -> the roster still reads {:?}. NOT applied.", m.public_note),
+            None => println!("  -> no member named {member:?} on the roster."),
+        }
+    }
+
+    if let Some(text) = drive.motd {
+        println!("\n--- CMSG_GUILD_MOTD {text:?}");
+        connection.guild_motd(text)?;
+        let batch = connection.drain(std::time::Duration::from_millis(1500), 256)?;
+        let report = state.replicate(&batch, None);
+        for event in &report.guild_events {
+            println!("  SMSG_GUILD_EVENT kind {} params {:?} guid {:?}", event.kind, event.params, event.guid);
+        }
+        println!("  (a motd change is pushed as an event, which is how the roster stays current)");
+    }
+
+    if let Some(name) = drive.invite {
+        println!("\n--- CMSG_GUILD_INVITE {name:?}");
+        println!("  Half of a two-client rig: the invitation arrives at *their* session.");
+        connection.guild_invite(name)?;
+        let batch = connection.drain(std::time::Duration::from_millis(2000), 256)?;
+        let report = state.replicate(&batch, None);
+        for result in &report.guild_results {
+            println!(
+                "  command {} name {:?} result {} -- {}",
+                result.command,
+                result.name,
+                result.result,
+                world::guild::describe_command_result(result.command, result.result, &result.name)
+            );
+        }
+    }
+
+    if drive.accept {
+        println!("\n--- waiting for SMSG_GUILD_INVITE, then CMSG_GUILD_ACCEPT (empty body)");
+        let batch = connection.drain(std::time::Duration::from_secs(30), 512)?;
+        state.replicate(&batch, None);
+        match state.guild_invitation.clone() {
+            Some(invite) => {
+                println!(
+                    "  {:?} asks this character to join {:?} -- and the packet carries no guid.",
+                    invite.inviter, invite.guild
+                );
+                connection.guild_accept()?;
+                let batch = connection.drain(std::time::Duration::from_millis(2000), 256)?;
+                let report = state.replicate(&batch, None);
+                for event in &report.guild_events {
+                    println!("  SMSG_GUILD_EVENT kind {} params {:?} guid {:?}", event.kind, event.params, event.guid);
+                }
+            }
+            None => println!("  nothing arrived."),
+        }
+    }
+
+    if let Some(text) = drive.say {
+        println!("\n--- guild chat: {text:?}");
+        println!("  Reaches every member online and nobody else, so only a second session can");
+        println!("  confirm it -- a guildless character's line is dropped by the server in");
+        println!("  silence, which is what makes a one-client test of this worthless.");
+        connection.say(world::ChatType::Guild, 0, "", text)?;
+        let batch = connection.drain(std::time::Duration::from_millis(1500), 128)?;
+        let report = state.replicate(&batch, None);
+        for line in &report.chat {
+            println!("  heard back: [{:?}] {}", line.channel, line.text);
+        }
+    }
+
+    if drive.wait > 0 {
+        println!("\n--- sitting still for {}s, reporting every SMSG_GUILD_EVENT", drive.wait);
+        println!("  Drive it from a second session: log a guild member in or out.");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(drive.wait);
+        let mut events = 0usize;
+        // **Kept alive, because a long idle wait is exactly what the server
+        // drops.** The first run of this loop had no ping in it and died at
+        // `failed to fill whole buffer` partway through a 150-second wait --
+        // the trap `CLAUDE.md` records for the world connection, walked into
+        // again by a loop that sends nothing on purpose. Sent no faster than
+        // `PING_INTERVAL`, since pinging too eagerly is punished harder than
+        // not pinging at all.
+        let mut last_ping = std::time::Instant::now();
+        let mut chat_seen = 0usize;
+        while std::time::Instant::now() < deadline {
+            let batch = connection.drain(std::time::Duration::from_millis(1000), 128)?;
+            let report = state.replicate(&batch, None);
+            for event in &report.guild_events {
+                events += 1;
+                println!(
+                    "  kind {:<3} params {:?} guid {:?}",
+                    event.kind, event.params, event.guid
+                );
+            }
+            // Guild chat lands here too, and it is the other half of the
+            // two-client rig: a line said by the far end and printed here is
+            // the only proof the send went out at all.
+            for line in &report.chat {
+                chat_seen += 1;
+                println!("  chat [{:?}] {}", line.channel, line.text);
+            }
+            if last_ping.elapsed() >= world::client::PING_INTERVAL {
+                last_ping = std::time::Instant::now();
+                connection.send_ping(0)?;
+            }
+        }
+        println!("  {chat_seen} chat line(s) heard while waiting.");
+        println!("  {events} event(s) in {}s.", drive.wait);
+    }
+
+    let _ = drive.roster;
+    Ok(())
+}
+
 struct MailDrive<'a> {
     list: bool,
     to: Option<&'a str>,

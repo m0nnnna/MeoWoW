@@ -16,6 +16,7 @@ pub mod death;
 pub mod environment;
 pub mod gossip;
 pub mod group;
+pub mod guild;
 pub mod inventory;
 pub mod loot;
 pub mod mail;
@@ -48,6 +49,7 @@ pub use quest::{
     ObjectiveTarget, QuestInfo, QuestItemObjective, QuestObjective, QuestPoi, QuestPoiSet,
     QuestPoint, QuestRewardItem,
 };
+pub use guild::{GuildEvent, GuildInfo, GuildInvitation, GuildMember, GuildRank, Roster};
 pub use quest_cache::{Answer, QuestCache};
 pub use mail::{Inbox, Mail, MailAction, MailItem, MailResult, MailSender, NextMailTime};
 pub use taxi::{Flight, TaxiMenu, TaxiReply};

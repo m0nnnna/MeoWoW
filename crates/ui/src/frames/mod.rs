@@ -18,6 +18,7 @@ pub mod bags;
 pub mod cast_bar;
 pub mod character;
 pub mod chat;
+pub mod guild;
 pub mod loot;
 pub mod combat_text;
 pub mod loot_sparkle;
@@ -39,6 +40,7 @@ pub mod world_map;
 
 pub use bags::{BagItem, BagSlot};
 pub use character::EquipSlot;
+pub use guild::{GuildRow, GuildView, OfficerNotes};
 pub use loot::{LootRow, Take};
 pub use cast_bar::CastBarView;
 pub use release::ReleasePromptView;

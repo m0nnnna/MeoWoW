@@ -2185,6 +2185,13 @@ struct Renderer {
 enum ChatChannel {
     Say,
     Party,
+    /// Guild chat.
+    ///
+    /// Refused locally when this character is in no guild, exactly as `Party`
+    /// is when there is no group -- and for the identical reason: the server
+    /// drops a guild line from a guildless character in **silence**, which is
+    /// indistinguishable from a broken send.
+    Guild,
     Yell,
     Whisper(String),
 }
@@ -2197,6 +2204,7 @@ impl ChatChannel {
         match self {
             ChatChannel::Say => (::world::ChatType::Say, ""),
             ChatChannel::Party => (::world::ChatType::Party, ""),
+            ChatChannel::Guild => (::world::ChatType::Guild, ""),
             ChatChannel::Yell => (::world::ChatType::Yell, ""),
             ChatChannel::Whisper(name) => (::world::ChatType::Whisper, name.as_str()),
         }
@@ -2209,6 +2217,7 @@ impl ChatChannel {
         match self {
             ChatChannel::Say => None,
             ChatChannel::Party => Some("party".into()),
+            ChatChannel::Guild => Some("guild".into()),
             ChatChannel::Yell => Some("yell".into()),
             ChatChannel::Whisper(name) => Some(format!("to {name}")),
         }
@@ -2634,6 +2643,22 @@ struct App {
     /// walk away from it would send requests refused for a reason nothing on
     /// screen explains, so it closes itself -- see [`App::mailbox_in_reach`].
     mailbox: Option<u64>,
+
+    /// Whether the guild window is open.
+    ///
+    /// A `bool` rather than a guid, unlike the mailbox beside it: a roster is
+    /// not attached to anything in the world, needs nothing in reach, and
+    /// cannot be walked away from. That is the whole novelty of the milestone
+    /// stated as a field type.
+    guild_open: bool,
+
+    /// Which guild's invitation has already been announced in chat.
+    ///
+    /// The invitation is *state* and the line is an *event*, so something has
+    /// to stop it being said on every pump. Keyed by the guild's name rather
+    /// than by a bare flag, so a second invitation from a different guild is
+    /// announced rather than swallowed by the first one's flag.
+    guild_invitation_said: Option<String>,
     /// The taxi flight currently being flown, or `None`.
     ///
     /// **While this is `Some`, the server owns the character's position** and
@@ -3402,6 +3427,8 @@ impl App {
             questgiver: None,
             trainer: None,
             mailbox: None,
+            guild_open: false,
+            guild_invitation_said: None,
             flight: None,
             taxi: None,
             looting: None,
@@ -3943,6 +3970,22 @@ impl ApplicationHandler for App {
                             // `L` for the quest log, as 3.3.5a binds it.
                             KeyCode::KeyL => {
                                 self.quest_log_open = !self.quest_log_open;
+                                window.request_redraw();
+                                return;
+                            }
+                            // `G` for the guild roster. 3.3.5a puts it
+                            // behind the social frame's tabs; there is no
+                            // social frame here, so it gets the letter.
+                            //
+                            // Opening **asks**, rather than drawing whatever
+                            // was last said: a roster is a list of people who
+                            // are not in the world, so nothing else in this
+                            // client would ever notice it going stale.
+                            KeyCode::KeyG => {
+                                self.guild_open = !self.guild_open;
+                                if self.guild_open {
+                                    self.ask_guild();
+                                }
                                 window.request_redraw();
                                 return;
                             }
@@ -5321,6 +5364,28 @@ impl App {
                     self.send_on_channel(&ChatChannel::Party, argument);
                 }
             }
+            // `/g` mirrors `/p` exactly, including the local refusal: a
+            // guild line from a character in no guild is dropped by the
+            // server without a word, so refusing here is the only way the
+            // player finds out. Checked again on every ordinary line, because
+            // the sticky channel outlives the guild it was switched for --
+            // the same trap `/p` documents.
+            "g" | "guild" => {
+                if !self.in_guild() {
+                    self.notice("you are not in a guild.".into());
+                } else if argument.is_empty() {
+                    self.chat_channel = ChatChannel::Guild;
+                } else {
+                    self.send_on_channel(&ChatChannel::Guild, argument);
+                }
+            }
+            // The two halves of answering a guild invitation. Commands rather
+            // than a prompt frame, deliberately and with the cost stated: an
+            // invitation times out, so a chat line is weaker than the party
+            // frame's two buttons, and this is named in the milestone's
+            // not-done list rather than left to look finished.
+            "gaccept" => self.answer_guild_invitation(true),
+            "gdecline" => self.answer_guild_invitation(false),
             "s" | "say" => {
                 if argument.is_empty() {
                     self.chat_channel = ChatChannel::Say;
@@ -6686,6 +6751,90 @@ impl App {
             .is_some_and(|entity| entity.will_talk() && !entity.is_dead_or_ghost())
     }
 
+    /// Whether this character is in a guild at all.
+    ///
+    /// Read off the replicated field rather than off the stored roster,
+    /// because the roster is only there once somebody has pressed `G`: a
+    /// character who has never opened the window is still in their guild, and
+    /// keying the chat refusal off the roster would refuse the first guild
+    /// line of every session.
+    fn in_guild(&self) -> bool {
+        self.live.as_ref().is_some_and(|live| {
+            live.state
+                .get(live.guid)
+                .and_then(|player| player.fields.get(::world::update::fields::PLAYER_GUILDID))
+                .is_some_and(|id| id != 0)
+        })
+    }
+
+    /// Accepts or declines the pending guild invitation.
+    ///
+    /// **Neither request identifies anything** -- both bodies are empty and
+    /// the server resolves which guild from the invitation it recorded when
+    /// the invite went out, because a character holds one at a time. The local
+    /// record is cleared either way: it exists only so the prompt can say who
+    /// is asking, and an answered invitation has nothing left to say.
+    fn answer_guild_invitation(&mut self, accept: bool) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if live.state.guild_invitation.is_none() {
+            self.notice("nobody has asked you to join a guild.".into());
+            return;
+        }
+        let sent = if accept {
+            live.connection.guild_accept()
+        } else {
+            live.connection.guild_decline()
+        };
+        if let Err(e) = sent {
+            tracing::warn!("answering a guild invitation failed: {e:#}");
+            self.notice(format!("could not answer: {e}"));
+            return;
+        }
+        live.state.guild_invitation = None;
+        // Nothing else is said locally. **An accept is answered by
+        // `SMSG_GUILD_EVENT`** naming the join, which is the server agreeing;
+        // saying "joined" here would state as fact the thing that reply is
+        // about to answer, and a decline is silent by design.
+    }
+
+    /// Asks for the roster, and for the guild's name alongside it.
+    ///
+    /// **Two requests, because the roster does not name its own guild.**
+    /// `SMSG_GUILD_ROSTER` carries the members, the ranks' permissions and the
+    /// message of the day, and nowhere in it is the guild's id or its name --
+    /// those come from `CMSG_GUILD_QUERY`, which is answered for any guild id
+    /// at all and reaches the id through the player's own replicated
+    /// `PLAYER_GUILDID`.
+    ///
+    /// The rank *names* are in the same second packet, which is why a roster
+    /// drawn before it arrives shows rank numbers: the two halves of a row
+    /// genuinely come from two packets.
+    fn ask_guild(&mut self) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.guild_roster() {
+            tracing::warn!("asking for the guild roster failed: {e:#}");
+            self.notice(format!("could not ask for the roster: {e}"));
+            return;
+        }
+        // An absent field is a zero, and zero is "no guild" -- so this is
+        // skipped rather than sent with a zero id, which the server drops
+        // without a reply and which would look exactly like a wrong opcode.
+        let guild = live
+            .state
+            .get(live.guid)
+            .and_then(|player| player.fields.get(::world::update::fields::PLAYER_GUILDID))
+            .unwrap_or(0);
+        if guild != 0 {
+            if let Err(e) = live.connection.guild_query(guild) {
+                tracing::warn!("asking what guild {guild} is called failed: {e:#}");
+            }
+        }
+    }
+
     /// Whether this guid is a mailbox that can be opened.
     ///
     /// **The only question in this client answered by asking what an object
@@ -7477,6 +7626,10 @@ impl App {
         // gossip messages above use -- the connection is borrowed for the
         // whole loop, so nothing inside it may touch `self` again.
         let mut trainer_lists: Vec<::world::TrainerList> = Vec::new();
+        // Whether a guild event arrived that makes an open roster stale.
+        // Collected rather than acted on inside the loop for the reason every
+        // other flag here is: the connection is borrowed for the whole drain.
+        let mut refresh_guild = false;
         let mut taxi_menus: Vec<::world::TaxiMenu> = Vec::new();
         let mut refusals: Vec<u32> = Vec::new();
         // A spline the server sent for *this* character. See the arm below.
@@ -7534,6 +7687,78 @@ impl App {
                     self.chat.push(Line::Chat(local_notice(
                         "You have new mail.".to_string(),
                     )));
+                }
+
+                // **Something happened to the guild.**
+                //
+                // Said as a line and never folded into the roster, because an
+                // event says only *that* somebody signed on -- their level,
+                // zone and notes are not in it. Editing a row from one would
+                // be inventing the fields it does not carry, so the honest
+                // response is to re-ask, and the window does that when it is
+                // open.
+                //
+                // The types are named only where naming one is safe. A
+                // sign-on and a sign-off carry the member's name in their
+                // first parameter and are unambiguous; the rest print their
+                // number, the same rule `describe_cast_failure` follows.
+                for event in &report.guild_events {
+                    let who = event.params.first().map(String::as_str).unwrap_or("");
+                    let text = match event.kind {
+                        ::world::guild::GuildEventType::SIGNED_ON => {
+                            format!("{who} has come online.")
+                        }
+                        ::world::guild::GuildEventType::SIGNED_OFF => {
+                            format!("{who} has gone offline.")
+                        }
+                        ::world::guild::GuildEventType::JOINED => {
+                            format!("{who} has joined the guild.")
+                        }
+                        ::world::guild::GuildEventType::LEFT => {
+                            format!("{who} has left the guild.")
+                        }
+                        ::world::guild::GuildEventType::MOTD => who.to_string(),
+                        other => format!("guild event {other} {:?}", event.params),
+                    };
+                    self.chat.push(Line::Chat(local_notice(text)));
+                    // Re-asked rather than edited, and only while somebody is
+                    // looking: a roster nobody has open does not need to be
+                    // current, and asking on every sign-on in a large guild
+                    // would be a packet per member per login.
+                    if self.guild_open {
+                        refresh_guild = true;
+                    }
+                }
+                // What the server said about a guild request.
+                //
+                // Drawn where the player is looking, for the reason the party
+                // command result is: **the reply echoes the command**, so it
+                // is the only thing tying an answer to a question in a block
+                // where almost every request is otherwise silent.
+                for result in &report.guild_results {
+                    let text = ::world::guild::describe_command_result(
+                        result.command,
+                        result.result,
+                        &result.name,
+                    );
+                    self.chat.push(Line::Chat(local_notice(text)));
+                }
+                // Somebody has asked this character to join a guild.
+                //
+                // A line rather than a prompt frame, and the cost is real: an
+                // invitation times out, so this is weaker than the party
+                // frame's two buttons. Named in the milestone's not-done list
+                // rather than left looking finished.
+                if let Some(invite) = live.state.guild_invitation.clone() {
+                    if self.guild_invitation_said.as_deref() != Some(invite.guild.as_str()) {
+                        self.guild_invitation_said = Some(invite.guild.clone());
+                        self.chat.push(Line::Chat(local_notice(format!(
+                            "{} invites you to join {}.  /gaccept or /gdecline",
+                            invite.inviter, invite.guild
+                        ))));
+                    }
+                } else {
+                    self.guild_invitation_said = None;
                 }
 
                 // Why a cast did not happen, in the one place the player is
@@ -8005,6 +8230,21 @@ impl App {
 
         for line in party_results {
             self.chat.push(Line::Chat(local_notice(line)));
+        }
+
+        // **A guild event says a row changed and not what to.** So the
+        // answer is to ask again rather than to edit, and only while the
+        // window is open -- a roster nobody is looking at does not need to be
+        // current, and re-asking on every sign-on in a large guild would be a
+        // packet per member per login.
+        //
+        // Only the roster, not the name query beside it: the guild's name and
+        // rank names do not change when somebody logs in, and they are
+        // already cached from the first ask.
+        if refresh_guild {
+            if let Err(e) = live.connection.guild_roster() {
+                tracing::warn!("re-asking the guild roster failed: {e:#}");
+            }
         }
 
         // **Filed by guid, never accepted blindly.** Two trainers can be
@@ -9047,6 +9287,74 @@ impl App {
                 withheld: inbox.withheld(),
             }
         });
+        // The guild roster.
+        //
+        // **Every field here comes from one packet and has no second source.**
+        // A replicated player's level can be checked against their object and
+        // a party member's against theirs; a guild member who logged out on
+        // Tuesday is whatever `SMSG_GUILD_ROSTER` said, so nothing is filled
+        // in, defaulted or inferred -- including the zone, which is resolved
+        // to a name only where `AreaTable` has one and left as a number where
+        // it does not.
+        let guild: Option<ui::GuildView> = self.guild_open.then(|| {
+            let Some(live) = self.live.as_ref() else {
+                return ui::GuildView::default();
+            };
+            let Some(roster) = live.state.guild_roster.as_ref() else {
+                // Open, asked, nothing back yet. `CMSG_GUILD_ROSTER` is
+                // answered either way, so this lasts one round trip -- and a
+                // window that waited for the reply would make a slow realm
+                // look like a key press that missed.
+                return ui::GuildView::default();
+            };
+            let guild_id = live
+                .state
+                .get(live.guid)
+                .and_then(|player| player.fields.get(::world::update::fields::PLAYER_GUILDID))
+                .unwrap_or(0);
+            let info = live.state.guilds.get(&guild_id);
+            let rows = roster
+                .members
+                .iter()
+                .map(|member| ui::GuildRow {
+                    name: member.name.clone(),
+                    level: member.level,
+                    // The rank's *name* is in the other packet. Until it
+                    // arrives the number is drawn, which is honest -- a blank
+                    // column would read as a rank with no name rather than as
+                    // one not yet asked about.
+                    rank: info
+                        .and_then(|info| info.ranks.get(member.rank as usize))
+                        .cloned()
+                        .unwrap_or_else(|| format!("rank {}", member.rank)),
+                    // Exactly one of these two is ever set, because the packet
+                    // writes exactly one: the offline float is absent for a
+                    // member who is logged in.
+                    zone: member.is_online().then(|| {
+                        self.maps
+                            .area_name(member.area)
+                            .unwrap_or_else(|| format!("area {}", member.area))
+                    }),
+                    offline_days: member.offline_days,
+                    public_note: member.public_note.clone(),
+                    officer_note: member.officer_note.clone(),
+                })
+                .collect();
+            ui::GuildView {
+                name: info.map(|info| info.name.clone()).unwrap_or_default(),
+                motd: roster.motd.clone(),
+                rows,
+                // The packet says why its own column is empty: the reader's
+                // rank is on their own row and the rank's rights are in the
+                // same body, so "hidden" and "none" are separable here and
+                // are drawn differently.
+                officer_notes: match roster.officer_notes_visible(live.guid) {
+                    Some(true) => ui::OfficerNotes::Visible,
+                    Some(false) => ui::OfficerNotes::Hidden,
+                    None => ui::OfficerNotes::Unknown,
+                },
+            }
+        });
         // The attachment entries, in the same order the rows were built, so
         // the second pass can pair them up without borrowing the world again.
         let attachment_entries: Vec<Vec<u32>> = self
@@ -9584,6 +9892,7 @@ impl App {
                     questgiver: questgiver_view.as_ref(),
                     trainer: trainer.as_ref(),
                     mail: mail.as_ref(),
+                    guild: guild.as_ref(),
                     trade: trade.as_ref(),
                     trade_offer: trade_offer.as_ref(),
                     taxi: taxi_view.as_ref(),
@@ -9855,6 +10164,21 @@ impl App {
         if let Some(id) = hud_response.take_mail {
             tracing::debug!("taking everything out of mail {id}");
             self.take_mail(id);
+        }
+
+        // A guild member was clicked.
+        //
+        // **The window reports only members who are online**, and it reports
+        // a *name* rather than a row -- which is not merely safer here, it is
+        // the only handle there is: every guild request in the protocol names
+        // a player by name, and a roster guid is no use for whispering.
+        //
+        // Switching the sticky channel rather than sending anything: the
+        // click says who to talk to, not what to say, and a client that
+        // silently sent something would be inventing the message.
+        if let Some(name) = hud_response.whisper_guild_member.clone() {
+            tracing::debug!("whispering guild member {name}");
+            self.chat_channel = ChatChannel::Whisper(name);
         }
 
         // **Logged whenever the window reports anything at all**, so a click

@@ -186,6 +186,37 @@ pub enum Error {
         announced: u16,
         actual: usize,
     },
+
+    /// The roster's two counts and the body disagree before a record is read.
+    ///
+    /// Both counts are `u32` and both sit behind two variable-length strings,
+    /// so a header read one string out of place asks for gigabytes of
+    /// records. The same guard the vendor, trainer and mail lists carry, and
+    /// the one that matters most here because the member record's minimum
+    /// size is the *online* one -- the short branch.
+    #[error(
+        "SMSG_GUILD_ROSTER: {members} members and {ranks} ranks need at least {expected} bytes          but the body has {got} left -- the counts are not where this parser thinks"
+    )]
+    GuildRosterCounts {
+        members: u32,
+        ranks: u32,
+        expected: usize,
+        got: usize,
+    },
+
+    /// `SMSG_GUILD_QUERY_RESPONSE` named more ranks than the ten it wrote
+    /// names for.
+    ///
+    /// The count arrives *after* the fixed array of ten, so it is the one
+    /// number in that packet that can be checked against something already
+    /// read. A value above ten means the ten strings were not where this
+    /// parser thinks, which is the only way the emblem words can be wrong
+    /// without anything else complaining.
+    #[error(
+        "SMSG_GUILD_QUERY_RESPONSE: {got} ranks, but the packet writes exactly {} names",
+        crate::guild::MAX_RANKS
+    )]
+    GuildRankCount { got: u32 },
 }
 
 /// A bounds-checked cursor over a packet body.

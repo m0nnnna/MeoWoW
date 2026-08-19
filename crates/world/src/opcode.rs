@@ -739,6 +739,92 @@ pub enum ClientOpcode {
     /// "walk to a mailbox" -- and it names at most two senders, because the
     /// server stops after two. See [`crate::mail::NextMailTime`].
     QueryNextMailTime = 0x0284,
+
+    /// Ask what a guild is called. Body is the guild id, four bytes.
+    ///
+    /// **Answered for any guild id, by any character, in or out of a guild**
+    /// -- the guild block's counterpart to `CMSG_QUEST_QUERY`, and the only
+    /// request here that can name a guild this character has nothing to do
+    /// with. A zero id is dropped without a reply, which is the one input that
+    /// makes a silence mean something other than a wrong opcode.
+    GuildQuery = 0x0054,
+
+    /// Ask somebody to join. Body is their name, and the request is silent on
+    /// success at the sender -- what arrives is `SMSG_GUILD_INVITE` at
+    /// *them*, which is [`crate::trade`]'s shape: the effect of a request is
+    /// visible at the other end.
+    ///
+    /// It is not entirely silent, though, and that is what makes it usable
+    /// alone: every refusal is a
+    /// [`COMMAND_RESULT`](server::GUILD_COMMAND_RESULT) naming
+    /// [`GuildCommand::INVITE`](crate::guild::GuildCommand::INVITE), and a
+    /// success is one too.
+    GuildInvite = 0x0082,
+
+    /// Accept the pending invitation. **Empty body** -- the server resolves
+    /// which guild from the invitation it recorded, so there is nothing to
+    /// name. See [`crate::guild::GuildInvitation`].
+    GuildAccept = 0x0084,
+
+    /// Decline the pending invitation. Empty body, and entirely silent: the
+    /// server clears its own record and tells nobody, including the inviter.
+    GuildDecline = 0x0085,
+
+    /// Ask for the guild's summary -- name, founding date, member and account
+    /// counts. Empty body. See [`crate::guild::GuildSummary`].
+    GuildInfo = 0x0087,
+
+    /// Ask for the roster. **Empty body, and answered either way**, which is
+    /// what bounds the rest of this block: sent by a character in no guild it
+    /// comes back as a
+    /// [`COMMAND_RESULT`](server::GUILD_COMMAND_RESULT) rather than as
+    /// silence, so one send from a character with no fixture at all confirms
+    /// this number and that packet's layout together.
+    GuildRoster = 0x0089,
+
+    /// Move a member up one rank. Body is their name.
+    ///
+    /// **A name and not a guid**, so it reaches a member who has been offline
+    /// for a month and whom this client has never replicated. See
+    /// [`crate::guild::named_player_body`].
+    GuildPromote = 0x008B,
+
+    /// Move a member down one rank. Body is their name.
+    GuildDemote = 0x008C,
+
+    /// Leave the guild. Empty body.
+    ///
+    /// **Refused for the guild master**, with the result code that also means
+    /// "you do not have permission" -- see
+    /// [`GuildResult::PERMISSIONS_OR_LEADER_LEAVE`](crate::guild::GuildResult::PERMISSIONS_OR_LEADER_LEAVE).
+    GuildLeave = 0x008D,
+
+    /// Remove somebody else. Body is their name.
+    GuildRemove = 0x008E,
+
+    /// Disband the guild. Empty body, guild master only, and irreversible --
+    /// which is why nothing in this client's interface sends it.
+    GuildDisband = 0x008F,
+
+    /// Hand the guild to somebody else. Body is their name.
+    GuildLeader = 0x0090,
+
+    /// Set the message of the day. Body is the text.
+    GuildMotd = 0x0091,
+
+    /// Set a member's public note. `{cstring member, cstring note}`.
+    GuildSetPublicNote = 0x0234,
+
+    /// Set a member's officer note. Same body as
+    /// [`GuildSetPublicNote`](Self::GuildSetPublicNote) exactly, and a
+    /// different number -- see [`crate::guild::member_note_body`], which is
+    /// the one place both are built, because two copies of a layout that must
+    /// agree is precisely the drift this project defines structures once to
+    /// avoid.
+    GuildSetOfficerNote = 0x0235,
+
+    /// Set the longer information text. Body is the text.
+    GuildInfoText = 0x02FC,
 }
 
 /// The server-to-client opcodes this client reacts to.
@@ -906,6 +992,43 @@ pub mod server {
     /// Which mailbox the server has just opened, when one was reached through
     /// a gossip menu. Eight bytes, the object's guid.
     pub const SHOW_MAILBOX: u16 = 0x0297;
+
+    /// A guild's name, rank names and tabard, in answer to
+    /// [`GuildQuery`](crate::ClientOpcode::GuildQuery).
+    ///
+    /// **Ten rank names always travel** and the count saying how many are real
+    /// arrives after them and after the tabard. See [`crate::guild`].
+    pub const GUILD_QUERY_RESPONSE: u16 = 0x0055;
+
+    /// Somebody has asked this character to join their guild. Two names and no
+    /// guid at all. See [`crate::guild::GuildInvitation`].
+    pub const GUILD_INVITE: u16 = 0x0083;
+
+    /// The guild's summary -- name, founding date, member and account counts.
+    /// See [`crate::guild::GuildSummary`], and note the date is a *calendar
+    /// reading* rather than a timestamp.
+    pub const GUILD_INFO: u16 = 0x0088;
+
+    /// The whole roster: motd, information text, the rank table and every
+    /// member.
+    ///
+    /// **The member record's four-byte offline field exists only for members
+    /// who are offline**, which is a conditional layout in the middle of a
+    /// variable-length record inside a list. See [`crate::guild`] for why the
+    /// fixture that can refute it has to hold both kinds of member.
+    pub const GUILD_ROSTER: u16 = 0x008A;
+
+    /// Something happened to the guild -- a sign-on, a promotion, a new motd.
+    ///
+    /// The only push in the block, and the reason the roster is not polled.
+    /// Its trailing guid is conditional on the event type. See
+    /// [`crate::guild::GuildEvent`].
+    pub const GUILD_EVENT: u16 = 0x0092;
+
+    /// What the server said about a guild request. **Echoes the command it is
+    /// about**, which is what ties an answer to a question, and is what bounds
+    /// every silent request in this block. See [`crate::guild::CommandResult`].
+    pub const GUILD_COMMAND_RESULT: u16 = 0x0093;
 
     /// What mark belongs over one NPC's head, in answer to
     /// [`QuestgiverStatusQuery`](crate::ClientOpcode::QuestgiverStatusQuery).
@@ -1275,6 +1398,12 @@ pub fn describe(opcode: u16) -> String {
         server::GROUP_CANCEL => "SMSG_GROUP_CANCEL",
         server::GROUP_DECLINE => "SMSG_GROUP_DECLINE",
         server::GROUP_SET_LEADER => "SMSG_GROUP_SET_LEADER",
+        server::GUILD_QUERY_RESPONSE => "SMSG_GUILD_QUERY_RESPONSE",
+        server::GUILD_INVITE => "SMSG_GUILD_INVITE",
+        server::GUILD_INFO => "SMSG_GUILD_INFO",
+        server::GUILD_ROSTER => "SMSG_GUILD_ROSTER",
+        server::GUILD_EVENT => "SMSG_GUILD_EVENT",
+        server::GUILD_COMMAND_RESULT => "SMSG_GUILD_COMMAND_RESULT",
         // Understood as movement without this client caring which movement it
         // is: every one of them is a position for a mover, and that is all it
         // does with them. The number stays visible so a log still says which.

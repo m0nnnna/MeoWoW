@@ -41,7 +41,7 @@ pub use frames::combat_text::{CombatTextKind, FloatingText};
 pub use frames::{
     CastBarView, InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
     QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
-    MailAttachment, MailRow, MailRowState, MailView,
+    GuildRow, GuildView, MailAttachment, MailRow, MailRowState, OfficerNotes, MailView,
     MapMarker, MapPatch, MapView, MarkerKind, MinimapTile, MinimapView, QuestgiverView,
     SpellbookEntry, TaxiRow, TaxiView, TradeClick, TradeOfferAnswer, TradeOfferView,
     TradeSquare, TradeSquareItem, TradeView, TrainerRow, TrainerRowState, TrainerView, UnitView,
@@ -174,6 +174,13 @@ pub struct HudData<'a> {
     /// mailbox that opened onto nothing at all would read as a request that
     /// failed rather than as a mailbox with nothing in it.
     pub mail: Option<&'a frames::MailView>,
+    /// The open guild window, or `None`.
+    ///
+    /// **`None` means the window is closed**, and it is not the same as being
+    /// in no guild, which is a `GuildView` with no rows and a title saying so.
+    /// Three states, because the roster has three: never asked, asked and
+    /// answered with a refusal, asked and answered with members.
+    pub guild: Option<&'a frames::GuildView>,
     /// The open trade window, or `None`. Existence is the flag, as it is for
     /// every other window that appears because something happened.
     ///
@@ -232,7 +239,13 @@ pub struct HudData<'a> {
 }
 
 /// What the user did to the interface this frame.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`: a guild row reports the member's **name**, because that
+/// is the only handle every guild request accepts. Worth the note, since the
+/// derive was load-bearing nowhere and the alternative -- reporting a row
+/// position and looking the name up again in the caller -- is the mistake this
+/// whole struct is shaped to avoid.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HudResponse {
     /// `(bar, slot)` of an action slot that was clicked with nothing held --
     /// the request to actually *use* what is in it.
@@ -306,6 +319,16 @@ pub struct HudResponse {
     /// mean there is *delete*, and deleting is irreversible with no
     /// confirmation anywhere in this interface.
     pub take_mail: Option<u32>,
+    /// A guild member was clicked, reported as their **name** rather than as
+    /// the row's position -- and here the name is not merely safer, it is the
+    /// only handle there is: every guild request in the protocol identifies a
+    /// player by name, and the roster's own guids are useless for whispering.
+    ///
+    /// Only ever set for a member who is **online**. A whisper to somebody who
+    /// is not logged in is refused by the server with a line this client would
+    /// then have to explain, so the row is inert -- the same decision the
+    /// trainer window makes about a spell you cannot learn.
+    pub whisper_guild_member: Option<String>,
     /// A party row was clicked, reported as the member's **guid** rather than
     /// as the row's position -- the same reasoning as [`Self::selected_quest`]
     /// carrying a quest id. The list is rebuilt from every group list the
@@ -646,6 +669,7 @@ impl Hud {
             let trainer_placeholder;
             let taxi_placeholder;
             let mail_placeholder;
+            let guild_placeholder;
             let world_map_placeholder;
             let minimap_placeholder;
             let release_prompt_placeholder;
@@ -763,6 +787,14 @@ impl Hud {
                     None if editing => {
                         mail_placeholder = frames::mail::placeholder();
                         Content::Mail(&mail_placeholder)
+                    }
+                    None => continue,
+                },
+                ElementId::Guild => match data.guild {
+                    Some(view) => Content::Guild(view),
+                    None if editing => {
+                        guild_placeholder = frames::guild::placeholder();
+                        Content::Guild(&guild_placeholder)
                     }
                     None => continue,
                 },
@@ -898,6 +930,9 @@ impl Hud {
                 Content::Mail(view) => {
                     frames::mail::size(view.rows.len(), &style, element.scale)
                 }
+                Content::Guild(view) => {
+                    frames::guild::size(view.rows.len(), &style, element.scale)
+                }
                 Content::Taxi(view) => {
                     frames::taxi::size(view.rows.len(), &style, element.scale)
                 }
@@ -999,6 +1034,7 @@ impl Hud {
                             | Content::Questgiver(_)
                             | Content::Trainer(_)
                             | Content::Mail(_)
+                            | Content::Guild(_)
                             | Content::Taxi(_)
                             | Content::Trade(_)
                             | Content::TradeOffer(_)
@@ -1108,6 +1144,13 @@ impl Hud {
                             element.scale,
                         ),
                         Content::Mail(view) => frames::mail::draw(
+                            &painter,
+                            response.rect,
+                            view,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Guild(view) => frames::guild::draw(
                             &painter,
                             response.rect,
                             view,
@@ -1367,6 +1410,29 @@ impl Hud {
                             ) {
                                 response_out.learn_spell =
                                     view.rows.get(row).map(|row| row.spell);
+                            }
+                        }
+                    }
+                }
+                (false, Content::Guild(view)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            // `row_at` answers only for members who are
+                            // logged in. A hit test that answered for every
+                            // row would open a whisper to somebody who cannot
+                            // hear it, which reads as a bug in chat rather
+                            // than one in the roster -- and would look
+                            // perfectly correct until somebody clicked a name
+                            // in grey.
+                            if let Some(row) = frames::guild::row_at(
+                                drawn_rect,
+                                &view.rows,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                response_out.whisper_guild_member =
+                                    view.rows.get(row).map(|row| row.name.clone());
                             }
                         }
                     }
@@ -1776,6 +1842,13 @@ impl Hud {
                             &style,
                             scale,
                         ),
+                        ElementId::Guild => frames::guild::size(
+                            data.guild
+                                .map(|view| view.rows.len())
+                                .unwrap_or_else(|| frames::guild::placeholder().rows.len()),
+                            &style,
+                            scale,
+                        ),
                         ElementId::Loot => frames::loot::size(
                             data.loot
                                 .map(|rows| rows.len())
@@ -1865,6 +1938,7 @@ enum Content<'a> {
     Questgiver(&'a frames::QuestgiverView),
     Trainer(&'a frames::TrainerView),
     Mail(&'a frames::MailView),
+    Guild(&'a frames::GuildView),
     Trade(&'a frames::TradeView),
     TradeOffer(&'a frames::TradeOfferView),
     Taxi(&'a frames::TaxiView),
@@ -2932,6 +3006,92 @@ mod tests {
             empty.take_mail, None,
             "a click on an emptied letter must send nothing -- the only other \
              thing it could mean is a delete nobody confirmed"
+        );
+    }
+
+    /// **Clicking an online guild member opens a whisper; clicking an offline
+    /// one does nothing.**
+    ///
+    /// The `Sense::click()` check every window here needs -- a frame left out
+    /// of that one `matches!` draws, hit-tests and silently never reports --
+    /// plus the half specific to this window.
+    ///
+    /// Both halves are asserted deliberately. A hit test that answered for
+    /// every row passes the first alone, and what it ships is a whisper aimed
+    /// at somebody who is not logged in: refused by the server with a line
+    /// this client would then have to explain, and looking like a bug in chat
+    /// rather than one in the roster.
+    ///
+    /// And the **name** is reported rather than the row, which is not merely
+    /// safer here but necessary -- every guild request in the protocol
+    /// identifies a player by name, and the roster's guids are no use for
+    /// whispering. The online member sits at position 1, so a window reporting
+    /// a position would name the wrong person.
+    #[test]
+    fn clicking_a_guild_member_whispers_them_and_only_when_they_are_online() {
+        let view = frames::GuildView {
+            name: "Cat Herders".into(),
+            motd: "Mice are for sharing.".into(),
+            officer_notes: frames::OfficerNotes::Visible,
+            rows: vec![
+                frames::GuildRow {
+                    name: "Huntertest".into(),
+                    level: 2,
+                    rank: "Veteran".into(),
+                    zone: None,
+                    offline_days: Some(1.66),
+                    public_note: "has a gun".into(),
+                    officer_note: "do not delete".into(),
+                },
+                frames::GuildRow {
+                    name: "Testwolf".into(),
+                    level: 5,
+                    rank: "Guild Master".into(),
+                    zone: Some("Elwynn Forest".into()),
+                    offline_days: None,
+                    public_note: String::new(),
+                    officer_note: "knows where the mailbox is".into(),
+                },
+            ],
+        };
+        let data = HudData {
+            guild: Some(&view),
+            ..Default::default()
+        };
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::Guild);
+        let rect = element.rect(
+            screen(),
+            frames::guild::size(view.rows.len(), &hud.profile.style, element.scale),
+        );
+        let centres: Vec<egui::Pos2> =
+            frames::guild::row_rects(rect, view.rows.len(), &hud.profile.style, element.scale)
+                .map(|row| row.center())
+                .collect();
+
+        let online = drive(
+            &mut hud,
+            &data,
+            &click_script(centres[1], egui::PointerButton::Primary),
+        );
+        assert_eq!(
+            online.whisper_guild_member.as_deref(),
+            Some("Testwolf"),
+            "a click on the member who is logged in must name them, not their row"
+        );
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let offline = drive(
+            &mut hud,
+            &data,
+            &click_script(centres[0], egui::PointerButton::Primary),
+        );
+        assert_eq!(
+            offline.whisper_guild_member, None,
+            "a click on a member who logged out days ago must send nothing"
         );
     }
 
@@ -4204,6 +4364,11 @@ mod tests {
             ),
             ElementId::Mailbox => frames::mail::size(
                 frames::mail::placeholder().rows.len(),
+                &profile.style,
+                scale,
+            ),
+            ElementId::Guild => frames::guild::size(
+                frames::guild::placeholder().rows.len(),
                 &profile.style,
                 scale,
             ),

@@ -1243,6 +1243,106 @@ impl Connection {
         self.send(ClientOpcode::GroupInvite, &body)
     }
 
+    /// Asks for the guild roster. See [`ClientOpcode::GuildRoster`].
+    ///
+    /// **The one request in this block that is answered whether or not it can
+    /// work**, which is what bounds the silent ones: sent by a character in no
+    /// guild it returns a
+    /// [`CommandResult`](crate::guild::CommandResult) rather than nothing.
+    pub fn guild_roster(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::GuildRoster, &[])
+    }
+
+    /// Asks what a guild is called, by id. Answers for any guild.
+    pub fn guild_query(&mut self, guild_id: u32) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::GuildQuery,
+            &crate::guild::guild_query_body(guild_id),
+        )
+    }
+
+    /// Asks for the guild's summary -- name, founding date, counts.
+    pub fn guild_info(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::GuildInfo, &[])
+    }
+
+    /// Asks a player to join, by name.
+    pub fn guild_invite(&mut self, name: &str) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::GuildInvite,
+            &crate::guild::named_player_body(name),
+        )
+    }
+
+    /// Accepts the pending guild invitation. Nothing identifies which, because
+    /// a character can hold only one -- the same shape as
+    /// [`Connection::group_accept`], and here the body is genuinely empty
+    /// rather than a zero word.
+    pub fn guild_accept(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::GuildAccept, &[])
+    }
+
+    /// Declines the pending guild invitation.
+    pub fn guild_decline(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::GuildDecline, &[])
+    }
+
+    /// Leaves the guild. Refused for the guild master.
+    pub fn guild_leave(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::GuildLeave, &[])
+    }
+
+    /// Moves a member up one rank, by name.
+    pub fn guild_promote(&mut self, name: &str) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::GuildPromote,
+            &crate::guild::named_player_body(name),
+        )
+    }
+
+    /// Moves a member down one rank, by name.
+    pub fn guild_demote(&mut self, name: &str) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::GuildDemote,
+            &crate::guild::named_player_body(name),
+        )
+    }
+
+    /// Throws a member out, by name.
+    pub fn guild_remove(&mut self, name: &str) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::GuildRemove,
+            &crate::guild::named_player_body(name),
+        )
+    }
+
+    /// Sets the message of the day.
+    pub fn guild_motd(&mut self, text: &str) -> Result<(), Error> {
+        self.send(ClientOpcode::GuildMotd, &crate::guild::text_body(text))
+    }
+
+    /// Sets the longer information text.
+    pub fn guild_info_text(&mut self, text: &str) -> Result<(), Error> {
+        self.send(ClientOpcode::GuildInfoText, &crate::guild::text_body(text))
+    }
+
+    /// Sets a member's public note.
+    pub fn guild_set_public_note(&mut self, member: &str, note: &str) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::GuildSetPublicNote,
+            &crate::guild::member_note_body(member, note),
+        )
+    }
+
+    /// Sets a member's officer note. Identical body to
+    /// [`Connection::guild_set_public_note`] and a different opcode.
+    pub fn guild_set_officer_note(&mut self, member: &str, note: &str) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::GuildSetOfficerNote,
+            &crate::guild::member_note_body(member, note),
+        )
+    }
+
     /// Accepts the pending invite. Nothing identifies *which* invite because a
     /// character can hold only one.
     pub fn group_accept(&mut self) -> Result<(), Error> {

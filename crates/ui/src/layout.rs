@@ -55,10 +55,11 @@ pub enum ElementId {
     Trade,
     TradeOffer,
     Mailbox,
+    Guild,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 23] = [
+    pub const ALL: [ElementId; 24] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -82,6 +83,7 @@ impl ElementId {
         ElementId::Trade,
         ElementId::TradeOffer,
         ElementId::Mailbox,
+        ElementId::Guild,
     ];
 
     /// What order the frames are drawn in, lowest first.
@@ -110,7 +112,11 @@ impl ElementId {
             ElementId::Spellbook
             | ElementId::Bags
             | ElementId::Character
-            | ElementId::QuestLog => 1,
+            | ElementId::QuestLog
+            // A panel rather than an answer to something: the guild
+            // window is opened with a key and read at leisure, and
+            // nobody is waiting on it. Same rank as the quest log.
+            | ElementId::Guild => 1,
             ElementId::PlayerFrame
             | ElementId::TargetFrame
             | ElementId::ChatFrame
@@ -240,6 +246,7 @@ impl ElementId {
             ElementId::Trade => "trade",
             ElementId::TradeOffer => "trade-offer",
             ElementId::Mailbox => "mailbox",
+            ElementId::Guild => "guild",
         }
     }
 
@@ -273,6 +280,7 @@ impl ElementId {
             ElementId::Trade => "Trade",
             ElementId::TradeOffer => "Trade offer",
             ElementId::Mailbox => "Mailbox",
+            ElementId::Guild => "Guild",
         }
     }
 
@@ -517,6 +525,22 @@ impl ElementId {
             ElementId::Mailbox => Element {
                 anchor: Anchor::Center,
                 offset: [280.0, 210.0],
+                ..Default::default()
+            },
+            // Under the minimap and the quest log, against the right edge.
+            //
+            // **Both constraints came from tests rather than from taste.**
+            // The middle of the screen is taken by the loot and trade windows
+            // and a roster is read while standing still -- which is exactly
+            // when a corpse or a trade is open -- so a centred default
+            // overlapped one or the other. And anchoring to the *edge* rather
+            // than to the centre is what keeps it on a 1024-wide screen: a
+            // centre offset large enough to clear the middle at 1920 puts a
+            // 400-pixel window off the edge at 1024, where a first-time user
+            // has no visible way to drag it back.
+            ElementId::Guild => Element {
+                anchor: Anchor::TopRight,
+                offset: [-24.0, 220.0],
                 ..Default::default()
             },
         }

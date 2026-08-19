@@ -1062,6 +1062,23 @@ pub struct Replication {
     /// here so a probe can say "the request was answered" separately from
     /// "the inbox is empty", which are the same picture and different facts.
     pub inboxes: usize,
+    /// Rosters described this batch. Counted for the same reason inboxes are:
+    /// "the request was answered" and "the guild has one member" are the same
+    /// picture and different facts.
+    pub rosters: usize,
+    /// What the server said about the guild requests this client sent.
+    ///
+    /// Events, and the block's only tie between an answer and a question --
+    /// the result echoes the command, so a promote, a demote and a removal do
+    /// not collapse into one indistinguishable silence.
+    pub guild_results: Vec<crate::guild::CommandResult>,
+    /// Guild events pushed this batch -- sign-ons, promotions, a new motd.
+    ///
+    /// Handed back rather than folded in, because acting on one means asking
+    /// for the roster again: the event says *that* somebody signed on and
+    /// nothing else about them, so editing a row from it would be inventing
+    /// the fields it does not carry.
+    pub guild_events: Vec<crate::guild::GuildEvent>,
     /// Ticks of drowning, falling, lava or slime damage this batch.
     ///
     /// Returned rather than stored, unlike the mirror timers next to them,
@@ -1327,6 +1344,35 @@ pub struct WorldState {
     /// by opening a mailbox: a mailbox with fifty letters in it and one unread
     /// is still a mailbox with something unread.
     pub mail_waiting: bool,
+
+    /// The guild roster, as last described.
+    ///
+    /// **A snapshot of people who are mostly not in the world**, and the one
+    /// piece of state in this crate with no second source at all. A replicated
+    /// player can be checked against their object; a party member against
+    /// theirs where one exists. A guild member who logged out on Tuesday is
+    /// whatever this packet said and nothing else, so it is stored exactly as
+    /// parsed and re-asked rather than edited.
+    ///
+    /// `None` means *never asked*, which is not the same as a guild with no
+    /// members and is not the same as being in no guild -- three states, and
+    /// the interface draws all three differently.
+    pub guild_roster: Option<crate::guild::Roster>,
+
+    /// The guild's name, ranks and tabard, keyed by guild id.
+    ///
+    /// Separate from the roster because it answers for **any** guild, not just
+    /// this character's: a replicated player carries a guild id, and this is
+    /// what turns that number into a name. Small, so it is kept for the
+    /// session rather than for one window.
+    pub guilds: std::collections::HashMap<u32, crate::guild::GuildInfo>,
+
+    /// The pending guild invitation, if somebody has asked.
+    ///
+    /// Carries two names and identifies nothing, so accepting it needs no
+    /// stored handle -- it is held because the prompt has to say who is
+    /// asking, not because the answer needs it.
+    pub guild_invitation: Option<crate::guild::GuildInvitation>,
 }
 
 impl WorldState {
@@ -2959,6 +3005,71 @@ impl WorldState {
                 crate::opcode::server::QUERY_NEXT_MAIL_TIME => {
                     match crate::mail::parse_next_mail_time(&packet.body) {
                         Ok(next) => self.mail_waiting = next.has_unread(),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::GUILD_ROSTER => {
+                    match crate::guild::parse_roster(&packet.body) {
+                        Ok(roster) => {
+                            report.rosters += 1;
+                            self.guild_roster = Some(roster);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::GUILD_QUERY_RESPONSE => {
+                    match crate::guild::parse_guild_info(&packet.body) {
+                        Ok(info) => {
+                            self.guilds.insert(info.id, info);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::GUILD_COMMAND_RESULT => {
+                    match crate::guild::parse_command_result(&packet.body) {
+                        Ok(result) => report.guild_results.push(result),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::GUILD_EVENT => {
+                    match crate::guild::parse_guild_event(&packet.body) {
+                        Ok(event) => {
+                            // A disband is the one event that is also a fact
+                            // about this client's own state, and the only one
+                            // acted on here: everything else says a row
+                            // changed without saying what to, so the honest
+                            // response is to re-ask rather than to edit.
+                            if event.kind == crate::guild::GuildEventType::DISBANDED {
+                                self.guild_roster = None;
+                            }
+                            report.guild_events.push(event);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::GUILD_INVITE => {
+                    match crate::guild::parse_guild_invite(&packet.body) {
+                        Ok(invite) => self.guild_invitation = Some(invite),
                         Err(error) => report.failures.push((
                             packet.opcode,
                             error,

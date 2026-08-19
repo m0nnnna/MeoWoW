@@ -1114,6 +1114,34 @@ pub mod fields {
     /// `0x02070503` -- which pins the byte *order* as well as the index, since
     /// any other packing would have matched nothing.
     pub const PLAYER_BYTES: u16 = 0x99;
+
+    /// Which guild this character belongs to, or `0`/absent for none.
+    ///
+    /// **The roster does not carry the guild's id**, which is the reason this
+    /// field matters rather than being a curiosity: `SMSG_GUILD_ROSTER` lists
+    /// a guild's members and never names the guild, so the only route from
+    /// "this character is in a guild" to "the guild is called X" runs through
+    /// here and then through `CMSG_GUILD_QUERY`.
+    ///
+    /// It is also the field that puts a guild name under *another* player's
+    /// name plate, because every replicated player carries it and the query
+    /// answers for any guild id at all.
+    ///
+    /// Placed by the enum's own ordering between
+    /// [`PLAYER_GHOST`](Self::PLAYER_GHOST) (`PLAYER_FLAGS`, `0x96`) and
+    /// [`PLAYER_BYTES`](Self::PLAYER_BYTES) (`0x99`), which is a prediction
+    /// and not a measurement -- and measured the way every field here is, by
+    /// reading it off a character whose guild the realm's own database states
+    /// independently. See `wow-cli world --guild`.
+    pub const PLAYER_GUILDID: u16 = 0x97;
+
+    /// Which rank within that guild, as an index into the roster's rank block
+    /// and into `SMSG_GUILD_QUERY_RESPONSE`'s names. `0` is the guild master.
+    ///
+    /// Redundant with the reader's own row on the roster, and it is the
+    /// redundancy that makes it worth reading: the two arrive by unrelated
+    /// routes and must agree, which is the check that confirms both.
+    pub const PLAYER_GUILDRANK: u16 = 0x98;
     /// Facial hair in the low byte; the rest is bank slots and rest state,
     /// which this client does not read.
     ///
