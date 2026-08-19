@@ -57,10 +57,11 @@ pub enum ElementId {
     Mailbox,
     Guild,
     Auction,
+    Tracker,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 25] = [
+    pub const ALL: [ElementId; 26] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -86,6 +87,7 @@ impl ElementId {
         ElementId::Mailbox,
         ElementId::Guild,
         ElementId::Auction,
+        ElementId::Tracker,
     ];
 
     /// What order the frames are drawn in, lowest first.
@@ -134,6 +136,13 @@ impl ElementId {
             // And the minimap with them: it is never opened and never
             // closed, and a panel that covered it would be hiding the
             // one frame that says where you are.
+            // And the tracker with them, for the reason that decided the
+            // minimap: it is never opened and never closed, so a panel
+            // covering it would be hiding the frame that says what to do
+            // next. Above the map deliberately -- the map is the thing you
+            // open to find out where an objective is, and covering the list
+            // of objectives to do it would be a joke.
+            | ElementId::Tracker
             | ElementId::Minimap => 2,
             ElementId::Loot
             | ElementId::Questgiver
@@ -255,6 +264,7 @@ impl ElementId {
             ElementId::Mailbox => "mailbox",
             ElementId::Guild => "guild",
             ElementId::Auction => "auction",
+            ElementId::Tracker => "tracker",
         }
     }
 
@@ -290,6 +300,7 @@ impl ElementId {
             ElementId::Mailbox => "Mailbox",
             ElementId::Guild => "Guild",
             ElementId::Auction => "Auction house",
+            ElementId::Tracker => "Objective tracker",
         }
     }
 
@@ -547,9 +558,17 @@ impl ElementId {
             // centre offset large enough to clear the middle at 1920 puts a
             // 400-pixel window off the edge at 1024, where a first-time user
             // has no visible way to drag it back.
+            // **Moved inboard when the objective tracker arrived**, which is
+            // the same trade the quest log made when the minimap took the
+            // corner: a frame that is simply *there* outranks one somebody
+            // opens, and the spot directly under the minimap is the one every
+            // player of this game already looks at. So the roster keeps the
+            // right edge's reasoning -- an edge anchor, clear of the middle --
+            // one column further in, and is raised to sit between the quest
+            // log above it and the trade window below.
             ElementId::Guild => Element {
                 anchor: Anchor::TopRight,
-                offset: [-24.0, 220.0],
+                offset: [-280.0, 185.0],
                 ..Default::default()
             },
             // The widest window here, so it anchors to the left edge rather
@@ -569,6 +588,27 @@ impl ElementId {
             ElementId::Auction => Element {
                 anchor: Anchor::Center,
                 offset: [0.0, 0.0],
+                ..Default::default()
+            },
+            // Directly under the minimap, in the right-hand column, because
+            // that is where every client with a tracker puts one and therefore
+            // where a player will look for it. It cost the guild window its
+            // default spot; see that entry for why an always-there frame wins
+            // that argument.
+            //
+            // **It grows downward towards the spellbook's default, and will
+            // reach it with five quests.** That is stated rather than solved:
+            // there is no 340-pixel column free anywhere in this layout, and
+            // the alternative -- a default nobody can find -- is worse than
+            // one that overlaps a window somebody opened. The stacking order
+            // is what makes it safe, since `Tracker` sits with the
+            // always-there frames and the spellbook with the panels, so the
+            // tracker is drawn over it and keeps its clicks. Anyone who
+            // dislikes the arrangement drags it, which is the entire point of
+            // the layout file.
+            ElementId::Tracker => Element {
+                anchor: Anchor::TopRight,
+                offset: [-24.0, 220.0],
                 ..Default::default()
             },
         }

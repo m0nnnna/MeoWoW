@@ -136,6 +136,7 @@ impl Minimap {
         title: Option<&str>,
         range: f32,
         objectives: &[Objective<'_>],
+        givers: &[crate::maps::QuestgiverPin],
         party: &[PartyMemberPin],
     ) -> ui::MinimapView {
         if let Some(title) = title.filter(|t| !t.is_empty()) {
@@ -213,6 +214,26 @@ impl Minimap {
                     },
                 });
             }
+        }
+        // **No map test, unlike an objective's.** A remembered questgiver was
+        // filtered to the continent by its caller, which is where the map id
+        // lives; here every pin is already on this map, and the frame drops
+        // whatever falls outside the disc. The caller does that filtering
+        // because a questgiver cache holds every continent at once and this
+        // loop would otherwise walk the whole of it every frame.
+        for pin in givers {
+            let (u, v) = project(pin.x, pin.y);
+            markers.push(ui::MapMarker {
+                u,
+                v,
+                facing: 0.0,
+                kind: ui::MarkerKind::Questgiver {
+                    turn_in: pin.turn_in,
+                    live: pin.live,
+                },
+                label: pin.label.clone(),
+                outline: Vec::new(),
+            });
         }
         for pin in party {
             let (u, v) = project(pin.x, pin.y);

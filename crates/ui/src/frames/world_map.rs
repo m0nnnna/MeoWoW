@@ -56,6 +56,22 @@ pub enum MarkerKind {
     /// only shows on hover: knowing *which* member a dot is is the entire
     /// point of a party's dots existing at all.
     PartyMember,
+    /// A questgiver this character has walked past that had something over its
+    /// head. Drawn as a diamond -- not a circle, because it is not an
+    /// objective, and not the literal `!` the world uses, because a glyph the
+    /// size of a map pin is unreadable.
+    ///
+    /// **Both flags exist to stop this pin claiming more than it knows.**
+    ///
+    /// - `turn_in` separates a `?` from a `!`: a quest to hand in and a quest
+    ///   to take send the player to the same place for opposite reasons.
+    /// - `live` separates a mark refreshed this session by an NPC actually in
+    ///   range from one **remembered** out of a cache. Every pin on a zone the
+    ///   player is not standing in is the second kind, and three things may
+    ///   have changed since it was recorded -- the quest log, the creature,
+    ///   and whether it is even still there. A remembered pin is therefore
+    ///   drawn faded, and its label says when it was seen.
+    Questgiver { turn_in: bool, live: bool },
 }
 
 /// Something drawn on top of the page.
@@ -303,6 +319,35 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MapView, style: &Style, scale:
                     );
                 }
             }
+            MarkerKind::Questgiver { turn_in, live } => {
+                let colour: Color32 = style.world_map_questgiver.into();
+                // Faded rather than a different hue: a memory is the *same*
+                // claim held less firmly, and a second colour would read as a
+                // different kind of thing.
+                let colour = if live {
+                    colour
+                } else {
+                    colour.gamma_multiply(style.world_map_remembered)
+                };
+                // A diamond for "take this" and a smaller one inside it for
+                // "hand this in", which is the one distinction that has to
+                // survive being four pixels across.
+                let half = pin * 0.6;
+                let diamond = vec![
+                    at + Vec2::new(0.0, -half),
+                    at + Vec2::new(half, 0.0),
+                    at + Vec2::new(0.0, half),
+                    at + Vec2::new(-half, 0.0),
+                ];
+                clipped.add(egui::Shape::convex_polygon(
+                    diamond,
+                    colour,
+                    Stroke::new(scale.max(1.0), style.world_map_outline),
+                ));
+                if turn_in {
+                    clipped.circle_filled(at, half * 0.35, style.world_map_outline);
+                }
+            }
             MarkerKind::Player => {
                 // An arrow rather than a dot: the heading is the half of "you
                 // are here" a dot cannot say.
@@ -404,6 +449,68 @@ mod tests {
                 "aspect {ratio} at scale {scale}"
             );
         }
+    }
+
+    /// **A remembered pin must not look like a live one.**
+    ///
+    /// This is the whole honesty claim of the questgiver cache: everything
+    /// drawn from it is a fact about the past, and three things may have
+    /// changed since. The frame's answer is to fade it -- so the test asserts
+    /// the two are actually painted in *different* colours, which is the one
+    /// thing a person cannot check by reading the code that computes them.
+    #[test]
+    fn a_remembered_questgiver_is_drawn_fainter_than_a_live_one() {
+        fn pin_colour(live: bool) -> Color32 {
+            let style = Style::default();
+            let rect = Rect::from_min_size(Pos2::ZERO, size(&style, 1.0));
+            let view = MapView {
+                markers: vec![MapMarker {
+                    u: 0.5,
+                    v: 0.5,
+                    facing: 0.0,
+                    kind: MarkerKind::Questgiver {
+                        turn_in: false,
+                        live,
+                    },
+                    label: "Deputy Willem".into(),
+                    outline: Vec::new(),
+                }],
+                ..Default::default()
+            };
+            let ctx = egui::Context::default();
+            let mut found = None;
+            let output = ctx.run_ui(egui::RawInput::default(), |ctx| {
+                let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("t"));
+                let painter = egui::Painter::new(ctx.clone(), layer, rect);
+                draw(&painter, rect, &view, &style, 1.0);
+            });
+            for clipped in &output.shapes {
+                // The diamond: a four-point path, where the player's arrow
+                // has four *and* is only drawn when there is a player marker,
+                // which this view has none of.
+                if let egui::Shape::Path(path) = &clipped.shape {
+                    if path.points.len() == 4 {
+                        found = Some(path.fill);
+                    }
+                }
+            }
+            output.drop_without_applying_deltas();
+            found.expect("a questgiver pin must be painted")
+        }
+
+        let live = pin_colour(true);
+        let remembered = pin_colour(false);
+        assert_ne!(
+            live, remembered,
+            "a memory drawn identically to a fact is the one thing this pin must not do"
+        );
+        // Fainter, not merely different: a second hue would read as a
+        // different kind of thing rather than as the same claim held less
+        // firmly.
+        assert!(
+            remembered.a() < live.a() || remembered.r() < live.r(),
+            "remembered {remembered:?} is not fainter than live {live:?}"
+        );
     }
 
     #[test]

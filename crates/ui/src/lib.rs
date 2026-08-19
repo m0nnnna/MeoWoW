@@ -43,9 +43,10 @@ pub use frames::{
     CastBarView, InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
     QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
     GuildRow, GuildView, MailAttachment, MailRow, MailRowState, OfficerNotes, MailView,
-    MapMarker, MapPatch, MapView, MarkerKind, MinimapTile, MinimapView, QuestgiverView,
-    SpellbookEntry, TaxiRow, TaxiView, TradeClick, TradeOfferAnswer, TradeOfferView,
-    TradeSquare, TradeSquareItem, TradeView, TrainerRow, TrainerRowState, TrainerView, UnitView,
+    Difficulty, MapMarker, MapPatch, MapView, MarkerKind, MinimapTile, MinimapView,
+    QuestgiverView,
+    SpellbookEntry, TaxiRow, TaxiView, TrackedQuest, TrackerView, TradeClick, TradeOfferAnswer,
+    TradeOfferView, TradeSquare, TradeSquareItem, TradeView, TrainerRow, TrainerRowState, TrainerView, UnitView,
 };
 pub use layout::{default_path, CharacterBars, ElementId, Profile};
 pub use style::{Color, PowerType, Style};
@@ -219,6 +220,15 @@ pub struct HudData<'a> {
     /// all when the art will not load -- the same reasoning that keeps the
     /// world map's markers on an empty page.
     pub minimap: Option<&'a frames::MinimapView>,
+    /// The objective tracker, or `None` before there is a world.
+    ///
+    /// **`None` is "there is no session", not "nothing is tracked".** A
+    /// character carrying no quests is a `TrackerView` with no quests in it,
+    /// which draws a frame saying so; a login screen is this. The same
+    /// distinction the minimap makes, and for the same reason -- drawing a
+    /// placeholder tracker before login would put a fictional quest on the
+    /// character-select screen.
+    pub tracker: Option<&'a frames::TrackerView>,
     /// The character's money in copper, drawn along the bottom of the bag
     /// window. Ignored when `bags` is `None`.
     pub copper: u32,
@@ -337,6 +347,15 @@ pub struct HudResponse {
     /// then have to explain, so the row is inert -- the same decision the
     /// trainer window makes about a spell you cannot learn.
     pub whisper_guild_member: Option<String>,
+    /// A quest on the objective tracker was clicked, as a quest **id**.
+    ///
+    /// Its own field rather than a second writer of [`Self::selected_quest`]:
+    /// the two mean different things to the caller. Selecting in the log
+    /// highlights a row in a window that is already open; clicking the tracker
+    /// is a request to *open* the log and go to that quest, and a caller that
+    /// could not tell them apart would either never open the log or reopen it
+    /// every time somebody clicked a row inside it.
+    pub tracker_quest: Option<u32>,
     /// An auction row was clicked, reported as the **server's auction id**.
     ///
     /// A position would be wrong here in a way it is not anywhere else in this
@@ -705,6 +724,7 @@ impl Hud {
             let auction_placeholder;
             let world_map_placeholder;
             let minimap_placeholder;
+            let tracker_placeholder;
             let release_prompt_placeholder;
             let party_placeholder;
             let party_loot_placeholder;
@@ -885,6 +905,17 @@ impl Hud {
                     }
                     None => continue,
                 },
+                // The same three states as the minimap, and drawn in edit
+                // mode with a quest in it because a frame that draws as its
+                // own header cannot be positioned.
+                ElementId::Tracker => match data.tracker {
+                    Some(view) => Content::Tracker(view),
+                    None if editing => {
+                        tracker_placeholder = frames::tracker::placeholder();
+                        Content::Tracker(&tracker_placeholder)
+                    }
+                    None => continue,
+                },
                 // Absent while alive or already a ghost, on the same reasoning
                 // as the loot window: existence is the flag, and drawn in
                 // edit mode so it can be positioned without dying first.
@@ -993,6 +1024,7 @@ impl Hud {
                 // reason the world map's does: the disc is a shape, not a
                 // list.
                 Content::Minimap(_) => frames::minimap::size(&style, element.scale),
+                Content::Tracker(view) => frames::tracker::size(view, &style, element.scale),
                 Content::ReleasePrompt(_) => frames::release::size(&style, element.scale),
                 // Sized to the party *and* to what is known about each member
                 // -- a member out of view has no power bar, so the rows are
@@ -1087,6 +1119,12 @@ impl Hud {
                             | Content::Bags(_)
                             | Content::Party(..)
                             | Content::PartyInvite(_)
+                            // Clicking a tracked quest opens the log at it.
+                            // **This list is the thing that decides whether a
+                            // frame ever hears about a click at all**, and one
+                            // left out of it draws correctly, hit-tests
+                            // correctly and reports nothing.
+                            | Content::Tracker(_)
                     ) {
                         // The frames you interact with while playing, so they
                         // sense clicks rather than only hover.
@@ -1238,6 +1276,13 @@ impl Hud {
                             element.scale,
                         ),
                         Content::Minimap(view) => frames::minimap::draw(
+                            &painter,
+                            response.rect,
+                            view,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Tracker(view) => frames::tracker::draw(
                             &painter,
                             response.rect,
                             view,
@@ -1566,6 +1611,19 @@ impl Hud {
                         }
                     }
                 }
+                (false, Content::Tracker(view)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            response_out.tracker_quest = frames::tracker::quest_at(
+                                drawn_rect,
+                                view,
+                                &style,
+                                element.scale,
+                                pointer,
+                            );
+                        }
+                    }
+                }
                 (false, Content::QuestLog(entries)) => {
                     if response.clicked() {
                         if let Some(pointer) = response.interact_pointer_pos() {
@@ -1859,6 +1917,7 @@ impl Hud {
             let edit_questgiver = frames::questgiver::placeholder();
             let edit_party = frames::PartyMemberView::placeholder();
             let edit_party_loot = frames::party::LootRuleView::placeholder();
+            let tracker_edit_placeholder = frames::tracker::placeholder();
             let sizes: Vec<(ElementId, egui::Vec2)> = ElementId::ALL
                 .into_iter()
                 .map(|id| {
@@ -1897,6 +1956,11 @@ impl Hud {
                         ),
                         ElementId::WorldMap => frames::world_map::size(&style, scale),
                         ElementId::Minimap => frames::minimap::size(&style, scale),
+                        ElementId::Tracker => frames::tracker::size(
+                            data.tracker.unwrap_or(&tracker_edit_placeholder),
+                            &style,
+                            scale,
+                        ),
                         // Same rule as the bags, the loot window and the
                         // party frame: measure what is actually being drawn
                         // where there is one, and the placeholder otherwise,
@@ -2037,6 +2101,7 @@ enum Content<'a> {
     Taxi(&'a frames::TaxiView),
     WorldMap(&'a frames::MapView),
     Minimap(&'a frames::MinimapView),
+    Tracker(&'a frames::TrackerView),
     ReleasePrompt(&'a frames::ReleasePromptView),
     Party(&'a [frames::PartyMemberView], &'a Option<frames::LootRuleView>),
     PartyInvite(&'a frames::PartyInviteView),
@@ -3440,6 +3505,222 @@ mod tests {
         }
     }
 
+    fn tracked(id: u32, title: &str, distance: Option<f32>) -> TrackedQuest {
+        TrackedQuest {
+            id,
+            title: title.into(),
+            progress: vec!["Kobold Vermin slain: 4/8".into()],
+            complete: false,
+            difficulty: Difficulty::Even,
+            level: Some(2),
+            distance,
+        }
+    }
+
+    /// The tracker is one of the frames that is simply there -- but only once
+    /// there is a world, the same asymmetry the minimap is held to. A
+    /// character with nothing to do gets a frame saying so; a login screen
+    /// gets nothing.
+    #[test]
+    fn a_tracker_appears_with_a_world_or_while_editing() {
+        let mut quiet = Hud::default();
+        hide_bars(&mut quiet);
+        assert!(
+            painted(&mut quiet, &HudData::default()).is_empty(),
+            "a tracker was painted with no session at all"
+        );
+
+        // **An empty log is not an empty screen.** This is the half that
+        // separates "nothing tracked" from "not logged in", and collapsing
+        // them is the trap the quest cache exists to avoid.
+        let empty = TrackerView::default();
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let drawn = painted_text(&shapes(
+            &mut hud,
+            &HudData {
+                tracker: Some(&empty),
+                ..Default::default()
+            },
+            None,
+        ));
+        assert!(
+            drawn.iter().any(|line| line == "Nothing tracked."),
+            "an empty tracker must say so: {drawn:?}"
+        );
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        hud.toggle_edit();
+        assert!(!painted(&mut hud, &HudData::default()).is_empty());
+    }
+
+    /// **The header says it is a window, on screen, in both states.**
+    ///
+    /// The frame's own unit test asserts the string; this one asserts it
+    /// actually reaches the painter, which is the half a synthetic call to
+    /// `header()` cannot cover -- the same gap that let a whole milestone ship
+    /// on "the tests are green" with no HUD drawn at all.
+    #[test]
+    fn the_tracker_draws_its_count_whether_or_not_it_is_a_window() {
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let whole = TrackerView {
+            quests: vec![tracked(783, "A Threat Within", None)],
+            total: 1,
+        };
+        let drawn = painted_text(&shapes(
+            &mut hud,
+            &HudData {
+                tracker: Some(&whole),
+                ..Default::default()
+            },
+            None,
+        ));
+        assert!(
+            drawn.iter().any(|line| line == "Objectives (1)"),
+            "the uninteresting case must still say the count: {drawn:?}"
+        );
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let window = TrackerView {
+            quests: vec![tracked(783, "A Threat Within", None)],
+            total: 11,
+        };
+        let drawn = painted_text(&shapes(
+            &mut hud,
+            &HudData {
+                tracker: Some(&window),
+                ..Default::default()
+            },
+            None,
+        ));
+        assert!(
+            drawn.iter().any(|line| line == "Objectives (1 of 11)"),
+            "a window onto a longer list must say so: {drawn:?}"
+        );
+    }
+
+    /// The quest's own lines reach the screen: its title with the distance the
+    /// realm's markers gave, and its counted objective under it.
+    #[test]
+    fn a_tracked_quest_draws_its_title_and_its_counts() {
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let view = TrackerView {
+            quests: vec![tracked(783, "A Threat Within", Some(146.4))],
+            total: 1,
+        };
+        let drawn = painted_text(&shapes(
+            &mut hud,
+            &HudData {
+                tracker: Some(&view),
+                ..Default::default()
+            },
+            None,
+        ));
+        assert!(
+            drawn.iter().any(|line| line == "[2] A Threat Within - 146 yd"),
+            "{drawn:?}"
+        );
+        assert!(
+            drawn.iter().any(|line| line == "Kobold Vermin slain: 4/8"),
+            "{drawn:?}"
+        );
+    }
+
+    /// **A frame that never receives clicks looks exactly like one whose
+    /// handler is broken.** Frames opt into `Sense::click()` by appearing in
+    /// one `matches!`, and one left out draws correctly, hit-tests correctly
+    /// and reports nothing -- which is why this drives the real `show` rather
+    /// than calling `quest_at` directly.
+    #[test]
+    fn clicking_a_tracked_quest_reports_it() {
+        let view = TrackerView {
+            quests: vec![
+                tracked(783, "A Threat Within", None),
+                tracked(7, "Kobold Camp Cleanup", None),
+            ],
+            total: 2,
+        };
+        let data = HudData {
+            tracker: Some(&view),
+            ..Default::default()
+        };
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::Tracker);
+        let rect = element.rect(
+            screen(),
+            frames::tracker::size(&view, &hud.profile.style, element.scale),
+        );
+        let rows =
+            frames::tracker::quest_rects(rect, &view, &hud.profile.style, element.scale);
+
+        // The *second* row, so a handler that always answered with the first
+        // quest -- or with a row index read as a quest id -- would fail.
+        let answer = drive(
+            &mut hud,
+            &data,
+            &click_script(rows[1].center(), egui::PointerButton::Primary),
+        );
+        assert_eq!(
+            answer.tracker_quest,
+            Some(7),
+            "clicking the second tracked quest must report quest 7"
+        );
+        assert_eq!(
+            answer.selected_quest, None,
+            "the tracker must not write the log's own selection"
+        );
+
+        // And the first, so the geometry is not simply reporting the last row.
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        assert_eq!(
+            drive(
+                &mut hud,
+                &data,
+                &click_script(rows[0].center(), egui::PointerButton::Primary)
+            )
+            .tracker_quest,
+            Some(783)
+        );
+    }
+
+    /// A click on the frame's own background answers nothing rather than the
+    /// nearest row -- the rule every list in this interface follows.
+    #[test]
+    fn clicking_the_trackers_header_reports_nothing() {
+        let view = TrackerView {
+            quests: vec![tracked(783, "A Threat Within", None)],
+            total: 1,
+        };
+        let data = HudData {
+            tracker: Some(&view),
+            ..Default::default()
+        };
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::Tracker);
+        let rect = element.rect(
+            screen(),
+            frames::tracker::size(&view, &hud.profile.style, element.scale),
+        );
+        let header = egui::Pos2::new(rect.center().x, rect.min.y + 2.0);
+        assert_eq!(
+            drive(
+                &mut hud,
+                &data,
+                &click_script(header, egui::PointerButton::Primary)
+            )
+            .tracker_quest,
+            None
+        );
+    }
+
     /// The minimap is one of the frames that is simply there -- but only once
     /// there is a world. Absent with nothing to draw, present in edit mode,
     /// the same asymmetry every other frame here is held to.
@@ -4472,6 +4753,9 @@ mod tests {
             ),
             ElementId::WorldMap => frames::world_map::size(&profile.style, scale),
             ElementId::Minimap => frames::minimap::size(&profile.style, scale),
+            ElementId::Tracker => {
+                frames::tracker::size(&frames::tracker::placeholder(), &profile.style, scale)
+            }
             ElementId::Loot => {
                 frames::loot::size(frames::loot::placeholder().len(), &profile.style, scale)
             }

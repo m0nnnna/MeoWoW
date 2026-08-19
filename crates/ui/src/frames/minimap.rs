@@ -259,6 +259,34 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MinimapView, style: &Style, sc
                     Stroke::new(scale.max(1.0), style.world_map_outline),
                 );
             }
+            MarkerKind::Questgiver { turn_in, live } => {
+                // The same diamond the page draws, so the two frames cannot
+                // disagree about what a questgiver looks like -- and the same
+                // fade, which matters more here: a minimap covers a few
+                // hundred units, so a pin on it is usually a creature the
+                // player is standing near, and a *remembered* one that looked
+                // identical would read as an NPC actually in view.
+                let colour: Color32 = style.world_map_questgiver.into();
+                let colour = if live {
+                    colour
+                } else {
+                    colour.gamma_multiply(style.world_map_remembered)
+                };
+                let half = pin * 0.6;
+                clipped.add(egui::Shape::convex_polygon(
+                    vec![
+                        at + Vec2::new(0.0, -half),
+                        at + Vec2::new(half, 0.0),
+                        at + Vec2::new(0.0, half),
+                        at + Vec2::new(-half, 0.0),
+                    ],
+                    colour,
+                    Stroke::new(scale.max(1.0), style.world_map_outline),
+                ));
+                if turn_in {
+                    clipped.circle_filled(at, half * 0.35, style.world_map_outline);
+                }
+            }
             MarkerKind::Player => {
                 // The same arrow the world map draws, and for the same reason:
                 // a dot cannot say which way you are facing, and on a map that

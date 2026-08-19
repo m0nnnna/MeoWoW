@@ -461,6 +461,26 @@ pub struct PartyMemberPin {
     pub y: f32,
 }
 
+/// One remembered questgiver, for [`build_view`].
+///
+/// **World coordinates, not a `WorldMapArea` id**, which is the difference
+/// between this and a quest objective. A POI marker names the page it belongs
+/// to, so placing it is an equality test; a remembered spawn is a position
+/// this client wrote down off replicated state and nothing more, so placing it
+/// is a containment test against the page being drawn. Getting those two the
+/// wrong way round is the mistake `marker`'s doc comment describes.
+pub struct QuestgiverPin {
+    /// What the NPC is called, or its entry where no name has arrived.
+    pub label: String,
+    pub x: f32,
+    pub y: f32,
+    /// A `?` rather than a `!`.
+    pub turn_in: bool,
+    /// Asked about this session with the NPC in range, as opposed to
+    /// remembered off the disk. See [`ui::MarkerKind::Questgiver`].
+    pub live: bool,
+}
+
 /// Assembles what the map frame draws.
 ///
 /// A free function rather than a method on the viewer because the caller holds
@@ -480,6 +500,7 @@ pub fn build_view(
     chain: &mut Chain,
     standing: Option<Standing>,
     objectives: &[Objective<'_>],
+    givers: &[QuestgiverPin],
     party: &[PartyMemberPin],
     explored: &dyn Fn(u32) -> bool,
 ) -> ui::MapView {
@@ -536,6 +557,27 @@ pub fn build_view(
                 .filter_map(|poi| marker(&page, poi, &objective.label))
         })
         .collect();
+    // Then the remembered questgivers, under the party and the player for the
+    // same reason objectives are: a pin about somewhere you might go must not
+    // cover a dot about where somebody is.
+    //
+    // **Containment against the page, not equality** -- see `QuestgiverPin`.
+    markers.extend(givers.iter().filter(|pin| page.contains(pin.x, pin.y)).map(
+        |pin| {
+            let (u, v) = page.project(pin.x, pin.y);
+            ui::MapMarker {
+                u,
+                v,
+                facing: 0.0,
+                kind: ui::MarkerKind::Questgiver {
+                    turn_in: pin.turn_in,
+                    live: pin.live,
+                },
+                label: pin.label.clone(),
+                outline: Vec::new(),
+            }
+        },
+    ));
     markers.extend(party_markers);
     markers.push(ui::MapMarker {
         u,

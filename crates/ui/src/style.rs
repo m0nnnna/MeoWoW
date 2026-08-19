@@ -292,6 +292,47 @@ pub struct Style {
     /// to a frame -- there is no element to take a scale from.
     pub quest_mark_size: f32,
 
+    /// How wide the objective tracker is. Its own dimension rather than the
+    /// quest log's, and narrower: the tracker is always on screen, so every
+    /// pixel it takes is permanent, and it draws one counted line per
+    /// objective where the log also draws the quest's summary paragraph.
+    pub tracker_width: f32,
+    /// The tracker's backing. Its own colour because it is the one panel that
+    /// is never opened or closed, so it wants to sit lighter over the world
+    /// than a window somebody deliberately opened.
+    pub tracker_background: Color,
+    /// How many quests the tracker draws before it becomes a window onto a
+    /// longer list. The log holds twenty-five; a tracker drawing all of them
+    /// would be the screen.
+    pub tracker_quests: usize,
+    /// A quest that is finished and wants handing in.
+    ///
+    /// **Drawn instead of the difficulty colour, not beside it.** "Go and hand
+    /// this in" is the only thing worth saying about a complete quest, and a
+    /// trivial one coloured grey would otherwise be the least visible line on
+    /// the frame whose whole job is saying what to do next.
+    pub quest_complete: Color,
+    /// The four difficulty bands this client decides for itself. **The grey
+    /// one is the server's** -- see [`crate::frames::tracker::Difficulty`] for
+    /// why that split matters and why these are not presented as facts.
+    pub quest_very_hard: Color,
+    pub quest_hard: Color,
+    pub quest_even: Color,
+    pub quest_easy: Color,
+    pub quest_trivial: Color,
+    /// A remembered questgiver's pin on the map -- an NPC this character has
+    /// walked past that had something to offer.
+    ///
+    /// **A separate colour from an objective's pin, and it must be**: an
+    /// objective is where the realm says to go *now*, and a remembered
+    /// questgiver is where this client saw an exclamation at some point in the
+    /// past. Drawing them alike would turn a memory into a claim.
+    pub world_map_questgiver: Color,
+    /// How much of that colour a *remembered* pin keeps, against one refreshed
+    /// this session by an NPC actually in range. Zero would hide memories
+    /// entirely and one would make them indistinguishable from facts.
+    pub world_map_remembered: f32,
+
     /// Whether a lootable corpse sparkles at all.
     pub show_loot_sparkle: bool,
     /// The sparkle's colour.
@@ -508,6 +549,21 @@ impl Default for Style {
             quest_mark_dim: Color::rgb(150, 150, 150),
             quest_mark_size: 26.0,
 
+            tracker_width: 240.0,
+            tracker_background: Color::rgba(10, 12, 18, 150),
+            tracker_quests: 5,
+            quest_complete: Color::rgb(250, 210, 60),
+            // The original interface's ramp, which is what a player coming
+            // from it expects to read without being taught. See
+            // `frames::tracker::Difficulty` -- a presentation choice stated in
+            // one place, not a table transcribed as fact.
+            quest_very_hard: Color::rgb(255, 80, 80),
+            quest_hard: Color::rgb(255, 160, 60),
+            quest_even: Color::rgb(255, 225, 90),
+            quest_easy: Color::rgb(110, 220, 110),
+            quest_trivial: Color::rgb(150, 150, 150),
+            world_map_questgiver: Color::rgb(250, 210, 60),
+            world_map_remembered: 0.45,
             show_loot_sparkle: true,
             loot_sparkle: Color::rgb(255, 235, 120),
             loot_sparkle_size: 14.0,
@@ -621,6 +677,11 @@ impl Style {
         );
         self.minimap_pin = self.minimap_pin.clamp(1.0, 40.0);
         self.quest_mark_size = self.quest_mark_size.clamp(6.0, 120.0);
+        self.tracker_width = self.tracker_width.clamp(80.0, 800.0);
+        // Zero would be a frame that draws its header and nothing else, which
+        // looks exactly like a tracker that has stopped working.
+        self.tracker_quests = self.tracker_quests.clamp(1, 25);
+        self.world_map_remembered = self.world_map_remembered.clamp(0.1, 1.0);
         self.loot_sparkle_size = self.loot_sparkle_size.clamp(2.0, 80.0);
         self.chat_width = self.chat_width.clamp(120.0, 2000.0);
         self.chat_height = self.chat_height.clamp(40.0, 1200.0);

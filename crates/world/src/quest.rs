@@ -841,6 +841,27 @@ impl QuestgiverMark {
         }
     }
 
+    /// The byte that produced this mark.
+    ///
+    /// **Exists because the mark travels both ways.** It is read off the wire
+    /// and written into the questgiver cache, and a structure that travels in
+    /// two directions gets defined once and round-tripped -- a bad read fails
+    /// loudly at a known offset, where a bad write is accepted as some other
+    /// valid value. [`QuestgiverMark::Unknown`] carries the byte it could not
+    /// name for exactly this reason: a mark this client cannot explain still
+    /// survives a save and a load unchanged, rather than being flattened into
+    /// a plausible different one.
+    pub fn to_status(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::AvailableTrivial => 2,
+            Self::Incomplete => 5,
+            Self::Available => 8,
+            Self::Complete => 10,
+            Self::Unknown(raw) => raw,
+        }
+    }
+
     /// Whether anything should be drawn over the NPC at all.
     pub fn is_drawn(self) -> bool {
         matches!(

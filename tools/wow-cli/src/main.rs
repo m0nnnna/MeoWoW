@@ -824,6 +824,19 @@ enum Command {
         /// -- and the numbers name themselves.
         #[arg(long)]
         questgiver_status: bool,
+        /// Record every talkable NPC in range into a questgiver cache, ask
+        /// what mark each one wears, then save and reload the cache.
+        ///
+        /// **The bounding instrument for the one thing 4.31 draws that is not
+        /// a server answer.** Everything else the tracker and the map show
+        /// came off the wire and can be checked against the realm's own
+        /// database; a remembered questgiver is this client's memory of what
+        /// it was streamed, and the only question that matters about it is
+        /// whether the memory survives being written down. So the round trip
+        /// is part of the probe rather than a unit test's business: a
+        /// disagreement here is a real cache the client would have lost.
+        #[arg(long)]
+        questgivers: bool,
         /// Ask what a quest actually is: title, objectives, rewards.
         ///
         /// **The backbone of the whole quest feature.** Unlike the details a
@@ -1613,6 +1626,7 @@ fn main() -> Result<()> {
             party_kick,
             quest_log,
             quest_poi,
+            questgivers,
             questgiver_status,
             quest_info,
             target,
@@ -1710,6 +1724,7 @@ fn main() -> Result<()> {
                 party_kick: party_kick.as_deref(),
                 quest_log: *quest_log,
                 quest_poi: *quest_poi,
+                questgivers: *questgivers,
                 questgiver_status: *questgiver_status,
                 quest_info,
 
@@ -1936,6 +1951,7 @@ struct WorldRequest<'a> {
     party_kick: Option<&'a str>,
     quest_log: bool,
     quest_poi: bool,
+    questgivers: bool,
     questgiver_status: bool,
     quest_info: &'a [u32],
     target: Option<&'a str>,
@@ -2088,6 +2104,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         party_kick,
         quest_log,
         quest_poi,
+        questgivers,
         questgiver_status,
         quest_info,
         target,
@@ -3103,6 +3120,10 @@ cast {spell_id} at {} (attempt {attempt})",
 
         if questgiver_status {
             survey_questgiver_status(&mut connection, &mut state, character.guid)?;
+        }
+
+        if questgivers {
+            survey_questgivers(&mut connection, &mut state, character.guid, character.map)?;
         }
 
         for quest in quest_info {
@@ -5041,6 +5062,139 @@ fn survey_questgiver_status(
             }
         }
     }
+
+    Ok(())
+}
+
+/// Records every talkable NPC in range, asks what mark each wears, and
+/// round-trips the cache through a file.
+///
+/// **The one part of the native tracker that is not a server answer.** Every
+/// other thing 4.31 draws -- a quest's objectives, its map markers, the mark
+/// over an NPC's head -- came off the wire and can be checked against the
+/// realm's own tables. A remembered questgiver is this client's memory of what
+/// it was streamed, and the only question worth asking about a memory is
+/// whether it survives being written down. So the save and the reload happen
+/// here rather than only in a unit test: a disagreement in this run is a cache
+/// a real session would have lost.
+fn survey_questgivers(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    map: u32,
+) -> Result<()> {
+    let mut givers = world::Questgivers::new();
+
+    // Everything in range that will talk, with its entry and its position.
+    // The same filter the viewer uses, and it is deliberately `will_talk`
+    // rather than a questgiver-flag test: what an NPC will *do* is settled by
+    // sending the request, and the flag word has bits this client has not
+    // named.
+    let seen: Vec<(u64, u32, f32, f32, f32)> = state
+        .iter()
+        .filter(|entity| entity.guid != own_guid && entity.will_talk())
+        .filter_map(|entity| {
+            let entry = entity.entry()?;
+            let at = entity.position?;
+            Some((entity.guid, entry, at.x, at.y, at.z))
+        })
+        .collect();
+    println!("\n{} talkable NPC(s) in range on map {map}", seen.len());
+    if seen.is_empty() {
+        println!("  nothing to record. This is vacuous rather than negative --");
+        println!("  the cache fills from replicated state, so an empty street");
+        println!("  says nothing about whether recording works. Stand near an");
+        println!("  innkeeper or a questgiver and try again.");
+        return Ok(());
+    }
+    for (guid, entry, x, y, z) in &seen {
+        givers.see(*guid, *entry, map, *x, *y, *z);
+    }
+
+    // What is over each head. Asked one at a time, because the reply names
+    // the guid it is about and that pairing is the only thing that confirms
+    // the request went out as the right opcode.
+    for (guid, ..) in &seen {
+        connection.query_questgiver_status(*guid)?;
+    }
+    let batch = connection.drain(std::time::Duration::from_millis(2000), 256)?;
+    dump_unexpected(&batch, "after CMSG_QUESTGIVER_STATUS_QUERY");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let mut answered = 0;
+    for packet in &batch {
+        if packet.opcode != world::opcode::server::QUESTGIVER_STATUS {
+            continue;
+        }
+        match world::quest::parse_questgiver_status(&packet.body) {
+            Ok(status) => {
+                answered += 1;
+                givers.mark(status.npc, status.mark, now);
+            }
+            Err(error) => println!("  a status would not parse: {error}"),
+        }
+    }
+    // **Both numbers, always.** A counter that only speaks on failure cannot
+    // tell "none were wrong" from "there were none".
+    println!(
+        "{answered} of {} answered; {} recorded, {} worth drawing",
+        seen.len(),
+        givers.len(),
+        givers.on_map(map).count()
+    );
+
+    for known in givers.on_map(map) {
+        println!(
+            "  {:#018x}  entry {:>6}  ({:>8.1}, {:>8.1}, {:>7.1})  {:?}",
+            known.guid, known.entry, known.x, known.y, known.z, known.mark
+        );
+    }
+
+    // The round trip. Written to a temporary file and read straight back,
+    // because what this module has to be right about is exactly that.
+    let path = std::env::temp_dir().join("wow-cli-questgivers.cache");
+    givers.save(&path)?;
+    let back = world::Questgivers::load(&path)?;
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    std::fs::remove_file(&path).ok();
+
+    let mut differed = 0;
+    for before in givers.iter() {
+        match back.get(before.guid) {
+            // `live` deliberately does not survive: a loaded record is a
+            // memory by definition, and that is the field that keeps a
+            // remembered pin from being drawn as a fact.
+            Some(after) if after.live => {
+                println!("  {:#018x} came back marked live, which it must not", before.guid);
+                differed += 1;
+            }
+            Some(after)
+                if after.entry == before.entry
+                    && after.map == before.map
+                    && after.x == before.x
+                    && after.y == before.y
+                    && after.z == before.z
+                    && after.mark == before.mark
+                    && after.seen == before.seen
+                    && after.offers == before.offers => {}
+            Some(after) => {
+                println!("  {:#018x} changed: {before:?} -> {after:?}", before.guid);
+                differed += 1;
+            }
+            None => {
+                println!("  {:#018x} did not survive the save at all", before.guid);
+                differed += 1;
+            }
+        }
+    }
+    println!(
+        "cache round trip: {} bytes, {} of {} records identical, {differed} differed",
+        bytes,
+        givers.len() - differed,
+        givers.len()
+    );
 
     Ok(())
 }

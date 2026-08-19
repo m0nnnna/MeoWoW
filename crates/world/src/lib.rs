@@ -29,6 +29,7 @@ pub mod protocol;
 pub mod quest;
 pub mod quest_cache;
 pub mod query;
+pub mod spawns;
 pub mod spell;
 pub mod state;
 pub mod taxi;
@@ -56,6 +57,7 @@ pub use quest::{
 };
 pub use guild::{GuildEvent, GuildInfo, GuildInvitation, GuildMember, GuildRank, Roster};
 pub use quest_cache::{Answer, QuestCache};
+pub use spawns::{Questgivers, Remembered};
 pub use mail::{Inbox, Mail, MailAction, MailItem, MailResult, MailSender, NextMailTime};
 pub use taxi::{Flight, TaxiMenu, TaxiReply};
 pub use trade::{TradeItem, TradeOffer, TradeSession, TradeStatus};

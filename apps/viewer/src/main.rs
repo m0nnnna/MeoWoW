@@ -314,6 +314,22 @@ impl Scene {
     }
 }
 
+/// Seconds since the Unix epoch, or `0` if the clock is before it.
+///
+/// **The only wall clock in this file**, and it is used for exactly one thing:
+/// stamping a remembered questgiver so the interface can say *when* it was
+/// seen. Everything else here is timed with `Instant`, which is monotonic and
+/// cannot go backwards -- but an `Instant` is meaningless across a restart,
+/// and "seen three hours ago" has to survive one. Nothing branches on this
+/// value, so a clock that jumped costs a misleading sentence rather than a
+/// wrong pin.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -2916,6 +2932,23 @@ struct App {
     /// When each outstanding quest query was sent, so one that is never
     /// answered can be given up on rather than counted as pending forever.
     quest_asked_at: std::collections::HashMap<u32, std::time::Instant>,
+    /// Where the questgivers this character has walked past were standing, and
+    /// what was over their heads at the time.
+    ///
+    /// **The only thing this client draws that is not a server answer**, and
+    /// it exists because there is no opcode that asks where a quest is before
+    /// you have found it. See `world::spawns` for what that costs and how the
+    /// interface is obliged to say so.
+    givers: ::world::Questgivers,
+    /// Where that cache is written. `None` when no configuration directory
+    /// could be found, exactly like `quest_cache_path`.
+    giver_cache_path: Option<std::path::PathBuf>,
+    /// The quest log the remembered marks were last reconciled against, so
+    /// `Questgivers::forget_offering` runs when it changes rather than every
+    /// frame.
+    giver_marks_log: Vec<u32>,
+    /// When the questgiver cache was last written.
+    giver_saved_at: Instant,
     /// The questgiver currently being talked to, or `None`.
     ///
     /// **Existence is the flag**, as it is for the loot window: this is set
@@ -3777,6 +3810,10 @@ impl App {
             minimap,
             map_open: false,
             objectives: maps::Objectives::default(),
+            givers: ::world::Questgivers::new(),
+            giver_cache_path: None,
+            giver_marks_log: Vec::new(),
+            giver_saved_at: Instant::now(),
             quest_marks: std::collections::HashMap::new(),
             quest_marks_asked: std::collections::HashMap::new(),
             quest_marks_log: Vec::new(),
@@ -4162,6 +4199,7 @@ impl ApplicationHandler for App {
                 // whole session. The trade is that a crash loses the
                 // session's discoveries, which costs only re-asking.
                 self.save_quest_cache();
+                self.save_giver_cache();
                 event_loop.exit()
             }
             WindowEvent::Resized(size) => {
@@ -6785,6 +6823,111 @@ impl App {
         lines
     }
 
+    /// What the objective tracker draws.
+    ///
+    /// **A second view of the quest log, never a second copy of it.** Every
+    /// line comes from the same three places the log's rows do -- the quest
+    /// cache for the title and level, the player's own fields and bags for the
+    /// counters, `self.objectives` for the markers -- so the two frames cannot
+    /// drift. What the tracker adds is the one thing the log does not have:
+    /// how far away the nearest marker is.
+    ///
+    /// Returns `None` before there is a session, which is not the same as a
+    /// character with nothing to do; see `ui::HudData::tracker`.
+    fn tracker_view(&self) -> Option<ui::TrackerView> {
+        let live = self.live.as_ref()?;
+        let player = live.state.get(live.guid);
+        let log: Vec<u32> = player
+            .map(|player| player.quest_log_ids())
+            .unwrap_or_default();
+        let level = player.and_then(|player| player.level()).unwrap_or(0);
+
+        let mut quests: Vec<ui::TrackedQuest> = log
+            .iter()
+            .map(|id| {
+                let complete = player
+                    .and_then(|player| player.quest_is_complete(*id))
+                    .unwrap_or(false);
+                let (title, quest_level, progress) = match self.quests.answer(*id) {
+                    ::world::Answer::Known(info) => (
+                        info.title.clone(),
+                        Some(info.level),
+                        self.quest_progress(info),
+                    ),
+                    // The id, which a player can report, rather than a
+                    // placeholder title, which they cannot. The log's rows
+                    // make the same call.
+                    _ => (format!("Quest {id}"), None, Vec::new()),
+                };
+                ui::TrackedQuest {
+                    id: *id,
+                    title,
+                    progress,
+                    complete,
+                    // **The server's own trivial verdict where there is one.**
+                    // `quest_marks` is keyed by NPC rather than by quest, so
+                    // there is no mark to consult for a quest already in the
+                    // log -- a quest you are carrying is never on offer. So
+                    // this passes `false` and the band is decided by the
+                    // arithmetic alone, which is honest here: the grey band
+                    // exists to say "do not bother taking this", and a quest
+                    // already taken is past that question.
+                    difficulty: ui::Difficulty::of(
+                        quest_level.unwrap_or(0),
+                        level,
+                        false,
+                    ),
+                    level: quest_level,
+                    distance: self.nearest_objective(*id),
+                }
+            })
+            .collect();
+
+        // Finished quests first -- "go and hand this in" outranks anything
+        // still in progress -- and the rest by how far away they are, nearest
+        // first. **A quest with no markers sorts last rather than as zero**,
+        // which is the difference between "you are standing on it" and "the
+        // realm did not say".
+        quests.sort_by(|a, b| {
+            b.complete.cmp(&a.complete).then_with(|| {
+                a.distance
+                    .unwrap_or(f32::INFINITY)
+                    .total_cmp(&b.distance.unwrap_or(f32::INFINITY))
+            })
+        });
+        let total = quests.len();
+        quests.truncate(self.hud.profile.style.tracker_quests);
+        Some(ui::TrackerView { quests, total })
+    }
+
+    /// Yards to the nearest point of any marker the realm gave for one quest,
+    /// or `None` when it gave none.
+    ///
+    /// **Measured from the walked position, not from replicated state.** The
+    /// server never relays this client's own movement back, so the entity for
+    /// our guid holds the position the character logged in at, forever. That
+    /// trap has caught four callers in this file already -- the thing that
+    /// draws the player, the thing that aims at it, a loot range check, and
+    /// the world map -- and here it would produce a distance that was correct
+    /// once and then counted down to a place nobody is standing.
+    ///
+    /// Flat distance, ignoring height, because a POI point has no height: the
+    /// server sends an `(x, y)` pair per point and nothing else.
+    fn nearest_objective(&self, quest: u32) -> Option<f32> {
+        let live = self.live.as_ref()?;
+        let markers = self.objectives.markers(quest);
+        markers
+            .iter()
+            .filter(|poi| poi.map_id == live.map_id)
+            .flat_map(|poi| poi.points.iter())
+            .map(|(x, y)| {
+                let dx = *x as f32 - live.position.x;
+                let dy = *y as f32 - live.position.y;
+                (dx * dx + dy * dy).sqrt()
+            })
+            .min_by(f32::total_cmp)
+    }
+
     /// Takes hold of the pointer for the duration of a drag.
     ///
     /// Hidden, confined to the window, and pinned to where the gesture
@@ -8317,6 +8460,51 @@ impl App {
         }
     }
 
+    /// Reads this character's questgiver cache, and remembers where to write
+    /// it back.
+    ///
+    /// **Named by character as well as by realm** -- see
+    /// `world::spawns::Questgivers::path_for`. Failing to load is not failing
+    /// to run: without it the map starts empty and fills as the player walks,
+    /// which is what it does on a new realm anyway.
+    fn load_giver_cache(&mut self, realm: &str, character: &str) {
+        let base = ui::default_path()
+            .ok()
+            .and_then(|path| path.parent().map(PathBuf::from));
+        let Some(base) = base else {
+            tracing::info!("no configuration directory -- questgivers will not be remembered");
+            return;
+        };
+        let path = ::world::Questgivers::path_for(&base, realm, character);
+        match ::world::Questgivers::load(&path) {
+            Ok(cache) => {
+                tracing::info!(
+                    "{} questgiver(s) remembered for {character:?} on {realm:?} ({})",
+                    cache.len(),
+                    path.display()
+                );
+                self.givers = cache;
+            }
+            Err(error) => tracing::warn!("could not read {}: {error}", path.display()),
+        }
+        self.giver_cache_path = Some(path);
+    }
+
+    /// Writes the questgiver cache, if anything was learned.
+    fn save_giver_cache(&mut self) {
+        if !self.givers.is_dirty() {
+            return;
+        }
+        let Some(path) = self.giver_cache_path.clone() else {
+            return;
+        };
+        let count = self.givers.len();
+        match self.givers.save(&path) {
+            Ok(()) => tracing::info!("{count} questgiver(s) remembered in {}", path.display()),
+            Err(error) => tracing::warn!("could not write {}: {error}", path.display()),
+        }
+    }
+
     fn pump_live_connection(&mut self) {
         // **Loaded here rather than at construction**, because the file is
         // named after the realm and the realm is not known until a connection
@@ -8325,6 +8513,19 @@ impl App {
         if self.quest_cache_path.is_none() {
             if let Some(realm) = self.live.as_ref().map(|live| live.realm.clone()) {
                 self.load_quest_cache(&realm);
+            }
+        }
+        // The same shape, and guarded the same way. Two caches rather than one
+        // because they answer questions with different lifetimes: what a quest
+        // *is* is the realm's business and the same for everybody on it, and
+        // what is over an NPC's head is one character's progress.
+        if self.giver_cache_path.is_none() {
+            if let Some((realm, character)) = self
+                .live
+                .as_ref()
+                .map(|live| (live.realm.clone(), live.character.clone()))
+            {
+                self.load_giver_cache(&realm, &character);
             }
         }
         // **Before the borrow of `live` below**, which is what makes this the
@@ -8339,6 +8540,15 @@ impl App {
         if self.quest_saved_at.elapsed() >= QUEST_SAVE_INTERVAL {
             self.quest_saved_at = Instant::now();
             self.save_quest_cache();
+        }
+        // Longer than the quest cache's, because this one goes dirty far more
+        // readily: every new NPC that comes into range is news, so a walk
+        // through a city dirties it continuously where a quest cache goes
+        // quiet as soon as the log is described.
+        const GIVER_SAVE_INTERVAL: Duration = Duration::from_secs(60);
+        if self.giver_saved_at.elapsed() >= GIVER_SAVE_INTERVAL {
+            self.giver_saved_at = Instant::now();
+            self.save_giver_cache();
         }
         let Some(live) = self.live.as_mut() else {
             return;
@@ -8921,6 +9131,16 @@ impl App {
                                         );
                                     }
                                     self.quest_marks.insert(status.npc, status.mark);
+                                    // **And into the cache, which is a
+                                    // different question.** `quest_marks` is
+                                    // this frame's answer about an NPC in
+                                    // range and is thrown away whenever the
+                                    // log changes; the cache is what survives
+                                    // the NPC walking out of view and the
+                                    // client being shut down. Both are fed
+                                    // from the one reply so they cannot
+                                    // disagree about what the server said.
+                                    self.givers.mark(status.npc, status.mark, unix_now());
                                 }
                                 Err(error) => {
                                     tracing::warn!("a questgiver status would not parse: {error}")
@@ -9161,6 +9381,20 @@ impl App {
             }
         }
 
+        // **Which quests an NPC offers, recorded before the window is.** A
+        // gossip menu names its own NPC and its quest ids, so this is the one
+        // place in the client that learns the pair -- and it is what lets a
+        // remembered exclamation be retired *precisely* when the quest behind
+        // it is accepted, instead of every remembered mark being distrusted
+        // the moment anything is. Outside the `questgiver` check on purpose:
+        // the pairing is worth keeping whether or not a window is open.
+        for gossip in &greetings {
+            if !gossip.quests.is_empty() {
+                let ids: Vec<u32> = gossip.quests.iter().map(|quest| quest.quest_id).collect();
+                self.givers.offers(gossip.npc, &ids);
+            }
+        }
+
         if let Some(questgiver) = self.questgiver.as_mut() {
             for gossip in &greetings {
                 questgiver.note_gossip(gossip);
@@ -9293,6 +9527,37 @@ impl App {
             self.quest_marks_log = log.clone();
             self.quest_marks.clear();
             self.quest_marks_asked.clear();
+        }
+        // **The remembered set gets the precise version of that same
+        // reconciliation, and it must.** Clearing it wholesale would empty the
+        // map every time the player accepted anything, because most of what is
+        // in it is miles away and cannot be re-asked. So only the NPCs this
+        // client has actually *seen* offering a quest now in the log lose
+        // their mark. See `world::spawns::Questgivers::forget_offering`.
+        if self.giver_marks_log != log {
+            self.giver_marks_log = log.clone();
+            let retired = self.givers.forget_offering(&log);
+            if retired > 0 {
+                tracing::debug!("{retired} remembered questgiver(s) have nothing left to offer");
+            }
+        }
+        // Where every talkable NPC in range is standing. Cheap and
+        // unconditional: `see` only dirties the cache for a creature that is
+        // new or has actually moved, which is what keeps a city walk from
+        // rewriting the file every frame.
+        let map_id = live.map_id;
+        let sightings: Vec<(u64, u32, f32, f32, f32)> = live
+            .state
+            .iter()
+            .filter(|entity| entity.guid != live.guid && entity.will_talk())
+            .filter_map(|entity| {
+                let entry = entity.entry()?;
+                let at = entity.position?;
+                Some((entity.guid, entry, at.x, at.y, at.z))
+            })
+            .collect();
+        for (guid, entry, x, y, z) in sightings {
+            self.givers.see(guid, entry, map_id, x, y, z);
         }
         const MARKS_PER_FRAME: usize = 6;
         // Long enough that a slow realm is not asked twice, short enough that
@@ -10311,6 +10576,52 @@ impl App {
             })
             .filter(|objective| !objective.markers.is_empty())
             .collect();
+        // Every remembered questgiver on the continent the character is on.
+        //
+        // **Filtered to the map here rather than in either frame**, because
+        // the cache holds every continent at once and two of them share a
+        // coordinate range -- a Kalimdor NPC drawn on an Elwynn page would
+        // land somewhere entirely plausible. The world map narrows it again by
+        // page rectangle and the minimap by the disc; both need the continent
+        // settled first.
+        let giver_pins: Vec<maps::QuestgiverPin> = self
+            .live
+            .as_ref()
+            .map(|live| {
+                self.givers
+                    .on_map(live.map_id)
+                    .map(|known| maps::QuestgiverPin {
+                        // The creature's name where one has ever arrived, and
+                        // its entry where none has. **Never an invented
+                        // name** -- `creature 823` is checkable and visibly
+                        // unfinished, and a plausible wrong one is believed.
+                        label: live
+                            .state
+                            .names
+                            .creature(known.entry)
+                            .flatten()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("creature {}", known.entry)),
+                        x: known.x,
+                        y: known.y,
+                        // A `?` for a quest of theirs that is finished, a `!`
+                        // for one to take. `Incomplete` -- a quest of theirs
+                        // in the log and not done -- is deliberately drawn as
+                        // a turn-in too: it is the same NPC to come back to,
+                        // and the difference between "come back later" and
+                        // "come back now" is what the tracker's own counters
+                        // are for.
+                        turn_in: matches!(
+                            known.mark,
+                            Some(::world::quest::QuestgiverMark::Complete)
+                                | Some(::world::quest::QuestgiverMark::Incomplete)
+                        ),
+                        live: known.live,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // A member's own zone and position, not the vitals the party
         // frame reads -- `party_member_vitals` prefers a replicated
         // entity's position when there is one, but a page is picked by
@@ -10408,6 +10719,7 @@ impl App {
                 &mut self.chain,
                 standing,
                 &objectives,
+                &giver_pins,
                 &party_pins,
                 &|bit| explored_bits.contains(&bit),
             )
@@ -10428,6 +10740,7 @@ impl App {
                 area_name.as_deref(),
                 range,
                 &objectives,
+                &giver_pins,
                 &near_party,
             )
         };
@@ -10727,6 +11040,8 @@ impl App {
                 })
         });
 
+        let tracker = self.tracker_view();
+
         let mut hud_response = ui::HudResponse::default();
         let spellbook_open = self.spellbook_open;
         let bags_open = self.bags_open;
@@ -10779,6 +11094,9 @@ impl App {
                     world_map: map_view.as_ref(),
                     // No flag: a minimap is never opened or shut.
                     minimap: Some(&minimap_view),
+                    // Nor is the tracker. `None` only before there is a
+                    // world -- see `HudData::tracker`.
+                    tracker: tracker.as_ref(),
                     // No flag: the window exists exactly while the server
                     // says a corpse is open.
                     loot: (!loot.is_empty()).then_some(loot.as_slice()),
@@ -10984,6 +11302,17 @@ impl App {
             // Clicking the highlighted row clears it, so there is a way back
             // to "nothing selected" without closing the window.
             self.selected_quest = (self.selected_quest != Some(quest)).then_some(quest);
+        }
+
+        // **A tracker click opens the log at that quest and never closes
+        // it.** The two paths are separate for exactly this reason: a click
+        // in the log toggles a highlight, and one on the tracker is a request
+        // to go and read the thing. Making the tracker toggle too would mean
+        // clicking a tracked quest while the log was open shut the log, which
+        // is the opposite of what the gesture asks for.
+        if let Some(quest) = hud_response.tracker_quest {
+            self.quest_log_open = true;
+            self.selected_quest = Some(quest);
         }
 
         // A destination was chosen. **Both node ids come from the server**:
