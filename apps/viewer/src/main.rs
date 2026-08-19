@@ -729,6 +729,20 @@ const BODY_HEIGHT: f32 = 2.0;
 /// place, if stairs still catch or fences stop catching.
 const STEP_HEIGHT: f32 = 0.8;
 
+/// How far the ground snap may lower the character in one frame **while
+/// tiles are still streaming in**.
+///
+/// Not a physics constant and not a step height: it is the line between
+/// "settling onto the surface under you" and "being teleported to whatever
+/// answered before the real floor arrived". Generous on purpose -- a real
+/// staircase or slope moves a character a fraction of this per frame, and
+/// the only thing it needs to exclude is the seventy-unit plunge from
+/// Stormwind's gryphon platform to the terrain beneath the city.
+///
+/// It applies **only** while more tiles are coming. In a settled world the
+/// assignment is unconditional exactly as it was.
+const MAX_STREAMING_DROP: f32 = 5.0;
+
 /// How far a liquid surface must stand above the bed before a character swims
 /// rather than wades.
 ///
@@ -4808,7 +4822,40 @@ impl App {
         // It is only the *assignment* that a swimmer opts out of.
         if self.swimming.is_none() {
             if let Some(z) = stand_at {
-                live.position.z = z;
+                // **A large drop while tiles are still arriving is refused.**
+                //
+                // A building's collision is filed under the single tile
+                // holding its origin, and tiles are admitted a few per frame.
+                // So there is a window at login where the character's own
+                // tile is resident and answering with terrain height, while
+                // the tile carrying the floor under their feet has not
+                // arrived yet. Stormwind's gryphon platform is seventy units
+                // above the terrain beneath the city: one frame in that
+                // window drops a character logging out on the platform to the
+                // ground below it.
+                //
+                // And the drop is **permanent**, which is what makes refusing
+                // it worth the special case rather than letting it settle. A
+                // floor search only considers surfaces at or below where it
+                // starts, so the floor that streams in a frame later is now
+                // above the character and will never be found. They are under
+                // the city for good.
+                //
+                // Deliberately narrow. It refuses only a *downward* move,
+                // only a large one, and only while `still_streaming` says
+                // more tiles are coming -- so walking off a cliff in a
+                // settled world behaves exactly as it did, and a character
+                // genuinely standing on terrain is unaffected. Once streaming
+                // settles the ordinary assignment resumes and puts them
+                // wherever they really belong.
+                let streaming = match self.renderer.as_ref().and_then(|r| r.scene.as_ref()) {
+                    Some(Scene::Streaming(world)) => world.still_streaming(),
+                    _ => false,
+                };
+                let dropping_far = z < live.position.z - MAX_STREAMING_DROP;
+                if !(streaming && dropping_far) {
+                    live.position.z = z;
+                }
             }
         }
 

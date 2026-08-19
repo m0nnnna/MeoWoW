@@ -1152,6 +1152,22 @@ impl World {
         at
     }
 
+    /// Whether tiles are still being admitted.
+    ///
+    /// **Read by the movement code before it lowers the character**, which is
+    /// not a decoration. Tiles arrive a few per frame, and a building's
+    /// collision is filed under the one tile containing its origin -- so
+    /// there is a window at login where the character's *own* tile is
+    /// resident, the terrain height answers, and the tile holding the floor
+    /// underfoot has not arrived. Snapping to the terrain in that window puts
+    /// a character standing on Stormwind's gryphon platform at the terrain
+    /// height seventy units below the city, and the drop is permanent: a
+    /// floor search only looks at or below where it starts, so the floor that
+    /// streams in a frame later is above them and never found again.
+    pub fn still_streaming(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// What is holding a character up under a point: how high it is, and what
     /// it is made of as a `TerrainType` row id.
     ///
