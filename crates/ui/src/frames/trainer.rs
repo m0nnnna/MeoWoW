@@ -301,7 +301,7 @@ pub fn draw(
 /// Dims a colour towards the background without inventing a new one, so a
 /// restyled interface greys its inert rows in its own palette rather than in
 /// this module's.
-fn dim(colour: Color32, factor: f32) -> Color32 {
+pub(crate) fn dim(colour: Color32, factor: f32) -> Color32 {
     let scale = |channel: u8| (f32::from(channel) * factor).round().clamp(0.0, 255.0) as u8;
     Color32::from_rgba_unmultiplied(
         scale(colour.r()),

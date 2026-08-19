@@ -14,6 +14,7 @@
 //! with different colours.
 
 pub mod action_bar;
+pub mod auction;
 pub mod bags;
 pub mod cast_bar;
 pub mod character;
@@ -38,6 +39,7 @@ pub mod trainer;
 pub mod unit;
 pub mod world_map;
 
+pub use auction::{AuctionClick, AuctionRow, AuctionTab, AuctionView};
 pub use bags::{BagItem, BagSlot};
 pub use character::EquipSlot;
 pub use guild::{GuildRow, GuildView, OfficerNotes};

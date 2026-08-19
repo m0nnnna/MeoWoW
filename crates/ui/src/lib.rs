@@ -39,6 +39,7 @@ pub use element::{Anchor, Element};
 pub use frames::chat::{ChatEntry, ChatKind};
 pub use frames::combat_text::{CombatTextKind, FloatingText};
 pub use frames::{
+    AuctionClick, AuctionRow, AuctionTab, AuctionView,
     CastBarView, InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
     QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
     GuildRow, GuildView, MailAttachment, MailRow, MailRowState, OfficerNotes, MailView,
@@ -181,6 +182,13 @@ pub struct HudData<'a> {
     /// Three states, because the roster has three: never asked, asked and
     /// answered with a refusal, asked and answered with members.
     pub guild: Option<&'a frames::GuildView>,
+
+    /// The open auction window, or `None`.
+    ///
+    /// **One page, never an accumulation.** See `world::auction::AuctionPage`:
+    /// merging successive pages builds something that looks like the auction
+    /// house and is a union of snapshots that was never true at any instant.
+    pub auction: Option<&'a frames::AuctionView>,
     /// The open trade window, or `None`. Existence is the flag, as it is for
     /// every other window that appears because something happened.
     ///
@@ -329,6 +337,30 @@ pub struct HudResponse {
     /// then have to explain, so the row is inert -- the same decision the
     /// trainer window makes about a spell you cannot learn.
     pub whisper_guild_member: Option<String>,
+    /// An auction row was clicked, reported as the **server's auction id**.
+    ///
+    /// A position would be wrong here in a way it is not anywhere else in this
+    /// interface: row three of page two and row three of page one are
+    /// different auctions and would both be "3". Every other list this client
+    /// draws is the whole of its subject.
+    ///
+    /// Only ever set for a row this character can act on -- somebody else's
+    /// auction on the browse and bid tabs, this character's own on the selling
+    /// tab.
+    pub select_auction: Option<u32>,
+    /// A tab in the auction window was clicked.
+    ///
+    /// Three tabs, three different requests, and the same reply layout for
+    /// all of them -- so the tab is the only thing that says which question
+    /// was asked.
+    pub auction_tab: Option<frames::AuctionTab>,
+    /// A control under the auction list was clicked.
+    ///
+    /// Only ever set for a control that would actually do something: a page
+    /// that does not exist, a bid on your own auction and a buyout of an
+    /// auction with no buyout are all requests the server drops in silence,
+    /// which is the one failure this client cannot diagnose.
+    pub auction_click: Option<frames::AuctionClick>,
     /// A party row was clicked, reported as the member's **guid** rather than
     /// as the row's position -- the same reasoning as [`Self::selected_quest`]
     /// carrying a quest id. The list is rebuilt from every group list the
@@ -670,6 +702,7 @@ impl Hud {
             let taxi_placeholder;
             let mail_placeholder;
             let guild_placeholder;
+            let auction_placeholder;
             let world_map_placeholder;
             let minimap_placeholder;
             let release_prompt_placeholder;
@@ -795,6 +828,14 @@ impl Hud {
                     None if editing => {
                         guild_placeholder = frames::guild::placeholder();
                         Content::Guild(&guild_placeholder)
+                    }
+                    None => continue,
+                },
+                ElementId::Auction => match data.auction {
+                    Some(view) => Content::Auction(view),
+                    None if editing => {
+                        auction_placeholder = frames::auction::placeholder();
+                        Content::Auction(&auction_placeholder)
                     }
                     None => continue,
                 },
@@ -933,6 +974,9 @@ impl Hud {
                 Content::Guild(view) => {
                     frames::guild::size(view.rows.len(), &style, element.scale)
                 }
+                Content::Auction(view) => {
+                    frames::auction::size(view.rows.len(), &style, element.scale)
+                }
                 Content::Taxi(view) => {
                     frames::taxi::size(view.rows.len(), &style, element.scale)
                 }
@@ -1035,6 +1079,7 @@ impl Hud {
                             | Content::Trainer(_)
                             | Content::Mail(_)
                             | Content::Guild(_)
+                            | Content::Auction(_)
                             | Content::Taxi(_)
                             | Content::Trade(_)
                             | Content::TradeOffer(_)
@@ -1151,6 +1196,13 @@ impl Hud {
                             element.scale,
                         ),
                         Content::Guild(view) => frames::guild::draw(
+                            &painter,
+                            response.rect,
+                            view,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Auction(view) => frames::auction::draw(
                             &painter,
                             response.rect,
                             view,
@@ -1410,6 +1462,39 @@ impl Hud {
                             ) {
                                 response_out.learn_spell =
                                     view.rows.get(row).map(|row| row.spell);
+                            }
+                        }
+                    }
+                }
+                (false, Content::Auction(view)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            // Tabs first: they sit above the rows and a point
+                            // can only be in one of the two, but asking in a
+                            // fixed order is what stops a geometry change
+                            // from silently making one unreachable.
+                            if let Some(tab) =
+                                frames::auction::tab_at(drawn_rect, &style, element.scale, pointer)
+                            {
+                                response_out.auction_tab = Some(tab);
+                            } else if let Some(click) = frames::auction::control_at(
+                                drawn_rect,
+                                view,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                response_out.auction_click = Some(click);
+                            } else if let Some(row) = frames::auction::row_at(
+                                drawn_rect,
+                                &view.rows,
+                                view.tab,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                response_out.select_auction =
+                                    view.rows.get(row).map(|row| row.id);
                             }
                         }
                     }
@@ -1849,6 +1934,13 @@ impl Hud {
                             &style,
                             scale,
                         ),
+                        ElementId::Auction => frames::auction::size(
+                            data.auction
+                                .map(|view| view.rows.len())
+                                .unwrap_or_else(|| frames::auction::placeholder().rows.len()),
+                            &style,
+                            scale,
+                        ),
                         ElementId::Loot => frames::loot::size(
                             data.loot
                                 .map(|rows| rows.len())
@@ -1939,6 +2031,7 @@ enum Content<'a> {
     Trainer(&'a frames::TrainerView),
     Mail(&'a frames::MailView),
     Guild(&'a frames::GuildView),
+    Auction(&'a frames::AuctionView),
     Trade(&'a frames::TradeView),
     TradeOffer(&'a frames::TradeOfferView),
     Taxi(&'a frames::TaxiView),
@@ -4372,6 +4465,11 @@ mod tests {
                 &profile.style,
                 scale,
             ),
+            ElementId::Auction => frames::auction::size(
+                frames::auction::placeholder().rows.len(),
+                &profile.style,
+                scale,
+            ),
             ElementId::WorldMap => frames::world_map::size(&profile.style, scale),
             ElementId::Minimap => frames::minimap::size(&profile.style, scale),
             ElementId::Loot => {
@@ -4501,6 +4599,30 @@ mod tests {
         }
     }
 
+    /// Where every default frame ends up, printed. Not an assertion -- the
+    /// thing a new frame's default position actually needs is somewhere to
+    /// read the others from.
+    #[test]
+    fn print_the_default_rects() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let profile = Profile::default();
+        for id in ElementId::ALL {
+            let element = profile.get(id);
+            if !element.visible {
+                continue;
+            }
+            let rect = element.rect(screen, size_of(&profile, id));
+            println!(
+                "{:24} {:7.0},{:7.0} .. {:7.0},{:7.0}",
+                id.label(),
+                rect.min.x,
+                rect.min.y,
+                rect.max.x,
+                rect.max.y
+            );
+        }
+    }
+
     /// And they must not sit on top of each other, which a shared default
     /// offset would quietly produce.
     #[test]
@@ -4519,7 +4641,17 @@ mod tests {
         // rather than an exemption -- see the test that follows.
         let shown: Vec<(ElementId, egui::Rect)> = ElementId::ALL
             .into_iter()
-            .filter(|id| profile.get(*id).visible && *id != ElementId::WorldMap)
+            .filter(|id| {
+                profile.get(*id).visible
+                    && *id != ElementId::WorldMap
+                    // Excluded for the map's reason and no other: at 520 by
+                    // 474 it is the second-largest frame here, and there is
+                    // nowhere on a 1024-wide screen to put one that size
+                    // without touching something. What has to be true of it
+                    // is the narrower claim below, which is a real assertion
+                    // rather than an exemption.
+                    && *id != ElementId::Auction
+            })
             .map(|id| (id, profile.get(id).rect(screen, size_of(&profile, id))))
             .collect();
         for (i, (a_id, a)) in shown.iter().enumerate() {
@@ -4579,6 +4711,41 @@ mod tests {
             !map.intersects(party),
             "the world map at {map:?} covers the party frame at {party:?}"
         );
+    }
+
+    /// The auction window may cover a window somebody opened; it may not
+    /// cover the frames that are simply *there*.
+    ///
+    /// Exactly the map's claim, and the reason it is a separate test rather
+    /// than a wider exemption: a player who opened the auction house has
+    /// chosen to stand at an auctioneer and read, and the loot window
+    /// underneath can be dealt with by closing it -- but health, target, chat
+    /// and the action bars are not things anybody opened.
+    #[test]
+    fn the_auction_window_covers_only_windows_that_were_opened() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let profile = Profile::default();
+        let auction = profile
+            .get(ElementId::Auction)
+            .rect(screen, size_of(&profile, ElementId::Auction));
+        for id in [
+            ElementId::PlayerFrame,
+            ElementId::TargetFrame,
+            ElementId::ChatFrame,
+            ElementId::CastBar,
+            ElementId::ActionBar1,
+            ElementId::ActionBar2,
+            ElementId::ActionBar3,
+            ElementId::Minimap,
+            ElementId::PartyFrame,
+        ] {
+            let rect = profile.get(id).rect(screen, size_of(&profile, id));
+            assert!(
+                !auction.intersects(rect),
+                "the auction window at {auction:?} covers {} at {rect:?}",
+                id.label()
+            );
+        }
     }
 
     fn party() -> Vec<frames::PartyMemberView> {

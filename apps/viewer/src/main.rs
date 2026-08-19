@@ -2934,6 +2934,9 @@ struct App {
     /// Cleared by the questgiver window's Close button, since the same click
     /// opened both, and replaced whenever another NPC is greeted.
     trainer: Option<TrainerSession>,
+
+    /// The open auction window, or `None`. See [`AuctionSession`].
+    auction: Option<AuctionSession>,
     /// The mailbox currently open, or `None`.
     ///
     /// **Existence is the flag**, like the trainer's and the taxi's, and it
@@ -3500,6 +3503,56 @@ struct TrainerSession {
     list: Option<::world::TrainerList>,
 }
 
+
+/// The open auction window, and everything about it the wire does not carry.
+///
+/// **The offset is the interesting field.** A list result says how many rows
+/// it holds and how many matched, and nothing at all about where in the match
+/// those rows sit -- so the requester is the only thing that knows, and this
+/// is where it is kept. Everything else here is either what the server said or
+/// what the player picked.
+struct AuctionSession {
+    /// The auctioneer every request in this block has to name again.
+    npc: u64,
+    /// Which house it serves, once the greeting says so. `None` until then.
+    ///
+    /// The only field in the whole block that distinguishes two auctioneers,
+    /// and a client that let the player walk from one to another without
+    /// noticing would show one house's rows while sending another's requests.
+    house: Option<u32>,
+    tab: ui::AuctionTab,
+    /// The row the current search was asked to start at.
+    offset: u32,
+    /// What is being searched for. Empty is everything.
+    search: String,
+    /// The selected auction, by the **server's id**: paging must not move a
+    /// selection to whatever is now in that slot.
+    selected: Option<u32>,
+    /// Whether a request has gone out with no reply yet, so the window can say
+    /// "asking" rather than looking like a search that matched nothing --
+    /// the same picture and a different fact.
+    waiting: bool,
+}
+
+impl AuctionSession {
+    /// The request that matches this session's tab.
+    ///
+    /// One function so the tab and the request cannot disagree; three separate
+    /// call sites is how a Browse tab ends up showing an owner list.
+    fn ask(&self, connection: &mut ::world::Connection) -> Result<(), ::world::client::Error> {
+        match self.tab {
+            ui::AuctionTab::Browse => {
+                let mut search = ::world::AuctionSearch::any();
+                search.name = self.search.clone();
+                connection.auction_list_items(self.npc, self.offset, &search)
+            }
+            // Neither of these pages, so neither carries an offset.
+            ui::AuctionTab::Bids => connection.auction_list_bidder_items(self.npc, &[]),
+            ui::AuctionTab::Selling => connection.auction_list_owner_items(self.npc),
+        }
+    }
+}
+
 struct Questgiver {
     npc: u64,
     /// Resolved at greeting time rather than per frame: an NPC's name cannot
@@ -3755,6 +3808,7 @@ impl App {
             quest_saved_at: Instant::now(),
             questgiver: None,
             trainer: None,
+            auction: None,
             mailbox: None,
             guild_open: false,
             guild_invitation_said: None,
@@ -6879,6 +6933,16 @@ impl App {
             // exactly like a click that missed.
             if self.is_mailbox(guid) {
                 self.open_mailbox(guid);
+            } else if self.runs_an_auction_house(guid) {
+                // **Before the talk branch, and that ordering is the whole
+                // reason this arm exists here.** An auctioneer's entire
+                // `UNIT_NPC_FLAGS` word is the auctioneer bit -- it does not
+                // gossip -- so `is_talk_candidate` says yes on "any bit set"
+                // and `greet` would send a `CMSG_GOSSIP_HELLO` the server
+                // answers with nothing. That is indistinguishable from a
+                // click that missed, which is exactly what the mailbox arm
+                // above was added to stop happening.
+                self.open_auction_house(guid);
             } else if self.is_talk_candidate(guid) {
                 // **Before the attack branch, and that is a fix as much as a
                 // feature.** Right-clicking a questgiver used to send a swing
@@ -7394,6 +7458,10 @@ impl App {
         // failure this client cannot diagnose.
         self.trainer = None;
         self.taxi = None;
+        // And the auction window with them, for the identical reason: bids
+        // sent to an auctioneer the server no longer considers open are
+        // refused in silence.
+        self.auction = None;
 
         // **A trainer is asked in the same breath as it is greeted**, and the
         // flag is what decides. `UNIT_NPC_FLAGS` bit `0x10` is replicated, so
@@ -7445,6 +7513,279 @@ impl App {
                 }
             }
         }
+    }
+
+
+
+    /// The auction window, built from the one page the world state holds.
+    ///
+    /// **Truncated to what the window can draw**, and the page arithmetic goes
+    /// with it: the server's fifty is a cap on what it will send, not a step,
+    /// because `listfrom` is a row index. So the window pages by
+    /// `VISIBLE_ROWS` and asks from row `offset`, and `total` -- the server's
+    /// own number -- keeps the range line honest whichever page size is used.
+    #[allow(clippy::too_many_arguments)]
+    fn auction_view(
+        session: Option<&AuctionSession>,
+        live: Option<&live::LiveWorld>,
+        items: &mut items::Items,
+        chain: &mut Chain,
+        gpu: &Gpu,
+        egui_renderer: &mut egui_wgpu::Renderer,
+    ) -> Option<ui::AuctionView> {
+        let session = session?;
+        let (tab, offset, search, selected, waiting, house) = (
+            session.tab,
+            session.offset,
+            session.search.clone(),
+            session.selected,
+            session.waiting,
+            session.house,
+        );
+
+        // What is needed off the live world, gathered before anything takes
+        // `self` mutably for icons.
+        let gathered: Vec<(::world::Auction, String)> = live
+            .and_then(|live| live.state.auctions.as_ref().map(|page| (live, page)))
+            .map(|(live, page)| {
+                page.auctions
+                    .iter()
+                    .take(ui::frames::auction::VISIBLE_ROWS)
+                    .map(|auction| {
+                        // The seller is a guid and the roster of everybody
+                        // selling is not something this client has. A name
+                        // query answers for one, and until it does the guid's
+                        // low half is drawn -- honest, and better than a blank
+                        // column that would read as an auction with no owner.
+                        let seller = live
+                            .state
+                            .names
+                            .player(auction.owner)
+                            .flatten()
+                            .map(|name| name.to_string())
+                            .unwrap_or_else(|| format!("player {}", auction.owner & 0xFFFF_FFFF));
+                        (auction.clone(), seller)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let total = live
+            .and_then(|live| live.state.auctions.as_ref())
+            .map(|page| page.total)
+            .unwrap_or(0);
+
+        let rows = gathered
+            .into_iter()
+            .map(|(auction, seller)| {
+                let name = Self::item_name(live, items, auction.item);
+                let icon = items.icon(gpu, egui_renderer, chain, auction.item);
+                ui::AuctionRow {
+                    id: auction.id,
+                    name,
+                    count: auction.count,
+                    icon,
+                    seller,
+                    bid: auction.bid,
+                    // Worked out in one place, from the two different fields
+                    // it comes from -- see `world::auction::Auction::next_bid`.
+                    next_bid: auction.next_bid(),
+                    buyout: auction.buyout,
+                    band: match auction.band() {
+                        ::world::TimeBand::Short => ui::frames::auction::TimeBand::Short,
+                        ::world::TimeBand::Medium => ui::frames::auction::TimeBand::Medium,
+                        ::world::TimeBand::Long => ui::frames::auction::TimeBand::Long,
+                        ::world::TimeBand::VeryLong => ui::frames::auction::TimeBand::VeryLong,
+                    },
+                    own: live.is_some_and(|live| auction.is_own(live.guid)),
+                }
+            })
+            .collect();
+
+        Some(ui::AuctionView {
+            tab,
+            rows,
+            total,
+            offset,
+            page_rows: ui::frames::auction::VISIBLE_ROWS as u32,
+            selected,
+            search,
+            waiting,
+            house,
+        })
+    }
+
+    /// Whether this unit's replicated flags say it runs an auction house.
+    ///
+    /// Its own predicate beside [`App::offers_training`] for the same reason:
+    /// the one place naming bit `0x200000` is the place carrying the evidence.
+    /// Measured on Auctioneer Buckler, whose whole flag word is `0x200000` and
+    /// nothing else -- an auctioneer does not gossip, sell or train -- and who
+    /// answers `MSG_AUCTION_HELLO` from zero units away. The three NPCs
+    /// standing at this project's fixture spot carry `0x10283`, `0x3` and
+    /// `0x80` and none of them answers it.
+    fn runs_an_auction_house(&self, guid: u64) -> bool {
+        /// `UNIT_NPC_FLAG_AUCTIONEER`. See [`App::runs_an_auction_house`].
+        const AUCTIONEER: u32 = 0x0020_0000;
+        self.live
+            .as_ref()
+            .and_then(|live| live.state.get(guid))
+            .and_then(|entity| entity.npc_flags())
+            .is_some_and(|flags| flags & AUCTIONEER != 0)
+    }
+
+    /// Sends whatever this session's tab asks for, and records the offset.
+    ///
+    /// **The two calls are here, adjacent, and nowhere else.** The offset goes
+    /// out on the wire and is also told to the world state, because the reply
+    /// does not carry it -- and a pair of calls that must agree is exactly the
+    /// shape this project keeps getting wrong when it is spread over two call
+    /// sites.
+    fn ask_auctions(&mut self) {
+        let Some(session) = self.auction.as_mut() else {
+            return;
+        };
+        let offset = session.offset;
+        let browsing = session.tab == ui::AuctionTab::Browse;
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        // The two lists that do not page always start at row zero, and telling
+        // the state otherwise would label their rows with an offset they do
+        // not have.
+        live.state
+            .expect_auction_page(if browsing { offset } else { 0 });
+        let Some(session) = self.auction.as_ref() else {
+            return;
+        };
+        match session.ask(&mut live.connection) {
+            Ok(()) => {
+                if let Some(session) = self.auction.as_mut() {
+                    session.waiting = true;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("asking the auction house failed: {e:#}");
+                self.notice(format!("could not ask the auction house: {e}"));
+            }
+        }
+    }
+
+    /// Opens the auction window at an auctioneer.
+    ///
+    /// The greeting and the first search go out together, exactly as a
+    /// trainer's list does -- and the greeting is the one that matters,
+    /// because it is the only packet in the block that names the house.
+    fn open_auction_house(&mut self, guid: u64) {
+        // Any page held from a previous auctioneer is dropped before the new
+        // one is asked. Rows from one house under a title naming another is
+        // precisely the confusion `AuctionHouse` exists to prevent, and there
+        // is no packet anywhere that would say it had happened.
+        if let Some(live) = self.live.as_mut() {
+            live.state.auctions = None;
+            live.state.auction_house = None;
+            if let Err(e) = live.connection.auction_hello(guid) {
+                tracing::warn!("greeting auctioneer {guid:#x} failed: {e:#}");
+                return;
+            }
+        }
+        self.auction = Some(AuctionSession {
+            npc: guid,
+            house: None,
+            tab: ui::AuctionTab::Browse,
+            offset: 0,
+            search: String::new(),
+            selected: None,
+            waiting: true,
+        });
+        self.ask_auctions();
+    }
+
+    /// Acts on a control under the auction list.
+    ///
+    /// Every arm here is reached only when
+    /// `ui::frames::auction::control_live` said the control would do
+    /// something, so the refusals below are belt and braces rather than the
+    /// only guard -- but they log, because all four of the ways this can be a
+    /// no-op are otherwise silent, and a silent send is the one failure this
+    /// client cannot diagnose.
+    fn auction_control(&mut self, click: ui::AuctionClick) {
+        let page = ui::frames::auction::VISIBLE_ROWS as u32;
+        match click {
+            ui::AuctionClick::PreviousPage | ui::AuctionClick::NextPage => {
+                let Some(session) = self.auction.as_mut() else {
+                    return;
+                };
+                session.offset = match click {
+                    ui::AuctionClick::NextPage => session.offset.saturating_add(page),
+                    _ => session.offset.saturating_sub(page),
+                };
+                // The selection is dropped rather than carried: it names a row
+                // that is about to stop being on screen, and a Bid button that
+                // still pointed at it would spend money on something nobody
+                // can see.
+                session.selected = None;
+                self.ask_auctions();
+            }
+            ui::AuctionClick::Bid | ui::AuctionClick::Buyout => {
+                let Some((npc, id, price)) = self.selected_auction_price(click) else {
+                    tracing::info!("a bid was asked for with nothing selected to bid on");
+                    return;
+                };
+                let Some(live) = self.live.as_mut() else {
+                    return;
+                };
+                match live.connection.auction_place_bid(npc, id, price) {
+                    // A zero id or a zero price; refused here rather than
+                    // dropped by the server without a word.
+                    Ok(false) => {
+                        tracing::info!("auction {id} at {price} is not a bid the server accepts")
+                    }
+                    Ok(true) => self.notice(format!(
+                        "bid {} on auction {id}",
+                        ui::frames::auction::money(price)
+                    )),
+                    Err(e) => tracing::warn!("bidding on auction {id} failed: {e:#}"),
+                }
+            }
+            ui::AuctionClick::Cancel => {
+                let Some(session) = self.auction.as_ref() else {
+                    return;
+                };
+                let (npc, Some(id)) = (session.npc, session.selected) else {
+                    tracing::info!("a cancellation was asked for with nothing selected");
+                    return;
+                };
+                if let Some(live) = self.live.as_mut() {
+                    match live.connection.auction_remove_item(npc, id) {
+                        // The goods come back as **mail**, not to the bag, so
+                        // the notice says where to look for them.
+                        Ok(()) => self.notice(format!(
+                            "cancelled auction {id}; the goods come back by mail"
+                        )),
+                        Err(e) => tracing::warn!("cancelling auction {id} failed: {e:#}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// What a bid or a buyout on the selection would cost.
+    ///
+    /// The two prices come from **different fields** and picking the wrong one
+    /// is refused in silence: a bid is the current bid plus the server's own
+    /// increment, or the opening price when nobody has bid, and a buyout is
+    /// the seller's number. See `world::auction::Auction::next_bid`.
+    fn selected_auction_price(&self, click: ui::AuctionClick) -> Option<(u64, u32, u32)> {
+        let session = self.auction.as_ref()?;
+        let id = session.selected?;
+        let live = self.live.as_ref()?;
+        let page = live.state.auctions.as_ref()?;
+        let auction = page.get(id)?;
+        let price = match click {
+            ui::AuctionClick::Buyout => auction.buyout,
+            _ => auction.next_bid(),
+        };
+        (price > 0).then_some((session.npc, id, price))
     }
 
     /// Whether this unit's replicated flags say it trains.
@@ -8019,6 +8360,12 @@ impl App {
         // other flag here is: the connection is borrowed for the whole drain.
         let mut refresh_guild = false;
         let mut taxi_menus: Vec<::world::TaxiMenu> = Vec::new();
+        // The auction block's three, collected for the same reason: the
+        // connection is borrowed for the whole drain, so nothing inside the
+        // loop may touch `self` again.
+        let mut auction_house: Option<::world::AuctionHouse> = None;
+        let mut auction_answered = false;
+        let mut auction_outcomes: Vec<::world::AuctionOutcome> = Vec::new();
         let mut refusals: Vec<u32> = Vec::new();
         // A spline the server sent for *this* character. See the arm below.
         let mut own_spline: Option<::world::update::MonsterMove> = None;
@@ -8465,6 +8812,51 @@ impl App {
                                 }
                             }
                         }
+                        // The auctioneer's greeting, and the **only packet
+                        // in the block that names a house**. Folded into the
+                        // session rather than only into the world state,
+                        // because the window's title is what tells the player
+                        // that walking to a different auctioneer changed which
+                        // goods they are looking at.
+                        ::world::opcode::server::AUCTION_HELLO => {
+                            match ::world::auction::parse_auction_hello(&packet.body) {
+                                Ok(house) => {
+                                    tracing::debug!(
+                                        "auctioneer {:#018x} serves house {} ({})",
+                                        house.auctioneer,
+                                        house.house,
+                                        if house.enabled { "open" } else { "shut" }
+                                    );
+                                    auction_house = Some(house);
+                                }
+                                Err(error) => {
+                                    tracing::warn!("an auction greeting would not parse: {error}")
+                                }
+                            }
+                        }
+                        // Any of the three lists. The state parses them; what
+                        // is needed here is only that one arrived, so the
+                        // window can stop saying it is waiting -- "asking" and
+                        // "nothing matched" are the same picture and different
+                        // facts.
+                        ::world::opcode::server::AUCTION_LIST_RESULT
+                        | ::world::opcode::server::AUCTION_OWNER_LIST_RESULT
+                        | ::world::opcode::server::AUCTION_BIDDER_LIST_RESULT => {
+                            auction_answered = true;
+                        }
+                        // What a post, a bid or a cancellation did. Every one
+                        // of these is worth a chat line: the request that
+                        // caused it was one the player pressed a button for,
+                        // and a success and a refusal look identical from the
+                        // outside.
+                        ::world::opcode::server::AUCTION_COMMAND_RESULT => {
+                            match ::world::auction::parse_command_result(&packet.body) {
+                                Ok(outcome) => auction_outcomes.push(outcome),
+                                Err(error) => {
+                                    tracing::warn!("an auction result would not parse: {error}")
+                                }
+                            }
+                        }
                         ::world::opcode::server::TRAINER_LIST => {
                             match ::world::trainer::parse_trainer_list(&packet.body) {
                                 Ok(list) => {
@@ -8651,6 +9043,35 @@ impl App {
                     "a trainer list for {:#018x} arrived with no window open for it",
                     list.trainer
                 ),
+            }
+        }
+
+
+        // **Filed by guid, like the trainer's**, and for a reason with more
+        // teeth here: `.npc add` stacks auctioneers at a foot, two auctioneers
+        // in a city can serve *different houses*, and nothing in a list result
+        // or a bid says which house it belongs to. A greeting filed against
+        // the wrong session would put one house's name over another house's
+        // rows and no packet would ever say so.
+        if let Some(house) = auction_house {
+            match self
+                .auction
+                .as_mut()
+                .filter(|session| session.npc == house.auctioneer)
+            {
+                Some(session) => session.house = Some(house.house),
+                None => tracing::debug!(
+                    "an auction greeting for {:#018x} arrived with no window open for it",
+                    house.auctioneer
+                ),
+            }
+        }
+        // A list arrived. Which one is the world state's business; what the
+        // window needs is only that the wait is over, because "asking" and
+        // "nothing matched" are the same picture and different facts.
+        if auction_answered {
+            if let Some(session) = self.auction.as_mut() {
+                session.waiting = false;
             }
         }
 
@@ -8962,6 +9383,30 @@ impl App {
             tracing::info!("mailbox closed: out of reach");
             self.mailbox = None;
         }
+        // And the auction window, for the identical reason and with the same
+        // measurement: every request in the block resolves its auctioneer
+        // through `GetNPCIfCanInteractWith`, which refuses past five units --
+        // **in silence**. A window left open after the player walked away is a
+        // window whose every button does nothing and says nothing.
+        if let Some(npc) = self.auction.as_ref().map(|session| session.npc) {
+            const REACH: f32 = 8.0;
+            let near = live
+                .state
+                .get(npc)
+                .and_then(|entity| entity.position)
+                .is_some_and(|at| {
+                    let (dx, dy, dz) = (
+                        at.x - standing.x,
+                        at.y - standing.y,
+                        at.z - standing.z,
+                    );
+                    dx * dx + dy * dy + dz * dz <= REACH * REACH
+                });
+            if !near {
+                tracing::info!("auction window closed: the auctioneer is out of reach");
+                self.auction = None;
+            }
+        }
 
         // The corpse a released ghost has to run back to. See
         // `own_corpse_query_sent`'s doc comment for why this asks once
@@ -8977,6 +9422,36 @@ impl App {
             // a second death asks again rather than trusting a stale
             // `corpse_location` left over from the first one.
             self.own_corpse_query_sent = false;
+        }
+
+        // **Last, because these take `&mut self`** -- a notice and a re-ask
+        // both do -- and the connection above is borrowed out of `self` for
+        // the whole of this function.
+        for outcome in auction_outcomes {
+            let line = if outcome.succeeded() {
+                format!("auction {}: {} accepted", outcome.auction, outcome.action.label())
+            } else {
+                // The number as well as the words, because only the codes this
+                // project has actually observed have words -- everything else
+                // comes back as its number rather than as a name nobody can
+                // check.
+                format!(
+                    "auction {}: {} refused -- {} ({})",
+                    outcome.auction,
+                    outcome.action.label(),
+                    ::world::auction::describe_auction_error(outcome.error),
+                    outcome.error
+                )
+            };
+            tracing::info!("{line}");
+            self.notice(line);
+            // Re-asked rather than edited in place, the same decision the
+            // trainer list makes after a purchase: a bid changes the minimum
+            // increment, the bidder and possibly whether the auction still
+            // exists, and only the server knows which.
+            if outcome.succeeded() {
+                self.ask_auctions();
+            }
         }
     }
 
@@ -10053,6 +10528,21 @@ impl App {
         } else {
             Vec::new()
         };
+        // **Built here rather than beside the other views**, because it needs
+        // the renderer for its icons and the renderer is borrowed out of
+        // `self` for this whole block: everything after this point takes
+        // `&self`, which would extend that borrow past them.
+        //
+        // Disjoint fields rather than `&mut self` for the same reason -- an
+        // icon needs the archive chain and the egui renderer at once.
+        let auction_view = Self::auction_view(
+            self.auction.as_ref(),
+            self.live.as_ref(),
+            &mut self.items,
+            &mut self.chain,
+            &r.gpu,
+            &mut r.egui_renderer,
+        );
         let copper = self
             .live
             .as_ref()
@@ -10281,6 +10771,7 @@ impl App {
                     trainer: trainer.as_ref(),
                     mail: mail.as_ref(),
                     guild: guild.as_ref(),
+                    auction: auction_view.as_ref(),
                     trade: trade.as_ref(),
                     trade_offer: trade_offer.as_ref(),
                     taxi: taxi_view.as_ref(),
@@ -10567,6 +11058,36 @@ impl App {
         if let Some(name) = hud_response.whisper_guild_member.clone() {
             tracing::debug!("whispering guild member {name}");
             self.chat_channel = ChatChannel::Whisper(name);
+        }
+
+        // The auction window's three answers, in the order the frame reports
+        // them. Each logs, because every one of them can end in a request the
+        // server drops without a word.
+        if let Some(tab) = hud_response.auction_tab {
+            if let Some(session) = self.auction.as_mut() {
+                if session.tab != tab {
+                    tracing::debug!("auction window switched to {tab:?}");
+                    session.tab = tab;
+                    // Back to the start of the match: an offset carried across
+                    // a tab change would ask the bidder list for row 96, which
+                    // it reads and ignores, and label the answer page nine.
+                    session.offset = 0;
+                    session.selected = None;
+                    self.ask_auctions();
+                }
+            }
+        }
+        if let Some(id) = hud_response.select_auction {
+            tracing::debug!("auction {id} selected");
+            if let Some(session) = self.auction.as_mut() {
+                // A second click on the selected row clears it, so there is a
+                // way to put the Bid button back to sleep without paging.
+                session.selected = (session.selected != Some(id)).then_some(id);
+            }
+        }
+        if let Some(click) = hud_response.auction_click {
+            tracing::debug!("auction control {click:?}");
+            self.auction_control(click);
         }
 
         // **Logged whenever the window reports anything at all**, so a click

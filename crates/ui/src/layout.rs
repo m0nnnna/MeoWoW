@@ -56,10 +56,11 @@ pub enum ElementId {
     TradeOffer,
     Mailbox,
     Guild,
+    Auction,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 24] = [
+    pub const ALL: [ElementId; 25] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -84,6 +85,7 @@ impl ElementId {
         ElementId::TradeOffer,
         ElementId::Mailbox,
         ElementId::Guild,
+        ElementId::Auction,
     ];
 
     /// What order the frames are drawn in, lowest first.
@@ -147,6 +149,11 @@ impl ElementId {
             // is, and one sealed under the map is a mailbox nobody can
             // empty.
             | ElementId::Mailbox
+            // With them, and for the same reason as the trainer: the auction
+            // window is the answer to clicking an auctioneer. It is also the
+            // largest window in this interface, so one sealed under the map
+            // would cover everything and answer nothing.
+            | ElementId::Auction
             // With them, and for the same reason: a trade window is open for
             // seconds and every second of it is somebody else waiting. One
             // sealed under a panel is a trade the player cannot cancel, which
@@ -247,6 +254,7 @@ impl ElementId {
             ElementId::TradeOffer => "trade-offer",
             ElementId::Mailbox => "mailbox",
             ElementId::Guild => "guild",
+            ElementId::Auction => "auction",
         }
     }
 
@@ -281,6 +289,7 @@ impl ElementId {
             ElementId::TradeOffer => "Trade offer",
             ElementId::Mailbox => "Mailbox",
             ElementId::Guild => "Guild",
+            ElementId::Auction => "Auction house",
         }
     }
 
@@ -541,6 +550,25 @@ impl ElementId {
             ElementId::Guild => Element {
                 anchor: Anchor::TopRight,
                 offset: [-24.0, 220.0],
+                ..Default::default()
+            },
+            // The widest window here, so it anchors to the left edge rather
+            // than to the centre: a centre offset that clears the middle at
+            // 1920 puts a 700-pixel window half off the screen at 1024, and a
+            // first-time user has no visible way to drag back something whose
+            // title bar is past the edge. The guild window's anchor carries
+            // the same reasoning, with less window to be wrong about.
+            // Centred, like the world map, and for the same reason: it is
+            // the second-largest frame in the interface, it is read while
+            // stopped, and there is nowhere on a 1024-wide screen to put a
+            // 520-pixel window that does not touch something. Anchoring to an
+            // edge with an offset large enough to clear the middle at 1920
+            // puts it half off the screen at 1024, where a first-time user has
+            // no visible way to drag it back. See the tests in `crate::lib`
+            // about what it may and may not cover.
+            ElementId::Auction => Element {
+                anchor: Anchor::Center,
+                offset: [0.0, 0.0],
                 ..Default::default()
             },
         }
