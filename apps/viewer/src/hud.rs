@@ -247,6 +247,15 @@ pub fn names_to_ask(
             .unwrap_or(0);
         wanted.push((entity.is_player(), entity.guid, entry));
     }
+    // Game objects, asked about separately because the question is different:
+    // the others are asked what they are *called* and these are asked what
+    // they *are*. A starting zone holds forty of them and the answer is
+    // cached per entry like a creature's, so this costs one query per kind
+    // and never repeats.
+    let objects: Vec<(u64, u32)> = state
+        .game_objects()
+        .filter_map(|object| object.entry().map(|entry| (object.guid, entry)))
+        .collect();
     // Chat senders who are not in range, and so were never in the sweep above.
     for guid in extra_players {
         wanted.push((true, *guid, 0));
@@ -263,6 +272,14 @@ pub fn names_to_ask(
             }
         } else if entry != 0 && state.names.claim_creature(entry, now) {
             asking.push(NameRequest::Creature { entry, guid });
+        }
+    }
+    for (guid, entry) in objects {
+        if asking.len() >= limit {
+            break;
+        }
+        if entry != 0 && state.names.claim_gameobject(entry, now) {
+            asking.push(NameRequest::GameObject { entry, guid });
         }
     }
     asking
@@ -437,6 +454,13 @@ mod party_tests {
 pub enum NameRequest {
     Player { guid: u64 },
     Creature { entry: u32, guid: u64 },
+    /// **What a game object *is*, not what it is called.**
+    ///
+    /// The name is a by-product; the reason to ask is the type, which is the
+    /// only thing that separates a mailbox from a bench. A display id draws
+    /// either one and says nothing about which -- see
+    /// `world::query::GameObjectInfo`.
+    GameObject { entry: u32, guid: u64 },
 }
 
 /// Item entries worth asking about, and marking them asked.

@@ -54,10 +54,11 @@ pub enum ElementId {
     Taxi,
     Trade,
     TradeOffer,
+    Mailbox,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 22] = [
+    pub const ALL: [ElementId; 23] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -80,6 +81,7 @@ impl ElementId {
         ElementId::Taxi,
         ElementId::Trade,
         ElementId::TradeOffer,
+        ElementId::Mailbox,
     ];
 
     /// What order the frames are drawn in, lowest first.
@@ -134,6 +136,11 @@ impl ElementId {
             // bug the questgiver's Accept button had.
             | ElementId::Trainer
             | ElementId::Taxi
+            // With them: a mailbox window is the answer to walking up to
+            // an object and pressing a key, exactly as the trainer window
+            // is, and one sealed under the map is a mailbox nobody can
+            // empty.
+            | ElementId::Mailbox
             // With them, and for the same reason: a trade window is open for
             // seconds and every second of it is somebody else waiting. One
             // sealed under a panel is a trade the player cannot cancel, which
@@ -232,6 +239,7 @@ impl ElementId {
             ElementId::Taxi => "taxi",
             ElementId::Trade => "trade",
             ElementId::TradeOffer => "trade-offer",
+            ElementId::Mailbox => "mailbox",
         }
     }
 
@@ -264,6 +272,7 @@ impl ElementId {
             ElementId::Taxi => "Flight master",
             ElementId::Trade => "Trade",
             ElementId::TradeOffer => "Trade offer",
+            ElementId::Mailbox => "Mailbox",
         }
     }
 
@@ -493,6 +502,21 @@ impl ElementId {
             ElementId::TradeOffer => Element {
                 anchor: Anchor::Center,
                 offset: [0.0, -220.0],
+                ..Default::default()
+            },
+            // Right of centre and low, clear of everything a mailbox can be
+            // open beside.
+            //
+            // The constraint that decided it is the **bag window**: emptying
+            // a mailbox puts things into the bags, and a letter refused for
+            // want of room is answered with an inventory error rather than
+            // with silence -- so the two frames are read together and the
+            // player needs to see the squares fill. Anywhere the mailbox
+            // covered the bags would hide the consequence of the click that
+            // was just made.
+            ElementId::Mailbox => Element {
+                anchor: Anchor::Center,
+                offset: [280.0, 210.0],
                 ..Default::default()
             },
         }

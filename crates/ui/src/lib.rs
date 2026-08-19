@@ -41,6 +41,7 @@ pub use frames::combat_text::{CombatTextKind, FloatingText};
 pub use frames::{
     CastBarView, InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
     QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
+    MailAttachment, MailRow, MailRowState, MailView,
     MapMarker, MapPatch, MapView, MarkerKind, MinimapTile, MinimapView, QuestgiverView,
     SpellbookEntry, TaxiRow, TaxiView, TradeClick, TradeOfferAnswer, TradeOfferView,
     TradeSquare, TradeSquareItem, TradeView, TrainerRow, TrainerRowState, TrainerView, UnitView,
@@ -165,6 +166,14 @@ pub struct HudData<'a> {
     /// The open flight master's list, or `None`. Existence is the flag, like
     /// the trainer and loot windows.
     pub taxi: Option<&'a frames::TaxiView>,
+    /// The open mailbox, or `None`. Existence is the flag, like every other
+    /// window that appears because the player walked up to something.
+    ///
+    /// **`None` means the mailbox is closed, not that the inbox is empty.**
+    /// An empty inbox is a `MailView` with no rows, and it is drawn -- a
+    /// mailbox that opened onto nothing at all would read as a request that
+    /// failed rather than as a mailbox with nothing in it.
+    pub mail: Option<&'a frames::MailView>,
     /// The open trade window, or `None`. Existence is the flag, as it is for
     /// every other window that appears because something happened.
     ///
@@ -287,6 +296,16 @@ pub struct HudResponse {
     /// mask, so a position names a different place to two readers standing at
     /// the same flight master.
     pub fly_to: Option<u32>,
+    /// A letter was clicked, reported as the **server's mail id** rather than
+    /// as the row's position -- the same reasoning as [`Self::learn_spell`]
+    /// and [`Self::take_loot`]. The inbox is filtered (deleted, undelivered
+    /// and expired letters are skipped), so positions do not close up.
+    ///
+    /// Only ever set for a letter with something in it. A letter already
+    /// emptied reports nothing, because the only other thing a click could
+    /// mean there is *delete*, and deleting is irreversible with no
+    /// confirmation anywhere in this interface.
+    pub take_mail: Option<u32>,
     /// A party row was clicked, reported as the member's **guid** rather than
     /// as the row's position -- the same reasoning as [`Self::selected_quest`]
     /// carrying a quest id. The list is rebuilt from every group list the
@@ -626,6 +645,7 @@ impl Hud {
             let questgiver_placeholder;
             let trainer_placeholder;
             let taxi_placeholder;
+            let mail_placeholder;
             let world_map_placeholder;
             let minimap_placeholder;
             let release_prompt_placeholder;
@@ -735,6 +755,14 @@ impl Hud {
                     None if editing => {
                         trainer_placeholder = frames::trainer::placeholder();
                         Content::Trainer(&trainer_placeholder)
+                    }
+                    None => continue,
+                },
+                ElementId::Mailbox => match data.mail {
+                    Some(view) => Content::Mail(view),
+                    None if editing => {
+                        mail_placeholder = frames::mail::placeholder();
+                        Content::Mail(&mail_placeholder)
                     }
                     None => continue,
                 },
@@ -867,6 +895,9 @@ impl Hud {
                 Content::Trainer(view) => {
                     frames::trainer::size(view.rows.len(), &style, element.scale)
                 }
+                Content::Mail(view) => {
+                    frames::mail::size(view.rows.len(), &style, element.scale)
+                }
                 Content::Taxi(view) => {
                     frames::taxi::size(view.rows.len(), &style, element.scale)
                 }
@@ -967,6 +998,7 @@ impl Hud {
                             | Content::QuestLog(_)
                             | Content::Questgiver(_)
                             | Content::Trainer(_)
+                            | Content::Mail(_)
                             | Content::Taxi(_)
                             | Content::Trade(_)
                             | Content::TradeOffer(_)
@@ -1072,6 +1104,13 @@ impl Hud {
                             response.rect,
                             &view.greeting,
                             &view.rows,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Mail(view) => frames::mail::draw(
+                            &painter,
+                            response.rect,
+                            view,
                             &style,
                             element.scale,
                         ),
@@ -1328,6 +1367,34 @@ impl Hud {
                             ) {
                                 response_out.learn_spell =
                                     view.rows.get(row).map(|row| row.spell);
+                            }
+                        }
+                    }
+                }
+                (false, Content::Mail(view)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            // **The row carries the mail id; this does not
+                            // derive it.** The inbox is filtered, so a row
+                            // number is not a mail id and never was.
+                            //
+                            // `row_at` answers only for letters with
+                            // something in them. The other thing a click
+                            // could mean on an emptied letter is *delete*,
+                            // and that is irreversible with nothing
+                            // confirming it -- so it is not on the gesture
+                            // that collects, and an emptied row reports
+                            // nothing at all rather than reporting a click
+                            // the caller has to remember to ignore.
+                            if let Some(row) = frames::mail::row_at(
+                                drawn_rect,
+                                &view.rows,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                response_out.take_mail =
+                                    view.rows.get(row).map(|row| row.id);
                             }
                         }
                     }
@@ -1702,6 +1769,13 @@ impl Hud {
                             &style,
                             scale,
                         ),
+                        ElementId::Mailbox => frames::mail::size(
+                            data.mail
+                                .map(|view| view.rows.len())
+                                .unwrap_or_else(|| frames::mail::placeholder().rows.len()),
+                            &style,
+                            scale,
+                        ),
                         ElementId::Loot => frames::loot::size(
                             data.loot
                                 .map(|rows| rows.len())
@@ -1790,6 +1864,7 @@ enum Content<'a> {
     QuestLog(&'a [frames::QuestLogEntry]),
     Questgiver(&'a frames::QuestgiverView),
     Trainer(&'a frames::TrainerView),
+    Mail(&'a frames::MailView),
     Trade(&'a frames::TradeView),
     TradeOffer(&'a frames::TradeOfferView),
     Taxi(&'a frames::TaxiView),
@@ -2767,6 +2842,97 @@ mod tests {
                 "a click on the {what} row must send nothing"
             );
         }
+    }
+
+    /// **Clicking a letter reports its mail id, and an emptied letter reports
+    /// nothing.**
+    ///
+    /// The `Sense::click()` check every window here needs -- a frame left out
+    /// of that one `matches!` draws, hit-tests and silently never reports --
+    /// plus the half specific to this window.
+    ///
+    /// A mailbox is *mostly letters with nothing left in them* once anybody
+    /// has used it for a while, and the only other thing a click could mean
+    /// there is **delete**, which is irreversible with nothing confirming it.
+    /// So both halves are asserted: the full letter answers with its id and
+    /// the emptied one answers with nothing. A hit test that reported every
+    /// row would pass the first half alone.
+    ///
+    /// And the id is carried, not counted. The collectable letter sits at
+    /// position 1 and holds mail 4321, so a window reporting its position
+    /// would ask to empty mail 1.
+    #[test]
+    fn clicking_a_letter_reports_its_id_and_only_when_there_is_something_in_it() {
+        let view = frames::MailView {
+            withheld: 0,
+            rows: vec![
+                frames::MailRow {
+                    id: 7,
+                    sender: "Testwolf".into(),
+                    subject: "Already emptied".into(),
+                    body: String::new(),
+                    money: 0,
+                    attachments: Vec::new(),
+                    read: true,
+                    days_left: 12.0,
+                    state: frames::MailRowState::Empty,
+                },
+                frames::MailRow {
+                    id: 4321,
+                    sender: "Watcher".into(),
+                    subject: "Supplies".into(),
+                    body: "Take what you need.".into(),
+                    money: 500,
+                    attachments: vec![frames::MailAttachment {
+                        count: 3,
+                        icon: None,
+                    }],
+                    read: false,
+                    days_left: 30.0,
+                    state: frames::MailRowState::Collectable,
+                },
+            ],
+        };
+        let data = HudData {
+            mail: Some(&view),
+            ..Default::default()
+        };
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::Mailbox);
+        let rect = element.rect(
+            screen(),
+            frames::mail::size(view.rows.len(), &hud.profile.style, element.scale),
+        );
+        let centres: Vec<egui::Pos2> =
+            frames::mail::row_rects(rect, view.rows.len(), &hud.profile.style, element.scale)
+                .map(|row| row.center())
+                .collect();
+
+        let full = drive(
+            &mut hud,
+            &data,
+            &click_script(centres[1], egui::PointerButton::Primary),
+        );
+        assert_eq!(
+            full.take_mail,
+            Some(4321),
+            "a click on the full letter must ask for mail 4321, not row 1"
+        );
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let empty = drive(
+            &mut hud,
+            &data,
+            &click_script(centres[0], egui::PointerButton::Primary),
+        );
+        assert_eq!(
+            empty.take_mail, None,
+            "a click on an emptied letter must send nothing -- the only other \
+             thing it could mean is a delete nobody confirmed"
+        );
     }
 
     /// **Clicking our own trade square asks to clear it; clicking theirs asks
@@ -4033,6 +4199,11 @@ mod tests {
             ElementId::TradeOffer => frames::trade::offer_size(&profile.style, scale),
             ElementId::Trainer => frames::trainer::size(
                 frames::trainer::placeholder().rows.len(),
+                &profile.style,
+                scale,
+            ),
+            ElementId::Mailbox => frames::mail::size(
+                frames::mail::placeholder().rows.len(),
                 &profile.style,
                 scale,
             ),

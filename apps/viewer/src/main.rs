@@ -2625,6 +2625,15 @@ struct App {
     /// Cleared by the questgiver window's Close button, since the same click
     /// opened both, and replaced whenever another NPC is greeted.
     trainer: Option<TrainerSession>,
+    /// The mailbox currently open, or `None`.
+    ///
+    /// **Existence is the flag**, like the trainer's and the taxi's, and it
+    /// holds the mailbox's **guid** rather than a boolean because every mail
+    /// request names it: the server checks on each one that the object is
+    /// still a mailbox this character can reach. A window that outlived the
+    /// walk away from it would send requests refused for a reason nothing on
+    /// screen explains, so it closes itself -- see [`App::mailbox_in_reach`].
+    mailbox: Option<u64>,
     /// The taxi flight currently being flown, or `None`.
     ///
     /// **While this is `Some`, the server owns the character's position** and
@@ -3222,6 +3231,39 @@ fn describe_party_result(result: &::world::PartyCommandResult) -> String {
     }
 }
 
+/// What to write in a letter's "from" column.
+///
+/// **Only a player sender has a name that can be asked for**, and even then
+/// only once the query comes back. Everything else -- an auction, a creature,
+/// a game object, a calendar event -- arrives as a bare entry into a table
+/// this client does not have, so it is *labelled* with what is actually known
+/// rather than given a name nothing answered for. Same rule as printing `$s1`
+/// on a tooltip whose column was never confirmed: a visible `auction 4242`
+/// says "not resolved" and a fabricated name says nothing and is believed.
+///
+/// A free function rather than a method because a method borrows the whole of
+/// `App`, and the view this feeds is built while the renderer and the item
+/// icon cache are already borrowed out of it.
+fn mail_sender_label(state: &::world::WorldState, sender: ::world::MailSender) -> String {
+    use ::world::MailSender as S;
+    match sender {
+        // Sender zero is what the server writes for a letter with no person
+        // behind it -- the console sent it, or the game did. Not drawn as a
+        // guid, and not left blank either.
+        S::Player(0) => "the game".to_string(),
+        S::Player(guid) => state
+            .names
+            .player(guid)
+            .flatten()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("player {guid:#x}")),
+        S::Auction(id) => format!("auction {id}"),
+        S::Creature(entry) => format!("creature {entry}"),
+        S::GameObject(entry) => format!("object {entry}"),
+        S::Calendar(id) => format!("calendar {id}"),
+    }
+}
+
 fn local_notice(text: String) -> ::world::ChatMessage {
     ::world::ChatMessage {
         chat_type: ::world::ChatType::System,
@@ -3359,6 +3401,7 @@ impl App {
             quest_saved_at: Instant::now(),
             questgiver: None,
             trainer: None,
+            mailbox: None,
             flight: None,
             taxi: None,
             looting: None,
@@ -6374,7 +6417,16 @@ impl App {
         };
         self.set_target(picked);
         if let Some(guid) = picked {
-            if self.is_talk_candidate(guid) {
+            // **Before the talk branch, because a mailbox is not an NPC and
+            // would fall through every one of the tests below to nothing.**
+            // A game object carries no `UNIT_NPC_FLAGS`, so `will_talk` says
+            // no, `is_attack_candidate` says no and `is_loot_candidate` says
+            // no -- and a right-click on the one object in the world this
+            // milestone is about would do nothing at all while looking
+            // exactly like a click that missed.
+            if self.is_mailbox(guid) {
+                self.open_mailbox(guid);
+            } else if self.is_talk_candidate(guid) {
                 // **Before the attack branch, and that is a fix as much as a
                 // feature.** Right-clicking a questgiver used to send a swing
                 // the server refused -- `is_attack_candidate` rules out only
@@ -6632,6 +6684,140 @@ impl App {
         live.state
             .get(guid)
             .is_some_and(|entity| entity.will_talk() && !entity.is_dead_or_ghost())
+    }
+
+    /// Whether this guid is a mailbox that can be opened.
+    ///
+    /// **The only question in this client answered by asking what an object
+    /// *is*.** A display id draws a mailbox and a bench with equal
+    /// confidence; `SMSG_GAMEOBJECT_QUERY_RESPONSE`'s type is the only thing
+    /// that tells them apart, and it arrives a moment after the object does.
+    ///
+    /// So an entry whose answer has not come back yet is `false` here, which
+    /// is right and worth stating: the alternative is opening a window for
+    /// something that turns out to be a bench. The cost is that the very
+    /// first right-click on a freshly-streamed mailbox can miss, and the
+    /// query is claimed once per *entry* rather than per object, so the
+    /// second click works and every later mailbox of the same kind works at
+    /// once.
+    fn is_mailbox(&self, guid: u64) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        let Some(object) = live.state.get(guid) else {
+            return false;
+        };
+        if object.object_type != ::world::ObjectType::GameObject {
+            return false;
+        }
+        object
+            .entry()
+            .and_then(|entry| live.state.names.gameobject(entry).flatten())
+            .is_some_and(|info| info.is_mailbox())
+    }
+
+    /// Opens a mailbox and asks it what is inside.
+    ///
+    /// The window appears *before* the answer, like the trainer's and unlike
+    /// the loot window's: `CMSG_GET_MAIL_LIST` is always answered, so an
+    /// empty window is a reply still in flight rather than a click that did
+    /// not register -- and an inbox with nothing in it is a real and ordinary
+    /// state that has to be drawn as itself.
+    fn open_mailbox(&mut self, guid: u64) {
+        let Some(live) = self.live.as_mut() else { return };
+        if let Err(e) = live.connection.get_mail_list(guid) {
+            tracing::warn!("asking mailbox {guid:#x} for its contents failed: {e:#}");
+            return;
+        }
+        tracing::info!("opened mailbox {guid:#018x}");
+        self.mailbox = Some(guid);
+    }
+
+    /// Whether the open mailbox is still there and still in reach.
+    ///
+    /// **The server checks this on every single mail request** -- the object
+    /// must still exist, still be a mailbox, and still be within about ten
+    /// units -- and every refusal is the request simply doing nothing. So the
+    /// window closes itself when the character walks away, rather than
+    /// staying open to send things that are silently dropped.
+    ///
+    /// Distance is measured from where this client thinks it *is*, never from
+    /// replicated state: the server does not relay our own movement back, so
+    /// our replicated position is wherever we logged in. That trap has been
+    /// walked into by four separate callers in this project, which is why the
+    /// position is passed in rather than looked up.
+    fn mailbox_in_reach(state: &::world::WorldState, mailbox: Option<u64>, from: glam::Vec3) -> bool {
+        // The server logs "maximal 10 is allowed" and then applies its own
+        // model-aware box test, which is more generous than a point distance.
+        // Ten is used here because being slightly too permissive costs one
+        // refused request, and being too strict closes a window somebody is
+        // in the middle of using.
+        const REACH: f32 = 10.0;
+        let Some(guid) = mailbox else {
+            return false;
+        };
+        state
+            .get(guid)
+            .and_then(|object| object.position)
+            .is_some_and(|at| {
+                let (dx, dy, dz) = (at.x - from.x, at.y - from.y, at.z - from.z);
+                (dx * dx + dy * dy + dz * dz).sqrt() <= REACH
+            })
+    }
+
+    /// Takes everything out of one letter, then asks the mailbox again.
+    ///
+    /// **Re-asked rather than edited**, the decision the trainer window made
+    /// and for the same reason: these requests can be refused, and a window
+    /// that struck a letter off its own list would show an inbox the server
+    /// disagrees with and say nothing about it.
+    ///
+    /// The money goes first and the attachments after it, which is the order
+    /// the server's own refusals want: taking an attachment off a
+    /// cash-on-delivery letter *spends* money, and a letter whose copper has
+    /// already been collected is the cheapest state to stop halfway in.
+    fn take_mail(&mut self, id: u32) {
+        let Some(mailbox) = self.mailbox else { return };
+        let letter = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.mail.as_ref())
+            .and_then(|inbox| inbox.get(id))
+            .cloned();
+        let Some(letter) = letter else {
+            // Every refusal here says so. All four ways out of the trade
+            // window's offer were silent, and the result was a live report of
+            // "I couldn't give him an item" with every line of code correct.
+            tracing::warn!("take from mail {id}: no such letter in the inbox");
+            return;
+        };
+        let Some(live) = self.live.as_mut() else { return };
+        if letter.money > 0 {
+            if let Err(e) = live.connection.mail_take_money(mailbox, id) {
+                tracing::warn!("taking money from mail {id} failed: {e:#}");
+                return;
+            }
+        }
+        for item in &letter.items {
+            // The **32-bit low guid**, which is the only handle a mailed item
+            // has: it is not a replicated object, so there is no full guid on
+            // the wire to widen this to.
+            if let Err(e) = live.connection.mail_take_item(mailbox, id, item.guid) {
+                tracing::warn!(
+                    "taking attachment {} from mail {id} failed: {e:#}",
+                    item.guid
+                );
+                return;
+            }
+        }
+        // Silent either way, and the only request in this block that is. Its
+        // effect shows up in the list below and nowhere else.
+        if let Err(e) = live.connection.mail_mark_as_read(mailbox, id) {
+            tracing::warn!("marking mail {id} read failed: {e:#}");
+        }
+        if let Err(e) = live.connection.get_mail_list(mailbox) {
+            tracing::warn!("re-asking the mailbox failed: {e:#}");
+        }
     }
 
     /// Greets an NPC and opens the window its answer will fill.
@@ -7332,6 +7518,24 @@ impl App {
                         "You have been moved.".to_string(),
                     )));
                 }
+                // **Mail arrived, and a sentence is the whole of what can
+                // honestly be drawn for it.**
+                //
+                // `SMSG_RECEIVED_MAIL` is four bytes of zero: no sender, no
+                // subject, no count. There is nothing to put in a widget, and
+                // finding out what came needs a mailbox, which may be a
+                // continent away. So the packet becomes a line of text, which
+                // is exactly as much as it says.
+                //
+                // Said per packet rather than from the flag next to it,
+                // because the flag cannot tell "one arrived just now" from
+                // "one was already waiting" -- and the second is not news.
+                for _ in 0..report.received_mail {
+                    self.chat.push(Line::Chat(local_notice(
+                        "You have new mail.".to_string(),
+                    )));
+                }
+
                 // Why a cast did not happen, in the one place the player is
                 // looking. This was missed on the first pass -- the failures
                 // were parsed and then dropped on the floor, so pressing a key
@@ -7935,6 +8139,9 @@ impl App {
                 hud::NameRequest::Creature { entry, guid } => {
                     live.connection.ask_creature_name(entry, guid)
                 }
+                hud::NameRequest::GameObject { entry, guid } => {
+                    live.connection.ask_gameobject(entry, guid)
+                }
             };
             if let Err(e) = sent {
                 tracing::warn!("asking for a name failed: {e:#}");
@@ -8108,6 +8315,24 @@ impl App {
             .is_some_and(|guid| !live.state.still_targetable(guid))
         {
             self.target = None;
+        }
+
+        // **A mailbox closes itself when the character walks away from it.**
+        //
+        // Every mail request names the mailbox and the server re-checks the
+        // reach on each one, refusing by doing nothing at all. So a window
+        // left open past the walk is a window whose clicks are dropped in
+        // silence, which is the one failure this client cannot diagnose --
+        // and the fix is not to explain it afterwards but to not offer it.
+        //
+        // Measured from `live.position`, which is where this client thinks it
+        // is. Replicated state holds our *login* position forever, and a
+        // window that closed as soon as the character walked ten units from
+        // the spawn would be the fifth caller to relearn that.
+        let standing = live.position;
+        if self.mailbox.is_some() && !Self::mailbox_in_reach(&live.state, self.mailbox, standing) {
+            tracing::info!("mailbox closed: out of reach");
+            self.mailbox = None;
         }
 
         // The corpse a released ghost has to run back to. See
@@ -8763,6 +8988,90 @@ impl App {
             }
         });
 
+        // The mailbox. Built here beside the trainer's because it needs the
+        // renderer for the attachment icons, and rebuilt every frame from
+        // `WorldState::mail` rather than kept: the inbox is replaced whole by
+        // every `SMSG_MAIL_LIST_RESULT`, and a retained copy would draw a
+        // letter that has already been emptied as though it still held
+        // something.
+        // Two passes on purpose. The first reads replicated state and the
+        // name cache; the second asks the icon cache, which wants the GPU and
+        // the archive chain. Doing both at once needs `&World` and `&mut
+        // Items` out of the same `self` inside one closure, and the rows are
+        // cheap to carry across.
+        let mail: Option<ui::MailView> = self.mailbox.map(|_| {
+            let Some(live) = self.live.as_ref() else {
+                return ui::MailView::default();
+            };
+            let Some(inbox) = live.state.mail.as_ref() else {
+                // Open, asked, nothing back yet. An empty view rather than no
+                // window: the request is always answered, so this state lasts
+                // one round trip, and a window that waited for the reply
+                // would make a slow realm look like a click that missed.
+                return ui::MailView::default();
+            };
+            let rows: Vec<ui::MailRow> = inbox
+                .mails
+                .iter()
+                .map(|letter| ui::MailRow {
+                    id: letter.id,
+                    sender: mail_sender_label(&live.state, letter.sender),
+                    subject: letter.subject.clone(),
+                    body: letter.body.clone(),
+                    money: letter.money,
+                    attachments: letter
+                        .items
+                        .iter()
+                        .map(|item| ui::MailAttachment {
+                            count: item.count,
+                            // Filled in below: the entry travels as the icon
+                            // for one pass so that the GPU is not needed
+                            // while replicated state is borrowed.
+                            icon: None,
+                        })
+                        .collect(),
+                    read: letter.is_read(),
+                    days_left: letter.days_left,
+                    state: if letter.has_anything() {
+                        ui::MailRowState::Collectable
+                    } else {
+                        ui::MailRowState::Empty
+                    },
+                })
+                .collect();
+            ui::MailView {
+                rows,
+                // Named because nothing else in the protocol names them: the
+                // list is capped at fifty and again by the packet size, and
+                // the letters that did not fit are the oldest ones.
+                withheld: inbox.withheld(),
+            }
+        });
+        // The attachment entries, in the same order the rows were built, so
+        // the second pass can pair them up without borrowing the world again.
+        let attachment_entries: Vec<Vec<u32>> = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.mail.as_ref())
+            .map(|inbox| {
+                inbox
+                    .mails
+                    .iter()
+                    .map(|letter| letter.items.iter().map(|item| item.entry).collect())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mail = mail.map(|mut view| {
+            for (row, entries) in view.rows.iter_mut().zip(&attachment_entries) {
+                for (slot, entry) in row.attachments.iter_mut().zip(entries) {
+                    slot.icon =
+                        self.items
+                            .icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, *entry);
+                }
+            }
+            view
+        });
+
         // The flight master's list. Needs no renderer -- there are no icons
         // -- but it is built here beside the trainer's so that every window
         // fed from an NPC conversation is assembled in one place.
@@ -9274,6 +9583,7 @@ impl App {
                     // is on screen exactly while a conversation is open.
                     questgiver: questgiver_view.as_ref(),
                     trainer: trainer.as_ref(),
+                    mail: mail.as_ref(),
                     trade: trade.as_ref(),
                     trade_offer: trade_offer.as_ref(),
                     taxi: taxi_view.as_ref(),
@@ -9537,6 +9847,14 @@ impl App {
                 // window being broken.
                 _ => tracing::warn!("a trainer row was clicked with no trainer open"),
             }
+        }
+
+        // A letter was clicked. The window reports only letters it said had
+        // something in them, and it carries the **mail id** rather than a row
+        // position -- the inbox is filtered, so positions do not close up.
+        if let Some(id) = hud_response.take_mail {
+            tracing::debug!("taking everything out of mail {id}");
+            self.take_mail(id);
         }
 
         // **Logged whenever the window reports anything at all**, so a click
