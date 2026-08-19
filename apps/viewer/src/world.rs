@@ -770,9 +770,24 @@ impl World {
         let centre = tile_at(camera);
 
         // Evict first, so memory is released before anything new is admitted.
+        //
+        // **A tile is kept if it is near *or* if what it holds still reaches
+        // the camera**, and the second half is not an optimisation -- without
+        // it the collision fix is only two thirds of a fix. A world object is
+        // filed under the tile containing its origin, and that origin can sit
+        // at the *edge* of what the object covers: Stormwind is filed under
+        // (30,48) and spans (29..31, 48..50), so its owner is a corner of its
+        // own footprint. With a 3x3 residency, standing anywhere on the y=50
+        // row evicts the one tile holding every triangle of the city, and the
+        // character falls through exactly as before.
+        //
+        // Keeping it costs one tile's buffers while a player is inside a
+        // building bigger than a tile, which is precisely when they are wanted.
         let limit = self.radius + EVICT_MARGIN;
-        self.tiles.retain(|tile, _| {
-            (tile.0 - centre.0).abs() <= limit && (tile.1 - centre.1).abs() <= limit
+        self.tiles.retain(|tile, loaded| {
+            let near =
+                (tile.0 - centre.0).abs() <= limit && (tile.1 - centre.1).abs() <= limit;
+            near || solid_reaches(loaded.solid_bounds, camera, camera)
         });
         self.pending.retain(|tile| {
             (tile.0 - centre.0).abs() <= self.radius
