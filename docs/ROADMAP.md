@@ -5168,3 +5168,251 @@ timestamp on the executable answered it in one command.
 * **Nothing reads `SpellVisualKit`'s other 35 columns**, including the second
   animation slot (column 1), which is set on 84 rows and whose names are also
   cast-family -- consistent with a lead-in, unconfirmed, and unused.
+
+### 4.23: footsteps, and a block nobody had read
+
+The character makes a noise walking, and the noise is right about two separate
+things: *when* the foot lands, and *what it lands on*. Neither is a number this
+client chose. The first comes out of the model's own timed events and the second
+out of the ground's own texture layer.
+
+This is the first milestone in a while that had to open a block of the M2 format
+that had never been parsed at all -- and the reason to say so is that 4.14
+already paid for it. The weapon-impact delay is `625ms`, a constant a person
+dialled in by watching a sword, documented as such *because* "the time from the
+animation's first frame to the frame the weapon connects" lives in that block
+and nothing read it. Footsteps have exactly the same shape and are worse: a walk
+cycle's feet land at two irregular moments per loop, so a client emitting steps
+on a timer plays them out of step with the legs. That reads as the feature
+working badly rather than as a table nobody transcribed.
+
+#### The event record, and a name doing the measuring
+
+36 bytes: an identifier, an argument, a bone, a position, and an `M2TrackBase` --
+an ordinary track with the *values* array removed, so its one `(count, offset)`
+outer array sits at +28 rather than at +24.
+
+The stride was measured the way the emitter strides were, by asking whether the
+block accounts for its own bytes: **4,265 of 4,265** models fit at 36, where 28
+and 32 fit none and 40 and 44 fit 1,343. But the better half of the measurement
+is different in kind from anything the emitters could offer, because **an event's
+identifier is a name**. Four printable ASCII bytes cannot be arrived at by a
+coincidence of small integers, and a stride a word out shifts the name into the
+middle of a float:
+
+| stride | records with four printable identifier bytes |
+|---|---|
+| 28 | 5,991 of 25,500 (23.5%) |
+| 32 | 6,014 of 25,500 (23.6%) |
+| **36** | **25,498 of 25,500 (100.0%)** |
+| 40 | 5,747 of 25,500 (22.5%) |
+| 44 | 5,539 of 25,500 (21.7%) |
+
+**The argument column then confirmed the whole record from the other end.** The
+human male carries six `$CSD` events whose `data` values are 6576, 6919, 6921,
+6922 and 6923 -- `ClapSounds`, `HumanMaleEmoteChicken`, `HumanMaleEmoteCry`,
+`HumanMaleEmoteKiss`, `HumanMaleEmoteLaugh`. Sounds named for the very model
+carrying them, and each fires in exactly the sequence its name matches:
+`EmoteApplaud` at 634, 967, 1300 and 1634ms -- an applaud is four claps --
+`EmoteChicken`, `EmoteCry`, `EmoteKiss`, `EmoteLaugh`. No wrong stride and no
+wrong field offset produces sound names that match the animation names they fire
+in. Nothing acts on it; emote sounds are a feature this client does not have.
+
+#### Which event is the footfall, and the rival that draws the same picture
+
+A model carries two families that could be the moment a foot lands.
+`$FL0`/`$FR0` (and `$RL0`/`$RR0` for the run, `$BL0`/`$BR0` for backing up) are
+one per foot, each firing once per locomotion cycle, sitting at ground level and
+offset to opposite sides by the same distance. `$FSD` sits at the model's origin
+and fires more than once. Both give two steps per walk cycle on a human, which
+is why picking by the four-letter names would have been a coin flip dressed up
+as knowledge.
+
+Three measurements separate them, and they agree:
+
+* **The count tracks the number of legs.** The human male's walk has two `$FSD`
+  timestamps. The **wolf's has four** -- one per paw -- and so does its run.
+* **On the wolf they line up.** Each of those four `$FSD` times precedes its
+  matching per-foot marker by exactly 33ms: 34 before 67, 167 before 200, 534
+  before 567, 667 before 700. Four times out of four.
+* **On the human male the skeleton says the same thing.** Posed through the walk,
+  the two bones that reach the ground touch down at 255 and 755ms and the two
+  that reach it lowest at 330 and 830 -- heel then toe. `$FSD` fires at 266 and
+  800, between the pairs both times. `$FR0` fires at 0 and `$FL0` at 533, which
+  is the *middle of each foot's stance*. The run repeats it: contacts at 246 and
+  580, `$FSD` at 267 and 600, `$RR0`/`$RL0` at 33 and 367.
+
+So the per-foot events mark *where a foot is planted* and `$FSD` marks *when it
+lands*. `wow-cli m2 events <model> --trace <sequence>` is the third measurement
+and it could have come out the other way.
+
+**Two instrument bugs on the way there, and both are the same mistake.** The
+first attempt traced the *event's own* point through the cycle and got a flat
+line for every event on the model -- the event bones carry no animation track at
+all, so the thing being measured could not move. The second posed the skeleton
+and read `matrix.transform_point3(ZERO)`, which for every bone in a walk gives a
+small plausible wobble: a posed matrix is a *deformation about the bone's pivot*,
+so where a bone ends up is its own pivot pushed through its own matrix, and the
+origin's displacement is a different quantity that happens to look like a curve.
+Both wrong readings produced graphs. Neither produced an error.
+
+#### What the foot lands on
+
+Three tables, and two hops that go in opposite directions:
+
+```
+the ground:   MCLY.effect_id -> GroundEffectTexture -> a TerrainType row id
+                             -> that row's sound_id
+the creature: CreatureDisplayInfo/CreatureModelData -> CreatureSoundData
+                             -> a footstep group
+together:     FootstepTerrainLookup(group, sound_id) -> a SoundEntries id
+```
+
+**`FootstepTerrainLookup`'s terrain column is a `TerrainType.sound_id`, not a
+row id**, and this is the trap the whole feature turns on. The two are off by one
+from each other all the way down a twelve-row table -- `Dirt` is row 0 and sound
+1, `Metallic` row 1 and sound 2 -- so both readings parse and both produce a
+client that plays footsteps. What separates them is that `SoundEntries` labels
+its rows. Taking only the sounds whose name states a material and asking which
+reading agrees:
+
+| reading | agrees |
+|---|---|
+| terrain is a `sound_id` | **25 of 50** |
+| terrain is a row id | 9 of 50 |
+
+and the misses are not scattered. Terrain 1 is `Dirt` five times of five, 3 is
+`Stone` four of five, 4 is `Snow` five of five, 5 is `Wood` five of five, 6 is
+`Grass` four of five. The three values with no material of their own --
+`Leaves`, `Sand`, `Soggy` -- reach grass and dirt sounds instead, because this
+build ships no leaf or sand footstep to reach. Under the losing reading every one
+of those is off by one and snow plays on wood.
+
+Terrain **0 is not a row of `TerrainType` at all** -- its sound ids start at 1 --
+and the seventeen rows carrying it reach dirt sounds. It is the fallback, and
+this client uses it wherever the ground does not say.
+
+The rest of the chain checked out cleanly. **342 of 342** sound references
+resolve; all 217 step sounds are `SoundEntries` type 3 and 115 of the 125 splash
+sounds are type 20 with `Splash` in their name, which is what told the two
+columns apart. And `CreatureSoundData`'s footstep column is the cleanest
+identification in that table: it names a `FootstepTerrainLookup` group rather
+than a sound, and the lookup uses only **23** distinct groups over the 0..=188
+range they span -- so landing inside that set is not nearly free the way landing
+inside `SoundEntries` is. Field 9 is set on 738 rows and **738 of 738** name a
+real group; the best any other column of the 38 manages is 21 of 1,306.
+
+#### The ground column identified itself by filenames
+
+`GroundEffectTexture`'s terrain column is a bare number 0..=11 pointing into a
+twelve-row table, which is exactly the shape this project has been wrong about
+before. What confirms it is one step further out: a map chunk's texture layer
+names one of those rows *and* names a **texture file**, and filenames are
+authored English.
+
+| terrain | layers | textures they are called |
+|---|---|---|
+| 0 `Dirt` | 161,780 | dirt x122,678 |
+| 2 `Stone` | 80,747 | rock x66,490 |
+| 3 `Snow` | 14,972 | snow x14,484 |
+| 5 `Grass` | 63,917 | grass x44,840 |
+| 7 `Sand` | 18,715 | sand x6,093 |
+| 8 `Soggy` | 35,335 | mud x11,427 |
+| 9 `DustyGrass` | 8,404 | grass x3,622 |
+
+over the whole of Azeroth, where **387,009 of 390,011 layers name a ground effect
+and all of them resolve**. That table also answers a question that mattered:
+22,708 of `GroundEffectTexture`'s 24,981 rows carry terrain 0, and whether that
+means `Dirt` or means "unset" decides what four tenths of the world sounds like.
+It means `Dirt`. (And the ambiguity was harmless either way, which is worth
+recording rather than hiding: "unset" would have fallen through to the lookup's
+own terrain 0, whose sounds are dirt.)
+
+**The first run of this survey said the opposite**, and for the reason this
+project keeps writing down. Over the first 60 tiles in WDT order, 16,657 of
+16,658 layers came back as terrain 0 -- which reads as the whole chain being
+useless. Those 60 tiles are one corner of one continent. Over all 687 the
+distribution is the table above. Check the population before believing the
+result; the sample that cannot exhibit the thing is not evidence.
+
+#### Which layer is underfoot, and where the axes came from
+
+A chunk blends up to four textures through three alpha maps, so "which one is
+the character standing on" is a question about weights. `adt::footing` computes
+exactly the weights the terrain shader draws with -- layer 3 contributes `a3`,
+layer 2 `a2 * (1 - a3)`, layer 1 `a1 * (1 - a2) * (1 - a3)`, layer 0 the
+remainder -- and takes the largest. A rule of its own ("the last layer over
+half") would be a second answer to a question the picture already answers.
+
+**The axes are the renderer's own, deliberately.** The terrain mesh gives each
+vertex `uv = (col / 8, row / 8)` and the shader samples the blend map with that
+`uv`, so the alpha map's column runs along the axis `height_in_chunk` calls `col`
+and its row along the one it calls `row`. Deriving that from the format
+documentation instead would be a second derivation of something that must agree
+exactly with what is drawn, and a footing rotated a quarter turn against the
+picture is a road that sounds like grass a few yards to one side. Same rule as
+the picking ray being unprojected from the matrix the scene is drawn with.
+
+The blend is reduced at tile load to a **16x16 grid per chunk** -- a little over
+two yards a cell, against a walk that covers two and a half yards a second --
+because the alpha maps are uploaded to the GPU and dropped, and the GPU cannot
+be asked what a character is standing on. 256 bytes a chunk rather than 4KB.
+
+#### End to end, on ground a person can point at
+
+Every link is checked in isolation and a chain of correct links can still be
+wired up wrong, so `wow-cli sound footsteps` finishes by walking a real tile and
+printing the sound *names* that come out. Northshire's tile, as a human male:
+
+```
+  group 7, 65536 cells over the tile:
+     28226  CharacterMediumLargeGrass
+     18796  CharacterMediumLargeDirt
+     18514  CharacterMediumLargeStone
+```
+
+Grass over the fields, dirt on the paths, stone in the abbey courtyard and on
+the road. Elsewhere it varies as it should: `31,47` comes out three quarters
+dirt with almost no grass, and `33,44` reaches `CharacterMediumLargeSnow`. A
+composed thing needs a way to be seen as itself.
+
+#### What plays it
+
+The trigger is a **crossing**, not a state: each frame asks which of the current
+cycle's footfall timestamps the clock passed since the last reading, wrapping
+when the cycle does -- and missing the wrap drops the footfall at or near zero,
+which on a walk is every other step. A changed sequence resets the phase rather
+than firing, or every change of gait would stamp a step at whatever moment the
+new cycle happened to be entered at.
+
+The phase comes from the same `FramePose` the body was drawn with, one frame
+old, rather than from a clock of its own. A footstep timed from a second clock
+drifts against the legs it belongs to -- the same reason a held weapon is placed
+from the wielder's own posed hand.
+
+Wading is its own state, not the absence of swimming: `App::swimming` is `None`
+for a character on dry land *and* for one crossing a ford, and those want
+opposite sounds. `FootstepTerrainLookup` carries a splash column beside every
+ordinary one for exactly this, and it is empty on 92 of 217 rows -- a spider has
+no splash sound and gets its ordinary step rather than silence.
+
+#### What is not done
+
+* **The player's own footsteps only.** There is no distance attenuation anywhere
+  in this client's audio, so every creature in view would step as loudly as the
+  character does, and a starting zone has ninety-five of them. The tables are
+  keyed by display id and would answer for any of them; what is missing is the
+  volume curve, not the lookup.
+* **No footstep spray.** `TerrainType` carries `FootstepSprayRun` and
+  `FootstepSprayWalk`, only `Snow` sets them in this build, and nothing draws
+  either.
+* **No WMO floors.** A character on the abbey's flagstones is asked about the
+  terrain underneath the building, because a WMO's own material is a different
+  lookup this client has not opened.
+* **The other event families are parsed and ignored.** `$HIT` and `$CAH` mark
+  the frame a weapon connects, which is the number 4.14's hand-dialled 625ms
+  stands in for; `$DTH` marks a body hitting the ground; `$CSD` carries an emote
+  sound id. All read, none acted on -- and the weapon-impact one is the obvious
+  next thing, now that the block it lives in parses.
+* **Not yet confirmed at the window.** Everything above is measured against the
+  files and against a live tile; nobody has heard it.

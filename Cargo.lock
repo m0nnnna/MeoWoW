@@ -38,6 +38,7 @@ name = "adt"
 version = "0.0.1"
 dependencies = [
  "chunk",
+ "dbc",
  "m2",
  "mpq",
  "thiserror 2.0.20",

@@ -22,8 +22,9 @@
 use std::io::Cursor;
 
 use dbc::schema::{
-    AreaTable, CreatureDisplayInfo, CreatureModelData, CreatureSoundData, Item, SoundAmbience,
-    SoundEntries, SoundType, Spell, SpellVisual, SpellVisualKit, WeaponImpactSounds, ZoneMusic,
+    AreaTable, CreatureDisplayInfo, CreatureModelData, CreatureSoundData, FootstepTerrainLookup,
+    GroundEffectTexture, Item, SoundAmbience, SoundEntries, SoundType, Spell, SpellVisual,
+    SpellVisualKit, TerrainType, WeaponImpactSounds, ZoneMusic,
 };
 use mpq::Chain;
 
@@ -207,6 +208,47 @@ impl Entry {
     }
 }
 
+/// How many footfalls the animation clock passed between two readings.
+///
+/// A footfall is a **crossing**, not a state: the model names the moments a
+/// foot lands and the question each frame is which of them the clock went past
+/// since the last look. With no previous reading there is nothing to have
+/// crossed, and the answer is none.
+///
+/// Its own function, out of the frame loop, because every rule in it is one
+/// that can only be got wrong once a person is watching:
+///
+/// * **The wrap.** A looping cycle's clock goes backwards at the end, so the
+///   interval is two pieces. Treating it as one drops every footfall at or near
+///   zero, which on a walk is every other step.
+/// * **A changed sequence fires nothing.** The new cycle's clock has no
+///   relationship to the old one's, so any comparison is meaningless -- and the
+///   meaningless answer is not zero, it is "everything before wherever the new
+///   cycle happened to be entered", which stamps a step on every change of gait.
+/// * **Half-open at the start.** A timestamp exactly at the previous reading
+///   was already played; one exactly at this reading is due now. Closing both
+///   ends plays a footfall twice whenever a frame lands exactly on one.
+pub fn footfalls_crossed(
+    previous: Option<(usize, u32)>,
+    sequence: usize,
+    now: u32,
+    duration: u32,
+    times: &[u32],
+) -> usize {
+    let Some(then) = previous
+        .filter(|(was, _)| *was == sequence)
+        .map(|(_, then)| then)
+    else {
+        return 0;
+    };
+    if now >= then {
+        times.iter().filter(|t| **t > then && **t <= now).count()
+    } else {
+        times.iter().filter(|t| **t > then && **t < duration).count()
+            + times.iter().filter(|t| **t <= now).count()
+    }
+}
+
 /// Every table this needs, read once.
 #[derive(Default)]
 pub struct Sounds {
@@ -238,6 +280,15 @@ pub struct Sounds {
     /// target. Same resolution as [`Self::spell_cast`], through
     /// `SpellVisual::impact_kit` instead.
     spell_impact: std::collections::HashMap<u32, u32>,
+    /// `GroundEffectTexture` id to the terrain [`FootstepTerrainLookup`] keys
+    /// on. Absent means the ground says nothing about its surface, which is
+    /// most of it -- see [`Sounds::footstep`].
+    footing_terrain: std::collections::HashMap<u32, u32>,
+    /// `(creature footstep group, terrain)` to `(footstep, splash)`.
+    footsteps: std::collections::HashMap<(u32, u32), (u32, Option<u32>)>,
+    /// Creature display id to the footstep group its feet use. Keyed by
+    /// display for the same reason [`Sounds::creatures`] is.
+    footstep_groups: std::collections::HashMap<u32, u32>,
 }
 
 /// What one kind of creature sounds like.
@@ -375,6 +426,17 @@ impl Sounds {
                     .collect()
             })
             .unwrap_or_default();
+        let footstep_groups: std::collections::HashMap<u32, u32> = chain
+            .read(CreatureSoundData::PATH)
+            .ok()
+            .and_then(|bytes| CreatureSoundData::parse(&bytes).ok())
+            .map(|t| {
+                t.iter()
+                    .filter(|row| row.footstep_group() != 0)
+                    .map(|row| (row.id(), row.footstep_group()))
+                    .collect()
+            })
+            .unwrap_or_default();
         // **A display's own sound id is an override, and most creatures do not
         // use it.** The Diseased Young Wolf's display carries `sound_id: 0`
         // and would have been silent; its *model* carries 43, which is the
@@ -403,6 +465,83 @@ impl Sounds {
                 };
                 if let Some(voice) = voices.get(&sound_id) {
                     sounds.creatures.insert(display.id(), *voice);
+                }
+            }
+        }
+
+        // Footsteps. Three tables and two hops, and the hops are in different
+        // directions, which is the thing to get right:
+        //
+        //   the ground:   GroundEffectTexture -> a TerrainType *row id*
+        //                 -> that row's `sound_id`
+        //   the creature: CreatureSoundData   -> a footstep *group*
+        //   together:     FootstepTerrainLookup(group, sound_id) -> a sound
+        //
+        // A `TerrainType` row id and its `sound_id` are off by one from each
+        // other all the way down the table, so using either where the other
+        // belongs plays snow on wood. See `FootstepTerrainLookup`'s doc
+        // comment for the measurement that separates them.
+        if let Some(terrain) = chain
+            .read(TerrainType::PATH)
+            .ok()
+            .and_then(|bytes| TerrainType::parse(&bytes).ok())
+        {
+            let sound_of_row: std::collections::HashMap<u32, u32> =
+                terrain.iter().map(|r| (r.id(), r.sound_id())).collect();
+            if let Some(textures) = chain
+                .read(GroundEffectTexture::PATH)
+                .ok()
+                .and_then(|bytes| GroundEffectTexture::parse(&bytes).ok())
+            {
+                for row in textures.iter() {
+                    // **Only the rows that say something.** 22,708 of 24,981
+                    // name terrain 0, and an absent entry here means exactly
+                    // what `FootstepTerrainLookup`'s own terrain 0 means --
+                    // "this does not say" -- so storing them would be ten
+                    // times the memory to reach the same sound by a longer
+                    // road. That the two zeroes agree is luck rather than
+                    // design, and it is why this is safe: row 0 is `Dirt` and
+                    // the fallback rows are dirt sounds.
+                    if row.terrain_type() == 0 {
+                        continue;
+                    }
+                    if let Some(&sound) = sound_of_row.get(&row.terrain_type()) {
+                        sounds.footing_terrain.insert(row.id(), sound);
+                    }
+                }
+            }
+        }
+        if let Some(lookup) = chain
+            .read(FootstepTerrainLookup::PATH)
+            .ok()
+            .and_then(|bytes| FootstepTerrainLookup::parse(&bytes).ok())
+        {
+            for row in lookup.iter() {
+                sounds.footsteps.insert(
+                    (row.creature_footstep_id(), row.terrain()),
+                    (
+                        row.sound(),
+                        (row.sound_splash() != 0).then_some(row.sound_splash()),
+                    ),
+                );
+            }
+        }
+        // Which group a creature's feet use, resolved display id first and
+        // model second -- the same override this file already documents at
+        // length for voices, and it matters more here rather than less: 738 of
+        // 1,306 `CreatureSoundData` rows name a footstep group at all.
+        if let Some(displays) = chain
+            .read(CreatureDisplayInfo::PATH)
+            .ok()
+            .and_then(|bytes| CreatureDisplayInfo::parse(&bytes).ok())
+        {
+            for display in displays.iter() {
+                let sound_id = match display.sound_id() {
+                    0 => model_sounds.get(&display.model_id()).copied().unwrap_or(0),
+                    own => own,
+                };
+                if let Some(group) = footstep_groups.get(&sound_id) {
+                    sounds.footstep_groups.insert(display.id(), *group);
                 }
             }
         }
@@ -487,7 +626,52 @@ impl Sounds {
             sounds.spell_cast.len(),
             sounds.spell_impact.len()
         );
+        tracing::info!(
+            "footsteps: {} ground textures name a terrain, {} (group, terrain) pairs,              {} displays with feet",
+            sounds.footing_terrain.len(),
+            sounds.footsteps.len(),
+            sounds.footstep_groups.len(),
+        );
         sounds
+    }
+
+    /// What a creature's foot sounds like landing on a patch of ground.
+    ///
+    /// `footing` is a `GroundEffectTexture` id from
+    /// [`crate::world::World::footing_at`], and `None` -- a tile still
+    /// streaming, a chunk with no layers, or ground whose texture says nothing
+    /// about its surface -- falls through to the lookup's **own** terrain 0,
+    /// which is a real row rather than an invention: seventeen of its rows
+    /// carry it, they reach dirt sounds, and that is what a client should play
+    /// when it does not know what it is standing on.
+    ///
+    /// Splashing is the same row's other column, and it is `None` on 92 of 217
+    /// rows -- a spider has no splash sound and gets its ordinary step rather
+    /// than silence.
+    ///
+    /// `None` overall means this display has no feet the tables know about,
+    /// which is 568 of the 1,306 `CreatureSoundData` rows and every model that
+    /// floats, swims or hovers.
+    pub fn footstep(&self, display_id: u32, footing: Option<u32>, splashing: bool) -> Option<u32> {
+        let group = self.footstep_groups.get(&display_id).copied()?;
+        let terrain = footing
+            .and_then(|id| self.footing_terrain.get(&id).copied())
+            .unwrap_or(0);
+        // Falls back to the fallback: a group that has no row for this terrain
+        // still has one for terrain 0, because every group in the table does.
+        // Without this a creature with a short list would go silent on stone
+        // rather than sounding wrong, and silence is the harder of the two to
+        // notice.
+        let (step, splash) = self
+            .footsteps
+            .get(&(group, terrain))
+            .or_else(|| self.footsteps.get(&(group, 0)))
+            .copied()?;
+        Some(if splashing {
+            splash.unwrap_or(step)
+        } else {
+            step
+        })
     }
 
     /// What a spell sounds like when the cast begins (`SMSG_SPELL_START`).
@@ -753,6 +937,99 @@ impl Effects {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ordinary case, and the one that only shows up at the end of a
+    /// cycle. Asserted together because a rule that ignores the wrap passes
+    /// the first on its own and drops every other step in play.
+    #[test]
+    fn footfalls_are_counted_once_as_the_clock_passes_them() {
+        let times = [266, 800];
+        // Nothing to have crossed yet.
+        assert_eq!(footfalls_crossed(None, 1, 300, 1000, &times), 0);
+        // Straddling one.
+        assert_eq!(footfalls_crossed(Some((1, 250)), 1, 280, 1000, &times), 1);
+        // Between them.
+        assert_eq!(footfalls_crossed(Some((1, 300)), 1, 340, 1000, &times), 0);
+        // Round the end of the cycle: 800 is behind us, and the next reading
+        // is at 40ms of the new lap.
+        assert_eq!(footfalls_crossed(Some((1, 780)), 1, 40, 1000, &times), 1);
+        // A whole lap in one step counts each footfall once, not twice.
+        assert_eq!(footfalls_crossed(Some((1, 100)), 1, 90, 1000, &times), 2);
+    }
+
+    /// A frame landing exactly on a footfall plays it once, not twice: the
+    /// interval is half-open, so the timestamp belongs to the reading that
+    /// first reached it and to no other.
+    #[test]
+    fn a_footfall_exactly_on_a_frame_plays_once() {
+        let times = [500];
+        assert_eq!(footfalls_crossed(Some((1, 480)), 1, 500, 1000, &times), 1);
+        assert_eq!(footfalls_crossed(Some((1, 500)), 1, 520, 1000, &times), 0);
+    }
+
+    /// Changing cycle fires nothing at all. The wrong answer here is not zero:
+    /// a walk entered at 900ms would otherwise "cross" both of the run's
+    /// earlier footfalls at once, so every change of gait would stamp a step.
+    #[test]
+    fn a_changed_cycle_fires_nothing() {
+        let times = [266, 800];
+        assert_eq!(footfalls_crossed(Some((2, 900)), 1, 300, 1000, &times), 0);
+    }
+
+    /// A quadruped's cycle has four contacts and they are counted
+    /// independently -- the wolf's walk, which is the sample that identified
+    /// the event in the first place.
+    #[test]
+    fn four_feet_are_four_footfalls() {
+        let times = [34, 167, 534, 667];
+        assert_eq!(footfalls_crossed(Some((0, 0)), 0, 200, 1000, &times), 2);
+        assert_eq!(footfalls_crossed(Some((0, 200)), 0, 700, 1000, &times), 2);
+    }
+
+    /// Builds a `Sounds` with just enough footstep tables to answer, standing
+    /// in for the real ones so the rules can be tested without an archive.
+    fn footed() -> Sounds {
+        let mut sounds = Sounds::default();
+        // Display 1 walks on the group 8 the human male uses; display 2 has no
+        // feet at all, which 568 of 1,306 creature sound rows genuinely do not.
+        sounds.footstep_groups.insert(1, 8);
+        // Terrain 3 is `Stone` and terrain 0 is the lookup's own fallback.
+        sounds.footsteps.insert((8, 0), (650, Some(1054)));
+        sounds.footsteps.insert((8, 3), (653, None));
+        // Ground effect 42 is stone; 99 is a texture that names no terrain.
+        sounds.footing_terrain.insert(42, 3);
+        sounds
+    }
+
+    /// The ground chooses the sound, and ground that says nothing falls back
+    /// to the lookup's own terrain 0 rather than to silence.
+    ///
+    /// Both halves asserted together: a rule that always answered with the
+    /// fallback would pass the second on its own.
+    #[test]
+    fn a_footstep_takes_the_terrain_it_lands_on() {
+        let sounds = footed();
+        assert_eq!(sounds.footstep(1, Some(42), false), Some(653));
+        assert_eq!(sounds.footstep(1, Some(99), false), Some(650));
+        assert_eq!(sounds.footstep(1, None, false), Some(650));
+    }
+
+    /// A splash where the row has one, and the ordinary step where it does
+    /// not -- 92 of 217 rows carry no splash and a spider wading should not go
+    /// quiet.
+    #[test]
+    fn wading_splashes_only_where_the_row_says_so() {
+        let sounds = footed();
+        assert_eq!(sounds.footstep(1, None, true), Some(1054));
+        assert_eq!(sounds.footstep(1, Some(42), true), Some(653));
+    }
+
+    /// A display with no footstep group has no footsteps, rather than borrowing
+    /// somebody else's. Most models are in this case.
+    #[test]
+    fn a_display_with_no_feet_is_silent() {
+        assert_eq!(footed().footstep(2, Some(42), false), None);
+    }
 
     fn entry(files: &[(&str, u32)]) -> Entry {
         Entry {

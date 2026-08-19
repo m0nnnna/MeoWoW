@@ -11,6 +11,7 @@
 //! `9x9 + 8x8`, two interleaved lattices where the inner one sits at the centre
 //! of each outer cell. See [`Chunk::vertex_position`].
 
+pub mod footing;
 pub mod liquid;
 pub mod minimap;
 

@@ -2265,6 +2265,24 @@ struct App {
     /// *what* is being swum in without asking the world a second time and
     /// possibly getting a different answer -- the character has moved by then.
     swimming: Option<world::Liquid>,
+    /// Standing in liquid too shallow to swim in.
+    ///
+    /// Its own state rather than derived from [`App::swimming`], which is
+    /// `None` for both a character on dry land and one wading a ford -- and
+    /// those want opposite footstep sounds. `FootstepTerrainLookup` carries a
+    /// splash column beside every ordinary one for exactly this.
+    wading: bool,
+    /// Where the player's own cycle was last time footsteps were checked, as
+    /// `(sequence, milliseconds into it)`.
+    ///
+    /// Kept because a footfall is a *crossing*, not a state: the question each
+    /// frame is which of the cycle's footfall timestamps the clock passed since
+    /// the last reading, and with no previous reading there is nothing to have
+    /// crossed. A changed sequence resets it rather than firing, or every
+    /// change of gait would stamp a step at whatever moment the new cycle
+    /// happened to be entered at.
+    footstep_phase: Option<(usize, u32)>,
+
     /// Sustained forward movement, toggled rather than held.
     ///
     /// Cleared by pressing a movement key, which is what every game with an
@@ -3158,6 +3176,8 @@ impl App {
             live_move: ::world::motion::Motion::default(),
             jump: None,
             swimming: None,
+            wading: false,
+            footstep_phase: None,
             autorun: false,
             last_heartbeat: Instant::now(),
             last_ping: Instant::now(),
@@ -4578,6 +4598,14 @@ impl App {
         // named a value this build does not use, and starting to swim on the
         // strength of a number nobody could resolve is the fabrication the
         // category exists to refuse. It still draws.
+        // Wading is liquid over the feet that is not deep enough to swim in.
+        // Measured against the same ground sample the swim test uses, so the
+        // two cannot disagree about where the bottom is.
+        self.wading = liquid_here.is_some_and(|liquid| {
+            stand_at.is_some_and(|ground| {
+                liquid.surface > ground && liquid.surface - ground < SWIM_DEPTH
+            })
+        });
         let was_swimming = self.swimming.is_some();
         self.swimming = liquid_here.filter(|liquid| {
             liquid.category.is_swimmable()
@@ -5555,14 +5583,15 @@ impl App {
             return;
         };
 
-        let area = match self
+        let streaming_world = self
             .renderer
             .as_ref()
             .and_then(|r| r.scene.as_ref())
             .and_then(|scene| match scene {
-                Scene::Streaming(world) => world.area_at(at.x, at.y),
+                Scene::Streaming(world) => Some(world),
                 _ => None,
-            }) {
+            });
+        let area = match streaming_world.and_then(|world| world.area_at(at.x, at.y)) {
             Some(area) => {
                 self.area = Some(area);
                 area
@@ -5606,6 +5635,65 @@ impl App {
             return;
         };
         let mixer = audio.mixer();
+
+
+        // **Footsteps.** The model says when its feet land -- see
+        // `m2::event::FOOTFALL`, which carries the measurement -- and the
+        // ground says what they land on, so neither half is a timer this
+        // client invented.
+        //
+        // The player's own only. There is no distance attenuation anywhere in
+        // this file, so every creature in view would step as loudly as the
+        // character does, and a starting zone has ninety-five of them.
+        if let (Some(live), Some(world)) = (self.live.as_ref(), streaming_world) {
+            let crossed = match world.footfalls_of(live.guid) {
+                Some((sequence, times, now, duration)) => {
+                    let fired = sound::footfalls_crossed(
+                        self.footstep_phase,
+                        sequence,
+                        now,
+                        duration,
+                        &times,
+                    );
+                    self.footstep_phase = Some((sequence, now));
+                    fired
+                }
+                None => {
+                    // Nothing with feet in it is playing. Forgetting the phase
+                    // is the point: returning to a walk must not fire for
+                    // everything that "happened" while standing still.
+                    self.footstep_phase = None;
+                    0
+                }
+            };
+            if crossed > 0 {
+                let footing = world.footing_at(live.position.x, live.position.y);
+                if let Some(id) = live
+                    .state
+                    .get(live.guid)
+                    .and_then(|entity| entity.display_id())
+                    .and_then(|display| self.sounds.footstep(display, footing, self.wading))
+                {
+                    // Once, however many landed. Two feet inside one frame is a
+                    // very short cycle rather than two steps a person could
+                    // hear apart, and playing both stacks two copies of the
+                    // same file at the same instant.
+                    self.pending_sounds.push((id, false));
+                    // One line per step, at trace. A footstep is the kind of
+                    // feature that is either obviously working or obviously
+                    // not, and "obviously" needs an ear -- so this leaves a
+                    // trail saying which ground it thought it was on, which
+                    // is readable without one. `crossed` is printed too: more
+                    // than one means the cycle is short enough that a frame
+                    // spans two contacts, which is worth knowing before
+                    // anyone reports steps sounding sparse.
+                    tracing::trace!(
+                        "footstep: sound {id} on ground {footing:?}, wading {}, {crossed}                          contact(s) this frame",
+                        self.wading,
+                    );
+                }
+            }
+        }
 
         // Combat sounds queued since the last frame. Swept every frame either
         // way -- a finished sink that is never dropped is a slow leak, which

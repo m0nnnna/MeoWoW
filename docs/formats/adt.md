@@ -89,6 +89,61 @@ Expected result on a stock install:
 no failures
 ```
 
+## What the ground is made of
+
+A texture layer carries an `effect_id`, and that is the only thing in the whole
+format that says a particular square yard is road rather than grass. The area id
+says which *zone* it is and nothing about the surface; the liquid sheets say
+where water is and nothing about the bank.
+
+The chain runs `MCLY.effect_id` -> `GroundEffectTexture.dbc` -> a `TerrainType`
+row -> that row's `sound_id`, which is what `FootstepTerrainLookup` keys on.
+Over the whole of Azeroth, **387,009 of 390,011 texture layers name a ground
+effect and all 387,009 of those resolve**; the 3,002 that name none are a real
+answer rather than a gap.
+
+**The terrain column identifies itself by the filenames of the textures that
+reach it**, which is the check that made the chain trustworthy -- a bare small
+integer pointing into a twelve-row table is nearly free to get right by
+accident, and a filename is not:
+
+| terrain | layers | textures they are called |
+|---|---|---|
+| 0 `Dirt` | 161,780 | dirt x122,678 |
+| 2 `Stone` | 80,747 | rock x66,490 |
+| 3 `Snow` | 14,972 | snow x14,484 |
+| 5 `Grass` | 63,917 | grass x44,840 |
+| 7 `Sand` | 18,715 | sand x6,093 |
+| 8 `Soggy` | 35,335 | mud x11,427 |
+| 9 `DustyGrass` | 8,404 | grass x3,622 |
+
+That table is also what says terrain **0 really is `Dirt`** rather than "unset",
+which was a real question: 22,708 of `GroundEffectTexture`'s 24,981 rows carry
+it. `wow-cli sound footsteps` prints it.
+
+### Which layer is underfoot
+
+Up to four textures are blended by three alpha maps, so "which one" is a
+question about weights rather than a lookup. `adt::footing` computes exactly the
+weights the terrain shader draws with -- layer 3 contributes `a3`, layer 2
+`a2 * (1 - a3)`, layer 1 `a1 * (1 - a2) * (1 - a3)`, layer 0 the remainder --
+and takes the largest. Deriving it from anything else ("the last layer over
+half", say) would be a second answer to a question the picture already answers,
+and the two would agree until somebody changed the shader.
+
+**The axes come from the renderer for the same reason.** The terrain mesh gives
+each vertex `uv = (col / 8, row / 8)` and the shader samples the blend map with
+that `uv`, so the alpha map's *column* runs along the axis `height_in_chunk`
+calls `col` and its *row* along the one it calls `row`. Rebuilding that from the
+format documentation would be a second derivation of something that has to agree
+exactly with what is drawn, and a footing rotated a quarter turn against the
+picture is a road that sounds like grass a few yards to one side.
+
+The result is reduced to a 16x16 grid per chunk -- a little over two yards a
+cell -- because the alpha maps are uploaded to the GPU and dropped, and the GPU
+cannot be asked what a character is standing on. That is 256 bytes a chunk
+instead of 4KB.
+
 ## Not implemented yet
 
 Liquid (`MH2O`), shadow maps (`MCSH`), vertex colours (`MCCV`) and flight bounds

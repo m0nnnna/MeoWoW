@@ -16,6 +16,19 @@ changed is what a person sees: the window, the README, this file.
 Phases 1, 2 and 3 are complete: every data format reads, the world renders and
 streams, and the protocol reaches a live realm. Phase 4 has started.
 
+**4.23 is the milestone that had to open a block nobody had ever parsed.**
+Footsteps need two facts and neither is a number this client may choose: *when*
+a foot lands and *what it lands on*. The first is in the M2's timed-event block,
+which had gone unread for four milestones -- and 4.14 had already paid for that,
+since the weapon-impact delay is a constant a person dialled in by watching a
+sword precisely because the frame a blade connects on lives in that block. The
+identifier in an event record is a **name**, which made the record stride the
+easiest measurement in this project so far: 100.0% of records have four
+printable identifier bytes at 36, and every neighbouring stride manages 22%. The
+harder question was *which* event is the footfall, because two families both
+fire twice in a human's walk cycle -- and it was settled by a **wolf**, whose
+`$FSD` fires four times, once per paw.
+
 **4.22 is the milestone that had to open a table to fix an interface.** The two
 tickets on it were about drawing -- a cast that plays nothing, a second weapon
 that never swings -- and both answers were in files nobody had read: which
@@ -62,7 +75,8 @@ claim rests on which.
 | Appearance | Humanoid NPCs wear their baked `CreatureDisplayInfoExtra` texture and other players are dressed from their replicated appearance fields, so nothing in a zone renders as a white ghost. The player's own armour is painted on from `ItemDisplayInfo`'s eight body components. **Other players are dressed too now (`foss-wow#23`)**: their visible-item fields carry item *entries*, not display ids, so `Item.dbc` bridges the two — `PLAYER_VISIBLE_ITEM_ENTRY_HEAD + 2 * slot`, measured the same way `PLAYER_BYTES` was, against two characters wearing five and seventeen items respectively, and confirmed live: a second account's distinctly-dressed character renders in a different outfit from the viewer's own. **The player's weapon is drawn**, and now so is another player's, off the same path: the M2 attachment table parses, and a sword or shield hangs off the hand's animated bone and swings with it. Shoulders, helms and ranged weapons are not, and there is no sheathed state for anyone but the viewer's own character — see below |
 | Game | **4.3 done**: three action bars with real icons, keys `1`-`=` with Shift/Ctrl, click-to-cast, the player's own character drawn in third person with its chosen face, beard, skin and haircut, hover tooltips reading real numbers (82% of `Spell.dbc`'s description templates resolve), a cooldown sweep, and a cast bar off `SMSG_SPELL_START`/`SMSG_SPELL_GO`. **4.4 melee done**: swing at a target and be swung at, a named combat log (`You hit Kobold Vermin for 6. Killing blow.`), and a dead unit dimmed in the frames. **A spellbook panel** (`P`) now lists what the character can do and puts it on a bar by click, auto-attack included -- see the note below on why the seeding filter had to reject it. Threat and the corpse *interface* remain (the corpse protocol is done). Quests follow |
 | Loot | **Works end to end.** Right-click a body to open it, click a row to take money or an item, and the corpse releases itself once empty -- a client that never releases leaves the body locked to it for everyone else. `CMSG_LOOT` `0x15D`, `CMSG_LOOT_MONEY` `0x15E`, `CMSG_AUTOSTORE_LOOT_ITEM` `0x108`, `SMSG_LOOT_RESPONSE` `0x160`, `SMSG_LOOT_REMOVED` `0x162`, `SMSG_LOOT_CLEAR_MONEY` `0x165` -- every one confirmed by content or by effect. A loot slot is the **server's** index and never a row position: the numbers do not close up when one is taken |
-| Sound | **4.14 done.** Zone music and ambience by area and hour, creature attack/wound/death/aggro voices, and weapon impacts -- all from the tables. `SoundEntries`' layout is checked by its filenames resolving in the archive (93%); the zone tables by their ids landing on a sound of the **right type** (99.1%), which validity alone cannot show. `CreatureSoundData`'s 38 columns identified themselves through the *names* of the sounds they reach. No distance attenuation, no crossfade, no spell or footstep sounds |
+| Sound | **4.14 done.** Zone music and ambience by area and hour, creature attack/wound/death/aggro voices, and weapon impacts -- all from the tables. `SoundEntries`' layout is checked by its filenames resolving in the archive (93%); the zone tables by their ids landing on a sound of the **right type** (99.1%), which validity alone cannot show. `CreatureSoundData`'s 38 columns identified themselves through the *names* of the sounds they reach. No distance attenuation, no crossfade, no spell sounds. **Footsteps landed in 4.23** -- see the row below |
+| Footsteps | **4.23 done: the ground is heard.** The model says *when* -- the `$FSD` timed event, identified against a **wolf**, whose walk carries four of them (one per paw) where a human's carries two, each preceding its matching per-foot marker by exactly 33ms, four times of four. The ground says *what*: `MCLY.effect_id` -> `GroundEffectTexture` -> a `TerrainType` row -> its `sound_id` -> `FootstepTerrainLookup(creature group, terrain)`. **The terrain column is a `sound_id` and not a row id** -- off by one all the way down a twelve-row table, so both readings parse, and the sound *names* separate them 25 of 50 against 9 of 50 with `Snow` and `Wood` unanimous. `GroundEffectTexture`'s own terrain column identified itself by the **filenames** of the textures reaching it (`Snow` x14,484 of 14,972 layers named `snow`), over 387,009 of Azeroth's 390,011 layers, all resolving. Which of four blended layers is underfoot is computed with the **terrain shader's own weights** and its axes taken from the renderer's UVs, because a footing rotated against the picture is a road that sounds like grass. The player's own only -- there is no distance attenuation anywhere here, and a starting zone has ninety-five creatures in it. No spray, no WMO floors, and **not yet heard at the window** |
 | NPCs | **4.15 started: they answer.** `CMSG_GOSSIP_HELLO` `0x017B` → `SMSG_GOSSIP_MESSAGE` `0x017D`, parsed whole — menu id, greeting text id, a list of clickable options and a list of quests offered. Confirmed on **three** NPCs picked so the two counts differ (3 options/0 quests, 0/0, 0 options/1 quest), because one sample is nearly all zeroes and any reading survives it. Every field then agreed with the server's own database independently: menu ids equal `creature_template.gossip_menu_id`, the options match `gossip_menu_option` in text *and* icon, quest 783 came with title `A Threat Within`, level 1 and flags 524296. **An option index is the server's id, never a row position** — menu 1291 has four rows and three arrived, numbered 1,2,3 with 0 filtered out and the numbering *not* closed up, exactly like a loot slot. **A menu can now be chosen and a vendor lists its stock**: `CMSG_GOSSIP_SELECT_OPTION` `0x017C` (`{guid, menu id, option index}`) is confirmed by effect -- choosing an innkeeper's `I want to browse your goods.` produces `SMSG_LIST_INVENTORY` `0x019F`, a different opcode carrying stock, which no misunderstood request would cause. Twelve rows of 32 bytes, `8 + 1 + 12*32 = 393` exactly, matching `npc_vendor` in order, each entry paired with the display id `Item.dbc` gives it -- and one of those pairs (2070/6353) was independently confirmed by `SMSG_LOOT_RESPONSE` in 4.13. **The price on the wire is not `Item.dbc`'s `BuyPrice`**: the server applies the buyer's reputation discount first (25→23, 500→475, 2000→1900, i.e. `*0.95` truncated), so a client showing the table's number is silently wrong for everyone not at neutral. The wire is authoritative for price. **Buying and selling work**: `CMSG_LIST_INVENTORY` `0x019E`, `CMSG_BUY_ITEM` `0x01A2` (`{u64 vendor, u32 entry, u32 slot, u32 count, u8 bag}` -- entry *before* slot, counts are `u32`), `CMSG_SELL_ITEM` `0x01A0` (item named by **guid**, not slot, so a request racing an inventory change refuses rather than selling the wrong thing). Both confirmed by effect, and the buy checks the stock list too: a row quoted at 23 took exactly 23 from `PLAYER_FIELD_COINAGE` where the table says 25, and delivered a stack of exactly `buy_count`. Nothing vendor-related is drawn yet and the `UNIT_NPC_FLAGS` bits are still unnamed |
 | Quests | **4.16: a quest can be taken, finished and paid for.** The whole loop runs against the live realm on a character created from nothing. **Accepting is confirmed**: `CMSG_QUESTGIVER_ACCEPT_QUEST` `0x0189` put quest 333 into field `0x00a3` — `PLAYER_QUEST_LOG + 1 * QUEST_LOG_STRIDE`, exactly where the measured base and stride say slot 1 goes. **Turning in works**: `CMSG_QUESTGIVER_COMPLETE_QUEST` `0x018A` (`{u64 npc, u32 quest}`) is *answered* — `SMSG_QUESTGIVER_OFFER_REWARD` `0x018D`, 525 bytes of real completion text — and so it bounds the silent `CMSG_QUESTGIVER_CHOOSE_REWARD` `0x018E` (`{u64 npc, u32 quest, u32 reward}`) that follows, the same move that bounded `CMSG_BUY_ITEM`. Which reply arrives is the diagnosis: `SMSG_QUESTGIVER_REQUEST_ITEMS` `0x018B` says the send was understood and the quest is not finished, silence says the opcode, the body or an NPC that does not end it. **The verdict is the log, never a packet**: 783 left `PLAYER_QUEST_LOG` and quest 7 — McBride's follow-up, `PrevQuestID` 783 — appeared in its place, a chain step no misread packet could fake; `character_queststatus_rewarded` and `xp` 0→40 agree independently. **The trap: asking to *read* a quest's scroll can accept it.** `CMSG_QUESTGIVER_QUERY_QUEST` adds a quest carrying `QUEST_FLAGS_AUTO_ACCEPT` `0x80000` to the log before the accept is ever sent, and `quest_template_addon.SpecialFlags & 0x4` ORs that flag in at load time, which is how the entire Northshire chain has it. Only **179 of 9,464** quests do — rare enough to look like a bug, common enough to cover the zone a first end-to-end test reaches for. **`SMSG_QUEST_QUERY_RESPONSE` `0x005D` parses**, and it is the backbone: it answers for *any* quest id with no NPC and no log entry, which is what a tracker and a map need. A 260-byte fixed head, five strings, then two more arrays -- so nothing past byte 260 is at a fixed offset. Measured against eight quests picked so every array count disagrees, then confirmed by **sweeping the whole table: 9,464 answered, 9,464 parsed whole**, bodies 381-1438 bytes. Two things the wire does that the table does not: **a game object target arrives with the top bit set** (`|id| | 0x80000000`, stored as a *negative* creature id -- reading the sign gives a valid creature id pointing somewhere else), and **`Flags` arrives as `Flags & 0xFFFF`**, so `QUEST_FLAGS_AUTO_ACCEPT` `0x80000` *cannot* travel and a client testing this field to decide whether an accept is needed would wait forever. **A per-realm cache** (`world::quest_cache`) holds packet **bodies, not parsed structs** -- a struct cache freezes a parse, a body cache freezes an observation, so a parser that learns a new field upgrades every cached quest with no migration. **A missing answer is `unknown`, never `nothing`**: there is deliberately no `get() -> Option<&QuestInfo>`, and an id asked about but never answered is not written to disk, because "no such quest" and "the reply was lost" are indistinguishable and only one is permanent. **A quest log panel (`L`)** shows titles, levels, objectives and `(Complete)`, all off the wire. Completion is `PLAYER_QUEST_LOG + 1` bit 0, measured against two quests in opposite states -- and the first two attempts could not have answered it, because quest 783 has no objectives (complete on accept) and quest 333's `StartItem` *is* its own `RequiredItemId1` (also complete on accept). Quest 38, wanting twelve items, gave the `0` that named the column. **Quests can be taken and handed in from the viewer**: right-click a questgiver, read what it says, press Accept; walk to the ender, right-click, press Complete Quest. Right-clicking a talker greets instead of swinging -- `UNIT_NPC_FLAGS` is replicated, so it is the one interaction test the client can make locally, and before this an innkeeper got a swing the server silently refused. **The window shows the cache's text, not the questgiver's**: `SMSG_QUESTGIVER_QUEST_DETAILS` `0x0188` is read for twenty bytes (npc guid + quest id, offset confirmed on two captures) and `SMSG_QUESTGIVER_OFFER_REWARD` `0x018D` is not parsed at all -- its *arrival* is the server saying the hand-in is legal, which is the one thing the query cannot say. Two parses of the same strings would drift. **`SMSG_QUESTGIVER_QUEST_LIST` `0x0185` is deliberately unparsed**: nothing has captured one, every fixture NPC has a gossip menu, and `SMSG_GOSSIP_MESSAGE`'s quest block is what arrives. Known limits, all recorded rather than hidden: reward *names* need `CMSG_ITEM_QUERY_SINGLE` so a reward reads `item 2224 x1`; `choose_quest_reward` sends index `0`, correct only where there is nothing to choose; no `!`/`?` markers; no map |
 | Inventory | **4.13 done including slot moves; `foss-wow#55` closed.** A **single combined bag window** (`B`) covering the backpack *and every equipped bag's contents* -- deliberately unlike the original's one frame per bag -- with real icons, stack counts and money; a separate **character panel** (`C`) with the nineteen worn slots, all nineteen named. The slot array, coinage, stack count, container capacity, container contents and the owner/contained pair were all measured against the live realm. Right-click **auto-equips** a backpack item, sending the already-confirmed `CMSG_AUTOEQUIP_ITEM`. **Left-click picks a square up and drops it on another, and the drop now sends and moves the item** -- a genuine two-way swap, confirmed live: two backpack items landed at each other's slots. The mystery result code **59** was the wrong question -- **the opcode was off by one.** `0x010B` is a real, different request (`CMSG_AUTOSTORE_BAG_ITEM`, a 3-byte `{src_bag, src_slot, dst_bag}` body that auto-stores into *any* free slot); this client's 4-byte body happened to line its first three bytes up with that shape, with the fourth silently unread, which is what made it look like a swap opcode being coy about a refusal. Sent against two slots the item is already validly in, the auto-store is a no-op and the answer is `EQUIP_ERR_NONE` (59) -- "nothing needed to happen," not a refusal. Sent with an equipped source it is *not* a no-op: the item was live-observed leaving its equipped slot and landing in the first free backpack square, not at the requested destination, which is what named the bug -- a real swap honours a *chosen* destination and this didn't. The genuine `CMSG_SWAP_ITEM` sits one number up at `0x010C`, wants exactly the four-byte body already built here, and was confirmed the same way: a chosen pair landed at each other's positions, nothing in between. See `SwapItemCandidate`'s doc comment in `crates/world/src/opcode.rs`. `AzerothCore`'s own source supplied the hypothesis (rule 2 permits reading it); a live realm confirmed it, the same division of labour as everywhere else in this project. |
@@ -78,15 +92,15 @@ claim rests on which.
 | Frame stacking | **Interface frames draw in an explicit order, and it decides which window a click reaches.** The map is centred and 760x520; a questgiver's scroll grows down into the same space, and with both open the Accept button was drawn, hit-tested and unreachable. Ranked by how much answering them matters: map at the bottom, then panels, then the always-there frames (no window may eat a click meant for an action bar), then the windows that want an answer -- loot, questgiver, release. The live bug is a headless test that asserts the overlap before asserting the click |
 | Cursor | **A drag holds the pointer.** Hidden, confined to the window, and warped back to the press position after every movement, so turning the camera never runs out of desk. That broke the click test, which was press-and-release-in-the-same-place -- exactly what a pinned pointer produces for every drag -- so it is now distance *travelled* since the press |
 
-Roughly 62% of the way to something a person could test by playing. See
+Roughly 63% of the way to something a person could test by playing. See
 `docs/ROADMAP.md` for the milestone ladder and what is deliberately deferred.
 
 **The destination for the next few milestones is a native Questie**, and the
 ladder to it is a dependency chain rather than a preference: NPC interaction
 (4.15) → quests (4.16) → map (4.17) → minimap (4.21) → Questie's features
-(**4.23**). The last two rungs were numbered 4.18 and 4.19 when that was
-written; liquids, emitters, parties and now the animation gaps took those
-numbers on the way past and the order is unchanged. The number keeps moving
+(**4.24**). The last two rungs were numbered 4.18 and 4.19 when that was
+written; liquids, emitters, parties, the animation gaps and now footsteps took
+those numbers on the way past and the order is unchanged. The number keeps moving
 and the *order* never has, which is the point worth reading: this ladder is a
 dependency chain, so anything that lands in between renumbers the rungs
 without reordering them. A quest tracker is a map feature — its whole value is "the thing you
@@ -97,7 +111,7 @@ not been offered, so it ships a hand-collected database of the entire game. This
 client can send the query. **Decided: quest data comes from the server and
 Questie's database is not ported** — so quests are never out of date, and are
 correct on a private realm with custom content, which is what this client is
-developed against. 4.19 is therefore a *presentation* milestone — pins, tracker,
+developed against. 4.24 is therefore a *presentation* milestone — pins, tracker,
 availability colouring — with facts off the wire wherever the wire will answer.
 The cost lands on **4.16**, which must build the query layer (`CMSG_QUEST_QUERY`
 `0x05C`, the questgiver-status queries, and a cache that treats a missing answer
@@ -1160,6 +1174,37 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   not yet built: before shipping anything a player can click repeatedly, ask
   what happens to the *connection* under a burst, not only whether one send
   is answered correctly.
+- **An instrument that cannot move cannot measure, and it says so with a
+  straight line rather than an error.** Which of an M2's timed events marks a
+  footfall was asked by posing the model and watching heights, and the first two
+  attempts both produced perfectly readable output that meant nothing. The first
+  traced the *event's own* point through the walk cycle: every event on a
+  character hangs off a bone with no animation track at all, so the answer was a
+  flat line for all thirty-seven of them -- a zero-variance result that reads as
+  "these all sit still" rather than as "this probe is pointed at the wrong
+  thing". The second posed the skeleton and read
+  `matrix.transform_point3(ZERO)`, which for every bone in a walk gives a small
+  plausible wobble; a posed matrix is a **deformation about the bone's pivot**,
+  so where a bone ends up is its own pivot pushed through its own matrix, and
+  the origin's displacement is a different quantity that happens to look like a
+  curve. Only the third reading -- pivot through matrix -- showed two feet
+  planted for a third of the cycle each, in antiphase, which is what a walk is.
+  The tell for both was the same and was available immediately: **the numbers
+  had no shape the subject must have.** Before reading a measurement, ask what
+  it would look like if the probe were aimed at nothing.
+- **A name is the one thing in a binary format that cannot be a coincidence.**
+  The M2 event stride was settled by two independent checks and only one of them
+  was informative. Byte accounting fit 4,265 of 4,265 models at 36 -- which is
+  what every measurement in this project hopes for, and neighbouring strides
+  still fit 1,343 apiece. The identifier being four printable ASCII characters
+  fit **25,498 of 25,500 records at 36 and 22-24% at every neighbour**, because
+  a stride a word out shifts the name into the middle of a float. Where a format
+  stores a `FourCC`, a label or a filename, that field is worth more than any
+  amount of range-checking: the same move as `CreatureSoundData`'s columns
+  naming themselves through `SoundEntries` labels, as `GroundEffectTexture`'s
+  terrain column naming itself through the *filenames* of the textures that
+  reach it, and as the guard test that checks hardcoded animation ids against
+  the name of the row they claim.
 
 ## Traps already hit
 
@@ -1176,6 +1221,13 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   tools; if a script must write, open in **binary** mode. Check the stat before
   committing — a file you changed three lines of has no business showing
   thousands.
+- **Do not run `cargo fmt` on this tree.** It is not rustfmt-clean and never has
+  been: much of it is hand-wrapped in ways rustfmt disagrees with. One run turned
+  a 190-line change into a 1,500-line one across thirteen files nobody had
+  touched, and the build and the tests are entirely happy with it -- exactly the
+  shape of the CRLF trap above, and caught the same way, by reading
+  `git diff --stat` before committing. Format the lines you write to match their
+  neighbours instead.
 - `wgpu`/`egui`/`egui-wgpu`/`egui-winit` versions are coupled, and the `windows`
   crate needs a pin to build the DX12 backend at all — see `docs/RENDERING.md`
   before touching any of them.

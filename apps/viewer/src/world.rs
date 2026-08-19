@@ -59,6 +59,14 @@ pub struct CachedModel {
     /// it, and arrives here as its own model.
     pub particles: Vec<m2::ParticleEmitter>,
     pub ribbons: Vec<m2::RibbonEmitter>,
+    /// When this model's feet hit the ground, one sorted list of
+    /// milliseconds per sequence.
+    ///
+    /// Read from the model's own timed events -- see [`m2::event`], which
+    /// carries the measurement that identified them. Empty for everything with
+    /// no legs, which is most models, and empty *per sequence* for the cycles
+    /// a creature does not walk in.
+    pub footfalls: Vec<Vec<u32>>,
     /// The model's own extent, in its local space. Carried so a replicated
     /// entity can be clicked on: a click needs a volume to test a ray against,
     /// and the model already knows how big it is. `None` for a WMO, which is
@@ -263,6 +271,18 @@ struct ChunkHeights {
     /// surfaces at one place -- so [`TileHeights::liquid_at`] takes the
     /// highest one the position falls inside rather than the first.
     liquid: Vec<adt::LiquidInstance>,
+    /// Which texture layer a foot lands on, over a coarse grid -- see
+    /// [`adt::footing`].
+    ///
+    /// Kept for the same reason the heights are, and it is the same argument
+    /// one step further on: the alpha maps that decide this are uploaded to
+    /// the GPU and dropped, and the GPU cannot be asked what a character is
+    /// standing on. `u8::MAX` where the chunk names no layers.
+    footing: Vec<u8>,
+    /// Each layer's `GroundEffectTexture` id, which is what says what the
+    /// surface is made of. Zero where a layer names none, and that is a real
+    /// answer: 3,002 of Azeroth's 390,011 layers do not.
+    effects: Vec<u32>,
 }
 
 impl TileHeights {
@@ -300,6 +320,8 @@ impl TileHeights {
                 heights: chunk.heights.clone(),
                 area_id: chunk.area_id,
                 liquid: liquid.chunk(file_index).to_vec(),
+                footing: adt::footing::footing_grid(chunk),
+                effects: chunk.layers.iter().map(|l| l.effect_id).collect(),
             });
         }
 
@@ -337,6 +359,27 @@ impl TileHeights {
         // Zero means the chunk names no area, which is a real answer and not
         // a missing one -- plenty of open water and unfinished terrain does.
         (chunk.area_id != 0).then_some(chunk.area_id)
+    }
+
+    /// What the ground is made of at a position, as a `GroundEffectTexture`
+    /// id.
+    ///
+    /// `None` where the tile is not resident, the chunk names no layers, or
+    /// the winning layer names no ground effect -- three different reasons
+    /// that all mean the same thing to a caller, which is that this client
+    /// does not know and must not invent a material.
+    ///
+    /// Shares `height_at`'s chunk indexing deliberately, for the reason
+    /// `area_at` does.
+    fn footing_at(&self, x: f32, y: f32) -> Option<u32> {
+        let side = adt::CHUNKS_PER_TILE as i64;
+        let cx = (((self.origin.0 - x) / adt::CHUNK_SIZE).floor() as i64).clamp(0, side - 1);
+        let cy = (((self.origin.1 - y) / adt::CHUNK_SIZE).floor() as i64).clamp(0, side - 1);
+        let chunk = self.chunks.get((cy * side + cx) as usize)?.as_ref()?;
+        let (row, col) = adt::footing::footing_cell(chunk.position, x, y)?;
+        let layer = chunk.footing.get(row * adt::footing::FOOTING_GRID + col)?;
+        let effect = chunk.effects.get(*layer as usize)?;
+        (*effect != 0).then_some(*effect)
     }
 
     /// The liquid surface at a position: how high it is and what it is.
@@ -577,6 +620,16 @@ pub struct World {
     /// that agree until one of them is edited, and a fire that trails a frame
     /// behind the arm carrying it.
     frame_poses: RefCell<HashMap<(u32, Motion), FramePose>>,
+    /// Which animation bucket each replicated entity is in, rebuilt with the
+    /// entities themselves.
+    ///
+    /// The buckets are shared -- every wolf walking is drawn from one pose --
+    /// so going the other way, from a guid to the cycle it is playing, needs a
+    /// map rather than a search. Footsteps are the caller: the sound a
+    /// character's feet make is per character, and the cycle they are timed
+    /// from is per bucket.
+    entity_buckets: RefCell<HashMap<u64, (u32, Motion)>>,
+
     /// Origin for the animation clock. The server does not say which frame of
     /// a walk cycle a creature is on -- nothing does, since 3.3.5a leaves that
     /// entirely to the client -- so any fixed origin that advances is enough
@@ -645,6 +698,7 @@ impl World {
             blending: RefCell::new(HashMap::new()),
             last_motion_per_display: RefCell::new(HashMap::new()),
             frame_poses: RefCell::new(HashMap::new()),
+            entity_buckets: RefCell::new(HashMap::new()),
             started: Instant::now(),
             tiles: HashMap::new(),
             pending: VecDeque::new(),
@@ -953,6 +1007,45 @@ impl World {
         self.tiles.get(&tile)?.heights.area_at(x, y)
     }
 
+    /// When this entity's feet are due to land in the cycle it is playing right
+    /// now, with where in that cycle it currently is.
+    ///
+    /// Returns `(sequence, footfall times, time into the cycle, cycle length)`,
+    /// the last three in milliseconds. The sequence is handed back because a
+    /// caller comparing phases has to tell a cycle that *wrapped* from one
+    /// that was *replaced*, and those look identical from the clock alone. `None` for an entity that is not drawn, has no cycle, or
+    /// whose model carries no footfall events -- which is most models, since
+    /// only 762 of 22,844 have feet the format describes.
+    ///
+    /// **Read from this frame's pose rather than recomputed.** The pose is
+    /// what the character was drawn at, and a footstep timed from a second
+    /// clock would drift against the legs it is meant to belong to -- the same
+    /// reason a held item is placed from the wielder's own posed hand.
+    pub fn footfalls_of(&self, guid: u64) -> Option<(usize, Vec<u32>, u32, u32)> {
+        let bucket = self.entity_buckets.borrow().get(&guid).copied()?;
+        let poses = self.frame_poses.borrow();
+        let frame = poses.get(&bucket)?;
+        let model = self
+            .entities
+            .iter()
+            .find(|group| group.animation == Some(bucket))
+            .map(|group| &group.model)?;
+        let times = model.footfalls.get(frame.sequence)?;
+        if times.is_empty() {
+            return None;
+        }
+        let duration = model.sequences.get(frame.sequence)?.duration_ms.max(1);
+        Some((frame.sequence, times.clone(), frame.time_ms, duration))
+    }
+
+    /// What the ground is made of at a position, as a `GroundEffectTexture`
+    /// id. `None` while the tile is streaming, or where the ground says
+    /// nothing about its surface.
+    pub fn footing_at(&self, x: f32, y: f32) -> Option<u32> {
+        let tile = tile_at(Vec3::new(x, y, 0.0));
+        self.tiles.get(&tile)?.heights.footing_at(x, y)
+    }
+
     /// Where a character ends up moving from `from` towards `to`.
     ///
     /// **Consults the tiles the move touches, not just the one it starts on.**
@@ -1066,6 +1159,7 @@ impl World {
             attachments: Vec<m2::Attachment>,
             particles: Vec<m2::ParticleEmitter>,
             ribbons: Vec<m2::RibbonEmitter>,
+            footfalls: Vec<Vec<u32>>,
             bounds: Option<(Vec3, Vec3)>,
             collision: Vec<[[f32; 3]; 3]>,
         }
@@ -1084,6 +1178,7 @@ impl World {
                     attachments: Vec::new(),
                     particles: Vec::new(),
                     ribbons: Vec::new(),
+                    footfalls: Vec::new(),
                     bounds: None,
                     collision: w.collision,
                 })
@@ -1113,6 +1208,7 @@ impl World {
                         attachments: m.attachments,
                         particles: m.particles,
                         ribbons: m.ribbons,
+                        footfalls: m.footfalls,
                         bounds: Some((m.min, m.max)),
                         collision: m.collision,
                     }
@@ -1135,6 +1231,7 @@ impl World {
                 attachments: b.attachments,
                 particles: b.particles,
                 ribbons: b.ribbons,
+                footfalls: b.footfalls,
                 bounds: b.bounds,
                 textures: b.textures,
                 collision: b.collision,
@@ -1194,6 +1291,9 @@ impl World {
         // object. Two vectors rather than a vector of pairs because the
         // transforms are uploaded wholesale and the guids never are.
         let mut grouped_guids: HashMap<(u32, Motion, u64), Vec<u64>> = HashMap::new();
+        // The same association the other way round, kept because a caller
+        // holding a guid cannot search a shared bucket for it.
+        let mut bucket_of_guid: HashMap<u64, (u32, Motion)> = HashMap::new();
         // One clock reading for the whole rebuild, so two units that died in
         // the same frame land in the same bucket and share a pose rather than
         // missing each other by a millisecond.
@@ -1265,6 +1365,7 @@ impl World {
                 .entry(bucket)
                 .or_default()
                 .push(placement.guid);
+            bucket_of_guid.insert(placement.guid, (bucket.0, bucket.1));
             grouped
                 .entry(bucket)
                 .or_default()
@@ -1504,6 +1605,10 @@ impl World {
                 .retain(|display, _| wanted_displays.contains(display));
         }
 
+        // Rebuilt wholesale for the same reason `frame_poses` is: an entity
+        // that left view this pass must stop having a bucket, or a footstep
+        // would keep being timed from a cycle nothing is drawing.
+        *self.entity_buckets.borrow_mut() = bucket_of_guid;
         self.entities = built;
         self.refresh_stats();
         undrawable
@@ -1888,6 +1993,7 @@ impl World {
                     attachments: loaded.attachments,
                     particles: loaded.particles,
                     ribbons: loaded.ribbons,
+                    footfalls: loaded.footfalls,
                     // This is the cache click-to-target reads from, so this is
                     // the one that has to carry the model's extent.
                     bounds: Some((loaded.min, loaded.max)),

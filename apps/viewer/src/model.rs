@@ -41,6 +41,14 @@ pub struct LoadedModel {
     /// and re-reading it per placement would parse a torch once per torch.
     pub particles: Vec<m2::ParticleEmitter>,
     pub ribbons: Vec<m2::RibbonEmitter>,
+    /// When this model's feet hit the ground, one sorted list of
+    /// milliseconds per sequence.
+    ///
+    /// Read from the model's own timed events -- see [`m2::event`], which
+    /// carries the measurement that identified them. Empty for everything with
+    /// no legs, which is most models, and empty *per sequence* for the cycles
+    /// a creature does not walk in.
+    pub footfalls: Vec<Vec<u32>>,
     /// Human-readable name per sequence, from `AnimationData.dbc`.
     pub sequence_names: Vec<String>,
     pub min: Vec3,
@@ -382,6 +390,10 @@ pub fn load_dressed(
     let sequences = model.sequences();
     let external = load_external_anims(chain, &path, &sequences);
     let bones = model.animated_bones_with(&external);
+    // Read here rather than at the struct literal because that runs after
+    // `sequences` has moved into it, and the outer index of a footfall list
+    // *is* a sequence index.
+    let footfalls = m2::event::footfalls(&model.events_with(&external), sequences.len());
     let sequence_names = sequence_names(chain, &sequences);
 
     Ok(LoadedModel {
@@ -411,6 +423,7 @@ pub fn load_dressed(
         attachments: model.attachments(),
         particles: model.particle_emitters(),
         ribbons: model.ribbon_emitters(),
+        footfalls,
         collision: model.collision_triangles(),
         sequence_names,
         min,

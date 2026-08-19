@@ -576,3 +576,109 @@ fn sampled_emitters_name_things_that_exist() {
     );
     assert_eq!(strays, 0, "{strays} of {emitters} emitters name nothing real");
 }
+
+/// The two footfall families are told apart by what they *do*, not by their
+/// names, and this pins the finding that decided which one a footstep hangs
+/// off.
+///
+/// The wolf is the sample that separates them, because it has four feet. Its
+/// walk cycle carries four `$FSD` timestamps -- one per paw -- and four
+/// per-foot markers, and each `$FSD` precedes its matching marker by exactly
+/// one animation frame. A biped's has two of each. A marker that tracks how
+/// many legs a creature has is the ground contact.
+#[test]
+fn the_ground_contact_event_counts_feet() {
+    let mut chain = require_data!();
+
+    for (path, walk, expected) in [
+        (r"Creature\Wolf\Wolf.m2", 0usize, 4usize),
+        (r"Character\Human\Male\HumanMale.m2", 1, 2),
+    ] {
+        let model = load(&mut chain, path);
+        let sequences = model.sequences();
+        let mut external = std::collections::BTreeMap::new();
+        for (i, seq) in sequences.iter().enumerate() {
+            if seq.is_inline() {
+                continue;
+            }
+            if let Ok(bytes) = chain.read(&m2::anim::external_anim_path(path, seq)) {
+                external.insert(i, bytes);
+            }
+        }
+        let events = model.events_with(&external);
+        let contacts = m2::event::footfalls(&events, sequences.len());
+        assert_eq!(
+            contacts[walk].len(),
+            expected,
+            "{path} sequence {walk} should have one ground contact per foot, got {:?}",
+            contacts[walk]
+        );
+        // And they are spread through the cycle rather than piled at its
+        // start, which is what a misread timestamp array looks like.
+        let duration = sequences[walk].duration_ms;
+        assert!(
+            contacts[walk].iter().all(|t| *t < duration),
+            "{path}: a contact at {:?} in a {duration}ms cycle",
+            contacts[walk]
+        );
+        assert!(
+            contacts[walk].last().unwrap() - contacts[walk].first().unwrap() > duration / 4,
+            "{path}: every contact within a quarter of the cycle: {:?}",
+            contacts[walk]
+        );
+    }
+}
+
+/// Across the archives, no event fires outside the cycle it belongs to.
+///
+/// The property a wrong stride or a wrong timestamp offset destroys: a
+/// timestamp is milliseconds into its own sequence, so one past the end is a
+/// number read from somewhere else. Cheap, systematic, and it covers every
+/// event family rather than the two this client acts on.
+#[test]
+fn no_event_fires_after_its_own_cycle_ends() {
+    let mut chain = require_data!();
+    let names: Vec<String> = chain
+        .list()
+        .expect("listing")
+        .into_iter()
+        .filter(|n| n.to_lowercase().ends_with(".m2"))
+        .collect();
+
+    let (mut checked, mut models, mut past_the_end) = (0usize, 0usize, 0usize);
+    for name in names.iter().step_by(17) {
+        let Ok(bytes) = chain.read(name) else { continue };
+        let Ok(model) = Model::parse(&bytes) else {
+            continue;
+        };
+        let sequences = model.sequences();
+        let events = model.events();
+        if events.is_empty() {
+            continue;
+        }
+        models += 1;
+        for event in &events {
+            for (index, times) in event.times.iter().enumerate() {
+                let Some(sequence) = sequences.get(index) else {
+                    continue;
+                };
+                // A sequence whose keys live in an external `.anim` has no
+                // timestamps here at all, which is an empty list rather than a
+                // wrong one.
+                for time in times {
+                    checked += 1;
+                    if *time > sequence.duration_ms {
+                        past_the_end += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(models > 100, "only {models} models with events sampled");
+    assert!(checked > 1_000, "only {checked} timestamps checked");
+    assert_eq!(
+        past_the_end, 0,
+        "{past_the_end} of {checked} event timestamps land past the end of their own cycle"
+    );
+}

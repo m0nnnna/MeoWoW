@@ -5,9 +5,9 @@
 
 use dbc::infer::{infer, ColumnKind};
 use dbc::schema::{
-    AreaTable, CreatureDisplayInfo, CreatureModelData, Map, SoundEntries, SoundType, Spell,
-    SpellDuration, SpellRadius, SpellVisual, SpellVisualKit, WorldMapArea, WorldMapOverlay,
-    WorldSafeLocs,
+    AreaTable, CreatureDisplayInfo, CreatureModelData, CreatureSoundData, FootstepTerrainLookup,
+    GroundEffectTexture, Map, SoundEntries, SoundType, Spell, SpellDuration, SpellRadius,
+    SpellVisual, SpellVisualKit, TerrainType, WorldMapArea, WorldMapOverlay, WorldSafeLocs,
 };
 use dbc::Dbc;
 use mpq::Chain;
@@ -959,5 +959,178 @@ fn a_citys_page_projects_onto_the_patch_that_draws_it() {
     assert!(
         !near(dbc::worldmap::PAGE_HEIGHT - top, art_top),
         "a flipped vertical axis lands on the patch too"
+    );
+}
+
+/// `FootstepTerrainLookup`'s terrain column is a `TerrainType.sound_id` and
+/// not a `TerrainType` row id, and the sounds' own names say so.
+///
+/// The two readings are off by one from each other all the way down a
+/// twelve-row table, so both parse and both produce a plausible-looking client.
+/// What separates them is that `SoundEntries` labels its rows: taking only the
+/// footstep sounds whose name states a material -- `CharacterSmallSnow`,
+/// `CharacterMediumLargeWood` -- and asking which reading agrees, one wins by a
+/// wide margin and the other is wrong nearly everywhere.
+///
+/// The unanimous halves are asserted separately from the tally, because a
+/// margin can survive a single column being wrong and these two cannot: under
+/// the losing reading, terrain 4's five snow sounds all become `Wood` and
+/// terrain 5's five wood sounds all become `Grass`.
+#[test]
+fn the_footstep_terrain_column_is_a_sound_id() {
+    let mut chain = require_data!();
+    let terrain = TerrainType::parse(&chain.read(TerrainType::PATH).expect("TerrainType"))
+        .expect("parsing TerrainType");
+    let lookup =
+        FootstepTerrainLookup::parse(&chain.read(FootstepTerrainLookup::PATH).expect("lookup"))
+            .expect("parsing FootstepTerrainLookup");
+    let sounds = SoundEntries::parse(&chain.read(SoundEntries::PATH).expect("SoundEntries"))
+        .expect("parsing SoundEntries");
+    let named: std::collections::HashMap<u32, String> =
+        sounds.iter().map(|r| (r.id(), r.name().to_string())).collect();
+
+    const MATERIALS: [&str; 8] = [
+        "dirt", "metal", "stone", "snow", "wood", "grass", "leaves", "sand",
+    ];
+    let material_of = |name: &str| {
+        let lower = name.to_lowercase();
+        MATERIALS.into_iter().find(|m| lower.contains(m))
+    };
+    // What each reading claims the terrain value means, as lower-case words.
+    // `Metallic` is trimmed to `metal` so a name match is about the material
+    // rather than about English word endings.
+    let claims = |value: u32, by_sound_id: bool| -> Vec<String> {
+        terrain
+            .iter()
+            .filter(|r| if by_sound_id { r.sound_id() == value } else { r.id() == value })
+            .map(|r| r.name().to_lowercase().replace("metallic", "metal"))
+            .collect()
+    };
+    let agrees = |claims: &[String], material: &str| {
+        claims.iter().any(|c| c.contains(material) || material.contains(c.as_str()))
+    };
+
+    let (mut by_sound, mut by_row, mut voters) = (0usize, 0usize, 0usize);
+    for row in lookup.iter() {
+        let Some(name) = named.get(&row.sound()) else {
+            continue;
+        };
+        let Some(material) = material_of(name) else {
+            continue;
+        };
+        voters += 1;
+        if agrees(&claims(row.terrain(), true), material) {
+            by_sound += 1;
+        }
+        if agrees(&claims(row.terrain(), false), material) {
+            by_row += 1;
+        }
+        // The two decisive columns, each unanimous under the right reading.
+        if row.terrain() == 4 {
+            assert_eq!(material, "snow", "terrain 4 reached {name}, which is not snow");
+        }
+        if row.terrain() == 5 {
+            assert_eq!(material, "wood", "terrain 5 reached {name}, which is not wood");
+        }
+    }
+
+    assert!(voters >= 40, "only {voters} sounds name a material at all");
+    assert!(
+        by_sound >= 2 * by_row,
+        "the sound-id reading should win outright: {by_sound} against {by_row} of {voters}"
+    );
+}
+
+/// Every sound a footstep row names exists, and the splash column is a
+/// different *kind* of sound from the step column.
+///
+/// The type is what tells the two columns apart without recalling their order:
+/// a splash is `SoundEntries` type 20 and says `Splash` in its own name, where
+/// every ordinary footstep is type 3.
+#[test]
+fn footstep_rows_reach_real_sounds_of_the_right_kind() {
+    let mut chain = require_data!();
+    let lookup =
+        FootstepTerrainLookup::parse(&chain.read(FootstepTerrainLookup::PATH).expect("lookup"))
+            .expect("parsing FootstepTerrainLookup");
+    let sounds = SoundEntries::parse(&chain.read(SoundEntries::PATH).expect("SoundEntries"))
+        .expect("parsing SoundEntries");
+    let rows: std::collections::HashMap<u32, (u32, String)> = sounds
+        .iter()
+        .map(|r| (r.id(), (r.sound_type(), r.name().to_string())))
+        .collect();
+
+    let (mut steps, mut splashes, mut splash_named, mut missing) = (0usize, 0usize, 0usize, 0usize);
+    for row in lookup.iter() {
+        match rows.get(&row.sound()) {
+            Some((kind, _)) => {
+                steps += 1;
+                assert_eq!(*kind, 3, "footstep {} is sound type {kind}", row.sound());
+            }
+            None => missing += 1,
+        }
+        if row.sound_splash() == 0 {
+            continue;
+        }
+        match rows.get(&row.sound_splash()) {
+            Some((_, name)) => {
+                splashes += 1;
+                if name.to_lowercase().contains("splash") {
+                    splash_named += 1;
+                }
+            }
+            None => missing += 1,
+        }
+    }
+
+    assert_eq!(missing, 0, "{missing} footstep sound ids name no row");
+    assert_eq!(steps, lookup.len(), "every row names a step sound");
+    assert!(
+        splash_named * 10 >= splashes * 9,
+        "only {splash_named} of {splashes} splash sounds are called `Splash`"
+    );
+}
+
+/// `CreatureSoundData`'s footstep column names a group that exists, and that
+/// is not a free result.
+///
+/// Every other column in that table holds `SoundEntries` ids, which run to
+/// 18,019 over 12,941 rows -- so landing on a valid one proves nothing. The
+/// footstep groups are 23 distinct values scattered over 0..=188, so a wrong
+/// column lands inside that set by luck and almost never.
+#[test]
+fn the_creature_footstep_column_names_a_group_that_exists() {
+    let mut chain = require_data!();
+    let lookup =
+        FootstepTerrainLookup::parse(&chain.read(FootstepTerrainLookup::PATH).expect("lookup"))
+            .expect("parsing FootstepTerrainLookup");
+    let creatures =
+        CreatureSoundData::parse(&chain.read(CreatureSoundData::PATH).expect("CreatureSoundData"))
+            .expect("parsing CreatureSoundData");
+    let groups: std::collections::HashSet<u32> =
+        lookup.iter().map(|r| r.creature_footstep_id()).collect();
+
+    let (mut set, mut inside) = (0usize, 0usize);
+    // The control: the aggro column, which is a sound id and must *not* look
+    // like a group. Asserting only that the footstep column resolves would
+    // pass just as well if every column did.
+    let (mut control_set, mut control_inside) = (0usize, 0usize);
+    for row in creatures.iter() {
+        if row.footstep_group() != 0 {
+            set += 1;
+            inside += usize::from(groups.contains(&row.footstep_group()));
+        }
+        if row.aggro() != 0 {
+            control_set += 1;
+            control_inside += usize::from(groups.contains(&row.aggro()));
+        }
+    }
+
+    assert!(groups.len() < 30, "{} groups is too many to be selective", groups.len());
+    assert!(set > 500, "only {set} rows name a footstep group");
+    assert_eq!(inside, set, "{} of {set} groups do not exist", set - inside);
+    assert!(
+        control_inside * 20 < control_set,
+        "the aggro column looks like a group too: {control_inside} of {control_set}"
     );
 }

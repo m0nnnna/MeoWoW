@@ -1250,6 +1250,119 @@ dbc_table! {
         6  death: u32,
         /// Played when it notices you.
         10 aggro: u32,
+        /// Which group of surface sounds this creature's feet use: a
+        /// [`FootstepTerrainLookup::creature_footstep_id`], **not** a
+        /// `SoundEntries` id like every other column in this table.
+        ///
+        /// That is what identified it, and it is the cleanest identification
+        /// in the table. `FootstepTerrainLookup` names only **23** distinct
+        /// groups out of the 0..=188 range they span, so landing inside that
+        /// set is not free the way landing inside `SoundEntries` is. Of the 38
+        /// columns here, field 9 is set on 738 rows and **738 of 738** name a
+        /// real group; the best any other column manages is 21 of 1,306
+        /// (1.6%), and those are coincidences of magnitude in the id column.
+        /// The values also span exactly the group range -- 6 to 188 -- where
+        /// every neighbouring column holds four-figure sound ids.
+        9  footstep_group: u32,
+    }
+}
+
+dbc_table! {
+    /// The materials a foot can land on: dirt, stone, snow, wood, grass.
+    ///
+    /// Twelve rows, and the second column is a *name* -- which makes this one
+    /// of the few tables here that identifies its own contents. Everything
+    /// downstream is checked against those names rather than against a
+    /// remembered ordering.
+    ///
+    /// **[`TerrainTypeRow::sound_id`] is not the row id**, and the difference
+    /// matters because both are small integers in overlapping ranges. `Dirt`
+    /// is row 0 and sound 1, `Metallic` row 1 and sound 2, and so on -- an
+    /// off-by-one all the way down, with `DustyGrass` (row 9) sharing `Grass`'s
+    /// sound 6 and `None` (row 10) having sound 0. What
+    /// [`FootstepTerrainLookup`] is keyed by is the **sound**, not the row; see
+    /// its doc comment for the measurement that separates the two.
+    ///
+    /// The two spray columns name the ground effect kicked up by a footfall.
+    /// Only `Snow` sets them in this build, and nothing here draws either.
+    TerrainType, TerrainTypeRow,
+    path = r"DBFilesClient\TerrainType.dbc", fields = 6, {
+        0 id: u32,
+        /// `Dirt`, `Metallic`, `Stone`, `Snow`, `Wood`, `Grass`, `Leaves`,
+        /// `Sand`, `Soggy`, `DustyGrass`, `None`, `Water`.
+        1 name: str,
+        2 footstep_spray_run: u32,
+        3 footstep_spray_walk: u32,
+        /// What [`FootstepTerrainLookup`] keys on. Ten distinct values over
+        /// twelve rows.
+        4 sound_id: u32,
+        5 friction: bool,
+    }
+}
+
+dbc_table! {
+    /// Which sound a particular creature makes stepping on a particular
+    /// surface: 217 rows of `(creature footstep group, terrain, sound)`.
+    ///
+    /// **The terrain column is a [`TerrainType::sound_id`], not a
+    /// [`TerrainType`] row id**, and the two readings both parse. What
+    /// separates them is that `SoundEntries` names its rows: taking the fifty
+    /// footstep sounds whose name carries a material word and asking which
+    /// reading agrees with it, the sound-id reading scores **25 of 50** and the
+    /// row-id reading **9 of 50** -- and the misses are not scattered. Terrain
+    /// 1 is `Dirt` five times out of five, 3 is `Stone` four of five, 4 is
+    /// `Snow` five of five, 5 is `Wood` five of five and 6 is `Grass` four of
+    /// five. The three values that never match a material of their own --
+    /// `Leaves`, `Sand` and `Soggy` -- reach grass and dirt sounds instead,
+    /// because this build ships no leaf or sand footstep to reach. Under the
+    /// row-id reading every one of those columns is off by one and `Snow`
+    /// plays on wood.
+    ///
+    /// Terrain **0** is not a row of [`TerrainType`] at all -- its ids start at
+    /// sound 1 -- and the seventeen rows carrying it reach dirt sounds. It is
+    /// the fallback, and this client uses it wherever the ground does not name
+    /// a terrain, which is most of the world.
+    ///
+    /// Both sound columns resolve completely: **342 of 342** references land on
+    /// a real `SoundEntries` row. They are also of different *types*, which is
+    /// what named them: all 217 ordinary sounds are type 3, while 115 of the
+    /// 125 splash sounds are type 20 and 115 of them have `Splash` in their
+    /// name.
+    FootstepTerrainLookup, FootstepTerrainLookupRow,
+    path = r"DBFilesClient\FootstepTerrainLookup.dbc", fields = 5, {
+        0 id: u32,
+        /// The group of surfaces one kind of creature has sounds for, named by
+        /// [`CreatureSoundData::footstep_group`].
+        1 creature_footstep_id: u32,
+        /// A [`TerrainType::sound_id`], or 0 for the fallback.
+        2 terrain: u32,
+        /// `SoundEntries` id for stepping on dry ground.
+        3 sound: u32,
+        /// `SoundEntries` id for stepping in water. Zero on 92 of 217 rows.
+        4 sound_splash: u32,
+    }
+}
+
+dbc_table! {
+    /// What grows on a terrain texture, and -- the only column read here --
+    /// what it sounds like underfoot.
+    ///
+    /// A map chunk's texture layer names one of these rows through its
+    /// `effect_id`, and this is the only link in the game's data from a patch
+    /// of ground to a [`TerrainType`]. The other columns are the grass and
+    /// scrub doodads scattered over it, which this client does not draw.
+    ///
+    /// **22,708 of 24,981 rows carry terrain 0**, which is not `Dirt`: it is
+    /// the row saying nothing about the surface, exactly as in
+    /// [`FootstepTerrainLookup`]. Most of the table is doodad scatter with no
+    /// sound attached, so a client treating 0 as `Dirt` would be asserting a
+    /// material for the majority of the world on no evidence.
+    GroundEffectTexture, GroundEffectTextureRow,
+    path = r"DBFilesClient\GroundEffectTexture.dbc", fields = 11, {
+        0 id: u32,
+        /// A [`TerrainType`] **row id**, unlike everything downstream of it.
+        /// Values run 0..=11, which is exactly that table's twelve rows.
+        10 terrain_type: u32,
     }
 }
 

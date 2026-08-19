@@ -328,3 +328,145 @@ fn referenced_assets_exist() {
         assert!(chain.contains(&resolved), "missing doodad {resolved}");
     }
 }
+
+/// `GroundEffectTexture`'s terrain column names the material its textures are
+/// *called*, which is what makes it usable for footsteps.
+///
+/// The chain a footstep needs runs: map chunk -> texture layer -> `effect_id`
+/// -> `GroundEffectTexture` -> a `TerrainType` row. Every link but the last is
+/// a bare small integer with nothing to confirm it, and the last one is a
+/// twelve-row table of names. What confirms the whole chain is one step
+/// further out: a layer also names a **texture file**, and those filenames are
+/// authored English. A column whose `Snow` rows are reached by files called
+/// `..._snow_...` is the terrain column, and no coincidence of small integers
+/// produces that.
+///
+/// Two rows are checked because their material word is unambiguous in a
+/// filename. `Dirt` is not, and is deliberately left out: terrain row 0 is
+/// `Dirt` *and* is what 22,708 of 24,981 ground effects say when they say
+/// nothing at all, so agreement there would prove nothing either way.
+#[test]
+fn ground_effects_name_the_terrain_their_textures_are_called() {
+    let mut chain = require_data!();
+    let terrain =
+        dbc::schema::TerrainType::parse(&chain.read(dbc::schema::TerrainType::PATH).expect("terrain"))
+            .expect("parsing TerrainType");
+    let textures = dbc::schema::GroundEffectTexture::parse(
+        &chain.read(dbc::schema::GroundEffectTexture::PATH).expect("ground effects"),
+    )
+    .expect("parsing GroundEffectTexture");
+    let ids: std::collections::HashSet<u32> = terrain.iter().map(|r| r.id()).collect();
+    let effect: std::collections::HashMap<u32, u32> =
+        textures.iter().map(|r| (r.id(), r.terrain_type())).collect();
+
+    for row in textures.iter() {
+        assert!(
+            ids.contains(&row.terrain_type()),
+            "ground effect {} names terrain {}, which is not a row",
+            row.id(),
+            row.terrain_type()
+        );
+    }
+
+    let wdt = adt::Wdt::parse(&chain.read(&adt::wdt_path("Azeroth")).expect("wdt")).expect("wdt");
+    let mut hits: std::collections::HashMap<u32, (usize, usize)> = std::collections::HashMap::new();
+    let (mut tiles, mut resolved, mut layers) = (0usize, 0usize, 0usize);
+    for (x, y) in wdt.tiles() {
+        if tiles >= 250 {
+            break;
+        }
+        let Ok(bytes) = chain.read(&adt::tile_path("Azeroth", x, y)) else {
+            continue;
+        };
+        let Ok(tile) = adt::Adt::parse(&bytes, wdt.big_alpha()) else {
+            continue;
+        };
+        tiles += 1;
+        for chunk in &tile.chunks {
+            for layer in &chunk.layers {
+                if layer.effect_id == 0 {
+                    continue;
+                }
+                layers += 1;
+                let Some(&id) = effect.get(&layer.effect_id) else {
+                    continue;
+                };
+                resolved += 1;
+                let Some(name) = tile.textures.get(layer.texture_id as usize) else {
+                    continue;
+                };
+                let lower = name.to_lowercase();
+                for (terrain_id, word) in [(3u32, "snow"), (5, "grass")] {
+                    if id != terrain_id {
+                        continue;
+                    }
+                    let entry = hits.entry(terrain_id).or_default();
+                    entry.1 += 1;
+                    entry.0 += usize::from(lower.contains(word));
+                }
+            }
+        }
+    }
+
+    // A layer naming a ground effect that does not exist would be the chain
+    // breaking at its first link, and would be invisible in the tally below.
+    assert_eq!(
+        resolved, layers,
+        "{} of {layers} layers name a GroundEffectTexture row that is not there",
+        layers - resolved
+    );
+    for (terrain_id, word) in [(3u32, "snow"), (5, "grass")] {
+        let (named, total) = hits.get(&terrain_id).copied().unwrap_or((0, 0));
+        assert!(total > 100, "only {total} layers reach terrain {terrain_id}");
+        assert!(
+            named * 2 > total,
+            "terrain {terrain_id} should be reached by textures called `{word}`: \
+             {named} of {total}"
+        );
+    }
+}
+
+/// A chunk's footing grid says which layer is underfoot, and it agrees with
+/// the alpha maps it was reduced from.
+///
+/// The property that matters is that it is not constant: a grid that answered
+/// "layer 0" everywhere would look perfectly reasonable and would make every
+/// road in the game sound like the field beside it.
+#[test]
+fn the_footing_grid_varies_across_a_real_tile() {
+    let mut chain = require_data!();
+    let wdt = adt::Wdt::parse(&chain.read(&adt::wdt_path("Azeroth")).expect("wdt")).expect("wdt");
+    // Northshire's tile, which carries the abbey, its roads and open grass.
+    let tile = adt::Adt::parse(
+        &chain.read(&adt::tile_path("Azeroth", 32, 48)).expect("tile"),
+        wdt.big_alpha(),
+    )
+    .expect("parsing tile");
+
+    let (mut mixed, mut multi_layer) = (0usize, 0usize);
+    for chunk in &tile.chunks {
+        if chunk.layers.len() < 2 {
+            continue;
+        }
+        multi_layer += 1;
+        let grid = adt::footing::footing_grid(chunk);
+        assert_eq!(grid.len(), adt::footing::FOOTING_GRID * adt::footing::FOOTING_GRID);
+        for cell in &grid {
+            assert!(
+                (*cell as usize) < chunk.layers.len(),
+                "footing names layer {cell} of {}",
+                chunk.layers.len()
+            );
+        }
+        if grid.iter().any(|c| *c != grid[0]) {
+            mixed += 1;
+        }
+    }
+
+    assert!(multi_layer > 100, "only {multi_layer} chunks have more than one layer");
+    assert!(
+        mixed * 2 > multi_layer,
+        "only {mixed} of {multi_layer} multi-layer chunks have more than one footing -- \
+         a grid that is constant per chunk is not reading the alpha maps"
+    );
+}

@@ -1038,6 +1038,47 @@ enum M2Command {
         #[arg(long)]
         strides: bool,
     },
+    /// List a model's timed events: the moments inside an animation when
+    /// something is supposed to happen.
+    ///
+    /// Everything else in an M2 is continuous -- where a bone is at time `t`.
+    /// An event is a bare list of timestamps with no value, and it is where
+    /// the answers to "when does the foot land" and "when does the blade
+    /// connect" live. This client guessed at the second of those with a
+    /// hand-dialled constant precisely because nothing read this block.
+    Events {
+        /// Archive path, or a substring to filter on when `--survey` is set.
+        path: String,
+        /// Also load the external `.anim` files, so the sequences whose data
+        /// moved out of the `.m2` report their timestamps.
+        ///
+        /// **A character's walk and run cycles are exactly those sequences**,
+        /// so without this a footfall reads as an event that never fires.
+        #[arg(long)]
+        anims: bool,
+        /// Read every model in the archives and tally which identifiers exist,
+        /// how many models carry each, and how many sequences they fire in.
+        #[arg(long)]
+        survey: bool,
+        /// Score candidate record strides instead.
+        ///
+        /// The identifier is four ASCII characters, which no neighbouring
+        /// stride can produce by accident -- it shifts the name into the
+        /// middle of a float. So the measurement is the share of records whose
+        /// four bytes are printable, and the wrong answers are punctuation
+        /// rather than plausible names.
+        #[arg(long)]
+        strides: bool,
+        /// Pose the skeleton through this sequence and report where each
+        /// event's own point is lowest, against the times it actually fires.
+        ///
+        /// Which of a model's event families marks a footfall cannot be read
+        /// off the four-letter names without recalling a table nobody here has
+        /// checked. It can be *measured*: a foot that is planted is a foot at
+        /// the bottom of its travel.
+        #[arg(long)]
+        trace: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -9096,6 +9137,17 @@ fn m2_cmd(chain: &mut Chain, cmd: M2Command) -> Result<()> {
                 m2_emitters(chain, &path)
             }
         }
+        M2Command::Events {
+            path,
+            anims,
+            survey,
+            strides,
+            trace,
+        } => match trace {
+            Some(anim) => m2_event_trace(chain, &path, anim),
+            None if survey || strides => m2_event_survey(chain, &path, strides),
+            None => m2_events(chain, &path, anims),
+        },
     }
 }
 
@@ -9168,6 +9220,23 @@ enum SoundCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Ask the footstep tables to identify their own columns, and the terrain
+    /// whether the chain from a patch of ground to a material reaches one.
+    Footsteps {
+        /// Map directory to walk for the terrain half. Defaults to `Azeroth`.
+        #[arg(long)]
+        map: Option<String>,
+        /// How many tiles to read. Defaults to 64.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// The one tile to resolve end to end, as `x,y`. Defaults to Elwynn's
+        /// `32,48`, which carries Northshire's roads, grass and abbey floor.
+        #[arg(long)]
+        tile: Option<String>,
+        /// Creature display id to walk it as. Defaults to 49, the human male.
+        #[arg(long, default_value_t = 49)]
+        walker: u32,
+    },
     /// Extract a sound's files to disk so they can actually be listened to.
     ///
     /// The audio equivalent of `blp export`: a format that has only ever been
@@ -9179,6 +9248,392 @@ enum SoundCommand {
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
+}
+
+/// Asks the footstep tables to identify their own columns, then asks the
+/// terrain whether the chain from a patch of ground to a material actually
+/// reaches one.
+///
+/// Three separate questions, and only the first two are about tables:
+///
+/// 1. **Which reading of `FootstepTerrainLookup`'s terrain column is right.**
+///    It is either a [`TerrainType`] row id or that row's `sound_id`, the two
+///    are off by one from each other, and both parse. `SoundEntries` names its
+///    rows, so the sounds each terrain value reaches can be checked against the
+///    material word in their own names -- and one reading agrees with them
+///    while the other does not.
+/// 2. **Whether both sound columns resolve**, and what *type* of sound each
+///    reaches. A splash is a different sound type from a footstep, which is
+///    what separates the two columns without recalling their order.
+/// 3. **Whether the terrain under a character can be found at all.** A map
+///    chunk's texture layer names a `GroundEffectTexture` row, that row names a
+///    terrain, and this reports how much of the ground actually gets that far.
+///    The honest answer matters more than a high number: ground that names no
+///    terrain must fall back to the lookup's own terrain 0 rather than be
+///    asserted to be dirt.
+fn sound_footsteps(
+    chain: &mut Chain,
+    map: Option<&str>,
+    limit: Option<usize>,
+    tile: Option<&str>,
+    walker: u32,
+) -> Result<()> {
+    use dbc::schema::{
+        CreatureSoundData, FootstepTerrainLookup, GroundEffectTexture, SoundEntries, TerrainType,
+    };
+    use std::collections::BTreeMap;
+
+    let terrain = TerrainType::parse(&chain.read(TerrainType::PATH)?)?;
+    let lookup = FootstepTerrainLookup::parse(&chain.read(FootstepTerrainLookup::PATH)?)?;
+    let sounds = SoundEntries::parse(&chain.read(SoundEntries::PATH)?)?;
+
+    let sound: BTreeMap<u32, (u32, String)> = sounds
+        .iter()
+        .map(|r| (r.id(), (r.sound_type(), r.name().to_string())))
+        .collect();
+
+    println!("TerrainType: {} rows", terrain.len());
+    println!("  {:>3}  {:<12} {:>8}  {}", "id", "name", "sound_id", "spray run/walk");
+    for row in terrain.iter() {
+        println!(
+            "  {:>3}  {:<12} {:>8}  {}/{}",
+            row.id(),
+            row.name(),
+            row.sound_id(),
+            row.footstep_spray_run(),
+            row.footstep_spray_walk(),
+        );
+    }
+
+    // Which material word each terrain value's sounds carry. Only the sounds
+    // whose *name* states a material can vote; the rest ("SpiderAllSurface")
+    // say nothing about the ground and are excluded rather than counted as
+    // misses.
+    const MATERIALS: [&str; 8] = [
+        "Dirt", "Metal", "Stone", "Snow", "Wood", "Grass", "Leaves", "Sand",
+    ];
+    let material_of = |name: &str| -> Option<&'static str> {
+        MATERIALS
+            .into_iter()
+            .find(|m| name.to_lowercase().contains(&m.to_lowercase()))
+    };
+    // The two readings, each mapping a terrain column value to the names it
+    // would claim. `DustyGrass` shares `Grass`'s sound, so a sound id can name
+    // more than one row.
+    let by_sound_id = |value: u32| -> Vec<String> {
+        terrain
+            .iter()
+            .filter(|r| r.sound_id() == value)
+            .map(|r| r.name().to_string())
+            .collect()
+    };
+    let by_row_id = |value: u32| -> Vec<String> {
+        terrain
+            .iter()
+            .filter(|r| r.id() == value)
+            .map(|r| r.name().to_string())
+            .collect()
+    };
+    let agrees = |claims: &[String], material: &str| {
+        claims.iter().any(|c| {
+            let c = c.to_lowercase().replace("metallic", "metal");
+            c.contains(&material.to_lowercase()) || material.to_lowercase().contains(&c)
+        })
+    };
+
+    let (mut votes_sound, mut votes_row, mut voters) = (0usize, 0usize, 0usize);
+    let mut per_value: BTreeMap<u32, BTreeMap<&str, usize>> = BTreeMap::new();
+    let (mut resolved, mut references) = (0usize, 0usize);
+    let mut types: BTreeMap<&str, BTreeMap<u32, usize>> = BTreeMap::new();
+    let mut splash_named = 0usize;
+    let mut splash_set = 0usize;
+    for row in lookup.iter() {
+        for (column, id) in [("sound", row.sound()), ("splash", row.sound_splash())] {
+            if id == 0 {
+                continue;
+            }
+            references += 1;
+            let Some((kind, name)) = sound.get(&id) else {
+                continue;
+            };
+            resolved += 1;
+            *types.entry(column).or_default().entry(*kind).or_default() += 1;
+            if column == "splash" {
+                splash_set += 1;
+                if name.to_lowercase().contains("splash") {
+                    splash_named += 1;
+                }
+            }
+        }
+        let Some((_, name)) = sound.get(&row.sound()) else {
+            continue;
+        };
+        let Some(material) = material_of(name) else {
+            continue;
+        };
+        voters += 1;
+        *per_value
+            .entry(row.terrain())
+            .or_default()
+            .entry(material)
+            .or_default() += 1;
+        if agrees(&by_sound_id(row.terrain()), material) {
+            votes_sound += 1;
+        }
+        if agrees(&by_row_id(row.terrain()), material) {
+            votes_row += 1;
+        }
+    }
+
+    println!("\nFootstepTerrainLookup: {} rows", lookup.len());
+    println!("  {resolved} of {references} sound references resolve");
+    for (column, kinds) in &types {
+        let listed: Vec<String> = kinds.iter().map(|(k, n)| format!("type {k} x{n}")).collect();
+        println!("  {column:<7} {}", listed.join(", "));
+    }
+    println!("  {splash_named} of {splash_set} splash sounds are named `Splash`");
+
+    println!("\n  which reading of the terrain column agrees with the sound names");
+    println!(
+        "  as a TerrainType.sound_id: {votes_sound} of {voters}  ({:.0}%)",
+        100.0 * votes_sound as f32 / voters.max(1) as f32
+    );
+    println!(
+        "  as a TerrainType row id:   {votes_row} of {voters}  ({:.0}%)",
+        100.0 * votes_row as f32 / voters.max(1) as f32
+    );
+    println!("\n  {:>7}  {:<20} {:<20} {}", "terrain", "sound_id says", "row id says", "names seen");
+    for (value, materials) in &per_value {
+        let seen: Vec<String> = materials.iter().map(|(m, n)| format!("{m} x{n}")).collect();
+        println!(
+            "  {value:>7}  {:<20} {:<20} {}",
+            by_sound_id(*value).join("/"),
+            by_row_id(*value).join("/"),
+            seen.join(", "),
+        );
+    }
+
+    // The creature side: which column of `CreatureSoundData` names a group.
+    if let Ok(csd) = chain
+        .read(CreatureSoundData::PATH)
+        .ok()
+        .map(|b| CreatureSoundData::parse(&b))
+        .unwrap_or(Err(dbc::Error::UnexpectedSchema {
+            table: CreatureSoundData::NAME,
+            expected: CreatureSoundData::FIELDS,
+            got: 0,
+        }))
+    {
+        let groups: std::collections::BTreeSet<u32> =
+            lookup.iter().map(|r| r.creature_footstep_id()).collect();
+        let (mut set, mut inside) = (0usize, 0usize);
+        for row in csd.iter() {
+            if row.footstep_group() == 0 {
+                continue;
+            }
+            set += 1;
+            if groups.contains(&row.footstep_group()) {
+                inside += 1;
+            }
+        }
+        println!(
+            "\nCreatureSoundData: {set} rows name a footstep group, {inside} of them name one \
+             of the {} groups that exist",
+            groups.len()
+        );
+    }
+
+    // The ground side.
+    let textures = GroundEffectTexture::parse(&chain.read(GroundEffectTexture::PATH)?)?;
+    let effect: BTreeMap<u32, u32> = textures.iter().map(|r| (r.id(), r.terrain_type())).collect();
+    let named: BTreeMap<u32, String> = terrain
+        .iter()
+        .map(|r| (r.id(), r.name().to_string()))
+        .collect();
+
+    let maps: Vec<String> = match map {
+        Some(m) => vec![m.to_string()],
+        None => vec!["Azeroth".to_string()],
+    };
+    let (mut chunks, mut layers, mut with_effect, mut effect_resolved) = (0u64, 0u64, 0u64, 0u64);
+    let mut per_terrain: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut texture_words: BTreeMap<u32, BTreeMap<&str, u64>> = BTreeMap::new();
+    let mut tiles = 0usize;
+    let mut budget = limit.unwrap_or(64);
+    for name in &maps {
+        let Ok(wdt) = load_wdt(chain, name) else {
+            continue;
+        };
+        for (x, y) in wdt.tiles() {
+            if budget == 0 {
+                break;
+            }
+            let Ok(bytes) = chain.read(&adt::tile_path(name, x, y)) else {
+                continue;
+            };
+            let Ok(tile) = adt::Adt::parse(&bytes, wdt.big_alpha()) else {
+                continue;
+            };
+            budget -= 1;
+            tiles += 1;
+            for chunk in &tile.chunks {
+                chunks += 1;
+                for layer in &chunk.layers {
+                    layers += 1;
+                    if layer.effect_id == 0 {
+                        continue;
+                    }
+                    with_effect += 1;
+                    let Some(&terrain_id) = effect.get(&layer.effect_id) else {
+                        continue;
+                    };
+                    effect_resolved += 1;
+                    *per_terrain.entry(terrain_id).or_default() += 1;
+                    // **The texture's own filename is the check on the whole
+                    // chain.** A layer drawing `ElwynnRockBase01` that comes
+                    // out as `Stone` is the column identifying itself, the
+                    // same way `CreatureSoundData`'s columns did -- and no
+                    // wrong column could do it, because a filename is not a
+                    // small integer.
+                    if let Some(texture) = tile.textures.get(layer.texture_id as usize) {
+                        let lower = texture.to_lowercase();
+                        for word in [
+                            "grass", "dirt", "rock", "stone", "snow", "sand", "wood", "leaf",
+                            "leaves", "water", "metal", "mud", "cobble", "brick", "lava",
+                        ] {
+                            if lower.contains(word) {
+                                *texture_words
+                                    .entry(terrain_id)
+                                    .or_default()
+                                    .entry(word)
+                                    .or_default() += 1u64;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("\nthe ground: {tiles} tiles, {chunks} chunks, {layers} texture layers");
+    println!(
+        "  {with_effect} layers name a GroundEffectTexture, {effect_resolved} of those resolve"
+    );
+    println!("  the terrains they reach:");
+    for (id, count) in &per_terrain {
+        let mut words: Vec<(&&str, &u64)> = texture_words
+            .get(id)
+            .map(|w| w.iter().collect())
+            .unwrap_or_default();
+        words.sort_by(|a, b| b.1.cmp(a.1));
+        let listed: Vec<String> = words
+            .iter()
+            .take(4)
+            .map(|(w, n)| format!("{w} x{n}"))
+            .collect();
+        println!(
+            "    {id:>3} {:<12} {count:>8} layers   textures called: {}",
+            named.get(id).map(String::as_str).unwrap_or("?"),
+            listed.join(", "),
+        );
+    }
+
+    // **End to end, on ground a person can point at.** Every link above is
+    // checked in isolation, and a chain of correct links can still be wired up
+    // wrong -- so this walks a real tile, asks what is underfoot at each cell
+    // the way the viewer will, and prints the *sound name* that comes out. A
+    // composed thing needs a way to be seen as itself.
+    let group = chain
+        .read(CreatureSoundData::PATH)
+        .ok()
+        .and_then(|b| CreatureSoundData::parse(&b).ok())
+        .and_then(|table| {
+            let models = dbc::schema::CreatureModelData::parse(
+                &chain.read(dbc::schema::CreatureModelData::PATH).ok()?,
+            )
+            .ok()?;
+            let displays = dbc::schema::CreatureDisplayInfo::parse(
+                &chain.read(dbc::schema::CreatureDisplayInfo::PATH).ok()?,
+            )
+            .ok()?;
+            let display = displays.iter().find(|d| d.id() == walker)?;
+            let sound = match display.sound_id() {
+                0 => models
+                    .iter()
+                    .find(|m| m.id() == display.model_id())
+                    .map(|m| m.sound_id())
+                    .unwrap_or(0),
+                own => own,
+            };
+            table
+                .iter()
+                .find(|r| r.id() == sound)
+                .map(|r| r.footstep_group())
+        });
+    println!("\nwalking {}/{} as display {walker}", maps[0], tile.unwrap_or("32,48"));
+    match group {
+        None => println!("  that display has no footstep group; it would be silent"),
+        Some(group) => {
+            let step: BTreeMap<(u32, u32), (u32, u32)> = lookup
+                .iter()
+                .map(|r| {
+                    (
+                        (r.creature_footstep_id(), r.terrain()),
+                        (r.sound(), r.sound_splash()),
+                    )
+                })
+                .collect();
+            let (tx, ty) = tile
+                .and_then(|t| t.split_once(','))
+                .and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))
+                .unwrap_or((32usize, 48usize));
+            let Ok(wdt) = load_wdt(chain, &maps[0]) else {
+                return Ok(());
+            };
+            let Ok(bytes) = chain.read(&adt::tile_path(&maps[0], tx, ty)) else {
+                println!("  tile {tx},{ty} is not in this install");
+                return Ok(());
+            };
+            let parsed = adt::Adt::parse(&bytes, wdt.big_alpha())?;
+            let mut heard: BTreeMap<String, usize> = BTreeMap::new();
+            let mut cells = 0usize;
+            for chunk in &parsed.chunks {
+                for cell in adt::footing::footing_grid(chunk) {
+                    cells += 1;
+                    // Exactly the viewer's own chain, and deliberately its
+                    // fallbacks too: a layer that names no ground effect and a
+                    // ground effect that names no terrain both land on the
+                    // lookup's terrain 0.
+                    let surface = chunk
+                        .layers
+                        .get(cell as usize)
+                        .map(|l| l.effect_id)
+                        .filter(|e| *e != 0)
+                        .and_then(|e| effect.get(&e).copied())
+                        .and_then(|row| {
+                            terrain.iter().find(|t| t.id() == row).map(|t| t.sound_id())
+                        })
+                        .unwrap_or(0);
+                    let id = step
+                        .get(&(group, surface))
+                        .or_else(|| step.get(&(group, 0)))
+                        .map(|s| s.0);
+                    let label = id
+                        .and_then(|id| sound.get(&id).map(|(_, n)| n.clone()))
+                        .unwrap_or_else(|| "(silence)".to_string());
+                    *heard.entry(label).or_default() += 1;
+                }
+            }
+            println!("  group {group}, {cells} cells over the tile:");
+            let mut by_count: Vec<(&String, &usize)> = heard.iter().collect();
+            by_count.sort_by(|a, b| b.1.cmp(a.1));
+            for (name, count) in by_count {
+                println!("    {count:>6}  {name}");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn sound_cmd(chain: &mut Chain, cmd: &SoundCommand) -> Result<()> {
@@ -9278,6 +9733,15 @@ fn sound_cmd(chain: &mut Chain, cmd: &SoundCommand) -> Result<()> {
                  like a uniform failure means the file and directory columns are\n\
                  not where this schema says they are."
             );
+        }
+
+        SoundCommand::Footsteps {
+            map,
+            limit,
+            tile,
+            walker,
+        } => {
+            return sound_footsteps(chain, map.as_deref(), *limit, tile.as_deref(), *walker);
         }
 
         SoundCommand::Types => {
@@ -10467,6 +10931,438 @@ fn block_accounts_for_itself(
 /// exists, a texture index a texture that exists, and an emitter type has to
 /// be one of the three the format defines. A wrong offset satisfies none of
 /// those for long.
+/// Where the events `(count, offset)` pair sits in the M2 header.
+///
+/// Derived by counting back from the ribbon array at `0x120`, which
+/// [`m2_emitter_survey`] already relies on: camera lookup, cameras, lights and
+/// events are the four `(count, offset)` pairs before it.
+const EVENTS_ARRAY_AT: usize = 0x100;
+
+fn m2_events(chain: &mut Chain, path: &str, anims: bool) -> Result<()> {
+    let path = m2::model_path(path);
+    let bytes = chain.read(&path).with_context(|| format!("reading {path}"))?;
+    let model = m2::Model::parse(&bytes)?;
+    let sequences = model.sequences();
+
+    let mut external = std::collections::BTreeMap::new();
+    if anims {
+        for (i, seq) in sequences.iter().enumerate() {
+            if seq.is_inline() {
+                continue;
+            }
+            if let Ok(bytes) = chain.read(&m2::anim::external_anim_path(&path, seq)) {
+                external.insert(i, bytes);
+            }
+        }
+    }
+    let events = model.events_with(&external);
+
+    let names = dbc::schema::AnimationData::parse(&chain.read(dbc::schema::AnimationData::PATH)?)
+        .ok();
+    let anim_name = |id: u16| -> String {
+        names
+            .as_ref()
+            .and_then(|t| t.iter().find(|r| r.id() == id as u32))
+            .map(|r| r.name().to_string())
+            .unwrap_or_else(|| format!("#{id}"))
+    };
+
+    println!("{path}");
+    println!(
+        "  {} sequences, {} events, {} external .anim files loaded",
+        sequences.len(),
+        events.len(),
+        external.len()
+    );
+    if events.is_empty() {
+        println!("  (this model carries no timed events)");
+        return Ok(());
+    }
+    for event in &events {
+        let fired: Vec<usize> = (0..sequences.len())
+            .filter(|&i| !event.times_in(i).is_empty())
+            .collect();
+        println!(
+            "\n  {:?}  data {}  bone {}  at [{:.2}, {:.2}, {:.2}]  fires in {} of {} sequences",
+            event.name(),
+            event.data,
+            event.bone,
+            event.position[0],
+            event.position[1],
+            event.position[2],
+            fired.len(),
+            sequences.len(),
+        );
+        for i in fired.iter().take(12) {
+            let seq = &sequences[*i];
+            // Printed against the sequence's own duration because that is the
+            // property a misread timestamp array breaks: a footfall at 41000ms
+            // in a 1200ms walk is not a footfall.
+            println!(
+                "    [{i:3}] {:<24} {:>6}ms  at {:?}",
+                anim_name(seq.id),
+                seq.duration_ms,
+                event.times_in(*i),
+            );
+        }
+        if fired.len() > 12 {
+            println!("    ... and {} more sequences", fired.len() - 12);
+        }
+    }
+    Ok(())
+}
+
+/// Reads every model and asks the event block to identify itself.
+///
+/// **The stride question is settled by the identifier being a name.** Four
+/// ASCII bytes cannot be arrived at by a coincidence of small integers, and a
+/// stride a word out shifts the name into the middle of a float or a bone
+/// index -- so the share of records whose four bytes are printable separates
+/// the readings in a way byte accounting alone would not. The byte accounting
+/// runs too, because the two are independent and agreeing is the point.
+/// Traces every event's own point through one sequence and reports when it is
+/// nearest the ground.
+///
+/// **This is the experiment that says which events are footfalls.** A model
+/// carries several event families that could be one -- `$FL0`/`$FR0` fire
+/// twice a walk cycle and so does `$FSD`, at different moments -- and reading
+/// the four-letter names is exactly the kind of recall this project refuses.
+/// What cannot be recalled is where the foot *is*: an event hangs off a bone,
+/// so its point can be posed through the cycle, and a footfall is the moment
+/// that point stops descending. If an event's recorded timestamps land on its
+/// own point's minima, it marks a footfall; if they land a quarter cycle away,
+/// it marks something else.
+fn m2_event_trace(chain: &mut Chain, path: &str, anim: usize) -> Result<()> {
+    let path = m2::model_path(path);
+    let bytes = chain.read(&path).with_context(|| format!("reading {path}"))?;
+    let model = m2::Model::parse(&bytes)?;
+    let sequences = model.sequences();
+
+    let mut external = std::collections::BTreeMap::new();
+    for (i, seq) in sequences.iter().enumerate() {
+        if seq.is_inline() {
+            continue;
+        }
+        if let Ok(bytes) = chain.read(&m2::anim::external_anim_path(&path, seq)) {
+            external.insert(i, bytes);
+        }
+    }
+    let events = model.events_with(&external);
+    let bones = model.animated_bones_with(&external);
+    let sequence = sequences
+        .get(anim)
+        .with_context(|| format!("{path} has no sequence {anim}"))?;
+
+    let names = dbc::schema::AnimationData::parse(&chain.read(dbc::schema::AnimationData::PATH)?)
+        .ok();
+    let anim_name = names
+        .as_ref()
+        .and_then(|t| t.iter().find(|r| r.id() == sequence.id as u32))
+        .map(|r| r.name().to_string())
+        .unwrap_or_else(|| format!("#{}", sequence.id));
+
+    println!("{path}");
+    println!(
+        "  sequence {anim} ({anim_name}), {}ms, travelling at {}",
+        sequence.duration_ms, sequence.move_speed
+    );
+
+    // Dense enough that a contact lasting a twentieth of the cycle cannot be
+    // stepped over, which is what a coarse sample does to a run.
+    const SAMPLES: u32 = 200;
+    println!(
+        "\n  {:6} {:>8} {:>8} {:>8}  {}",
+        "event", "lowest", "at ms", "range", "recorded times / nearest minimum"
+    );
+    for event in &events {
+        let times = event.times_in(anim);
+        if times.is_empty() {
+            continue;
+        }
+        let point = glam::Vec3::from(event.position);
+        let height = |ms: u32| -> f32 {
+            m2::Model::pose_bones(&bones, anim, ms)
+                .get(event.bone as usize)
+                .copied()
+                .unwrap_or(glam::Mat4::IDENTITY)
+                .transform_point3(point)
+                .z
+        };
+        let samples: Vec<(u32, f32)> = (0..SAMPLES)
+            .map(|s| {
+                let ms = sequence.duration_ms * s / SAMPLES;
+                (ms, height(ms))
+            })
+            .collect();
+        let lowest = samples
+            .iter()
+            .copied()
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap_or((0, 0.0));
+        let highest = samples
+            .iter()
+            .map(|s| s.1)
+            .fold(f32::MIN, f32::max);
+        // How far each recorded timestamp sits above that event's own lowest
+        // point, as a fraction of its whole vertical travel. A footfall reads
+        // near zero; something happening mid-swing reads near one.
+        let travel = (highest - lowest.1).max(1e-6);
+        let scored: Vec<String> = times
+            .iter()
+            .map(|&t| {
+                let h = height(t.min(sequence.duration_ms));
+                format!("{t}ms {:.0}%", 100.0 * (h - lowest.1) / travel)
+            })
+            .collect();
+        println!(
+            "  {:6} {:>8.3} {:>8} {:>8.3}  {}",
+            event.name(),
+            lowest.1,
+            lowest.0,
+            travel,
+            scored.join(", ")
+        );
+    }
+    // **The event bones do not move**, so tracing an event's own point is a
+    // flat line and says nothing. What moves is the skeleton, and the
+    // measurement that identifies a footfall without recalling a single name
+    // is this: in an animation the model does not translate, so a foot that is
+    // *planted* slides backwards at exactly the cycle's own declared travel
+    // speed while a foot in flight swings forward much faster. `move_speed` is
+    // read off the sequence header and the motion off the bone tracks, so the
+    // two agreeing is a check rather than a definition.
+    let speed = sequence.move_speed;
+    // The posed matrices are *deformations* about each bone's pivot, so where
+    // a bone actually ends up is its own pivot pushed through its own matrix.
+    // Transforming the origin instead gives how far the model's origin moved,
+    // which for every bone in a walk cycle is a small wobble -- a plausible
+    // curve that is not the foot.
+    let sample_at = |bone: usize, ms: u32| -> glam::Vec3 {
+        m2::Model::pose_bones(&bones, anim, ms)[bone]
+            .transform_point3(glam::Vec3::from(bones[bone].bone.pivot))
+    };
+    let step_ms = (sequence.duration_ms / SAMPLES).max(1);
+    let mut ranked: Vec<(usize, f32, Vec<(u32, f32, f32)>)> = Vec::new();
+    for bone in 0..bones.len() {
+        let track: Vec<(u32, f32, f32)> = (0..SAMPLES)
+            .map(|s| {
+                let ms = sequence.duration_ms * s / SAMPLES;
+                let here = sample_at(bone, ms);
+                let next = sample_at(bone, (ms + step_ms) % sequence.duration_ms.max(1));
+                // Horizontal ground speed in model units per second, signed by
+                // whether the bone is going forwards or backwards along X.
+                let d = next - here;
+                let along = d.x / (step_ms as f32 / 1000.0);
+                (ms, here.z, along)
+            })
+            .collect();
+        let low = track.iter().map(|s| s.1).fold(f32::MAX, f32::min);
+        let high = track.iter().map(|s| s.1).fold(f32::MIN, f32::max);
+        ranked.push((bone, high - low, track));
+    }
+    // Ranked by how low the bone sits, not by how far it travels: the feet
+    // are the bottom of the skeleton, and a hand swinging a weapon travels
+    // further than either of them.
+    ranked.retain(|b| b.1 >= 0.05);
+    ranked.sort_by(|a, b| {
+        let low = |t: &Vec<(u32, f32, f32)>| t.iter().map(|s| s.1).fold(f32::MAX, f32::min);
+        low(&a.2).total_cmp(&low(&b.2))
+    });
+
+    println!(
+        "\n  the bones that travel most, as a strip over the cycle. `_` is a bone at the\n  \
+         bottom of its own vertical travel; `#` is one sliding backwards at the cycle's\n  \
+         own {speed:.2} travel speed -- that is a planted foot. Events marked below."
+    );
+    const CELLS: usize = 50;
+    let cell_ms = |c: usize| sequence.duration_ms as usize * c / CELLS;
+    for (bone, travel, track) in ranked.iter().take(14) {
+        if *travel < 0.05 {
+            continue;
+        }
+        let low = track.iter().map(|s| s.1).fold(f32::MAX, f32::min);
+        let strip: String = (0..CELLS)
+            .map(|c| {
+                let ms = cell_ms(c) as u32;
+                let s = track
+                    .iter()
+                    .min_by_key(|s| s.0.abs_diff(ms))
+                    .copied()
+                    .unwrap_or((0, 0.0, 0.0));
+                // Ten heights, so the shape of the swing is readable and not
+                // just a threshold somebody chose.
+                let step = (9.0 * (s.1 - low) / travel).round().clamp(0.0, 9.0) as u32;
+                char::from_digit(step, 10).unwrap_or('?')
+            })
+            .collect();
+        let _ = speed;
+        println!("  bone {bone:>3} low {low:>7.3} travel {travel:>6.3}  |{strip}|");
+    }
+    for event in &events {
+        let times = event.times_in(anim);
+        if times.is_empty() {
+            continue;
+        }
+        let strip: String = (0..CELLS)
+            .map(|c| {
+                let (from, to) = (cell_ms(c), cell_ms(c + 1).max(cell_ms(c) + 1));
+                if times
+                    .iter()
+                    .any(|&t| (t as usize) >= from && (t as usize) < to)
+                {
+                    '^'
+                } else {
+                    ' '
+                }
+            })
+            .collect();
+        println!("  {:<19}       |{strip}|", event.name());
+    }
+    // The exact contact intervals, because the strip above is quantised to a
+    // fiftieth of the cycle and the question is a matter of tens of
+    // milliseconds. A bone is "down" while it is within a twentieth of its own
+    // vertical travel of its lowest point; the interval's *start* is the
+    // touchdown, which is the moment a footstep is heard.
+    println!("\n  contact intervals of the bones that reach the ground");
+    for (bone, travel, track) in ranked.iter().take(14) {
+        let low = track.iter().map(|s| s.1).fold(f32::MAX, f32::min);
+        // Only the bones that actually get to the ground plane: a hand at the
+        // bottom of its swing is at the bottom of its own travel too.
+        if low > 0.1 {
+            continue;
+        }
+        let down: Vec<bool> = track.iter().map(|s| s.1 - low < 0.05 * travel).collect();
+        let mut touchdowns = Vec::new();
+        for i in 0..down.len() {
+            if down[i] && !down[(i + down.len() - 1) % down.len()] {
+                touchdowns.push(track[i].0);
+            }
+        }
+        let stance = down.iter().filter(|d| **d).count() * 100 / down.len().max(1);
+        println!(
+            "  bone {bone:>3} low {low:>7.3} travel {travel:>6.3}  down {stance:>3}% of the cycle, \
+             touching down at {touchdowns:?}"
+        );
+    }
+    Ok(())
+}
+
+fn m2_event_survey(chain: &mut Chain, filter: &str, strides: bool) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let needle = filter.to_lowercase();
+    let names: Vec<String> = chain
+        .list()?
+        .into_iter()
+        .filter(|n| {
+            let l = n.to_lowercase();
+            l.ends_with(".m2") && (needle.is_empty() || l.contains(needle.as_str()))
+        })
+        .collect();
+
+    // A word either side, plus the sizes a different arrangement of the record
+    // would give. As with the emitters, the answer is the comparison.
+    let candidates: Vec<usize> = vec![28, 32, 36, 40, 44];
+    // The one `(count, offset)` pair in the record: an `M2TrackBase`'s outer
+    // timestamp array.
+    let positions = [28usize];
+
+    let mut votes: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut named: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+    let mut identifiers: BTreeMap<String, usize> = BTreeMap::new();
+    let mut identifier_models: BTreeMap<String, usize> = BTreeMap::new();
+    let mut with_events = 0usize;
+    let mut total_events = 0usize;
+    let mut stray_bone = 0usize;
+    let mut examples: BTreeMap<String, String> = BTreeMap::new();
+
+    for name in &names {
+        let Ok(bytes) = chain.read(name) else { continue };
+        if bytes.len() < EVENTS_ARRAY_AT + 8 {
+            continue;
+        }
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let (count, offset) = (word(EVENTS_ARRAY_AT), word(EVENTS_ARRAY_AT + 4));
+        if count == 0 {
+            continue;
+        }
+        with_events += 1;
+        total_events += count;
+
+        for &stride in &candidates {
+            if block_accounts_for_itself(&bytes, offset, count, stride, &positions) {
+                *votes.entry(stride).or_default() += 1;
+            }
+            // The name test, read straight off the bytes rather than through
+            // the parser -- the parser is what is under test.
+            let entry = named.entry(stride).or_default();
+            for record in 0..count {
+                let at = offset + record * stride;
+                let Some(id) = bytes.get(at..at + 4) else {
+                    continue;
+                };
+                entry.1 += 1;
+                if id.iter().all(|&b| (0x20..0x7f).contains(&b)) {
+                    entry.0 += 1;
+                }
+            }
+        }
+
+        let Ok(model) = m2::Model::parse(&bytes) else {
+            continue;
+        };
+        let bone_count = model.bones().len() as u32;
+        let mut seen = std::collections::BTreeSet::new();
+        for event in model.events() {
+            let label = event.name();
+            *identifiers.entry(label.clone()).or_default() += 1;
+            if seen.insert(label.clone()) {
+                *identifier_models.entry(label.clone()).or_default() += 1;
+            }
+            if bone_count > 0 && event.bone >= bone_count {
+                stray_bone += 1;
+            }
+            examples.entry(label).or_insert_with(|| name.clone());
+        }
+    }
+
+    println!("{} models scanned", names.len());
+    println!("  {with_events} carry timed events, {total_events} records in total");
+    println!("  {stray_bone} name a bone the model does not have");
+
+    if strides {
+        println!("\ncandidate strides");
+        println!("  stride  accounts  printable identifiers");
+        for &stride in &candidates {
+            let (ok, total) = named.get(&stride).copied().unwrap_or((0, 0));
+            let share = if total == 0 {
+                0.0
+            } else {
+                100.0 * ok as f32 / total as f32
+            };
+            println!(
+                "  {stride:6}  {:8}  {ok:7} of {total:7} ({share:.1}%)",
+                votes.get(&stride).copied().unwrap_or(0),
+            );
+        }
+    }
+
+    println!("\nidentifiers, by how many models carry one");
+    let mut by_models: Vec<(&String, &usize)> = identifier_models.iter().collect();
+    by_models.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    for (label, models) in by_models.iter().take(40) {
+        println!(
+            "  {label:6}  {models:5} models  {:6} records   e.g. {}",
+            identifiers.get(*label).copied().unwrap_or(0),
+            examples.get(*label).map(String::as_str).unwrap_or(""),
+        );
+    }
+    if by_models.len() > 40 {
+        println!("  ... and {} more identifiers", by_models.len() - 40);
+    }
+    Ok(())
+}
+
 fn m2_emitter_survey(chain: &mut Chain, filter: &str, strides: bool) -> Result<()> {
     use std::collections::BTreeMap;
 
@@ -11663,7 +12559,11 @@ fn dbc_rows(chain: &mut Chain, table: &str, limit: usize, ids: &[u32]) -> Result
         GameObjectDisplayInfo,
         SoundEntries,
         WorldSafeLocs,
-        SpellVisualKit
+        SpellVisualKit,
+        TerrainType,
+        FootstepTerrainLookup,
+        GroundEffectTexture,
+        CreatureSoundData
     )
     // `CharacterFacialHairStyles` is deliberately absent: it has no id column
     // at all -- race, gender and variation are its key -- so it cannot satisfy
@@ -11725,6 +12625,10 @@ fn dbc_check(chain: &mut Chain) -> Result<()> {
         WorldSafeLocs,
         SpellVisualKit,
         LiquidType,
+        TerrainType,
+        FootstepTerrainLookup,
+        GroundEffectTexture,
+        CreatureSoundData,
     );
     println!();
     if failures == 0 {

@@ -15,11 +15,13 @@
 
 pub mod anim;
 pub mod emitter;
+pub mod event;
 pub mod particles;
 pub mod skin;
 
 pub use anim::{Fixed16, Interpolation, Keyframe, Keyframes, Pose, Sequence, Track};
 pub use emitter::{EmitterType, PartTrack, ParticleEmitter, RibbonEmitter};
+pub use event::Event;
 pub use particles::{Particle, ParticleSystem, RibbonTrail, Sprite};
 pub use skin::Skin;
 
@@ -136,6 +138,9 @@ struct Header {
     ribbons: Array,
     /// Flames, sparks, smoke. See [`emitter`].
     particles: Array,
+    /// Timed moments inside an animation -- a footfall, a weapon connecting.
+    /// See [`event`].
+    events: Array,
 }
 
 /// One vertex in the model's shared pool.
@@ -362,7 +367,7 @@ impl Model {
         // order *is* the layout, and a missing array here would shift both
         // emitter blocks onto a neighbour's numbers, which parses.
         let _attachment_lookup = r.array();
-        let _events = r.array();
+        h.events = r.array();
         let _lights = r.array();
         let _cameras = r.array();
         let _camera_lookup = r.array();
@@ -387,6 +392,7 @@ impl Model {
         model.slice("attachments", model.header.attachments, ATTACHMENT_SIZE)?;
         model.slice("ribbons", model.header.ribbons, emitter::RIBBON_SIZE)?;
         model.slice("particles", model.header.particles, emitter::PARTICLE_SIZE)?;
+        model.slice("events", model.header.events, event::EVENT_SIZE)?;
         Ok(model)
     }
 
@@ -413,6 +419,10 @@ impl Model {
 
     fn f32_at(&self, offset: usize) -> f32 {
         f32::from_bits(self.u32_at(offset))
+    }
+
+    fn byte_at(&self, offset: usize) -> u8 {
+        self.data.get(offset).copied().unwrap_or(0)
     }
 
     pub fn version(&self) -> u32 {
@@ -789,6 +799,94 @@ impl Model {
                     // Bytes 6..8 are padding that keeps the position aligned.
                     position: [f(8), f(12), f(16)],
                 }
+            })
+            .collect()
+    }
+
+    /// The model's timed events, with their timestamps decoded.
+    ///
+    /// See [`Model::events_with`] for why the external map matters.
+    pub fn events(&self) -> Vec<Event> {
+        self.events_with(&Default::default())
+    }
+
+    /// The model's timed events, reading the sequences whose data moved to an
+    /// external `.anim` file out of the bytes supplied for them.
+    ///
+    /// **A character's walk cycle is one of those sequences**, so a footfall
+    /// read without the external files has an empty timestamp list exactly
+    /// where the interesting one is -- which looks like a model that carries
+    /// the event and never fires it. Same trap as [`Model::animated_bones`],
+    /// and it is handled the same way.
+    pub fn events_with(
+        &self,
+        external: &std::collections::BTreeMap<usize, Vec<u8>>,
+    ) -> Vec<Event> {
+        let Ok(raw) = self.slice("events", self.header.events, event::EVENT_SIZE) else {
+            return Vec::new();
+        };
+        let inline: Vec<bool> = self.sequences().iter().map(|s| s.is_inline()).collect();
+        let base = self.header.events.offset as usize;
+        (0..raw.len() / event::EVENT_SIZE)
+            .map(|i| {
+                let at = base + i * event::EVENT_SIZE;
+                let f = |o: usize| self.f32_at(o);
+                Event {
+                    identifier: [
+                        self.byte_at(at),
+                        self.byte_at(at + 1),
+                        self.byte_at(at + 2),
+                        self.byte_at(at + 3),
+                    ],
+                    data: self.u32_at(at + 4),
+                    bone: self.u32_at(at + 8),
+                    position: [f(at + 12), f(at + 16), f(at + 20)],
+                    // An `M2TrackBase` is a `Track` with the values array
+                    // removed: interpolation, global sequence, then one
+                    // `(count, offset)` outer array of timestamp lists. The
+                    // outer array therefore sits at +28, not at +24 where a
+                    // full track's does.
+                    times: self.read_timestamps(at + 28, external, &inline),
+                }
+            })
+            .collect()
+    }
+
+    /// Reads an `M2TrackBase`'s per-sequence timestamp lists.
+    ///
+    /// Deliberately not [`Model::read_track`] with a dummy value type: that
+    /// function takes the *shorter* of the two parallel outer arrays, and here
+    /// there is no second array to be shorter than. Passing a zero-sized value
+    /// through it would silently produce no sequences at all.
+    fn read_timestamps(
+        &self,
+        outer_at: usize,
+        external: &std::collections::BTreeMap<usize, Vec<u8>>,
+        inline: &[bool],
+    ) -> Vec<Vec<u32>> {
+        let outer = Array {
+            count: self.u32_at(outer_at),
+            offset: self.u32_at(outer_at + 4),
+        };
+        (0..outer.count as usize)
+            .map(|i| {
+                if !inline.get(i).copied().unwrap_or(true) && !external.contains_key(&i) {
+                    return Vec::new();
+                }
+                let inner = Array {
+                    count: self.u32_at(outer.offset as usize + i * 8),
+                    offset: self.u32_at(outer.offset as usize + i * 8 + 4),
+                };
+                let source: &[u8] = external.get(&i).map(Vec::as_slice).unwrap_or(&self.data);
+                (0..inner.count as usize)
+                    .map(|k| {
+                        let at = inner.offset as usize + k * 4;
+                        source
+                            .get(at..at + 4)
+                            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                            .unwrap_or(0)
+                    })
+                    .collect()
             })
             .collect()
     }
