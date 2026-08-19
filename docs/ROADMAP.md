@@ -5782,3 +5782,207 @@ fills in -- and for the second, whether it is still white after a minute, which
 separates slow from hung. What cannot be reused is `--screenshot`: it does not
 draw the HUD, so it will produce a perfect picture of the world no matter how
 broken the interface is.
+
+## 4.25: flight paths, and the milestone where the server moves the player
+
+Second rung of the six-part city-services block, and the one that changes who
+is in charge of the character. Everything this client had ever done to its own
+position it did itself: the keys drive two axes, the height field supplies the
+third, and `MSG_MOVE_*` *reports* the result. The server had never
+contradicted any of it -- it does not even relay our own movement back, which
+is why replicated state holds the login position forever. A taxi flight
+inverts that for eighty seconds.
+
+**Confirmed at the window**, on the third attempt: the character takes off,
+the route is flown, input is refused, the camera follows and the minimap
+tracks. The two attempts before it are the more useful part of this entry.
+
+### Three tables, and the column geometry had to identify
+
+`TaxiNodes` (364 rows), `TaxiPath` (915) and `TaxiPathNode` (22,586). The
+interesting column is `TaxiPath`'s pair of endpoints: two adjacent small
+integers that both resolve to real nodes, so validity separates them not at
+all -- the trap that gave `Spell.dbc`'s duration column a 99.6% match on the
+wrong column.
+
+What separates them is **geometry from a third table**. A route's first
+waypoint must sit on the node it departs from and its last on the node it
+arrives at, and neither table controls the other's coordinates. Scored both
+ways over 900 testable paths at 50 units, single-waypoint paths excluded as
+undecidable:
+
+| reading | paths | share |
+|---|---|---|
+| as written (first→from, last→to) | 847 | 94.1% |
+| swapped (first→to, last→from) | 20 | 2.2% |
+
+And the residual names itself rather than sitting there as noise: 43 of the 53
+misses are boats, zeppelins, dev-land and quest-script routes -- rows that use
+these tables without being passenger flights -- and the remaining 10 are Death
+Knight scripted rides, Naxxramas, `Filming` and cross-map battleground routes.
+Every genuine flight passes.
+
+### The mount columns, which cost three wrong answers
+
+Worth recording in full because each wrong answer was a *reasonable* reading of
+real evidence.
+
+**First**: eight famous cities showed no node filling both mount columns, which
+reads as "not a faction pair" and was nearly written into the schema. The full
+table has **95** that do. A hand-picked sample is not a population -- the same
+rule that made `Light.dbc`'s storm column come back a coin flip.
+
+**Second**: the two id sets overlap in 30 places, which reads as a second
+refutation. It is not one either.
+
+**What settled it was names.** Resolved against `creature_template`, column A
+is `Wind Rider` ×75 and `Riding Bat` ×20; column B is `Riding Gryphon` ×73 and
+`Riding Hippogryph` ×25. A is Horde, B is Alliance, and the overlap is neutral
+mounts -- `Riding Drake, Red` nine times in each -- that both sides ride at one
+hub. Disjointness was simply the wrong question.
+
+**And the same resolution caught the column not being what it looked like.**
+Read as `CreatureDisplayInfo` ids these give `NightElfFemale.mdx` for a Wind
+Rider, and 541 resolves to nothing at all. They are `creature_template`
+entries -- server data no DBC here resolves. The mount the client would draw
+arrives in the replicated `UNIT_FIELD_MOUNTDISPLAYID` instead, which nothing
+reads yet. It was caught only because the check produced a **name**: a
+character model is obvious nonsense for a flying mount, where a
+plausible-looking display id would have passed unexamined.
+
+### The protocol, and the request that answers
+
+`CMSG_TAXIQUERYAVAILABLENODES` `0x1AC` → `SMSG_SHOWTAXINODES` `0x1A9`, a fixed
+**72-byte** body (`4 + 8 + 4 + 14*4`) whose fixed size is its own
+confirmation: there is no variable-length block to absorb a wrong mask width.
+`CMSG_ACTIVATETAXI` `0x1AD` `{u64 npc, u32 from, u32 to}` is answered **either
+way** by `SMSG_ACTIVATETAXIREPLY` `0x1AE`, so one send bounds the opcode, the
+body and the reply together -- the move `CMSG_GROUP_INVITE` made for parties.
+
+Known nodes arrive as fourteen `u32`s, one bit per node id: the same shape as
+`PLAYER_EXPLORED_ZONES`, and the same rule -- **a zero word is "none known",
+never "unknown"**, or a fresh character gets the whole continent.
+
+Live, with `.cheat taxi on`: 72 bytes exactly, **302 nodes set across all
+fourteen words** -- a far better alignment check than the one or two bits a
+fresh character gives -- and the node the server names as current is set in
+the mask.
+
+**The departure node is the server's and must not be recomputed.** Live, the
+server named node 2 (Stormwind, 573 units away) where node 1 sat 150 units
+off. A client working out "the nearest node" would send the wrong departure
+every time, and be right almost everywhere.
+
+### The flight bit was `Falling`
+
+The first live flight did nothing visible. The report was the diagnosis: *"the
+npc vanished, i can still move around freely"* -- the flight master vanishing
+means the server had already flown the player away, so it left visibility and
+was destroyed. The flight was running server-side; only the client failed to
+follow.
+
+`monster_spline_flags::FLYING` was `0x0000_0200`. The server's `Flying` is
+`0x0000_2000`. `0x0200` is **`Falling`**, one bit position down -- and nothing
+this client had ever met set either, so it matched nothing and looked correct
+for four milestones.
+
+The two spline encodings are a **conditional layout**, and a wrong flag does
+not fail a parse: it steers the reader down the other branch, which consumes a
+plausible number of bytes and yields a plausible destination. A flight is sent
+with every point written out; this read it as packed offsets and lost the
+route.
+
+Confirmed on the wire rather than from the header:
+
+```
+01 02          packed guid -> 2, Facetest
+00             move type NORMAL
+00 20 00 00    flags = 0x2000, Flying
+9a 3c 01 00    duration = 81,050 ms
+1b 00 00 00    27 points
+```
+
+356 bytes = 32 of header + 27 × 12, to the byte.
+
+`ANIMATION` was wrong too -- `0x8` against `0x0020_0000`. The low byte of the
+flag word holds an *animation id* (`Mask_Animations = 0xFF`), so the old value
+read one bit of an id as a flag and skipped five bytes whenever it was set.
+
+**A correction to the first write-up of this.** It was recorded as failing
+silently and it does not. The packed branch takes 12 bytes plus 4 per
+remaining point against 12 per point for the real one, so on 27 points it
+consumed 116 of 324 and the cursor's trailing-byte rule refused the packet
+outright -- loudly, in the log, where nobody was looking. Only when a route's
+count makes the two arithmetics coincide does it parse cleanly and lose
+everything. The test pins the **quiet** case deliberately, because a test
+showing only the loud one would suggest this bug always announces itself.
+
+### A flight replaces the movement path rather than modifying it
+
+The tempting shape is a guard beside the ground assignment, and another beside
+the input, and another beside the jump. That is precisely how 4.18's swimming
+bug happened. So `advance_flight` returns before turning, input, collision,
+ground height, buoyancy and the jump arc, and none of them acquire a new
+condition.
+
+**And that early return then took the camera with it**, which is the lesson
+worth keeping. The camera placement lived in the tail of the same function, so
+a flying character was followed by nothing: the view stayed where they took
+off, and since the streaming centre follows the camera, the world stopped
+loading too. One cause, three symptoms.
+
+A wholesale replacement is the right shape for a set of writes that must all
+be skipped **together**, and the wrong shape for anything that merely happened
+to share the function. Placing the camera is not movement; it is its own
+method now, called unconditionally, and correct by construction for whatever
+state replaces the movement path next.
+
+### The world was only ever loading one tile
+
+Kake's own diagnosis, and better than the one this session had: *"the next
+chunk won't load until the player crosses into that chunk so you enter the
+void for a second then it renders the missing chunk"*.
+
+The streaming radius defaulted to **0** and the live viewer never passed
+anything else, so only the tile under the camera was ever queued -- the tile a
+character is walking towards is by construction not there yet. It survived
+this long because `EVICT_MARGIN` retains a 3x3, so walking back the way you
+came looked fine and walking somewhere new did not.
+
+`MIN_STREAM_RADIUS` is 1 and is a **floor**, not a default: a streaming world
+at radius zero is not a small world, it is a broken one. A headless live render
+now reports 9 tiles resident where it reported 1.
+
+### Still not done
+
+* **No mount and no flight animation.** The character travels upright with
+  nothing under them. The mount's display id is in the replicated
+  `UNIT_FIELD_MOUNTDISPLAYID`, which nothing reads; `TaxiNodes`' own columns
+  are creature entries and cannot answer.
+* **No route line on the map**, and no `!` for a flight point on it.
+* **No scrolling in the window**, so a node with hundreds of destinations
+  overflows.
+* **The price shown is the table's**, not the server's -- the menu carries no
+  price at all, so this is the one number in the milestone that has had no
+  reputation discount applied and is not authoritative.
+* **`SMSG_NEW_TAXI_PATH` is deliberately unparsed** -- it arrives empty-bodied
+  and the menu is re-asked on every visit anyway.
+* Only `TaxiReply::Ok` is named. The server's header lists thirteen tidy names
+  and transcribing them is exactly what `describe_cast_failure` refuses.
+
+### Stormwind is its own ticket
+
+Two collision bugs were found and fixed on the way here -- a tile's collision
+not being confined to the tile, and eviction needing to learn the same lesson
+-- and a third remains. Walking over a fountain drops a character to the
+bottom of the city, which means `floor_under_footing` found nothing there and
+the code fell back to terrain height, which inside a building is never a valid
+surface.
+
+**Two candidates and nothing yet separates them**, which is the reason this is
+a ticket and not a paragraph: the WMO loader's three silent `continue`s
+skipping groups that fail validation, or a genuine gap in coverage where the
+terrain fallback is the real bug. The instrument that would answer it is a
+coverage survey -- sample a grid across the city's footprint offline and
+report where no floor is found. The raised streaming radius is a fair
+candidate for it too and is explicitly **not** claimed as the cause.
