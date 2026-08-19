@@ -520,6 +520,37 @@ dbc_table! {
     }
 }
 
+dbc_table! {
+    /// A sky model, named by [`LightParams::light_skybox_id`].
+    ///
+    /// **This is the skybox this client did not have, and the reason it did
+    /// not is still true**: 124 rows for a world of thousands of zones, named
+    /// `StratholmeSkybox`, `CavernsOfTimeSky`, `NetherstormSkyBox` -- special
+    /// places. Azeroth's default light names skybox 0 and gets none, which is
+    /// why the five-band gradient is the ordinary outdoor sky and not an
+    /// approximation of one.
+    ///
+    /// **Row 4 is `Environments\Stars\Stars.mdx`, and that is the useful
+    /// part.** The star dome is not a decoration this client invented a place
+    /// for: it is an entry in the same table as every zone's painted backdrop,
+    /// which is what makes drawing it a transcription rather than a choice.
+    ///
+    /// Paths carry the historical `.mdx` extension -- see [`m2::model_path`]
+    /// in the `m2` crate, which is where that rewrite lives for every table
+    /// with the same habit.
+    LightSkybox, LightSkyboxRow,
+    path = r"DBFilesClient\LightSkybox.dbc", fields = 3, {
+        0 id: u32,
+        /// The model, with an `.mdx` extension that must be rewritten.
+        1 model: str,
+        /// 0 on 60 rows, 1 on some and 2 on others. **Deliberately not
+        /// named**: three values with no observed consequence is not a flag
+        /// this client has identified, and a wrong name for it would never
+        /// fail loudly.
+        2 flags: u32,
+    }
+}
+
 /// Key slots in a lighting band. Both band tables carry sixteen.
 pub const LIGHT_BAND_KEYS: usize = 16;
 /// Colour curves per [`LightParams`].

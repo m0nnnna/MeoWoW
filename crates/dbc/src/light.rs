@@ -15,7 +15,7 @@
 
 use crate::schema::{
     float_band_id, int_band_id, Light, LightFloatBand, LightIntBand, LightParams, LightRow,
-    DAY_HALF_MINUTES, FLOAT_BANDS_PER_PARAMS, INT_BANDS_PER_PARAMS,
+    LightSkybox, DAY_HALF_MINUTES, FLOAT_BANDS_PER_PARAMS, INT_BANDS_PER_PARAMS,
 };
 
 /// A colour from a band, in 0..1 per channel.
@@ -185,6 +185,12 @@ pub struct Lighting {
     params: LightParams,
     int_bands: LightIntBand,
     float_bands: LightFloatBand,
+    /// **Optional where the other four are required, and deliberately.** A
+    /// missing skybox table costs the zone backdrops and the star dome --
+    /// which is exactly what this client had before either existed. Making it
+    /// required would let one absent file take the sky's *colours* with it,
+    /// turning a missing feature into a missing world.
+    skybox: Option<LightSkybox>,
 }
 
 /// The lighting in force somewhere, at some time.
@@ -204,6 +210,14 @@ pub struct Sample {
     /// was chosen" and "this light looks like that" are indistinguishable
     /// without it.
     pub params_id: u32,
+    /// The `LightSkybox` row this place names, or 0 for none.
+    ///
+    /// Zero is the common answer and not a gap: Azeroth's default light names
+    /// no skybox, which is why the five-band gradient *is* the ordinary
+    /// outdoor sky rather than a stand-in for one. Carried as an id rather
+    /// than a path so this stays `Copy`; resolve it with
+    /// [`Lighting::skybox_model`].
+    pub skybox_id: u32,
 }
 
 impl Sample {
@@ -234,6 +248,7 @@ impl Lighting {
             params: LightParams::parse(&read(LightParams::PATH)?).ok()?,
             int_bands: LightIntBand::parse(&read(LightIntBand::PATH)?).ok()?,
             float_bands: LightFloatBand::parse(&read(LightFloatBand::PATH)?).ok()?,
+            skybox: read(LightSkybox::PATH).and_then(|b| LightSkybox::parse(&b).ok()),
         })
     }
 
@@ -366,6 +381,12 @@ impl Lighting {
             // The row actually being blended towards, so a report can say which
             // curves are in play rather than only where they came from.
             params_id: if storm >= 0.5 { stormy.params_id } else { clear.params_id },
+            // **Not blended, and it cannot be.** A skybox is a model, and
+            // there is no halfway between two of them -- so it switches with
+            // the row rather than crossfading with the colours. Following the
+            // params id keeps the two consistent: whichever row a report names
+            // is the row whose sky is on screen.
+            skybox_id: if storm >= 0.5 { stormy.skybox_id } else { clear.skybox_id },
         })
     }
 
@@ -407,6 +428,7 @@ impl Lighting {
                     .unwrap_or(0.25)
                     .clamp(0.05, 0.95),
             params_id,
+            skybox_id: self.skybox_of(params_id),
         })
     }
 
@@ -425,6 +447,54 @@ impl Lighting {
         let id = float_band_id(params_id, band);
         let row = self.float_bands.iter().find(|row| row.id() == id)?;
         sample_keys(row.count(), at, |index| row.key(index))
+    }
+
+    /// Which `LightSkybox` row a params row names, or 0 for none.
+    pub fn skybox_of(&self, params_id: u32) -> u32 {
+        self.params
+            .iter()
+            .find(|row| row.id() == params_id)
+            .map_or(0, |row| row.light_skybox_id())
+    }
+
+    /// The model path a `LightSkybox` id names.
+    ///
+    /// **Returned with its `.mdx` extension intact.** This crate reads tables
+    /// and knows nothing about model files; rewriting the extension is
+    /// `m2::model_path`'s job, and doing it here would put a second copy of
+    /// that rule in a crate that cannot test it.
+    pub fn skybox_model(&self, skybox_id: u32) -> Option<String> {
+        if skybox_id == 0 {
+            return None;
+        }
+        self.skybox
+            .as_ref()?
+            .iter()
+            .find(|row| row.id() == skybox_id)
+            .map(|row| row.model().to_string())
+            .filter(|path| !path.is_empty())
+    }
+
+    /// The star dome, found by name rather than by id.
+    ///
+    /// **`Environments\Stars\Stars.mdx` is a `LightSkybox` row like any
+    /// other**, which is what makes drawing it a transcription instead of a
+    /// decision -- the stars are in the same table as Stratholme's green
+    /// murk. It is looked up by file name because an id is a number that could
+    /// be anything and a name is the one thing in this table that cannot be a
+    /// coincidence.
+    ///
+    /// It is *not* what any outdoor light names: Azeroth's default names
+    /// skybox 0. The client draws it in addition to whatever the place names,
+    /// which is why this is a separate accessor rather than a special case
+    /// inside [`Lighting::skybox_model`].
+    pub fn star_dome(&self) -> Option<String> {
+        self.skybox.as_ref()?.iter().find_map(|row| {
+            let path = row.model();
+            let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
+            file.eq_ignore_ascii_case("Stars.mdx")
+                .then(|| path.to_string())
+        })
     }
 
     pub fn params(&self) -> &LightParams {

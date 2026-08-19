@@ -6,7 +6,7 @@
 use dbc::infer::{infer, ColumnKind};
 use dbc::schema::{
     AreaTable, CreatureDisplayInfo, CreatureModelData, CreatureSoundData, FootstepTerrainLookup,
-    Map, SoundEntries, SoundType, Spell, SpellDuration, SpellRadius,
+    LightSkybox, Map, SoundEntries, SoundType, Spell, SpellDuration, SpellRadius,
     SpellVisual, SpellVisualKit, TerrainType, WorldMapArea, WorldMapOverlay, WorldSafeLocs,
 };
 use dbc::Dbc;
@@ -42,6 +42,7 @@ fn transcribed_schemas_match_build_12340() {
     }
     check!(
         Map,
+        LightSkybox,
         AreaTable,
         CreatureDisplayInfo,
         CreatureModelData,
@@ -1132,5 +1133,71 @@ fn the_creature_footstep_column_names_a_group_that_exists() {
     assert!(
         control_inside * 20 < control_set,
         "the aggro column looks like a group too: {control_inside} of {control_set}"
+    );
+}
+
+/// The star dome is a row of `LightSkybox`, found by name, and the outdoor
+/// world names no skybox of its own.
+///
+/// **Three claims in one test because they only mean anything together.** That
+/// `Stars.mdx` is in this table is what makes drawing it a transcription
+/// rather than an invention; that Azeroth and Kalimdor name *no* skybox is
+/// what makes the five-band gradient the ordinary sky rather than a stand-in
+/// for one; and the lookup by file name is what stops either claim resting on
+/// a row id that could be anything.
+///
+/// If a later build moves the star dome, this fails and says so, which is the
+/// point -- a client that silently drew no stars would look exactly like a
+/// clear night that happened to be dark.
+#[test]
+fn the_star_dome_is_a_light_skybox_row_and_the_outdoor_world_names_none() {
+    let mut chain = require_data!();
+    let lighting =
+        dbc::light::Lighting::load(|path| chain.read(path).ok()).expect("lighting tables");
+
+    let dome = lighting.star_dome().expect("no LightSkybox row named Stars.mdx");
+    assert!(
+        dome.to_ascii_lowercase().ends_with(r"stars\stars.mdx"),
+        "the star dome should live in Environments\\Stars, got {dome}"
+    );
+
+    // Every params row an outdoor light on either continent can select.
+    let mut outdoor = Vec::new();
+    for row in lighting.lights().iter() {
+        if row.map_id() != 0 && row.map_id() != 1 {
+            continue;
+        }
+        for id in [row.params_clear(), row.params_storm()] {
+            if id != 0 && !outdoor.contains(&id) {
+                outdoor.push(id);
+            }
+        }
+    }
+    assert!(
+        outdoor.len() > 100,
+        "only {} outdoor light params: the population is too small to mean anything",
+        outdoor.len()
+    );
+    let named: Vec<u32> = outdoor
+        .iter()
+        .copied()
+        .filter(|&id| lighting.skybox_model(lighting.skybox_of(id)).is_some())
+        .collect();
+    assert!(
+        named.is_empty(),
+        "an outdoor light named a skybox after all: {named:?}"
+    );
+
+    // And the table is not empty, or the check above would pass for the wrong
+    // reason -- 158 of the 850 params rows do name one, they are simply all
+    // somewhere this client is not standing.
+    let anywhere = lighting
+        .params()
+        .iter()
+        .filter(|row| lighting.skybox_model(row.light_skybox_id()).is_some())
+        .count();
+    assert_eq!(
+        anywhere, 158,
+        "158 LightParams rows named a skybox when this was measured"
     );
 }

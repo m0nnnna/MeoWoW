@@ -109,6 +109,10 @@ enum Command {
         /// column really is the stormy one, across every light on every map.
         #[arg(long)]
         weather_check: bool,
+        /// Instead of reporting one point, ask what *kind* of thing each of
+        /// the eighteen colour bands is, across every `LightParams` row.
+        #[arg(long)]
+        band_survey: bool,
     },
     /// Log in to a realm's logon server and list its realms.
     ///
@@ -1711,8 +1715,11 @@ fn main() -> Result<()> {
             y,
             hour,
             weather_check,
+            band_survey,
         } => {
-            if weather_check {
+            if band_survey {
+                light::band_survey(&mut chain)
+            } else if weather_check {
                 light::weather_check(&mut chain, hour)
             } else {
                 light::report(&mut chain, map, x, y, hour)
@@ -13555,6 +13562,7 @@ fn dbc_rows(chain: &mut Chain, table: &str, limit: usize, ids: &[u32]) -> Result
         LightParams,
         LightIntBand,
         LightFloatBand,
+        LightSkybox,
         GameObjectDisplayInfo,
         SoundEntries,
         WorldSafeLocs,
@@ -13619,6 +13627,7 @@ fn dbc_check(chain: &mut Chain) -> Result<()> {
         LightParams,
         LightIntBand,
         LightFloatBand,
+        LightSkybox,
         GameObjectDisplayInfo,
         SoundEntries,
         WorldSafeLocs,

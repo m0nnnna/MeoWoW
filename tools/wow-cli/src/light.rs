@@ -317,3 +317,213 @@ Light.dbc, clear column against storm column, at {hour:.0}:00");
     }
     Ok(())
 }
+
+/// Asks what *kind* of thing each of the eighteen colour bands is, across the
+/// whole table rather than one row.
+///
+/// **The question is not "could band 8 be a scalar", it is "is it neutral
+/// *because* it is one".** Any colour can happen to have equal channels once;
+/// a band that is grey on every key of every row is not a colour the artists
+/// kept desaturating, it is a number stored in a colour column. So the
+/// property counted here is exact channel equality, and the discriminator is
+/// the contrast between one band and the seventeen beside it -- the same move
+/// that separated the M2 event stride (25,498 of 25,500 printable against
+/// 22-24% everywhere else) from its neighbours.
+///
+/// The population is split, because `Light.dbc`'s decorative rows have already
+/// nearly refuted a true hypothesis once: a glowing crater's weather columns
+/// are authored for effect, and 200 of them drown the handful of rows that
+/// light a zone. Outdoor rows are counted separately from all rows for exactly
+/// that reason.
+pub fn band_survey(chain: &mut Chain) -> Result<()> {
+    let lighting = Lighting::load(|path| chain.read(path).ok())
+        .context("could not read the lighting tables")?;
+
+    // Every params row an outdoor light names, on either continent.
+    let mut outdoor: Vec<u32> = Vec::new();
+    for row in lighting.lights().iter() {
+        if row.map_id() != 0 && row.map_id() != 1 {
+            continue;
+        }
+        for id in [row.params_clear(), row.params_storm()] {
+            if id != 0 && !outdoor.contains(&id) {
+                outdoor.push(id);
+            }
+        }
+    }
+    let all: Vec<u32> = lighting.params().iter().map(|row| row.id()).collect();
+
+    // Hourly rather than per key: a band's keys are not addressable through
+    // the sampler, and a blend of two neutral colours is still neutral, so
+    // sampling the curve answers the question the keys would.
+    let hours: Vec<u32> = (0..24).map(|h| h * DAY_HALF_MINUTES / 24).collect();
+
+    let grey_of = |ids: &[u32], band: u32| {
+        let (mut grey, mut total) = (0usize, 0usize);
+        for &id in ids {
+            for &at in &hours {
+                if let Some([r, g, b]) = lighting.colour(id, band, at) {
+                    total += 1;
+                    if r == g && g == b {
+                        grey += 1;
+                    }
+                }
+            }
+        }
+        (grey, total)
+    };
+
+    println!(
+        "what kind of thing each colour band is, over {} outdoor and {} total LightParams rows",
+        outdoor.len(),
+        all.len()
+    );
+
+    // **The skybox count belongs beside the bands, because it is the same
+    // kind of statement**: what the table actually contains, rather than what
+    // its column names invite you to assume. A client that drew a skybox and
+    // nothing else would draw nothing at all almost everywhere.
+    let named = |ids: &[u32]| {
+        ids.iter()
+            .filter(|&&id| lighting.skybox_model(lighting.skybox_of(id)).is_some())
+            .count()
+    };
+    println!(
+        "  of those, {} outdoor and {} total rows name a LightSkybox model",
+        named(&outdoor),
+        named(&all)
+    );
+    match lighting.star_dome() {
+        Some(path) => println!("  the star dome is a row of that table: {path}"),
+        None => println!("  no LightSkybox row is named Stars.mdx: there is no star dome to draw"),
+    }
+    println!(
+        "\n  {:>4}  {:>22}  {:>22}  {:>12}",
+        "band", "outdoor: grey/samples", "all: grey/samples", "day spread"
+    );
+    for band in 0..INT_BANDS_PER_PARAMS {
+        let (grey_out, total_out) = grey_of(&outdoor, band);
+        let (grey_all, total_all) = grey_of(&all, band);
+        // How far a band travels across a day, averaged over the population.
+        // A constant band and a band that swings from black to white are the
+        // two ends of "is this a curve at all".
+        let (mut swing, mut swung) = (0.0f64, 0usize);
+        for &id in &outdoor {
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for &at in &hours {
+                if let Some(c) = lighting.colour(id, band, at) {
+                    let v = (c[0] + c[1] + c[2]) / 3.0;
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+            }
+            if lo.is_finite() {
+                swing += (hi - lo) as f64;
+                swung += 1;
+            }
+        }
+        let pct = |n: usize, d: usize| 100.0 * n as f32 / d.max(1) as f32;
+        println!(
+            "  {band:>4}  {:>10}/{:<8} {:>3.0}%  {:>10}/{:<8} {:>3.0}%  {:>12.3}",
+            grey_out,
+            total_out,
+            pct(grey_out, total_out),
+            grey_all,
+            total_all,
+            pct(grey_all, total_all),
+            swing / swung.max(1) as f64,
+        );
+    }
+
+    println!("\n  scalar bands, over the same {} outdoor rows:", outdoor.len());
+    println!(
+        "  {:>4}  {:>10}  {:>10}  {:>10}  {:>24}",
+        "band", "min", "max", "mean", "rows that move in a day"
+    );
+    for band in 0..FLOAT_BANDS_PER_PARAMS {
+        let (mut lo, mut hi, mut sum, mut n, mut moving, mut rows) =
+            (f32::INFINITY, f32::NEG_INFINITY, 0.0f64, 0usize, 0usize, 0usize);
+        for &id in &outdoor {
+            let (mut row_lo, mut row_hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for &at in &hours {
+                if let Some(v) = lighting.scalar(id, band, at) {
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                    row_lo = row_lo.min(v);
+                    row_hi = row_hi.max(v);
+                    sum += v as f64;
+                    n += 1;
+                }
+            }
+            if row_lo.is_finite() {
+                rows += 1;
+                if row_hi - row_lo > 1e-4 {
+                    moving += 1;
+                }
+            }
+        }
+        println!(
+            "  {band:>4}  {:>10.3}  {:>10.3}  {:>10.3}  {:>14} of {:<8}",
+            if lo.is_finite() { lo } else { 0.0 },
+            if hi.is_finite() { hi } else { 0.0 },
+            sum / n.max(1) as f64,
+            moving,
+            rows,
+        );
+    }
+
+    // And then the question a count of grey samples cannot answer: *which*
+    // scalar. A shadow is cast by the sun, so a storm must weaken it; a
+    // measure of overcast would go the other way. The two candidates disagree
+    // about the sign, which is what makes this evidence rather than a
+    // plausibility argument -- and the control is the same clear-against-storm
+    // pairing `--weather-check` uses, on rows already known to be weather.
+    let neutral: Vec<u32> = (0..INT_BANDS_PER_PARAMS)
+        .filter(|&band| {
+            let (grey, total) = grey_of(&outdoor, band);
+            total > 0 && grey * 100 / total >= 95
+        })
+        .collect();
+    if neutral.is_empty() {
+        println!("\n  no band is grey on 95% or more of its samples: nothing here is a packed scalar");
+        return Ok(());
+    }
+    for band in neutral {
+        let (mut lower, mut higher, mut same) = (0usize, 0usize, 0usize);
+        let (mut clear_sum, mut storm_sum) = (0.0f64, 0.0f64);
+        for row in lighting.lights().iter() {
+            if row.map_id() != 0 && row.map_id() != 1 {
+                continue;
+            }
+            let (clear, storm) = (row.params_clear(), row.params_storm());
+            if clear == 0 || storm == 0 || clear == storm {
+                continue;
+            }
+            for &at in &hours {
+                let (Some(a), Some(b)) = (
+                    lighting.colour(clear, band, at),
+                    lighting.colour(storm, band, at),
+                ) else {
+                    continue;
+                };
+                clear_sum += a[0] as f64;
+                storm_sum += b[0] as f64;
+                match b[0].partial_cmp(&a[0]) {
+                    Some(std::cmp::Ordering::Less) => lower += 1,
+                    Some(std::cmp::Ordering::Greater) => higher += 1,
+                    _ => same += 1,
+                }
+            }
+        }
+        let pairs = lower + higher + same;
+        println!(
+            "\n  band {band} is a packed scalar. Under storm it is lower on {lower}, higher on {higher} and unchanged on {same} of {pairs} samples"
+        );
+        println!(
+            "    mean value: clear {:.3}, storm {:.3}",
+            clear_sum / pairs.max(1) as f64,
+            storm_sum / pairs.max(1) as f64
+        );
+    }
+    Ok(())
+}
