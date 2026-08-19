@@ -5674,6 +5674,15 @@ impl App {
             self.notice("you are not in a group.".into());
             return;
         }
+        // And the same for guild, for the same reason and by the same door.
+        // `/g`'s doc comment in `run_command` claimed this check happened
+        // here from the day it was written; it did not, so a sticky `Guild`
+        // that outlived its guild sent lines the server dropped in silence.
+        // A comment describing a check is not a check.
+        if matches!(channel, ChatChannel::Guild) && !self.in_guild() {
+            self.notice("you are not in a guild.".into());
+            return;
+        }
         let Some(live) = self.live.as_mut() else {
             return;
         };

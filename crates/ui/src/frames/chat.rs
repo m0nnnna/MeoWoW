@@ -34,6 +34,14 @@ pub enum ChatKind {
     /// to a person only if the interface makes them look the same, which is
     /// the one thing a party's privacy assumption cannot survive.
     Party,
+    /// Guild chat. Its own kind for the same reason `Party` is, and it is
+    /// worth recording *why it was missing*: the wire type existed, the
+    /// parser produced it, and both maps from `world::ChatType` to this enum
+    /// simply had no arm for it -- so a guild line drew in `Other`'s grey
+    /// with no tag, which against `Say`'s near-white is a difference nobody
+    /// can see. **A line that renders as a plausible different line is the
+    /// chat frame's version of a wrong animation id**: it never errors.
+    Guild,
     /// Damage this character dealt or took. Its own kind because combat is
     /// the one category that arrives faster than it can be read, so it wants
     /// a colour that recedes rather than one that competes with a whisper.
@@ -94,6 +102,7 @@ pub fn colour(kind: ChatKind, style: &Style) -> Color {
         ChatKind::System => style.chat_system,
         ChatKind::Channel => style.chat_channel,
         ChatKind::Party => style.chat_party,
+        ChatKind::Guild => style.chat_guild,
         ChatKind::Combat => style.chat_combat,
         ChatKind::Other => style.chat_other,
     }

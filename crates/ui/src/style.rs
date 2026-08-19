@@ -333,6 +333,12 @@ pub struct Style {
     /// Party chat -- see [`crate::frames::chat::ChatKind::Party`] for why it
     /// is not folded into [`Self::chat_other`].
     pub chat_party: Color,
+    /// Guild chat. Its own colour for the same reason party has one, and it
+    /// had to be added late: 4.28 could *send* a guild line before anything
+    /// could *draw* one, so every guild line arrived, parsed correctly as
+    /// [`world::ChatType::Guild`], fell through to `chat_other` and read as
+    /// an ordinary say.
+    pub chat_guild: Color,
     /// Damage dealt and taken. Deliberately dimmer than speech: combat fills
     /// the scrollback faster than anything else, and a colour that competes
     /// with a whisper makes the whisper unreadable during a fight.
@@ -522,6 +528,7 @@ impl Default for Style {
             text_ghost: Color::rgb(150, 190, 230),
             chat_channel: Color::rgb(120, 210, 190),
             chat_party: Color::rgb(170, 170, 255),
+            chat_guild: Color::rgb(110, 220, 130),
             chat_combat: Color::rgb(190, 155, 120),
             chat_other: Color::rgb(170, 176, 190),
             chat_composing: Color::rgb(150, 235, 150),

@@ -135,6 +135,12 @@ pub fn chat_entry(message: &::world::ChatMessage, state: &::world::WorldState) -
         ChatType::Whisper => Some("whisper".into()),
         ChatType::WhisperInform => Some("to".into()),
         ChatType::Party => Some("party".into()),
+        // Guild, and only guild. `Officer` is a separate wire type that
+        // nothing here has ever sent or received, so it keeps falling
+        // through to no tag rather than borrowing this one -- an officer
+        // line labelled `[guild]` would be a *wrong* claim about who heard
+        // it, which is worse than an unlabelled one.
+        ChatType::Guild => Some("guild".into()),
         _ => None,
     };
 
@@ -221,6 +227,7 @@ fn chat_kind(chat_type: ::world::ChatType) -> ui::ChatKind {
         ChatType::System => ui::ChatKind::System,
         ChatType::Channel => ui::ChatKind::Channel,
         ChatType::Party => ui::ChatKind::Party,
+        ChatType::Guild => ui::ChatKind::Guild,
         _ => ui::ChatKind::Other,
     }
 }
@@ -833,6 +840,84 @@ mod tests {
         let entry = chat_entry(&message, &state);
         assert_eq!(entry.kind, ui::ChatKind::Party);
         assert_eq!(entry.rendered(), "[party] Watcher: on my way");
+    }
+
+    /// The same for guild, and this one is a live bug converted rather than a
+    /// precaution: 4.28 shipped able to *send* a guild line and unable to
+    /// *draw* one. `ChatType::Guild` parsed correctly the whole time and both
+    /// maps in this file simply had no arm for it, so every guild line drew
+    /// with no tag in `Other`'s grey -- which beside `Say`'s near-white is a
+    /// difference nobody at the window can see, and the report that came back
+    /// was "`/g` does not stick". The send path was never involved.
+    ///
+    /// Both halves are asserted, because the tag alone would pass with the
+    /// colour still wrong and the colour alone would pass with no tag.
+    #[test]
+    fn a_guild_line_is_named_and_coloured_as_guild() {
+        let message = ::world::ChatMessage {
+            chat_type: ::world::ChatType::Guild,
+            language: 7,
+            sender: 0x35,
+            sender_name: None,
+            target: 0,
+            channel: None,
+            text: "anyone for the abbey".into(),
+            tag: 0,
+        };
+        let mut state = ::world::WorldState::new();
+        state.names.apply_player(&::world::PlayerName {
+            guid: 0x35,
+            name: Some("Watcher".into()),
+            realm: String::new(),
+            race: 1,
+            gender: 0,
+            class: 1,
+        });
+        let entry = chat_entry(&message, &state);
+        assert_eq!(entry.kind, ui::ChatKind::Guild);
+        assert_eq!(entry.rendered(), "[guild] Watcher: anyone for the abbey");
+
+        let style = ui::Style::default();
+        // The bug's actual shape: `Other` and `Say` are both near-neutral, so
+        // a kind that falls through to either is invisible rather than wrong.
+        assert_ne!(
+            ui::frames::chat::colour(entry.kind, &style),
+            ui::frames::chat::colour(ui::ChatKind::Other, &style)
+        );
+        assert_ne!(
+            ui::frames::chat::colour(entry.kind, &style),
+            ui::frames::chat::colour(ui::ChatKind::Say, &style)
+        );
+    }
+
+    /// A guild line from a **game master** takes the other parser -- every
+    /// account on this project's own realm is one -- and has to arrive as
+    /// guild all the same. This was the standing hypothesis for the live
+    /// report and turned out not to be the cause; it is asserted anyway,
+    /// because `SMSG_GM_MESSAGECHAT` really does carry a different body and
+    /// the thing that must survive it is the `ChatType`.
+    #[test]
+    fn a_game_masters_guild_line_is_still_guild() {
+        let mut body = Vec::new();
+        body.push(::world::ChatType::Guild.id());
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.extend_from_slice(&1u64.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        // A GM's line names its sender inline, monster-shaped: length
+        // counting the terminator, then the name.
+        body.extend_from_slice(&9u32.to_le_bytes());
+        body.extend_from_slice(b"Testwolf\0");
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&5u32.to_le_bytes());
+        body.extend_from_slice(b"hello\0");
+        body.push(0);
+
+        let message = ::world::chat::parse_gm_message_chat(&body)
+            .expect("a gm guild line should parse whole");
+        assert_eq!(message.chat_type, ::world::ChatType::Guild);
+        let entry = chat_entry(&message, &::world::WorldState::new());
+        assert_eq!(entry.kind, ui::ChatKind::Guild);
+        assert_eq!(entry.rendered(), "[guild] Testwolf: hello");
     }
 
     fn camera() -> render::camera::Camera {

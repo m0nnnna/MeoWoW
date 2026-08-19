@@ -6499,3 +6499,152 @@ time.
   open a mailbox.
 * **The enchantment, charges, durability and random-property fields** on an
   attachment are parsed, carried, and drawn by nothing.
+
+## 4.28: guilds, and a list of people who are not in the world
+
+Fifth rung of the six-part city-services block, and the one that introduces a
+kind of data this client has never held. Everything before it described the
+world, this character's place in it, or somebody standing nearby. 4.20 came
+closest and still fell short: a party member two zones away is at least *alive
+somewhere*, and `SMSG_PARTY_MEMBER_STATS` describes them continuously. A guild
+roster is a list of characters who are mostly **logged out** — no object, no
+update block, no name query worth sending, and no second source for any field.
+Whatever `SMSG_GUILD_ROSTER` chose to carry is the whole of what is knowable,
+and when it stops arriving there is nothing to fall back to.
+
+Six server packets and seventeen requests. `CMSG_GUILD_QUERY` `0x0054` →
+`SMSG_GUILD_QUERY_RESPONSE` `0x0055`; `CMSG_GUILD_ROSTER` `0x0089` →
+`SMSG_GUILD_ROSTER` `0x008A`; `CMSG_GUILD_INFO` `0x0087` → `SMSG_GUILD_INFO`
+`0x0088`; `SMSG_GUILD_INVITE` `0x0083`, `SMSG_GUILD_EVENT` `0x0092` and
+`SMSG_GUILD_COMMAND_RESULT` `0x0093` on top.
+
+### The conditional field belongs to the absent
+
+**A member record carries a four-byte "days since logout" float only when the
+status byte is zero** — so the record for somebody you can *see* is the
+**short** one, which is the wrong way round from a client author's instinct.
+It is a conditional layout in the middle of a variable-length record inside a
+list: the shape `crates/world/src/mail.rs` already names as the worst place to
+put one, met again one milestone later.
+
+### And this project's first instrument is blind to it
+
+"Assert the parse consumed the whole record" has caught four separate
+world-protocol bugs and cannot catch this one. The two fields after the
+conditional are **null-terminated strings**, and a string scan
+**re-synchronises**: reading four bytes that are not there simply makes the
+following note start four bytes later and end at the same terminator. All
+three candidate readings — no float ever, a float always, a float only when
+offline — consumed the fixture's 703-byte body *exactly*.
+
+What refuted `no float at all` was a note that is **not text**, which is the
+trainer greeting and the M2 event's `FourCC` for the third time: where a format
+stores text, the text is the evidence. That still left two readings standing,
+and the probe **said so rather than picking one**.
+
+What settled it was making the sample decisive. Clearing an *online* member's
+public note with `CMSG_GUILD_SET_PUBLIC_NOTE` means a float read there eats the
+terminator and runs into the next record; the re-asked roster is **692 bytes**
+and `float on every record` dies at `ran out at 692`. **The probe manufactured
+the sample that settled the layout, in the same run** — the generalisable move
+being that when a population cannot separate two readings, the cheapest fix is
+often to *change the population* rather than to think harder about the bytes.
+
+### Ten rank names always travel, and the count arrives after them
+
+`SMSG_GUILD_QUERY_RESPONSE` writes **ten** rank names whatever the guild's real
+rank count is, and the number saying how many are real arrives *after* the
+names **and after the tabard** — so the count cannot bound the array it
+describes. Scored rather than asserted: only `10 names + 6 words = 90 bytes`
+fits the body, and no other count does.
+
+### A packed date is a calendar reading, not a timestamp
+
+The founding date is a bit-packed year/month/day/hour/minute with **no seconds
+and no timezone**, so it cannot be converted to an instant without knowing
+where the server thinks it is. Confirmed against the realm's own
+`guild.createdate`: the wire says 2026-08-19 15:59 where the database says
+15:59:45. The weekday travels too, is redundant with the date, and is
+**checked** against it (Sakamoto) rather than trusted or ignored — the same
+treatment as the trade slot's redundant index and `md5translate.trs`'s
+redundant `dir:` lines.
+
+### One number, two meanings
+
+`ERR_GUILD_PERMISSIONS` and `ERR_GUILD_LEADER_LEAVE` are **both `8`**, and
+nothing in the packet separates them. Trade's `BUSY` again, and treated the
+same way: `describe_command_result` deliberately leaves it a number rather than
+naming one of the two and being confidently wrong half the time.
+
+### The cheapest bound in the whole block
+
+`CMSG_GUILD_ROSTER` is **answered either way**. Sent by a character in no
+guild it comes back as `SMSG_GUILD_COMMAND_RESULT` (command 5, result 9)
+rather than as silence — so one send, from a character with no fixture behind
+it at all, confirms the request opcode, the reply opcode and the result
+layout together. No guild had to exist before the block could be entered,
+which is a better position than trade or mail started from.
+
+### The fields on the player's own object
+
+`PLAYER_GUILDID` is `0x97` and `PLAYER_GUILDRANK` `0x98`, predicted from the
+enum's ordering and measured against a two-client run. `Watcher`'s rank field
+reads `Some(1)` and agrees with their roster row; `Testwolf`'s is **absent**,
+because rank 0 is a zero and a create block omits zeros — the "an absent update
+field is a zero, not an unknown" rule, arriving exactly where it was expected
+for once.
+
+### The window draws the packet's distinction rather than one it invented
+
+An online row shows **where they are**; an offline row shows **how long they
+have been gone**; and there is no row that shows both, because no record
+carries both. Only online rows answer a click — a whisper to somebody logged
+out is refused with a line this client would then have to explain — and the
+officer-note column is headed **`hidden`** rather than left blank, because the
+roster carries the rank table *and* the reader's own rank, and so the frame can
+say why its own column is empty rather than looking broken.
+
+### Confirmed at the window, and the report was about chat
+
+`G` opens the roster and members draw, online ones included, with the two-client
+run putting two `ONLINE` members and four offline in one packet — the strongest
+form of the sample.
+
+**The one bug the window found was in the chat frame, not the guild code.**
+`/g` set the sticky channel and sent correctly; the line came back and rendered
+as an ordinary say. The standing hypothesis was `SMSG_GM_MESSAGECHAT` — every
+account on this realm is a game master, and that packet ate 4.20's first party
+line — and it was wrong. The cause was plainer and worse: `ChatType::Guild`
+parsed correctly the whole time, and **both** maps from the wire type to the
+interface's own `ChatKind` simply had no arm for it. A guild line therefore drew
+with **no tag** in `Other`'s grey, which against `Say`'s near-white is a
+difference nobody at the window can see. **A line that renders as a plausible
+*different* line is the chat frame's version of a wrong animation id**: it never
+errors, and the report it produces names the wrong half of the system. Both the
+ordinary and the GM-shaped path are now asserted headless, tag and colour
+separately, because either assertion alone passes with the other still broken.
+
+The same look found a claim that was never true: `/g`'s doc comment said guild
+membership was re-checked in `send_on_channel` on every ordinary line, the way
+`/p` is, and it was not — so a sticky `Guild` outliving its guild sent lines the
+server dropped in silence. **A comment describing a check is not a check.**
+
+### Still not done
+
+* **`SMSG_GUILD_EVENT` is unconfirmed live.** It parses and is dispatched;
+  nothing has watched one arrive. The first `--guild-wait` run died at
+  `failed to fill whole buffer` because the loop sent **no keepalive** — the
+  documented ping trap, walked into by a loop written in the same session that
+  wrote the rule down again. The keepalive is in; the run is owed.
+* **No guild creation, no disband, no rank editing from the interface.**
+  `CMSG_GUILD_DISBAND` is implemented and deliberately unreachable: it is
+  irreversible and there is no confirmation gesture here yet.
+* **Invitations are answered by `/gaccept` and `/gdecline`**, not by a prompt
+  frame with two buttons the way a party invitation is. An invitation times
+  out, so a chat line is the weaker of the two and is named here rather than
+  left to look finished.
+* **No guild bank, no calendar, no achievements, no tabard art.** The emblem
+  fields parse and are drawn by nothing.
+* **`ChatType::Officer` is still unhandled** and falls through to no tag. It
+  is a separate wire type nothing here has sent or received, and labelling it
+  `[guild]` would be a wrong claim about who heard it.
