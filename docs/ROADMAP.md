@@ -6929,6 +6929,29 @@ levels:
 * **The table.** `Stars.mdx` is in `LightSkybox`, no outdoor light names a
   skybox, and 158 rows somewhere do.
 
+### Confirmed at the window
+
+*"I see stars I see shadows."* Both halves of the milestone are on screen in a
+live session, which is the confirmation `--screenshot` could give for the
+picture and not for the session — the headless path renders one frame of a
+world that has just been streamed in, and every timing question about the sky
+is about the frames after it.
+
+**This is the rare milestone where the headless instrument was almost the whole
+of the check**, and it is worth writing down why, because 4.24 shipped on a
+clean render and came back a white screen. `--screenshot` draws no HUD, so it
+can confirm nothing about an interface; none of this milestone is interface.
+The sky, the shadows and the fades are all in the frame it draws, and the one
+thing left over is **motion** — the texel snapping exists so that shadow edges
+do not crawl as the camera moves, and a still frame cannot come out the other
+way whether it works or not.
+
+The rest is named as exploration rather than as done: how the cloud band reads
+at each hour, whether one cascade at 110 units is the right trade, and what the
+frame rate does with the resident world drawn twice. Those are judgements a
+person makes by walking around in it, and none of them is a defect this
+milestone knows about and left.
+
 ### Still not done
 
 * **One cascade.** `--shadow-radius` is 110 units by default and exposed
