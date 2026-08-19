@@ -1212,6 +1212,138 @@ impl Connection {
         self.send(ClientOpcode::QueryNextMailTime, &[])
     }
 
+    /// Greets an auctioneer, and asks which house it serves.
+    ///
+    /// **The only request in the block whose reply names a house.** See
+    /// [`crate::auction::AuctionHouse`].
+    pub fn auction_hello(&mut self, auctioneer: u64) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::AuctionHello,
+            &crate::auction::hello_body(auctioneer),
+        )
+    }
+
+    /// Asks for sales awaiting collection -- **the auction block's bounding
+    /// instrument**.
+    ///
+    /// The handler behind it checks nothing at all and always replies. So one
+    /// of these, sent from anywhere in the world with no auctioneer and no
+    /// fixture, is what separates "the opcode or the socket is wrong" from
+    /// "the request was declined". Every other send here is silent when its
+    /// auctioneer does not resolve, and a silent send is indistinguishable
+    /// from a wrong opcode -- the failure this project has walked into in
+    /// every city service so far.
+    ///
+    /// See [`ClientOpcode::AuctionListPendingSales`].
+    pub fn auction_list_pending_sales(&mut self, auctioneer: u64) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::AuctionListPendingSales,
+            &crate::auction::pending_sales_body(auctioneer),
+        )
+    }
+
+    /// Searches. `offset` is the row to start at, in units of rows and not of
+    /// pages.
+    ///
+    /// **The caller must also tell the world state what it asked for**, with
+    /// [`WorldState::expect_auction_page`](crate::WorldState::expect_auction_page):
+    /// the reply does not carry the offset, so nothing downstream can work it
+    /// out. Both calls are here rather than one because this type does not
+    /// own the state and the state does not own the socket; the pairing is
+    /// stated in both doc comments and exercised by the probe.
+    pub fn auction_list_items(
+        &mut self,
+        auctioneer: u64,
+        offset: u32,
+        search: &crate::auction::AuctionSearch,
+    ) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::AuctionListItems,
+            &crate::auction::list_items_body(auctioneer, offset, search),
+        )
+    }
+
+    /// Asks what this character is selling. Does not page.
+    pub fn auction_list_owner_items(&mut self, auctioneer: u64) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::AuctionListOwnerItems,
+            &crate::auction::list_owner_items_body(auctioneer, 0),
+        )
+    }
+
+    /// Asks what this character is bidding on.
+    ///
+    /// `outbid` are auctions this client believes it has been outbid on; the
+    /// server looks each one up and adds it to the reply. An empty slice is a
+    /// complete request -- see
+    /// [`crate::auction::list_bidder_items_body`] for what the server does
+    /// with a count that disagrees with the body.
+    pub fn auction_list_bidder_items(
+        &mut self,
+        auctioneer: u64,
+        outbid: &[u32],
+    ) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::AuctionListBidderItems,
+            &crate::auction::list_bidder_items_body(auctioneer, 0, outbid),
+        )
+    }
+
+    /// Posts an auction out of one or more stacks in this character's bags.
+    ///
+    /// Returns `Ok(false)` without sending when the request is one the server
+    /// would **drop in silence** -- no items, a zero count, a zero guid or a
+    /// zero opening bid. Being refused here with a reason beats being ignored
+    /// there without one. See [`crate::auction::sell_item_body`].
+    pub fn auction_sell_item(
+        &mut self,
+        auctioneer: u64,
+        items: &[(u64, u32)],
+        bid: u32,
+        buyout: u32,
+        duration: crate::auction::AuctionDuration,
+    ) -> Result<bool, Error> {
+        match crate::auction::sell_item_body(auctioneer, items, bid, buyout, duration) {
+            Some(body) => {
+                self.send(ClientOpcode::AuctionSellItem, &body)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Bids, or buys out -- **the same request**, separated only by whether
+    /// `price` equals the auction's buyout.
+    ///
+    /// Returns `Ok(false)` without sending for the two inputs the server
+    /// drops in silence.
+    pub fn auction_place_bid(
+        &mut self,
+        auctioneer: u64,
+        auction: u32,
+        price: u32,
+    ) -> Result<bool, Error> {
+        match crate::auction::place_bid_body(auctioneer, auction, price) {
+            Some(body) => {
+                self.send(ClientOpcode::AuctionPlaceBid, &body)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Cancels one of this character's own auctions.
+    ///
+    /// The goods come back **as mail**, so confirming this end to end needs an
+    /// inbox -- 4.27 is what makes 4.30 checkable, and neither milestone's
+    /// opcodes touch the other's.
+    pub fn auction_remove_item(&mut self, auctioneer: u64, auction: u32) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::AuctionRemoveItem,
+            &crate::auction::remove_item_body(auctioneer, auction),
+        )
+    }
+
     /// Sells an item to the open vendor.
     ///
     /// The item is named by **guid** rather than by slot, deliberately: a guid

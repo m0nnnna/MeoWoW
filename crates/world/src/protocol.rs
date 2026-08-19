@@ -147,6 +147,36 @@ pub enum Error {
         got: usize,
     },
 
+    /// The auction page count and the body disagree before a record is read.
+    ///
+    /// A `u32` count in front of 148-byte records, so a header read at the
+    /// wrong offset asks for gigabytes -- the trainer list's shape rather than
+    /// the vendor's, and checked before the allocation for the same reason.
+    #[error(
+        "auction list: {count} records need at least {expected} bytes but the body has {got} \
+         left -- the count is not where this parser thinks"
+    )]
+    AuctionRowCount {
+        count: u32,
+        expected: usize,
+        got: usize,
+    },
+
+    /// `SMSG_AUCTION_LIST_PENDING_SALES` announced records.
+    ///
+    /// This server writes a zero and nothing else -- its loop over the records
+    /// is commented out in its own source -- so the record shape has never
+    /// been observed. Inventing one would produce a structure that parses and
+    /// describes nothing, and the packet is the auction block's bounding
+    /// instrument precisely because its answer cannot vary with state. One
+    /// that did is worth refusing loudly. See
+    /// [`crate::auction::parse_pending_sales`].
+    #[error(
+        "SMSG_AUCTION_LIST_PENDING_SALES announced {count} records, and their shape has never \
+         been observed -- this server has only ever sent an empty one"
+    )]
+    UnconfirmedPendingSales { count: u32 },
+
     /// A mail record named a sender kind whose field width nobody has
     /// observed.
     ///

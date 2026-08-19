@@ -524,6 +524,62 @@ enum Command {
         /// layout with no fixture whatsoever.
         #[arg(long)]
         guild: bool,
+        /// Probe the auction house, and **measure the record stride** rather
+        /// than parse it and believe the answer.
+        ///
+        /// Takes the auctioneer's `creature_template` entry to walk to, or
+        /// nothing to use the nearest NPC that will talk.
+        ///
+        /// The run is deliberately in an order that keeps the silences apart.
+        /// It sends `CMSG_AUCTION_LIST_PENDING_SALES` **first, before finding
+        /// anybody**, because that handler checks nothing and always answers:
+        /// its reply confirms the socket and the opcode block with no fixture
+        /// at all, and every send after it can then be believed or disbelieved
+        /// on its own. Nine of this block's ten requests are silent when the
+        /// auctioneer does not resolve, which is indistinguishable from a
+        /// wrong opcode without that first bound.
+        #[arg(long)]
+        auction: bool,
+        /// Which auctioneer to walk to, by `creature_template` entry.
+        #[arg(long)]
+        auctioneer: Option<u32>,
+        /// Search for this substring instead of listing everything.
+        #[arg(long)]
+        auction_search: Option<String>,
+        /// Start the search at this **row**, not this page.
+        ///
+        /// The reply says how many rows it holds and how many matched, and
+        /// nothing about where in the match they sit -- so this number is also
+        /// handed to `WorldState::expect_auction_page`, and the probe prints
+        /// both so a disagreement is visible.
+        #[arg(long, default_value_t = 0)]
+        auction_offset: u32,
+        /// Post one auction per matching stack in the bags, by item entry.
+        ///
+        /// Repeatable. Each stack becomes its own auction, which is how a
+        /// fixture large enough to page is built -- a page is fifty rows and
+        /// nothing smaller can show a total that exceeds a count.
+        #[arg(long)]
+        auction_sell: Option<u32>,
+        /// Opening bid, in copper, for `--auction-sell`.
+        #[arg(long, default_value_t = 100)]
+        auction_bid: u32,
+        /// Buyout, in copper, for `--auction-sell`. Zero offers none.
+        #[arg(long, default_value_t = 0)]
+        auction_buyout: u32,
+        /// Bid this many copper on the auction named by `--auction-id`.
+        ///
+        /// A price equal to the buyout **is** the buyout; there is no second
+        /// opcode, which is worth seeing rather than reading.
+        #[arg(long)]
+        auction_place: Option<u32>,
+        /// Which auction `--auction-place` or `--auction-cancel` acts on.
+        #[arg(long)]
+        auction_id: Option<u32>,
+        /// Cancel the auction named by `--auction-id`. The goods come back as
+        /// **mail**, so `--mail-list` is what confirms it.
+        #[arg(long)]
+        auction_cancel: bool,
         /// Ask this player, by name, to join the guild.
         ///
         /// Half of a two-client rig: the invitation arrives at *their*
@@ -1521,6 +1577,16 @@ fn main() -> Result<()> {
             mail_wait,
             mail_own_guid,
             guild,
+            auction,
+            auctioneer,
+            auction_search,
+            auction_offset,
+            auction_sell,
+            auction_bid,
+            auction_buyout,
+            auction_place,
+            auction_id,
+            auction_cancel,
             guild_invite,
             guild_accept,
             guild_note,
@@ -1608,6 +1674,16 @@ fn main() -> Result<()> {
                 mail_wait: *mail_wait,
                 mail_own_guid: *mail_own_guid,
                 guild: *guild,
+                auction: *auction,
+                auctioneer: *auctioneer,
+                auction_search: auction_search.as_deref(),
+                auction_offset: *auction_offset,
+                auction_sell: *auction_sell,
+                auction_bid: *auction_bid,
+                auction_buyout: *auction_buyout,
+                auction_place: *auction_place,
+                auction_id: *auction_id,
+                auction_cancel: *auction_cancel,
                 guild_invite: guild_invite.as_deref(),
                 guild_accept: *guild_accept,
                 guild_note: guild_note.as_deref(),
@@ -1824,6 +1900,16 @@ struct WorldRequest<'a> {
     mail_wait: u64,
     mail_own_guid: bool,
     guild: bool,
+    auction: bool,
+    auctioneer: Option<u32>,
+    auction_search: Option<&'a str>,
+    auction_offset: u32,
+    auction_sell: Option<u32>,
+    auction_bid: u32,
+    auction_buyout: u32,
+    auction_place: Option<u32>,
+    auction_id: Option<u32>,
+    auction_cancel: bool,
     guild_invite: Option<&'a str>,
     guild_accept: bool,
     guild_note: Option<&'a str>,
@@ -1966,6 +2052,16 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         mail_wait,
         mail_own_guid,
         guild,
+        auction,
+        auctioneer,
+        auction_search,
+        auction_offset,
+        auction_sell,
+        auction_bid,
+        auction_buyout,
+        auction_place,
+        auction_id,
+        auction_cancel,
         guild_invite,
         guild_accept,
         guild_note,
@@ -2881,6 +2977,27 @@ cast {spell_id} at {} (attempt {attempt})",
                 &mut here,
                 prefer,
                 learn,
+            )?;
+        }
+
+
+        if auction {
+            survey_auction(
+                &mut connection,
+                &mut state,
+                character.guid,
+                &mut here,
+                AuctionProbe {
+                    prefer: auctioneer,
+                    search: auction_search,
+                    offset: auction_offset,
+                    sell: auction_sell,
+                    bid: auction_bid,
+                    buyout: auction_buyout,
+                    place: auction_place,
+                    id: auction_id,
+                    cancel: auction_cancel,
+                },
             )?;
         }
 
@@ -5969,6 +6086,519 @@ fn survey_gossip(
 /// integer are not printable. Same evidence as the M2 event identifier being
 /// four printable characters, and stronger than any amount of range-checking:
 /// a name cannot be arrived at by a coincidence of small integers.
+/// Collects until one of `wanted` arrives or the clock runs out.
+///
+/// **A packet limit does not bound time, and this probe proved it again.**
+/// The first version of `survey_auction` drained with `(2s quiet, 256
+/// packets)`, which is the shape the login burst once used: Elwynn never goes
+/// quiet for two seconds and 256 packets at a few per second is minutes. It
+/// looked exactly like a hang -- no output, no CPU -- and "a stuck run and a
+/// slow one look identical" is precisely why this prints a line per round.
+///
+/// So: a wall clock, short slices, an early exit the moment the answer is
+/// here, and something printed every round. That is the rule this project
+/// wrote after the 37-second login and then walked into twice more.
+fn await_reply(
+    connection: &mut world::Connection,
+    seconds: u64,
+    wanted: &[u16],
+    what: &str,
+) -> Result<Vec<world::client::Packet>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut collected: Vec<world::client::Packet> = Vec::new();
+    let mut round = 0usize;
+    while std::time::Instant::now() < deadline {
+        round += 1;
+        let batch = connection.drain(std::time::Duration::from_millis(250), 64)?;
+        let new = batch.len();
+        collected.extend(batch);
+        if collected.iter().any(|p| wanted.contains(&p.opcode)) {
+            println!("  ({what}: answered on round {round}, {} packets seen)", collected.len());
+            return Ok(collected);
+        }
+        // Every round says something, so a slow wait and a stuck one are
+        // distinguishable without waiting for the end of either.
+        if round % 4 == 0 {
+            println!("  ({what}: {round} rounds, {} packets, {new} last round, still waiting)",
+                collected.len());
+        }
+    }
+    println!("  ({what}: gave up after {seconds}s and {} packets)", collected.len());
+    Ok(collected)
+}
+
+/// What `--auction` needs beyond a connection.
+struct AuctionProbe<'a> {
+    /// Which auctioneer to walk to, by `creature_template` entry.
+    prefer: Option<u32>,
+    search: Option<&'a str>,
+    offset: u32,
+    sell: Option<u32>,
+    bid: u32,
+    buyout: u32,
+    place: Option<u32>,
+    id: Option<u32>,
+    cancel: bool,
+}
+
+/// Probes the auction house, and **measures the record stride** rather than
+/// trusting `world::auction`'s.
+///
+/// The order of the run is the point. Nine of the block's ten requests are
+/// dropped in silence when the auctioneer does not resolve, and a silent send
+/// is indistinguishable from a wrong opcode -- the failure this project walked
+/// into in the vendor block, the party block, the trainer block and all ten of
+/// trade's opcodes. So the **first** thing sent is
+/// `CMSG_AUCTION_LIST_PENDING_SALES`, from wherever the character happens to
+/// be standing, before any NPC has been found: its handler checks nothing at
+/// all -- not the auctioneer, not the range, not the level, not the body it
+/// just read -- and always answers. If that reply arrives, the socket and this
+/// half of the opcode table are proven, and every silence after it is a fact
+/// about the request rather than about the client.
+///
+/// It is a stronger bound than any other city service got. `CMSG_GUILD_ROSTER`
+/// is answered without a guild but still describes state; this one's answer is
+/// a fixed four bytes of zero, because the server's own loop over the records
+/// is commented out. **A reply that cannot vary cannot be mistaken for a reply
+/// that varied.**
+fn survey_auction(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    // Written back, like every other walking probe here: replicated state
+    // holds our login position forever.
+    here: &mut world::Position,
+    probe: AuctionProbe<'_>,
+) -> Result<()> {
+    use world::auction;
+
+    // ---- the bound, before anything else ----------------------------------
+    println!("\n== the bound: CMSG_AUCTION_LIST_PENDING_SALES, with no auctioneer ==");
+    println!("Sent from where the character is standing, naming nothing. This handler");
+    println!("checks nothing and always answers, so what comes back separates \"the");
+    println!("opcode block is wrong\" from \"the request was declined\".");
+    connection.auction_list_pending_sales(0)?;
+    let batch = await_reply(
+        connection,
+        6,
+        &[world::opcode::server::AUCTION_LIST_PENDING_SALES],
+        "the bound",
+    )?;
+    match batch
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::AUCTION_LIST_PENDING_SALES)
+    {
+        Some(reply) => {
+            println!(
+                "  SMSG_AUCTION_LIST_PENDING_SALES came back, {} bytes: {}",
+                reply.body.len(),
+                hex_preview(&reply.body, 32)
+            );
+            match auction::parse_pending_sales(&reply.body) {
+                Ok(count) => println!("  parses, {count} records. The block is reachable."),
+                Err(error) => println!("  did NOT parse: {error}"),
+            }
+        }
+        None => {
+            println!("  NOTHING came back. Everything that did arrive:");
+            dump_unexpected(&batch, "the pending-sales bound");
+            println!("  This is the informative failure: the one request in the block that");
+            println!("  cannot be declined was not answered, so the opcode number or the");
+            println!("  socket is wrong and nothing below is worth reading.");
+        }
+    }
+    state.replicate(&batch, None);
+
+    // ---- find an auctioneer ----------------------------------------------
+    let Some(npc) = approach_talker(connection, state, own_guid, here, probe.prefer)? else {
+        return Ok(());
+    };
+    let (chosen, entry, flags, distance) = (npc.guid, npc.entry, npc.flags, npc.distance);
+    connection.set_selection(chosen)?;
+    println!(
+        "\nasking {chosen:#018x} entry {entry} at {distance:.1} units, npcflag {flags} ({flags:#x})"
+    );
+
+    // Say what the flag word claims before sending, so a refusal has somewhere
+    // to be explained -- the same move `--trainer` makes. The bit is a
+    // hypothesis from the server's own header and is confirmed here by
+    // behaviour: a unit carrying it answers the greeting and a unit without it
+    // does not.
+    const AUCTIONEER_BIT: u32 = 0x0020_0000;
+    if flags & AUCTIONEER_BIT == 0 {
+        println!("  note: bit 0x200000 is NOT set on this unit, so the server will refuse.");
+        println!("  Sending anyway: a silence from a unit that admits it is not an");
+        println!("  auctioneer is a *different* observation from silence at one that is,");
+        println!("  and only the pair says the bit means what it claims.");
+    }
+
+    // ---- the greeting, and the only packet that names a house -------------
+    println!("\n== MSG_AUCTION_HELLO ==");
+    connection.auction_hello(chosen)?;
+    let batch = await_reply(connection, 8, &[world::opcode::server::AUCTION_HELLO], "the greeting")?;
+    match batch
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::AUCTION_HELLO)
+    {
+        Some(reply) => {
+            println!("  {} bytes: {}", reply.body.len(), hex_preview(&reply.body, 32));
+            match auction::parse_auction_hello(&reply.body) {
+                Ok(house) => println!(
+                    "  house {} , enabled {} , auctioneer {:#018x}",
+                    house.house, house.enabled, house.auctioneer
+                ),
+                Err(error) => println!("  did NOT parse: {error}"),
+            }
+        }
+        None => {
+            println!("  no MSG_AUCTION_HELLO. Everything that arrived:");
+            dump_unexpected(&batch, "the auction greeting");
+        }
+    }
+    state.replicate(&batch, None);
+
+    // ---- post, before listing, so the list has something in it ------------
+    if let Some(wanted) = probe.sell {
+        post_auctions(
+            connection,
+            state,
+            own_guid,
+            chosen,
+            wanted,
+            probe.bid,
+            probe.buyout,
+        )?;
+    }
+
+    if let Some(auction_id) = probe.place {
+        let target = probe.id.unwrap_or(0);
+        println!("\n== CMSG_AUCTION_PLACE_BID: {auction_id} copper on auction {target} ==");
+        println!("A price equal to the buyout *is* the buyout -- one opcode, two buttons.");
+        if !connection.auction_place_bid(chosen, target, auction_id)? {
+            println!("  refused here rather than in silence: a zero id or a zero price is");
+            println!("  dropped by the server without a word.");
+        } else {
+            let batch = await_reply(
+                connection,
+                8,
+                &[world::opcode::server::AUCTION_COMMAND_RESULT],
+                "the bid",
+            )?;
+            report_auction_results(&batch);
+            state.replicate(&batch, None);
+        }
+    }
+
+    if probe.cancel {
+        let target = probe.id.unwrap_or(0);
+        println!("\n== CMSG_AUCTION_REMOVE_ITEM: auction {target} ==");
+        println!("The goods come back as *mail*, not to the bag. --mail-list confirms it.");
+        connection.auction_remove_item(chosen, target)?;
+        let batch = await_reply(
+            connection,
+            8,
+            &[world::opcode::server::AUCTION_COMMAND_RESULT],
+            "the cancellation",
+        )?;
+        report_auction_results(&batch);
+        state.replicate(&batch, None);
+    }
+
+    // ---- the owner list: the cheapest check on the footer -----------------
+    println!("\n== CMSG_AUCTION_LIST_OWNER_ITEMS ==");
+    println!("This list never pages, so its total must equal its count. A body whose");
+    println!("two numbers disagree says the footer is not where the parser thinks.");
+    connection.auction_list_owner_items(chosen)?;
+    let batch = await_reply(
+        connection,
+        10,
+        &[world::opcode::server::AUCTION_OWNER_LIST_RESULT],
+        "the owner list",
+    )?;
+    let owner = batch
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::AUCTION_OWNER_LIST_RESULT)
+        .map(|p| p.body.clone());
+    match &owner {
+        Some(body) => report_auction_page(body, 0, "SMSG_AUCTION_OWNER_LIST_RESULT"),
+        None => {
+            println!("  no owner list came back. Everything that arrived:");
+            dump_unexpected(&batch, "the owner list");
+        }
+    }
+    state.replicate(&batch, None);
+
+    // ---- the search --------------------------------------------------------
+    let mut search = match probe.search {
+        Some(name) => auction::AuctionSearch::named(name),
+        None => auction::AuctionSearch::any(),
+    };
+    // Sorted by nothing on purpose. The server only *applies* a sort block
+    // when the match exceeds one page, so asking for one over a small fixture
+    // would produce a result indistinguishable from asking for none -- and a
+    // test that cannot come out the other way is not evidence.
+    search.sort.clear();
+
+    println!(
+        "\n== CMSG_AUCTION_LIST_ITEMS, from row {} , name {:?} ==",
+        probe.offset,
+        probe.search.unwrap_or("")
+    );
+    // The pairing this block exists to exercise: the offset goes out on the
+    // wire and is *also* told to the state, because the reply does not carry
+    // it. Adjacent on purpose.
+    state.expect_auction_page(probe.offset);
+    connection.auction_list_items(chosen, probe.offset, &search)?;
+    let batch = await_reply(
+        connection,
+        10,
+        &[world::opcode::server::AUCTION_LIST_RESULT],
+        "the search",
+    )?;
+    let first = batch
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::AUCTION_LIST_RESULT)
+        .map(|p| p.body.clone());
+    match &first {
+        Some(body) => report_auction_page(body, probe.offset, "SMSG_AUCTION_LIST_RESULT"),
+        None => {
+            println!("  no search result came back. Everything that arrived:");
+            dump_unexpected(&batch, "the auction search");
+        }
+    }
+    state.replicate(&batch, None);
+    if let Some(page) = &state.auctions {
+        println!(
+            "  state holds one page: offset {} , {} rows, {} matched, {} pages",
+            page.offset,
+            page.auctions.len(),
+            page.total,
+            page.pages()
+        );
+        if let Some(next) = page.next_offset() {
+            println!("  the match does not fit in this packet; next row is {next}");
+        }
+    }
+
+    // ---- the measurement --------------------------------------------------
+    //
+    // **Two packets with different counts is the whole measurement.** With a
+    // fixed-width record and a fixed footer, `len = 4 + count * stride + 8`,
+    // so the difference of two lengths over the difference of two counts is
+    // the stride and neither the header nor the footer appears in it. One
+    // packet cannot do this: it can only say which candidate accounts for the
+    // body, and that answer is only unique because the footer's width is
+    // already assumed.
+    println!("\n== the record stride, measured ==");
+    let counted = |body: &Vec<u8>| {
+        u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize
+    };
+    match (&owner, &first) {
+        (Some(a), Some(b)) if a.len() >= 4 && b.len() >= 4 => {
+            let (ca, cb) = (counted(a), counted(b));
+            println!("  owner list: {ca} rows in {} bytes", a.len());
+            println!("  search:     {cb} rows in {} bytes", b.len());
+            match auction::stride_between((a.len(), ca as u32), (b.len(), cb as u32)) {
+                Some(stride) => {
+                    println!("  two counts differ by {}, two lengths by {} -> stride {stride}",
+                        (cb as i64 - ca as i64).abs(),
+                        (b.len() as i64 - a.len() as i64).abs());
+                    println!(
+                        "  world::auction::RECORD_BYTES is {} -- {}",
+                        auction::RECORD_BYTES,
+                        if stride == auction::RECORD_BYTES { "AGREES" } else { "DISAGREES" }
+                    );
+                }
+                None => {
+                    println!("  the two packets carry the SAME number of rows, so they cannot");
+                    println!("  separate a stride from a header. That is the honest answer --");
+                    println!("  post or cancel an auction and run it again.");
+                }
+            }
+        }
+        _ => println!("  need both an owner list and a search result to measure."),
+    }
+    for body in [&owner, &first].into_iter().flatten() {
+        let fits = auction::measure_stride(
+            body,
+            &[
+                auction::RECORD_BYTES - 8,
+                auction::RECORD_BYTES - 4,
+                auction::RECORD_BYTES,
+                auction::RECORD_BYTES + 4,
+            ],
+        );
+        println!("  single-packet scoring of a {}-byte body:", body.len());
+        for fit in &fits {
+            println!(
+                "    {:>4} bytes: {} body, total {:?} {}, delay {:?}",
+                fit.stride,
+                if fit.accounts_for_body { "accounts for" } else { "does NOT account for" },
+                fit.total,
+                if fit.total_is_possible { "possible" } else { "IMPOSSIBLE" },
+                fit.delay,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Posts one auction per matching stack in the bags.
+///
+/// **One auction per stack, not one per item**, which is what makes a fixture
+/// big enough to page: a page is fifty rows and nothing smaller can show a
+/// total that exceeds a count. The server merges every stack named in a single
+/// request into one auction, so several requests are the only way.
+fn post_auctions(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    auctioneer: u64,
+    entry: u32,
+    bid: u32,
+    buyout: u32,
+) -> Result<()> {
+    use world::auction::AuctionDuration;
+
+    let stacks: Vec<(u64, u32)> = world::inventory::carried(state, own_guid)
+        .iter()
+        .filter(|c| c.item.entry == Some(entry))
+        .map(|c| (c.item.guid, c.item.count.max(1)))
+        .collect();
+
+    println!("\n== CMSG_AUCTION_SELL_ITEM: {} stacks of entry {entry} ==", stacks.len());
+    if stacks.is_empty() {
+        println!("  nothing in the bags matches. `.additem {entry} <n>` first -- and note");
+        println!("  that `.additem` needs `.save`, because a session that ends by closing");
+        println!("  the socket never writes the inventory back.");
+        return Ok(());
+    }
+
+    let mut posted = 0usize;
+    let mut refused = 0usize;
+    for (guid, count) in &stacks {
+        if !connection.auction_sell_item(
+            auctioneer,
+            &[(*guid, *count)],
+            bid,
+            buyout,
+            AuctionDuration::TwelveHours,
+        )? {
+            refused += 1;
+            continue;
+        }
+        posted += 1;
+        // The server states its own search delay in every list result; a burst
+        // of posts has no such number, and a party loot control clicked
+        // repeatedly once closed the socket outright. Paced deliberately.
+        let batch = await_reply(
+            connection,
+            4,
+            &[world::opcode::server::AUCTION_COMMAND_RESULT],
+            "the post",
+        )?;
+        report_auction_results(&batch);
+        state.replicate(&batch, None);
+    }
+    // Both numbers, always: a counter that only speaks on failure cannot tell
+    // "none were wrong" from "there were none".
+    println!("  {posted} sent, {refused} refused before sending");
+    Ok(())
+}
+
+/// Prints every `SMSG_AUCTION_COMMAND_RESULT` in a batch, and says so when
+/// there are none.
+fn report_auction_results(batch: &[world::client::Packet]) {
+    use world::auction;
+
+    let mut seen = 0usize;
+    for packet in batch {
+        if packet.opcode != world::opcode::server::AUCTION_COMMAND_RESULT {
+            continue;
+        }
+        seen += 1;
+        match auction::parse_command_result(&packet.body) {
+            Ok(outcome) => println!(
+                "  {} auction {}: {} (error {}, bid error {:?})",
+                outcome.action.label(),
+                outcome.auction,
+                auction::describe_auction_error(outcome.error),
+                outcome.error,
+                outcome.bid_error,
+            ),
+            Err(error) => println!(
+                "  SMSG_AUCTION_COMMAND_RESULT, {} bytes, did NOT parse: {error} -- {}",
+                packet.body.len(),
+                hex_preview(&packet.body, 32)
+            ),
+        }
+    }
+    if seen == 0 {
+        println!("  no SMSG_AUCTION_COMMAND_RESULT. Everything that arrived:");
+        dump_unexpected(batch, "an auction command");
+    }
+}
+
+/// Prints one list result: its bytes, its two counts, and its rows.
+fn report_auction_page(body: &[u8], offset: u32, what: &'static str) {
+    use world::auction;
+
+    // **The body, not the length.** A parser that declines an unconfirmed
+    // shape is only useful if the shape survives the refusal.
+    println!("  {what}, {} bytes:", body.len());
+    println!("    {}", hex_preview(body, 320));
+    match auction::parse_auction_page(body, offset, what) {
+        Ok(page) => {
+            println!(
+                "    {} rows in this packet, {} matched in the house, delay {}ms",
+                page.auctions.len(),
+                page.total,
+                page.search_delay_ms
+            );
+            if page.past_the_end() {
+                // Printed as its own case rather than as a page number,
+                // because the naive arithmetic says "page 3 of 1" here -- and
+                // it printed exactly that before this branch existed.
+                println!(
+                    "    PAST THE END: row {} of a {}-row match, {} page(s)",
+                    page.offset,
+                    page.total,
+                    page.pages()
+                );
+            } else if page.is_whole() {
+                println!("    this packet holds the whole match");
+            } else {
+                println!(
+                    "    THE PAGE IS NOT THE LIST: {} of {} , page {} of {}",
+                    page.auctions.len(),
+                    page.total,
+                    page.offset / auction::PAGE_ROWS as u32 + 1,
+                    page.pages()
+                );
+            }
+            for a in page.auctions.iter().take(12) {
+                println!(
+                    "    #{:<6} item {:<6} x{:<3} start {:<8} bid {:<8} +{:<6} buyout {:<8} {:<9} owner {:#018x}",
+                    a.id,
+                    a.item,
+                    a.count,
+                    a.start_bid,
+                    a.bid,
+                    a.min_increment,
+                    a.buyout,
+                    a.band().label(),
+                    a.owner,
+                );
+            }
+            if page.auctions.len() > 12 {
+                println!("    ... and {} more in this packet", page.auctions.len() - 12);
+            }
+        }
+        Err(error) => println!("    did NOT parse: {error}"),
+    }
+}
+
 fn survey_trainer(
     connection: &mut world::Connection,
     state: &mut world::WorldState,

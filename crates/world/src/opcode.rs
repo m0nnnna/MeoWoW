@@ -825,6 +825,80 @@ pub enum ClientOpcode {
 
     /// Set the longer information text. Body is the text.
     GuildInfoText = 0x02FC,
+
+    /// Greet an auctioneer. A `MSG_` opcode: the request and the reply share
+    /// this number, like [`QueryNextMailTime`](Self::QueryNextMailTime).
+    /// Body is the auctioneer's guid, unpacked.
+    ///
+    /// The reply names the **auction house** the NPC belongs to, which is the
+    /// thing a display id and a name cannot say: an auctioneer in Ironforge
+    /// and one in Stormwind serve the same house, and one in Booty Bay serves
+    /// a third that both factions share. See [`crate::auction::AuctionHouse`].
+    AuctionHello = 0x0255,
+
+    /// Post an auction. See [`crate::auction::sell_item_body`].
+    ///
+    /// **Answered either way** by
+    /// [`AUCTION_COMMAND_RESULT`](server::AUCTION_COMMAND_RESULT) -- once the
+    /// auctioneer resolves. Before that it is one of the silent ones, and the
+    /// difference matters: the server drops this packet without a word when
+    /// the guid is not an auctioneer in range, which is indistinguishable
+    /// from a wrong opcode.
+    AuctionSellItem = 0x0256,
+
+    /// Cancel one of your own auctions. `{u64 auctioneer, u32 auction id}`.
+    ///
+    /// The goods come back **as mail**, not to the bag, which is why this
+    /// milestone can only be checked end to end by a client that already has
+    /// an inbox. 4.27 is a prerequisite for confirming 4.30 and neither
+    /// milestone's opcodes touch the other's.
+    AuctionRemoveItem = 0x0257,
+
+    /// Search. The heaviest body this client builds, and the only request in
+    /// the whole protocol that carries a **sort order** -- see
+    /// [`crate::auction::list_items_body`].
+    ///
+    /// The reply is one **page**, and the page is the server's decision. See
+    /// [`crate::auction::AuctionPage`] for what that costs a client.
+    AuctionListItems = 0x0258,
+
+    /// List what this character is selling. `{u64 auctioneer, u32 offset}`,
+    /// and **the offset is read and ignored** -- the owner list has no paging
+    /// because it cannot be long enough to need any.
+    AuctionListOwnerItems = 0x0259,
+
+    /// Bid. `{u64 auctioneer, u32 auction id, u32 price}`.
+    ///
+    /// A price equal to the buyout is a **buyout**; there is no separate
+    /// opcode for one, which is worth stating because an interface that draws
+    /// two buttons is drawing one request twice.
+    AuctionPlaceBid = 0x025A,
+
+    /// List what this character is bidding on.
+    /// `{u64 auctioneer, u32 offset, u32 count, count * u32 auction id}`.
+    ///
+    /// The trailing ids are auctions the client believes it has been outbid
+    /// on, and the server merely looks each one up and adds it to the reply
+    /// -- so a client that sends none gets the same list minus nothing it did
+    /// not already know about. AzerothCore's own comment on the field is
+    /// *"which I'm honestly not entirely sure why?"*.
+    AuctionListBidderItems = 0x0264,
+
+    /// Ask for sales awaiting collection. Body is eight bytes the server
+    /// **reads and discards**.
+    ///
+    /// **This is the auction block's bounding instrument**, and it is a
+    /// stronger one than any other city service got. `CMSG_GUILD_ROSTER` is
+    /// answered without a guild but still needs a character;
+    /// `CMSG_TRAINER_LIST` needs a trainer standing in front of you. This
+    /// handler checks *nothing at all* -- not the auctioneer, not the range,
+    /// not the level, not the body it just read -- and always replies with
+    /// [`AUCTION_LIST_PENDING_SALES`](server::AUCTION_LIST_PENDING_SALES).
+    /// So one send, from anywhere in the world, with no fixture, separates
+    /// "this client cannot talk to the auction house" from "there is nothing
+    /// to talk about". Every other request in this block is conditional on an
+    /// NPC and silent when the condition fails.
+    AuctionListPendingSales = 0x048F,
 }
 
 /// The server-to-client opcodes this client reacts to.
@@ -992,6 +1066,55 @@ pub mod server {
     /// Which mailbox the server has just opened, when one was reached through
     /// a gossip menu. Eight bytes, the object's guid.
     pub const SHOW_MAILBOX: u16 = 0x0297;
+
+    /// The reply half of [`AuctionHello`](crate::ClientOpcode::AuctionHello),
+    /// sharing its number: `{u64 auctioneer, u32 house id, u8 enabled}`.
+    ///
+    /// **The only thing here that names a house.** Every other auction packet
+    /// is silent about which of the three sets of goods it belongs to, and a
+    /// client that greeted an auctioneer in Booty Bay and then searched at one
+    /// in Stormwind would get a different world with no packet ever saying so.
+    pub const AUCTION_HELLO: u16 = 0x0255;
+
+    /// The answer to a post, a bid or a cancellation:
+    /// `{u32 auction id, u32 action, u32 error}`, and **a fourth word only
+    /// when the error is zero and the action is not**. See
+    /// [`crate::auction::AuctionOutcome`].
+    pub const AUCTION_COMMAND_RESULT: u16 = 0x025B;
+
+    /// One **page** of a search. See [`crate::auction::parse_auction_page`].
+    pub const AUCTION_LIST_RESULT: u16 = 0x025C;
+
+    /// Everything this character is selling, in the same shape as
+    /// [`AUCTION_LIST_RESULT`] -- and its `total` always equals its `count`,
+    /// which is the cheapest confirmation available that the trailing word is
+    /// a total rather than something else.
+    pub const AUCTION_OWNER_LIST_RESULT: u16 = 0x025D;
+
+    /// Everything this character is bidding on, same shape again.
+    pub const AUCTION_BIDDER_LIST_RESULT: u16 = 0x0265;
+
+    /// Somebody has outbid this character, or this character's bid has won.
+    /// Arrives **unprompted**, like [`RECEIVED_MAIL`] -- the second packet in
+    /// this client that answers nothing, and the first one that says what
+    /// happened rather than merely that something did.
+    pub const AUCTION_BIDDER_NOTIFICATION: u16 = 0x025E;
+
+    /// One of this character's auctions has sold. Also unprompted.
+    pub const AUCTION_OWNER_NOTIFICATION: u16 = 0x025F;
+
+    /// An auction is gone. Unprompted, and this server never sends it.
+    pub const AUCTION_REMOVED_NOTIFICATION: u16 = 0x028D;
+
+    /// Sales awaiting collection, in answer to
+    /// [`AuctionListPendingSales`](crate::ClientOpcode::AuctionListPendingSales).
+    ///
+    /// **Always sent, and on this realm always empty** -- a `u32` zero and
+    /// nothing else, because the server's loop over the records is commented
+    /// out in its own source. That is exactly what makes it the block's
+    /// bounding instrument: a reply whose *content* is fixed cannot be
+    /// mistaken for a reply that depended on state.
+    pub const AUCTION_LIST_PENDING_SALES: u16 = 0x0490;
 
     /// A guild's name, rank names and tabard, in answer to
     /// [`GuildQuery`](crate::ClientOpcode::GuildQuery).
@@ -1339,6 +1462,15 @@ pub fn describe(opcode: u16) -> String {
         server::RECEIVED_MAIL => "SMSG_RECEIVED_MAIL",
         server::QUERY_NEXT_MAIL_TIME => "MSG_QUERY_NEXT_MAIL_TIME",
         server::SHOW_MAILBOX => "SMSG_SHOW_MAILBOX",
+        server::AUCTION_HELLO => "MSG_AUCTION_HELLO",
+        server::AUCTION_COMMAND_RESULT => "SMSG_AUCTION_COMMAND_RESULT",
+        server::AUCTION_LIST_RESULT => "SMSG_AUCTION_LIST_RESULT",
+        server::AUCTION_OWNER_LIST_RESULT => "SMSG_AUCTION_OWNER_LIST_RESULT",
+        server::AUCTION_BIDDER_LIST_RESULT => "SMSG_AUCTION_BIDDER_LIST_RESULT",
+        server::AUCTION_BIDDER_NOTIFICATION => "SMSG_AUCTION_BIDDER_NOTIFICATION",
+        server::AUCTION_OWNER_NOTIFICATION => "SMSG_AUCTION_OWNER_NOTIFICATION",
+        server::AUCTION_REMOVED_NOTIFICATION => "SMSG_AUCTION_REMOVED_NOTIFICATION",
+        server::AUCTION_LIST_PENDING_SALES => "SMSG_AUCTION_LIST_PENDING_SALES",
         server::QUESTGIVER_STATUS => "SMSG_QUESTGIVER_STATUS",
         server::QUESTGIVER_STATUS_MULTIPLE => "SMSG_QUESTGIVER_STATUS_MULTIPLE",
         server::QUESTGIVER_QUEST_LIST => "SMSG_QUESTGIVER_QUEST_LIST",

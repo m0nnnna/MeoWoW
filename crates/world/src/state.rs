@@ -1058,6 +1058,32 @@ pub struct Replication {
     /// reply to a request. Dropping them would collapse a take, a delete and a
     /// return into one indistinguishable silence.
     pub mail_results: Vec<crate::mail::MailResult>,
+    /// Auction pages described this batch -- a search result, an owner list or
+    /// a bidder list.
+    ///
+    /// Counted for the reason inboxes and rosters are, and with one more:
+    /// **an empty page and an unanswered request are the same picture**, and
+    /// here the difference is load-bearing, because nine of the block's ten
+    /// requests fail in silence when the auctioneer does not resolve.
+    pub auction_pages: usize,
+    /// What the server said about a post, a bid or a cancellation.
+    ///
+    /// Events rather than state, like `mail_results`, and for the same reason:
+    /// the result echoes the action it was for, which is the only thing tying
+    /// a reply to its request.
+    pub auction_results: Vec<crate::auction::AuctionOutcome>,
+    /// Outbid, or won -- **unprompted**, like `received_mail`, and unlike it
+    /// these carry a payload worth showing.
+    pub auction_bids: Vec<crate::auction::BidderNotification>,
+    /// One of this character's auctions sold. Also unprompted.
+    pub auction_sales: Vec<crate::auction::OwnerNotification>,
+    /// `SMSG_AUCTION_LIST_PENDING_SALES` replies this batch.
+    ///
+    /// A bare count of an always-empty packet, which sounds useless and is
+    /// the auction block's **bounding instrument**: it is the one thing that
+    /// separates "this client cannot reach the auction house" from "there is
+    /// nothing there", because its handler checks nothing and always answers.
+    pub auction_pending_replies: usize,
     /// Inboxes described this batch. Folded into [`WorldState::mail`]; counted
     /// here so a probe can say "the request was answered" separately from
     /// "the inbox is empty", which are the same picture and different facts.
@@ -1345,6 +1371,36 @@ pub struct WorldState {
     /// is still a mailbox with something unread.
     pub mail_waiting: bool,
 
+    /// The auction house this client last greeted, if any.
+    ///
+    /// **The only fact in the whole block that names which house is being
+    /// looked at.** No list result, bid or cancellation mentions it, so a
+    /// client that lets the player walk from a Stormwind auctioneer to a
+    /// Booty Bay one without noticing shows one house's rows while sending
+    /// another house's requests, and nothing on the wire ever says so.
+    pub auction_house: Option<crate::auction::AuctionHouse>,
+
+    /// One page of auctions -- **one**, never a growing collection.
+    ///
+    /// See [`crate::auction::AuctionPage`] for why merging successive pages
+    /// produces something that looks like the auction house and is a union of
+    /// snapshots that was never true at any instant.
+    ///
+    /// `None` means never asked, which is drawn differently from a search
+    /// that matched nothing.
+    pub auctions: Option<crate::auction::AuctionPage>,
+
+    /// Where the outstanding search was asked to start.
+    ///
+    /// **The one thing about a page that the wire does not carry.** The reply
+    /// states how many rows it holds and how many matched, and says nothing
+    /// about where in the match those rows are -- so the requester is the only
+    /// thing that knows, and this is the single place it is kept rather than a
+    /// number threaded through the parse. Set by
+    /// [`WorldState::expect_auction_page`] on the way out; zero is right for
+    /// the first search and for the owner and bidder lists, which never page.
+    pub auction_offset: u32,
+
     /// The guild roster, as last described.
     ///
     /// **A snapshot of people who are mostly not in the world**, and the one
@@ -1378,6 +1434,28 @@ pub struct WorldState {
 impl WorldState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Remember where the auction search that is going out was asked to
+    /// start.
+    ///
+    /// **Call this on every search, including the first.** The reply carries
+    /// how many rows it holds and how many matched, and nothing at all about
+    /// where in the match those rows sit -- so an
+    /// [`AuctionPage`](crate::auction::AuctionPage) that arrives without this
+    /// having been called describes itself as page one, which is right until
+    /// somebody pages forward and then silently wrong in the direction that
+    /// looks fine: the rows are real, the count is real, and the "showing 51
+    /// to 100" the interface draws is a lie.
+    ///
+    /// Kept on the state rather than passed through the parse because there is
+    /// exactly one outstanding search and therefore exactly one right answer;
+    /// a parameter threaded from the caller is a parameter that can be passed
+    /// wrong.
+    ///
+    /// The owner and bidder lists do not page, so they ignore this entirely.
+    pub fn expect_auction_page(&mut self, offset: u32) {
+        self.auction_offset = offset;
     }
 
     pub fn stats(&self) -> Stats {
@@ -3005,6 +3083,95 @@ impl WorldState {
                 crate::opcode::server::QUERY_NEXT_MAIL_TIME => {
                     match crate::mail::parse_next_mail_time(&packet.body) {
                         Ok(next) => self.mail_waiting = next.has_unread(),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::AUCTION_HELLO => {
+                    match crate::auction::parse_auction_hello(&packet.body) {
+                        Ok(house) => self.auction_house = Some(house),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // All three list results share one layout exactly, which is
+                // why one parser reads them -- and the owner list is the
+                // cheapest check on the footer available, because its total
+                // always equals its count.
+                crate::opcode::server::AUCTION_LIST_RESULT
+                | crate::opcode::server::AUCTION_OWNER_LIST_RESULT
+                | crate::opcode::server::AUCTION_BIDDER_LIST_RESULT => {
+                    // Named per opcode so a failure says which of the three
+                    // lists it was, and as a `&'static str` because the error
+                    // type takes one -- three constants here rather than
+                    // `describe`'s owned string.
+                    let what = match packet.opcode {
+                        crate::opcode::server::AUCTION_OWNER_LIST_RESULT => {
+                            "SMSG_AUCTION_OWNER_LIST_RESULT"
+                        }
+                        crate::opcode::server::AUCTION_BIDDER_LIST_RESULT => {
+                            "SMSG_AUCTION_BIDDER_LIST_RESULT"
+                        }
+                        _ => "SMSG_AUCTION_LIST_RESULT",
+                    };
+                    // The offset is not on the wire. See
+                    // `WorldState::expect_auction_page`.
+                    let offset = if packet.opcode == crate::opcode::server::AUCTION_LIST_RESULT {
+                        self.auction_offset
+                    } else {
+                        0
+                    };
+                    match crate::auction::parse_auction_page(&packet.body, offset, what) {
+                        Ok(page) => {
+                            report.auction_pages += 1;
+                            self.auctions = Some(page);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::AUCTION_COMMAND_RESULT => {
+                    match crate::auction::parse_command_result(&packet.body) {
+                        Ok(outcome) => report.auction_results.push(outcome),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::AUCTION_BIDDER_NOTIFICATION => {
+                    match crate::auction::parse_bidder_notification(&packet.body) {
+                        Ok(notice) => report.auction_bids.push(notice),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::AUCTION_OWNER_NOTIFICATION => {
+                    match crate::auction::parse_owner_notification(&packet.body) {
+                        Ok(notice) => report.auction_sales.push(notice),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::AUCTION_LIST_PENDING_SALES => {
+                    match crate::auction::parse_pending_sales(&packet.body) {
+                        Ok(_) => report.auction_pending_replies += 1,
                         Err(error) => report.failures.push((
                             packet.opcode,
                             error,

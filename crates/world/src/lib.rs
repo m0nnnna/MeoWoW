@@ -8,6 +8,7 @@
 //! Written from public protocol documentation. Nothing here is derived from a
 //! GPL server implementation -- see `docs/REUSE-POLICY.md`.
 
+pub mod auction;
 pub mod chat;
 pub mod combat;
 pub mod client;
@@ -37,6 +38,10 @@ pub mod update;
 pub mod vendor;
 pub mod weather;
 
+pub use auction::{
+    Auction, AuctionAction, AuctionDuration, AuctionHouse, AuctionOutcome, AuctionPage,
+    AuctionSearch, BidderNotification, OwnerNotification, SortKey, TimeBand,
+};
 pub use chat::{ChatMessage, ChatType};
 pub use client::{Connection, DEFAULT_PORT};
 pub use crypt::HeaderCrypt;
