@@ -4125,6 +4125,13 @@ impl App {
         // walk, not a free-flying camera -- see `drive_live_movement`.
         if self.live.is_some() {
             self.drive_live_movement();
+            // **Unconditionally, and after movement rather than inside it.**
+            // A taxi flight returns early from `drive_live_movement`, and
+            // while the camera placement lived in that function's tail the
+            // view stayed where the character took off from -- watching an
+            // empty field while the minimap tracked them across the map.
+            let dt = (self.frame_ms / 1000.0).max(0.0);
+            self.follow_camera_to_character(dt);
             self.pump_live_connection();
             // After the pump, because the spellbook it needs arrives through
             // it, and because both want the archive chain.
@@ -5069,11 +5076,33 @@ impl App {
         // Only the vertical is eased. Smoothing the horizontal too would make
         // the camera trail behind a running character, trading a shake for a
         // lag nobody asked for.
-        let follow_z = Self::camera_follow_z(&mut self.camera_z, live.position.z, dt);
-        let camera_at = glam::Vec3::new(live.position.x, live.position.y, follow_z);
+    }
+
+    /// Puts the camera behind the character.
+    ///
+    /// **Its own method because it is not movement**, and having it live in
+    /// the tail of `drive_live_movement` cost a real bug: a taxi flight
+    /// returns early from that function -- deliberately, so no input,
+    /// collision or ground assignment runs -- and took the camera placement
+    /// with it. The character took off, the minimap tracked them across the
+    /// map, and the view stayed in Westfall watching an empty field. The
+    /// streaming centre follows the camera, so the world stopped loading with
+    /// it.
+    ///
+    /// The lesson is the early return's, not the flight's: a wholesale
+    /// replacement is the right shape for the position writes *because* they
+    /// must all be skipped together, and it is the wrong shape for anything
+    /// that merely happened to share the function.
+    fn follow_camera_to_character(&mut self, dt: f32) {
+        let Some(live) = self.live.as_ref() else {
+            return;
+        };
+        let (position, orientation) = (live.position, live.orientation);
+        let follow_z = Self::camera_follow_z(&mut self.camera_z, position.z, dt);
+        let camera_at = glam::Vec3::new(position.x, position.y, follow_z);
         let placed = orbit_around(
             camera_at,
-            live.orientation + self.camera_yaw_offset,
+            orientation + self.camera_yaw_offset,
             self.camera_pitch,
             self.camera_distance,
         );
@@ -5107,6 +5136,7 @@ impl App {
             fly.pitch = placed.pitch;
         }
     }
+
 
     /// Handles one keypress while a chat line is being written.
     ///
@@ -7608,6 +7638,16 @@ impl App {
                         started: Instant::now(),
                         orientation_before: live.orientation,
                     });
+                    // **The windows close because the conversation is over.**
+                    // Taking off is the flight master's answer, and a list of
+                    // destinations left on screen while the character is in
+                    // the air offers flights from a node they have already
+                    // left -- which the server refuses, from a window that
+                    // looks perfectly live. Closed on the takeoff rather than
+                    // on the click, so a refused flight leaves the list up to
+                    // try again with.
+                    self.taxi = None;
+                    self.questgiver = None;
                     // A flight cancels every local motion state. None of
                     // these survive being put on a gryphon, and a jump arc
                     // still running would fight the spline for the altitude.
