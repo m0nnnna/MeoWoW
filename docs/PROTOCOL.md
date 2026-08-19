@@ -1101,3 +1101,186 @@ assignment, and party chat. `LootRule`, `group_type`, `own_subgroup`,
 and are read by nothing: they are `0` in every party, so there is nothing here
 that could be checked against a real raid, and an interface guessed from fields
 that are always zero would be fiction.
+## Trade, and the first request whose success this client cannot see
+
+Everything above this is one end asking and the other answering. A vendor sells
+to whoever asks, a trainer teaches whoever asks, a flight master flies whoever
+asks -- and the answering end is always the server, which is always listening.
+Trade is the first exchange in this client where the far end is **another
+person's client**, and that one fact decides what can be measured.
+
+Twelve opcodes, ten out and two in:
+
+| request | body | what answers it |
+|---|---|---|
+| `CMSG_INITIATE_TRADE` `0x0116` | `u64` partner, unpacked | nothing, on success -- the *partner* gets `BEGIN_TRADE` |
+| `CMSG_BEGIN_TRADE` `0x0117` | empty | `OPEN_WINDOW` at **both** ends |
+| `CMSG_BUSY_TRADE` `0x0118` | empty | `TRADE_CANCELED` |
+| `CMSG_IGNORE_TRADE` `0x0119` | empty | not sent by this client -- there is no ignore list here |
+| `CMSG_ACCEPT_TRADE` `0x011A` | `u32` token | `TRADE_ACCEPT` at the *partner* |
+| `CMSG_UNACCEPT_TRADE` `0x011B` | empty | `BACK_TO_TRADE` at the other end |
+| `CMSG_CANCEL_TRADE` `0x011C` | empty | `TRADE_CANCELED` |
+| `CMSG_SET_TRADE_ITEM` `0x011D` | `{u8 trade slot, u8 bag, u8 slot}` | the partner's copy of the offer |
+| `CMSG_CLEAR_TRADE_ITEM` `0x011E` | `u8` trade slot | the same |
+| `CMSG_SET_TRADE_GOLD` `0x011F` | `u32` copper | the same, or `BUSY` if the sender has not got it |
+| | | |
+| `SMSG_TRADE_STATUS` `0x0120` | `u32` status, then a tail **the status decides** | |
+| `SMSG_TRADE_STATUS_EXTENDED` `0x0121` | fixed 532 bytes, one side's half | |
+
+### The refusal is the instrument
+
+**Every request in this block is silent when it works.** The usual bounding move
+-- send an answered request first, then the silent one, the way
+`CMSG_LIST_INVENTORY` bounded `CMSG_BUY_ITEM` -- has nothing inside this block to
+work with.
+
+What talks back is the *failure*. Aiming `CMSG_INITIATE_TRADE` at a guid that is
+not a player answers immediately with `SMSG_TRADE_STATUS`, from one client, with
+nobody else logged in -- and that single send confirms the opcode number, the
+eight-byte unpacked body and the reply layout together. The bounding case here
+is this request's own refusal rather than a neighbour's success, and it is why
+`wow-cli world --trade-nobody` exists and runs before anything else.
+
+**The first one produced a fact about the character rather than about the
+packet, and that is what confirmed the packet.** The send came back with status
+`17`, not the `6` expected: `Testwolf` was lying dead somewhere in Elwynn from a
+previous milestone's flight. A `.revive` and the *identical* send returned `6`.
+One condition changed, one value changed, and both are now named from
+observation rather than transcription -- the same one-change-at-a-time method
+that produced `SMSG_TRAINER_LIST`'s availability byte.
+
+### The status word is a length as well as a reason
+
+`SMSG_TRADE_STATUS`'s tail depends on its status. That is a conditional layout,
+the shape that cost 4.25 an entire feature when one flag bit was wrong -- but
+this one cannot fail the same way, and the difference is worth writing down.
+There the two branches were the *same length* for some point counts, so a wrong
+branch parsed cleanly and lost the route. Here the branches differ in length and
+the body is short, so a misreading leaves the cursor holding bytes and the
+trailing-byte rule refuses the packet in the log.
+
+Which makes the body length independent evidence about the status:
+
+| status | body | tail |
+|---|---|---|
+| `BEGIN_TRADE` `1` | 12 | the initiator's guid |
+| `OPEN_WINDOW` `2` | 8 | a `u32` this client calls a token, `0` on this server |
+| `NO_TARGET` `6` | 13 | three fields the server writes as zero |
+| everything else observed | 4 | none |
+
+`BEGIN_TRADE` is the only packet in the block that names a guid, which makes it
+confirmable by **content** and not only by length: on the two-client rig the guid
+in it was `1`, which is `Testwolf`'s, known independently at the other end.
+
+Only the values this project has actually produced are named. The server's
+header lists two dozen and transcribing them would take a minute -- and a wrong
+*name* for a status never errors, it misexplains what happened and sends the
+next reader somewhere else. Note in particular that **`BUSY` `0` does two
+unrelated jobs**: before the window opens it is "that person is already
+trading", and after it opens it is "you have not got that much money". Which one
+it is is not in the packet; it is in whether the window is open.
+
+### The server tells the other person what you offered, and never tells you
+
+`SMSG_TRADE_STATUS_EXTENDED` is not the trade. It is **one side** of it, and
+which side is the first byte: `1` is the partner's half, `0` is the reader's own.
+The obvious design follows -- draw each half from the packet that describes it --
+and it is wrong.
+
+Putting an item down or money beside it makes the server send the `1` form to the
+*partner* and nothing at all to whoever did it. Over a complete two-client trade
+-- two items, a sum of money, both ends accepting -- **every** extended packet at
+both clients carried `theirs = 1` and not one carried `0`. The `0` form is real
+and reachable, but only when a spell is being applied to the non-traded slot: an
+enchant, a socket. That is the single path in the server that sends both forms.
+
+So **this client's own half of the trade window is the only thing in the whole
+six-part services block that it has to remember for itself.** Every other window
+here is drawn from the server's own words.
+
+Two things make that safe, and both are worth stating because the usual rule in
+this project points the other way -- a silent request normally means the client
+must not believe its own intentions.
+
+* **No refusal is quiet.** Every way `CMSG_SET_TRADE_ITEM` can fail -- a slot
+  past the seventh, an item that cannot be traded, an item already in another
+  slot -- answers `TRADE_CANCELED` and ends the trade outright. There is no state
+  in which the client thinks an item is on the table and the server disagrees
+  while the window is still open.
+* **The `0` form could not replace the local record anyway.** It carries an
+  entry, a display id and a count, and nowhere in its seventy-two bytes an item
+  *guid*. A client cannot work out from it which of two identical stacks it put
+  down.
+
+`Replication::trade_own_offers` counts the `0` form rather than ignoring it, so a
+session that does see one is not silent about it: a number that only appears on
+failure cannot tell "none were wrong" from "there were none".
+
+### The record stride, and what stands in for a name
+
+The body is a 21-byte header and seven fixed 73-byte slot records: `1 + 4 + 4 +
+4 + 4 + 4 + 7 * 73 = 532`, and it is a **fixed size**, which is its own
+confirmation the way `SMSG_SHOWTAXINODES`'s 72 bytes were. Nothing
+variable-length can absorb a misread field width.
+
+There is no trailing string to land on, so the greeting trick that settled
+`SMSG_TRADE_LIST`'s stride is not available. What stands in for it is that **each
+slot record begins with its own index**. This server writes all seven every time,
+in order, so the byte carries no information at all -- and it carries the whole
+confirmation, because a stride wrong by a word reads it out of the middle of a
+`u32`, and seven consecutive correct small integers do not happen by accident.
+Same use as the redundant `dir:` lines in `md5translate.trs`. The parser checks
+it and refuses at the *first* record rather than reporting a length at the end.
+
+An item's entry and display id agree with each other the way the vendor list's
+did: `2070` arrived paired with display `6353`, which is the exact pair
+`SMSG_LOOT_RESPONSE` produced in 4.13 and `SMSG_LIST_INVENTORY` in 4.15, and
+which `Item.dbc` gives independently of any wire.
+
+### What a live run looked like, 2026-08-19
+
+`Testwolf` (guid 1, `OWC33`) and `Watcher` (guid 3, `OWC34`) three units apart at
+the Northshire spawn, one running `wow-cli world --trade Watcher` and the other
+`--trade-wait`:
+
+```
+Watcher:   <- Begin { partner: 1 }
+           0x1 offered a trade -- opening the window.
+           <- OpenWindow { token: 0 }
+           <- their half: slot 0 = entry 2070 x5 (display 6353), 0g 43s 21c
+Testwolf:  <- OpenWindow { token: 0 }
+           <- their half: slot 0 = entry 159 x3 (display 18084)
+both:      <- BackToTrade  (as each offer changed under the other's accept)
+           <- Accepted
+           <- Complete
+
+SMSG_TRADE_STATUS_EXTENDED: 3 describing the partner's half, 0 describing our own
+```
+
+That last line is the measurement, and it is the reason the probe prints two
+numbers rather than one: an absence reported as "it never printed" is not
+evidence, and "zero of three" is.
+
+The verdict on the trade itself is not the `Complete` either. It is the server's
+own database afterwards: `Watcher`'s stack of 2070 went from fifteen to twenty
+and `Testwolf` has none; `Testwolf`'s stack of 159 went from four to seven and
+`Watcher` has none; and `Testwolf`'s money is exactly 4,321 lower than it was
+while `Watcher`'s is exactly 4,321 higher. That is a source the client is never
+sent, agreeing to the copper with a number this client chose and put on the
+wire.
+
+`BackToTrade` is not noise: changing an offer withdraws *both* accepts, which is
+why the probe re-sends an accept rather than sending one. Two scripted clients
+staging a second apart hit it every run.
+
+### Not sent yet
+
+`CMSG_IGNORE_TRADE`, which is a third answer to an offer and needs an ignore list
+this client does not have. `CMSG_UNACCEPT_TRADE` is implemented and unsent -- the
+window has no un-accept button, because an accept here is undone by changing the
+offer, which every player does by taking something off the table. The trade
+spell (`TradeOffer::spell` and `NONTRADED_SLOT`) parses and nothing casts it, so
+enchanting a partner's item is not possible; that is also the one path that would
+produce the own-half packet, and it has never been seen. `TradeItem`'s
+enchantment, gem, suffix, random-property and lock fields are parsed, carried and
+drawn by nothing.

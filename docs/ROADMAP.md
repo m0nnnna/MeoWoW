@@ -5986,3 +5986,225 @@ terrain fallback is the real bug. The instrument that would answer it is a
 coverage survey -- sample a grid across the city's footprint offline and
 report where no floor is found. The raised streaming radius is a fair
 candidate for it too and is explicitly **not** claimed as the cause.
+## 4.26: trade, and the first request whose success is invisible to its sender
+
+Third rung of the six-part city-services block, and the one the block was
+ordered around. Flight paths were the first time the *server* moved this
+character; trainers were the cheap rung that bounded the rest. Trade is the
+first time **the far end is another person's client** -- something that may be
+looking the other way, may decline, and in the ordinary case has to send a
+packet of its own before this client learns that anything happened at all.
+
+That is not a framing. It changes what can be measured, and it changed the
+instrument: `wow-cli world --trade <name>` and `--trade-wait` are two halves of
+one run, and neither on its own proves an opcode.
+
+### Every request here is silent on success, so the refusal is the instrument
+
+The move this project reaches for -- send an *answered* request first, then the
+silent one, the way `CMSG_LIST_INVENTORY` bounded `CMSG_BUY_ITEM` and
+`CMSG_GROUP_INVITE` bounded the rest of the party block -- has nothing inside
+this block to work with. All ten client opcodes are silent when they work.
+`CMSG_INITIATE_TRADE` succeeding produces a packet at *somebody else's* session.
+
+What talks back is the **failure**. Aimed at a guid that is not a player,
+`CMSG_INITIATE_TRADE` is answered immediately, at the sender, with nobody else
+logged in -- and that one send confirms the opcode number, the eight-byte
+unpacked body and the reply layout together. The novelty is only that the
+bounding case is this request's own refusal rather than a neighbour's success.
+**A refusal that names a reason is a reply.**
+
+### The first send reported a fact about the character, not the packet
+
+It came back `17` where `6` was expected. `Testwolf` was lying dead in Elwynn,
+left there by 4.25's flight fixture. A `.revive` and the **identical** send
+returned `6`.
+
+One condition changed, one value changed, and two status codes are now named
+from observation rather than from the server's header -- the same
+one-change-at-a-time method that produced `SMSG_TRAINER_LIST`'s availability
+byte, arrived at by accident rather than by design. Worth keeping for the shape:
+the probe was pointed at the protocol and answered about the fixture, and
+answering about the fixture is what proved the protocol was being understood.
+
+### The status word is a length as well as a reason
+
+`SMSG_TRADE_STATUS` is a `u32` and then a tail **the status decides**. That is a
+conditional layout -- the shape that cost 4.25 a whole feature when one flag bit
+was wrong -- and this one cannot fail the same way, which is worth having in
+writing beside it. There, the two branches were the *same length* for some point
+counts, so a wrong branch parsed cleanly and silently lost the route. Here the
+branches differ in length and the body is short, so a misreading leaves the
+cursor holding bytes and the trailing-byte rule refuses the packet loudly.
+
+Which means the body length is independent evidence about the status: twelve
+bytes for a `BEGIN`, eight for an `OPEN_WINDOW`, four for the rest. And `BEGIN`
+is the only packet in the block that names a guid, so it is confirmable by
+**content** too: on the rig it carried `1`, which is `Testwolf`'s guid, known
+independently at the other end.
+
+**`BUSY` does two unrelated jobs and the packet does not say which.** Before the
+window opens it means "that person is already trading" and the session is over;
+after it opens it means "you have not got that much money" and the session is
+very much alive. Closing the window on the second is throwing away a live trade
+with items on the table over a typo. What separates them is
+`TradeSession::open`, which exists for this.
+
+### The finding: the server tells the other person, and never tells you
+
+`SMSG_TRADE_STATUS_EXTENDED` is one **side** of the trade, and which side is the
+first byte of the body. The obvious design follows straight from that -- draw
+each half of the window from the packet describing it -- and this milestone was
+built on it for an afternoon before the rig said otherwise.
+
+Putting an item on the table, or money beside it, makes the server send the
+partner's-half form to **the partner** and nothing at all to whoever did it.
+Over a complete two-client trade -- an item and a sum of money one way, an item
+the other, both ends accepting -- **three** extended packets arrived across the
+two clients, every one of them describing the partner's half and **none** the
+reader's own. Three runs of it, and none has ever produced the own-half form. The own-half form is real and
+reachable, and only along one path: a spell applied to the non-traded slot, an
+enchant or a socket, which is the single place in the server that sends both.
+
+So this client's own half of the trade window is **the only thing in the whole
+six-part block it has to remember for itself.** Every other window here --
+vendor stock, trainer list, taxi menu, quest scroll -- is drawn from the
+server's own words.
+
+Two things make a remembered half safe, and both had to be established rather
+than assumed, because the standing rule in this project points the other way: a
+silent request normally means the client must not believe its own intentions.
+
+* **No refusal here is quiet.** Every way `CMSG_SET_TRADE_ITEM` can fail -- a
+  slot past the seventh, an untradeable item, an item already in another slot --
+  answers `TRADE_CANCELED` and ends the trade. There is no state in which the
+  client believes an item is on the table and the server disagrees while the
+  window is still open.
+* **The own-half packet could not replace the record even where it arrives.** It
+  carries an entry, a display id and a count, and nowhere an item **guid** -- so
+  it cannot say which of two identical stacks was put down.
+
+The counter for it (`Replication::trade_own_offers`) is kept rather than
+dropped, for the reason every counter here is kept: a number that only speaks on
+failure cannot tell "none were wrong" from "there were none".
+
+### The redundant byte is the whole confirmation
+
+The body is a 21-byte header and seven fixed 73-byte slot records, `21 + 7 * 73
+= 532`, and being **fixed** is its own confirmation -- the same property that
+made `SMSG_SHOWTAXINODES` the cheapest packet in the previous milestone.
+
+There is no trailing string, so the greeting that settled the trainer stride is
+not available here. What stands in for it is that each record begins with **its
+own index**, which this server writes for all seven, in order, every time. The
+byte carries no information whatever and carries the entire confirmation: a
+stride wrong by a word reads it out of the middle of a `u32`, and seven
+consecutive correct small integers do not happen by accident. Same use as the
+redundant `dir:` header lines in `md5translate.trs`. The parser checks it and
+fails at the *first* record rather than reporting a length at the end.
+
+### Which end asked is not on the wire, and both ends hold the same state
+
+Before `OPEN_WINDOW` arrives, the initiator and the invited have *identical*
+replicated state: a partner guid and a closed window. Nothing in any packet
+separates them -- the initiator knows who it asked only because it chose them,
+and the invited knows only because `BEGIN_TRADE` said so.
+
+So an interface that decides "is somebody asking me?" from the window being
+closed shows **the person who pressed the key a prompt asking whether they
+accept their own request**. It was written that way first and it compiled,
+parsed and drew a perfectly convincing dialog. `TradeSession::we_asked` is the
+one bit that separates the two, it is local because it has to be, and the test
+asserts both directions -- a rule answering `true` for everything closed passes
+the invited half on its own.
+
+### The window is the first one here that draws two people
+
+Every frame in this interface shows one thing: what a corpse holds, what a
+trainer teaches, what this character carries. A trade window shows both halves,
+they arrive separately, and a mix-up draws a completely convincing picture of
+one person's goods twice. Three rules came out of that and all three are
+asserted headlessly:
+
+* **Ours on the left, always**, and the two halves are tested not to overlap.
+* **Only our own occupied squares answer a click.** Their column is drawn and
+  never hit-tested -- taking an item off the table is a request only its owner
+  may make, and one sent for their square is declined *in silence*. Same shape
+  as the trainer window's inert rows, and the test asserts both halves, because
+  a hit test answering for everything passes the first alone.
+* **The seventh square is drawn apart from the six.** It is the slot that does
+  not change hands; lining all seven up shows something as offered that is going
+  to be handed straight back. `first_free_slot` will never choose it either.
+
+The accept button reports what the **other** side has done, because that is the
+only part a player cannot work out for themselves: their own accept is a button
+they just pressed, and the partner's is a fact only the server knows.
+
+### One modal rule, stated once
+
+While a trade window is open, a right-click in the bag window puts the item on
+the table instead of equipping or using it. That does swallow the ordinary
+gesture, which this project has a rule about -- so the reasoning is recorded
+rather than left implicit: a trade window is open for seconds and every one of
+them is somebody else waiting, an equip is undoable and a trade is not, and the
+offered item is visible in the window before anything is irreversible. Two cases
+are refused *before* sending, because the server answers both by cancelling the
+entire trade rather than declining the request: an item already on the table,
+and a table with no room.
+
+`T` asks the target to trade. The original client puts that on a right-click
+menu, which this interface does not have -- right-click in the world already
+means select-and-attack, and overloading it would be a gesture that sometimes
+swings and sometimes does not.
+
+### Confirmed at the window, and the first report was about discoverability
+
+The whole loop runs from the viewer against a scripted partner: `T` asks the
+target, the window opens when their client answers, a right-click in the bag
+window puts an item on the table, Accept goes through and the exchange
+completes. The partner's log is what confirms the offer -- `their half: slot 0 =
+entry 2592 x5 (display 7418)` is the viewer's own right-click arriving at
+somebody else's session.
+
+**The first live run failed, and not in the code.** It came back "I couldn't
+give him an item", and the log proved the send had never happened: the partner
+received zero extended packets and the trade did not cancel, which excludes a
+refusal, since every way `CMSG_SET_TRADE_ITEM` can be declined cancels the whole
+trade. The window and the bag window were measured not to overlap at 1280x720,
+1920x1080 or 2560x1440 at any bag count, so that was excluded too.
+
+What was left is that **offering is a modal right-click and nothing on screen
+said so.** A gesture nobody can find is not a gesture, whatever the code does.
+The window now draws `Right-click a bag item to offer it` under this side's
+column while it is empty -- and the room for that line is reserved whether or
+not it is drawn, because a window that resized as the table filled would move
+its own Cancel button out from under the cursor at the exact moment somebody
+puts an item down. `the_buttons_clear_every_square` asserts the band under the
+grid stays off the squares, since growing it was growing it towards a click
+target.
+
+The other half of the fix is the instrument: all four ways out of `offer_item`
+were **silent**, so "the gesture never reached the bags", "no trade is open" and
+"nothing is carried there" were one observation. They each log now.
+
+The two-accept path also fired for the first time in that run and recovered: the
+viewer's item landed *after* the partner had accepted, which withdrew their
+accept, and the re-accept loop put it back.
+
+### Still not done
+
+* **No un-accept button.** `CMSG_UNACCEPT_TRADE` is implemented and never sent;
+  an accept is undone here by changing the offer, which is what taking something
+  off the table already does.
+* **No ignore.** `CMSG_IGNORE_TRADE` is the third answer to an offer and wants an
+  ignore list this client has not got.
+* **No trade spell**, so a partner's item cannot be enchanted -- and that is the
+  one path that produces the own-half packet, which is why it has never been
+  seen.
+* **No drag into the window.** The bag window's pick-up-and-drop knows nothing
+  about the trade squares, so offering is the modal right-click above.
+* `TradeItem`'s enchantment, gems, suffix factor, random property and lock are
+  parsed, carried and drawn by nothing.
+* **Only the status codes actually produced are named** -- `BUSY`, `BEGIN`,
+  `OPEN_WINDOW`, `CANCELED`, `ACCEPT`, `BACK_TO_TRADE`, `COMPLETE`, `NO_TARGET`
+  and the dead-sender one. The other fifteen print their number.
