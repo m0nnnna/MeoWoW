@@ -1294,6 +1294,35 @@ Worth reading before debugging anything, because the same shapes keep recurring.
   covers. **When claiming a milestone is verified, say which instrument saw
   which half** -- and the interface half currently has no headless instrument
   that starts the real thing.
+- **A thing's *owner* and a thing's *extent* are different, and an ownership
+  rule written for drawing can silently break every query that is not
+  drawing.** A world object is filed under the single terrain tile containing
+  its **origin** -- correctly, and for a stated reason: so it is neither drawn
+  twice nor left behind when a neighbour is evicted. Collision queries then
+  chose which tiles to ask by looking at *where the character was*, which is
+  right only if a tile's geometry stays inside the tile. It does not.
+  **Stormwind is one WMO placement, 1,058 by 1,060 units against a 533-unit
+  tile: it covers a three-by-three block and every triangle of it is filed
+  under one.** Standing over any of the other eight, the floor query asked
+  tiles that hold nothing and the character fell through a city drawn
+  perfectly around them. **It had been true since collision existed and cost
+  nothing for four milestones, because every building in Elwynn is a fraction
+  of a tile and nobody had walked into a capital.** That is the part worth
+  remembering: the bug was not in the new feature that exposed it, and what
+  exposed it was new *ground* rather than new code -- the first fixture ever
+  placed in a city. Tiles are now selected by the bounds of what they hold.
+  It also produced four unrelated-looking symptoms from one cause -- falling
+  through the ground, walking on nothing, NPCs sunk into the floor (they are
+  standing on it; the viewer is underneath), and ending up stuck below the
+  world -- which is the "one bug can produce several unrelated-looking
+  reports" rule over again.
+- **`cargo build --release` does not compile test targets, so "zero warnings"
+  has never covered them.** An unused import sat in
+  `crates/dbc/tests/real_data.rs` for two milestones under a green
+  zero-warning claim. `cargo test --release --no-run` is what sees those, and
+  a milestone-end check wants both. Small, and the same shape as
+  `--screenshot` not drawing the HUD: an instrument that omits part of the
+  subject reports success for the part it can see.
 - **A corpse keeps every flag it had in life, so "will it talk" and "will it
   answer" are different questions.** `Entity::will_talk` reads only the
   `UNIT_NPC_FLAGS` word, which a dead NPC carries unchanged -- so a CLI probe

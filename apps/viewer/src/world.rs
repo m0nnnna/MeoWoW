@@ -228,6 +228,22 @@ pub struct Tile {
     /// beside reading the tile off disk, and a set that outlived its tile
     /// would be invisible walls where a building used to be.
     solid: collision::World,
+    /// The world-space box [`Tile::solid`] actually occupies, or `None` when
+    /// the tile holds nothing solid at all.
+    ///
+    /// **A tile's collision is not confined to the tile**, and that is the
+    /// whole reason this exists. A world object is filed under the single
+    /// tile containing its *origin* -- deliberately, so it is neither drawn
+    /// twice nor left behind when a neighbour is evicted -- and a building
+    /// bigger than a tile therefore spills its geometry into neighbours that
+    /// know nothing about it. Stormwind is 1,058 by 1,060 units against a
+    /// 533-unit tile: **it spans three tiles by three and every triangle of
+    /// it is filed under one.**
+    ///
+    /// So a collision query cannot choose which tiles to ask by looking at
+    /// where the *character* is. It has to ask every resident tile whose
+    /// geometry could reach the point, and this box is what makes that cheap.
+    solid_bounds: Option<(Vec3, Vec3)>,
     /// Kept alongside the uploaded mesh so the ground can be *asked* about,
     /// not only drawn -- see [`World::height_at`]. The GPU copy cannot answer:
     /// reading a vertex buffer back per frame to find out how high the ground
@@ -903,6 +919,9 @@ impl World {
 
         let mut built = Vec::new();
         let mut solid = collision::World::new();
+        // Grown as triangles are added, so it costs one comparison per vertex
+        // rather than a second pass over the whole set.
+        let mut solid_bounds: Option<(Vec3, Vec3)> = None;
         for (path, transforms) in groups {
             let Some(model) = self.model(gpu, meshes, chain, &path) else {
                 continue;
@@ -920,12 +939,16 @@ impl World {
                     // hundreds and the only thing identifying the triangle is
                     // the triangle. An M2's list is empty and every one of its
                     // triangles is untagged, which is what `add` already does.
-                    solid.add_tagged(
-                        collision::Triangle::new(
-                            p(triangle[0]),
-                            p(triangle[1]),
-                            p(triangle[2]),
+                    let (a, b, c) = (p(triangle[0]), p(triangle[1]), p(triangle[2]));
+                    solid_bounds = Some(match solid_bounds {
+                        Some((lo, hi)) => (
+                            lo.min(a).min(b).min(c),
+                            hi.max(a).max(b).max(c),
                         ),
+                        None => (a.min(b).min(c), a.max(b).max(c)),
+                    });
+                    solid.add_tagged(
+                        collision::Triangle::new(a, b, c),
                         model
                             .collision_footing
                             .get(index)
@@ -960,6 +983,7 @@ impl World {
             terrain,
             groups: built,
             heights: TileHeights::new(&parsed.chunks, &parsed.liquid),
+            solid_bounds,
             solid,
         })
     }
@@ -1120,9 +1144,33 @@ impl World {
     /// answer. `None` for the *surface* where the floor came from an M2, or
     /// from a WMO material that names no terrain -- which is 91% of them,
     /// because most of a building is walls and roof.
+    /// **Asks every resident tile whose geometry could reach the point**, and
+    /// keeps the highest floor.
+    ///
+    /// This used to look up the single tile the character was standing on,
+    /// which is the assumption that made all of Stormwind non-solid -- see
+    /// [`World::tiles_touching`]. Highest wins for the same reason it does
+    /// within one tile: a balcony over a courtyard is what holds you up, not
+    /// the flagstones under it.
+    ///
+    /// The surface tag travels with the winning height rather than being
+    /// looked up again, exactly as `floor_under_tagged` does inside a tile --
+    /// two derivations of one fact agree until a tie breaks differently, and
+    /// the frame they disagree on is a character standing on floorboards and
+    /// hearing stone.
     pub fn floor_under_footing(&self, at: Vec3, step: f32) -> Option<(f32, Option<u8>)> {
-        let tile = self.tiles.get(&tile_at(at))?;
-        tile.solid.floor_under_tagged(at.truncate(), at.z, step)
+        let mut best: Option<(f32, Option<u8>)> = None;
+        for tile in self.tiles_touching(at, at) {
+            if tile.solid.is_empty() {
+                continue;
+            }
+            if let Some((z, tag)) = tile.solid.floor_under_tagged(at.truncate(), at.z, step) {
+                if best.is_none_or(|(b, _)| z > b) {
+                    best = Some((z, tag));
+                }
+            }
+        }
+        best
     }
 
     /// Every resident tile a straight move between two points could touch.
@@ -1130,12 +1178,32 @@ impl World {
     /// A short move is one or two tiles; listing them rather than assuming the
     /// start's is what makes a tile seam an implementation detail instead of a
     /// hole in the world.
+    /// Every resident tile whose **collision geometry** could reach the box
+    /// between two points.
+    ///
+    /// **Selected by what a tile holds, not by where the query is**, and the
+    /// difference is the whole of `foss-wow` Stormwind bug. The old version
+    /// walked the tile coordinates between `from` and `to` -- which is right
+    /// only if a tile's collision stays inside the tile, and it does not: a
+    /// world object is filed under the one tile containing its origin, so
+    /// Stormwind's 1,058-by-1,060-unit shell is filed under a single 533-unit
+    /// tile and physically covers nine. Standing over any of the other eight,
+    /// the query asked tiles that hold nothing and the character fell through
+    /// a city that was drawn perfectly around them.
+    ///
+    /// Every building in Elwynn is a fraction of a tile, which is why this
+    /// was invisible for four milestones and surfaced the first time anyone
+    /// walked into a capital.
+    ///
+    /// Iterating all resident tiles is deliberate rather than lazy: streaming
+    /// keeps a handful, the test is an AABB overlap, and a cleverer index
+    /// would be a second structure to keep in step with the first.
     fn tiles_touching(&self, from: Vec3, to: Vec3) -> impl Iterator<Item = &Tile> {
-        let (a, b) = (tile_at(from), tile_at(to));
-        let xs = a.0.min(b.0)..=a.0.max(b.0);
-        let ys = a.1.min(b.1)..=a.1.max(b.1);
-        xs.flat_map(move |x| ys.clone().map(move |y| (x, y)))
-            .filter_map(|key| self.tiles.get(&key))
+        let lo = from.min(to);
+        let hi = from.max(to);
+        self.tiles
+            .values()
+            .filter(move |tile| solid_reaches(tile.solid_bounds, lo, hi))
     }
 
     /// Loads a model, or returns the cached one. Failures are cached too.
@@ -3005,8 +3073,111 @@ fn sequence_for(model: &CachedModel, motion: Motion) -> Option<usize> {
         .find_map(|id| model.sequences.iter().position(|s| s.id == *id))
 }
 
+
+/// Whether a tile holding collision bounded by `bounds` could answer a query
+/// over the horizontal box `lo`..`hi`.
+///
+/// **The predicate that was wrong**, extracted so it can be tested without a
+/// GPU. The old rule was "is this tile's coordinate between the two ends of
+/// the query", which silently assumes a tile's collision stays inside the
+/// tile. A world object is filed under the single tile containing its origin,
+/// so it does not: Stormwind is filed under tile (30,48) and physically
+/// covers a three-by-three block.
+///
+/// Horizontal only. A floor query walks down from the character's own `z`
+/// and the vertical span of a tile's geometry says nothing useful about
+/// whether it is underfoot -- a tile holding a tower reaches hundreds of
+/// units up, and excluding it because the character is at ground level would
+/// reintroduce the same class of hole.
+fn solid_reaches(bounds: Option<(Vec3, Vec3)>, lo: Vec3, hi: Vec3) -> bool {
+    match bounds {
+        Some((tlo, thi)) => thi.x >= lo.x && tlo.x <= hi.x && thi.y >= lo.y && tlo.y <= hi.y,
+        // A tile with nothing solid on it can never be the answer, and saying
+        // so here keeps the caller from paying for an empty query.
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// **The Stormwind bug, as a test that fails on the old rule.**
+    ///
+    /// The numbers are the real ones. `STORMWIND.WMO` is placed at world
+    /// (-8931, 540), which is tile (30,48), and its own bounds are 1,058 by
+    /// 1,060 units against a 533-unit tile -- so its collision physically
+    /// covers tiles (29..31, 48..50) while every triangle of it is filed
+    /// under (30,48) alone.
+    ///
+    /// A character standing over tile (31,49) is therefore standing on
+    /// geometry that belongs to a different tile. The old selector picked
+    /// tiles by the *query's* coordinates and would ask (31,49), which holds
+    /// nothing -- and the character fell through a city drawn perfectly
+    /// around them.
+    #[test]
+    fn a_building_bigger_than_a_tile_is_solid_from_its_neighbours() {
+        // Stormwind's shell, in world space, filed under one tile.
+        let origin = Vec3::new(-8931.0, 540.0, 100.0);
+        let bounds = Some((
+            origin + Vec3::new(-850.4, -504.3, -99.8),
+            origin + Vec3::new(208.0, 555.7, 276.6),
+        ));
+
+        // Somewhere inside the city but over a neighbouring tile.
+        let over_a_neighbour = origin + Vec3::new(-700.0, 400.0, 0.0);
+        assert_ne!(
+            tile_at(over_a_neighbour),
+            tile_at(origin),
+            "the sample has to sit on a different tile or it proves nothing"
+        );
+        assert!(
+            solid_reaches(bounds, over_a_neighbour, over_a_neighbour),
+            "the owning tile must answer for a point over its neighbour"
+        );
+
+        // And the old rule, stated explicitly so the regression is named
+        // rather than merely absent: it asked only the tile under the query.
+        let old_rule_would_ask = tile_at(over_a_neighbour) == tile_at(origin);
+        assert!(!old_rule_would_ask, "this is exactly what used to be asked");
+    }
+
+    /// The other half: a tile whose geometry is nowhere near is not consulted.
+    /// Without this the fix would be "ask everything", which is not a fix so
+    /// much as a refusal to choose -- and it would make every floor query
+    /// scan every resident tile.
+    #[test]
+    fn a_tile_whose_geometry_is_far_away_is_not_consulted() {
+        let bounds = Some((Vec3::new(0.0, 0.0, 0.0), Vec3::new(100.0, 100.0, 50.0)));
+        let far = Vec3::new(5000.0, 5000.0, 0.0);
+        assert!(!solid_reaches(bounds, far, far));
+        // Just outside, by a unit.
+        let just_outside = Vec3::new(101.0, 50.0, 0.0);
+        assert!(!solid_reaches(bounds, just_outside, just_outside));
+        // Just inside.
+        let just_inside = Vec3::new(99.0, 50.0, 0.0);
+        assert!(solid_reaches(bounds, just_inside, just_inside));
+    }
+
+    /// A tile with nothing solid never answers, whatever is asked of it.
+    #[test]
+    fn an_empty_tile_is_never_consulted() {
+        let anywhere = Vec3::ZERO;
+        assert!(!solid_reaches(None, anywhere, anywhere));
+    }
+
+    /// **Height is deliberately not part of the test.** A floor query starts
+    /// at the character's own `z` and searches downward, so a tile holding a
+    /// cathedral spire reaches far above them and still holds the flagstones
+    /// they are standing on. Filtering by the vertical span would reintroduce
+    /// the same kind of hole one axis over.
+    #[test]
+    fn altitude_does_not_exclude_a_tile() {
+        let bounds = Some((Vec3::new(0.0, 0.0, -500.0), Vec3::new(100.0, 100.0, 900.0)));
+        let at_ground = Vec3::new(50.0, 50.0, 0.0);
+        let high_above = Vec3::new(50.0, 50.0, 5000.0);
+        assert!(solid_reaches(bounds, at_ground, at_ground));
+        assert!(solid_reaches(bounds, high_above, high_above));
+    }
     use super::*;
 
     /// In the bind pose a held item lands exactly on the attachment point, in

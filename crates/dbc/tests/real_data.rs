@@ -6,7 +6,7 @@
 use dbc::infer::{infer, ColumnKind};
 use dbc::schema::{
     AreaTable, CreatureDisplayInfo, CreatureModelData, CreatureSoundData, FootstepTerrainLookup,
-    GroundEffectTexture, Map, SoundEntries, SoundType, Spell, SpellDuration, SpellRadius,
+    Map, SoundEntries, SoundType, Spell, SpellDuration, SpellRadius,
     SpellVisual, SpellVisualKit, TerrainType, WorldMapArea, WorldMapOverlay, WorldSafeLocs,
 };
 use dbc::Dbc;
