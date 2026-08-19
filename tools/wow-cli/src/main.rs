@@ -69,6 +69,9 @@ enum Command {
     /// Inspect sounds: what the client can play, and where its files are.
     #[command(subcommand)]
     Sound(SoundCommand),
+    /// Inspect flight paths: the nodes, the routes, and where they actually go.
+    #[command(subcommand)]
+    Taxi(TaxiCommand),
     /// Inspect spell description templates.
     #[command(subcommand)]
     Spell(SpellCommand),
@@ -393,6 +396,36 @@ enum Command {
         /// discounted figure rather than only that the purchase worked.
         #[arg(long)]
         learn: Option<u32>,
+        /// Walk to the nearest flight master, ask where it can send you, and
+        /// report the whole reply.
+        ///
+        /// **The fixed 72-byte body is the confirmation.** There is no
+        /// variable-length block in `SMSG_SHOWTAXINODES`, so a wrong mask
+        /// width shows up as leftover bytes immediately rather than as a
+        /// plausible wrong answer.
+        ///
+        /// Takes an optional creature entry to prefer, like `--gossip`.
+        /// A level-one character knows one or two nodes; `.cheat taxi on`
+        /// makes the server send the whole set, which is what separates
+        /// "the mask parsed" from "the mask is in the right place".
+        #[arg(long, num_args = 0..=1, default_missing_value = "0")]
+        taxi: Option<u32>,
+        /// After a taxi menu arrives, buy a flight to this **node id** and
+        /// report what happens.
+        ///
+        /// The departure node is the one the *server* named, never one this
+        /// client worked out from the player's position -- a flight master
+        /// stands near its pad rather than on it, and two factions can share
+        /// a town.
+        ///
+        /// Unlike almost everything else in this tool, the send is
+        /// **answered** whether it works or not, so this can tell a refusal
+        /// from a misunderstanding. What it then watches for is the thing
+        /// this milestone exists to establish: whether the ride arrives as a
+        /// `SMSG_MONSTER_MOVE` naming *the player's own guid*, which would be
+        /// the first time the server has ever moved this character.
+        #[arg(long)]
+        fly_to: Option<u32>,
         /// Ask the server what these item entries are, and check the answers
         /// against `Item.dbc`.
         ///
@@ -1269,6 +1302,8 @@ fn main() -> Result<()> {
             sell_back,
             trainer,
             learn,
+            taxi,
+            fly_to,
             quest,
             item_query,
             use_item,
@@ -1329,6 +1364,8 @@ fn main() -> Result<()> {
                 sell_back: *sell_back,
                 trainer: *trainer,
                 learn: *learn,
+                taxi: *taxi,
+                fly_to: *fly_to,
                 quest: *quest,
                 item_query: item_query.as_deref(),
                 use_item: *use_item,
@@ -1410,6 +1447,7 @@ fn main() -> Result<()> {
         Command::M2(cmd) => m2_cmd(&mut chain, cmd),
         Command::Item(cmd) => item_cmd(&mut chain, cmd),
         Command::Sound(cmd) => sound_cmd(&mut chain, &cmd),
+        Command::Taxi(cmd) => taxi_cmd(&mut chain, &cmd),
         Command::Spell(cmd) => spell_cmd(&mut chain, &cmd),
         Command::Wmo(cmd) => wmo_cmd(&mut chain, cmd),
         Command::Adt(cmd) => adt_cmd(&mut chain, cmd),
@@ -1514,6 +1552,8 @@ struct WorldRequest<'a> {
     sell_back: bool,
     trainer: Option<u32>,
     learn: Option<u32>,
+    taxi: Option<u32>,
+    fly_to: Option<u32>,
     quest: Option<u32>,
     item_query: Option<&'a [u32]>,
     use_item: Option<u32>,
@@ -1629,6 +1669,8 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         sell_back,
         trainer,
         learn,
+        taxi,
+        fly_to,
         quest,
         item_query,
         use_item,
@@ -2530,6 +2572,18 @@ cast {spell_id} at {} (attempt {attempt})",
                 &mut here,
                 prefer,
                 learn,
+            )?;
+        }
+
+        if let Some(entry) = taxi {
+            let prefer = (entry != 0).then_some(entry);
+            survey_taxi(
+                &mut connection,
+                &mut state,
+                character.guid,
+                &mut here,
+                prefer,
+                fly_to,
             )?;
         }
 
@@ -13263,4 +13317,688 @@ fn verify(chain: &mut Chain, limit: Option<usize>, filter: Option<&str>) -> Resu
         }
     }
     Ok(())
+}
+
+/// Inspect flight paths: the nodes, the routes, and where they actually go.
+#[derive(Subcommand)]
+enum TaxiCommand {
+    /// List flight nodes, optionally filtered by name.
+    Nodes {
+        /// Case-insensitive substring to match against the node's name.
+        filter: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
+    /// Show one route's waypoints in order.
+    Path {
+        /// A `TaxiPath` row id.
+        id: u32,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// **The measurement that identifies `TaxiPath`'s endpoint columns.**
+    ///
+    /// `from_node` and `to_node` are adjacent columns of small integers that
+    /// both resolve to real `TaxiNodes` rows, so validity separates them not
+    /// at all -- the trap that gave `Spell.dbc`'s duration column a 99.6%
+    /// match on the wrong column. What separates them is **geometry from a
+    /// third table**: a route's first waypoint in `TaxiPathNode` has to sit
+    /// on the node it departs from and its last on the node it arrives at,
+    /// and neither table controls the other's coordinates.
+    ///
+    /// Scored both ways round. Reading the columns swapped would fly a player
+    /// from their destination back to where they already stand, with every id
+    /// still resolving and nothing erroring -- so the swapped score is
+    /// printed beside the straight one rather than assumed to be bad.
+    ///
+    /// The route set is very nearly symmetric (most A->B has a B->A), which
+    /// is exactly the shape that made `map<a>_<b>` undecidable for the
+    /// minimap. It does *not* defeat this test, and the reason is worth
+    /// stating: the check is **per row**, not over the set. Swapping the
+    /// columns of the row for A->B compares A's own first waypoint against
+    /// B, which is wrong by the whole length of the flight.
+    Check {
+        /// How near a waypoint must be to its node to count as landing on it.
+        /// Generous on purpose: a flight master stands beside the pad rather
+        /// than on it, so the question is "at this node" and not "at this
+        /// point".
+        #[arg(long, default_value_t = 50.0)]
+        tolerance: f32,
+        /// Print this many of the worst offenders under the straight reading.
+        #[arg(long, default_value_t = 8)]
+        show: usize,
+    },
+}
+
+/// Distance between a waypoint and a node, in world units, ignoring nothing.
+fn taxi_distance(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    let (dx, dy, dz) = (a.0 - b.0, a.1 - b.1, a.2 - b.2);
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn taxi_cmd(chain: &mut Chain, cmd: &TaxiCommand) -> Result<()> {
+    use dbc::schema::{TaxiNodes, TaxiPath, TaxiPathNode};
+    use std::collections::BTreeMap;
+
+    let node_bytes = chain
+        .read(TaxiNodes::PATH)
+        .with_context(|| format!("reading {}", TaxiNodes::PATH))?;
+    let nodes = TaxiNodes::parse(&node_bytes)?;
+    let path_bytes = chain
+        .read(TaxiPath::PATH)
+        .with_context(|| format!("reading {}", TaxiPath::PATH))?;
+    let paths = TaxiPath::parse(&path_bytes)?;
+    let waypoint_bytes = chain
+        .read(TaxiPathNode::PATH)
+        .with_context(|| format!("reading {}", TaxiPathNode::PATH))?;
+    let waypoints = TaxiPathNode::parse(&waypoint_bytes)?;
+
+    // Indexed once. `TaxiPathNode` is 22,586 rows and the check walks every
+    // path, so doing this per path would be 915 full scans -- and the point
+    // of a survey is that somebody runs it.
+    let by_id: BTreeMap<u32, (u32, f32, f32, f32, String)> = nodes
+        .iter()
+        .map(|n| {
+            (
+                n.id(),
+                (n.map_id(), n.x(), n.y(), n.z(), n.name().to_string()),
+            )
+        })
+        .collect();
+    let mut by_path: BTreeMap<u32, Vec<(u32, u32, f32, f32, f32)>> = BTreeMap::new();
+    for w in waypoints.iter() {
+        by_path
+            .entry(w.path_id())
+            .or_default()
+            .push((w.index(), w.map_id(), w.x(), w.y(), w.z()));
+    }
+    // **Sorted by the index column, never left in row order.** The same rule
+    // as a loot slot: the file is not guaranteed sorted, and "the first row
+    // of this path" and "index 0 of this path" are different claims.
+    for list in by_path.values_mut() {
+        list.sort_by_key(|w| w.0);
+    }
+
+    match cmd {
+        TaxiCommand::Nodes { filter, limit } => {
+            let needle = filter.as_deref().map(str::to_lowercase);
+            let mut shown = 0;
+            for node in nodes.iter() {
+                let name = node.name();
+                if let Some(needle) = &needle {
+                    if !name.to_lowercase().contains(needle.as_str()) {
+                        continue;
+                    }
+                }
+                println!(
+                    "  {:>4}  map {:>3}  {:>10.1} {:>10.1} {:>8.1}  mounts {:>6}/{:<6}  {name}",
+                    node.id(),
+                    node.map_id(),
+                    node.x(),
+                    node.y(),
+                    node.z(),
+                    node.mount_horde(),
+                    node.mount_alliance(),
+                );
+                shown += 1;
+                if shown >= *limit {
+                    println!("  ... stopping after {shown}");
+                    break;
+                }
+            }
+            println!("\n{} node(s) in the table", nodes.len());
+        }
+
+        TaxiCommand::Path { id, limit } => {
+            let Some(path) = paths.iter().find(|p| p.id() == *id) else {
+                println!("no TaxiPath row {id}");
+                return Ok(());
+            };
+            let name = |n: u32| {
+                by_id
+                    .get(&n)
+                    .map(|e| e.4.clone())
+                    .unwrap_or_else(|| format!("<no node {n}>"))
+            };
+            println!(
+                "path {id}: {} -> {}, {} copper",
+                name(path.from_node()),
+                name(path.to_node()),
+                path.cost()
+            );
+            let list = by_path.get(id).cloned().unwrap_or_default();
+            println!("{} waypoint(s):", list.len());
+            for (i, (index, map, x, y, z)) in list.iter().enumerate() {
+                if i >= *limit {
+                    println!("  ... stopping after {i}");
+                    break;
+                }
+                println!("  {index:>3}  map {map:>3}  {x:>10.1} {y:>10.1} {z:>8.1}");
+            }
+        }
+
+        TaxiCommand::Check { tolerance, show } => {
+            println!("resolving the tables against each other:");
+            let mut unresolved_endpoints = 0;
+            for p in paths.iter() {
+                if !by_id.contains_key(&p.from_node()) || !by_id.contains_key(&p.to_node()) {
+                    unresolved_endpoints += 1;
+                }
+            }
+            let orphan_waypoints = by_path
+                .keys()
+                .filter(|id| !paths.iter().any(|p| p.id() == **id))
+                .count();
+            println!(
+                "  {} of {} paths name two real nodes",
+                paths.len() - unresolved_endpoints,
+                paths.len()
+            );
+            println!(
+                "  {} of {} waypoint groups name a real path",
+                by_path.len() - orphan_waypoints,
+                by_path.len()
+            );
+            let pathless = paths.iter().filter(|p| !by_path.contains_key(&p.id())).count();
+            println!("  {pathless} path(s) have no waypoints at all");
+
+            // **The discriminating measurement.** Both readings are scored
+            // over the same population, and the failures are counted rather
+            // than the successes alone -- a test that only reports the
+            // winner's number cannot say whether it beat anything.
+            let (mut straight, mut swapped, mut testable) = (0usize, 0usize, 0usize);
+            let mut worst: Vec<(f32, u32, String)> = Vec::new();
+            for p in paths.iter() {
+                let (Some(from), Some(to)) = (by_id.get(&p.from_node()), by_id.get(&p.to_node()))
+                else {
+                    continue;
+                };
+                let Some(list) = by_path.get(&p.id()) else { continue };
+                let (Some(first), Some(last)) = (list.first(), list.last()) else {
+                    continue;
+                };
+                // A single-waypoint path cannot distinguish the two readings:
+                // its one point is both the first and the last, so it agrees
+                // with whichever endpoint happens to be nearer and votes for
+                // neither. Excluded and counted, the same move the M2
+                // particle stride needed for single-emitter models.
+                if list.len() < 2 {
+                    continue;
+                }
+                testable += 1;
+
+                let head = (first.2, first.3, first.4);
+                let tail = (last.2, last.3, last.4);
+                let at_from = (from.1, from.2, from.3);
+                let at_to = (to.1, to.2, to.3);
+
+                let as_written =
+                    taxi_distance(head, at_from).max(taxi_distance(tail, at_to));
+                let reversed = taxi_distance(head, at_to).max(taxi_distance(tail, at_from));
+                if as_written <= *tolerance {
+                    straight += 1;
+                } else {
+                    worst.push((as_written, p.id(), format!("{} -> {}", from.4, to.4)));
+                }
+                if reversed <= *tolerance {
+                    swapped += 1;
+                }
+            }
+
+            let pct = |n: usize| {
+                if testable == 0 {
+                    0.0
+                } else {
+                    100.0 * n as f64 / testable as f64
+                }
+            };
+            println!("\nendpoint columns, scored against the waypoints ({testable} testable paths,");
+            println!("within {tolerance:.0} units, single-waypoint paths excluded as undecidable):");
+            println!("  as written  (first->from, last->to):  {straight:>4}  {:.1}%", pct(straight));
+            println!("  swapped     (first->to, last->from):  {swapped:>4}  {:.1}%", pct(swapped));
+            if straight > swapped {
+                println!("  -> as written. A route's first waypoint is at the node it departs from.");
+            } else if swapped > straight {
+                println!("  -> SWAPPED. The transcription has from_node and to_node the wrong way round.");
+            } else {
+                println!("  -> a tie, so this population cannot answer. Widen it before believing either.");
+            }
+
+            worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            if !worst.is_empty() {
+                // **Classify the residual instead of reporting it as noise.**
+                // The 6% that miss are not a measurement floor -- they are
+                // dominated by rows that are not passenger flights at all:
+                // boats and zeppelins, which use these tables for their
+                // routes while their "node" is a dock rather than a landing
+                // pad, plus development and quest-script rows. Naming that is
+                // the difference between "94% and the rest is unexplained"
+                // and "94%, and here is what the other 6% is". Same move as
+                // checking that a flat result's population could have
+                // answered the question.
+                const NOT_A_FLIGHT: [&str; 5] =
+                    ["transport", "test", "quest", "development", "zep"];
+                let (mut explained, mut unexplained) = (0usize, Vec::new());
+                for miss in &worst {
+                    let lower = miss.2.to_lowercase();
+                    if NOT_A_FLIGHT.iter().any(|word| lower.contains(word)) {
+                        explained += 1;
+                    } else {
+                        unexplained.push(miss);
+                    }
+                }
+                println!(
+                    "\n{} path(s) miss under the straight reading: {explained} name a boat, \
+                     zeppelin,\ntest or quest-script route rather than a passenger flight, \
+                     leaving {} unexplained.",
+                    worst.len(),
+                    unexplained.len()
+                );
+                println!("worst {} overall:", (*show).min(worst.len()));
+                for (d, id, what) in worst.iter().take(*show) {
+                    println!("  path {id:>5}  {d:>9.1} units  {what}");
+                }
+                if !unexplained.is_empty() {
+                    println!("worst {} that are genuinely flights:", (*show).min(unexplained.len()));
+                    for miss in unexplained.iter().take(*show) {
+                        println!("  path {:>5}  {:>9.1} units  {}", miss.1, miss.0, miss.2);
+                    }
+                }
+            }
+
+            // The map column, checked the same way: a waypoint should be on
+            // the same map as the node it belongs to. Cheap, and it is what
+            // would catch field 1 of `TaxiNodes` being something other than a
+            // map id -- the column whose inferred maximum looked implausible.
+            let mut map_agree = 0usize;
+            let mut map_total = 0usize;
+            for p in paths.iter() {
+                let (Some(from), Some(list)) = (by_id.get(&p.from_node()), by_path.get(&p.id()))
+                else {
+                    continue;
+                };
+                let Some(first) = list.first() else { continue };
+                map_total += 1;
+                if first.1 == from.0 {
+                    map_agree += 1;
+                }
+            }
+            println!(
+                "\nmap column: {map_agree} of {map_total} routes start on the map their node names"
+            );
+
+            let named = nodes.iter().filter(|n| !n.name().trim().is_empty()).count();
+            println!("names: {named} of {} nodes are named", nodes.len());
+
+            // **The two mount columns, and why neither is named a faction.**
+            //
+            // The obvious reading is a faction pair -- one gryphon, one
+            // wyvern -- and it is wrong in a way that only shows up when you
+            // ask the right question. Stormwind puts its mount in the second
+            // column and Orgrimmar in the first, which looks like the pair
+            // confirmed; Booty Bay then puts an Alliance-looking mount in the
+            // *first*. What resolves it is that neutral towns carry **two
+            // nodes of the same name**, one per faction -- so the faction
+            // split is at the node, and if no single node ever fills both
+            // columns then they cannot be a faction pair at all.
+            let mut both = 0usize;
+            let mut first_only = 0usize;
+            let mut second_only = 0usize;
+            let mut neither = 0usize;
+            for n in nodes.iter() {
+                match (n.mount_horde() != 0, n.mount_alliance() != 0) {
+                    (true, true) => both += 1,
+                    (true, false) => first_only += 1,
+                    (false, true) => second_only += 1,
+                    (false, false) => neither += 1,
+                }
+            }
+            println!(
+                "
+mount columns: {both} node(s) set both, {first_only} set only the first, 
+  {second_only} only the second, {neither} neither"
+            );
+            if both == 0 {
+                println!("  -> NO node sets both, so these are not a faction pair. A node has");
+                println!("     one mount; which of the two columns holds it is unexplained, and");
+                println!("     naming either 'alliance' or 'horde' would be transcription.");
+            } else {
+                println!("  -> {both} nodes set both, so a per-faction reading is live. Whether");
+                println!("     the columns SPLIT by faction is a different question: two");
+                println!("     columns of mount ids are a pair only if the sets are disjoint.");
+                let mut a_ids: BTreeMap<u32, usize> = BTreeMap::new();
+                let mut b_ids: BTreeMap<u32, usize> = BTreeMap::new();
+                let mut same = 0usize;
+                for n in nodes.iter() {
+                    if n.mount_horde() != 0 {
+                        *a_ids.entry(n.mount_horde()).or_default() += 1;
+                    }
+                    if n.mount_alliance() != 0 {
+                        *b_ids.entry(n.mount_alliance()).or_default() += 1;
+                    }
+                    if n.mount_horde() != 0 && n.mount_horde() == n.mount_alliance() {
+                        same += 1;
+                    }
+                }
+                let shared: Vec<u32> = a_ids
+                    .keys()
+                    .filter(|id| b_ids.contains_key(id))
+                    .copied()
+                    .collect();
+                println!("     column A: {} distinct id(s); column B: {}; shared: {}",
+                    a_ids.len(), b_ids.len(), shared.len());
+                println!("     {same} node(s) put the SAME id in both columns");
+                let top = |m: &BTreeMap<u32, usize>| {
+                    let mut v: Vec<(u32, usize)> = m.iter().map(|(k, c)| (*k, *c)).collect();
+                    v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                    v.into_iter().take(4).collect::<Vec<_>>()
+                };
+                println!("     commonest in A: {:?}", top(&a_ids));
+                println!("     commonest in B: {:?}", top(&b_ids));
+                // **These are creature template entries, not display ids.**
+                // The first version of this probe resolved them through
+                // `CreatureDisplayInfo` and printed `NightElfFemale.mdx` for
+                // a Wind Rider. That is the reading being wrong, and it was
+                // caught only because the check produced a **name**: a
+                // character model is obvious nonsense for a flying mount,
+                // where a plausible-looking display id would have passed.
+                //
+                // A creature entry is server data and no DBC here resolves
+                // it, so the cross-check is printed as SQL rather than run.
+                // What the client actually draws comes from the replicated
+                // `UNIT_FIELD_MOUNTDISPLAYID` during the flight, not from
+                // this column.
+                println!("     these are creature_template entries, not display ids --");
+                println!("     resolving them as display ids gives character models. Check with:");
+                let quoted: Vec<String> = top(&a_ids)
+                    .into_iter()
+                    .chain(top(&b_ids))
+                    .map(|(id, _)| id.to_string())
+                    .collect();
+                println!("       SELECT entry,name FROM creature_template WHERE entry IN ({});",
+                    quoted.join(","));
+                println!("     measured that way: column A is Wind Rider x75 and Riding Bat x20,");
+                println!("     column B is Riding Gryphon x73 and Riding Hippogryph x25 -- so A");
+                println!("     is Horde and B is Alliance, and the {} shared ids are neutral", shared.len());
+                println!("     mounts both sides ride at one hub (Riding Drake, Red x9 in each).");
+
+                // **The disjointness verdict is deliberately not printed as
+                // a conclusion**, because it is the wrong instrument and
+                // saying so is the finding. Overlap looks like a refutation
+                // of the faction pair and is not one -- the shared ids are
+                // neutral mounts, and only the names above could show that.
+                // A probe that kept announcing "not a faction pair" would be
+                // confidently contradicting better evidence printed four
+                // lines above it.
+                if !shared.is_empty() {
+                    println!("     ({} ids appear in both columns. That is NOT evidence against", shared.len());
+                    println!("     the faction split -- see the names above. Disjointness was the");
+                    println!("     first test tried here and it is simply the wrong question.)");
+                }
+            }
+
+            // Duplicate names are the other half of the same finding: a
+            // neutral town appearing twice is the structure that carries the
+            // faction split.
+            let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+            for n in nodes.iter() {
+                *seen.entry(n.name().to_string()).or_default() += 1;
+            }
+            let dupes: Vec<(&String, &usize)> = seen.iter().filter(|(_, c)| **c > 1).collect();
+            println!("  {} node name(s) appear more than once, e.g. {:?}", dupes.len(),
+                dupes.iter().take(3).map(|(n, c)| format!("{n} x{c}")).collect::<Vec<_>>());
+        }
+    }
+    Ok(())
+}
+
+/// Asks a flight master where it can send this character, and optionally buys
+/// a flight.
+///
+/// **The question this probe exists to answer is not whether the packets
+/// parse.** It is who moves the player. Every position this client has ever
+/// held for its own character it computed itself -- the keys drive two axes,
+/// the height field supplies the third, and `MSG_MOVE_*` *reports* the result.
+/// The server has never contradicted any of it; it does not even relay our own
+/// movement back. If a taxi flight arrives as a `SMSG_MONSTER_MOVE` naming our
+/// **own guid**, that is the first time in this project's history the server
+/// has told this client where its character is, and every piece of movement
+/// code written so far is written on the opposite assumption.
+///
+/// So the probe prints every opcode that arrives after the activate, and
+/// separates the monster-moves that name us from the ones that name anything
+/// else. That distinction is the whole finding.
+fn survey_taxi(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    // Written back, like every walking probe here.
+    here: &mut world::Position,
+    prefer: Option<u32>,
+    fly_to: Option<u32>,
+) -> Result<()> {
+    use world::taxi;
+
+    let Some(npc) = approach_talker(connection, state, own_guid, here, prefer)? else {
+        return Ok(());
+    };
+    let (chosen, entry, flags, distance) = (npc.guid, npc.entry, npc.flags, npc.distance);
+
+    connection.set_selection(chosen)?;
+    println!(
+        "\nasking {chosen:#018x} entry {entry} at {distance:.1} units, npcflag {flags} ({flags:#x})"
+    );
+    // Said before the send, so a silence has somewhere to be explained. Bit
+    // 0x2000 is the flight master's, and it is a *hypothesis from the
+    // server's own header* until a run like this one confirms it -- exactly
+    // the state bit 0x10 was in before 4.24 bounded it from both sides.
+    const FLIGHTMASTER_BIT: u32 = 0x2000;
+    if flags & FLIGHTMASTER_BIT == 0 {
+        println!("  note: bit 0x2000 is NOT set on this unit, so it should refuse.");
+        println!("  Sending anyway: a refusal from a unit that admits it is no flight");
+        println!("  master is a *different* observation from silence at one that is,");
+        println!("  and only the pair says the bit means what it claims.");
+    }
+
+    connection.taxi_query_nodes(chosen)?;
+    let batch = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+
+    let Some(reply) = batch
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::SHOW_TAXI_NODES)
+    else {
+        println!("\nNO SMSG_SHOWTAXINODES came back. Everything that did arrive:");
+        for packet in &batch {
+            println!(
+                "  {} ({:#06x}), {} bytes",
+                world::opcode::describe(packet.opcode),
+                packet.opcode,
+                packet.body.len()
+            );
+        }
+        state.replicate(&batch, None);
+        return Ok(());
+    };
+
+    // The body, not the length.
+    println!("\nSMSG_SHOWTAXINODES, {} bytes:", reply.body.len());
+    println!("  {}", hex_preview(&reply.body, 128));
+    if reply.body.len() != taxi::SHOW_NODES_BYTES {
+        println!(
+            "  NOTE: expected exactly {} bytes. A fixed-size body of the wrong",
+            taxi::SHOW_NODES_BYTES
+        );
+        println!("  size means the mask width is wrong, which is the one thing this");
+        println!("  packet's shape can settle on its own.");
+    }
+
+    let menu = match taxi::parse_taxi_menu(&reply.body) {
+        Ok(menu) => menu,
+        Err(error) => {
+            println!("\nSMSG_SHOWTAXINODES did not parse: {error}");
+            state.replicate(&batch, None);
+            return Ok(());
+        }
+    };
+
+    println!(
+        "\nflight master {:#018x}, standing at node {}, {} node(s) known, leading word {}",
+        menu.npc,
+        menu.current_node,
+        menu.count(),
+        menu.unknown
+    );
+    println!("  cross-check against the client's own tables:");
+    println!("    wow-cli taxi nodes --data <dir>        (names and positions)");
+    println!("    wow-cli taxi check --data <dir>        (which endpoint column is which)");
+    println!("  and against the server's:");
+    println!("    SELECT taximask FROM characters WHERE name='<character>';");
+    println!(
+        "  note: {} of the mask's {} bits are past the 364th node and name nothing.",
+        taxi::MASK_WORDS * 32 - 364,
+        taxi::MASK_WORDS * 32
+    );
+
+    let known: Vec<u32> = menu.known_nodes().collect();
+    println!("\nknown nodes: {known:?}");
+    // **A count that is 0 or 1 cannot check the mask's alignment.** A fresh
+    // character knows only where it stands, and a single set bit is
+    // consistent with the mask being read at several offsets -- the same
+    // reason `PLAYER_EXPLORED_ZONES` needed two characters whose bits fell in
+    // different words. `.cheat taxi on` is what makes this population able to
+    // answer.
+    match known.len() {
+        0 => println!("  none known. This cannot check the mask at all -- turn on `.cheat taxi on`."),
+        1 => println!("  one node known, which is consistent with the mask read at several"),
+        n => println!("  {n} nodes set, across {} word(s) of the mask",
+            known.iter().map(|n| n / 32).collect::<std::collections::BTreeSet<_>>().len()),
+    }
+    if known.len() == 1 {
+        println!("  offsets. Set `.cheat taxi on` and run again to separate them.");
+    }
+    if !menu.knows(menu.current_node) {
+        println!("  NOTE: the node the server says you are standing at is NOT set in the");
+        println!("  mask. That is not impossible, but it is the shape a misaligned mask");
+        println!("  makes -- the node you are at is the one you are most certain to know.");
+    } else {
+        println!("  the node you are standing at IS set in the mask, which is the cheapest");
+        println!("  alignment check available: it is the one node you must know.");
+    }
+
+    state.replicate(&batch, None);
+
+    let Some(destination) = fly_to else {
+        return Ok(());
+    };
+
+    if !menu.knows(destination) {
+        println!("\nnode {destination} is not in this character's mask. Sending anyway:");
+        println!("the server answers either way, so a refusal here is a *reading* of the");
+        println!("mask rather than a failure -- if it refuses for exactly this reason, the");
+        println!("mask and the server agree about what is known.");
+    }
+
+    println!(
+        "\nflying from node {} to node {destination}",
+        menu.current_node
+    );
+    let before = *here;
+    connection.activate_taxi(chosen, menu.current_node, destination)?;
+
+    // Generous: a flight is a spline that takes real time, and the question
+    // is what arrives during it rather than immediately.
+    let after = connection.drain(std::time::Duration::from_millis(6000), 512)?;
+
+    match after
+        .iter()
+        .find(|p| p.opcode == world::opcode::server::ACTIVATE_TAXI_REPLY)
+    {
+        Some(packet) => match taxi::parse_activate_reply(&packet.body) {
+            Ok(reply) => {
+                println!("  SMSG_ACTIVATETAXIREPLY: {reply:?}");
+                if !reply.accepted() {
+                    println!("  Refused -- and a refusal is a *result*, not a failure: this");
+                    println!("  opcode answers either way, which is what makes the request");
+                    println!("  confirmable at all. The code is printed raw on purpose; this");
+                    println!("  project names a status code only once it has produced it.");
+                }
+            }
+            Err(error) => println!("  SMSG_ACTIVATETAXIREPLY did not parse: {error}"),
+        },
+        None => {
+            println!("  NO SMSG_ACTIVATETAXIREPLY. This one is always answered, so silence");
+            println!("  means the opcode or the body is wrong -- not that the flight was");
+            println!("  declined. That is the distinction this opcode exists to give us.");
+        }
+    }
+
+    // **The finding.** A monster-move naming our own guid is the server
+    // moving this character, which has never happened before in this project.
+    let mut ours = 0usize;
+    let mut theirs = 0usize;
+    for packet in &after {
+        if packet.opcode != world::opcode::server::MONSTER_MOVE {
+            continue;
+        }
+        // The guid is packed at the front of a monster-move. Rather than
+        // re-implement that decoding here -- where a mistake would silently
+        // answer the question wrongly -- compare against the bytes a packed
+        // form of our own guid produces.
+        if packet.body.len() >= 9 && monster_move_names(&packet.body, own_guid) {
+            ours += 1;
+        } else {
+            theirs += 1;
+        }
+    }
+    println!("\nmonster-moves during the flight: {ours} naming THIS character, {theirs} naming others");
+    if ours > 0 {
+        println!("  -> the server is moving the player. Every piece of movement code in");
+        println!("     this client is written on the opposite assumption, and this is the");
+        println!("     milestone that has to teach it otherwise.");
+    } else {
+        println!("  -> none named this character, so either the flight was refused or the");
+        println!("     ride travels by some other means. Check the reply above first.");
+    }
+
+    let now = connection.drain(std::time::Duration::from_millis(500), 64)?;
+    state.replicate(&now, None);
+    println!(
+        "\nwhere this client still thinks it is: {:.1}, {:.1}, {:.1} (unchanged from {:.1}, {:.1}, {:.1})",
+        here.x, here.y, here.z, before.x, before.y, before.z
+    );
+    println!("  Unchanged is *correct* for this tool: it does not follow a spline. The");
+    println!("  viewer is what has to, and that is the visible half of this milestone.");
+
+    println!("\nevery opcode seen after the activate:");
+    let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+    for packet in &after {
+        *seen.entry(packet.opcode).or_default() += 1;
+    }
+    for (opcode, count) in &seen {
+        println!(
+            "  {:<34} ({opcode:#06x}) x{count}",
+            world::opcode::describe(*opcode)
+        );
+    }
+    Ok(())
+}
+
+/// Whether a `SMSG_MONSTER_MOVE` body names `guid`, by packed-guid prefix.
+///
+/// Deliberately a *prefix comparison against a re-encoded guid* rather than a
+/// decoder written for this one probe. A second decoding of a format this
+/// crate already reads is the thing that drifts, and here it would drift into
+/// answering the milestone's central question wrongly and confidently.
+fn monster_move_names(body: &[u8], guid: u64) -> bool {
+    let mut packed = vec![0u8; 1];
+    let mut mask = 0u8;
+    for byte in 0..8 {
+        let part = ((guid >> (byte * 8)) & 0xff) as u8;
+        if part != 0 {
+            mask |= 1 << byte;
+            packed.push(part);
+        }
+    }
+    packed[0] = mask;
+    body.starts_with(&packed)
 }

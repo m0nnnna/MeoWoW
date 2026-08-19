@@ -543,6 +543,29 @@ pub enum ClientOpcode {
     /// only after [`ClientOpcode::TrainerList`] has already answered from the
     /// same block, the same bounding move that rescued `CMSG_BUY_ITEM`.
     TrainerBuySpell = 0x01B2,
+
+    /// Ask a flight master where it can send you. Body is its guid, unpacked.
+    ///
+    /// Answered by [`SHOW_TAXI_NODES`](server::SHOW_TAXI_NODES), whose body is
+    /// a **fixed 72 bytes** -- which makes this the cheapest confirmation in
+    /// the block, since there is no variable-length part to absorb a
+    /// misreading.
+    TaxiQueryAvailableNodes = 0x01AC,
+
+    /// Fly from one node to another. Body is `{u64 npc, u32 from, u32 to}` --
+    /// sixteen bytes, and the node ids are [`dbc::schema::TaxiNodes`] rows
+    /// rather than anything the server sent as a list position.
+    ///
+    /// **Always answered**, accepted or refused, by
+    /// [`ACTIVATE_TAXI_REPLY`](server::ACTIVATE_TAXI_REPLY). That is unusual
+    /// enough in this project to be the reason flight paths are tractable:
+    /// one send bounds the opcode, the body layout and the reply layout
+    /// together, the same move `CMSG_GROUP_INVITE` made for parties.
+    ///
+    /// The `from` node must be the one the server itself named in the menu.
+    /// A client that recomputed it from the player's position would be right
+    /// almost everywhere and wrong exactly where two factions share a town.
+    ActivateTaxi = 0x01AD,
 }
 
 /// The server-to-client opcodes this client reacts to.
@@ -626,6 +649,27 @@ pub mod server {
     /// success and its absence is the failure. See
     /// [`TrainerBuySpell`](crate::ClientOpcode::TrainerBuySpell).
     pub const TRAINER_BUY_SUCCEEDED: u16 = 0x01B3;
+
+    /// Where a flight master can send you: the node you are standing at, and
+    /// a bit array of every node this character has visited. See
+    /// [`crate::taxi`].
+    ///
+    /// **A fixed 72-byte body**, which is its own confirmation -- nothing
+    /// variable-length can absorb a wrong mask width, so a misreading shows
+    /// up as leftover bytes on the first packet.
+    pub const SHOW_TAXI_NODES: u16 = 0x01A9;
+
+    /// Whether a flight was accepted, in answer to
+    /// [`ActivateTaxi`](crate::ClientOpcode::ActivateTaxi). One `u32`.
+    ///
+    /// Arrives either way, which is what makes the request above confirmable
+    /// in one send rather than by effect.
+    pub const ACTIVATE_TAXI_REPLY: u16 = 0x01AE;
+
+    /// A route the server is adding to the player's known set mid-session.
+    /// **Deliberately unparsed** -- nothing has produced one, and the menu is
+    /// re-asked on every visit anyway.
+    pub const NEW_TAXI_PATH: u16 = 0x01AF;
 
     /// What mark belongs over one NPC's head, in answer to
     /// [`QuestgiverStatusQuery`](crate::ClientOpcode::QuestgiverStatusQuery).
@@ -920,6 +964,9 @@ pub fn describe(opcode: u16) -> String {
         server::GOSSIP_MESSAGE => "SMSG_GOSSIP_MESSAGE",
         server::LIST_INVENTORY => "SMSG_LIST_INVENTORY",
         server::TRAINER_LIST => "SMSG_TRAINER_LIST",
+        server::SHOW_TAXI_NODES => "SMSG_SHOWTAXINODES",
+        server::ACTIVATE_TAXI_REPLY => "SMSG_ACTIVATETAXIREPLY",
+        server::NEW_TAXI_PATH => "SMSG_NEW_TAXI_PATH",
         server::TRAINER_BUY_SUCCEEDED => "SMSG_TRAINER_BUY_SUCCEEDED",
         server::QUESTGIVER_STATUS => "SMSG_QUESTGIVER_STATUS",
         server::QUESTGIVER_STATUS_MULTIPLE => "SMSG_QUESTGIVER_STATUS_MULTIPLE",

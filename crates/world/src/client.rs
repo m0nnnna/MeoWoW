@@ -978,6 +978,31 @@ impl Connection {
         self.send(ClientOpcode::TrainerBuySpell, &body)
     }
 
+    /// Asks a flight master where it can send this character.
+    ///
+    /// The guid goes out unpacked, like the vendor's and the trainer's. See
+    /// [`ClientOpcode::TaxiQueryAvailableNodes`].
+    pub fn taxi_query_nodes(&mut self, npc: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::TaxiQueryAvailableNodes, &npc.to_le_bytes())
+    }
+
+    /// Buys a flight from `from` to `to`.
+    ///
+    /// Both are [`dbc::schema::TaxiNodes`] row ids, and `from` must be the
+    /// node the **server** named in [`TaxiMenu::current_node`](crate::TaxiMenu)
+    /// rather than one this client worked out from the player's position --
+    /// see [`ClientOpcode::ActivateTaxi`].
+    ///
+    /// Answered either way, so unlike most requests in this crate a caller
+    /// can tell a refusal from a misunderstanding.
+    pub fn activate_taxi(&mut self, npc: u64, from: u32, to: u32) -> Result<(), Error> {
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&npc.to_le_bytes());
+        body.extend_from_slice(&from.to_le_bytes());
+        body.extend_from_slice(&to.to_le_bytes());
+        self.send(ClientOpcode::ActivateTaxi, &body)
+    }
+
     /// Sells an item to the open vendor.
     ///
     /// The item is named by **guid** rather than by slot, deliberately: a guid

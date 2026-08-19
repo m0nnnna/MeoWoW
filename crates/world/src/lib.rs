@@ -28,6 +28,7 @@ pub mod quest_cache;
 pub mod query;
 pub mod spell;
 pub mod state;
+pub mod taxi;
 pub mod trainer;
 pub mod update;
 pub mod vendor;
@@ -46,6 +47,7 @@ pub use quest::{
     QuestPoint, QuestRewardItem,
 };
 pub use quest_cache::{Answer, QuestCache};
+pub use taxi::{TaxiMenu, TaxiReply};
 pub use trainer::{TrainerList, TrainerSpell, TrainerSpellState};
 pub use vendor::{VendorItem, VendorList};
 pub use inventory::{Carried, HeldItem, InventorySlot, SlotKind, Where};

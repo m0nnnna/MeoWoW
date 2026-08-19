@@ -1737,6 +1737,129 @@ impl_table_info!(
     SpellVisualKit
 );
 
+dbc_table! {
+    /// A place a flight master can send you, and where it is in the world.
+    ///
+    /// 364 rows in this build. The id is what
+    /// [`PLAYER_FIELD_KNOWN_TAXI_MASK`](../../world/update/fields) indexes by
+    /// bit, and what [`TaxiPath`]'s endpoints name.
+    ///
+    /// **The position is the load-bearing column here**, and not because
+    /// anything is drawn at it. It is the *check*: a path's first waypoint in
+    /// [`TaxiPathNode`] must land on the node it departs from and its last on
+    /// the node it arrives at, and those two facts come out of different
+    /// tables. That is what identifies [`TaxiPath`]'s `from`/`to` columns,
+    /// which are otherwise two adjacent small integers that both resolve --
+    /// the same trap as `MOMT`'s ground type and the same escape as the
+    /// entry-to-display-id pairing that confirmed `SMSG_LOOT_RESPONSE`.
+    TaxiNodes, TaxiNodesRow, path = r"DBFilesClient\TaxiNodes.dbc", fields = 24, {
+        0 id: u32,
+        /// The [`Map`] this node stands on.
+        1 map_id: u32,
+        2 x: f32,
+        3 y: f32,
+        4 z: f32,
+        /// What the flight master's list calls it, e.g. `Stormwind, Elwynn`.
+        ///
+        /// A **name**, which makes it the strongest column in the table for
+        /// checking any claim about the others -- the rule the M2 event
+        /// stride, `GroundEffectTexture`'s terrain column and 4.24's trainer
+        /// greeting all rest on.
+        5 name: loc,
+        /// The **creature template entry** of the beast this node's flights
+        /// leave on, for a Horde character.
+        ///
+        /// **A creature entry, not a `CreatureDisplayInfo` id**, and the
+        /// difference is not academic: reading it as a display id resolves
+        /// 2,224 to `NightElfFemale.mdx` and 541 to nothing at all. It was
+        /// caught only because the resolution was checked by **name** -- a
+        /// character model is obvious nonsense for a flying mount, where a
+        /// plausible-but-wrong small integer would have gone unnoticed. A
+        /// creature entry is server data, so this client cannot resolve it
+        /// from any table it has; the mount it actually draws arrives in the
+        /// replicated `UNIT_FIELD_MOUNTDISPLAYID` instead.
+        ///
+        /// **The faction split was measured, and the obvious test was the
+        /// wrong one.** Two columns of mount ids look like a faction pair,
+        /// and the first check tried was whether the two id sets are
+        /// disjoint. They are not -- thirty ids appear in both -- which reads
+        /// as a refutation and is not one: the overlap is entirely *neutral*
+        /// mounts that both sides ride at a shared hub, `Riding Drake, Red`
+        /// nine times in each column. What settled it was resolving the ids
+        /// against the server's `creature_template` and reading the **names**:
+        /// this column holds `Wind Rider` 75 times and `Riding Bat` 20, and
+        /// [`Self::mount_alliance`] holds `Riding Gryphon` 73 times and
+        /// `Riding Hippogryph` 25.
+        ///
+        /// A hand-picked sample nearly wrote the opposite finding into this
+        /// file: eight famous cities happened to contain none of the 95 nodes
+        /// that fill both columns, so "no node sets both, therefore not a
+        /// faction pair" survived until the whole table was counted.
+        22 mount_horde: u32,
+        /// The same for an Alliance character. See [`Self::mount_horde`] for
+        /// how the two were told apart and why it took names to do it.
+        23 mount_alliance: u32,
+    }
+}
+
+dbc_table! {
+    /// One flight route: where it starts, where it ends, what it costs.
+    ///
+    /// 915 rows. A route is *directional* -- a return trip is a separate row
+    /// -- so the pair of endpoint columns is not symmetric and getting them
+    /// the wrong way round is not cosmetic: it would fly a player from their
+    /// destination to where they already are, and every id involved would
+    /// still resolve.
+    ///
+    /// **Which column is `from` is settled geometrically**, by
+    /// [`TaxiPathNode`]'s waypoints landing on [`TaxiNodes`]' coordinates in
+    /// the right order. Validity cannot separate them; both are node ids.
+    TaxiPath, TaxiPathRow, path = r"DBFilesClient\TaxiPath.dbc", fields = 4, {
+        0 id: u32,
+        /// The [`TaxiNodes`] row this route departs from.
+        1 from_node: u32,
+        /// The [`TaxiNodes`] row it arrives at.
+        2 to_node: u32,
+        /// Copper. Zero on 145 rows, which are the free intra-city hops.
+        3 cost: u32,
+    }
+}
+
+dbc_table! {
+    /// One waypoint of a flight route, in order.
+    ///
+    /// 22,586 rows, and the table that actually describes a flight: the
+    /// server sends a *path id*, and this is the only thing that says where
+    /// the gryphon goes between the two ends.
+    ///
+    /// The index within a path is its own column rather than implied by row
+    /// order -- the same rule as a loot slot and a gossip option index, and
+    /// worth honouring here for the ordinary reason that a table is not
+    /// guaranteed to be stored sorted.
+    TaxiPathNode, TaxiPathNodeRow, path = r"DBFilesClient\TaxiPathNode.dbc", fields = 11, {
+        0 id: u32,
+        /// The [`TaxiPath`] this waypoint belongs to.
+        1 path_id: u32,
+        /// Position along that path, from zero.
+        2 index: u32,
+        /// The [`Map`] this waypoint is on. A path does not change maps
+        /// mid-flight in this build, but the column is per-waypoint.
+        3 map_id: u32,
+        4 x: f32,
+        5 y: f32,
+        6 z: f32,
+        /// Takes only 0, 1 and 2 over all 22,586 rows, and 22,491 of them are
+        /// zero. **Deliberately left a number**: three values with no
+        /// behaviour observed is not an enum this project may name, the same
+        /// refusal `LiquidType`'s categories and the trainer `kind` get.
+        7 flags: u32,
+        /// Seconds the flight pauses here. Non-zero on 92 rows.
+        8 delay: u32,
+        9 arrival_event: u32,
+        10 departure_event: u32,
+    }
+}
+
 /// Marker so the unused-import lint does not fire on the re-exports the macro
 /// relies on.
 const _: () = {
