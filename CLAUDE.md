@@ -16,15 +16,17 @@ changed is what a person sees: the window, the README, this file.
 Phases 1, 2 and 3 are complete: every data format reads, the world renders and
 streams, and the protocol reaches a live realm. Phase 4 has started.
 
-**4.24 opens a six-part block, and it is the biggest thing left in Phase 4.**
+**4.24 and 4.25 open a six-part block, the biggest thing left in Phase 4.**
 Flight paths, trainers, mail, auction, guild and trade — the services a city
 offers — taken as six milestones rather than one push, in an order set by what
 each one introduces. Trainers went first because they introduce *nothing*: no
 new format, no new interface mechanism, and a request the server **answers**,
-which is what bounds the five silent ones after it. What each of the rest
+which is what bounds the silent ones after it. **Flight paths (4.25) followed
+and are done** -- three DBCs, and the first time the *server* has ever moved
+this character. What each of the rest
 brings that this client has never done is the real cost — flight paths are the
-first time the **server moves the player**; trade is the first time **both ends
-must act** rather than one watching; mail is the first **effect with no
+first time the **server moves the player** (done); trade is the first time
+**both ends must act** rather than one watching; mail is the first **effect with no
 request**; auction is the first **list this client cannot bound**. Questie —
 the destination of the 4.15→4.21 ladder — slides to 4.30 behind them, which the
 ladder note below already explains is the normal thing to happen to a rung
