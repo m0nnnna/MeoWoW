@@ -3526,12 +3526,16 @@ each rung is a prerequisite for the next, not a preference.
 4.16  Quests              accept, track, turn in
 4.17  Map                 the world map, and where things are on it
 4.21  Minimap             the same, small, and following the player
-4.22  Questie, natively   what to do, where, and whether you can yet
+4.22  Animations          the cast, the off hand, and a stow that asked a question
+4.23  Questie, natively   what to do, where, and whether you can yet
 ```
 
 The last two rungs were numbered 4.18 and 4.19 when this was written. Liquids,
-emitters and parties took those numbers on the way past; the *order* is what
-this table is about and it has not changed.
+emitters, parties and the animation gaps took those numbers on the way past;
+the *order* is what this table is about and it has not changed. That the
+number keeps moving while the order never does is the point: this is a
+dependency chain, so anything landing in between renumbers the rungs without
+reordering them.
 
 ### Why this order and not another
 
@@ -4962,7 +4966,7 @@ same reason: the wheel must not rewrite a saved setting on every notch.
   the whole of Azeroth would hold about 22MB of BC1, which is small enough not
   to evict and be wrong about.
 * **Nothing but objectives and party members is on it.** No corpse, no
-  questgivers, no vendors, no dungeon entrances -- 4.22's material.
+  questgivers, no vendors, no dungeon entrances -- 4.23's material.
 
 ### 4.22: the animation subsystem's remaining gaps
 

@@ -84,9 +84,12 @@ Roughly 62% of the way to something a person could test by playing. See
 **The destination for the next few milestones is a native Questie**, and the
 ladder to it is a dependency chain rather than a preference: NPC interaction
 (4.15) → quests (4.16) → map (4.17) → minimap (4.21) → Questie's features
-(4.22). The last two rungs were numbered 4.18 and 4.19 when that was written;
-liquids, emitters and parties took those numbers on the way past and the order
-is unchanged. A quest tracker is a map feature — its whole value is "the thing you
+(**4.23**). The last two rungs were numbered 4.18 and 4.19 when that was
+written; liquids, emitters, parties and now the animation gaps took those
+numbers on the way past and the order is unchanged. The number keeps moving
+and the *order* never has, which is the point worth reading: this ladder is a
+dependency chain, so anything that lands in between renumbers the rungs
+without reordering them. A quest tracker is a map feature — its whole value is "the thing you
 need is over there", and there is no *there* until a map exists. The scoping
 fact that matters: **most of Questie's bulk is a workaround for a restriction
 this client does not have.** An addon cannot ask the server about a quest it has
