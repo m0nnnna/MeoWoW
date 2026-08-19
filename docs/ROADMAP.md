@@ -6208,3 +6208,256 @@ accept, and the re-accept loop put it back.
 * **Only the status codes actually produced are named** -- `BUSY`, `BEGIN`,
   `OPEN_WINDOW`, `CANCELED`, `ACCEPT`, `BACK_TO_TRADE`, `COMPLETE`, `NO_TARGET`
   and the dead-sender one. The other fifteen print their number.
+
+## 4.27: mail, and the first effect with no request
+
+Fourth rung of the six-part city-services block. Trainers were the cheap rung
+that bounded the rest; flight paths were the first time the *server* moved this
+character; trade was the first time **both ends had to act**. Mail is the first
+time something happens here **because somebody else did something**, at a
+moment with nothing outstanding to correlate it against.
+
+Everything else this client reads is the far end answering. A vendor list
+follows a request for it. A monster move describes a creature this session
+asked to have replicated. Even the unprompted-looking ones -- weather, a mirror
+timer -- are the server describing a world the character walked into.
+`SMSG_RECEIVED_MAIL` is not that: it arrives because a letter was posted, by
+anyone, anywhere, and there is no send in the session it belongs to.
+
+### The packet that says mail arrived says nothing else
+
+It is **four bytes and they are zero.** No sender, no subject, no count, no
+mail id. Confirmed on the wire: `wow-cli world --mail-wait 120` sends nothing
+for two minutes while a script posts a letter every twenty-two seconds, and
+five arrived -- each one `00 00 00 00`.
+
+The obvious follow-up is not available either, and that is the other half of
+the shape. `CMSG_GET_MAIL_LIST` names a mailbox, and the server's
+`CanOpenMailBox` refuses anything that is not a mailbox game object or a
+mailbox NPC the character can reach. So an arrival is knowable anywhere in the
+world and its **contents are knowable only within a few units of a physical
+object**. A mail interface is two frames rather than one, and no amount of
+protocol work collapses them.
+
+Which is why the arrival becomes a **line of chat** in the viewer and not a
+widget: `You have new mail.` is exactly as much as the packet says. The one
+thing between that and walking to a mailbox is `MSG_QUERY_NEXT_MAIL_TIME`,
+which names senders with no mailbox involved -- and names **at most two**,
+because the server stops after two. That is the original client's "you have
+mail from X", and it is a summary by construction rather than a list that
+happened to be short. Its leading float is a **sentinel and not a time**
+despite the opcode's name: `0.0` when something is unread and `-86400.0` when
+nothing is, written before the server knows anything about *when*.
+
+### Each record announces its own length, and the number is wrong
+
+Every letter in `SMSG_MAIL_LIST_RESULT` begins with a `u16` size. That is the
+field this project reaches for -- the redundant slot index that caught a trade
+stride, the redundant `dir:` lines in `md5translate.trs` -- because a length
+that agrees with the parse is confirmation for free.
+
+It does not agree. The size is computed from a hand-written expression counting
+**eight** four-byte fields where the writer writes **seven**: COD, a zero word,
+the stationery, the money, the check mask, the expiry as a float, and the
+template id. The eighth does not exist.
+
+Predicted from the server's source and then **measured**: over sixteen letters
+of thirteen different lengths, every single one announced exactly four bytes
+more than it parsed as. `68/64`, `73/69`, `78/74`, `79/75`, `86/82`.
+
+What matters is what the parser does with it. **It checks the size and never
+seeks by it.** A parser that trusted the field would land four bytes into the
+second record on the first letter it read and turn the rest of the packet into
+plausible garbage. One that ignored it entirely would give up a per-record
+check and report a stride error as a length at the end of a body holding twelve
+other letters. Reading it and comparing keeps the diagnosis where the mistake
+is -- and the test that documents this asserts the odd half: a record whose
+announced size *equals* its real one is **refused**, because that is not what
+this realm writes and a parser tolerant of both has no check at all.
+
+### A mailed item is not in the world, which is why the record is fat
+
+An item in a bag is a replicated object: the client holds its guid, its fields,
+its stack count and its durability, so the vendor and trade packets can name
+one with a `(bag, slot)` pair and say nothing else. **A mailed item is attached
+to nothing.** It has left the sender's inventory and has not arrived in the
+receiver's, so there is no object anywhere in replicated state to look up and
+no query that answers for one.
+
+So an attachment record carries everything inline -- entry, count, charges,
+durability, and seven enchantment slots -- and that is why it is **118 bytes**
+where a trade slot is 73. The list is self-contained because its contents are
+outside the world.
+
+It also explains the **third way this client names an item**. Inventory moves
+address `(bag, slot)`; `CMSG_SELL_ITEM` names a full 64-bit guid;
+`CMSG_MAIL_TAKE_ITEM` names a bare **32-bit low guid**, because that is the
+only handle a thing with no object has. Reading it as the low half of a full
+guid and rebuilding the high half would be inventing a fact. Confirmed by
+effect: taking attachment `209` from mail `4` came back
+`ItemTaken -> OK (took item 209 x2)`, and the realm's own `mail_items` row said
+`(4, 209, 1)`.
+
+### Mail is not trade, and the bounding request is back
+
+Trade was the exception where nothing in the block talked back. Mail is the
+ordinary case and better than ordinary: **every request but one is answered by
+`SMSG_SEND_MAIL_RESULT`, and the reply echoes the action it was for.** That is
+what ties an answer to a question when several are in flight, and it means one
+send bounds the opcode, the body and the reply layout together -- the move
+`CMSG_LIST_INVENTORY` made for `CMSG_BUY_ITEM` and `CMSG_GROUP_INVITE` made for
+the party block.
+
+The exception is `CMSG_MAIL_MARK_AS_READ`, silent either way. Its effect shows
+up in the *next* inbox and nowhere else, so it is confirmed by re-asking: mail
+4 came back with `flags 0x01`.
+
+**The result's tail branches on the result first and the action second**, and
+the order matters more than it looks. A take that succeeded carries the item's
+low guid and the count; a take that *failed* on inventory space carries the
+inventory error **instead**, not as well. A parser branching on the action
+first is correct on every success and wrong on exactly the case it exists to
+explain -- and wrong silently, reading a four-byte error as an item guid and
+then running out of body. The three shapes are twelve, sixteen and twenty
+bytes, so the length is independent evidence about the branch.
+
+### The count the server sent is not the count it has
+
+`SMSG_MAIL_LIST_RESULT` carries a total *and* a row count. They differ when the
+mailbox holds more than fifty letters, or more than one packet's worth, and the
+surplus is named nowhere else in the protocol. A client drawing the number of
+rows it received tells the person with a full mailbox that it is not full --
+and the letters it silently dropped are the oldest, which are the ones about to
+expire. `Inbox::withheld` is that number and the window's header draws it.
+
+### The first thing here that asks what an object *is*
+
+A mailbox is a game object, and game objects have been replicated and drawn
+since Phase 3 off a display id alone. A display id says how to draw a thing and
+**nothing whatever about what it does** -- it draws a mailbox and a bench with
+equal confidence. Mail is the first feature that has to pick one kind out of a
+field of them, so it is also the first send of `CMSG_GAMEOBJECT_QUERY` this
+client has ever made.
+
+Live in Northshire: 39 game objects in view, 39 distinct entries, and the
+answers name them -- twenty Wooden Benches (type 7), eight doors and lifts
+(11), six ships and zeppelins (15), one quest object (9) and **one Mailbox
+(19)**. Nothing but the type separates the last from the first.
+
+One entry had not answered inside the probe's 1.2-second window and printed as
+`type ?`. That is the right answer and not a gap: `Names::gameobject` keeps
+three states -- not asked, answered "no such thing", and answered -- and a
+window that read "not asked yet" as "not a mailbox" would refuse to open the
+one object the player is standing in front of.
+
+The same top-bit convention appears again in the not-found reply
+(`entry | 0x80000000`), which is now the **third** place in this protocol that
+says "not this" by setting the high bit of an id, after the creature query and
+4.16's quest game-object target.
+
+### The delivery delay is narrower than it looks, and both halves were measured
+
+The claim, read out of the server's source and unconfirmed until now: the
+one-hour delay applies **only** to mail that carries items, and only when the
+recipient is on a different account.
+
+`Testwolf` to `Facetest`, same account, with a stack of Linen Cloth attached:
+`deliver_time` equals the send time exactly. No delay. Money-only and text-only
+mail is instant to anybody.
+
+That is the confirming half. It matters because an hour-long fixture and a
+seconds-long one are the difference between a milestone that can be tested and
+one that cannot.
+
+### The acceptance that is a fact about the actor
+
+`CanOpenMailBox` accepts the **reader's own guid** as a mailbox from anybody at
+moderator rank or above. Every fixture account on this project's local realm is
+a game master, so the cheapest possible probe -- ask for the inbox with no
+mailbox anywhere -- works here and would work for no player at all.
+
+Measured deliberately in order to be ruled out. `--mail-own-guid` reports
+`ANSWERED. This works here and would not work for a player.` This is the mirror
+of a rule this project already had -- *a refusal is a fact about the actor, not
+about the thing being asked for* -- with the sign reversed: **an acceptance can
+be one too**, and that is the more dangerous direction, because a refusal sends
+somebody looking and an acceptance sends them home.
+
+### One gesture, and the destructive half is not on it
+
+The mailbox window is a list of letters. Clicking one takes everything in it --
+money first, then attachments, in that order because taking an attachment off a
+cash-on-delivery letter *spends* money and a letter whose copper is already
+collected is the cheapest state to stop halfway in. Clicking a letter with
+nothing left in it does **nothing**.
+
+That is deliberate rather than unfinished. The only other thing a click could
+mean on an emptied letter is *delete*, which is irreversible and has no
+confirmation anywhere in this interface -- and a stray click on the wrong row
+must not destroy anything. Same caution as the CLI's selection helpers refusing
+players outright after a `--target Wolf` substring matched somebody's character
+and killed it.
+
+The two states are mutually exclusive and both are drawn, and **the window says
+what the gesture is** in a line under the list, with the room for it reserved
+whether or not anything is drawn there. That is 4.26's lesson applied *before*
+the first live test rather than after it: the trade window's offer gesture was
+correct code nobody could find, and the report came back as "I couldn't give
+him an item".
+
+### The window closes itself
+
+Every mail request names the mailbox, and the server re-checks on each one that
+the object still exists, is still a mailbox, and is still within about ten
+units -- refusing by doing nothing at all. So the window closes when the
+character walks away, rather than staying open to send things that are dropped
+in silence.
+
+Measured from where this client thinks it *is*, never from replicated state:
+the server does not relay our own movement back, so our replicated position is
+wherever we logged in. A window keyed off that would close as soon as the
+character walked ten units from the spawn, and this would be the fifth caller
+in the project to relearn it.
+
+### Reading a probe's silence, one milestone after being told to
+
+The first arrival run reported **zero** `SMSG_RECEIVED_MAIL`s while the realm's
+own database showed the letter had been created and delivered. That is two
+findings wearing one sentence: the server never sent one, or it sent one under
+a number this client does not recognise. They want opposite investigations.
+
+The wait loop had been written without an opcode tally -- the cheapest
+instrument in this box, the one that turned three failed attempts at chat into
+a one-run answer, and the one `CLAUDE.md` already names twice. Adding it
+settled the question immediately, and the answer was that the earlier run's
+timing had simply missed the window:
+
+```
+SMSG_RECEIVED_MAIL                 (0x0285) x5
+```
+
+### Still not done
+
+* **No sending from the interface.** `CMSG_SEND_MAIL` is confirmed and driven
+  from `wow-cli`; the window reads and empties and has no compose form.
+* **No delete and no return-to-sender in the window.** Both requests are
+  implemented and both are confirmed from the CLI (`--mail-clear`), but the
+  destructive gesture is deliberately not on the click that collects -- see
+  above. There is no second gesture yet.
+* **No cash-on-delivery anywhere.** The field is parsed and drawn as a number;
+  nothing has produced a letter carrying one, and the server's refusals around
+  it are unexercised.
+* **No `CMSG_MAIL_CREATE_TEXT_ITEM`.** Copying a letter's body into a paper
+  item is implemented, never sent, and named here rather than left to look
+  finished.
+* **No stationery art and no mail template.** `Stationery.dbc` and
+  `MailTemplate.dbc` are untranscribed, so a letter the game wrote itself shows
+  its subject and body and not the parchment it came on.
+* **The unread indicator is a chat line**, not a mark on the minimap. That is
+  honest about what the packet carries and is less than the original client
+  shows.
+* **`MSG_QUERY_NEXT_MAIL_TIME` is sent by the probe and not by the viewer**, so
+  a character who logs in with mail already waiting is told nothing until they
+  open a mailbox.
+* **The enchantment, charges, durability and random-property fields** on an
+  attachment are parsed, carried, and drawn by nothing.

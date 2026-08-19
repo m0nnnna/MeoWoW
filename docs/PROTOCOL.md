@@ -1284,3 +1284,212 @@ enchanting a partner's item is not possible; that is also the one path that woul
 produce the own-half packet, and it has never been seen. `TradeItem`'s
 enchantment, gem, suffix, random-property and lock fields are parsed, carried and
 drawn by nothing.
+
+## Mail, and the first packet that answers nothing
+
+Everything above this is the far end answering something. Even the
+unprompted-looking packets -- weather, a mirror timer -- are the server
+describing a world this character walked into. `SMSG_RECEIVED_MAIL` is the
+first thing here that arrives because **somebody else acted**, with nothing
+outstanding in the session to correlate it against.
+
+Eleven opcodes, nine out and four in (`MSG_QUERY_NEXT_MAIL_TIME` travels both
+ways under one number):
+
+| request | body | what answers it |
+|---|---|---|
+| `CMSG_SEND_MAIL` `0x0238` | see below | `SMSG_SEND_MAIL_RESULT`, either way |
+| `CMSG_GET_MAIL_LIST` `0x023A` | `u64` mailbox, unpacked | `SMSG_MAIL_LIST_RESULT` |
+| `CMSG_MAIL_TAKE_MONEY` `0x0245` | `{u64 mailbox, u32 mail}` | `SMSG_SEND_MAIL_RESULT` (`MoneyTaken`) |
+| `CMSG_MAIL_TAKE_ITEM` `0x0246` | `{u64 mailbox, u32 mail, u32 item low guid}` | `SMSG_SEND_MAIL_RESULT` (`ItemTaken`) |
+| `CMSG_MAIL_MARK_AS_READ` `0x0247` | `{u64 mailbox, u32 mail}` | **nothing, either way** |
+| `CMSG_MAIL_RETURN_TO_SENDER` `0x0248` | `{u64 mailbox, u32 mail, u64 ignored}` | `SMSG_SEND_MAIL_RESULT` |
+| `CMSG_MAIL_DELETE` `0x0249` | `{u64 mailbox, u32 mail, u32 template}` | `SMSG_SEND_MAIL_RESULT` (`Deleted`) |
+| `CMSG_MAIL_CREATE_TEXT_ITEM` `0x024A` | `{u64 mailbox, u32 mail}` | `SMSG_SEND_MAIL_RESULT` |
+| `MSG_QUERY_NEXT_MAIL_TIME` `0x0284` | empty | the same opcode, back |
+| | | |
+| `SMSG_SEND_MAIL_RESULT` `0x0239` | `{u32 mail, u32 action, u32 result}` + a conditional tail | |
+| `SMSG_MAIL_LIST_RESULT` `0x023B` | `{u32 total, u8 shown}` + `shown` variable-length records | |
+| `SMSG_RECEIVED_MAIL` `0x0285` | **`u32`, always zero** | |
+| `SMSG_SHOW_MAILBOX` `0x0297` | `u64` mailbox guid | |
+
+`CMSG_SEND_MAIL`'s body is the longest this client builds:
+`u64 mailbox`, three NUL-terminated strings (receiver, subject, text),
+`u32 stationery`, `u32` zero, `u8 count`, then `count` pairs of
+`{u8 index, u64 item guid}`, then `u32 money`, `u32 cod`, `u64` zero, `u8` zero.
+Note the two item addressing schemes in one exchange: **outgoing** names full
+64-bit item guids, because the items are still replicated objects in the
+sender's bags, and **incoming** names bare 32-bit low guids, because by then
+they are not.
+
+### The answered request is back, and it echoes the action
+
+Trade was the exception where nothing talked back. Mail is better than the
+ordinary case: nearly every request is answered by `SMSG_SEND_MAIL_RESULT`, and
+the reply carries the **action** it was for. That is what ties an answer to a
+question when several are in flight, and it means one send bounds the opcode,
+the body and the reply layout together.
+
+`CMSG_MAIL_MARK_AS_READ` is the one exception. Its effect appears in the next
+`SMSG_MAIL_LIST_RESULT` and nowhere else, so it is confirmed by re-asking.
+
+### The result's tail branches on the result before the action
+
+```
+u32 mail id
+u32 action        0 Send, 1 MoneyTaken, 2 ItemTaken, 3 ReturnedToSender,
+                  4 Deleted, 5 MadePermanent
+u32 result        0 is success
+  if result == 1 (an inventory error):   u32 equip error
+  else if action == 2 (ItemTaken):       u32 item low guid, u32 count
+```
+
+The order is load-bearing. A take that *failed* on inventory space carries the
+error **instead of** the item pair, not as well -- so a parser branching on the
+action first is right on every success and wrong on exactly the case it exists
+to explain, reading a four-byte error as an item guid and then running out of
+body. The three shapes are 12, 16 and 20 bytes, so the length is independent
+evidence about which branch was taken.
+
+### Each record announces its own length, and the number is four too many
+
+One letter in `SMSG_MAIL_LIST_RESULT`:
+
+```
+u16 size            <- see below
+u32 mail id
+u8  message type    0 normal, 2 auction, 3 creature, 4 game object, 5 calendar
+    if type == 0:   u64 sender player guid
+    otherwise:      u32 sender entry
+u32 cash on delivery
+u32 zero
+u32 stationery      Stationery.dbc
+u32 money
+u32 check mask      a u8 mask in a u32 field
+f32 days until it expires
+u32 mail template   MailTemplate.dbc
+cstring subject
+cstring body
+u8  attachment count
+    per attachment, 118 bytes:
+      u8  index
+      u32 item low guid    <- what CMSG_MAIL_TAKE_ITEM names
+      u32 entry
+      7 x { u32 enchant id, u32 duration, u32 charges }
+      i32 random property  (signed: the sign separates suffix from prefix)
+      u32 suffix factor
+      u32 stack count
+      u32 spell charges
+      u32 max durability
+      u32 durability
+      u8  zero
+```
+
+**The size field is four bytes larger than the record, on every record.** The
+server computes it from an expression counting eight four-byte fields between
+the sender and the subject where the writer writes seven. Measured over sixteen
+letters of thirteen different lengths: `68/64`, `73/69`, `78/74`, `79/75`,
+`86/82` -- always `+4`.
+
+This parser **checks the size and never seeks by it**. Seeking would land four
+bytes into the second record on the first letter read; ignoring it entirely
+would give up a per-record check and report a stride error as a length at the
+end of a body holding twelve other letters.
+
+The message type is a **conditional width inside a variable-length record
+inside a list**, which is the worst place for one: getting it wrong
+desynchronises everything after it. The server's own switch has no default arm
+and writes no sender at all for a type it does not know; this parser refuses
+such a type by name instead, because a width nobody has observed is not a
+width.
+
+### A mailed item is not an object
+
+An attachment record is 118 bytes where a trade slot is 73, and the reason is
+that there is nothing to query. The item has left the sender's inventory and
+has not entered the receiver's, so it is not replicated anywhere and no query
+answers for it. Entry, count, charges, durability and seven enchantment slots
+all travel inline because they have to.
+
+### Reaching a mailbox at all needs a different question
+
+`CanOpenMailBox` accepts a game object of type 19, an NPC carrying the mailbox
+flag -- or the reader's **own guid**, if they are a game master. That last one
+works on every fixture account on this project's local realm and would work for
+no player, so it is measured (`wow-cli world --mail-own-guid`) in order to be
+ruled out.
+
+Which game object is a mailbox is not on the object update. A display id draws
+a mailbox and a bench with equal confidence, so mail is the first feature here
+that needs `CMSG_GAMEOBJECT_QUERY` `0x005E`:
+
+```
+CMSG_GAMEOBJECT_QUERY          {u32 entry, u64 guid}   -- like CMSG_CREATURE_QUERY
+SMSG_GAMEOBJECT_QUERY_RESPONSE 0x005F
+  u32 entry            (| 0x80000000 and nothing else, when there is no such entry)
+  u32 type             <- 19 is a mailbox, and the only reason to ask
+  u32 display id
+  cstring name, then three empty strings
+  cstring icon name, cstring cast-bar caption, cstring unknown
+  24 x u32 type-specific data
+  f32 size
+  6 x u32 quest item ids
+```
+
+The top-bit "not this" convention is now the third place it appears in this
+protocol, after the creature query and 4.16's quest game-object target.
+
+### The delivery delay is narrower than it looks
+
+An hour's wait is applied **only** to mail that carries items, and only when
+the recipient is on a different account. Both halves measured against the
+realm's own `mail.deliver_time`: `Testwolf` to `Facetest` (same account, one
+attachment) delivered at the send time exactly; `Testwolf` to `Watcher`
+(different account, one attachment) delivered 3,296 seconds later. Money-only
+and text-only mail is instant to anybody.
+
+### What a live run looked like, 2026-08-19
+
+```
+game objects in view: 39 objects, 39 distinct entries
+  ...  entry 142075  type 19  Mailbox   0.0 units   <- MAILBOX
+
+--mail-own-guid -> ANSWERED. This works here and would not work for a player.
+
+posting to "Facetest": subject "probe-item", 4321 copper, 1 attachment(s)
+  <- SMSG_SEND_MAIL_RESULT: mail 0 Send -> OK
+
+MSG_QUERY_NEXT_MAIL_TIME: marker 0.0 (something unread), 2 sender(s) named
+
+inbox: server counted 13, sent 13
+  #4  "With goods"  from player 0x1  0c  flags 0x01 read  90.0 days
+      announced 68 bytes, parsed 64 -- a 4 overcount
+      attachment 0: low guid 209 entry 4306 x2
+
+taking from mail 4 ("With goods")
+  <- SMSG_SEND_MAIL_RESULT: mail 4 ItemTaken -> OK (took item 209 x2)
+taking from mail 3 ("Some coins")
+  <- SMSG_SEND_MAIL_RESULT: mail 3 MoneyTaken -> OK
+
+waiting 120s and sending NOTHING.
+  <- SMSG_RECEIVED_MAIL x1 at 18s.  body: 00 00 00 00
+  <- SMSG_RECEIVED_MAIL x1 at 43s.  body: 00 00 00 00
+  <- SMSG_RECEIVED_MAIL x1 at 64s.  body: 00 00 00 00
+  <- SMSG_RECEIVED_MAIL x1 at 85s.  body: 00 00 00 00
+  <- SMSG_RECEIVED_MAIL x1 at 109s. body: 00 00 00 00
+  every opcode seen while sending nothing:
+    SMSG_RECEIVED_MAIL                 (0x0285) x5
+```
+
+The 777 copper taken from mail 3 came off `Testwolf`'s purse to the copper, and
+the two Silk Cloth from mail 4 matched the realm's own `mail_items` row.
+
+### Not sent yet
+
+`CMSG_MAIL_CREATE_TEXT_ITEM` is implemented and unsent -- copying a body into a
+paper item has no gesture. `CMSG_MAIL_RETURN_TO_SENDER` is implemented and only
+sent from the CLI. Cash on delivery is parsed and nothing has produced a letter
+carrying one, so every refusal around it is unexercised. `SMSG_SHOW_MAILBOX` is
+parsed and read by nothing: a game object clicked directly does not produce
+one, so it is a convenience rather than the thing that tells a client a mailbox
+exists.
