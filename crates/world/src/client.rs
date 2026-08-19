@@ -978,6 +978,101 @@ impl Connection {
         self.send(ClientOpcode::TrainerBuySpell, &body)
     }
 
+    /// Asks another player to trade.
+    ///
+    /// The guid goes out unpacked, like the vendor's and the trainer's.
+    ///
+    /// **This send is silent when it works and answered when it does not.**
+    /// A trade that starts is announced to the *partner*, not to the sender,
+    /// so nothing comes back here until their client replies. Every refusal
+    /// does come back, naming a [`crate::TradeStatus`] -- and that asymmetry
+    /// is what makes the block confirmable at all: pointed at a guid that is
+    /// not a player, this is answered immediately, from one client, with
+    /// nobody else logged in. See [`ClientOpcode::InitiateTrade`].
+    pub fn initiate_trade(&mut self, partner: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::InitiateTrade, &partner.to_le_bytes())
+    }
+
+    /// Agrees to open a trade window somebody else asked for.
+    ///
+    /// **The first request in this client that exists because another person
+    /// has to say yes.** Answered with `OPEN_WINDOW` at *both* ends, which is
+    /// also the first time a send from here has produced a packet at somebody
+    /// else's client.
+    pub fn begin_trade(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::BeginTrade, &[])
+    }
+
+    /// Declines a trade because this client is busy.
+    ///
+    /// One of three mutually exclusive answers to an offer -- this,
+    /// [`Self::begin_trade`], and the ignore form this client does not send.
+    /// The server closes the trade on either refusal, so exactly one of the
+    /// three goes out per offer.
+    pub fn busy_trade(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::BusyTrade, &[])
+    }
+
+    /// Accepts what is on the table.
+    ///
+    /// `token` is the `u32` from [`crate::TradeStatus::OpenWindow`]. **The
+    /// body cannot be confirmed on this realm**: the server's handler reads
+    /// nothing from it, so no observation here separates four bytes from
+    /// none. It is sent because the risk is one-sided -- a server checking a
+    /// minimum size refuses an empty body and none refuse a body they ignore
+    /// -- and the token is what goes in it because it is the only number the
+    /// server has offered that belongs to this trade. See
+    /// [`ClientOpcode::AcceptTrade`].
+    ///
+    /// Silent at the sender. The partner gets `TRADE_ACCEPT`; both get
+    /// `TRADE_COMPLETE` once the second accept lands.
+    pub fn accept_trade(&mut self, token: u32) -> Result<(), Error> {
+        self.send(ClientOpcode::AcceptTrade, &token.to_le_bytes())
+    }
+
+    /// Takes an accept back. The server answers **the other end** with
+    /// `BACK_TO_TRADE`.
+    pub fn unaccept_trade(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::UnacceptTrade, &[])
+    }
+
+    /// Calls the trade off.
+    pub fn cancel_trade(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::CancelTrade, &[])
+    }
+
+    /// Puts one carried item into a trade slot.
+    ///
+    /// `bag` and `slot` address the item exactly as [`Self::equip_item`] and
+    /// [`Self::swap_item_candidate`] address theirs, so
+    /// [`HeldItem::address`](crate::HeldItem::address) supplies both.
+    ///
+    /// `trade_slot` is one of the seven, and
+    /// [`trade::NONTRADED_SLOT`](crate::trade::NONTRADED_SLOT) is the one that
+    /// does not change hands -- putting something there offers nothing.
+    ///
+    /// **Confirmed by effect and by nothing else**: the server answers by
+    /// resending the whole offer to both ends, so the item appearing in the
+    /// reflected offer is the proof the three bytes were understood.
+    pub fn set_trade_item(&mut self, trade_slot: u8, bag: u8, slot: u8) -> Result<(), Error> {
+        self.send(ClientOpcode::SetTradeItem, &[trade_slot, bag, slot])
+    }
+
+    /// Takes an item back out of a trade slot.
+    pub fn clear_trade_item(&mut self, trade_slot: u8) -> Result<(), Error> {
+        self.send(ClientOpcode::ClearTradeItem, &[trade_slot])
+    }
+
+    /// Puts copper on the table.
+    ///
+    /// **Refused with `BUSY` when the sender does not have it**, which is one
+    /// value doing two unrelated jobs -- it means "the other end is already
+    /// trading" everywhere else. Reported raw rather than explained, for the
+    /// reason `describe_cast_failure` names exactly one code.
+    pub fn set_trade_gold(&mut self, copper: u32) -> Result<(), Error> {
+        self.send(ClientOpcode::SetTradeGold, &copper.to_le_bytes())
+    }
+
     /// Asks a flight master where it can send this character.
     ///
     /// The guid goes out unpacked, like the vendor's and the trainer's. See

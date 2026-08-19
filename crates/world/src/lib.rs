@@ -29,6 +29,7 @@ pub mod query;
 pub mod spell;
 pub mod state;
 pub mod taxi;
+pub mod trade;
 pub mod trainer;
 pub mod update;
 pub mod vendor;
@@ -48,6 +49,7 @@ pub use quest::{
 };
 pub use quest_cache::{Answer, QuestCache};
 pub use taxi::{Flight, TaxiMenu, TaxiReply};
+pub use trade::{TradeItem, TradeOffer, TradeSession, TradeStatus};
 pub use trainer::{TrainerList, TrainerSpell, TrainerSpellState};
 pub use vendor::{VendorItem, VendorList};
 pub use inventory::{Carried, HeldItem, InventorySlot, SlotKind, Where};

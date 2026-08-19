@@ -117,6 +117,19 @@ pub enum Error {
         expected: usize,
         got: usize,
     },
+
+    /// A trade slot record did not begin with its own index.
+    ///
+    /// The seven records are fixed-width and every one starts with the number
+    /// of the slot it describes, which this server writes in order every time.
+    /// That makes the byte redundant as *information* and load-bearing as
+    /// *evidence*: a record stride wrong by a word reads it out of the middle
+    /// of a `u32`, and the mistake is then reported at the first record rather
+    /// than as a length at the end of the body.
+    #[error(
+        "SMSG_TRADE_STATUS_EXTENDED: slot record {expected} announced itself as {got} --          the record stride is not what this parser thinks"
+    )]
+    TradeSlotOutOfOrder { expected: u8, got: u8 },
 }
 
 /// A bounds-checked cursor over a packet body.

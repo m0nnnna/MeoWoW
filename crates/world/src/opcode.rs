@@ -544,6 +544,100 @@ pub enum ClientOpcode {
     /// same block, the same bounding move that rescued `CMSG_BUY_ITEM`.
     TrainerBuySpell = 0x01B2,
 
+    /// Ask another player to trade. Body is their guid, unpacked.
+    ///
+    /// **Silent on success and answered on every failure**, which is the
+    /// inverse of everything else in this block and is what makes it
+    /// confirmable at all. A trade that starts is announced to the *partner*
+    /// -- see [`TRADE_STATUS`](server::TRADE_STATUS) -- so the sender learns
+    /// nothing until the other client acts. A trade that is refused comes
+    /// straight back with a status naming the reason.
+    ///
+    /// So the bounding send for this whole block is this opcode aimed at a
+    /// guid that is **not a player**: the reply is immediate, from one client,
+    /// with nobody else logged in, and it confirms the opcode number, the
+    /// eight-byte body and the reply layout together. Same move as
+    /// `CMSG_LIST_INVENTORY` bounding `CMSG_BUY_ITEM`, except that here the
+    /// bounding case is this request's own failure rather than a neighbour's
+    /// success.
+    InitiateTrade = 0x0116,
+
+    /// Agree to open the window somebody else asked for. Empty body.
+    ///
+    /// **The packet that makes this milestone different.** Every request
+    /// before it was one end asking the server for something; this one exists
+    /// only because the far end is a person who has to say yes. Answered by
+    /// [`TRADE_STATUS`](server::TRADE_STATUS) carrying `OPEN_WINDOW` **to both
+    /// clients**, which is the first time a send from this client has produced
+    /// a packet at somebody else's.
+    BeginTrade = 0x0117,
+
+    /// Refuse an offer to trade because this client is busy. Empty body.
+    ///
+    /// Sent instead of [`Self::BeginTrade`] and never alongside it: the
+    /// original client sends one of the three answers exactly once, and the
+    /// server closes the trade on either refusal.
+    BusyTrade = 0x0118,
+
+    /// Refuse an offer to trade from somebody on the ignore list. Empty body.
+    ///
+    /// Kept beside [`Self::BusyTrade`] and **not sent by this client**, since
+    /// there is no ignore list here yet. Named rather than omitted because the
+    /// three answers are one decision with three outcomes, and a reader
+    /// finding only two would reasonably assume the third does not exist.
+    IgnoreTrade = 0x0119,
+
+    /// Accept what is on the table. Body is the token from `OPEN_WINDOW`.
+    ///
+    /// **The body is unconfirmable here and is sent anyway.** This server's
+    /// handler reads nothing from it, so no observation available on this
+    /// realm can separate a four-byte body from an empty one -- which means
+    /// the choice is made on risk rather than on evidence, and the risk is
+    /// asymmetric: a server that checks a minimum size refuses an empty body,
+    /// and none refuse a body they ignore. The token is what goes in it
+    /// because it is the only number the server has offered that belongs to
+    /// this trade.
+    ///
+    /// Silent on success at the sender. The *partner* gets `TRADE_ACCEPT`, and
+    /// both get `TRADE_COMPLETE` once the second accept lands -- so a client
+    /// never sees its own accept acknowledged, only its consequences.
+    AcceptTrade = 0x011A,
+
+    /// Take an accept back. Empty body. The server answers **the other end**
+    /// with `BACK_TO_TRADE`.
+    UnacceptTrade = 0x011B,
+
+    /// Call the whole thing off. Empty body.
+    ///
+    /// Also what the original client sends on logout, which is worth knowing
+    /// because it means a trade left open by a disconnect does not linger.
+    CancelTrade = 0x011C,
+
+    /// Put one of this character's items on the table. Body is
+    /// `{u8 trade slot, u8 bag, u8 slot}` -- three bytes.
+    ///
+    /// The `(bag, slot)` pair is addressed exactly as
+    /// [`ClientOpcode::SwapItemCandidate`] and [`ClientOpcode::UseItem`]
+    /// address theirs, so nothing new had to be measured for it.
+    ///
+    /// **Silent on success, and its effect is a packet at both ends**: the
+    /// server answers by sending the whole offer again, to this client as
+    /// *your* half and to the partner as *theirs*. That is the confirmation --
+    /// an item appearing in the reflected offer is proof the three bytes were
+    /// understood, and it is the only proof available.
+    SetTradeItem = 0x011D,
+
+    /// Take an item back off the table. Body is one byte, the trade slot.
+    ClearTradeItem = 0x011E,
+
+    /// Put money on the table. Body is one `u32` of copper.
+    ///
+    /// **Refused with `BUSY` when the sender does not have it**, which is the
+    /// one place in this block where a request that is normally silent answers
+    /// back -- and it answers with a code that means something else entirely
+    /// everywhere else it appears. Reported raw for exactly that reason.
+    SetTradeGold = 0x011F,
+
     /// Ask a flight master where it can send you. Body is its guid, unpacked.
     ///
     /// Answered by [`SHOW_TAXI_NODES`](server::SHOW_TAXI_NODES), whose body is
@@ -649,6 +743,34 @@ pub mod server {
     /// success and its absence is the failure. See
     /// [`TrainerBuySpell`](crate::ClientOpcode::TrainerBuySpell).
     pub const TRAINER_BUY_SUCCEEDED: u16 = 0x01B3;
+
+    /// What just happened to the trade: a `u32` status, then a tail **whose
+    /// shape the status decides**. See [`crate::trade`].
+    ///
+    /// **Identified by its refusal.** Aiming `CMSG_INITIATE_TRADE` at a guid
+    /// that is not a player answers with this opcode carrying `NO_TARGET`,
+    /// which is a reply arriving at one client with nobody else in the world
+    /// -- so the opcode number, the request body and this layout are all
+    /// bounded by a single send that needs no second person. Every other
+    /// packet in the block then arrives during a trade that this one has
+    /// already proved is being understood.
+    ///
+    /// The conditional tail is confirmed a second way, by length: a `BEGIN`
+    /// body is twelve bytes and carries the initiator's guid, an `OPEN_WINDOW`
+    /// is eight, and the rest are four. A reader treating the body as a bare
+    /// `u32` leaves eight bytes unread on the first one, and the cursor
+    /// refuses it.
+    pub const TRADE_STATUS: u16 = 0x0120;
+
+    /// One side's half of the open trade -- seven slots, the money, and a
+    /// leading byte saying **whose half it is**. A fixed 532 bytes.
+    ///
+    /// The fixed size is its own confirmation, like `SMSG_SHOWTAXINODES`: a
+    /// misread field width cannot be absorbed by anything variable-length, so
+    /// it shows up as leftovers on the first capture. The seven records each
+    /// begin with their own index, which localises a stride error to a record
+    /// instead of to the packet.
+    pub const TRADE_STATUS_EXTENDED: u16 = 0x0121;
 
     /// Where a flight master can send you: the node you are standing at, and
     /// a bit array of every node this character has visited. See
@@ -968,6 +1090,8 @@ pub fn describe(opcode: u16) -> String {
         server::ACTIVATE_TAXI_REPLY => "SMSG_ACTIVATETAXIREPLY",
         server::NEW_TAXI_PATH => "SMSG_NEW_TAXI_PATH",
         server::TRAINER_BUY_SUCCEEDED => "SMSG_TRAINER_BUY_SUCCEEDED",
+        server::TRADE_STATUS => "SMSG_TRADE_STATUS",
+        server::TRADE_STATUS_EXTENDED => "SMSG_TRADE_STATUS_EXTENDED",
         server::QUESTGIVER_STATUS => "SMSG_QUESTGIVER_STATUS",
         server::QUESTGIVER_STATUS_MULTIPLE => "SMSG_QUESTGIVER_STATUS_MULTIPLE",
         server::QUESTGIVER_QUEST_LIST => "SMSG_QUESTGIVER_QUEST_LIST",

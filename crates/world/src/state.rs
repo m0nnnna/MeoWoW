@@ -1001,6 +1001,33 @@ pub struct Replication {
     /// built to escape: a send that fails identically whether the opcode, the
     /// body or the permission was wrong.
     pub party_results: Vec<crate::group::PartyCommandResult>,
+    /// Everything `SMSG_TRADE_STATUS` said this batch, in arrival order.
+    ///
+    /// Handed back as events rather than only folded into
+    /// [`WorldState::trade`], because most of them are *transitions* the state
+    /// cannot preserve: a `Cancelled` clears the session, so a caller reading
+    /// only the state afterwards sees no trade and cannot tell a refusal from
+    /// one that never started. Same reasoning as `party_results`, and the
+    /// stakes are higher here -- every request in this block is silent, so
+    /// these are the only thing that ever explains one.
+    pub trade_statuses: Vec<crate::trade::TradeStatus>,
+    /// `SMSG_TRADE_STATUS_EXTENDED`s describing the **partner's** half that
+    /// were folded into the session this batch.
+    pub trade_offers: usize,
+    /// The same packet describing **our own** half.
+    ///
+    /// Counted rather than stored, and counted rather than ignored. This
+    /// server sends it only when a trade spell is involved -- an enchant, a
+    /// socket -- and over a complete two-client trade with items and money on
+    /// both sides, zero arrived at either client. It is not stored because it
+    /// could not replace what it would be replacing: the body names an entry,
+    /// a display id and a count, and nowhere an item guid, so it cannot say
+    /// *which* of two identical stacks is on the table.
+    ///
+    /// The counter is here so that a session which does see one is not silent
+    /// about it. A number that only ever appears on failure cannot tell "none
+    /// were wrong" from "there were none".
+    pub trade_own_offers: usize,
     /// Ticks of drowning, falling, lava or slime damage this batch.
     ///
     /// Returned rather than stored, unlike the mirror timers next to them,
@@ -1223,6 +1250,19 @@ pub struct WorldState {
     /// event would flash a dialog for one frame. Cleared when this client
     /// answers, and when the server withdraws it.
     pub party_invite: Option<crate::group::GroupInvite>,
+
+    /// The trade this character is in, or has just been offered.
+    ///
+    /// **The first piece of replicated state in this client that only exists
+    /// because a second person is acting.** A party is close, but a party is
+    /// restated in full by the server on every change; a trade is assembled
+    /// here out of four packet kinds arriving in an order neither client
+    /// controls, plus one fact that is never on the wire at all -- who this
+    /// end asked, at the initiating end. See [`crate::trade::TradeSession`].
+    ///
+    /// Set locally by [`Self::note_trade_request`] when this client asks, and
+    /// from `SMSG_TRADE_STATUS` when somebody else does.
+    pub trade: Option<crate::trade::TradeSession>,
 }
 
 impl WorldState {
@@ -1278,6 +1318,141 @@ impl WorldState {
         // An invite that has been answered -- by this client or by anyone --
         // cannot still be pending once a group list arrives.
         self.party_invite = None;
+    }
+
+    /// Records that this client has just asked somebody to trade.
+    ///
+    /// **The one fact in a trade that is never on the wire.** The server tells
+    /// the *partner* who asked; it tells the asker nothing at all until the
+    /// partner's client answers. So an initiator that did not write this down
+    /// would open a window with no name in it, having chosen the name itself
+    /// one line earlier.
+    ///
+    /// Deliberately not an assumption that the trade will happen: the session
+    /// starts closed, and only `OPEN_WINDOW` opens it. Every refusal path
+    /// clears it again -- see [`Self::fold_trade_status`].
+    pub fn note_trade_request(&mut self, partner: u64) {
+        self.trade = Some(crate::trade::TradeSession::requested(partner));
+    }
+
+    /// Records an item this client has just asked to put on the table.
+    ///
+    /// **Has to be called beside the send and cannot be folded into it**, for
+    /// the ordinary reason every request in this crate is separate from the
+    /// state it affects: [`crate::Connection`] owns the socket and knows
+    /// nothing about the world. What is unusual here is the cost of
+    /// forgetting -- our own half of the trade window is *only* this record,
+    /// because the server sends an offer to the other person and never back
+    /// to its author, so a send without this draws an empty table under an
+    /// item that is really on it.
+    pub fn note_trade_item(&mut self, slot: u8, item: u64) {
+        if let Some(session) = self.trade.as_mut() {
+            session.put(slot, item);
+        }
+    }
+
+    /// Records an item taken back off the table. See [`Self::note_trade_item`].
+    pub fn note_trade_clear(&mut self, slot: u8) {
+        if let Some(session) = self.trade.as_mut() {
+            session.take_back(slot);
+        }
+    }
+
+    /// Records money put on the table. See [`Self::note_trade_item`].
+    pub fn note_trade_gold(&mut self, copper: u32) {
+        if let Some(session) = self.trade.as_mut() {
+            session.put_money(copper);
+        }
+    }
+
+    /// Records that this client has accepted.
+    ///
+    /// Local because the server never says it back: an accept produces
+    /// `TRADE_ACCEPT` at the *partner* and nothing at the sender until the
+    /// second accept completes the trade.
+    pub fn note_trade_accept(&mut self) {
+        if let Some(session) = self.trade.as_mut() {
+            session.accepted = true;
+        }
+    }
+
+    /// Folds one `SMSG_TRADE_STATUS` into the open trade.
+    ///
+    /// **The subtle one is `Busy`, which does two unrelated jobs.** Before the
+    /// window opens it means the request was declined and the session is over;
+    /// after it opens it is the server refusing a gold amount the sender does
+    /// not have, and closing the window on it would throw away a live trade
+    /// over a typo. [`crate::trade::TradeSession::open`] is what separates
+    /// them, which is the whole reason that flag exists.
+    fn fold_trade_status(&mut self, status: crate::trade::TradeStatus) {
+        use crate::trade::TradeStatus as S;
+        match status {
+            S::Begin { partner } => {
+                self.trade = Some(crate::trade::TradeSession::offered(partner));
+            }
+            S::OpenWindow { token } => {
+                // Arrives at both ends. The initiator already has a session
+                // from `note_trade_request`; the invited end has one from
+                // `Begin`. A third case -- neither -- means this client missed
+                // the packet that named the partner, and an open window with
+                // an unknown partner is still better than none, because the
+                // items in it are real.
+                let session = self.trade.get_or_insert_with(Default::default);
+                session.token = token;
+                session.open = true;
+            }
+            S::Accepted => {
+                if let Some(session) = self.trade.as_mut() {
+                    session.partner_accepted = true;
+                }
+            }
+            S::BackToTrade => {
+                // An accept has been withdrawn because an offer changed under
+                // it. Both flags are cleared rather than one, because the
+                // server sends this to whichever end lost its accept and this
+                // client cannot tell from the packet which end that was --
+                // and the cost of the two mistakes is not symmetric: a client
+                // that wrongly thinks it has accepted shows a button as
+                // pressed that is not, and a client that wrongly thinks it has
+                // not merely offers to press it again.
+                if let Some(session) = self.trade.as_mut() {
+                    session.accepted = false;
+                    session.partner_accepted = false;
+                }
+            }
+            other if other.ends_trade() => self.trade = None,
+            // Every other refusal -- too far, busy, dead, whatever the server
+            // has named -- ends a trade that never opened and reports
+            // something about one that did. See the doc comment.
+            _ => {
+                if self.trade.as_ref().is_some_and(|session| !session.open) {
+                    self.trade = None;
+                }
+            }
+        }
+    }
+
+    /// Files the partner's half of the trade window.
+    ///
+    /// **Only the partner's.** The leading byte of the body says whose half a
+    /// packet describes, and the own-half form is deliberately not stored --
+    /// see [`Replication::trade_own_offers`] for both the reason and the
+    /// measurement. What this client is offering lives in
+    /// [`crate::trade::TradeSession::ours`], which is local, because the
+    /// server sends an offer to the other person and not back to its author.
+    ///
+    /// Getting the byte wrong is not a parse failure: it draws a complete,
+    /// plausible window in which the partner's column shows the reader's own
+    /// goods.
+    fn fold_trade_offer(&mut self, offer: crate::trade::TradeOffer) {
+        if !offer.theirs {
+            return;
+        }
+        let session = self.trade.get_or_insert_with(Default::default);
+        // An offer arriving at all means the window is open, whatever this
+        // client believes about the status packets it did or did not see.
+        session.open = true;
+        session.theirs = Some(offer);
     }
 
     /// Folds one `SMSG_PARTY_MEMBER_STATS` into what is known about a member.
@@ -2620,6 +2795,36 @@ impl WorldState {
                 crate::opcode::server::GROUP_CANCEL | crate::opcode::server::GROUP_DECLINE => {
                     self.party_invite = None;
                 }
+                crate::opcode::server::TRADE_STATUS => {
+                    match crate::trade::parse_trade_status(&packet.body) {
+                        Ok(status) => {
+                            self.fold_trade_status(status);
+                            report.trade_statuses.push(status);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::TRADE_STATUS_EXTENDED => {
+                    match crate::trade::parse_trade_offer(&packet.body) {
+                        Ok(offer) => {
+                            if offer.theirs {
+                                report.trade_offers += 1;
+                            } else {
+                                report.trade_own_offers += 1;
+                            }
+                            self.fold_trade_offer(offer);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
                 crate::opcode::server::PARTY_COMMAND_RESULT => {
                     match crate::group::parse_party_command_result(&packet.body) {
                         Ok(result) => report.party_results.push(result),
@@ -2738,6 +2943,197 @@ mod tests {
         packet.extend_from_slice(&0u16.to_le_bytes()); // no update flags
         packet.extend_from_slice(&body);
         packet
+    }
+
+    /// One `SMSG_TRADE_STATUS` body, through `replicate` rather than through
+    /// the parser: this is the boundary that turns bytes into applied state.
+    fn trade_status(code: u32, tail: &[u8]) -> Packet {
+        let mut body = code.to_le_bytes().to_vec();
+        body.extend_from_slice(tail);
+        Packet {
+            opcode: crate::opcode::server::TRADE_STATUS,
+            body,
+        }
+    }
+
+    /// **`Busy` means two unrelated things and only the window's state tells
+    /// them apart.**
+    ///
+    /// Before the window opens it is the server declining the request, and
+    /// the session is over. After it opens it is the server refusing a sum of
+    /// money the sender does not have, and closing the window on it would
+    /// throw away a live trade with items on the table over a typo.
+    ///
+    /// Both halves are asserted, because a rule that closed on every `Busy`
+    /// passes the first alone -- and so does one that closed on none of them,
+    /// which leaves a dead session in place that every later status folds
+    /// into.
+    #[test]
+    fn busy_ends_a_trade_that_never_opened_and_survives_one_that_did() {
+        let mut state = WorldState::new();
+        state.note_trade_request(0x7);
+        state.replicate(&[trade_status(0, &[])], None);
+        assert!(
+            state.trade.is_none(),
+            "a refusal before the window opened left a session behind"
+        );
+
+        let mut state = WorldState::new();
+        state.note_trade_request(0x7);
+        state.replicate(&[trade_status(2, &0u32.to_le_bytes())], None);
+        assert!(state.trade.as_ref().is_some_and(|t| t.open));
+        state.replicate(&[trade_status(0, &[])], None);
+        assert!(
+            state.trade.is_some(),
+            "a money refusal during an open trade closed the window"
+        );
+    }
+
+    /// The initiator learns the partner from itself and the invited end from
+    /// the packet -- the two routes into the same field, and neither is
+    /// reachable from the other end.
+    #[test]
+    fn both_ends_learn_who_they_are_trading_with() {
+        let mut invited = WorldState::new();
+        invited.replicate(&[trade_status(1, &0x1u64.to_le_bytes())], None);
+        assert_eq!(
+            invited.trade.as_ref().and_then(|t| t.partner),
+            Some(1),
+            "the invited end reads the partner off the packet"
+        );
+        assert!(
+            !invited.trade.as_ref().unwrap().open,
+            "an offer is not an open window"
+        );
+
+        let mut asking = WorldState::new();
+        asking.note_trade_request(0x9);
+        assert_eq!(asking.trade.as_ref().and_then(|t| t.partner), Some(9));
+    }
+
+    /// **Which end asked is not on the wire, and both ends hold the same state
+    /// until the window opens.**
+    ///
+    /// Before `OPEN_WINDOW` the initiator and the invited both have a partner
+    /// guid and a closed window, and nothing in any packet separates them. An
+    /// interface that drew a prompt from "closed" alone asks the person who
+    /// pressed the key whether they accept their own request.
+    ///
+    /// Both directions are asserted, because a rule that answered `true` for
+    /// everything closed passes the invited half alone.
+    #[test]
+    fn only_the_invited_end_is_asked_to_answer() {
+        let mut invited = WorldState::new();
+        invited.replicate(&[trade_status(1, &0x1u64.to_le_bytes())], None);
+        assert!(invited.trade.as_ref().unwrap().awaiting_our_answer());
+
+        let mut asking = WorldState::new();
+        asking.note_trade_request(0x9);
+        assert!(
+            !asking.trade.as_ref().unwrap().awaiting_our_answer(),
+            "the end that asked was prompted to answer its own request"
+        );
+
+        // And once the window opens neither end is being asked anything.
+        for state in [&mut invited, &mut asking] {
+            state.replicate(&[trade_status(2, &0u32.to_le_bytes())], None);
+            assert!(!state.trade.as_ref().unwrap().awaiting_our_answer());
+        }
+    }
+
+    /// **Our own half is never read off the wire**, because the server does
+    /// not send it -- see `trade::TradeSession::ours`. The own-half form of
+    /// the packet is parsed, counted, and deliberately not stored: it carries
+    /// no item guid, so it cannot say which of two identical stacks is down.
+    #[test]
+    fn the_own_half_packet_is_counted_and_not_stored() {
+        fn extended(theirs: bool) -> Packet {
+            let mut body = vec![theirs as u8];
+            body.extend_from_slice(&0u32.to_le_bytes()); // token
+            body.extend_from_slice(&7u32.to_le_bytes());
+            body.extend_from_slice(&7u32.to_le_bytes());
+            body.extend_from_slice(&50u32.to_le_bytes()); // money
+            body.extend_from_slice(&0u32.to_le_bytes()); // spell
+            for slot in 0..crate::trade::TRADE_SLOTS as u8 {
+                body.push(slot);
+                for _ in 0..18 {
+                    body.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+            Packet {
+                opcode: crate::opcode::server::TRADE_STATUS_EXTENDED,
+                body,
+            }
+        }
+
+        let mut state = WorldState::new();
+        state.note_trade_request(0x7);
+        state.note_trade_item(0, 0xABC);
+
+        let report = state.replicate(&[extended(false)], None);
+        assert_eq!(report.trade_own_offers, 1, "the own half went uncounted");
+        assert_eq!(report.trade_offers, 0);
+        let session = state.trade.as_ref().unwrap();
+        assert_eq!(
+            session.ours[0],
+            Some(0xABC),
+            "the own-half packet overwrote what this client knows it put down"
+        );
+        assert!(session.theirs.is_none());
+
+        let report = state.replicate(&[extended(true)], None);
+        assert_eq!(report.trade_offers, 1);
+        assert_eq!(
+            state.trade.as_ref().unwrap().theirs.as_ref().unwrap().money,
+            50
+        );
+    }
+
+    /// Changing an offer withdraws both accepts, because the server does.
+    ///
+    /// Asserted from both directions: the local record clears them when this
+    /// client changes something, and `BACK_TO_TRADE` clears them when the
+    /// server says so. A window that kept an accept lit shows a button as
+    /// pressed that no longer counts, and a player waiting on it waits for
+    /// something that will not happen.
+    #[test]
+    fn changing_an_offer_withdraws_both_accepts() {
+        let mut state = WorldState::new();
+        state.note_trade_request(0x7);
+        state.replicate(&[trade_status(2, &0u32.to_le_bytes())], None);
+        state.note_trade_accept();
+        state.replicate(&[trade_status(4, &[])], None);
+        assert!(state.trade.as_ref().unwrap().both_accepted());
+
+        state.note_trade_gold(500);
+        let session = state.trade.as_ref().unwrap();
+        assert!(!session.accepted && !session.partner_accepted);
+
+        state.note_trade_accept();
+        state.replicate(&[trade_status(4, &[])], None);
+        assert!(state.trade.as_ref().unwrap().both_accepted());
+        state.replicate(&[trade_status(7, &[])], None);
+        let session = state.trade.as_ref().unwrap();
+        assert!(!session.accepted && !session.partner_accepted);
+    }
+
+    /// The seventh slot is never chosen for an offer: it is the one that does
+    /// not change hands, so filling it while looking for room would put an
+    /// item on the table that is handed straight back.
+    #[test]
+    fn the_non_traded_slot_is_never_offered() {
+        let mut session = crate::trade::TradeSession::requested(0x7);
+        for expected in 0..crate::trade::NONTRADED_SLOT {
+            assert_eq!(session.first_free_slot(), Some(expected));
+            session.put(expected, 0x100 + expected as u64);
+        }
+        assert_eq!(
+            session.first_free_slot(),
+            None,
+            "the non-traded slot was offered as free room"
+        );
+        assert!(session.already_offered(0x100));
+        assert!(!session.already_offered(0x999));
     }
 
     fn fields(entries: &[(u16, u32)]) -> Fields {
