@@ -5733,3 +5733,34 @@ times the placeholder's. So it takes the left edge at mid-height.
   tooltips; no coin icons; and the window has no close control of its own --
   the questgiver's Close button shuts both, which is right only because the
   same right-click opened both.
+
+### Confirmed at the window
+
+Kake, on `Facetest`: *"training is there spell was there for 9 copper i clicked
+it and now it says known"*. Six rows drawn, the discounted price on the row, the
+click routed, the purchase sent, the reply received, and the list re-asked and
+redrawn with that row in a different state.
+
+That last step is the one no headless test reaches. The click routing goes
+through egui in a real window with real input, and the state change is the
+**re-ask** rather than an edit of the clicked row -- a design decision that
+looks identical to editing in every unit test and differs only when the server
+disagrees with what the client would have written.
+
+**What the report also exposed is that this milestone was declared verified on
+an instrument that cannot see the interface.** It shipped on "1,004 tests green
+and a clean live render", a white-screen report came back, and the reproduction
+run produced a flawless picture of Elwynn at night -- because `--screenshot`
+never builds an egui frame at all. The tell was in the image and was missed on
+the first look: no player frame, no action bar, no minimap. Nothing was wrong
+with the render; it simply could not have shown the subject.
+
+The white screen did not reproduce and cleared on a later launch, so it stays
+**unexplained rather than fixed**. The one benign reading that fits the
+measurements: the headless live run took 19 seconds to clear the login burst
+and 35 to first pixel, so a cold launch sitting white for a while is the
+documented cost of that burst rather than a hang.
+
+Still unlooked-at: **the inert rows refusing a click.** It is asserted
+headlessly, in the test that deliberately checks both halves, and nobody has
+watched it.
