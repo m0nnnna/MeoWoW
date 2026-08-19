@@ -23,14 +23,14 @@ itself here too.
 Phases 1, 2 and 3 are complete: every data format reads, the world renders and
 streams, and the protocol reaches a live realm.
 
-**Phase 4 is in the six-part city-services block** — flight paths, trainers,
-mail, auction, guild, trade — the services a city offers, taken as six
-milestones in an order set by what each one introduces that this client has
-never done. Five are done: trainers (4.24, *nothing* new, which is what makes
-it the bound on the rest), flight paths (4.25, the **server moves the
-player**), trade (4.26, **both ends must act**), mail (4.27, an **effect with
-no request**), guild (4.28, **a list of people who are not in the world**).
-**One left: auction (4.30), the first list this client cannot bound.**
+**Phase 4's six-part city-services block is finished** — flight paths,
+trainers, mail, auction, guild, trade — the services a city offers, taken as
+six milestones in an order set by what each one introduces that this client has
+never done: trainers (4.24, *nothing* new, which is what makes it the bound on
+the rest), flight paths (4.25, the **server moves the player**), trade (4.26,
+**both ends must act**), mail (4.27, an **effect with no request**), guild
+(4.28, **a list of people who are not in the world**), auction (4.30, **the
+first list this client cannot bound**).
 
 **4.29 stepped out of that order to pay off Phase 2's last debt**: shadows, a
 skybox, clouds and stars. Phase 2 named all four as deliberately deferred until
@@ -86,8 +86,8 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | Game | Melee, spells with real tooltips and a cast bar, cooldowns, combat log, corpse and loot end to end, inventory with slot moves, character panel, quests taken and handed in, quest log with progress counters |
 | Map | `M` opens the zone page with the character and quest objectives on it; fills in as explored. **Minimap** in the corner with party dots and objective rings. No zoom, panning, continent view or rotation |
 | Sound | Zone music and ambience by area and hour, creature voices, weapon impacts, **footsteps that know what they are standing on** — terrain and building floors both. No attenuation, no spell sounds |
-| NPCs | Gossip, vendors (buy and sell), quests, questgiver `!`/`?` marks, trainers |
-| City services | **Trainers, flight paths, trade, mail and guilds all done.** Auction is the last rung |
+| NPCs | Gossip, vendors (buy and sell), quests, questgiver `!`/`?` marks, trainers, auctioneers |
+| City services | **All six done: trainers, flight paths, trade, mail, guilds and the auction house.** Browsing, paging, bidding and cancelling; no sell window and no search box |
 | Collision | Walls stop you, floors and stairs hold you up, M2 collision meshes are obstacles. Tiles are selected by the **bounds of what they hold**, not by where the character is — Stormwind is one placement covering nine tiles. Transitions cut rather than blend; a stair stutter is instrumented, not solved |
 
 ### At the window
@@ -104,7 +104,10 @@ server refuse the rest.
 
 Panels: **B** bags, **C** character, **P** spellbook, **L** quest log, **M**
 map, **G** guild, **T** trade, **Z** sheathe, **Enter** chat, **F1** to drag
-the layout around and save it.
+the layout around and save it. **The auction window has no key** — it opens by
+right-clicking an auctioneer and closes when you walk out of range, because
+every request in that block resolves its NPC through the server's five-unit
+check and fails in silence past it.
 
 **Chat commands take `/` and never reach the wire; `.` is the *server's*
 prefix**, which is how a GM command travels as ordinary chat.
@@ -387,6 +390,42 @@ the full account is in `docs/ROADMAP.md`.
   variable blocks back to back, and a wrong reading parses an innkeeper's
   three-option/no-quest packet perfectly. Three NPCs were greeted so the counts
   would disagree, and the test asserts *both* shapes.
+- **A count in a reply is not always the length of the thing it counts.**
+  Every list this client read for four phases arrived whole, so "store the
+  reply" was the same as "store the truth". `SMSG_AUCTION_LIST_RESULT` carries
+  two counts -- **50 rows in the packet, 130 matched in the house** -- and on a
+  populated realm the second is tens of thousands with no opcode that returns
+  them. Nothing errors: the rows are real, the prices are real, and a client
+  that merges successive pages builds a union of snapshots that was never true
+  at any instant. Ask whether the count at the front of a packet is the
+  subject's length or the packet's.
+- **The difference of two lengths over the difference of two counts is a
+  stride, and it is the only measurement that does not assume the header and
+  the footer.** `(16440 - 7412) / (111 - 50) = 148`, and neither the four-byte
+  header nor the eight-byte footer appears in it. One packet can only say
+  which candidate accounts for the body, which is a unique answer *given* a
+  footer width -- the thing being tested. Header and footer then came free off
+  an **empty** page: twelve bytes.
+- **A trailing block absorbs a stride error instead of exposing one.** With the
+  count at the front and nothing after the records, a wrong stride runs off the
+  end and the cursor says so. With a total and a delay *after* them, a stride
+  wrong by a word eats the footer as record data and reads the last record's
+  tail as the total -- the parse succeeds and the number shown to the player is
+  garbage.
+- **The strongest bound is a reply that cannot vary.**
+  `CMSG_AUCTION_LIST_PENDING_SALES` checks nothing at all -- not the NPC, not
+  the range, not the level, not the body it just read -- and always answers a
+  `u32` zero, because the server's own loop over the records is commented out.
+  `CMSG_GUILD_ROSTER` is answered without a guild but still *describes state*,
+  so a reply that looked wrong could be a wrong parse or a strange guild. Sent
+  before looking for an auctioneer, this separates "the opcode block is
+  unreachable" from "the request was declined" with no fixture at all.
+- **The value that disables a filter is not always zero.**
+  `CMSG_AUCTION_LIST_ITEMS` turns a filter off with `0xFFFFFFFF`, because zero
+  is a real item class -- so a zeroed request is not "search everything", it is
+  a real and very narrow search that returns almost nothing and looks like a
+  broken parser. `AuctionSearch` has no `Default` for that reason; the only
+  constructor is `any()`.
 - **A filtered list is the cheapest proof that an index is an id.** Menu 1291
   has four options and three arrived, numbered 1,2,3 with the numbering **not
   closing up**. Same for loot slots, trainer rows and gossip options: **an
@@ -542,7 +581,11 @@ the full account is in `docs/ROADMAP.md`.
   one look identical. Any loop draining a live stream needs a wall clock *and*
   something printed per round. A 150-second guild wait then died at `failed to
   fill whole buffer` for the mirror reason: **no keepalive**. A loop that sends
-  nothing on purpose is exactly the one the server drops.
+  nothing on purpose is exactly the one the server drops. **4.30's auction
+  probe made it four**, with `(2s quiet, 256 packets)` in an Elwynn that never
+  goes quiet for two seconds — five minutes of no output and no CPU, which
+  reads as a hang. The rule predicted its own next instance and was right
+  again.
 - **Measure the thing, not the thing next to it.** That same delay presented
   as the action bar filling half a minute after login, and the confident
   diagnosis was a slow `Spell.dbc` read blocking the render thread — with a
@@ -670,6 +713,27 @@ the full account is in `docs/ROADMAP.md`.
   broken.** Frames opt into `Sense::click()` by appearing in one `matches!`,
   and one left out draws correctly, hit-tests correctly, and never reports a
   click. Anything reading `response.clicked()` has to appear in that list.
+- **A window onto a longer list has to say that it is a window.** The auction
+  window draws `49-60 of 1284 -- page 5 of 107` as one sentence, in every
+  state, including the ones where it is uninteresting. The failure is not a
+  rendering bug: the fifty rows are real and their prices are real, and the
+  person reading them believes they are the market. A line that appeared only
+  when there was a surplus is a line nobody has learned to read.
+- **A control that sorts what is on screen answers a different question from
+  the one it appears to answer.** Sorting fifty rows of 1,284 by price gives
+  the cheapest of *those fifty*, in price order, looking exactly like the
+  cheapest fifty in the house -- with the actual cheapest on page nine. The
+  auction window therefore has **no clickable column headers at all**, because
+  the sort belongs in the request and the request does not carry one yet. An
+  honest absence beats a plausible wrong answer, the same call
+  `describe_cast_failure` makes about naming a status code.
+- **Page arithmetic has a boundary nobody has to be careless to reach.**
+  Narrowing a search while on page nine leaves the offset where it was, and the
+  server *answers* an offset past the end -- an empty page and the true total.
+  `offset / 50 + 1` against `ceil(39 / 50)` then reads **"page 3 of 1"**, which
+  the probe printed before anything asserted otherwise. It is a named state
+  now, and the window says "past the end, go back" rather than lying about the
+  search.
 - **A hit test that answers for every row is indistinguishable from a correct
   one until somebody clicks the wrong one.** `row_at` answers only for rows
   that can act — learnable trainer spells, unemptied letters, online guild

@@ -6975,3 +6975,285 @@ milestone knows about and left.
   neither.
 * **No shadows indoors**, because there is no indoor light. A WMO interior is
   lit by the outdoor sun here and always has been.
+
+## 4.30: auctions, and the first list this client cannot bound
+
+The last of the six city services, and the one whose novelty is not a packet
+shape or a direction of travel but an **arithmetic fact**: the reply is not the
+answer. It is a window onto the answer, and the window's size is the server's
+decision.
+
+Every list this client had read before this one arrives whole. A vendor sends
+its whole stock, a trainer its whole spellbook, a mailbox the whole inbox, a
+guild its whole roster, a trade window seven slots of which six can hold
+anything. In each case the count at the front of the packet is the length of
+the thing itself, and a client that stores the reply stores the truth.
+
+`SMSG_AUCTION_LIST_RESULT` carries **two counts** — how many records are in
+this packet, and how many matched the search — and on the fixture built for
+this milestone they came back as **50 and 130**. On a populated realm the
+second is tens of thousands and there is no opcode anywhere that returns them.
+
+That single fact is the milestone. Everything below is either how it was
+measured or what it costs a client that takes it seriously.
+
+### The block's bounding instrument is the strongest one any city service got
+
+Nine of the block's ten client opcodes are conditional on an auctioneer NPC:
+`GetNPCIfCanInteractWith` refuses a wrong guid, an NPC out of range, a dead
+one, a charmed one or one without `UNIT_NPC_FLAG_AUCTIONEER`, and every
+handler then **returns without a word**. A silent send is indistinguishable
+from a wrong opcode, which is the failure this project has walked into in the
+vendor block, the party block, the trainer block and all ten of trade's.
+
+The tenth is `CMSG_AUCTION_LIST_PENDING_SALES` `0x48F`. Its handler reads
+eight bytes, discards them, and sends a reply. It checks nothing at all — not
+the NPC, not the range, not the level, not the body it just read — and its
+answer is a fixed `u32` zero, because the server's own loop over the records is
+commented out in its source.
+
+That is a stronger bound than `CMSG_GUILD_ROSTER` was. The roster is answered
+without a guild but still describes state, so a reply that looked wrong could
+be a wrong parse or a strange guild; **a reply that cannot vary cannot be
+mistaken for a reply that varied.** `wow-cli world --auction` sends it first,
+before it has even looked for an auctioneer, and the first live run answered on
+the first round:
+
+```
+== the bound: CMSG_AUCTION_LIST_PENDING_SALES, with no auctioneer ==
+  SMSG_AUCTION_LIST_PENDING_SALES came back, 4 bytes: 00 00 00 00
+  parses, 0 records. The block is reachable.
+```
+
+A non-zero count is **refused** rather than parsed, by name
+(`Error::UnconfirmedPendingSales`), because the record shape behind it has
+never been observed here and inventing one would produce a structure that
+parses and describes nothing.
+
+### The record stride: 148, and the measurement that got it
+
+The record is fixed-width with no strings anywhere, so "assert the parse
+consumed the whole record" is a complete check here in a way it was not for the
+guild roster — where all three candidate readings consumed 703 bytes exactly,
+because a string scan re-synchronises.
+
+But there is a trap in the other direction, and it is the reason
+`stride_between` exists. The body is `4 + count * stride + 8`: a **trailing**
+block rather than a leading one. So a stride wrong by a word does not run off
+the end of the packet — it eats the footer as record data and reads the last
+record's tail as the total. The parse "succeeds" and the number the interface
+shows is garbage.
+
+Byte accounting on **one** packet cannot settle it either, and that is worth
+being precise about because it looks as though it can. With a fixed record and
+a fixed footer only one candidate accounts for the body — but only *given* the
+footer's width, which is the thing being assumed. What settles it is two
+packets whose counts **differ**:
+
+```
+owner list: 111 rows in 16440 bytes
+search:      50 rows in  7412 bytes
+two counts differ by 61, two lengths by 9028 -> stride 148
+```
+
+`(16440 - 7412) / (111 - 50) = 148`, and neither the header nor the footer
+appears anywhere in that arithmetic. The header and footer were then measured
+separately and for free, off an **empty** page from a real auctioneer: twelve
+bytes, `00000000 00000000 2c010000` — a count, a total and a delay of 300ms.
+
+This is the same rule that has now produced a stride four times — *"one sample
+of a variable-length packet is nearly free; a sample where the counts differ is
+the evidence"* — and this time the probe was built to say so when it cannot
+answer. Against an empty auction house it printed:
+
+```
+the two packets carry the SAME number of rows, so they cannot
+separate a stride from a header. That is the honest answer --
+post or cancel an auction and run it again.
+```
+
+### The owner list is the cheapest check on the footer there is
+
+`SMSG_AUCTION_OWNER_LIST_RESULT` has the identical layout and **its total
+always equals its count**, because the server writes the same number into both.
+So a body whose two numbers disagree says the footer is not where the parser
+thinks it is, at no fixture cost at all. It came back 111 and 111.
+
+It is also the packet that says the owner list **does not page**: 111 rows in
+one body, where a search caps at fifty. The offset field in
+`CMSG_AUCTION_LIST_OWNER_ITEMS` is read by the server and ignored.
+
+### The fixture, and the house that made it invisible
+
+130 auctions in the Alliance house and 15 more in the Neutral house, seeded
+into `acore_characters.auctionhouse` and `item_instance` and then read by the
+**server's own startup loader** — `>> Loaded 145 auction items`,
+`>> Loaded 145 auctions`. That is not a fixture built behind the server's back
+in the sense the relocated bag was: auctions live only in that table between
+restarts, and the loader is the one path they take into memory. The load count
+in the log is what says the rows were accepted.
+
+The number 130 is chosen rather than convenient: a page is fifty, so 130 is
+three pages with a short one at the end — the only shape that exercises
+`next_offset`, `previous_offset` and a last page that must not shorten the page
+count. Fifteen more in a **different house** is the discriminating half: a
+search at an Alliance auctioneer must report 130 and not 145, and it does.
+
+That mattered, because the first attempt got it wrong in the most instructive
+way available. The seed used `houseid = 1`, which is not a house at all —
+AzerothCore's `AuctionHouseId` is `Alliance = 2, Horde = 6, Neutral = 7` — and
+the search came back **empty from a real auctioneer with a perfect greeting and
+a perfect owner list**. Nothing on the wire said why. `MSG_AUCTION_HELLO` is
+the only packet in the entire block that names a house; no list result, bid or
+cancellation mentions one. So a client that lets a player walk from a Stormwind
+auctioneer to a Booty Bay one without noticing is showing one house's rows
+while sending another house's requests, and there is no packet that would ever
+say so. That is why `AuctionHouse` is a type, why the session carries it, and
+why the window's title draws it.
+
+### What the wire actually says, per row
+
+Every seeded value round-tripped through the parser, which is what makes the
+fixture evidence rather than decoration: startbid `500 + i * 13`, a buyout on
+two rows in three, a bidder on one in five. The server's own minimum increment
+came back as 5% of the current bid — `bid 1305, +65` — computed by the server
+and **not** by this client, which is the point of carrying it rather than
+deriving it.
+
+The two bid floors are different fields and picking one is the bug:
+
+* with no bid the floor is the seller's **opening price**, and `min_increment`
+  is zero because there is nothing to outbid;
+* with a bid it is **the current bid plus the server's increment**, and
+  `start_bid` is history.
+
+A client that always sent `bid + min_increment` would send zero on an unbid
+auction; one that always sent `start_bid` would underbid every contested one.
+Both are refused, differently, and `Auction::next_bid` is the single place the
+two cases are joined — a rule this project has written before as *"a trap
+documented at one call site does not protect the next one"*.
+
+The name filter is a case-insensitive substring, confirmed by a search that
+could have come out the other way: `Ore` matched **39 of 130**, which is
+exactly the three ore entries at thirteen copies each.
+
+### The page is not the list, and three things follow from it
+
+**One page is held, never an accumulation.** `WorldState::auctions` is a single
+`AuctionPage` and there is deliberately no accumulator anywhere. Merging
+successive pages builds something that looks like the auction house and is a
+union of snapshots taken at different times — auctions are bid on and bought
+out while the reader is paging, and there is no instant at which the union was
+ever true. Same shape as `quest_cache`'s refusal to answer
+`Option<&QuestInfo>`: the type is built so the wrong thing cannot be said.
+
+**The offset is the one thing about a page the wire does not carry.** The reply
+says how many rows it holds and how many matched, and nothing about where in
+the match those rows sit. So `WorldState::expect_auction_page` is called on the
+way out, beside the send, and the state keeps exactly one copy — because a
+number threaded through the parse from the caller is a number that can be
+passed wrong.
+
+**Sorting belongs to the request and not to the table.** `AuctionSearch::sort`
+travels in `CMSG_AUCTION_LIST_ITEMS`; nothing else this client sends tells the
+server what order to answer in. Fifty rows out of 1,284 sorted by price look
+exactly like the cheapest fifty and are an arbitrary fifty in price order, with
+the actual cheapest possibly on page nine. There is no rendering difference
+between the right answer and the wrong one — the same family as the guild-chat
+line that drew in the wrong colour — so the auction window has **no clickable
+column headers at all** until the search side carries the sort. An honest
+absence beats a control that answers a different question from the one it
+appears to answer.
+
+### The server states a rate limit, in the reply, in milliseconds
+
+Every list result ends with a search delay: 300 on this realm. That is the
+first limit in this protocol that has been **stated** rather than discovered by
+tripping it. Three keepalives once dropped the world connection because the
+server enforced a minimum ping interval nothing announced; clicking a party
+loot control repeatedly closed the socket outright. Here the number is in the
+packet.
+
+### Two failures worth not rediscovering
+
+**A packet limit does not bound time, again.** The first version of the probe
+drained with `(2s quiet, 256 packets)` and appeared to hang: no output, no CPU,
+five minutes. Elwynn never goes quiet for two seconds and 256 packets at a few
+per second is minutes. This is the same bug as the 37-second login burst, and
+CLAUDE.md predicted the shape of it exactly — *"the loop that needs it is
+always the one somebody is writing now"*. `await_reply` is a wall clock, short
+slices, an early exit when the wanted opcode arrives, and **a line printed
+every fourth round**, because a stuck run and a slow one are otherwise the same
+picture.
+
+**"Page 3 of 1".** Asking for row 100 of a 39-row match is answered rather than
+refused: an empty page and the true total. The naive page arithmetic then reads
+`offset / 50 + 1 = 3` against `ceil(39 / 50) = 1`, and the probe printed that
+nonsense before anything asserted otherwise. It is reachable without anybody
+being careless — narrow the search while on page nine and the offset stays
+where it was — so `AuctionPage::past_the_end` is a named state, the window says
+"Past the end — 39 matched, 1 page. Go back." rather than lying about the
+search, and the way back stays live.
+
+### The window has to say that it is a window
+
+The auction window's range line is the frame's whole reason for existing:
+`49-60 of 1284 — page 5 of 107`, drawn as one sentence, in every state,
+including the ones where it is uninteresting. The failure mode is not a
+rendering bug — the rows are all real and the prices are all real — it is a
+person reading fifty rows and believing they are the market. A line that
+appeared only when there was a surplus is a line nobody has learned to read.
+
+Two decisions follow the interface rules this project already has:
+
+* **A click selects; bidding and buying out are separate buttons**, and the
+  buttons name their prices, so the number somebody is agreeing to is under the
+  pointer when they press it. Money spent cannot be undone — the same caution
+  that keeps *delete* off the mailbox's row gesture.
+* **Nothing that would be refused answers a click.** `control_live` is the one
+  place that decides, read by the drawing so a dead control is dimmed and by
+  the hit test so it does not answer: a page that does not exist, a bid on your
+  own auction, a buyout of an auction with no buyout. All three are dropped by
+  the server in silence.
+
+**The window pages by twelve, not by fifty**, and that is a fact about the wire
+rather than a compromise: `listfrom` is a **row index**, so fifty is a ceiling
+on what the server will send and not a step. Fifty rows at thirty pixels is
+1,500 and fits on no screen this client supports.
+
+The right-click that opens it sits **before** the talk branch, beside the
+mailbox's. An auctioneer's entire `UNIT_NPC_FLAGS` word is the auctioneer bit —
+`0x200000`, and nothing else; it does not gossip — so `is_talk_candidate`
+answers yes on "any bit set" and `greet` would send a `CMSG_GOSSIP_HELLO` the
+server answers with nothing, which is indistinguishable from a click that
+missed. That is precisely the bug the mailbox arm was added to stop.
+
+The window closes when the auctioneer goes out of reach, for the same reason
+the mailbox does: every request in the block resolves its NPC through the same
+five-unit check, silently.
+
+### Still not done
+
+* **No sell path in the interface.** `CMSG_AUCTION_SELL_ITEM` is implemented,
+  bounded and tested, and there is no window for it: posting needs a price
+  entry, a duration control and a deposit the client cannot compute. The CLI
+  has `--auction-sell`.
+* **No search box.** The window draws what it is searching for and the viewer
+  always searches for everything; the CLI has `--auction-search`, which is what
+  confirmed the filter works.
+* **No sort control**, deliberately — see above. It needs the request side, not
+  the table.
+* **The seller is a guid until a name query answers**, and there is no roster
+  of everybody selling. Until then the guid's low half is drawn, which is
+  honest and ugly.
+* **`SMSG_AUCTION_BIDDER_NOTIFICATION` and `SMSG_AUCTION_OWNER_NOTIFICATION`
+  parse and are not drawn.** Both arrive unprompted — the second and third
+  packets in this client that answer nothing — and neither has been observed
+  live, because seeing one needs two characters bidding against each other over
+  a real auction's lifetime.
+* **`SMSG_AUCTION_REMOVED_NOTIFICATION` is named and never sent** by this
+  server.
+* **The `getAll` flag is on the wire and not offered.** It is capped at 55,000
+  rows in one packet and the original client rate-limits it to once every
+  fifteen minutes; a request that can return a multi-megabyte packet is not
+  something to attach to a button somebody can lean on.

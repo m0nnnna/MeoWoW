@@ -1493,3 +1493,231 @@ carrying one, so every refusal around it is unexercised. `SMSG_SHOW_MAILBOX` is
 parsed and read by nothing: a game object clicked directly does not produce
 one, so it is a convenience rather than the thing that tells a client a mailbox
 exists.
+
+## Auctions, and the first reply that is a window onto its answer
+
+Ten client opcodes, nine server ones, one record layout shared by three
+different questions, and one arithmetic fact that shapes everything else: the
+reply carries **two counts**, and the second can exceed the first without
+bound.
+
+| direction | opcode | number |
+|---|---|---|
+| both | `MSG_AUCTION_HELLO` | `0x255` |
+| out | `CMSG_AUCTION_SELL_ITEM` | `0x256` |
+| out | `CMSG_AUCTION_REMOVE_ITEM` | `0x257` |
+| out | `CMSG_AUCTION_LIST_ITEMS` | `0x258` |
+| out | `CMSG_AUCTION_LIST_OWNER_ITEMS` | `0x259` |
+| out | `CMSG_AUCTION_PLACE_BID` | `0x25A` |
+| out | `CMSG_AUCTION_LIST_BIDDER_ITEMS` | `0x264` |
+| out | `CMSG_AUCTION_LIST_PENDING_SALES` | `0x48F` |
+| in | `SMSG_AUCTION_COMMAND_RESULT` | `0x25B` |
+| in | `SMSG_AUCTION_LIST_RESULT` | `0x25C` |
+| in | `SMSG_AUCTION_OWNER_LIST_RESULT` | `0x25D` |
+| in | `SMSG_AUCTION_BIDDER_NOTIFICATION` | `0x25E` |
+| in | `SMSG_AUCTION_OWNER_NOTIFICATION` | `0x25F` |
+| in | `SMSG_AUCTION_BIDDER_LIST_RESULT` | `0x265` |
+| in | `SMSG_AUCTION_REMOVED_NOTIFICATION` | `0x28D` |
+| in | `SMSG_AUCTION_LIST_PENDING_SALES` | `0x490` |
+
+### The bound is a request that checks nothing
+
+Nine of the ten outgoing opcodes resolve their auctioneer through the server's
+`GetNPCIfCanInteractWith`, which refuses a wrong guid, an NPC out of range, a
+dead one, a charmed one, or one without `UNIT_NPC_FLAG_AUCTIONEER` `0x200000`
+-- and every handler then returns **without a word**.
+
+`CMSG_AUCTION_LIST_PENDING_SALES` does not. Its handler reads eight bytes,
+discards them, and replies. No NPC, no range, no level check, no look at the
+body. On this realm the reply is a `u32` zero and nothing else, because the
+server's own loop over the records is commented out.
+
+That makes it the strongest bounding instrument any city service in this
+project has had. `CMSG_GUILD_ROSTER` is answered without a guild but still
+describes state; **this one's answer cannot vary**, so it cannot be mistaken
+for a reply that depended on something. One send, from anywhere in the world,
+with no fixture:
+
+```
+-> CMSG_AUCTION_LIST_PENDING_SALES  0x48F   body: 00 00 00 00 00 00 00 00
+<- SMSG_AUCTION_LIST_PENDING_SALES  0x490   body: 00 00 00 00
+```
+
+A non-zero count is refused by name rather than parsed: the record shape has
+never been observed here and inventing one would produce a structure that
+parses and describes nothing.
+
+### `MSG_AUCTION_HELLO` is the only packet that names a house
+
+Request is the auctioneer's guid, unpacked. Reply is
+`{u64 auctioneer, u32 house, u8 enabled}` -- thirteen bytes.
+
+```
+<- MSG_AUCTION_HELLO  13 bytes: fc 0c 00 df 21 00 30 f1  02 00 00 00  01
+   house 2, enabled true
+```
+
+`AuctionHouse.dbc`'s house ids are **2 Alliance, 6 Horde, 7 Neutral**. Nothing
+else in the entire block mentions a house: not a list result, not a bid, not a
+cancellation. So a client that lets a player walk from one auctioneer to
+another without noticing shows one house's goods while sending another house's
+requests, and no packet ever says so.
+
+This was measured the hard way. A fixture seeded with `houseid = 1` -- not a
+house at all -- produced a search that came back **empty from a real auctioneer
+with a perfect greeting and a perfect owner list**, and there was nothing on
+the wire to point at.
+
+### The list result, and the two counts
+
+All three lists -- search, owner and bidder -- share one layout exactly:
+
+```
+u32   rows in this packet
+rows x 148-byte record
+u32   rows that matched, over the whole house
+u32   search delay, milliseconds
+```
+
+Header 4, footer 8, both measured directly off an empty page from a real
+auctioneer: twelve bytes total, `00000000 00000000 2c010000`.
+
+The record, 148 bytes and no strings anywhere:
+
+| offset | width | field |
+|---|---|---|
+| 0 | 4 | auction id |
+| 4 | 4 | item entry |
+| 8 | 84 | seven enchantment slots: `{u32 id, u32 duration, u32 charges}` |
+| 92 | 4 | random property id, signed |
+| 96 | 4 | suffix factor |
+| 100 | 4 | stack count |
+| 104 | 4 | spell charges |
+| 108 | 4 | flags -- the server writes zero and the original client ignores it |
+| 112 | 8 | owner guid |
+| 120 | 4 | opening bid |
+| 124 | 4 | minimum increment -- **zero when nobody has bid** |
+| 128 | 4 | buyout -- zero means none offered |
+| 132 | 4 | milliseconds remaining |
+| 136 | 8 | bidder guid -- zero when nobody has bid |
+| 144 | 4 | current bid |
+
+**The stride was measured from two packets whose counts differ**, which is the
+only measurement that does not assume the footer:
+
+```
+owner list: 111 rows in 16440 bytes
+search:      50 rows in  7412 bytes
+(16440 - 7412) / (111 - 50) = 148
+```
+
+Byte accounting on one packet narrows it and does not settle it. The block is
+`4 + count * stride + 8`, and a **trailing** footer means a stride wrong by a
+word eats it as record data and reads the last record's tail as the total --
+the parse succeeds and the number shown is garbage. Only *given* a footer width
+does one candidate uniquely account for the body, and the footer width is the
+thing under test.
+
+The owner list is the cheapest free check available: it does not page, and its
+total always equals its count, so a body whose two numbers disagree says the
+footer is not where the parser thinks. 111 and 111.
+
+### The page is the server's decision
+
+`SMSG_AUCTION_LIST_RESULT` caps at **fifty rows**. `CMSG_AUCTION_LIST_ITEMS`
+carries `listfrom`, which is a **row index and not a page number** -- so a
+client chooses its own page size and fifty is a ceiling rather than a step.
+Nothing in the request asks for a page size and nothing in the reply states
+one.
+
+The owner and bidder lists do not page at all. Their offset fields are read by
+the server and ignored, and the owner list came back with 111 rows in one body.
+
+Asking for an offset past the end is **answered** rather than refused: an empty
+page with the true total. Naive page arithmetic then reads "page 3 of 1", which
+is why that state is named rather than computed.
+
+### The search request is the heaviest body this client builds
+
+```
+u64  auctioneer
+u32  listfrom
+cstr name substring, matched case-insensitively; empty matches everything
+u8   level_min
+u8   level_max
+u32  inventory slot     0xFFFFFFFF for no filter
+u32  item class         0xFFFFFFFF
+u32  item subclass      0xFFFFFFFF
+u32  quality            0xFFFFFFFF
+u8   usable-by-me
+u8   get-all
+u8   sort key count
+n x  {u8 column, u8 descending}
+```
+
+Two things about it are unusual enough to state:
+
+* **The disabled value is `0xFFFFFFFF` and not zero**, because zero is a real
+  item class. A zeroed request is a real and very narrow search, which is why
+  `AuctionSearch` has no `Default` -- only `AuctionSearch::any()`.
+* **It is the only request in this protocol that carries a sort order.** That
+  is not a convenience: sorting is meaningful over the whole match, and a
+  client holding fifty of 1,284 rows that sorts them produces the cheapest of
+  *these fifty* looking exactly like the cheapest fifty in the house.
+
+The name filter was confirmed on a search that could have failed: `Ore` matched
+**39 of 130**, which is the three ore entries at thirteen copies each.
+
+### `SMSG_AUCTION_COMMAND_RESULT` has a conditional tail
+
+`{u32 auction, u32 action, u32 error}` and **a fourth word only when the error
+is zero and the action is not**. Actions are `0` sell, `1` cancel, `2` bid.
+
+That is normally the shape this project refuses to guess at, and here it is
+safe for one reason: the packet is fixed-width with nothing after the field, so
+the cursor's leftover check decides it. The parser reads the fourth word if the
+body has one and refuses trailing bytes either way, rather than copying the
+server's condition -- a build that wrote the word unconditionally would
+otherwise parse as success with a garbage code.
+
+Error codes are left as numbers except the four this project has observed. A
+wrong offset eventually fails loudly; a wrong *name* for a status code never
+does.
+
+### Bids and buyouts are one request
+
+`CMSG_AUCTION_PLACE_BID` is `{u64 auctioneer, u32 auction, u32 price}`. A price
+equal to the buyout **is** the buyout; there is no second opcode, so an
+interface drawing two buttons is drawing one request twice.
+
+The two floors come from different fields and picking one is the bug: with no
+bid the floor is the seller's opening price and `min_increment` is zero; with a
+bid it is the current bid plus the server's own increment, which came back as
+5% (`bid 2500, +125`). A client that always sent `bid + min_increment` would
+send zero on an unbid auction.
+
+A zero auction id or a zero price is dropped by the server **in silence**, so
+both are refused by this client before the send instead.
+
+### Cancelling returns the goods as mail
+
+`CMSG_AUCTION_REMOVE_ITEM` is `{u64 auctioneer, u32 auction}`. The items come
+back through the **mail system**, not to the bag -- so confirming a
+cancellation end to end needs an inbox, which is why 4.27 is a prerequisite for
+checking 4.30 even though neither milestone's opcodes touch the other's.
+
+### Not sent yet
+
+`CMSG_AUCTION_SELL_ITEM` is implemented, bounded and tested and has no gesture
+in the interface: posting needs a price entry, a duration control and a deposit
+the client cannot compute. `CMSG_AUCTION_LIST_BIDDER_ITEMS`' trailing
+"outbid" id list is always sent empty -- the server merely looks each id up and
+adds it to the reply, and AzerothCore's own comment on the field is *"which
+I'm honestly not entirely sure why?"*. The `get-all` flag is on the wire and
+not offered: it is capped at 55,000 rows in one packet.
+
+`SMSG_AUCTION_BIDDER_NOTIFICATION` and `SMSG_AUCTION_OWNER_NOTIFICATION` parse
+and have never been observed live -- both arrive unprompted, like
+`SMSG_RECEIVED_MAIL`, and seeing one needs two characters bidding against each
+other over a real auction's lifetime. `SMSG_AUCTION_REMOVED_NOTIFICATION` is
+named and this server never sends it.
