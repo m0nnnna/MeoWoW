@@ -81,7 +81,20 @@ pub struct Entity {
     /// Kept per attacker rather than as a single "in combat" flag because two
     /// creatures fighting the same player swing on their own timers, and one
     /// flag would make them animate in lockstep.
-    pub last_swing: Option<std::time::Instant>,
+    /// **With the hand it came from**, because a dual-wielder's two weapons
+    /// swing on independent timers and play different cycles. See
+    /// [`crate::combat::hit_info::OFF_HAND`].
+    pub last_swing: Option<(std::time::Instant, crate::combat::Hand)>,
+    /// When this unit's last cast *landed*, and which spell it was.
+    ///
+    /// `SMSG_SPELL_GO`, stamped on the caster for the same reason
+    /// [`Self::last_swing`] is: a renderer has to start the animation from
+    /// the moment the thing happened, and a report the caller has to
+    /// remember to read is one that stops being read. The spell id travels
+    /// with it because which animation a cast plays is a property of the
+    /// spell -- `SpellVisualKit` names it -- and by the time anything draws,
+    /// the packet is gone.
+    pub last_cast: Option<(std::time::Instant, u32)>,
     /// How many updates of any kind have touched this object.
     pub updates: usize,
     /// When this unit's sheath state was *seen to change*, as opposed to
@@ -512,10 +525,32 @@ impl Entity {
         self.died_at.map(|at| now.saturating_duration_since(at))
     }
 
-    /// How long ago this unit last swung, if it has.
-    pub fn swung_ago(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+    /// How long ago this unit last swung, if it has, and **with which hand**.
+    ///
+    /// The hand travels with the time rather than beside it because the two
+    /// are one observation: a caller that read the age and then asked
+    /// separately which hand it was could get the answer from a *later*
+    /// swing, and a dual-wielder alternates hands several times a second.
+    pub fn swung_ago(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<(std::time::Duration, crate::combat::Hand)> {
         self.last_swing
-            .map(|at| now.saturating_duration_since(at))
+            .map(|(at, hand)| (now.saturating_duration_since(at), hand))
+    }
+
+    /// How long ago this unit's last cast landed, and which spell it was.
+    ///
+    /// `SMSG_SPELL_GO` is the moment the spell *happens*, which is what an
+    /// animation is timed from -- an instant-cast ability has no other event
+    /// at all. A cast still winding up is in [`WorldState::casts`] instead,
+    /// because that one is a state with a duration rather than an instant.
+    pub fn cast_landed_ago(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<(std::time::Duration, u32)> {
+        self.last_cast
+            .map(|(at, spell)| (now.saturating_duration_since(at), spell))
     }
 
     /// Records a crossing of the drawn/stowed line, given what was true
@@ -1630,6 +1665,9 @@ impl WorldState {
                 // not watch it die, so it must not fall over again.
                 died_at: None,
                 last_swing: None,
+                // And the same for a cast: a unit that came into view
+                // mid-cast has not been watched casting.
+                last_cast: None,
                 updates: 1,
                 // Also deliberately `None`: a create block that already shows
                 // a stowed weapon is not a draw or a stow just happening, and
@@ -2380,6 +2418,18 @@ impl WorldState {
                             if self.casts.remove(&go.caster).is_some() {
                                 report.casts_landed += 1;
                             }
+                            // Stamped on the caster for the same reason a
+                            // swing is: this is the instant the spell
+                            // happens, and an *instant* cast has no other
+                            // event at all -- no `SMSG_SPELL_START`, nothing
+                            // in `casts`, so a renderer reading only the
+                            // in-flight table would animate long casts and
+                            // silently ignore every ability a melee class
+                            // uses.
+                            if let Some(caster) = self.entities.get_mut(&go.caster) {
+                                caster.last_cast =
+                                    Some((std::time::Instant::now(), go.spell_id));
+                            }
                             report.cast_landings.push(go);
                         }
                         Err(error) => report.failures.push((
@@ -2405,7 +2455,12 @@ impl WorldState {
                             // that stops playing the first time a caller does
                             // not.
                             if let Some(attacker) = self.entities.get_mut(&swing.attacker) {
-                                attacker.last_swing = Some(std::time::Instant::now());
+                                // With the hand, which is the whole of
+                                // `foss-wow#76`: a dual-wielder alternates
+                                // several times a second and every one of
+                                // those swings drew the main-hand cycle.
+                                attacker.last_swing =
+                                    Some((std::time::Instant::now(), swing.hand()));
                             }
                             report.swings.push(swing);
                         }

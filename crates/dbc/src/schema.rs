@@ -746,7 +746,59 @@ dbc_table! {
     /// past 70%.
     SpellVisualKit, SpellVisualKitRow, path = r"DBFilesClient\SpellVisualKit.dbc", fields = 38, {
         0  id: u32,
+        /// The `AnimationData` row the caster plays for this moment, or `0`
+        /// for a kit that moves nobody. `0xFFFF_FFFF` also appears and means
+        /// the same thing -- see [`SpellVisualKitRow::anim`], which folds
+        /// both to `None`.
+        ///
+        /// **Validity could not have found this column and did not.**
+        /// `AnimationData` is 506 rows numbered 0..505, so nearly any small
+        /// integer resolves -- three other columns here also resolve 100% of
+        /// the time and none of them is an animation. What identifies it is
+        /// that it *varies the way an animation varies*: grouped by which
+        /// [`SpellVisual`] slot names the kit, this column's top names are
+        ///
+        /// | moment | most common animations |
+        /// |---|---|
+        /// | precast (609 set) | `ReadySpellOmni` 106, `ReadySpellDirected` 94 |
+        /// | casting (1,453) | `SpellCastOmni` 275, `SpellCastDirected` 244 |
+        /// | channel (519) | `ChannelCastDirected` 292, `ChannelCastOmni` 96 |
+        /// | impact (320) | `CombatCritical` 73, `CombatWound` 72, `Knockdown` 37 |
+        /// | state (373) | `Stun` 46, `ChannelCastOmni` 31, `Whirlwind` 23 |
+        ///
+        /// Every row of that table is the family a person would name for the
+        /// moment, and the controls are not: column 16 gives `Stop`, `Walk`,
+        /// `Dead` and column 17 gives `StandWound`, `ShuffleRight` with the
+        /// same 100% validity and no relation to the moment at all. Same
+        /// instrument as the `Light.dbc` storm column and
+        /// `CreatureSoundData` -- ask whether the candidate varies the way
+        /// the thing it names varies, not whether its values are legal.
+        ///
+        /// **The impact row is a finding rather than a curiosity**: an impact
+        /// kit's animation is the *victim's* reaction, not the caster's, so a
+        /// client that played every kit's animation on whoever cast the spell
+        /// would make a mage flinch each time their own bolt landed. Only the
+        /// precast, casting and channel slots are read for the caster.
+        2  anim: u32,
         15 sound: u32,
+    }
+}
+
+impl SpellVisualKitRow<'_> {
+    /// [`Self::anim`] as an animation id, with both ways of saying "none"
+    /// folded together.
+    ///
+    /// The column stores `0` on 7,110 of 8,663 rows and `-1` (as
+    /// `0xFFFF_FFFF`) on a further handful, and the two mean the same thing
+    /// here. Folding them at the accessor rather than at each call site is
+    /// the point: `0` is also a perfectly good animation id -- it is `Stand`
+    /// -- so a caller that tests the raw column for zero is right by accident
+    /// and a caller that does not is wrong silently.
+    pub fn animation(&self) -> Option<u16> {
+        match self.anim() {
+            0 | u32::MAX => None,
+            id => u16::try_from(id).ok(),
+        }
     }
 }
 

@@ -66,8 +66,18 @@ pub struct Entity {
     /// `None` for a corpse that was already lying there -- see
     /// `world::state::Entity::died_at`.
     pub died_ms_ago: Option<u32>,
-    /// How long ago it last swung at something.
-    pub swung_ms_ago: Option<u32>,
+    /// How long ago it last swung at something, and with which hand.
+    pub swung_ms_ago: Option<(u32, ::world::combat::Hand)>,
+    /// The spell this unit is currently winding up, if any -- the cast bar's
+    /// own spell, from `SMSG_SPELL_START`.
+    pub casting_spell: Option<u32>,
+    /// How long ago this unit's last cast *landed*, and which spell it was.
+    ///
+    /// Separate from `casting_spell` rather than folded into it because they
+    /// are different kinds of statement, and an instant-cast ability only
+    /// ever produces the second: no cast bar, no wind-up, one
+    /// `SMSG_SPELL_GO`. Most of what a melee class casts is instant.
+    pub cast_landed: Option<(u32, u32)>,
     /// Whether it is in a melee, on either side of it.
     pub fighting: bool,
     /// The five character-creation numbers, for a *player*.
@@ -540,7 +550,17 @@ pub fn drawable_entities(
             swimming: entity.swimming(),
             dead: entity.is_corpse(),
             died_ms_ago: entity.dying_for(now).map(|d| d.as_millis() as u32),
-            swung_ms_ago: entity.swung_ago(now).map(|d| d.as_millis() as u32),
+            swung_ms_ago: entity
+                .swung_ago(now)
+                .map(|(age, hand)| (age.as_millis() as u32, hand)),
+            // The in-flight cast comes from the world's own table rather than
+            // from the entity, because that is where `SMSG_SPELL_START` puts
+            // it -- and it is the same table the cast bar reads, so the bar
+            // and the body cannot disagree about whether a cast is running.
+            casting_spell: state.active_cast(entity.guid, now).map(|cast| cast.spell_id),
+            cast_landed: entity
+                .cast_landed_ago(now)
+                .map(|(age, spell)| (age.as_millis() as u32, spell)),
             fighting: state.is_fighting(entity.guid),
             appearance: entity.appearance(),
             visible_items: entity.visible_item_entries(),
@@ -719,7 +739,16 @@ pub fn own_entity(
             .map(|d| d.as_millis() as u32),
         swung_ms_ago: entity
             .swung_ago(std::time::Instant::now())
-            .map(|d| d.as_millis() as u32),
+            .map(|(age, hand)| (age.as_millis() as u32, hand)),
+        // Our own cast is read the same way everyone else's is. This is one
+        // of the things the server *does* tell us about, like our death and
+        // our sheath state and unlike our position.
+        casting_spell: state
+            .active_cast(own_guid, std::time::Instant::now())
+            .map(|cast| cast.spell_id),
+        cast_landed: entity
+            .cast_landed_ago(std::time::Instant::now())
+            .map(|(age, spell)| (age.as_millis() as u32, spell)),
         fighting: state.is_fighting(own_guid),
         // Our own appearance is already resolved -- see `LiveWorld::look` --
         // and came from the character list rather than from these fields,

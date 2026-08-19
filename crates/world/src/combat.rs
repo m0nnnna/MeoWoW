@@ -27,6 +27,33 @@ use crate::update::read_packed_guid;
 pub mod hit_info {
     /// Set on every landed swing in the capture, both directions.
     pub const NORMAL_SWING: u32 = 0x0000_0002;
+    /// The blow came from the **off hand** of a dual-wielding attacker.
+    ///
+    /// AzerothCore names this bit `HITINFO_OFFHAND` (`Unit.h`), which is
+    /// where the hypothesis came from -- rule 2's usual division of labour.
+    /// What confirms it is three observations from the local realm, one of
+    /// which could have refuted it:
+    ///
+    /// * A level-2 rogue with a dagger in each hand landed **exactly ten of
+    ///   twenty** swings with this bit set. Two weapons on two independent
+    ///   timers is the only thing in melee that produces a clean half.
+    /// * Those ten did about **half the damage** of the other ten -- landed
+    ///   hits of 2 against 4 and 5, and the criticals carrying the bit did 4
+    ///   where a main-hand critical did 10. An off-hand swing is penalised
+    ///   in exactly that way, and nothing else in a fight is.
+    /// * **The refutation that did not happen.** The same rogue, same
+    ///   wolves, same command, with the off-hand dagger moved out of slot 16
+    ///   and into the backpack: **0 of 10** swings carried it, and every one
+    ///   of those ten landed for a main-hand 4 or 5. Creatures, which have
+    ///   one mouth, are 0 of 46 across all three runs. A bit that meant
+    ///   something else about a swing -- a glance, a second roll, a damage
+    ///   band -- would not have disappeared with the second weapon and come
+    ///   back with it.
+    ///
+    /// Named because it changes what is *drawn*: without it a dual-wielder
+    /// plays the main-hand swing twice as often as it should and never uses
+    /// the other arm. See `world::Hand` in the viewer.
+    pub const OFF_HAND: u32 = 0x0000_0004;
     /// The swing did not connect: damage, and every damage block in it, read
     /// zero, and the victim state reads zero rather than one.
     pub const MISS: u32 = 0x0000_0010;
@@ -49,6 +76,22 @@ pub mod hit_info {
     /// on a combat log misexplains a fight to whoever reads it next. See
     /// [`MeleeSwing::extra_amount`].
     pub const CARRIES_EXTRA_AMOUNT: u32 = 0x0000_2000;
+}
+
+/// Which hand a blow came from.
+///
+/// Lives here rather than in the renderer because it is a fact the *wire*
+/// reports -- [`hit_info::OFF_HAND`] -- and the alternative was for every
+/// consumer to re-test the bit. A client that instead looked at what the
+/// attacker has equipped would be guessing: two weapons are visible in the
+/// replicated fields, but which of them just landed is not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Hand {
+    /// The main hand, and everything else that swings: a two-hander, a fist,
+    /// a wolf's teeth.
+    #[default]
+    Main,
+    Off,
 }
 
 /// One damage component of a swing: physical, or a school of magic.
@@ -126,6 +169,16 @@ impl MeleeSwing {
 
     pub fn critical(&self) -> bool {
         self.hit_info & hit_info::CRITICAL != 0
+    }
+
+    /// Which hand this blow came from. See [`hit_info::OFF_HAND`] for how
+    /// that was established.
+    pub fn hand(&self) -> Hand {
+        if self.hit_info & hit_info::OFF_HAND != 0 {
+            Hand::Off
+        } else {
+            Hand::Main
+        }
     }
 
     /// Whether this swing killed the victim.
@@ -566,6 +619,49 @@ mod tests {
         0x00, 0x07, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x08,
         0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
+
+    /// An **off-hand** swing, verbatim, from the local realm: a level-two
+    /// rogue with a dagger in each hand hitting a Northshire wolf for 2.
+    ///
+    /// Two things about it are the evidence rather than the packet. The
+    /// `hit_info` carries `0x4` on top of the ordinary `0x2`, and the damage
+    /// is 2 where the same rogue's main hand landed 4s and 5s in the same
+    /// fight -- the off-hand penalty. See [`hit_info::OFF_HAND`] for the
+    /// controls, including the same character with the second weapon removed.
+    ///
+    /// 43 bytes rather than the 42 of the older captures, and that is not a
+    /// different layout: this attacker's packed guid is two bytes and this
+    /// victim's is seven, where the older pair were two and six.
+    const OFF_HAND_HIT: &[u8] = &[
+        0x06, 0x00, 0x00, 0x00, // hit_info: normal swing + off hand
+        0x01, 0x0b, // attacker, packed -- the rogue, guid 11
+        0xdb, 0x95, 0x8c, 0x2b, 0x01, 0x30, 0xf1, // victim, packed
+        0x02, 0x00, 0x00, 0x00, // 2 damage
+        0x00, 0x00, 0x00, 0x00, // no overkill
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// The bit that says which arm swung, against the two captures that
+    /// differ in it -- and the main-hand one is asserted too, because "the
+    /// off-hand packet reports the off hand" passes just as well under a rule
+    /// that reports the off hand for everything.
+    #[test]
+    fn a_captured_off_hand_swing_names_the_other_arm() {
+        let off = parse_melee_swing(OFF_HAND_HIT).expect("the captured packet must parse");
+        assert_eq!(off.attacker, 0x0b, "the rogue");
+        assert_eq!(off.victim, 0xf130_0001_2b00_8c95, "the wolf");
+        assert_eq!(off.hand(), Hand::Off);
+        assert_eq!(off.damage, 2, "an off-hand swing is penalised");
+        assert!(!off.missed());
+
+        // The same fight's main-hand swings, and the wolf's own: one weapon,
+        // one arm, and the bit clear on all of them.
+        for body in [HIT, KILL, MISS] {
+            let swing = parse_melee_swing(body).unwrap();
+            assert_eq!(swing.hand(), Hand::Main, "{:#x}", swing.hit_info);
+        }
+    }
 
     #[test]
     fn a_landed_swing_matches_a_captured_live_packet() {

@@ -251,7 +251,6 @@ impl Minimap {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     /// The Northshire human spawn -- the position this project has logged in
     /// at more often than any other, and the one the world map's own hand

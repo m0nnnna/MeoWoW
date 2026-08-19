@@ -165,6 +165,143 @@ fn world_safe_locs_columns_land_on_the_right_values() {
     assert_eq!((reuse.x(), reuse.y(), reuse.z()), (0.0, 0.0, 0.0));
 }
 
+/// **`SpellVisualKit::anim` was identified by what it varies with**, which is
+/// the only thing that could have identified it.
+///
+/// `AnimationData` is 506 rows numbered 0..505, so a column of small integers
+/// resolving into it is nearly free -- two other columns in this same table
+/// resolve 100% of the time and are not animations. The argument is that this
+/// column's *values change with the moment the kit belongs to*, in the
+/// direction anyone who has played the game would predict: kits named by
+/// `SpellVisual`'s precast slot reach the ready poses, its casting slot the
+/// cast gestures, its channel slot the channelled ones.
+///
+/// The impact slot is the half that makes this a measurement rather than a
+/// story: its animations are overwhelmingly `CombatCritical`, `CombatWound`
+/// and `Knockdown` -- the **victim's** flinch, not the caster's gesture --
+/// which is why the client reads three of the six slots and not this one.
+///
+/// The controls are the two columns that resolve just as well. Neither shows
+/// any moment structure at all, which is what a coincidence of magnitudes
+/// looks like.
+#[test]
+fn spell_visual_kit_animation_varies_with_the_moment() {
+    use std::collections::{HashMap, HashSet};
+
+    let mut chain = require_data!();
+    let visuals = SpellVisual::parse(&chain.read(SpellVisual::PATH).unwrap()).unwrap();
+    let kits = SpellVisualKit::parse(&chain.read(SpellVisualKit::PATH).unwrap()).unwrap();
+    let animations =
+        dbc::schema::AnimationData::parse(&chain.read(dbc::schema::AnimationData::PATH).unwrap())
+            .unwrap();
+
+    let animation_name: HashMap<u32, String> = animations
+        .iter()
+        .map(|row| (row.id(), row.name().to_string()))
+        .collect();
+    // Raw column access, because the controls are columns this schema
+    // deliberately does not transcribe.
+    let column: HashMap<u32, Vec<u32>> = kits
+        .iter()
+        .map(|row| {
+            let raw = row.raw();
+            (row.id(), vec![raw.u32(2), raw.u32(16), raw.u32(17)])
+        })
+        .collect();
+
+    // Which kits each moment names.
+    let moment = |slot: fn(&dbc::schema::SpellVisualRow<'_>) -> u32| -> HashSet<u32> {
+        visuals
+            .iter()
+            .map(|visual| slot(&visual))
+            .filter(|id| *id != 0 && *id != u32::MAX && column.contains_key(id))
+            .collect()
+    };
+    let precast = moment(|v| v.precast_kit());
+    let casting = moment(|v| v.casting_kit());
+    let channel = moment(|v| v.channel_kit());
+    let impact = moment(|v| v.impact_kit());
+
+    /// What fraction of a moment's animations belong to a named family.
+    fn share(
+        ids: &HashSet<u32>,
+        column: &HashMap<u32, Vec<u32>>,
+        which: usize,
+        names: &HashMap<u32, String>,
+        family: fn(&str) -> bool,
+    ) -> (usize, f64) {
+        let resolved: Vec<&String> = ids
+            .iter()
+            .filter_map(|kit| column.get(kit)?.get(which))
+            .filter(|value| **value != 0 && **value != u32::MAX)
+            .filter_map(|value| names.get(value))
+            .collect();
+        if resolved.is_empty() {
+            return (0, 0.0);
+        }
+        let hits = resolved.iter().filter(|name| family(name)).count();
+        (resolved.len(), hits as f64 / resolved.len() as f64)
+    }
+
+    let ready = |name: &str| name.starts_with("ReadySpell") || name == "SpellPrecast";
+    let cast = |name: &str| name.starts_with("SpellCast");
+    let channelled = |name: &str| name.starts_with("ChannelCast");
+    let flinch = |name: &str| name.starts_with("Combat") || name.starts_with("Knock");
+
+    // The transcribed column, moment by moment. Each family is the plurality
+    // of its own moment and a fraction of any other -- the fractions are not
+    // near 1.0 because most spells in the table are creature abilities using
+    // ordinary gestures, which is exactly why a *comparison* rather than a
+    // threshold is what settles it.
+    let (n, precast_ready) = share(&precast, &column, 0, &animation_name, ready);
+    assert!(n > 500, "only {n} precast animations to test");
+    let (_, precast_cast) = share(&precast, &column, 0, &animation_name, cast);
+    assert!(
+        precast_ready > 0.25 && precast_ready > 3.0 * precast_cast,
+        "precast kits should reach the ready poses: {precast_ready:.3} against \
+         {precast_cast:.3} for the cast gestures"
+    );
+
+    let (n, casting_cast) = share(&casting, &column, 0, &animation_name, cast);
+    assert!(n > 1000, "only {n} casting animations to test");
+    let (_, casting_ready) = share(&casting, &column, 0, &animation_name, ready);
+    assert!(
+        casting_cast > 0.30 && casting_cast > 6.0 * casting_ready,
+        "casting kits should reach the cast gestures: {casting_cast:.3} against \
+         {casting_ready:.3}"
+    );
+
+    let (_, channel_share) = share(&channel, &column, 0, &animation_name, channelled);
+    assert!(
+        channel_share > 0.60,
+        "channel kits should reach the channelled cycles: {channel_share:.3}"
+    );
+
+    // The finding: an impact poses the *victim*.
+    let (_, impact_flinch) = share(&impact, &column, 0, &animation_name, flinch);
+    let (_, impact_cast) = share(&impact, &column, 0, &animation_name, cast);
+    assert!(
+        impact_flinch > 0.40 && impact_cast < 0.10,
+        "impact kits should reach the wound reactions rather than the caster's \
+         gesture: {impact_flinch:.3} flinching against {impact_cast:.3} casting"
+    );
+
+    // And the controls: two columns that resolve into `AnimationData` just as
+    // reliably and carry no moment structure whatsoever.
+    for control in [1usize, 2] {
+        for (label, ids) in [("precast", &precast), ("casting", &casting), ("channel", &channel)] {
+            for family in [ready, cast, channelled] {
+                let (_, got) = share(ids, &column, control, &animation_name, family);
+                assert!(
+                    got < 0.20,
+                    "control column {} carries moment structure on {label}: {got:.3}",
+                    if control == 1 { 16 } else { 17 }
+                );
+            }
+        }
+    }
+}
+
 /// `SpellVisualKit::sound` was identified by type, not by validity:
 /// `SpellVisualKit`'s own ids are 56% dense over their range, so almost any
 /// small integer in a row lands on one -- the actual argument is that the

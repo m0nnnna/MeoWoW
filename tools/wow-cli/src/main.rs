@@ -2067,6 +2067,18 @@ nothing replicated matches {wanted:?}"),
                     let mut started = false;
                     for _ in 0..3 {
                         let batch = connection.drain(std::time::Duration::from_millis(1200), 128)?;
+                        // **Into the capture, which it was not.** This loop is
+                        // where the interesting swings arrive -- a level-one
+                        // fight can be over before `--stay` begins -- and a
+                        // `--capture` run that recorded only the quiet phase
+                        // came back with 506 monster moves and not one
+                        // `SMSG_ATTACKERSTATEUPDATE`. Same rule as printing a
+                        // refused packet's body rather than its length: the
+                        // phase that produces the evidence is the one that has
+                        // to keep it.
+                        if let Some(capture) = capture.as_mut() {
+                            capture.record(&batch)?;
+                        }
                         let report = state.replicate(&batch, None);
                         print_events(&report, &state, character.guid);
                         if !report.swings.is_empty() {
@@ -3280,6 +3292,22 @@ fn print_events(report: &world::Replication, state: &world::WorldState, own_guid
         println!(
             "  {}",
             world::combat::describe_swing(swing, own_guid, |guid| combat_name(state, guid))
+        );
+        // **The raw mask beside the sentence.** `describe_swing` deliberately
+        // names only the bits this project has confirmed, so a run that is
+        // *investigating* a bit -- which is how every named one got named --
+        // has nothing to read otherwise. This is what identified the off-hand
+        // bit: two runs of the same fight, one weapon and then two, with only
+        // this line differing between them.
+        println!(
+            "    hit_info {:#010x}, damage {}, victim_state {}{}",
+            swing.hit_info,
+            swing.damage,
+            swing.victim_state,
+            match swing.extra_amount {
+                Some(extra) => format!(", extra {extra}"),
+                None => String::new(),
+            }
         );
     }
     // Threat is returned rather than stored -- nothing in the interface reads

@@ -4963,3 +4963,204 @@ same reason: the wheel must not rewrite a saved setting on every notch.
   to evict and be wrong about.
 * **Nothing but objectives and party members is on it.** No corpse, no
   questgivers, no vendors, no dungeon entrances -- 4.22's material.
+
+### 4.22: the animation subsystem's remaining gaps
+
+Three of them, and only two were on the board. `foss-wow#75` said casting plays
+no animation; `#76` said a dual-wielding character swings only the main hand,
+repeatedly. The third was found on the way past, by opening the table the other
+two needed: **the sheath transition had been playing the wrong cycle since it
+was written, and on half the weapons in the game it was playing a character
+asking a question with its hands.**
+
+All three land in the same precedence machinery, and all three share the
+property that makes this subsystem expensive: a wrong animation id does not
+error. It plays a different, plausible-looking cycle, or none.
+
+#### The sheath ids were sequence indices, and one of them resolved
+
+`SHEATH_ANIMATION_ID` was 32 and `HIP_SHEATH_ANIMATION_ID` was 65. Those are
+the human male's *sequence indices* for `Sheath` and `HipSheath`, read out of a
+`wow-cli m2 anims` listing whose first column is a position in the model rather
+than an animation id. The real ids are **89 and 90**.
+
+What the two wrong numbers did is worth recording, because they failed in
+opposite ways and neither failed loudly:
+
+* **Id 32 is `SpellCast`**, which no character model in the game carries at
+  all. So stowing a weapon on the back fell through the chain to `Stand` and
+  the transition simply never played. Nothing was drawn wrong; something was
+  not drawn.
+* **Id 65 is `EmoteTalkQuestion`**, which the human male *does* carry --
+  sequence 55, 1800ms, in an external `.anim`. So stowing a one-hander played a
+  character gesturing a question for nearly two seconds. That is a wrong
+  picture that reads as a slightly odd right one.
+
+The comment warning against exactly this mistake was already in the file,
+eleven lines above the two constants, on `Jump` and `Fall`: *"the sequence
+indices for these on the human male are 31 and 17, which is exactly the
+confusion that makes transcribing an id out of a model listing a mistake."*
+The doc comment on the sheath constants even claimed the numbers had been
+*confirmed* against `m2 anims` -- "both list at 1000ms, named `Sheath` and
+`HipSheath` respectively" -- and that sentence is true and is the misreading.
+Sequences 32 and 65 are indeed those two cycles and are indeed 1000ms each.
+They are not ids 32 and 65.
+
+So the guard is a test that reads `AnimationData.dbc` and checks **every**
+animation constant this client hardcodes against the *name* of the row it
+claims. A name is the one thing in that table that cannot be arrived at by a
+coincidence of small integers -- the same reason `CreatureSoundData`'s columns
+were identified by the names of the sounds they reach. A second test asserts
+the distinction itself: on the human male, fewer than a quarter of sequences
+sit at their own id, so the two readings are not interchangeable and a listing
+is not a source of ids.
+
+#### The off hand: the wire says which arm, and nothing was asking
+
+A dual-wielder swings two weapons on two independent timers. Every one of those
+swings drew the main-hand cycle, because `Entity::last_swing` stored a time and
+nothing else.
+
+`SMSG_ATTACKERSTATEUPDATE`'s `hit_info` carries it. AzerothCore names bit `0x4`
+`HITINFO_OFFHAND`, which is where the hypothesis came from -- rule 2's usual
+division of labour -- and three measurements against the local realm are what
+confirm it, one of which could have refuted it:
+
+| run | attacker | swings | with `0x4` |
+|---|---|---|---|
+| dual-wield | level-2 rogue, a dagger in each hand | 20 | **10** |
+| control | the same rogue, off-hand dagger moved to the backpack | 10 | **0** |
+| creatures | Northshire wolves, across all three runs | 46 | **0** |
+
+The clean half is what a second weapon on its own timer produces and nothing
+else in melee does. The damage agrees independently: the ten swings carrying
+the bit landed for 2 where the ten without landed for 4 and 5, and a critical
+carrying it did 4 where a main-hand critical did 10 -- the off-hand penalty,
+measured rather than assumed. And the control is the refutation that did not
+happen: a bit meaning anything else about a swing -- a glance, a second roll, a
+damage band -- would not have vanished when the second weapon left the slot and
+returned when it came back.
+
+That control needed the *character* changed rather than the technique. The CLI
+applies `--swap` after `--attack`, so one session cannot unequip and then
+fight; and a session that ends by closing the socket never saves, so the swap
+did not persist either. Moving the row in `character_inventory` while the
+character was offline is a **legal** placement -- a weapon in a backpack slot
+-- which the loader honoured and the login report confirmed, unlike the bag
+hand-placed into an equipped slot in 4.13 that the server silently relocated.
+
+`Hand` lives in `world::combat` beside the bit rather than in the renderer,
+because it is a fact the wire reports. A client that instead looked at what the
+attacker has equipped would be guessing: both weapons are visible in the
+replicated fields, but which of them just landed is not. The chain is the
+table's own -- `AttackOff` (87) names `AttackOffPierce` (88), which names
+`AttackUnarmed` (16), which names `Stand`.
+
+#### Casting: a column identified by what it varies with
+
+`SpellVisual` was already transcribed and its six kit columns already
+identified, by the *names of the sounds they reach*. What was missing is the
+animation, and it is `SpellVisualKit`'s column 2.
+
+Validity could not have found it and did not. `AnimationData` is 506 rows
+numbered 0..505, so a column of small integers resolving into it is nearly
+free -- two other columns in the same table resolve **100%** of the time and
+are not animations. What identifies column 2 is that it varies the way an
+animation varies. Grouped by which `SpellVisual` slot names the kit:
+
+| moment | most common animations |
+|---|---|
+| precast (609 set) | `ReadySpellOmni` 106, `ReadySpellDirected` 94 |
+| casting (1,453) | `SpellCastOmni` 275, `SpellCastDirected` 244 |
+| channel (519) | `ChannelCastDirected` 292, `ChannelCastOmni` 96 |
+| impact (320) | `CombatCritical` 73, `CombatWound` 72, `Knockdown` 37 |
+
+Every row is the family a person would name for that moment. The controls show
+no moment structure at all: column 16 gives `Stop`, `Walk`, `Dead` and column
+17 gives `StandWound`, `ShuffleRight`, with the same perfect validity.
+
+Named spells make the point one level down, and that is the version worth
+reading: **Fireball, Frostbolt and Shadow Bolt all wind up in
+`ReadySpellDirected` and release in `SpellCastDirected`. Sinister Strike
+releases in `Attack1H` -- it *is* a weapon swing. Eviscerate and Heroic Strike
+release in `Special1H`.** A column of coincidentally-valid small integers does
+not name the gesture a player would name for six spells in a row.
+
+**The impact slot is a finding rather than a curiosity.** Its animations are
+the *victim's* flinch, not the caster's gesture, so a client that played every
+kit's animation on whoever cast the spell would make a mage recoil from their
+own fireball. Three of the six slots are read and this is not one of them.
+
+Two states came out of that, and the distinction between them is one this
+project keeps making:
+
+* `Motion::Casting` is the **wind-up**, held for as long as the server says a
+  cast is in flight. It carries no start time, because it is a state rather
+  than an event -- the same distinction as `UNIT_FIELD_TARGET` against
+  `SMSG_MONSTER_MOVE`'s facing block.
+* `Motion::CastRelease` is the **release**, a one-shot stamped from
+  `SMSG_SPELL_GO`. It is the only cast animation an *instant* spell ever gets,
+  and instants are most of what a melee class casts -- so it is the more
+  visible half, and a renderer reading only the in-flight table would animate
+  long casts and silently ignore every ability a rogue owns.
+
+The wind-up outranks the release, and both outrank the swing. Auto-attack keeps
+swinging through a cast, so without the second rule the cast is never drawn at
+all; and a release lingers up to its ceiling, which is longer than the gap
+between two casts of a fast spell, so without the first the wind-up of every
+cast after the first is eaten by the one before it -- casting appearing to work
+every other time.
+
+#### Two things the chain cost
+
+**`animation_ids` could no longer be a literal.** Every cycle before this was
+nameable in the enum, so the chain was a `&'static [u16]`. A spell's is data:
+`SpellVisualKit` names the head and `AnimationData`'s fallback column chains
+it, for 17,837 spells. `Cycle` carries it by value inside the motion key, which
+is sound rather than merely convenient -- a chain is entirely determined by its
+head, so two motions with the same head cannot carry different tails and the
+extra bytes in the key partition nothing new.
+
+Walking that column needs two guards and the table earns both: `Stand`'s own
+fallback is not zero (it names 147, `Stand` again by another name), so the walk
+must stop *at* standing rather than follow it; and **`FlyClose` and `FlyOpen`
+name each other**, so a chain can loop. The deepest real chain is eleven.
+
+**`plays_once` could not answer for a cast.** It keys on the resolved animation
+id -- deliberately, because that is what lets a swing falling back to `Stand`
+still loop rather than freeze as a statue -- and a cast's id is whatever a
+table names, out of dozens. So the question is now asked the other way round:
+the *looping* cycles are the small closed known set, because they are exactly
+the ones this client resolves by name, and anything a `SpellVisual` names is a
+gesture. The rule it was built on survives intact, including the case that
+built it.
+
+#### Confirmed at the window
+
+All three, on the local realm, by the person at the keyboard: the off-hand arm
+alternating, the cast animation playing, and the stow transition drawing the
+cycle it names.
+
+The report that opened the session -- *"he still only attacks with 1 hand not 2
+and the animation for sinister strike doesn't play but the sound does"* -- was
+made against a binary built four hours before any of this existed, and reads
+exactly like the finished feature failing. That is its own small lesson, and it
+is the same one as the character list reporting a stale position in 3.4:
+**check that the thing being watched is the thing that was changed.** The
+timestamp on the executable answered it in one command.
+
+#### What is not done
+
+* **No channelled cast.** The channel kit is transcribed and its animations
+  identified; nothing here parses a channel start, so there is no event to
+  hang it on.
+* **No upper-body blending**, so a cast or a swing while moving is not drawn at
+  all. A deliberate loss rather than an oversight -- a whole-body cast cycle
+  played over a run reads as a stumble -- but it is why casting on the move
+  looks like nothing happened.
+* **`AttackUnarmedOff` (117) is unused.** A dual-wielder is by definition
+  holding two weapons, so the unarmed off-hand cycle cannot be reached from
+  anything the wire reports.
+* **Nothing reads `SpellVisualKit`'s other 35 columns**, including the second
+  animation slot (column 1), which is set on 84 rows and whose names are also
+  cast-family -- consistent with a lead-in, unconfirmed, and unused.

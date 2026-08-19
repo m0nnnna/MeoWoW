@@ -369,6 +369,10 @@ fn build_live_scene(
         // entry-to-display bridge, the same table this struct already reads
         // for icons.
         let items = crate::items::Items::load(chain);
+        // And the cast animations, for the same reason the item bridge is
+        // read here: a headless render that posed casters differently from
+        // the window would be evidence about neither.
+        let casts = crate::spells::CastAnimations::read(chain);
         let placements: Vec<world::EntityPlacement> =
             // A headless render has no movement driver to have decided, and
             // the character is standing still: not swimming.
@@ -405,6 +409,7 @@ fn build_live_scene(
                         dead: entity.dead,
                         died_ms_ago: entity.died_ms_ago,
                         swung_ms_ago: entity.swung_ms_ago,
+                        spell: casts.pose(entity.casting_spell, entity.cast_landed),
                         fighting: entity.fighting,
                         kind: entity.kind,
                         stance: look.as_deref().map(|l| l.stance).unwrap_or_default(),
@@ -4113,6 +4118,10 @@ impl App {
                                     dead: entity.dead,
                                     died_ms_ago: entity.died_ms_ago,
                                     swung_ms_ago: entity.swung_ms_ago,
+                                    spell: self
+                                        .spells
+                                        .cast_animations
+                                        .pose(entity.casting_spell, entity.cast_landed),
                                     fighting: entity.fighting,
                                     kind: entity.kind,
                                     stance: look

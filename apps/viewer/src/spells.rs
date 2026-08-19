@@ -73,6 +73,188 @@ const ATTR_PASSIVE: u32 = 0x0000_0040;
 /// `SMSG_ATTACKSTART`. See `App::activate_slot`.
 pub const AUTO_ATTACK: u32 = 6603;
 
+/// Which animation a spell poses its caster in, for every spell in the game.
+///
+/// **Not scoped to what the player knows**, unlike everything else in this
+/// file. A cast bar belongs to whoever is casting, and most of the casting in
+/// view is done by creatures and other players -- so a table that only
+/// answered for the character's own spellbook would leave every NPC caster
+/// standing perfectly still, which is the bug this exists to fix.
+///
+/// Two moments, from two of `SpellVisual`'s six kit columns:
+///
+/// * the **precast** kit's animation is the wind-up, held while the cast bar
+///   runs -- `ReadySpellDirected` for Fireball, Frostbolt and Shadow Bolt;
+/// * the **casting** kit's is the release, played once when the spell lands
+///   -- `SpellCastDirected` for those three, `Attack1H` for Sinister Strike,
+///   `Special1H` for Eviscerate and Heroic Strike.
+///
+/// That list is worth reading twice: those are the animations anyone who has
+/// played the game would name for those spells, arrived at by following two
+/// table columns. It is the same evidence that identified
+/// [`dbc::schema::SpellVisualKitRow::anim`] in the first place, one level up.
+///
+/// The **impact** kit is deliberately not read. Its animations are
+/// `CombatCritical`, `CombatWound` and `Knockdown` -- the *victim's* flinch,
+/// not the caster's gesture -- so playing it on the caster would make a mage
+/// recoil from their own fireball. The **channel** kit is transcribed and
+/// unused for a different reason: nothing here parses a channel start, so
+/// there is no event to hang it on.
+#[derive(Default)]
+pub struct CastAnimations {
+    /// Spell id to `(wind-up head, release head)`, stored as animation ids
+    /// rather than as resolved chains: 17,837 spells name a release and a
+    /// chain is twelve times the size of the number it starts from. The
+    /// chains are built from [`Self::chains`] on demand, which is a hash
+    /// lookup and at most a dozen array writes.
+    heads: HashMap<u32, (Option<u16>, Option<u16>)>,
+    /// Every head that appears above, already walked down `AnimationData`'s
+    /// fallback column. A few hundred entries against tens of thousands of
+    /// spells, because the same handful of gestures serve the whole game.
+    chains: HashMap<u16, crate::world::Cycle>,
+}
+
+impl CastAnimations {
+    /// The pose to hold while a cast of this spell winds up.
+    pub fn wind_up(&self, spell: u32) -> Option<crate::world::Cycle> {
+        let (head, _) = self.heads.get(&spell)?;
+        self.chains.get(&(*head)?).copied()
+    }
+
+    /// The gesture to play once when a cast of this spell lands.
+    pub fn release(&self, spell: u32) -> Option<crate::world::Cycle> {
+        let (_, head) = self.heads.get(&spell)?;
+        self.chains.get(&(*head)?).copied()
+    }
+
+    /// How many spells resolved to at least one animation. For the log line
+    /// that says whether this table loaded at all.
+    pub fn len(&self) -> usize {
+        self.heads.len()
+    }
+
+    /// Turns what a unit is doing about a spell into the pose to draw.
+    ///
+    /// One function rather than two lookups at each call site, because the
+    /// *precedence* between the two is a decision and it should be made once:
+    /// a cast in flight is a fact about now and a cast that landed is a fact
+    /// about a moment ago, so the first wins whenever both are true -- which
+    /// they routinely are, since the landing of the previous cast outlives
+    /// the start of the next one.
+    ///
+    /// Falling back from an absent wind-up to the release is deliberate too.
+    /// 15,920 spells name a precast animation and 17,837 name a casting one,
+    /// and only 10,460 name both, so a spell with a cast bar and no wind-up
+    /// is common -- and holding its release gesture for the length of the
+    /// bar is a better picture than standing at ease through it.
+    pub fn pose(
+        &self,
+        casting: Option<u32>,
+        landed: Option<(u32, u32)>,
+    ) -> Option<crate::world::SpellPose> {
+        use crate::world::SpellPose;
+
+        if let Some(spell) = casting {
+            if let Some(cycle) = self.wind_up(spell).or_else(|| self.release(spell)) {
+                return Some(SpellPose::WindUp(cycle));
+            }
+        }
+        let (age, spell) = landed?;
+        Some(SpellPose::Released(age, self.release(spell)?))
+    }
+
+    /// The same table for a caller that has no `Spell.dbc` parsed already --
+    /// the headless render path.
+    ///
+    /// It costs a 60MB read that a screenshot has no other use for, and it is
+    /// worth it: the alternative is a `--screenshot` that silently draws
+    /// every caster standing at ease while the window draws them casting,
+    /// which is the wrong kind of evidence about the window. Same reasoning
+    /// as that path already loading `Item.dbc` so people are dressed the same
+    /// way in both.
+    pub fn read(chain: &mut Chain) -> Self {
+        match chain
+            .read(dbc::schema::Spell::PATH)
+            .ok()
+            .and_then(|bytes| dbc::schema::Spell::parse(&bytes).ok())
+        {
+            Some(spells) => Self::load(chain, &spells),
+            None => Self::default(),
+        }
+    }
+
+    /// Reads `Spell` → `SpellVisual` → `SpellVisualKit` → `AnimationData`.
+    ///
+    /// Takes the already-parsed `Spell` table rather than reading it again:
+    /// it is 60MB and 185ms, and [`Spellbook::load`] is already holding one.
+    ///
+    /// Degrades to empty like every other lookup here -- a client with no
+    /// installation draws no casts rather than failing to start.
+    fn load(chain: &mut Chain, spells: &dbc::schema::Spell) -> Self {
+        use dbc::schema::{AnimationData, SpellVisual, SpellVisualKit};
+
+        let mut table = CastAnimations::default();
+        let Some(visuals) = chain
+            .read(SpellVisual::PATH)
+            .ok()
+            .and_then(|bytes| SpellVisual::parse(&bytes).ok())
+        else {
+            return table;
+        };
+        let Some(kits) = chain
+            .read(SpellVisualKit::PATH)
+            .ok()
+            .and_then(|bytes| SpellVisualKit::parse(&bytes).ok())
+        else {
+            return table;
+        };
+        // The fallback column, which is what turns one animation id into a
+        // chain a model without it can still follow.
+        let fallback: HashMap<u16, u16> = chain
+            .read(AnimationData::PATH)
+            .ok()
+            .and_then(|bytes| AnimationData::parse(&bytes).ok())
+            .map(|animations| {
+                animations
+                    .iter()
+                    .filter_map(|row| {
+                        Some((u16::try_from(row.id()).ok()?, u16::try_from(row.fallback()).ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let kit_animation: HashMap<u32, u16> = kits
+            .iter()
+            .filter_map(|row| Some((row.id(), row.animation()?)))
+            .collect();
+        // Spell visual to the pair of animations its two useful kits name.
+        let by_visual: HashMap<u32, (Option<u16>, Option<u16>)> = visuals
+            .iter()
+            .filter_map(|row| {
+                let wind_up = kit_animation.get(&row.precast_kit()).copied();
+                let release = kit_animation.get(&row.casting_kit()).copied();
+                (wind_up.is_some() || release.is_some()).then(|| (row.id(), (wind_up, release)))
+            })
+            .collect();
+
+        for row in spells.iter() {
+            if let Some(pair) = by_visual.get(&row.spell_visual()) {
+                table.heads.insert(row.id(), *pair);
+            }
+        }
+        for (wind_up, release) in table.heads.values() {
+            for head in [wind_up, release].into_iter().flatten() {
+                table
+                    .chains
+                    .entry(*head)
+                    .or_insert_with(|| crate::world::Cycle::chain_from(*head, &fallback));
+            }
+        }
+        table
+    }
+}
+
 /// Names, icons and the GPU textures they turned into.
 #[derive(Default)]
 pub struct Spellbook {
@@ -103,6 +285,9 @@ pub struct Spellbook {
     cooldowns: HashMap<u32, u32>,
     /// Whether a game installation was available at all.
     pub have_data: bool,
+    /// What a cast looks like, for every spell rather than only the known
+    /// ones -- see [`CastAnimations`].
+    pub cast_animations: CastAnimations,
 }
 
 impl Spellbook {
@@ -129,6 +314,10 @@ impl Spellbook {
         };
         book.have_data = true;
         tracing::debug!("Spell.dbc read in {:?}", started.elapsed());
+        // Before the `wanted` filter below, and over every row rather than a
+        // few dozen: a creature casting at the player is not in this
+        // character's spellbook and still has to move.
+        book.cast_animations = CastAnimations::load(chain, &spells);
 
         // The two index tables a description's `$d` and `$a1` resolve
         // through. Both are tiny -- 130 and 58 rows -- and both are optional:
@@ -249,11 +438,13 @@ impl Spellbook {
         }
 
         tracing::info!(
-            "spell data loaded in {:?}: {} of {} spells named, {} with icons",
+            "spell data loaded in {:?}: {} of {} spells named, {} with icons, \
+             {} with a cast animation",
             started.elapsed(),
             book.known.len(),
             wanted.len(),
-            book.known.values().filter(|s| s.icon_path.is_some()).count()
+            book.known.values().filter(|s| s.icon_path.is_some()).count(),
+            book.cast_animations.len()
         );
         book
     }
@@ -644,5 +835,90 @@ mod tests {
         assert_eq!(book.cooldown_ms(100), 15_000, "Charge's real 15s cooldown");
         assert_eq!(book.cooldown_ms(78), 0, "Heroic Strike is GCD-only");
         assert_eq!(book.cooldown_ms(6673), 0, "Battle Shout has no cooldown");
+    }
+
+    /// **Spells everybody can picture, posed by following two columns.**
+    ///
+    /// This is the evidence that `SpellVisualKit`'s column 2 is the animation
+    /// and that the two `SpellVisual` slots are the moments they are labelled
+    /// as. Validity could not have shown it -- `AnimationData` is 506 rows
+    /// numbered 0..505 and three other columns in the same table resolve just
+    /// as often -- so what is asserted is the *identity* of the animation
+    /// each named spell reaches, which nothing but the right column produces:
+    ///
+    /// * the three iconic ranged nukes wind up in `ReadySpellDirected` and
+    ///   release in `SpellCastDirected`;
+    /// * `Sinister Strike` releases in `Attack1H` -- it *is* a weapon swing;
+    /// * `Eviscerate` and `Heroic Strike` release in `Special1H`.
+    ///
+    /// A column of coincidentally-valid small integers does not name the
+    /// gesture a player would name for six spells in a row.
+    #[test]
+    fn a_spells_cast_animation_is_the_one_anybody_would_name() {
+        let mut chain = match chain() {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping: WOW_DATA not set");
+                return;
+            }
+        };
+
+        // `AnimationData` ids, from the table.
+        const READY_SPELL_DIRECTED: u16 = 51;
+        const SPELL_CAST_DIRECTED: u16 = 53;
+        const ATTACK_1H: u16 = 17;
+        const SPECIAL_1H: u16 = 57;
+        const STAND: u16 = 0;
+
+        let casts = CastAnimations::read(&mut chain);
+        for (spell, what) in [(133, "Fireball"), (116, "Frostbolt"), (686, "Shadow Bolt")] {
+            assert_eq!(
+                casts.wind_up(spell).as_deref().and_then(|c| c.first().copied()),
+                Some(READY_SPELL_DIRECTED),
+                "{what} should wind up in the directed ready pose"
+            );
+            assert_eq!(
+                casts.release(spell).as_deref().and_then(|c| c.first().copied()),
+                Some(SPELL_CAST_DIRECTED),
+                "{what} should release in the directed cast"
+            );
+        }
+        assert_eq!(
+            casts.release(1752).as_deref().and_then(|c| c.first().copied()),
+            Some(ATTACK_1H),
+            "Sinister Strike is a weapon swing and animates as one"
+        );
+        for (spell, what) in [(2098, "Eviscerate"), (78, "Heroic Strike")] {
+            assert_eq!(
+                casts.release(spell).as_deref().and_then(|c| c.first().copied()),
+                Some(SPECIAL_1H),
+                "{what} should release in the one-handed special"
+            );
+        }
+
+        // Every chain ends somewhere a model without the gesture can go --
+        // the wolf case. Without it a casting creature draws its bind pose.
+        for spell in [133, 116, 686, 1752, 2098, 78] {
+            for chain in [casts.wind_up(spell), casts.release(spell)].into_iter().flatten() {
+                assert_eq!(chain.last(), Some(&STAND), "spell {spell} can resolve to nothing");
+            }
+        }
+
+        // And the pose that gets *drawn*, which is where the two moments are
+        // told apart: mid-cast is the wind-up even though a release for the
+        // same spell exists, and a landed cast an instant later is not.
+        let pose = casts.pose(Some(133), None).expect("Fireball has a pose");
+        assert!(
+            matches!(pose, crate::world::SpellPose::WindUp(c) if c.first() == Some(&READY_SPELL_DIRECTED))
+        );
+        let landed = casts.pose(None, Some((100, 133))).expect("a landed Fireball");
+        assert!(
+            matches!(landed, crate::world::SpellPose::Released(100, c)
+                if c.first() == Some(&SPELL_CAST_DIRECTED))
+        );
+        // A spell with no visual at all poses nobody, rather than posing them
+        // at animation zero -- `Stand` is a real id and `0` in this column
+        // means "none", which is exactly the confusion `animation()` folds.
+        assert!(casts.pose(Some(5019), None).is_none(), "`Shoot` names no visual");
     }
 }

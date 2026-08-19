@@ -24,6 +24,8 @@ use mpq::Chain;
 use render::mesh::{BoneBuffer, Instance, InstanceBuffer, MeshRenderer};
 use render::{Gpu, TerrainRenderer, UploadedTexture};
 
+use ::world::combat::Hand;
+
 use crate::character::Stance;
 use crate::model::Draw;
 use crate::scene::{object_rotation, placement_position, placement_rotation};
@@ -425,8 +427,15 @@ pub struct EntityPlacement {
     /// `None` for a corpse that was already lying there when it came into
     /// view -- which must start settled rather than topple over again.
     pub died_ms_ago: Option<u32>,
-    /// How long ago it last swung at something.
-    pub swung_ms_ago: Option<u32>,
+    /// How long ago it last swung at something, and with which hand -- a
+    /// dual-wielder's two weapons swing on their own timers and play
+    /// different cycles.
+    pub swung_ms_ago: Option<(u32, Hand)>,
+    /// What this unit is doing about a spell, already resolved to the
+    /// animation chain it should play. `None` for the overwhelming majority
+    /// of units at any instant, and for every spell whose `SpellVisual`
+    /// names no animation.
+    pub spell: Option<SpellPose>,
     /// Whether it is in a melee, on either side. Holds the guard up between
     /// swings instead of dropping back to the town idle.
     pub fighting: bool,
@@ -1248,6 +1257,7 @@ impl World {
                             placement.stance
                         },
                     sheathing,
+                    placement.spell,
                 ),
                 key,
             );
@@ -1547,7 +1557,9 @@ impl World {
                 // unit died, which is why every settled corpse of a display
                 // can share one bucket.
                 duration - 1
-            } else if plays_once(played) {
+            } else if plays_once(played)
+                || (matches!(motion, Motion::CastRelease(..)) && !always_loops(played))
+            {
                 match motion.started_at() {
                     Some(started) => now_ms.saturating_sub(started).min(duration - 1),
                     // A play-once cycle with nothing to time it from: hold the
@@ -2024,6 +2036,17 @@ const ATTACK_1H_ANIMATION_ID: u16 = 17;
 /// `Attack2H`, whose own fallback in the table is `Attack1H`.
 const ATTACK_2H_ANIMATION_ID: u16 = 18;
 const ATTACK_UNARMED_ANIMATION_ID: u16 = 16;
+/// The *other* hand swinging. `AttackOff` (87), whose own fallback column
+/// reads `AttackOffPierce` (88) → `AttackUnarmed` (16) → `Stand` (0).
+///
+/// A dual-wielding character swings two weapons on two independent timers,
+/// and before this every one of those swings drew the main-hand cycle -- so
+/// a rogue with a dagger in each hand stabbed with the right hand twice as
+/// often as the fight actually called for and never used the left at all.
+/// Which swings are which is not guesswork: `SMSG_ATTACKERSTATEUPDATE`
+/// carries it in `hit_info`, see [`world::combat::hit_info::OFF_HAND`].
+const ATTACK_OFF_ANIMATION_ID: u16 = 87;
+const ATTACK_OFF_PIERCE_ANIMATION_ID: u16 = 88;
 /// Standing *in* a fight, between swings: weapon up, guard raised. `Ready1H`
 /// (26) falls back to `ReadyUnarmed` (25), again per the table's own column.
 ///
@@ -2037,11 +2060,25 @@ const READY_1H_ANIMATION_ID: u16 = 26;
 const READY_2H_ANIMATION_ID: u16 = 27;
 const READY_UNARMED_ANIMATION_ID: u16 = 25;
 /// The hand travelling to or from a weapon's resting place. `AnimationData`
-/// rows 32 and 65, confirmed against `wow-cli m2 anims` on the human male
-/// rather than assumed from the row numbers alone: both list at 1000ms,
-/// named `Sheath` and `HipSheath` respectively.
-const SHEATH_ANIMATION_ID: u16 = 32;
-const HIP_SHEATH_ANIMATION_ID: u16 = 65;
+/// rows **89 and 90**, `Sheath` and `HipSheath`.
+///
+/// **These were 32 and 65, which are the human male's *sequence indices* for
+/// those two cycles** -- read out of a `wow-cli m2 anims` listing, whose first
+/// column is a position in the model rather than an animation id. The comment
+/// warning against exactly that mistake is eleven lines above, on `Jump` and
+/// `Fall`, and this walked into it anyway.
+///
+/// It is worth recording what the two wrong numbers actually did, because
+/// neither errored and only one of them did nothing. Id 32 is `SpellCast`,
+/// which no character model carries at all, so stowing a weapon on the back
+/// fell through to `Stand` -- the transition simply never played. Id 65 is
+/// `EmoteTalkQuestion`, which the human male *does* carry (sequence 55, 1800ms,
+/// in an external `.anim`), so stowing a one-hander played a character asking
+/// a question with its hands for nearly two seconds. Both read as "the sheath
+/// animation is a bit underwhelming" rather than as a wrong row, which is the
+/// whole reason [`animation_constants_name_the_rows_they_claim`] now exists.
+const SHEATH_ANIMATION_ID: u16 = 89;
+const HIP_SHEATH_ANIMATION_ID: u16 = 90;
 
 /// How long any one-shot cycle is allowed to run before the unit is treated as
 /// settled.
@@ -2071,6 +2108,16 @@ const ATTACK_CEILING_MS: u32 = 1_500;
 /// hand on its follow-through for noticeably longer than the motion itself.
 const SHEATH_CEILING_MS: u32 = 1_500;
 
+/// And the same again for a cast's follow-through.
+///
+/// The cast animations are 1000ms on the human male (`SpellCastOmni` and
+/// `SpellCastDirected` both), and unlike a swing there is no auto-repeat to
+/// snap the pose back to the start -- an instant ability used once and then
+/// not again would hold its last frame for as long as this allows. Kept
+/// tighter than the attack ceiling for that reason: the failure here is a
+/// character stuck mid-flourish, not a cycle cut short.
+const CAST_CEILING_MS: u32 = 1_200;
+
 /// How coarsely a one-shot's start time is bucketed.
 ///
 /// **This is not an optimisation, it is the difference between the animation
@@ -2090,6 +2137,89 @@ const ONE_SHOT_BUCKET_MS: u32 = 100;
 /// Rounds a one-shot's start time to its bucket. See [`ONE_SHOT_BUCKET_MS`].
 fn bucket(at_ms: u32) -> u32 {
     at_ms / ONE_SHOT_BUCKET_MS * ONE_SHOT_BUCKET_MS
+}
+
+/// The animation ids a motion tries, in order, ending somewhere every model
+/// can go.
+///
+/// **This was a `&'static [u16]` and could not stay one.** Every cycle here
+/// used to be nameable in the enum -- walking, dying, swinging -- so the chain
+/// could be written as a literal. A *cast* cannot be: which animation a spell
+/// plays is data, named by `SpellVisualKit` and chained by `AnimationData`'s
+/// own fallback column, and there are 17,837 spells with one. So the chain
+/// travels by value.
+///
+/// It is `Copy`, `Eq` and `Hash` because it rides inside [`Motion`], which is
+/// a cache key -- and that is sound rather than merely convenient: a chain is
+/// entirely determined by its head, so two motions with the same head can
+/// never carry different tails and the extra bytes in the key partition
+/// nothing new.
+///
+/// [`Self::MAX`] is twelve because the deepest chain in `AnimationData` is
+/// eleven (`FlySpellCastDirected`, whose tail wanders through
+/// `FlyClose`/`FlyOpen` -- and *those two name each other*, so anything
+/// walking this column needs a cycle guard as well as a length cap; see
+/// [`Cycle::chain_from`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Cycle {
+    ids: [u16; Cycle::MAX],
+    len: u8,
+}
+
+impl Cycle {
+    pub const MAX: usize = 12;
+
+    /// The chain, in the order it should be tried.
+    ///
+    /// Longer input is truncated *and said so*, rather than silently: a
+    /// truncated chain still draws something plausible, which is exactly the
+    /// failure mode this whole file keeps running into.
+    pub fn of(ids: &[u16]) -> Self {
+        let mut cycle = Cycle::default();
+        if ids.len() > Self::MAX {
+            tracing::warn!(
+                "animation chain {ids:?} is longer than {} and was cut short",
+                Self::MAX
+            );
+        }
+        for (slot, id) in cycle.ids.iter_mut().zip(ids) {
+            *slot = *id;
+            cycle.len += 1;
+        }
+        cycle
+    }
+
+    /// Walks `AnimationData`'s own `fallback` column from `head` down to
+    /// `Stand`, which every model has.
+    ///
+    /// `fallback` maps an id to the one to try instead. Two properties of
+    /// that column make the walk less trivial than it looks: `Stand`'s own
+    /// fallback is *not* zero (it names 147, `Stand` again by another name),
+    /// so the walk stops **at** `Stand` rather than following it; and
+    /// `FlyClose` and `FlyOpen` name each other, so a chain can loop. Both
+    /// are guarded, and the chain always ends at `Stand` whether or not the
+    /// table got there.
+    pub fn chain_from(head: u16, fallback: &HashMap<u16, u16>) -> Self {
+        let mut ids = Vec::with_capacity(Self::MAX);
+        let mut at = head;
+        while ids.len() < Self::MAX - 1 && at != STAND_ANIMATION_ID && !ids.contains(&at) {
+            ids.push(at);
+            match fallback.get(&at) {
+                Some(&next) => at = next,
+                None => break,
+            }
+        }
+        ids.push(STAND_ANIMATION_ID);
+        Cycle::of(&ids)
+    }
+}
+
+impl std::ops::Deref for Cycle {
+    type Target = [u16];
+
+    fn deref(&self) -> &[u16] {
+        &self.ids[..self.len as usize]
+    }
 }
 
 /// Which cycle a replicated entity should be playing.
@@ -2161,8 +2291,33 @@ pub enum Motion {
     Dying(u32),
     /// Settled: lying still, and no longer tied to when death happened.
     Dead,
-    /// Mid-swing, from the world-clock millisecond the blow landed.
-    Attacking(u32, Stance),
+    /// Mid-swing, from the world-clock millisecond the blow landed, and with
+    /// which hand -- see [`Hand`].
+    Attacking(u32, Stance, Hand),
+    /// Winding up a cast: the pose held for as long as the cast bar runs.
+    ///
+    /// Carries the chain rather than a spell id because that is what the
+    /// renderer needs and because it is what keeps the *cache* honest: two
+    /// characters casting different spells that pose the body identically
+    /// share a bucket, and two casting the same spell in different forms do
+    /// not. The chain comes from `SpellVisual`'s **precast** kit -- the
+    /// moment whose animations are named `ReadySpellOmni` and
+    /// `ReadySpellDirected`.
+    ///
+    /// A state rather than an event, and unlike every other one-shot here it
+    /// carries no start time: it is true exactly while the server says a cast
+    /// is in flight, which is a replicated fact rather than something this
+    /// client watched happen once. Same distinction as `UNIT_FIELD_TARGET`
+    /// against `SMSG_MONSTER_MOVE`'s facing block.
+    Casting(Cycle),
+    /// A cast landing, from the world-clock millisecond it did.
+    ///
+    /// `SpellVisual`'s **casting** kit -- `SpellCastOmni`, `SpellCastDirected`,
+    /// and for a melee ability the swing it actually looks like (`Attack1H`
+    /// for Sinister Strike, `Special1H` for Eviscerate). This is the only
+    /// cast animation an *instant* spell ever gets, and instants are most of
+    /// what a melee character casts, so it is the more visible half.
+    CastRelease(u32, Cycle),
     /// Weapon out: guard up rather than at ease. Held for as long as the
     /// weapon is drawn, not only during a fight -- a character standing in
     /// town with a greatsword in hand still grips it with both hands.
@@ -2190,6 +2345,21 @@ pub enum RestKind {
     Back,
     /// `HipSheath` -- a one-hander, at the belt.
     Hip,
+}
+
+/// What a unit is doing about a spell right now, already resolved to the
+/// animation it should play.
+///
+/// The chains are resolved by the caller rather than here because this module
+/// has no game data: which animation a spell poses is
+/// `SpellVisualKit`'s business, and the placement builder is where the
+/// spellbook lives. See [`crate::spells::CastAnimations`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum SpellPose {
+    /// A cast is in flight, and this is the wind-up to hold while it runs.
+    WindUp(Cycle),
+    /// A cast landed this many milliseconds ago.
+    Released(u32, Cycle),
 }
 
 /// Which way a character is sidestepping.
@@ -2316,11 +2486,12 @@ impl Motion {
         swimming: bool,
         dead: bool,
         died_ms_ago: Option<u32>,
-        swung_ms_ago: Option<u32>,
+        swung_ms_ago: Option<(u32, Hand)>,
         fighting: bool,
         now_ms: u32,
         stance: Stance,
         sheathing: Option<(u32, RestKind)>,
+        spell: Option<SpellPose>,
     ) -> Self {
         if dead {
             return match died_ms_ago {
@@ -2350,9 +2521,30 @@ impl Motion {
         }
         let moving = Motion::from_pace(speed, lateral);
         if moving == Motion::Stand {
-            if let Some(age) = swung_ms_ago {
+            // **A cast outranks a swing, and the wind-up outranks the
+            // release.** A character casting is auto-attacking at the same
+            // time on most of these fights, so the two states are routinely
+            // both true and the order decides which one is ever seen. A cast
+            // is the deliberate act and the swing is the automatic one, which
+            // is the same reason a run outranks a swing two rules up.
+            //
+            // Wind-up first because it is a *state* and the release is an
+            // *event*: while the server says a cast is in flight, that is
+            // true right now, where "a cast landed 400ms ago" is a statement
+            // about the past that a new cast has already superseded. The
+            // reverse order lets the previous cast's follow-through eat the
+            // next one's wind-up, which reads as casting working only every
+            // other time.
+            match spell {
+                Some(SpellPose::WindUp(cycle)) => return Motion::Casting(cycle),
+                Some(SpellPose::Released(age, cycle)) if age < CAST_CEILING_MS => {
+                    return Motion::CastRelease(bucket(now_ms.saturating_sub(age)), cycle)
+                }
+                _ => {}
+            }
+            if let Some((age, hand)) = swung_ms_ago {
                 if age < ATTACK_CEILING_MS {
-                    return Motion::Attacking(bucket(now_ms.saturating_sub(age)), stance);
+                    return Motion::Attacking(bucket(now_ms.saturating_sub(age)), stance, hand);
                 }
             }
             // **Below a swing, above the ready/at-ease fallback.** A swing
@@ -2394,7 +2586,14 @@ impl Motion {
     /// When a one-shot cycle began, on the caller's world clock.
     fn started_at(self) -> Option<u32> {
         match self {
-            Motion::Dying(at) | Motion::Attacking(at, _) | Motion::Sheathing(at, _) => Some(at),
+            Motion::Dying(at)
+            | Motion::Attacking(at, _, _)
+            | Motion::Sheathing(at, _)
+            | Motion::CastRelease(at, _) => Some(at),
+            // **`Casting` is deliberately absent.** It is held for as long as
+            // the cast bar runs rather than played once from a stamp, so it
+            // has nothing to time from -- and giving it one would rebuild the
+            // bone buffer every time a second caster started.
             _ => None,
         }
     }
@@ -2406,8 +2605,15 @@ impl Motion {
     /// as standing: a model with neither travelling cycle has nothing sensible
     /// to play while it moves, and drawing it standing still as it slides along
     /// is the "every creature walks on the spot" bug from the other direction.
-    fn animation_ids(self) -> &'static [u16] {
-        match self {
+    ///
+    /// The cast cycles are the exception to every sentence above: their chain
+    /// is data rather than a literal, so it arrives already built and is
+    /// handed straight back. See [`Cycle`].
+    fn animation_ids(self) -> Cycle {
+        if let Motion::Casting(cycle) | Motion::CastRelease(_, cycle) = self {
+            return cycle;
+        }
+        let ids: &'static [u16] = match self {
             Motion::Stand => &[STAND_ANIMATION_ID],
             Motion::Walk => &[WALK_ANIMATION_ID],
             Motion::Run => &[RUN_ANIMATION_ID, WALK_ANIMATION_ID],
@@ -2470,13 +2676,25 @@ impl Motion {
             // has `AttackUnarmed` and `Death` and **no ready stance at all**,
             // so without it a wolf entering combat resolves to no sequence and
             // draws its bind pose, stiff and T-posed.
-            Motion::Attacking(_, Stance::TwoHand) => &[
+            // **The off hand outranks the grip**, and it has to: a
+            // dual-wielder is by definition holding two one-handers, so
+            // `Stance::TwoHand` and `Hand::Off` cannot both be true and there
+            // is nothing to arbitrate. The chain is again the table's own --
+            // `AttackOff` (87) names `AttackOffPierce` (88), which names
+            // `AttackUnarmed` (16), which names `Stand`.
+            Motion::Attacking(_, _, Hand::Off) => &[
+                ATTACK_OFF_ANIMATION_ID,
+                ATTACK_OFF_PIERCE_ANIMATION_ID,
+                ATTACK_UNARMED_ANIMATION_ID,
+                STAND_ANIMATION_ID,
+            ],
+            Motion::Attacking(_, Stance::TwoHand, _) => &[
                 ATTACK_2H_ANIMATION_ID,
                 ATTACK_1H_ANIMATION_ID,
                 ATTACK_UNARMED_ANIMATION_ID,
                 STAND_ANIMATION_ID,
             ],
-            Motion::Attacking(_, _) => &[
+            Motion::Attacking(..) => &[
                 ATTACK_1H_ANIMATION_ID,
                 ATTACK_UNARMED_ANIMATION_ID,
                 STAND_ANIMATION_ID,
@@ -2499,7 +2717,12 @@ impl Motion {
             // changes what the animation means, not just what plays.
             Motion::Sheathing(_, RestKind::Back) => &[SHEATH_ANIMATION_ID, STAND_ANIMATION_ID],
             Motion::Sheathing(_, RestKind::Hip) => &[HIP_SHEATH_ANIMATION_ID, STAND_ANIMATION_ID],
-        }
+            // Returned above, where the chain they carry is handed straight
+            // back. Unreachable rather than empty, but an empty chain is the
+            // honest thing to write here: there is no literal to give.
+            Motion::Casting(_) | Motion::CastRelease(..) => &[],
+        };
+        Cycle::of(ids)
     }
 }
 
@@ -2518,8 +2741,46 @@ fn plays_once(animation_id: u16) -> bool {
             | ATTACK_1H_ANIMATION_ID
             | ATTACK_2H_ANIMATION_ID
             | ATTACK_UNARMED_ANIMATION_ID
+            | ATTACK_OFF_ANIMATION_ID
+            | ATTACK_OFF_PIERCE_ANIMATION_ID
             | SHEATH_ANIMATION_ID
             | HIP_SHEATH_ANIMATION_ID
+    )
+}
+
+/// Whether a cycle repeats until something else happens.
+///
+/// The mirror of [`plays_once`], and it exists because a **cast** cannot use
+/// that list. A spell's animation is whatever `SpellVisualKit` names -- 17,837
+/// spells name one, between them reaching `SpellCastOmni`, `Attack1H`,
+/// `Special1H`, `BattleRoar` and dozens more -- so "is this id in the
+/// hardcoded set of one-shots" is a question that cannot be asked about it.
+///
+/// What *can* be asked is the other way round: the looping cycles are the
+/// small, closed, known set, because they are exactly the ones this client
+/// resolves by name. Anything a `SpellVisual` names is a gesture, and a
+/// gesture held on its last frame is a pose while a gesture looped is a tic.
+///
+/// This keeps the rule the original was built on -- decide from the animation
+/// that **resolved**, not from the motion that asked -- which is what lets a
+/// cast falling back to `Stand` on a model with no cast cycle still loop
+/// rather than freeze. That fallback is not hypothetical: `AnimationData`
+/// chains every cast animation down to `Stand`, and a wolf has none of them.
+fn always_loops(animation_id: u16) -> bool {
+    matches!(
+        animation_id,
+        STAND_ANIMATION_ID
+            | WALK_ANIMATION_ID
+            | RUN_ANIMATION_ID
+            | WALK_BACK_ANIMATION_ID
+            | SHUFFLE_LEFT_ANIMATION_ID
+            | SHUFFLE_RIGHT_ANIMATION_ID
+            | SWIM_IDLE_ANIMATION_ID
+            | SWIM_ANIMATION_ID
+            | SWIM_BACK_ANIMATION_ID
+            | READY_1H_ANIMATION_ID
+            | READY_2H_ANIMATION_ID
+            | READY_UNARMED_ANIMATION_ID
     )
 }
 
@@ -2873,18 +3134,18 @@ mod tests {
     fn a_drawn_weapon_is_enough_to_hold_the_guard() {
         // Not fighting, standing still, weapon out.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::TwoHand, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::TwoHand, None, None),
             Motion::Ready(Stance::TwoHand),
         );
         // And with nothing drawn it still relaxes, which is the half that
         // stops this from simply making everyone stand guard forever.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::Unarmed, None, None),
             Motion::Stand,
         );
         // Moving still outranks it: a character runs, weapon or no weapon.
         assert_eq!(
-            Motion::resolve(7.0, 0.0, false, false, false, None, None, false, 4_000, Stance::TwoHand, None),
+            Motion::resolve(7.0, 0.0, false, false, false, None, None, false, 4_000, Stance::TwoHand, None, None),
             Motion::Run,
         );
     }
@@ -2900,32 +3161,32 @@ mod tests {
     #[test]
     fn swimming_sits_between_airborne_and_the_ground_cycles() {
         let swim = |speed: f32| {
-            Motion::resolve(speed, 0.0, false, true, false, None, None, false, 4_000, Stance::Unarmed, None)
+            Motion::resolve(speed, 0.0, false, true, false, None, None, false, 4_000, Stance::Unarmed, None, None)
         };
         // It beats running, standing and a drawn weapon's guard.
         assert_eq!(swim(7.0), Motion::Swim(Pace::Forward));
         assert_eq!(swim(0.0), Motion::Swim(Pace::Still));
         assert_eq!(swim(-2.5), Motion::Swim(Pace::Backward));
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, true, false, None, None, true, 4_000, Stance::TwoHand, None),
+            Motion::resolve(0.0, 0.0, false, true, false, None, None, true, 4_000, Stance::TwoHand, None, None),
             Motion::Swim(Pace::Still),
             "a swimmer does not hold a guard"
         );
         // A sidestep in water is carried by the forward stroke, not by a
         // shuffle: the turning input must not reach `from_pace`.
         assert_eq!(
-            Motion::resolve(0.0, 1.0, false, true, false, None, None, false, 4_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 1.0, false, true, false, None, None, false, 4_000, Stance::Unarmed, None, None),
             Motion::Swim(Pace::Still),
         );
 
         // And it loses to the two things above it.
         assert_eq!(
-            Motion::resolve(7.0, 0.0, true, true, false, None, None, false, 4_000, Stance::Unarmed, None),
+            Motion::resolve(7.0, 0.0, true, true, false, None, None, false, 4_000, Stance::Unarmed, None, None),
             Motion::Airborne,
             "a jump still in flight outranks the water it is heading for"
         );
         assert_eq!(
-            Motion::resolve(7.0, 0.0, false, true, true, None, None, false, 4_000, Stance::Unarmed, None),
+            Motion::resolve(7.0, 0.0, false, true, true, None, None, false, 4_000, Stance::Unarmed, None, None),
             Motion::Dead,
             "a drowned corpse does not keep swimming"
         );
@@ -2955,7 +3216,7 @@ mod tests {
     fn the_two_handed_stance_prefers_its_own_cycles() {
         let ready = Motion::Ready(Stance::TwoHand).animation_ids();
         assert_eq!(ready.first(), Some(&READY_2H_ANIMATION_ID));
-        let swing = Motion::Attacking(0, Stance::TwoHand).animation_ids();
+        let swing = Motion::Attacking(0, Stance::TwoHand, Hand::Main).animation_ids();
         assert_eq!(swing.first(), Some(&ATTACK_2H_ANIMATION_ID));
 
         // A one-handed character must not get them, or every dagger is held
@@ -2964,12 +3225,12 @@ mod tests {
         assert!(!Motion::Ready(Stance::OneHand)
             .animation_ids()
             .contains(&READY_2H_ANIMATION_ID));
-        assert!(!Motion::Attacking(0, Stance::OneHand)
+        assert!(!Motion::Attacking(0, Stance::OneHand, Hand::Main)
             .animation_ids()
             .contains(&ATTACK_2H_ANIMATION_ID));
 
         for stance in [Stance::Unarmed, Stance::OneHand, Stance::TwoHand] {
-            for motion in [Motion::Ready(stance), Motion::Attacking(0, stance)] {
+            for motion in [Motion::Ready(stance), Motion::Attacking(0, stance, Hand::Main)] {
                 assert_eq!(
                     motion.animation_ids().last(),
                     Some(&STAND_ANIMATION_ID),
@@ -2991,6 +3252,75 @@ mod tests {
         assert!(!plays_once(READY_2H_ANIMATION_ID));
     }
 
+    /// **The off hand swings its own arm**, and the main-hand chain must not
+    /// contain that cycle -- the half a "prefers `AttackOff`" assertion alone
+    /// would pass without, and the half that was actually broken: every swing
+    /// a dual-wielder made drew the main-hand cycle.
+    ///
+    /// The chain itself is `AnimationData`'s own fallback column, walked in
+    /// the table: 87 names 88, which names 16, which names 0.
+    #[test]
+    fn the_off_hand_swings_the_other_arm() {
+        let off = Motion::Attacking(0, Stance::OneHand, Hand::Off).animation_ids();
+        assert_eq!(off.first(), Some(&ATTACK_OFF_ANIMATION_ID));
+        assert_eq!(
+            &*off,
+            &[
+                ATTACK_OFF_ANIMATION_ID,
+                ATTACK_OFF_PIERCE_ANIMATION_ID,
+                ATTACK_UNARMED_ANIMATION_ID,
+                STAND_ANIMATION_ID
+            ]
+        );
+
+        for stance in [Stance::Unarmed, Stance::OneHand, Stance::TwoHand] {
+            let main = Motion::Attacking(0, stance, Hand::Main).animation_ids();
+            assert!(
+                !main.contains(&ATTACK_OFF_ANIMATION_ID),
+                "{stance:?} in the main hand reached for the off-hand cycle"
+            );
+        }
+        // A dual-wielder cannot be holding a two-hander, so there is nothing
+        // to arbitrate -- but the arm that decides has to be the *hand*, or
+        // the rule silently depends on a combination that cannot happen.
+        assert_eq!(
+            Motion::Attacking(0, Stance::TwoHand, Hand::Off)
+                .animation_ids()
+                .first(),
+            Some(&ATTACK_OFF_ANIMATION_ID)
+        );
+    }
+
+    /// And the hand travels all the way from the wire: a swing's `hit_info`
+    /// decides it, not what the attacker has equipped.
+    #[test]
+    fn the_wire_decides_which_hand_swung() {
+        let swing = |hand| {
+            Motion::resolve(
+                0.0,
+                0.0,
+                false,
+                false,
+                false,
+                None,
+                Some((50, hand)),
+                true,
+                4_000,
+                Stance::OneHand,
+                None,
+                None,
+            )
+        };
+        assert_eq!(swing(Hand::Off), Motion::Attacking(3_900, Stance::OneHand, Hand::Off));
+        assert_eq!(
+            swing(Hand::Main),
+            Motion::Attacking(3_900, Stance::OneHand, Hand::Main)
+        );
+        // Different buckets, so the two arms are posed from different bone
+        // buffers rather than one overwriting the other.
+        assert_ne!(swing(Hand::Off), swing(Hand::Main));
+    }
+
     /// The same trap in a new pair of ids: miss either in `plays_once` and a
     /// draw or a stow loops, which is a character repeatedly drawing a
     /// weapon that is already drawn.
@@ -2999,6 +3329,159 @@ mod tests {
         assert!(plays_once(SHEATH_ANIMATION_ID));
         assert!(plays_once(HIP_SHEATH_ANIMATION_ID));
         assert!(!plays_once(STAND_ANIMATION_ID));
+        // And the off hand, which is the third pair to walk into this.
+        assert!(plays_once(ATTACK_OFF_ANIMATION_ID));
+        assert!(plays_once(ATTACK_OFF_PIERCE_ANIMATION_ID));
+    }
+
+    /// **A cast cannot use `plays_once`'s list and must not need to.**
+    ///
+    /// Which animation a spell plays is whatever `SpellVisualKit` names --
+    /// thousands of spells between them reaching dozens of ids -- so the
+    /// question has to be asked the other way round, of the small closed set
+    /// of cycles that loop. Both halves are asserted because either alone
+    /// passes under the wrong rule: a gesture must hold its last frame, and
+    /// the `Stand` a model without that gesture falls back to must not.
+    #[test]
+    fn a_cast_holds_its_gesture_and_loops_the_fallback() {
+        // Two of the ids `SpellVisual`'s casting kits actually name, neither
+        // of which is in `plays_once`'s list and neither of which loops.
+        const SPELL_CAST_OMNI: u16 = 54;
+        const SPELL_CAST_DIRECTED: u16 = 53;
+        assert!(!always_loops(SPELL_CAST_OMNI));
+        assert!(!always_loops(SPELL_CAST_DIRECTED));
+        // The fallback every cast chain ends at, which a model with no cast
+        // cycle gets -- a wolf, say. Frozen on the last frame of a stand is
+        // a statue, which is the bug `plays_once` was written to avoid in
+        // the first place.
+        assert!(always_loops(STAND_ANIMATION_ID));
+        assert!(always_loops(READY_1H_ANIMATION_ID));
+        assert!(always_loops(RUN_ANIMATION_ID));
+    }
+
+    /// A cast in flight outranks the swings going on underneath it, and the
+    /// wind-up outranks the previous cast's follow-through.
+    ///
+    /// Both orderings matter and neither is arbitrary. Auto-attack keeps
+    /// swinging through a cast, so without the first rule the cast is never
+    /// drawn at all. And a release lingers for up to [`CAST_CEILING_MS`],
+    /// which is longer than the gap between two casts of a fast spell, so
+    /// without the second the wind-up of every cast after the first is eaten
+    /// by the one before it.
+    #[test]
+    fn a_cast_outranks_the_swings_and_the_previous_cast() {
+        let wind_up = SpellPose::WindUp(Cycle::of(&[53, 0]));
+        let release = SpellPose::Released(200, Cycle::of(&[54, 0]));
+        let resolve = |spell| {
+            Motion::resolve(
+                0.0,
+                0.0,
+                false,
+                false,
+                false,
+                None,
+                Some((50, Hand::Main)),
+                true,
+                4_000,
+                Stance::OneHand,
+                None,
+                Some(spell),
+            )
+        };
+        assert_eq!(resolve(wind_up), Motion::Casting(Cycle::of(&[53, 0])));
+        assert_eq!(
+            resolve(release),
+            Motion::CastRelease(3_800, Cycle::of(&[54, 0]))
+        );
+
+        // Moving still outranks both, for the reason it outranks a swing:
+        // nothing here can blend an upper body onto a run, so a cast played
+        // over one reads as a stumble.
+        assert_eq!(
+            Motion::resolve(
+                7.0,
+                0.0,
+                false,
+                false,
+                false,
+                None,
+                None,
+                false,
+                4_000,
+                Stance::OneHand,
+                None,
+                Some(wind_up),
+            ),
+            Motion::Run
+        );
+        // And a corpse does not cast, however recently it did.
+        assert_eq!(
+            Motion::resolve(
+                0.0,
+                0.0,
+                false,
+                false,
+                true,
+                None,
+                None,
+                false,
+                10_000,
+                Stance::OneHand,
+                None,
+                Some(release),
+            ),
+            Motion::Dead
+        );
+    }
+
+    /// The follow-through lapses, or a character who cast once stands frozen
+    /// mid-flourish for the rest of the session. Same shape as the sheath
+    /// transition and the fall.
+    #[test]
+    fn a_cast_release_lapses_once_it_has_had_time_to_finish() {
+        let stale = SpellPose::Released(CAST_CEILING_MS + 1, Cycle::of(&[54, 0]));
+        assert_eq!(
+            Motion::resolve(
+                0.0, 0.0, false, false, false, None, None, true, 10_000, Stance::OneHand, None,
+                Some(stale),
+            ),
+            Motion::Ready(Stance::OneHand),
+            "a lapsed cast should fall through to the ordinary standing rules"
+        );
+    }
+
+    /// A chain built from `AnimationData`'s fallback column always ends
+    /// somewhere every model can go, and survives the two things that column
+    /// actually does.
+    ///
+    /// `FlyClose` and `FlyOpen` name each other, so the walk must not loop
+    /// forever; and `Stand`'s own fallback is not zero, so the walk must stop
+    /// *at* standing rather than following it onwards.
+    #[test]
+    fn a_fallback_chain_terminates_even_when_the_table_does_not() {
+        let mut fallback = HashMap::new();
+        // A pair that names each other, exactly like the table's own.
+        fallback.insert(200, 201);
+        fallback.insert(201, 200);
+        let looping = Cycle::chain_from(200, &fallback);
+        assert_eq!(&*looping, &[200, 201, STAND_ANIMATION_ID]);
+
+        // A chain that simply runs out.
+        assert_eq!(&*Cycle::chain_from(300, &fallback), &[300, STAND_ANIMATION_ID]);
+        // And one that is already there.
+        assert_eq!(
+            &*Cycle::chain_from(STAND_ANIMATION_ID, &fallback),
+            &[STAND_ANIMATION_ID]
+        );
+
+        // Every chain ends at standing, whatever the table said.
+        let mut long = HashMap::new();
+        for id in 1..40u16 {
+            long.insert(id, id + 1);
+        }
+        let deep = Cycle::chain_from(1, &long);
+        assert_eq!(deep.last(), Some(&STAND_ANIMATION_ID));
+        assert!(deep.len() <= Cycle::MAX);
     }
 
     /// A recent sheath change, standing still, resolves to the transition --
@@ -3008,14 +3491,14 @@ mod tests {
         assert_eq!(
             Motion::resolve(
                 0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::Unarmed,
-                Some((200, RestKind::Hip)),
+                Some((200, RestKind::Hip)), None,
             ),
             Motion::Sheathing(3_800, RestKind::Hip)
         );
         assert_eq!(
             Motion::resolve(
                 0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::Unarmed,
-                Some((200, RestKind::Back)),
+                Some((200, RestKind::Back)), None,
             ),
             Motion::Sheathing(3_800, RestKind::Back)
         );
@@ -3029,10 +3512,10 @@ mod tests {
     fn a_swing_outranks_a_sheath_change() {
         assert_eq!(
             Motion::resolve(
-                0.0, 0.0, false, false, false, None, Some(50), true, 4_000, Stance::OneHand,
-                Some((50, RestKind::Hip)),
+                0.0, 0.0, false, false, false, None, Some((50, Hand::Main)), true, 4_000, Stance::OneHand,
+                Some((50, RestKind::Hip)), None,
             ),
-            Motion::Attacking(3_900, Stance::OneHand)
+            Motion::Attacking(3_900, Stance::OneHand, Hand::Main)
         );
     }
 
@@ -3044,7 +3527,7 @@ mod tests {
         assert_eq!(
             Motion::resolve(
                 0.0, 0.0, false, false, false, None, None, true, 10_000, Stance::OneHand,
-                Some((SHEATH_CEILING_MS + 1, RestKind::Hip)),
+                Some((SHEATH_CEILING_MS + 1, RestKind::Hip)), None,
             ),
             Motion::Ready(Stance::OneHand),
             "a stale sheath change should have lapsed into the ordinary ready stance"
@@ -3059,7 +3542,7 @@ mod tests {
         assert_eq!(
             Motion::resolve(
                 7.0, 0.0, false, false, false, None, None, false, 4_000, Stance::OneHand,
-                Some((50, RestKind::Hip)),
+                Some((50, RestKind::Hip)), None,
             ),
             Motion::Run
         );
@@ -3074,7 +3557,7 @@ mod tests {
     #[test]
     fn death_outranks_a_stale_speed() {
         assert_eq!(
-            Motion::resolve(7.0, 0.0, false, false, true, None, None, false, 10_000, Stance::Unarmed, None),
+            Motion::resolve(7.0, 0.0, false, false, true, None, None, false, 10_000, Stance::Unarmed, None, None),
             Motion::Dead,
             "a corpse was drawn running"
         );
@@ -3086,10 +3569,10 @@ mod tests {
     #[test]
     fn only_a_death_we_watched_plays_the_fall() {
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, true, Some(200), None, false, 10_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, true, Some(200), None, false, 10_000, Stance::Unarmed, None, None),
             Motion::Dying(9_800)
         );
-        assert_eq!(Motion::resolve(0.0, 0.0, false, false, true, None, None, false, 10_000, Stance::Unarmed, None), Motion::Dead);
+        assert_eq!(Motion::resolve(0.0, 0.0, false, false, true, None, None, false, 10_000, Stance::Unarmed, None, None), Motion::Dead);
     }
 
     /// And it stops falling eventually, rather than holding a one-shot bucket
@@ -3097,7 +3580,7 @@ mod tests {
     #[test]
     fn a_fall_settles_once_it_has_had_time_to_finish() {
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, true, Some(ONE_SHOT_CEILING_MS + 1), None, false, 10_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, true, Some(ONE_SHOT_CEILING_MS + 1), None, false, 10_000, Stance::Unarmed, None, None),
             Motion::Dead
         );
     }
@@ -3112,15 +3595,15 @@ mod tests {
     /// play correctly and the cost would be invisible.
     #[test]
     fn a_one_shot_keeps_its_bucket_as_the_clock_advances() {
-        let first = Motion::resolve(0.0, 0.0, false, false, true, Some(100), None, false, 5_000, Stance::Unarmed, None);
+        let first = Motion::resolve(0.0, 0.0, false, false, true, Some(100), None, false, 5_000, Stance::Unarmed, None, None);
         // A second later: the death is a second older and the clock a second
         // further on, which is the same death.
-        let later = Motion::resolve(0.0, 0.0, false, false, true, Some(1_100), None, false, 6_000, Stance::Unarmed, None);
+        let later = Motion::resolve(0.0, 0.0, false, false, true, Some(1_100), None, false, 6_000, Stance::Unarmed, None, None);
         assert_eq!(first, later, "the bucket moved with the clock");
 
         // Two deaths a second apart must *not* share, or one pops to the
         // other's frame.
-        let other = Motion::resolve(0.0, 0.0, false, false, true, Some(100), None, false, 6_000, Stance::Unarmed, None);
+        let other = Motion::resolve(0.0, 0.0, false, false, true, Some(100), None, false, 6_000, Stance::Unarmed, None, None);
         assert_ne!(first, other);
     }
 
@@ -3139,17 +3622,17 @@ mod tests {
     fn a_one_shot_bucket_survives_drift_between_two_clock_reads() {
         // The same swing, seen over eight frames, with the two clock readings
         // drifting a few milliseconds apart each time as they really do.
-        let reference = Motion::resolve(0.0, 0.0, false, false, false, None, Some(40), true, 8_000, Stance::Unarmed, None);
+        let reference = Motion::resolve(0.0, 0.0, false, false, false, None, Some((40, Hand::Main)), true, 8_000, Stance::Unarmed, None, None);
         for frame in 0..8u32 {
             let drift = frame * 3;
             let seen = Motion::resolve(0.0, 0.0, false,
                 false, false,
                 None,
-                Some(40 + frame * 16),
+                Some((40 + frame * 16, Hand::Main)),
                 true,
                 8_000 + frame * 16 + drift,
                 Stance::Unarmed,
-                None,
+                None, None,
             );
             assert_eq!(
                 seen, reference,
@@ -3179,7 +3662,7 @@ mod tests {
             "a fighter would be frozen on its follow-through between swings"
         );
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, false, None, Some(ATTACK_CEILING_MS + 1), true, 9_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, Some((ATTACK_CEILING_MS + 1, Hand::Main)), true, 9_000, Stance::Unarmed, None, None),
             Motion::Ready(Stance::Unarmed)
         );
     }
@@ -3190,13 +3673,13 @@ mod tests {
     #[test]
     fn a_swing_interrupts_standing_but_not_running() {
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, false, None, Some(50), true, 4_000, Stance::Unarmed, None),
-            Motion::Attacking(3_900, Stance::Unarmed)
+            Motion::resolve(0.0, 0.0, false, false, false, None, Some((50, Hand::Main)), true, 4_000, Stance::Unarmed, None, None),
+            Motion::Attacking(3_900, Stance::Unarmed, Hand::Main)
         );
-        assert_eq!(Motion::resolve(7.0, 0.0, false, false, false, None, Some(50), true, 4_000, Stance::Unarmed, None), Motion::Run);
+        assert_eq!(Motion::resolve(7.0, 0.0, false, false, false, None, Some((50, Hand::Main)), true, 4_000, Stance::Unarmed, None, None), Motion::Run);
         // And an old swing has stopped mattering.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, false, None, Some(ONE_SHOT_CEILING_MS + 1), false, 4_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, Some((ONE_SHOT_CEILING_MS + 1, Hand::Main)), false, 4_000, Stance::Unarmed, None, None),
             Motion::Stand
         );
     }
@@ -3212,22 +3695,22 @@ mod tests {
     #[test]
     fn a_fighter_between_swings_keeps_its_guard_up() {
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, false, None, None, true, 4_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, None, true, 4_000, Stance::Unarmed, None, None),
             Motion::Ready(Stance::Unarmed)
         );
         // Out of the fight, it relaxes.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::Unarmed, None),
+            Motion::resolve(0.0, 0.0, false, false, false, None, None, false, 4_000, Stance::Unarmed, None, None),
             Motion::Stand
         );
         // A swing still beats the guard, and running still beats both.
         assert_eq!(
-            Motion::resolve(0.0, 0.0, false, false, false, None, Some(50), true, 4_000, Stance::Unarmed, None),
-            Motion::Attacking(3_900, Stance::Unarmed)
+            Motion::resolve(0.0, 0.0, false, false, false, None, Some((50, Hand::Main)), true, 4_000, Stance::Unarmed, None, None),
+            Motion::Attacking(3_900, Stance::Unarmed, Hand::Main)
         );
-        assert_eq!(Motion::resolve(7.0, 0.0, false, false, false, None, None, true, 4_000, Stance::Unarmed, None), Motion::Run);
+        assert_eq!(Motion::resolve(7.0, 0.0, false, false, false, None, None, true, 4_000, Stance::Unarmed, None, None), Motion::Run);
         // And a corpse is not "in a fight" whatever the map still says.
-        assert_eq!(Motion::resolve(0.0, 0.0, false, false, true, None, None, true, 4_000, Stance::Unarmed, None), Motion::Dead);
+        assert_eq!(Motion::resolve(0.0, 0.0, false, false, true, None, None, true, 4_000, Stance::Unarmed, None, None), Motion::Dead);
     }
 
     /// Which cycles hold their last frame is a property of the *animation*,
@@ -3260,7 +3743,7 @@ mod tests {
     #[test]
     fn only_the_states_that_mark_an_instant_carry_a_start_time() {
         assert_eq!(Motion::Dying(1234).started_at(), Some(1234));
-        assert_eq!(Motion::Attacking(99, Stance::Unarmed).started_at(), Some(99));
+        assert_eq!(Motion::Attacking(99, Stance::Unarmed, Hand::Main).started_at(), Some(99));
         for looping in [Motion::Stand, Motion::Walk, Motion::Run, Motion::Ready(Stance::Unarmed), Motion::Dead] {
             assert_eq!(looping.started_at(), None, "{looping:?}");
         }
@@ -3275,7 +3758,7 @@ mod tests {
     /// drawn T-posed.
     #[test]
     fn the_combat_stances_fall_back_to_standing() {
-        for motion in [Motion::Attacking(0, Stance::Unarmed), Motion::Ready(Stance::Unarmed)] {
+        for motion in [Motion::Attacking(0, Stance::Unarmed, Hand::Main), Motion::Ready(Stance::Unarmed)] {
             assert_eq!(
                 motion.animation_ids().last(),
                 Some(&STAND_ANIMATION_ID),
@@ -3294,7 +3777,7 @@ mod tests {
             Motion::Run,
             Motion::Dying(0),
             Motion::Dead,
-            Motion::Attacking(0, Stance::Unarmed),
+            Motion::Attacking(0, Stance::Unarmed, Hand::Main),
             Motion::Ready(Stance::Unarmed),
         ] {
             assert!(!motion.animation_ids().is_empty(), "{motion:?}");
@@ -3538,6 +4021,123 @@ mod tests {
         // A creature crawling is still walking, not standing: standing is
         // reserved for no move in flight at all, so a slow patrol animates.
         assert_eq!(Motion::from_pace(0.2, 0.0), Motion::Walk);
+    }
+
+    /// **Every animation id this client hardcodes, checked against the row it
+    /// claims to be.**
+    ///
+    /// This exists because two of them were wrong for a whole milestone and
+    /// nothing could have said so. `SHEATH_ANIMATION_ID` was 32 and
+    /// `HIP_SHEATH_ANIMATION_ID` was 65 -- the human male's *sequence indices*
+    /// for `Sheath` and `HipSheath`, lifted out of a `wow-cli m2 anims`
+    /// listing whose first column is a position in the model. A wrong
+    /// animation id cannot fail loudly: 32 is `SpellCast`, which no character
+    /// model carries, so the stow transition silently fell back to `Stand`;
+    /// 65 is `EmoteTalkQuestion`, which the human male does carry, so the
+    /// other half played an 1800ms hand gesture. One did nothing and one did
+    /// something plausible, and neither is distinguishable from "the
+    /// animation is fine" without opening the table.
+    ///
+    /// So the check is by **name**, which is the only thing in
+    /// `AnimationData.dbc` that cannot be arrived at by a coincidence of small
+    /// integers -- the same reason `CreatureSoundData`'s columns were
+    /// identified by the names of the sounds they reach rather than by their
+    /// values being valid.
+    #[test]
+    fn animation_constants_name_the_rows_they_claim() {
+        let Some(data) = std::env::var_os("WOW_DATA") else {
+            eprintln!("skipping: WOW_DATA not set");
+            return;
+        };
+        let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
+        let table = dbc::schema::AnimationData::parse(
+            &chain
+                .read(dbc::schema::AnimationData::PATH)
+                .expect("AnimationData"),
+        )
+        .expect("parsing AnimationData");
+        let name_of = |id: u16| {
+            table
+                .iter()
+                .find(|row| row.id() == u32::from(id))
+                .unwrap_or_else(|| panic!("no AnimationData row with id {id}"))
+                .name()
+                .to_string()
+        };
+
+        for (id, name) in [
+            (STAND_ANIMATION_ID, "Stand"),
+            (WALK_ANIMATION_ID, "Walk"),
+            (RUN_ANIMATION_ID, "Run"),
+            (WALK_BACK_ANIMATION_ID, "Walkbackwards"),
+            (SHUFFLE_LEFT_ANIMATION_ID, "ShuffleLeft"),
+            (SHUFFLE_RIGHT_ANIMATION_ID, "ShuffleRight"),
+            (JUMP_ANIMATION_ID, "Jump"),
+            (FALL_ANIMATION_ID, "Fall"),
+            (SWIM_IDLE_ANIMATION_ID, "SwimIdle"),
+            (SWIM_ANIMATION_ID, "Swim"),
+            (SWIM_BACK_ANIMATION_ID, "SwimBackwards"),
+            (DEATH_ANIMATION_ID, "Death"),
+            (DEAD_ANIMATION_ID, "Dead"),
+            (ATTACK_1H_ANIMATION_ID, "Attack1H"),
+            (ATTACK_2H_ANIMATION_ID, "Attack2H"),
+            (ATTACK_UNARMED_ANIMATION_ID, "AttackUnarmed"),
+            (ATTACK_OFF_ANIMATION_ID, "AttackOff"),
+            (ATTACK_OFF_PIERCE_ANIMATION_ID, "AttackOffPierce"),
+            (READY_1H_ANIMATION_ID, "Ready1H"),
+            (READY_2H_ANIMATION_ID, "Ready2H"),
+            (READY_UNARMED_ANIMATION_ID, "ReadyUnarmed"),
+            (SHEATH_ANIMATION_ID, "Sheath"),
+            (HIP_SHEATH_ANIMATION_ID, "HipSheath"),
+        ] {
+            assert_eq!(name_of(id), name, "animation id {id}");
+        }
+    }
+
+    /// The other half of the mistake above: a *sequence index* is not an
+    /// animation id, and on the model this client draws most they disagree for
+    /// nearly every cycle.
+    ///
+    /// Asserted rather than described, because the wrong numbers were only
+    /// wrong on that distinction, and a comment saying so had already been
+    /// written -- eleven lines above the two constants that ignored it.
+    #[test]
+    fn a_sequence_index_is_not_an_animation_id() {
+        let Some(data) = std::env::var_os("WOW_DATA") else {
+            eprintln!("skipping: WOW_DATA not set");
+            return;
+        };
+        let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
+        let bytes = chain
+            .read(r"Character\Human\Male\HumanMale.m2")
+            .expect("HumanMale.m2");
+        let model = m2::Model::parse(&bytes).expect("parsing HumanMale.m2");
+        let sequences = model.sequences();
+
+        // The two the constants got wrong, stated as the numbers they were.
+        assert_eq!(
+            sequences[32].id, 89,
+            "sequence 32 is Sheath, whose animation id is 89 -- reading the \
+             index as the id asks for SpellCast"
+        );
+        assert_eq!(
+            sequences[65].id, 90,
+            "sequence 65 is HipSheath, whose animation id is 90 -- reading the \
+             index as the id asks for EmoteTalkQuestion"
+        );
+        // And the general fact, so this is about the file rather than about
+        // two rows: most sequences sit at an index that is not their id.
+        let agreeing = sequences
+            .iter()
+            .enumerate()
+            .filter(|(index, sequence)| *index as u16 == sequence.id)
+            .count();
+        assert!(
+            agreeing * 4 < sequences.len(),
+            "{agreeing} of {} sequences sit at their own id, which would make \
+             the two readings hard to tell apart",
+            sequences.len()
+        );
     }
 
     /// Height must not affect which tile a position is on.

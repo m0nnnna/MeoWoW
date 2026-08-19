@@ -637,6 +637,8 @@ mod tests {
             dead: false,
             died_ms_ago: None,
             swung_ms_ago: None,
+            casting_spell: None,
+            cast_landed: None,
             fighting: false,
             appearance: None,
             visible_items: [0; ::world::inventory::EQUIPPED_COUNT as usize],
@@ -847,6 +849,7 @@ mod tests {
             last_move_time: None,
             died_at: None,
             last_swing: None,
+            last_cast: None,
             updates: 0,
             sheath_changed_at: None,
         };
