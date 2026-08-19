@@ -426,6 +426,74 @@ enum Command {
         /// the first time the server has ever moved this character.
         #[arg(long)]
         fly_to: Option<u32>,
+        /// Ask this **player**, by name, to trade -- then drive the whole
+        /// exchange and report every packet.
+        ///
+        /// **Half of a two-client rig and useless alone.** Trade is the first
+        /// thing in this block where the far end is another person's client
+        /// rather than the server, so a successful request is answered by a
+        /// packet at *somebody else's* session and by nothing at all here. The
+        /// other client runs `--trade-wait`.
+        ///
+        /// The name is matched against replicated players, so the partner has
+        /// to be in visibility range -- which they must be anyway, since the
+        /// server refuses a trade past ten units.
+        #[arg(long)]
+        trade: Option<String>,
+        /// Wait for somebody to offer a trade, answer it, and drive the rest.
+        ///
+        /// The other half of `--trade`. Answers with `CMSG_BEGIN_TRADE` unless
+        /// `--trade-decline` is given.
+        #[arg(long)]
+        trade_wait: bool,
+        /// Answer an offered trade with "busy" instead of opening the window.
+        ///
+        /// Worth its own run: a decline is one of three mutually exclusive
+        /// answers and produces a *different* status at the initiator, which
+        /// is the only way to tell a refusal from a partner who never replied.
+        #[arg(long)]
+        trade_decline: bool,
+        /// The bounding send, and the one part of this milestone that needs
+        /// only one client.
+        ///
+        /// Aims `CMSG_INITIATE_TRADE` at a guid that is **not a player**. The
+        /// server answers immediately with a status naming the reason, so a
+        /// single send confirms the opcode number, the eight-byte body and the
+        /// reply layout together -- with nobody else logged in. Every other
+        /// request in this block is silent on success, so without this there
+        /// would be nothing to bound them against.
+        #[arg(long)]
+        trade_nobody: bool,
+        /// Put the carried item with this **entry** on the table.
+        ///
+        /// Confirmed by consequence and by nothing else: the request is
+        /// silent, and the server answers it by restating the whole offer to
+        /// both clients. The item appearing in the reflected offer is the
+        /// proof -- and it is the reflection that is read, never this
+        /// client's own intention.
+        #[arg(long = "trade-item")]
+        trade_item: Option<u32>,
+        /// Put this many copper on the table.
+        ///
+        /// Pick a number the character actually has: the server answers an
+        /// amount it cannot cover with a status that means "busy" everywhere
+        /// else, which is a good thing to have seen once deliberately.
+        #[arg(long = "trade-gold")]
+        trade_gold: Option<u32>,
+        /// Press accept once the window is open and the offer has been staged.
+        ///
+        /// Re-sent if the server withdraws it -- changing an offer resets both
+        /// accepts, and a scripted run where the two clients stage at slightly
+        /// different times hits that every time.
+        #[arg(long)]
+        trade_accept: bool,
+        /// How long to drive the trade for, in seconds.
+        ///
+        /// Long enough that the two clients need not be started in lockstep:
+        /// the initiator waits for the partner's client to answer, and a login
+        /// takes about ninety seconds.
+        #[arg(long, default_value_t = 60)]
+        trade_seconds: u64,
         /// Ask the server what these item entries are, and check the answers
         /// against `Item.dbc`.
         ///
@@ -1304,6 +1372,14 @@ fn main() -> Result<()> {
             learn,
             taxi,
             fly_to,
+            trade,
+            trade_wait,
+            trade_decline,
+            trade_nobody,
+            trade_item,
+            trade_gold,
+            trade_accept,
+            trade_seconds,
             quest,
             item_query,
             use_item,
@@ -1366,6 +1442,14 @@ fn main() -> Result<()> {
                 learn: *learn,
                 taxi: *taxi,
                 fly_to: *fly_to,
+                trade: trade.as_deref(),
+                trade_wait: *trade_wait,
+                trade_decline: *trade_decline,
+                trade_nobody: *trade_nobody,
+                trade_item: *trade_item,
+                trade_gold: *trade_gold,
+                trade_accept: *trade_accept,
+                trade_seconds: *trade_seconds,
                 quest: *quest,
                 item_query: item_query.as_deref(),
                 use_item: *use_item,
@@ -1554,6 +1638,14 @@ struct WorldRequest<'a> {
     learn: Option<u32>,
     taxi: Option<u32>,
     fly_to: Option<u32>,
+    trade: Option<&'a str>,
+    trade_wait: bool,
+    trade_decline: bool,
+    trade_nobody: bool,
+    trade_item: Option<u32>,
+    trade_gold: Option<u32>,
+    trade_accept: bool,
+    trade_seconds: u64,
     quest: Option<u32>,
     item_query: Option<&'a [u32]>,
     use_item: Option<u32>,
@@ -1671,6 +1763,14 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         learn,
         taxi,
         fly_to,
+        trade,
+        trade_wait,
+        trade_decline,
+        trade_nobody,
+        trade_item,
+        trade_gold,
+        trade_accept,
+        trade_seconds,
         quest,
         item_query,
         use_item,
@@ -2584,6 +2684,25 @@ cast {spell_id} at {} (attempt {attempt})",
                 &mut here,
                 prefer,
                 fly_to,
+            )?;
+        }
+
+        if trade_nobody || trade.is_some() || trade_wait {
+            survey_trade(
+                &mut connection,
+                &mut state,
+                character.guid,
+                &mut here,
+                TradeDrive {
+                    partner: trade,
+                    wait: trade_wait,
+                    decline: trade_decline,
+                    nobody: trade_nobody,
+                    item: trade_item,
+                    gold: trade_gold,
+                    accept: trade_accept,
+                    seconds: trade_seconds,
+                },
             )?;
         }
 
@@ -14019,3 +14138,412 @@ the SMSG_MONSTER_MOVE naming this character, {} bytes:", packet.body.len());
     Ok(())
 }
 
+
+/// What a `--trade` run should do.
+///
+/// A struct rather than eight arguments, because both halves of the two-client
+/// rig run the *same* function with different flags -- the initiator and the
+/// responder differ only in who sends first, and writing them as two functions
+/// would have produced two drifting copies of the same state machine.
+struct TradeDrive<'a> {
+    partner: Option<&'a str>,
+    wait: bool,
+    decline: bool,
+    nobody: bool,
+    item: Option<u32>,
+    gold: Option<u32>,
+    accept: bool,
+    seconds: u64,
+}
+
+/// Drives a player-to-player trade and reports every packet in it.
+///
+/// **The first probe in this tree where one client cannot produce the
+/// observation.** Everything before this asked the server for something and
+/// the server answered; a trade needs a second person's client to send a
+/// packet of its own before anything at all comes back here. So this function
+/// is half a rig: one session runs `--trade <name>` and another runs
+/// `--trade-wait`, and neither on its own proves the opcode is right.
+///
+/// Except for one part, which is why `--trade-nobody` exists and runs first.
+/// `CMSG_INITIATE_TRADE` is answered on *failure*, so aiming it at a guid that
+/// is not a player produces a reply immediately, from one client, with nobody
+/// else in the world -- confirming the opcode number, the eight-byte body and
+/// the reply layout together. That is the same bounding move
+/// `CMSG_LIST_INVENTORY` made for `CMSG_BUY_ITEM`, with the novelty that the
+/// bounding case is this request's own refusal rather than a neighbour's
+/// success.
+///
+/// Everything printed is read back off the wire. In particular the offer this
+/// client staged is reported from the server's **reflection** of it and never
+/// from what was sent: `CMSG_SET_TRADE_ITEM` is silent, so a client that drew
+/// its own intentions would show an item the server refused as though it were
+/// on the table.
+fn survey_trade(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    // Written back, like every other walking probe here: replicated state
+    // holds our login position forever, and three callers have already had to
+    // relearn that the hard way.
+    here: &mut world::Position,
+    drive: TradeDrive<'_>,
+) -> Result<()> {
+    use world::TradeStatus;
+
+    // The server's own limit is ten units. Approached to comfortably inside
+    // it for the reason `approach_talker` documents at length: aiming at the
+    // threshold produces a loop that asymptotically fails to cross it.
+    const TRADE_RANGE: f32 = 10.0;
+    const APPROACH_TO: f32 = 4.0;
+    const RUN_SPEED: f32 = 7.0;
+    // A burst of identical requests does not get refused, it gets the socket
+    // closed -- `10053`, observed on the party loot control in 4.20. Every
+    // repeated send here is spaced.
+    const RESEND_EVERY: std::time::Duration = std::time::Duration::from_millis(1200);
+
+    if drive.nobody {
+        // **The bounding send.** A guid shaped like a creature's and occupied
+        // by nothing: the server looks it up as a player, finds nothing, and
+        // says so. What matters is not the refusal but that it *arrives* -- a
+        // wrong opcode number produces silence here, and silence is what the
+        // rest of this block is made of.
+        let nobody = 0xF130_0000_0000_0001u64;
+        println!("\n--trade-nobody: CMSG_INITIATE_TRADE at {nobody:#018x}, which is not a player.");
+        println!("  A reply at all confirms the opcode, the body and the status layout,");
+        println!("  from one client, with nobody else logged in.");
+        connection.initiate_trade(nobody)?;
+        let batch = connection.drain(std::time::Duration::from_millis(1500), 128)?;
+        let mut answered = false;
+        for packet in &batch {
+            if packet.opcode == world::opcode::server::TRADE_STATUS {
+                answered = true;
+                println!(
+                    "\n  SMSG_TRADE_STATUS, {} bytes: {}",
+                    packet.body.len(),
+                    hex_preview(&packet.body, 64)
+                );
+                match world::trade::parse_trade_status(&packet.body) {
+                    Ok(status) => println!("  -> {status:?}"),
+                    // Printed rather than counted: a body that will not decode
+                    // here is the one thing that could have answered the
+                    // question, and two tools in this tree have already logged
+                    // a length and dropped the bytes.
+                    Err(error) => println!("  -> WILL NOT PARSE: {error}"),
+                }
+            }
+        }
+        if !answered {
+            println!("\n  NOTHING came back. Everything that did arrive:");
+            for packet in &batch {
+                println!(
+                    "    {} ({:#06x}), {} bytes",
+                    world::opcode::describe(packet.opcode),
+                    packet.opcode,
+                    packet.body.len()
+                );
+            }
+            println!("\n  This is the informative failure: the one request in this block that");
+            println!("  is answered did not answer, so the opcode number is wrong -- there is");
+            println!("  no 'declined' reading of a refusal that never came.");
+        }
+        state.replicate(&batch, None);
+        if drive.partner.is_none() && !drive.wait {
+            return Ok(());
+        }
+    }
+
+    // Names first: a player is anonymous until a query comes back, so a
+    // partner named on the command line cannot be matched without them.
+    if drive.partner.is_some() {
+        resolve_names(connection, state, 2)?;
+    }
+
+    if let Some(wanted) = drive.partner {
+        let found = state
+            .players()
+            .filter(|entity| entity.guid != own_guid)
+            .find(|entity| {
+                state
+                    .names
+                    .player(entity.guid)
+                    .flatten()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+            })
+            .map(|entity| (entity.guid, entity.position));
+
+        let Some((partner, at)) = found else {
+            println!("\n--trade: no replicated player is called {wanted:?}.");
+            println!("  Players in view:");
+            for entity in state.players().filter(|e| e.guid != own_guid) {
+                println!(
+                    "    {:#018x}  {}",
+                    entity.guid,
+                    state
+                        .names
+                        .player(entity.guid)
+                        .flatten()
+                        .unwrap_or("(unnamed)")
+                );
+            }
+            println!("\n  A trade partner has to be *replicated*, which needs them in");
+            println!("  visibility range -- and they must be anyway, since the server");
+            println!("  refuses past {TRADE_RANGE:.0} units. Two clients in different starting");
+            println!("  zones cannot see each other and prove nothing.");
+            return Ok(());
+        };
+
+        // Walk into range if need be. Measured from `here`, never from
+        // replicated state: the server does not relay our own movement back,
+        // so our replicated position is wherever we logged in.
+        if let Some(there) = at {
+            let d = ((there.x - here.x).powi(2) + (there.y - here.y).powi(2)).sqrt();
+            println!("\n{wanted} is {partner:#018x}, {d:.1} units away");
+            if d > TRADE_RANGE {
+                let heading = (there.y - here.y).atan2(there.x - here.x);
+                let close = d - APPROACH_TO;
+                println!(
+                    "  closing {close:.1} units first -- the server refuses past {TRADE_RANGE:.0}"
+                );
+                let (arrived, _) = connection.walk(own_guid, *here, heading, close, RUN_SPEED)?;
+                *here = arrived;
+                here.orientation = heading;
+                let batch = connection.drain(std::time::Duration::from_millis(400), 128)?;
+                state.replicate(&batch, None);
+            }
+        }
+
+        println!("\nasking {wanted} to trade. This send is SILENT when it works:");
+        println!("  the server answers it at *their* client, not at this one.");
+        connection.initiate_trade(partner)?;
+        // Recorded locally because it is nowhere on the wire -- the initiator
+        // is never told who it asked. See `WorldState::note_trade_request`.
+        state.note_trade_request(partner);
+    }
+
+    // The driving loop. Both roles run it; what differs is only who sent
+    // first.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(drive.seconds);
+    let mut answered_offer = false;
+    let mut staged = false;
+    let mut staged_at: Option<std::time::Instant> = None;
+    let mut last_accept: Option<std::time::Instant> = None;
+    let mut last_theirs: Option<world::TradeOffer> = None;
+    let mut last_ours: [Option<u64>; world::trade::TRADE_SLOTS] = Default::default();
+    // Counted rather than assumed. The **own-half** form of
+    // `SMSG_TRADE_STATUS_EXTENDED` was expected to arrive and does not: the
+    // server sends an offer to the partner and never back to its author. That
+    // is a claim about an absence, so the run reports the two counts side by
+    // side -- "zero of N" is a measurement and "it never printed" is not.
+    let mut halves = (0usize, 0usize);
+    let mut finished = false;
+
+    println!(
+        "\ndriving the trade for {}s. Every SMSG_TRADE_STATUS is printed as it lands.",
+        drive.seconds
+    );
+
+    while std::time::Instant::now() < deadline && !finished {
+        // A small batch, for the reason `hold_connection` documents: a
+        // populated zone is never quiet, so a large limit means few long
+        // iterations and a state machine that reacts in coarse jumps.
+        let batch = connection.drain(std::time::Duration::from_millis(300), 48)?;
+        let report = state.replicate(&batch, None);
+        halves.0 += report.trade_offers;
+        halves.1 += report.trade_own_offers;
+
+        for status in &report.trade_statuses {
+            println!("  <- {status:?}");
+            match status {
+                // Terminal, and the run is over: printing the reason is the
+                // whole point, because every *request* in this block is
+                // silent and these are the only things that ever explain one.
+                TradeStatus::Complete => {
+                    println!("     the exchange went through. Check the bags on both clients.");
+                    finished = true;
+                }
+                TradeStatus::Cancelled => {
+                    println!("     called off.");
+                    finished = true;
+                }
+                TradeStatus::NoTarget | TradeStatus::TooFar | TradeStatus::Busy => {
+                    println!("     refused. Note this arrived at the *sender*, which is what");
+                    println!("     makes the initiate request confirmable at all.");
+                }
+                _ => {}
+            }
+        }
+        for (opcode, error, body) in &report.failures {
+            println!("  undecodable {}: {error}", world::opcode::describe(*opcode));
+            if let Ok(body) = body {
+                println!("    {} bytes: {}", body.len(), hex_preview(body, 96));
+            }
+        }
+
+        let Some(session) = state.trade.clone() else {
+            if finished {
+                break;
+            }
+            continue;
+        };
+
+        // Answer an offer, once. Which of the three answers goes out is the
+        // whole of the responder's decision, and the server closes the trade
+        // on either refusal -- so exactly one is sent per offer.
+        if drive.wait && !session.open && !answered_offer {
+            // Ask who this is before saying it. The responder never ran the
+            // name sweep the initiator does -- it has no name to look up until
+            // somebody asks it to trade -- so without this the one line that
+            // says a trade was offered says it about a bare guid.
+            if let Some(guid) = session.partner {
+                if state.names.player(guid).is_none() {
+                    connection.ask_player_name(guid)?;
+                    let batch = connection.drain(std::time::Duration::from_millis(700), 64)?;
+                    state.replicate(&batch, None);
+                }
+            }
+            let who = session
+                .partner
+                .map(|guid| unit_label_for(state, guid))
+                .unwrap_or_else(|| "somebody".into());
+            if drive.decline {
+                println!("\n  {who} offered a trade -- answering BUSY.");
+                connection.busy_trade()?;
+            } else {
+                println!("\n  {who} offered a trade -- opening the window.");
+                connection.begin_trade()?;
+            }
+            answered_offer = true;
+        }
+
+        // Report each half of the window whenever it changes. Both halves are
+        // printed, and which is which is the leading byte of the body: a
+        // client that filed them together would draw a completely plausible
+        // window describing one person's goods twice.
+        if session.theirs != last_theirs {
+            if let Some(offer) = &session.theirs {
+                println!("  <- their half: {}", describe_trade_offer(offer));
+            }
+            last_theirs = session.theirs.clone();
+        }
+        // Our own half is **local**: the server does not send it back, so this
+        // prints what this client asked for rather than what anything
+        // confirmed. See `world::trade`.
+        if session.ours != last_ours {
+            let held: Vec<String> = session
+                .ours
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, item)| item.map(|guid| format!("slot {slot} = item {guid:#x}")))
+                .collect();
+            println!(
+                "  -- our half (local): {} [{}c]",
+                if held.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    held.join(", ")
+                },
+                session.our_money
+            );
+            last_ours = session.ours;
+        }
+
+        if session.open && !staged {
+            if let Some(entry) = drive.item {
+                let found = world::inventory::carried(state, own_guid)
+                    .into_iter()
+                    .find(|carried| carried.item.entry == Some(entry));
+                match found {
+                    Some(carried) => {
+                        let (bag, slot) = carried.at.address();
+                        println!(
+                            "\n  putting entry {entry} (bag {bag}, slot {slot}) into trade slot 0."
+                        );
+                        println!("  Silent: the proof is the offer coming back with it in.");
+                        connection.set_trade_item(0, bag, slot)?;
+                        // Recorded beside the send, because nothing will
+                        // record it for us -- our own half of the window has
+                        // no packet behind it.
+                        state.note_trade_item(0, carried.item.guid);
+                    }
+                    None => {
+                        println!("\n  nothing with entry {entry} is in the bags -- not staged.")
+                    }
+                }
+            }
+            if let Some(copper) = drive.gold {
+                println!("  putting {copper} copper on the table.");
+                connection.set_trade_gold(copper)?;
+                state.note_trade_gold(copper);
+            }
+            staged = true;
+            staged_at = Some(std::time::Instant::now());
+        }
+
+        // Accept, and re-accept if the server takes it back. Changing an
+        // offer resets *both* accepts, and two scripted clients staging a
+        // second apart hit that every run -- so this is a loop condition
+        // rather than a one-shot, with a cooldown for the reason above.
+        if drive.accept && session.open && staged && !session.accepted {
+            let settled = staged_at.is_some_and(|at| at.elapsed() >= RESEND_EVERY);
+            let cooled = last_accept.is_none_or(|at| at.elapsed() >= RESEND_EVERY);
+            if settled && cooled {
+                println!("  -> accepting (token {})", session.token);
+                connection.accept_trade(session.token)?;
+                // Local: the server never reports a client's own accept back
+                // to it, only the consequences.
+                state.note_trade_accept();
+                last_accept = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    println!(
+        "
+SMSG_TRADE_STATUS_EXTENDED: {} describing the partner's half, {} describing our own.",
+        halves.0, halves.1
+    );
+    println!("  The second number is the claim: an offer is sent to the *other* person");
+    println!("  and never back to whoever made it, so a client's own half of the window");
+    println!("  is the one thing in this block it has to remember for itself.");
+
+    match &state.trade {
+        Some(session) => {
+            println!("\ntrade still open at the end of the run:");
+            println!(
+                "  partner {:?}, token {}, accepted {} / theirs {}",
+                session.partner, session.token, session.accepted, session.partner_accepted
+            );
+        }
+        None => println!("\nno trade open at the end of the run."),
+    }
+    Ok(())
+}
+
+/// One line describing half a trade window.
+fn describe_trade_offer(offer: &world::TradeOffer) -> String {
+    let mut parts: Vec<String> = offer
+        .items
+        .iter()
+        .map(|item| {
+            format!(
+                "slot {} = entry {} x{} (display {})",
+                item.slot, item.entry, item.count, item.display_id
+            )
+        })
+        .collect();
+    if offer.money != 0 {
+        let (g, s, c) = world::inventory::purse(offer.money);
+        parts.push(format!("{g}g {s}s {c}c"));
+    }
+    if parts.is_empty() {
+        parts.push("nothing".into());
+    }
+    format!(
+        "{} [token {}, slots {}/{}]",
+        parts.join(", "),
+        offer.token,
+        offer.slot_count,
+        offer.slot_count_again
+    )
+}
