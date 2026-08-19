@@ -51,10 +51,11 @@ pub enum ElementId {
     PartyFrame,
     PartyInvite,
     Trainer,
+    Taxi,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 19] = [
+    pub const ALL: [ElementId; 20] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -74,6 +75,7 @@ impl ElementId {
         ElementId::PartyFrame,
         ElementId::PartyInvite,
         ElementId::Trainer,
+        ElementId::Taxi,
     ];
 
     /// What order the frames are drawn in, lowest first.
@@ -127,6 +129,7 @@ impl ElementId {
             // the map is one the player cannot buy from, which is exactly the
             // bug the questgiver's Accept button had.
             | ElementId::Trainer
+            | ElementId::Taxi
             | ElementId::ReleasePrompt
             // Top rank, with the other windows that appeared because
             // something happened and want an answer. An invite times out, so
@@ -212,6 +215,7 @@ impl ElementId {
             ElementId::PartyFrame => "party-frame",
             ElementId::PartyInvite => "party-invite",
             ElementId::Trainer => "trainer",
+            ElementId::Taxi => "taxi",
         }
     }
 
@@ -241,6 +245,7 @@ impl ElementId {
             ElementId::PartyFrame => "Party frame",
             ElementId::PartyInvite => "Party invite",
             ElementId::Trainer => "Trainer",
+            ElementId::Taxi => "Flight master",
         }
     }
 
@@ -403,6 +408,23 @@ impl ElementId {
             ElementId::Trainer => Element {
                 anchor: Anchor::Left,
                 offset: [270.0, -60.0],
+                ..Default::default()
+            },
+            // Below the trainer window rather than sharing its spot.
+            //
+            // Sharing was the first choice and it is *measurably* safe on
+            // this realm: no creature template carries both the trainer bit
+            // and the flight-master bit, 0 of them, so the two windows can
+            // never be open at once. It is not relied on. This client is
+            // developed against a private realm with custom content, where
+            // one NPC offering both is a single database edit away -- and
+            // the cost of being wrong is a window drawn, hit-tested and
+            // unreachable underneath another, which is exactly the bug the
+            // questgiver's Accept button had. A free patch of screen is
+            // cheaper than a fact about somebody else's data.
+            ElementId::Taxi => Element {
+                anchor: Anchor::Left,
+                offset: [270.0, 130.0],
                 ..Default::default()
             },
             // Dead centre, and the only window here that wants to be: a map

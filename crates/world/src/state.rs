@@ -3229,6 +3229,7 @@ mod tests {
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
 
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(1.0, 1.0),
             to: Some(at(50.0, 50.0)),
@@ -3966,6 +3967,7 @@ mod tests {
         let mut world = WorldState::new();
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(at(100.0, 0.0)),
@@ -4000,6 +4002,7 @@ mod tests {
         let mut world = WorldState::new();
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(at(100.0, 0.0)),
@@ -4041,6 +4044,7 @@ mod tests {
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
         world.apply(&[create(9, ObjectType::Unit, Some(at(0.0, 50.0)), &[])]);
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(at(0.0, 0.0)),
@@ -4061,6 +4065,7 @@ mod tests {
         // And a facing at a unit that is not in view leaves it as it was,
         // rather than snapping to a default heading nothing asked for.
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(at(0.0, 0.0)),
@@ -4088,6 +4093,7 @@ mod tests {
         // The player's *replicated* position: due north, and stale.
         world.apply(&[create(9, ObjectType::Player, Some(at(0.0, 50.0)), &[])]);
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(at(0.0, 0.0)),
@@ -4185,6 +4191,7 @@ mod tests {
         let mut world = WorldState::new();
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(at(0.0, 0.0)),
@@ -4209,6 +4216,7 @@ mod tests {
         let mut world = WorldState::new();
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(at(100.0, 0.0)), // due "east": direction of travel is 0 rad
@@ -4252,6 +4260,7 @@ mod tests {
         let mut world = WorldState::new();
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 5.0)), &[])]);
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 5.0),
             to: Some(at(0.0, 5.0)),
@@ -4275,6 +4284,7 @@ mod tests {
         let mut world = WorldState::new();
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(at(0.0, 100.0)), // due "north"
@@ -4304,6 +4314,7 @@ mod tests {
         let mut world = WorldState::new();
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(at(100.0, 0.0)),
@@ -4590,6 +4601,7 @@ mod tests {
         let mut world = WorldState::new();
         world.apply(&[create(7, ObjectType::Player, Some(at(0.0, 0.0)), &[])]);
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(at(100.0, 0.0)),
@@ -4626,6 +4638,7 @@ mod tests {
         let mut world = WorldState::new();
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(at(100.0, 0.0)),
@@ -4658,6 +4671,7 @@ mod tests {
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
         // 30 units in 4 seconds: 7.5, a run.
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(at(30.0, 0.0)),
@@ -4693,6 +4707,7 @@ mod tests {
             orientation: 0.0,
         };
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: Some(uphill),
@@ -5049,6 +5064,7 @@ mod tests {
         let mut world = WorldState::new();
         world.apply(&[create(7, ObjectType::Unit, Some(at(0.0, 0.0)), &[])]);
         world.apply_monster_move(&MonsterMove {
+            path: Vec::new(),
             guid: 7,
             from: at(0.0, 0.0),
             to: None,

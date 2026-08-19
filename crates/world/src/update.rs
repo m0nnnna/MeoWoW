@@ -783,6 +783,23 @@ pub struct MonsterMove {
     pub from: Position,
     /// Where it ends. Absent when the packet is a stop rather than a move.
     pub to: Option<Position>,
+    /// Every point of the path, when the server sent them in full.
+    ///
+    /// **Empty is not "no path", it is "the packet did not spell one out".**
+    /// The two spline encodings are not equally informative: a flying or
+    /// catmull-rom spline writes every point, while an ordinary ground move
+    /// writes only the destination and then packs the intermediates as
+    /// offsets from the midpoint, three to a word. This field carries the
+    /// former and stays empty for the latter, where [`Self::to`] is the whole
+    /// of what the packet said.
+    ///
+    /// It exists because of taxi flights. A creature walking across a field
+    /// is served perfectly by a start, an end and a duration -- which is what
+    /// `interpolated_position` was built on. A flight from Stormwind to
+    /// Westfall is a curve around terrain, and interpolating its endpoints
+    /// would fly the gryphon in a straight line through the hills between
+    /// them.
+    pub path: Vec<Position>,
     /// How long the whole path takes, in milliseconds.
     pub duration: u32,
     pub stopped: bool,
@@ -841,6 +858,32 @@ mod monster_spline_flags {
     pub const FLYING: u32 = 0x0000_0200;
 }
 
+/// Whether a `SMSG_MONSTER_MOVE` body is about `guid`, without parsing it.
+///
+/// A drain of a busy zone carries hundreds of these and `WorldState` already
+/// parses every one, so a caller looking for *its own* character wants a test
+/// that costs nothing on the ones that are not.
+///
+/// **Defined once and used by both the viewer and `wow-cli`.** The obvious
+/// alternative -- each caller re-encoding the packed guid inline -- is two
+/// derivations of one fact, and this particular fact decides whether the
+/// client believes the server is flying it. The two would agree until one was
+/// touched, and the frame they disagree on is a character standing still while
+/// its gryphon leaves.
+pub fn monster_move_is_about(body: &[u8], guid: u64) -> bool {
+    let mut packed = vec![0u8; 1];
+    let mut mask = 0u8;
+    for byte in 0..8 {
+        let part = ((guid >> (byte * 8)) & 0xff) as u8;
+        if part != 0 {
+            mask |= 1 << byte;
+            packed.push(part);
+        }
+    }
+    packed[0] = mask;
+    body.starts_with(&packed)
+}
+
 pub fn parse_monster_move(body: &[u8]) -> Result<MonsterMove, Error> {
     let mut reader = Reader::new(body, "SMSG_MONSTER_MOVE");
     let guid = read_packed_guid(&mut reader)?;
@@ -867,6 +910,7 @@ pub fn parse_monster_move(body: &[u8]) -> Result<MonsterMove, Error> {
                 guid,
                 from,
                 to: None,
+                path: Vec::new(),
                 duration: 0,
                 stopped: true,
                 facing: None,
@@ -900,18 +944,21 @@ pub fn parse_monster_move(body: &[u8]) -> Result<MonsterMove, Error> {
     // The path. Two encodings, and picking the wrong one desynchronises the
     // rest of the packet rather than merely losing the waypoints.
     let count = reader.u32()? as usize;
+    let mut path = Vec::new();
     let to = if flags & (monster_spline_flags::CATMULLROM | monster_spline_flags::FLYING) != 0 {
-        // Every point in full; the destination is the last of them.
-        let mut last = None;
+        // Every point in full. **All of them are kept**, not just the last:
+        // for a taxi flight these points are the route, and the destination
+        // is merely the one of them that happens to be at the end.
+        path.reserve(count);
         for _ in 0..count {
-            last = Some(Position {
+            path.push(Position {
                 x: reader.f32()?,
                 y: reader.f32()?,
                 z: reader.f32()?,
                 orientation: 0.0,
             });
         }
-        last
+        path.last().copied()
     } else {
         // The destination in full, then the *intermediate* points as offsets
         // from the midpoint, packed three to a word. Only the endpoint is
@@ -937,6 +984,7 @@ pub fn parse_monster_move(body: &[u8]) -> Result<MonsterMove, Error> {
 
     Ok(MonsterMove {
         guid,
+        path,
         from,
         to,
         duration,

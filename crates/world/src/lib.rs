@@ -47,7 +47,7 @@ pub use quest::{
     QuestPoint, QuestRewardItem,
 };
 pub use quest_cache::{Answer, QuestCache};
-pub use taxi::{TaxiMenu, TaxiReply};
+pub use taxi::{Flight, TaxiMenu, TaxiReply};
 pub use trainer::{TrainerList, TrainerSpell, TrainerSpellState};
 pub use vendor::{VendorItem, VendorList};
 pub use inventory::{Carried, HeldItem, InventorySlot, SlotKind, Where};

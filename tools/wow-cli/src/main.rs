@@ -13944,12 +13944,44 @@ fn survey_taxi(
         // re-implement that decoding here -- where a mistake would silently
         // answer the question wrongly -- compare against the bytes a packed
         // form of our own guid produces.
-        if packet.body.len() >= 9 && monster_move_names(&packet.body, own_guid) {
+        if packet.body.len() >= 9 && world::update::monster_move_is_about(&packet.body, own_guid) {
             ours += 1;
         } else {
             theirs += 1;
         }
     }
+    // **Dump the one that names us, in full.** This is the packet the whole
+    // milestone turns on and there is exactly one of it, so printing a length
+    // and dropping the bytes would be the mistake this project has already
+    // made twice with `SMSG_ATTACKERSTATEUPDATE`. The points in it are the
+    // route, and they can be checked against the client's own `TaxiPathNode`
+    // rows -- two files by different authors describing one flight, which is
+    // evidence in the way a self-consistent parse is not.
+    for packet in &after {
+        if packet.opcode != world::opcode::server::MONSTER_MOVE
+            || packet.body.len() < 9
+            || !world::update::monster_move_is_about(&packet.body, own_guid)
+        {
+            continue;
+        }
+        println!("
+the SMSG_MONSTER_MOVE naming this character, {} bytes:", packet.body.len());
+        println!("  {}", hex_preview(&packet.body, 256));
+        match world::update::parse_monster_move(&packet.body) {
+            Ok(mv) => {
+                println!(
+                    "  from {:.1},{:.1},{:.1} to {:?} over {}ms",
+                    mv.from.x, mv.from.y, mv.from.z,
+                    mv.to.map(|t| (t.x, t.y, t.z)),
+                    mv.duration
+                );
+                println!("  NOTE: the parser keeps only the LAST point. A flight's route is");
+                println!("  its intermediates, so this is the field that has to grow.");
+            }
+            Err(error) => println!("  did not parse: {error}"),
+        }
+    }
+
     println!("\nmonster-moves during the flight: {ours} naming THIS character, {theirs} naming others");
     if ours > 0 {
         println!("  -> the server is moving the player. Every piece of movement code in");
@@ -13983,22 +14015,3 @@ fn survey_taxi(
     Ok(())
 }
 
-/// Whether a `SMSG_MONSTER_MOVE` body names `guid`, by packed-guid prefix.
-///
-/// Deliberately a *prefix comparison against a re-encoded guid* rather than a
-/// decoder written for this one probe. A second decoding of a format this
-/// crate already reads is the thing that drifts, and here it would drift into
-/// answering the milestone's central question wrongly and confidently.
-fn monster_move_names(body: &[u8], guid: u64) -> bool {
-    let mut packed = vec![0u8; 1];
-    let mut mask = 0u8;
-    for byte in 0..8 {
-        let part = ((guid >> (byte * 8)) & 0xff) as u8;
-        if part != 0 {
-            mask |= 1 << byte;
-            packed.push(part);
-        }
-    }
-    packed[0] = mask;
-    body.starts_with(&packed)
-}

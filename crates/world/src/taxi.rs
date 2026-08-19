@@ -294,3 +294,201 @@ mod tests {
         }
     }
 }
+
+/// A flight in progress: the route the server sent, and how far along it is.
+///
+/// **The client does not choose this path and must not improve on it.** The
+/// route is whatever the server put in the spline, and the same points also
+/// exist in `TaxiPathNode` -- which makes the table tempting, since it is
+/// right there and needs no packet. Preferring it would be the picking-ray
+/// rule from the other side: two derivations of one fact agree until one of
+/// them changes, and here the disagreement draws a character flying beside
+/// their own gryphon on any realm whose path rows have been edited.
+///
+/// Interpolation is **linear between the points, by arc length**. The real
+/// client curves through them, and the difference is a metre of cornering on
+/// a route measured in hundreds. Stated rather than hidden: it is a
+/// deliberate approximation, and the type that makes it is the honest place
+/// to record it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Flight {
+    /// Every point of the route, in order, as the server sent them.
+    points: Vec<(f32, f32, f32)>,
+    /// Cumulative distance to each point.
+    ///
+    /// Precomputed because the alternative is measuring the whole polyline
+    /// once per frame, and because it is what makes "half way" mean half the
+    /// *distance* rather than half the *points* -- a route whose points bunch
+    /// up at one end would otherwise crawl there and race elsewhere.
+    lengths: Vec<f32>,
+    /// Milliseconds the whole route takes, from the packet.
+    duration_ms: u32,
+}
+
+impl Flight {
+    /// Builds a flight from a monster-move's spline.
+    ///
+    /// Returns `None` for anything that cannot describe a route: fewer than
+    /// two points, a zero duration, or a route of zero length. All three are
+    /// real packet shapes -- a stop carries no points at all -- and none is
+    /// an error worth reporting, so the absence is the answer.
+    pub fn new(points: &[(f32, f32, f32)], duration_ms: u32) -> Option<Self> {
+        if points.len() < 2 || duration_ms == 0 {
+            return None;
+        }
+        let mut lengths = Vec::with_capacity(points.len());
+        let mut total = 0.0;
+        lengths.push(0.0);
+        for pair in points.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let (dx, dy, dz) = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
+            total += (dx * dx + dy * dy + dz * dz).sqrt();
+            lengths.push(total);
+        }
+        if total <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            points: points.to_vec(),
+            lengths,
+            duration_ms,
+        })
+    }
+
+    pub fn duration_ms(&self) -> u32 {
+        self.duration_ms
+    }
+
+    /// Total length of the route in world units.
+    pub fn length(&self) -> f32 {
+        *self.lengths.last().unwrap_or(&0.0)
+    }
+
+    /// How many points the server sent.
+    pub fn points(&self) -> usize {
+        self.points.len()
+    }
+
+    /// Whether the flight has run out.
+    pub fn finished(&self, elapsed_ms: u32) -> bool {
+        elapsed_ms >= self.duration_ms
+    }
+
+    /// Where the character is `elapsed_ms` into the flight, and which way it
+    /// is heading.
+    ///
+    /// The heading comes from the **segment being flown**, not from a
+    /// difference between successive frames. The two look identical while
+    /// moving and differ at a corner and at a stall -- and a frame-difference
+    /// heading is undefined exactly when the character stops, which is what
+    /// left creatures facing a constant wrong direction before 3.5.
+    pub fn at(&self, elapsed_ms: u32) -> ((f32, f32, f32), f32) {
+        let clamped = elapsed_ms.min(self.duration_ms);
+        let fraction = f64::from(clamped) / f64::from(self.duration_ms);
+        let target = (fraction as f32) * self.length();
+
+        let mut segment = match self.lengths.binary_search_by(|probe| {
+            probe.partial_cmp(&target).unwrap_or(std::cmp::Ordering::Less)
+        }) {
+            Ok(exact) => exact,
+            Err(after) => after.saturating_sub(1),
+        };
+        segment = segment.min(self.points.len() - 2);
+
+        let (a, b) = (self.points[segment], self.points[segment + 1]);
+        let span = self.lengths[segment + 1] - self.lengths[segment];
+        let along = if span > 0.0 {
+            ((target - self.lengths[segment]) / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let position = (
+            a.0 + (b.0 - a.0) * along,
+            a.1 + (b.1 - a.1) * along,
+            a.2 + (b.2 - a.2) * along,
+        );
+        let heading = (b.1 - a.1).atan2(b.0 - a.0);
+        (position, heading)
+    }
+}
+
+#[cfg(test)]
+mod flight_tests {
+    use super::*;
+
+    /// An L-shaped route whose legs are deliberately different lengths -- 100
+    /// east then 300 north. Equal legs would make "half the distance" and
+    /// "half the points" the same answer, which is exactly the degeneracy
+    /// that would let a points-based interpolation pass.
+    fn route() -> Flight {
+        Flight::new(
+            &[(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 300.0, 0.0)],
+            4000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_ends_are_the_ends() {
+        let f = route();
+        assert_eq!(f.at(0).0, (0.0, 0.0, 0.0));
+        assert_eq!(f.at(4000).0, (100.0, 300.0, 0.0));
+        assert_eq!(f.length(), 400.0);
+        assert_eq!(f.points(), 3);
+    }
+
+    /// **Progress is by distance, not by point count.** A quarter of the time
+    /// is 100 units along a 400-unit route, which lands exactly on the corner.
+    /// Splitting the time evenly between segments would put the corner at the
+    /// halfway mark instead, drawing a gryphon that dawdles down the short leg
+    /// and sprints up the long one.
+    #[test]
+    fn a_fraction_of_the_time_is_that_fraction_of_the_distance() {
+        let f = route();
+        assert_eq!(f.at(1000).0, (100.0, 0.0, 0.0), "quarter time = the corner");
+        assert_eq!(f.at(2000).0, (100.0, 100.0, 0.0), "half time = 200 units");
+    }
+
+    /// The heading is the segment's, so it is right on the first frame rather
+    /// than after two.
+    #[test]
+    fn the_heading_comes_from_the_segment_being_flown() {
+        let f = route();
+        assert!(f.at(500).1.abs() < 1e-5, "first leg runs east");
+        assert!(
+            (f.at(3000).1 - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "second leg runs north"
+        );
+    }
+
+    /// Past the end it holds the destination rather than running off it. The
+    /// caller ends the flight on [`Flight::finished`]; this must not depend on
+    /// the caller being punctual.
+    #[test]
+    fn overrunning_holds_the_destination() {
+        let f = route();
+        assert_eq!(f.at(99_999).0, (100.0, 300.0, 0.0));
+        assert!(f.finished(4000));
+        assert!(!f.finished(3999));
+    }
+
+    /// Packets that cannot describe a route are refused rather than
+    /// half-accepted.
+    #[test]
+    fn a_route_that_is_not_one_is_refused() {
+        assert!(Flight::new(&[], 1000).is_none());
+        assert!(Flight::new(&[(1.0, 2.0, 3.0)], 1000).is_none());
+        assert!(Flight::new(&[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)], 0).is_none());
+        assert!(Flight::new(&[(5.0, 5.0, 5.0), (5.0, 5.0, 5.0)], 1000).is_none());
+    }
+
+    /// Altitude is interpolated like everything else -- the check that a
+    /// flight genuinely leaves the ground rather than tracking it.
+    #[test]
+    fn altitude_is_part_of_the_route() {
+        let f =
+            Flight::new(&[(0.0, 0.0, 100.0), (0.0, 0.0, 100.0), (0.0, 200.0, 300.0)], 1000)
+                .unwrap();
+        assert!((f.at(500).0 .2 - 200.0).abs() < 0.01);
+    }
+}

@@ -42,7 +42,7 @@ pub use frames::{
     CastBarView, InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
     QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
     MapMarker, MapPatch, MapView, MarkerKind, MinimapTile, MinimapView, QuestgiverView,
-    SpellbookEntry, TrainerRow, TrainerRowState, TrainerView, UnitView,
+    SpellbookEntry, TaxiRow, TaxiView, TrainerRow, TrainerRowState, TrainerView, UnitView,
 };
 pub use layout::{default_path, CharacterBars, ElementId, Profile};
 pub use style::{Color, PowerType, Style};
@@ -161,6 +161,9 @@ pub struct HudData<'a> {
     /// and questgiver windows -- and unlike them it can be open *beside* a
     /// questgiver's scroll, because a class trainer usually carries both bits.
     pub trainer: Option<&'a frames::TrainerView>,
+    /// The open flight master's list, or `None`. Existence is the flag, like
+    /// the trainer and loot windows.
+    pub taxi: Option<&'a frames::TaxiView>,
     /// The world map, or `None` when it is shut. Existence is the flag, as it
     /// is for the spellbook and the bag window.
     ///
@@ -262,6 +265,11 @@ pub struct HudResponse {
     /// malformed request, so an inert row reports nothing at all rather than
     /// reporting a click the caller would have to remember to ignore.
     pub learn_spell: Option<u32>,
+    /// A flight was chosen, reported as the **`TaxiNodes` id** rather than a
+    /// row position -- the list is filtered per character by the known-node
+    /// mask, so a position names a different place to two readers standing at
+    /// the same flight master.
+    pub fly_to: Option<u32>,
     /// A party row was clicked, reported as the member's **guid** rather than
     /// as the row's position -- the same reasoning as [`Self::selected_quest`]
     /// carrying a quest id. The list is rebuilt from every group list the
@@ -587,6 +595,7 @@ impl Hud {
             let quest_log_placeholder;
             let questgiver_placeholder;
             let trainer_placeholder;
+            let taxi_placeholder;
             let world_map_placeholder;
             let minimap_placeholder;
             let release_prompt_placeholder;
@@ -678,6 +687,14 @@ impl Hud {
                     None if editing => {
                         questgiver_placeholder = frames::questgiver::placeholder();
                         Content::Questgiver(&questgiver_placeholder)
+                    }
+                    None => continue,
+                },
+                ElementId::Taxi => match data.taxi {
+                    Some(view) => Content::Taxi(view),
+                    None if editing => {
+                        taxi_placeholder = frames::taxi::placeholder();
+                        Content::Taxi(&taxi_placeholder)
                     }
                     None => continue,
                 },
@@ -802,6 +819,9 @@ impl Hud {
                 Content::Trainer(view) => {
                     frames::trainer::size(view.rows.len(), &style, element.scale)
                 }
+                Content::Taxi(view) => {
+                    frames::taxi::size(view.rows.len(), &style, element.scale)
+                }
                 // The one frame whose size ignores its contents entirely:
                 // the page's shape is fixed by the art, not by what is on it.
                 Content::WorldMap(_) => frames::world_map::size(&style, element.scale),
@@ -893,6 +913,7 @@ impl Hud {
                             | Content::QuestLog(_)
                             | Content::Questgiver(_)
                             | Content::Trainer(_)
+                            | Content::Taxi(_)
                             | Content::ReleasePrompt(_)
                             | Content::Bags(_)
                             | Content::Party(..)
@@ -995,6 +1016,13 @@ impl Hud {
                             response.rect,
                             &view.greeting,
                             &view.rows,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Taxi(view) => frames::taxi::draw(
+                            &painter,
+                            response.rect,
+                            view,
                             &style,
                             element.scale,
                         ),
@@ -1146,6 +1174,27 @@ impl Hud {
                                 // wrong item -- silently, since nothing
                                 // acknowledges the request.
                                 response_out.take_loot = rows.get(row).map(|row| row.take);
+                            }
+                        }
+                    }
+                }
+                (false, Content::Taxi(view)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            // The node id, carried from the row. Every row
+                            // here is flyable -- the caller filtered against
+                            // the server's mask -- so unlike the trainer
+                            // window there is no inert state to hit-test
+                            // around.
+                            if let Some(row) = frames::taxi::row_at(
+                                drawn_rect,
+                                view.rows.len(),
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                response_out.fly_to =
+                                    view.rows.get(row).map(|row| row.node);
                             }
                         }
                     }
@@ -1529,6 +1578,13 @@ impl Hud {
                         // where there is one, and the placeholder otherwise,
                         // so re-anchoring cannot size a frame differently
                         // from how the loop above painted it.
+                        ElementId::Taxi => frames::taxi::size(
+                            data.taxi
+                                .map(|view| view.rows.len())
+                                .unwrap_or_else(|| frames::taxi::placeholder().rows.len()),
+                            &style,
+                            scale,
+                        ),
                         ElementId::Trainer => frames::trainer::size(
                             data.trainer
                                 .map(|view| view.rows.len())
@@ -1624,6 +1680,7 @@ enum Content<'a> {
     QuestLog(&'a [frames::QuestLogEntry]),
     Questgiver(&'a frames::QuestgiverView),
     Trainer(&'a frames::TrainerView),
+    Taxi(&'a frames::TaxiView),
     WorldMap(&'a frames::MapView),
     Minimap(&'a frames::MinimapView),
     ReleasePrompt(&'a frames::ReleasePromptView),
@@ -3736,6 +3793,11 @@ mod tests {
             ElementId::Questgiver => {
                 frames::questgiver::size(&frames::questgiver::placeholder(), &profile.style, scale)
             }
+            ElementId::Taxi => frames::taxi::size(
+                frames::taxi::placeholder().rows.len(),
+                &profile.style,
+                scale,
+            ),
             ElementId::Trainer => frames::trainer::size(
                 frames::trainer::placeholder().rows.len(),
                 &profile.style,

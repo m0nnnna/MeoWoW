@@ -20,6 +20,7 @@ mod model;
 mod scene;
 mod sound;
 mod spells;
+mod taxi;
 mod terrain;
 mod world;
 mod world_object;
@@ -2476,6 +2477,10 @@ struct App {
     items: items::Items,
     /// World map pages and their art.
     maps: maps::Maps,
+    /// The flight network from the client's own tables. Loaded once: three
+    /// DBCs that never change, and the answer to "where can I fly" is a
+    /// lookup rather than a scan.
+    taxi_network: taxi::Network,
     /// How far the minimap sees, in world units across the disc.
     ///
     /// **Live state seeded from the style, and deliberately not written back**
@@ -2600,6 +2605,19 @@ struct App {
     /// Cleared by the questgiver window's Close button, since the same click
     /// opened both, and replaced whenever another NPC is greeted.
     trainer: Option<TrainerSession>,
+    /// The taxi flight currently being flown, or `None`.
+    ///
+    /// **While this is `Some`, the server owns the character's position** and
+    /// this client's whole movement path stands down -- see
+    /// [`App::drive_live_movement`], which returns early rather than applying
+    /// input, collision, ground height or buoyancy. That is deliberately a
+    /// replacement rather than a set of exceptions: a flight is a different
+    /// mode of being, and adding `&& flight.is_none()` to five separate
+    /// conditions is how one of them gets missed.
+    flight: Option<ActiveFlight>,
+    /// The flight master currently being talked to, and its menu once it
+    /// arrives. Existence is the flag, like the trainer's.
+    taxi: Option<TaxiSession>,
     /// When the quest cache was last written.
     ///
     /// **Saving only on a clean exit is not enough**, and the failure is
@@ -3047,6 +3065,34 @@ enum Line {
 /// client rather than two that could disagree. See
 /// `world::quest::parse_questgiver_details` for why the questgiver's own text
 /// packets are read for their quest id and nothing else.
+/// An open conversation with a flight master.
+///
+/// Holds the **menu as sent**, for the reason the trainer session does:
+/// the known-node mask and the departure node were both decided by the
+/// server for this character and neither can be recomputed here. The
+/// departure node in particular is one the client would get *wrong* --
+/// live, the server named a node 573 units away where the nearest is 150.
+struct TaxiSession {
+    npc: u64,
+    /// `None` between the request and the reply.
+    menu: Option<::world::TaxiMenu>,
+}
+
+/// A taxi flight in progress.
+///
+/// The route and the clock are kept apart on purpose: [`::world::Flight`] is
+/// pure geometry and is unit-tested without a window, and the only thing this
+/// wrapper adds is *when it started*, which is the one part that needs a
+/// running program.
+struct ActiveFlight {
+    route: ::world::Flight,
+    started: Instant,
+    /// What the character was facing when it took off, so the landing can put
+    /// it back rather than leaving it pointing along the last leg. Cheap to
+    /// keep and impossible to recover afterwards.
+    orientation_before: f32,
+}
+
 /// An open conversation with a trainer.
 ///
 /// Holds the **parsed list as sent** rather than a rebuilt view, which is the
@@ -3184,6 +3230,7 @@ impl App {
         // finished logging in, and the arrow simply has nowhere to be yet.
         let mut chain = chain;
         let maps = maps::Maps::load(&mut chain);
+        let taxi_network = taxi::Network::load(&mut chain);
         // Read at startup for the same reason: 1.5MB of text naming every
         // tile's picture, which does not depend on the server and would
         // otherwise be parsed on the frame the player first looks at it.
@@ -3257,6 +3304,7 @@ impl App {
             spellbook_open: false,
             items: items::Items::default(),
             maps,
+            taxi_network,
             minimap,
             map_open: false,
             objectives: maps::Objectives::default(),
@@ -3291,6 +3339,8 @@ impl App {
             quest_saved_at: Instant::now(),
             questgiver: None,
             trainer: None,
+            flight: None,
+            taxi: None,
             looting: None,
             own_corpse_query_sent: false,
             modifiers: Default::default(),
@@ -4489,9 +4539,68 @@ impl App {
         )
     }
 
+    /// Moves the character along the server's spline, and reports whether a
+    /// flight is in progress at all.
+    ///
+    /// Returns `true` while flying, which is what makes
+    /// [`Self::drive_live_movement`] stand down wholesale.
+    ///
+    /// **Landing restores the pre-flight facing** rather than leaving the
+    /// character pointing along the last leg of the route. Not cosmetic: the
+    /// final leg is usually a descent into a landing pad from whatever
+    /// direction the route happened to arrive, and a character left facing
+    /// that way has been silently turned by something the player did not do.
+    fn advance_flight(&mut self) -> bool {
+        let Some(flight) = self.flight.as_ref() else {
+            return false;
+        };
+        let Some(live) = self.live.as_mut() else {
+            // No connection: nothing to fly. Dropped rather than held, since
+            // a flight resumed against a different session would be moving a
+            // character the server has different ideas about.
+            self.flight = None;
+            return false;
+        };
+
+        let elapsed = flight.started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        let ((x, y, z), heading) = flight.route.at(elapsed);
+        live.position.x = x;
+        live.position.y = y;
+        live.position.z = z;
+        live.orientation = heading;
+
+        if flight.route.finished(elapsed) {
+            tracing::info!("landed at {x:.1}, {y:.1}, {z:.1}");
+            live.orientation = flight.orientation_before;
+            self.flight = None;
+        }
+        true
+    }
+
     fn drive_live_movement(&mut self) {
         use ::world::update::movement_flags;
         use ::world::{ClientOpcode, MovementInfo, Position};
+
+        // **A flight replaces this function rather than modifying it.**
+        //
+        // The tempting shape is to guard the individual writes -- `if
+        // self.flight.is_none()` beside the ground assignment, and again
+        // beside the input, and again beside the jump. That is how 4.18's
+        // swimming bug happened: `position.z = ground` was correct and
+        // unconditional for four milestones, a second thing started writing
+        // the same field, and the assignment quietly undid it every frame.
+        // The lesson recorded then was to find *every* unconditional write to
+        // a field that now has to persist -- and the reliable way to do that
+        // is to not run any of them.
+        //
+        // So a flight returns before turning, input, collision, ground
+        // height, buoyancy and the jump arc, and none of them acquire a new
+        // condition. Nothing is reported to the server either: a movement
+        // packet is the client's statement about itself, and while the server
+        // is flying the character that statement is not the client's to make.
+        if self.advance_flight() {
+            return;
+        }
 
         let Some(live) = self.live.as_mut() else {
             return;
@@ -6466,6 +6575,7 @@ impl App {
         // no longer considers open -- refused in silence, which is the one
         // failure this client cannot diagnose.
         self.trainer = None;
+        self.taxi = None;
 
         // **A trainer is asked in the same breath as it is greeted**, and the
         // flag is what decides. `UNIT_NPC_FLAGS` bit `0x10` is replicated, so
@@ -6484,6 +6594,25 @@ impl App {
         // does not mean enough. So an unanswered request leaves the window
         // open and empty rather than counting as an error, and the window
         // says which silence it is showing.
+        // **A flight master is asked in the same breath as it is greeted**,
+        // exactly like a trainer and off the same replicated flag word.
+        // Dungar Longdrink, a Gryphon Master, carries 0x2003 and answers.
+        const FLIGHTMASTER: u32 = 0x2000;
+        let flies = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.get(guid))
+            .and_then(|entity| entity.npc_flags())
+            .is_some_and(|flags| flags & FLIGHTMASTER != 0);
+        if flies {
+            if let Some(live) = self.live.as_mut() {
+                match live.connection.taxi_query_nodes(guid) {
+                    Ok(()) => self.taxi = Some(TaxiSession { npc: guid, menu: None }),
+                    Err(e) => tracing::warn!("asking {guid:#x} for flights failed: {e:#}"),
+                }
+            }
+        }
+
         if self.offers_training(guid) {
             if let Some(live) = self.live.as_mut() {
                 match live.connection.trainer_list(guid) {
@@ -6862,6 +6991,10 @@ impl App {
         // gossip messages above use -- the connection is borrowed for the
         // whole loop, so nothing inside it may touch `self` again.
         let mut trainer_lists: Vec<::world::TrainerList> = Vec::new();
+        let mut taxi_menus: Vec<::world::TaxiMenu> = Vec::new();
+        let mut refusals: Vec<u32> = Vec::new();
+        // A spline the server sent for *this* character. See the arm below.
+        let mut own_spline: Option<::world::update::MonsterMove> = None;
         // Whether a spell was learned this drain, so the list can be re-asked
         // once the packet loop is done with the connection. A `bool` rather
         // than a count: several successes in one drain still want exactly one
@@ -7146,6 +7279,75 @@ impl App {
                         // character's reputation discount -- was decided by
                         // the server for this character at this moment, and
                         // the client cannot recompute any of it.
+                        // **The server moving this client's own character**,
+                        // which had never happened before flight paths. A
+                        // busy zone carries hundreds of these per drain and
+                        // `WorldState::replicate` already parses every one,
+                        // so the cheap prefix test comes first and only a
+                        // packet that is actually about us is parsed again.
+                        ::world::opcode::server::MONSTER_MOVE
+                            if ::world::update::monster_move_is_about(&packet.body, live.guid) =>
+                        {
+                            match ::world::update::parse_monster_move(&packet.body) {
+                                // **Two points minimum, and the path rather
+                                // than the endpoints.** A flight's route is
+                                // its intermediates; a spline with one point
+                                // or none is some other kind of server nudge
+                                // and must not be flown.
+                                Ok(mv) if mv.path.len() >= 2 && mv.duration > 0 => {
+                                    tracing::info!(
+                                        "the server is moving this character along {} point(s) over {}ms",
+                                        mv.path.len(),
+                                        mv.duration
+                                    );
+                                    own_spline = Some(mv);
+                                }
+                                Ok(mv) => tracing::debug!(
+                                    "a move for this character carried {} point(s) over {}ms --                                      not a route, ignored",
+                                    mv.path.len(),
+                                    mv.duration
+                                ),
+                                Err(error) => {
+                                    tracing::warn!("a move for this character would not parse: {error}")
+                                }
+                            }
+                        }
+                        ::world::opcode::server::SHOW_TAXI_NODES => {
+                            match ::world::taxi::parse_taxi_menu(&packet.body) {
+                                Ok(menu) => {
+                                    tracing::debug!(
+                                        "flight master {:#018x} at node {}, {} node(s) known",
+                                        menu.npc,
+                                        menu.current_node,
+                                        menu.count()
+                                    );
+                                    taxi_menus.push(menu);
+                                }
+                                Err(error) => {
+                                    tracing::warn!("a taxi menu would not parse: {error}")
+                                }
+                            }
+                        }
+                        ::world::opcode::server::ACTIVATE_TAXI_REPLY => {
+                            match ::world::taxi::parse_activate_reply(&packet.body) {
+                                // **The refusal is worth surfacing and the
+                                // acceptance is not.** A flight that works
+                                // announces itself by the character leaving
+                                // the ground; one that is declined produces
+                                // nothing a player can see, which reads as
+                                // the click having missed.
+                                Ok(::world::TaxiReply::Ok) => {
+                                    tracing::debug!("the flight was accepted")
+                                }
+                                Ok(::world::TaxiReply::Refused(code)) => {
+                                    tracing::info!("the flight was refused, code {code}");
+                                    refusals.push(code);
+                                }
+                                Err(error) => {
+                                    tracing::warn!("a taxi reply would not parse: {error}")
+                                }
+                            }
+                        }
                         ::world::opcode::server::TRAINER_LIST => {
                             match ::world::trainer::parse_trainer_list(&packet.body) {
                                 Ok(list) => {
@@ -7316,6 +7518,65 @@ impl App {
                 None => tracing::debug!(
                     "a trainer list for {:#018x} arrived with no window open for it",
                     list.trainer
+                ),
+            }
+        }
+
+        // Filed by guid, like the trainer's: two flight masters can be in
+        // reach and a menu filed against the wrong one would send its
+        // flights from a node the player is not standing at.
+        for menu in taxi_menus {
+            match self.taxi.as_mut().filter(|s| s.npc == menu.npc) {
+                Some(session) => session.menu = Some(menu),
+                None => tracing::debug!(
+                    "a taxi menu for {:#018x} arrived with no window open",
+                    menu.npc
+                ),
+            }
+        }
+        for code in refusals {
+            // Raw, never named. See `world::taxi::TaxiReply`.
+            self.chat.push(Line::Chat(local_notice(format!(
+                "The flight was refused (code {code})."
+            ))));
+        }
+
+        // **Taking off.** Done here rather than in the packet loop for the
+        // usual reason -- the connection is borrowed for the whole of it --
+        // and the orientation is captured *before* anything else touches the
+        // character, since it cannot be recovered once the flight starts.
+        if let Some(mv) = own_spline {
+            let points: Vec<(f32, f32, f32)> =
+                mv.path.iter().map(|p| (p.x, p.y, p.z)).collect();
+            match ::world::Flight::new(&points, mv.duration) {
+                Some(route) => {
+                    tracing::info!(
+                        "taking off: {} points, {:.0} units, {}ms",
+                        route.points(),
+                        route.length(),
+                        route.duration_ms()
+                    );
+                    self.flight = Some(ActiveFlight {
+                        route,
+                        started: Instant::now(),
+                        orientation_before: live.orientation,
+                    });
+                    // A flight cancels every local motion state. None of
+                    // these survive being put on a gryphon, and a jump arc
+                    // still running would fight the spline for the altitude.
+                    self.jump = None;
+                    self.swimming = None;
+                    self.autorun = false;
+                }
+                // Refused rather than half-flown. `Flight::new` rejects a
+                // route with no length or no duration, and pretending to fly
+                // one would pin the character at a single point for its
+                // duration -- which reads as a freeze, not as a declined
+                // packet.
+                None => tracing::warn!(
+                    "a spline for this character described no flyable route ({} points, {}ms)",
+                    points.len(),
+                    mv.duration
                 ),
             }
         }
@@ -8054,6 +8315,33 @@ impl App {
             }
         });
 
+        // The flight master's list. Needs no renderer -- there are no icons
+        // -- but it is built here beside the trainer's so that every window
+        // fed from an NPC conversation is assembled in one place.
+        //
+        // **The names and prices come from the client's tables and the
+        // filtering from the server's mask**, and neither could do the
+        // other's job: the wire sends no names, and the tables cannot know
+        // where this character has been.
+        let taxi_view: Option<ui::TaxiView> = self.taxi.as_ref().map(|session| {
+            let Some(menu) = session.menu.as_ref() else {
+                return ui::TaxiView::default();
+            };
+            ui::TaxiView {
+                here: self
+                    .taxi_network
+                    .name(menu.current_node)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("Node {}", menu.current_node)),
+                rows: self
+                    .taxi_network
+                    .destinations(menu.current_node, menu)
+                    .into_iter()
+                    .map(|d| ui::TaxiRow { node: d.node, name: d.name, cost: d.cost })
+                    .collect(),
+            }
+        });
+
         // Built here rather than beside the other windows below because it
         // needs the renderer to upload its tiles, and the borrow of that has
         // to end before anything reads `self` whole.
@@ -8538,6 +8826,7 @@ impl App {
                     // is on screen exactly while a conversation is open.
                     questgiver: questgiver_view.as_ref(),
                     trainer: trainer.as_ref(),
+                    taxi: taxi_view.as_ref(),
                     // `None` when shut, like the spellbook and the log.
                     world_map: map_view.as_ref(),
                     // No flag: a minimap is never opened or shut.
@@ -8732,6 +9021,32 @@ impl App {
             self.selected_quest = (self.selected_quest != Some(quest)).then_some(quest);
         }
 
+        // A destination was chosen. **Both node ids come from the server**:
+        // the destination from the row (a `TaxiNodes` id, not a position),
+        // and the departure from the menu the server sent. Recomputing the
+        // latter from the player's position is the one mistake this request
+        // invites, and it is wrong in the field rather than in theory --
+        // live, the server named a departure node 573 units away when a
+        // nearer one sat 150 units off.
+        if let Some(node) = hud_response.fly_to {
+            let asked = self
+                .taxi
+                .as_ref()
+                .and_then(|s| s.menu.as_ref().map(|m| (s.npc, m.current_node)));
+            match (asked, self.live.as_mut()) {
+                (Some((npc, from)), Some(live)) => {
+                    tracing::info!("buying a flight from node {from} to node {node}");
+                    if let Err(e) = live.connection.activate_taxi(npc, from, node) {
+                        tracing::warn!("buying a flight failed: {e:#}");
+                    }
+                }
+                // Logged rather than ignored: a click that reached the frame
+                // and produced no send is the shape that reads as a broken
+                // window.
+                _ => tracing::warn!("a flight was chosen with no menu open"),
+            }
+        }
+
         // A trainer row was clicked. The window only reports rows it said were
         // learnable, so nothing here re-checks that -- and nothing here
         // *invents* a spell id either: it is carried from the row, because the
@@ -8795,6 +9110,7 @@ impl App {
             // an NPC the player has walked away from -- which the server
             // refuses in silence, the one failure this client cannot explain.
             self.trainer = None;
+            self.taxi = None;
         }
 
         // Clicking a party row targets that member. **A guid, not a row** --
