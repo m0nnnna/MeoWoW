@@ -6457,6 +6457,16 @@ The second is the window **closing itself**. The server re-checks the reach on
 every mail request and refuses by doing nothing at all, so a window that
 outlived the walk away would be one whose clicks vanish. Walking off closes it.
 
+**And the realm's own database agrees, which is the half a window cannot
+show.** After the run, mail 18 held `money 0` where it had held 12,345 and
+`checked 1`; mail 19 held no items where it had held two stacks, and `checked
+1`; and `Testwolf`'s purse read 430,406 against 418,061 before -- exactly
+12,345 more, to the copper. Mail 20, the emptied letter, is still `checked 0`:
+the click that did nothing genuinely sent nothing, which is the *refusal*
+confirmed from a second source rather than from the absence of a visible
+change. A window drawing a row grey and a client that had quietly marked it
+read look identical on screen.
+
 Unlike 4.26, the first live run found nothing. That is not extra care -- it is
 that 4.26's lesson was applied before the test rather than after it: the
 gesture is named on screen in a line under the list, and the room for that line
