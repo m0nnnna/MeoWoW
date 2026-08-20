@@ -155,6 +155,28 @@ cargo run -p wow-cli -- --data "<path>/Data" info
 Set `WOW_DATA` to avoid passing `--data` every time. If your source tree lives
 on a network share, see [docs/BUILDING.md](docs/BUILDING.md).
 
+## Releases
+
+Prebuilt Windows binaries (`wow-viewer.exe`, `wow-cli.exe`) are attached to
+each [GitHub Release](https://github.com/m0nnnna/MeoWoW/releases) as a zip --
+no build toolchain required, and, per the design commitments above, no game
+assets inside it either. Unzip it, point `wow-viewer.exe` at your own `Data`
+folder from its sign-in screen (or pass `--data`), and go.
+
+**Cutting a new release** (maintainers): push a tag matching `v*.*.*`, e.g.
+
+```console
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` picks that up, runs the same zero-warning
+build and full test suite this project holds itself to, packages both
+binaries plus the README into a zip, and publishes it as a GitHub Release with
+auto-generated notes. A tag is the only trigger that publishes; the workflow
+can also be run by hand from the Actions tab (`workflow_dispatch`) to sanity
+check the build without cutting a real release.
+
 ## Design commitments
 
 These are the constraints the project holds itself to; they are the reason it
