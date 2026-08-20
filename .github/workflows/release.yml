@@ -9,6 +9,9 @@ name: Release
 # workflow_dispatch lets one be cut on demand from the Actions tab without
 # needing a tag at all, which is the only way to test this workflow before
 # the project's first real tag exists.
+permissions:
+  contents: write
+
 on:
   push:
     tags:
