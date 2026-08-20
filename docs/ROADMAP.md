@@ -7481,3 +7481,330 @@ spellbook cannot eat a click meant for the tracker.
   so a quest not yet accepted has a questgiver pin and no objective ring. That
   is the wire's limit rather than this client's, and it is the exact boundary
   the shipped-database decision drew.
+
+## 4.32: a way in, and the flag that keeps every probe working
+
+Everything above this line was reachable only by somebody who already knew the
+command line. That is exactly the right shape for a probe — a run that names
+its own conditions is a run that reproduces — and it is the wrong shape for a
+person, and it was the last thing standing between this client and something a
+friend could be handed.
+
+So: `wow-viewer` with no arguments asks. Double-clicking counts, which is the
+whole test this milestone had to pass.
+
+### The hard part was not the screen
+
+It was not breaking the other way in.
+
+Thirty-odd probes in this document begin `wow-viewer --creature 1216` or
+`wow-viewer --realm-host ... --user ... --character ...`, and each is a claim
+somebody may want to re-run in two years. A client that stopped to ask would
+turn every one of them into a login panel waiting forever for a keystroke, in
+CI as readily as at a desk — and it would do it *silently*, because a window
+that is up and waiting looks exactly like a window that is working.
+
+`Args::is_self_contained` is the whole decision, and it is three answers rather
+than one flag:
+
+* `--texture`, `--model`, `--creature`, `--wmo` or `--map` each name something
+  to draw off disk. Complete on its own.
+* `--realm-host` **and** `--user` **and** `--character` name a session.
+  Complete only together.
+* Anything less — including the bare double-click this milestone exists for —
+  falls through to asking, with whatever *was* given already filled in.
+
+Both halves are asserted, because each fails invisibly to the other. Too eager
+and the probes hang; too shy and a double-click opens a fireball icon nobody
+asked for, which is what the viewer did with no arguments for four phases.
+
+That third bullet is the part worth keeping. `--realm-host 127.0.0.1 --user
+OWC33` is not enough to skip the screen and is not an error either: it is two
+of the screen's three questions, already answered, and making somebody retype
+what they just typed would be absurd.
+
+### `--data` had to become optional, and that is what made the rest possible
+
+The archive chain was opened in `main` before the event loop, from a required
+flag. A settings panel that supplies a data directory cannot live downstream of
+that.
+
+So the chain starts **empty** — `Chain::new()` — and is opened when somebody
+says where. The surprise was how little else had to change: `maps`, `taxi`,
+`minimap` and the new name tables all already tolerated a file that would not
+read, because that is what makes an install missing an optional table a client
+that draws less rather than one that will not start. An empty chain needed no
+new case, only a `reload_tables` to re-read them when the directory changes.
+
+**`Chain::open_wow_data` answers `Ok` for a directory holding no archives at
+all**, and correctly: no two installs carry the same set of optional patches,
+so a missing member is skipped rather than refused. That is fine for a flag
+typed by somebody who knows what a `Data` folder is, and it is exactly the
+mistake a folder picker makes easy — choosing the install's root instead of the
+`Data` inside it. `open_data` therefore *reads* `Map.dbc` and reports what the
+directory is not.
+
+**Reading, not listing**, and that distinction is already written down here: an
+MPQ resolves by hash, so a coverage check built on `wow-cli ls` once claimed
+0.1% of the baked NPC textures shipped while forty random names by path got
+forty hits. A directory listing would answer a question about filenames. The
+question being asked is whether the archives hold the game.
+
+### Three steps where there had been one
+
+`live::connect` logged in, picked a realm, found a character and entered the
+world in one call. A screen that shows a realm list and then a character list
+has to be able to stop between each, so it became:
+
+| | |
+|---|---|
+| `authenticate` | the logon exchange, and the realm list |
+| `open_realm` | the world handshake, and the character list |
+| `enter` | into the world, and the login burst |
+
+`connect` is now those three composed, making both choices from the command
+line, so the probe path and the screen path build the same world through the
+same code — `world_for_live` is one function for the same reason.
+
+**`open_realm` returns the connection still open**, and it must. The header
+cipher's RC4 state cannot be shared or rewound, so the socket that read the
+character list is the only one that can enter the world with that session. This
+is the same fact that keeps `LiveWorld::connection` alive rather than dropping
+it at the end of `connect`; it is just now visible in a signature.
+
+### The logon exchange runs on a thread, and not for speed
+
+It is three round trips. What put it on a thread is that **the common way to
+get it wrong is a hostname that resolves to nothing**, and that spends the full
+ten-second timeout. Ten seconds of blocked event loop is a window Windows
+paints grey and offers to kill — which would be the first thing a new user saw
+after their first typo, and it looks like a crash rather than like a mistake.
+
+Everything after the character list is still synchronous. Entering the world
+reads the archives, which the render thread owns anyway.
+
+### Two habits this crate has, inverted
+
+Everything else `crates/ui` draws is a *second view of something already on the
+wire*: `HudData` is rebuilt from the world every frame precisely so nothing in
+the interface can go stale without the world going stale with it.
+
+The sign-in screen is the opposite in both directions, and both are worth
+naming:
+
+* **It is not an `Element`.** No anchor, no offset, no scale. It is drawn
+  centred on an empty window, and the layout editor that would drag it around
+  cannot be opened until it has been dismissed. `login_width` and `login_row`
+  are the whole of its geometry.
+* **It holds state.** A half-typed password has no world to be rebuilt from.
+
+What did **not** change is the split that matters. `crates/ui` still opens no
+sockets and reads no archives: the panel emits a `login::Action` — *sign in*,
+*choose row 3*, *set the neko theme*, *ask the operating system for a folder* —
+and `apps/viewer/src/signin.rs` does all of it. Which is why the panel's
+geometry, its focus ring, its refusals and its clicks are all tested without a
+connection or a GPU.
+
+### Geometry stated once, and controls that decline to answer
+
+`SignIn::panel` builds a list of items each carrying its rectangle; the drawing
+walks that list and so does the hit test. That is the party invite's lesson
+applied before it could bite again — two separately computed rectangles a few
+pixels apart leave a press between them answering nothing — and this panel has
+nine controls where the invite prompt had two. A test asserts no two items
+overlap, in every stage.
+
+**A control that cannot act does not answer.** An offline realm, a character
+the server would demand be renamed, and a greyed-out *Enter World* all return
+`None` from the hit test, exactly as `row_at` does in every list frame here.
+The alternative ships a request the server declines in silence — and in this
+particular frame it is worse than that, because a realm flagged offline costs
+the full ten-second timeout to be told what its own flag already said.
+
+### What it will not do
+
+**It creates no characters**, and the panel says so under the list rather than
+leaving a gap somebody has to guess about.
+
+That is a decision, not a shortfall. Character creation is a race and class
+list, an appearance picker driven by tables this client reads for other
+reasons, a name-validity dialogue, and a server verdict carrying a dozen
+refusal codes — and every one of those codes is a *string* nobody here has
+verified. This project already has a rule for exactly that shape:
+`describe_cast_failure` names the one status it has observed and returns the
+raw number for everything else, because a wrong offset eventually fails loudly
+and a wrong *name* never does. Twelve invented refusal strings on the screen
+where a person names a character is that mistake at its most expensive.
+
+The original client does it correctly today.
+
+### The password
+
+Never written to disk. Not as a setting, not obfuscated, not behind a
+"remember me": `login::Settings` has no field for it.
+
+The test asserts on the **serialised text** rather than on the struct, and the
+difference is the point — the struct not having the field is what a reviewer
+sees, and the bytes are what a person's disk gets. It checks that neither the
+password nor the word appears anywhere in the TOML.
+
+Everything else is remembered, in `%APPDATA%\open-wow\login.toml`. **A separate
+file from `ui.toml`**, deliberately: that one is the interface's layout, the
+thing a person hand-edits and shares, and merging them would mean somebody
+swapping layouts also swapped which account they sign in as.
+
+### Themes, and why none of them is recorded anywhere
+
+Four palettes: `slate` — what this client has always looked like, and still the
+default, because a theme system whose arrival silently repainted everybody's
+client is a theme system nobody asked for — plus `neko`, `void` and `calico`.
+
+**A theme is not an overlay.** Choosing one *writes its colours into
+`ui.toml`*. That follows directly from `Profile`'s own rule, written long
+before this milestone: there is no second set of defaults the file only partly
+overrides, because a user who cannot see why their change had no effect
+concludes the feature is broken. A theme living in the file as a name and
+supplying colours from underneath would be precisely that hidden second set.
+
+The consequence is the interesting half: **nothing stores which theme is in
+force.** `Theme::of` answers by comparing the style against each palette, so
+after a hand edit the answer is honestly `None` and the settings panel
+highlights nothing at all. A "closest match" would keep naming a theme after
+every colour in it had been changed — a label that stops meaning anything at
+the moment it starts mattering. Same call the tracker makes about a quest with
+no distance, and `describe_cast_failure` about an unconfirmed status code: **a
+number nobody can check is worse than a blank.**
+
+A theme sets colours and never dimensions, and a test says so. Resetting how
+wide somebody's chat frame is because they liked a different pink is not
+theming.
+
+### `ChrClasses.dbc` and `ChrRaces.dbc`, and two strings that are not the name
+
+A character list reading `Testwolf` and `Level 12` is thin. `Level 12 Human
+Warrior — Northshire Valley` needs three lookups, and two of the tables had
+never been transcribed.
+
+Both are small and both were read the way everything here is read — off the
+data, with the name as the check, because **a name is the one thing in a binary
+format that cannot be a coincidence.** What made `ChrClasses` worth writing up
+is that it contains *two other strings*, both plausible and both wrong:
+
+| field | holds | looks like |
+|---|---|---|
+| 3 | `PET`, `DEMON` | a name |
+| 4 | `Warrior`, `Death Knight` | the name |
+| 55 | `WARRIOR`, `DEATHKNIGHT` | a name |
+
+Field 3 is a pet name token and field 55 is the uppercase filename the original
+client keys by. Either would dump cleanly, parse cleanly, and put `PET` or
+`WARRIOR` on a screen a person reads. `wow-cli dbc info` guessed the localised
+block started at 3, because a string sits there and the heuristic cannot tell a
+lone string from the first slot of a `loc`.
+
+The arithmetic settles it independently of the text, which is what makes it
+worth stating rather than eyeballing: a `loc` block is sixteen locale slots and
+a flags word, so a mask at 20 places its first slot at **4** — exactly as the
+masks at 37 and 54 place the female and male name blocks that follow it. Three
+blocks, three masks, one spacing.
+
+`ChrRaces` reads the same way: its mask sits at 30, so its names start at 14.
+Verified against the reference install — `Warrior`…`Druid`, `Human`…`Ice
+Troll`, with human male display id **49**, which is the number this renderer
+has been drawing since 3.5 and had no way of getting wrong.
+
+**Every part of the line is omitted rather than guessed when its table is
+missing.** A client pointed at an install whose `ChrRaces.dbc` will not read
+says `Level 12 Warrior`, not `Level 12 Race 4 Warrior`.
+
+### The icon, drawn in one file compiled twice
+
+`src/icon_art.rs` uses nothing but `std` and knows about neither `winit` nor
+the ICO format. The viewer compiles it as a module, for the window's icon;
+`build.rs` pulls it in with `include!`, for the `.ico` in the executable's
+resource table. A build script cannot depend on the crate it is building, and
+two hand-drawn cats that drifted apart would be worse than one.
+
+Procedural for the same reason every frame in `crates/ui` is painted from
+explicit geometry: **no art file enters this tree**, it renders at whatever
+size is asked for, and the colours are the neko theme's own. Three samples per
+axis, because at sixteen pixels — which is what a taskbar asks for — a
+hard-edged circle with a triangle on it is a stack of steps.
+
+Two details in the container that fail silently if missed. An ICO directory
+entry stores each dimension in **one byte**, so 256 is written as zero. And a
+`BITMAPINFOHEADER` inside an icon states **twice** the real height, because it
+describes the colour rows and the mask rows as one image; writing the true
+height there is the classic way to produce an icon that draws its bottom half
+over its top. Both are asserted.
+
+A missing `rc.exe` is a `cargo:warning`, not a failed build. A client that will
+not compile because a decoration could not be attached would be the wrong trade
+by a wide margin.
+
+### The clear pass, which is not a detail
+
+With no scene, **nothing writes the colour target** — and the egui pass loads
+it. `LoadOp::Load` over a surface nothing has written is whatever the driver
+last had there: a panel floating over garbage, intermittently, on some machines
+and not others. `paint_sign_in` clears.
+
+Near-black rather than the panel's own colour, so the panel has an edge.
+
+### Two instruments that lied, and what they taught
+
+**A headless click test needs more passes than a headless draw test.** egui
+matches a press against the widget rectangles from the pass *before* it, so on
+a fresh context the first press lands on nothing. Two passes is right for
+asserting what was painted and wrong for asserting what was clicked: written
+with two, the click test reported the panel's **initial state** for every
+control and read exactly like a hit test that was simply wrong. Four. The HUD's
+own harness already carried the split, and said why, in a comment about
+tooltips.
+
+**`mem::zeroed` on a wire struct holding a `String` takes the whole test binary
+down.** A zeroed `String` is a null pointer wearing a `String`'s shape, and the
+`Vec` behind it must be non-null. `wow-viewer`'s tests died with
+`STATUS_STACK_BUFFER_OVERRUN` and *no failing test name*, which reads as a
+harness or toolchain fault rather than as one line in one fixture. The compiler
+had warned — `invalid_value`, in the same output as the crash. Wire structs
+here have no `Default` on purpose; a fixture that wants one writes the fields
+out.
+
+### Confirmed at the window
+
+Kake ran it with no arguments against the local AzerothCore realm and got in.
+
+That matters more here than in most milestones, because the instrument this
+project usually reaches for cannot see any of it: **`--screenshot` draws no
+HUD**, and it now refuses outright without `--data` rather than rendering a
+plausible empty picture — the failure mode this document has paid for more than
+any other. What the 1,218 green tests cover is the panel's arithmetic, its
+focus ring, its refusals, and — through four tests that drive the real `show`
+in a headless egui context — that something is actually painted and that
+clicking a control does the thing it draws. What they cannot cover is whether
+signing in reaches Northshire. A person had to do that.
+
+### Still not done
+
+* **No character creation.** The decision above, not an oversight.
+* **No character deletion either**, for the same reason and with less of an
+  argument: deletion is one opcode and one confirmation, and it was left out
+  because the screen that cannot make a character has no business being the
+  screen that unmakes one.
+* **The realm list shows what the logon server said and no more.** Population
+  is described in words (`low`, `medium`, `high`) rather than printed, because
+  what the float means numerically is not documented anywhere this project
+  trusts. Timezone and realm kind are parsed and not shown.
+* **No queue handling.** A full realm answers the world handshake differently
+  and this client has never seen one do it.
+* **The settings panel cannot browse to a locale.** It takes `enUS` as text,
+  which is what the command line always took, and nothing enumerates the
+  locale folders actually present in the chosen directory — which is a thing
+  the archives could answer.
+* **A theme cannot be edited from inside the client.** Choosing one writes
+  forty colours into `ui.toml`; changing one of them afterwards is still a text
+  editor. The layout editor moves frames, not palettes.
+* **The window does not go back to the sign-in screen on a disconnect.** A
+  dropped connection still ends the session the way it always did. The screen
+  exists, the state machine that would return to it does not.

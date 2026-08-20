@@ -65,6 +65,14 @@ Two scoping facts that were decided before it started, and held:
   have seen them; that is solved by recording what the client already streams,
   keyed by realm, starting empty.
 
+**4.32 is the way in, and it is confirmed at the window**: `wow-viewer` with no
+arguments opens a sign-in screen, so double-clicking the executable is now the
+ordinary way to start this client. Everything above it was reachable only by
+somebody who already knew the command line — the right shape for a probe and
+the wrong one for a person. **The hard part was not breaking the other way in**;
+see `Args::is_self_contained`, which is what keeps every probe in the roadmap
+reproducible.
+
 **Reading the realm's MySQL is a verification oracle, not a client
 capability** — a player on someone else's server has no DB access, so anything
 built on it works only for realm operators.
@@ -86,7 +94,7 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | Shadows | **A directional shadow map from the sun**, cast by terrain, models and alpha-keyed foliage, received by everything but liquid. One cascade around the camera; `--no-shadows` and `--shadow-dump` are the instruments |
 | Appearance | NPCs, other players and the viewer's own character are all dressed from their replicated fields. Weapons draw and sheathe. No shoulders, helms or ranged weapons on others |
 | Interface | Native, fully customisable, **no addons** — see the decision below. Player/target/party frames, click-to-target, chat, spellbook, action bars per character, `F1` to rearrange, saved to `ui.toml` |
-| Sign-in | **The viewer opens a login screen with no arguments**, so double-clicking it is the ordinary way to start: account, password, server, a folder picker for the `Data` directory, then a realm list and a character list. Remembers everything but the password, in `%APPDATA%\open-wow\login.toml`. **Creates no characters** — the original client does that. Four themes (`slate`, `neko`, `void`, `calico`) that *write their colours into `ui.toml`* rather than sitting under it. Its own cat-head icon, drawn in code, on the window and on the executable |
+| Sign-in | **The viewer opens a login screen with no arguments** — confirmed at the window — so double-clicking it is the ordinary way to start: account, password, server, a folder picker for the `Data` directory, then a realm list and a character list. Remembers everything but the password, in `%APPDATA%\open-wow\login.toml`. **Creates no characters and deletes none** — the original client does that. Four themes (`slate`, `neko`, `void`, `calico`) that *write their colours into `ui.toml`* rather than sitting under it. Its own cat-head icon, drawn in code, on the window and on the executable. No queue handling, no return to the screen after a disconnect |
 | Game | Melee, spells with real tooltips and a cast bar, cooldowns, combat log, corpse and loot end to end, inventory with slot moves, character panel, quests taken and handed in, quest log with progress counters |
 | Map | `M` opens the zone page with the character and quest objectives on it; fills in as explored. **Minimap** in the corner with party dots and objective rings. **Questgiver pins** as diamonds — `!` and `?` told apart, and a *remembered* one drawn faded, because it is a fact about the past. No zoom, panning, continent view or rotation |
 | Tracker | **Always on, no key**, top right under the minimap: five quests of however many, by distance with the finished ones first, each with its objective counters and yards to the nearest marker. States the count in every state. A quest the realm gave no markers for sorts **last, not as zero**, and shows no distance at all |
