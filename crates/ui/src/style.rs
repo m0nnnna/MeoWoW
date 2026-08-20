@@ -471,6 +471,32 @@ pub struct Style {
     pub party_invite_border: Color,
     pub party_invite_accept: Color,
     pub party_invite_decline: Color,
+
+    /// How wide the sign-in panel is. **Not scaled by an element**, and it is
+    /// the one frame here that has no [`crate::element::Element`] at all: it
+    /// is drawn centred, before there is a world to anchor anything against,
+    /// and the layout editor it would be dragged around in cannot be opened
+    /// until after it has been dismissed.
+    pub login_width: f32,
+    /// Height of one field, one list row and one button on that panel. A
+    /// single number because they are the same shape by design: a row of the
+    /// sign-in panel is a box with a word in it whatever the box is for.
+    pub login_row: f32,
+    /// The panel's own backing. Opaque where [`Self::background`] is not,
+    /// because there is nothing behind it worth showing through.
+    pub login_background: Color,
+    /// A field's box, so an empty field still reads as somewhere to type.
+    pub login_field: Color,
+    /// The cat. Ears, whiskers, the ring around whatever has the keyboard,
+    /// and the fill of the button that does the thing the panel is for --
+    /// one colour, because they are one idea: *this is the part that is
+    /// yours*. It is what a theme actually changes about this screen.
+    pub login_accent: Color,
+    /// What a refusal is written in. Its own colour rather than
+    /// [`Self::release_prompt_text`]: those two are the same shade today and
+    /// have nothing to do with each other, and a sign-in error nobody
+    /// notices is the failure this screen has to avoid most.
+    pub login_error: Color,
 }
 
 impl Default for Style {
@@ -616,6 +642,13 @@ impl Default for Style {
             party_invite_border: Color::rgb(240, 190, 70),
             party_invite_accept: Color::rgb(90, 200, 110),
             party_invite_decline: Color::rgb(230, 120, 100),
+
+            login_width: 360.0,
+            login_row: 30.0,
+            login_background: Color::rgba(18, 20, 27, 250),
+            login_field: Color::rgba(9, 10, 14, 230),
+            login_accent: Color::rgb(240, 190, 70),
+            login_error: Color::rgb(232, 110, 96),
         }
     }
 }
@@ -694,6 +727,11 @@ impl Style {
         self.party_bar_gap = self.party_bar_gap.clamp(0.0, 60.0);
         self.party_invite_width = self.party_invite_width.clamp(120.0, 1200.0);
         self.party_invite_button_height = self.party_invite_button_height.clamp(8.0, 200.0);
+        // A sign-in panel too small to type in is the one unrecoverable
+        // layout mistake in the file: every other frame can be fixed from
+        // inside the running client, and this one is what gets you there.
+        self.login_width = self.login_width.clamp(220.0, 1200.0);
+        self.login_row = self.login_row.clamp(14.0, 120.0);
         before != *self
     }
 }

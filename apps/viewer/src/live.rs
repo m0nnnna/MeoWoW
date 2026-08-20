@@ -185,18 +185,68 @@ pub struct Login<'a> {
     pub locale: &'a str,
 }
 
-/// Logs in, enters the world, and reads the initial object update.
-pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
-    let timeout = std::time::Duration::from_secs(10);
+/// How long any one step of signing in waits before giving up.
+///
+/// Shared by the logon exchange and the world handshake so a wrong address
+/// fails in the same ten seconds whichever half of it was wrong -- and named
+/// rather than repeated because the sign-in screen has to say how long it is
+/// prepared to wait.
+pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    tracing::info!("logging in to {}:{}", login.host, login.port);
-    let session = auth::login(
+/// Runs the logon exchange and comes back with the realm list.
+///
+/// **The first of three steps, and the only one that can be answered without
+/// choosing anything.** Split out because a sign-in screen has to be able to
+/// stop here: `connect` below picks a realm and a character from the command
+/// line, which is the right shape for a probe and the wrong one for a person
+/// who has not been shown the lists yet.
+pub fn authenticate(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    locale: &str,
+) -> Result<auth::LoggedIn> {
+    tracing::info!("logging in to {host}:{port}");
+    Ok(auth::login(host, port, user, password, locale, TIMEOUT)?)
+}
+
+/// Opens the world connection to one realm and reads the character list.
+///
+/// The connection is returned still open, because it is the one this session
+/// plays on: RC4 header state cannot be shared or rewound, so a second
+/// connection could not pick up where this one left off -- the same reason
+/// [`LiveWorld::connection`] is kept alive rather than dropped.
+pub fn open_realm(
+    realm: &auth::Realm,
+    user: &str,
+    session_key: &[u8; auth::srp6::SESSION_KEY_LEN],
+) -> Result<(world::Connection, Vec<world::protocol::Character>)> {
+    tracing::info!("realm {:?} at {}", realm.name, realm.address);
+    let (host, port) = world::client::split_realm_address(&realm.address)?;
+    let mut connection = world::Connection::open(
+        &format!("{host}:{port}"),
+        user,
+        realm.id as u32,
+        session_key,
+        TIMEOUT,
+    )?;
+    let characters = connection.characters()?;
+    Ok((connection, characters))
+}
+
+/// Logs in, enters the world, and reads the initial object update.
+///
+/// The command-line path: it makes both choices itself from `--realm` and
+/// `--character`. The sign-in screen calls [`authenticate`], [`open_realm`]
+/// and [`enter`] instead, showing a list between each.
+pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
+    let session = authenticate(
         login.host,
         login.port,
         login.user,
         login.password,
         login.locale,
-        timeout,
     )?;
 
     let realm = match login.realm {
@@ -210,18 +260,8 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
             .first()
             .context("the logon server offered no realms")?,
     };
-    tracing::info!("realm {:?} at {}", realm.name, realm.address);
 
-    let (host, port) = world::client::split_realm_address(&realm.address)?;
-    let mut connection = world::Connection::open(
-        &format!("{host}:{port}"),
-        login.user,
-        realm.id as u32,
-        &session.session_key,
-        timeout,
-    )?;
-
-    let characters = connection.characters()?;
+    let (connection, characters) = open_realm(realm, login.user, &session.session_key)?;
     let character = characters
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case(login.character))
@@ -233,6 +273,20 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
             )
         })?;
 
+    enter(chain, connection, &realm.name, character)
+}
+
+/// Enters the world as one character and reads the login burst.
+///
+/// Takes the connection by value and the character by reference: the
+/// connection becomes the session's, and the character is one row of a list
+/// the caller is still holding.
+pub fn enter(
+    chain: &mut Chain,
+    mut connection: world::Connection,
+    realm_name: &str,
+    character: &world::protocol::Character,
+) -> Result<LiveWorld> {
     let landed = connection.enter_world(character.guid)?;
     tracing::info!(
         "in world as {} on map {} at {:.1}, {:.1}, {:.1}",
@@ -292,7 +346,7 @@ pub fn connect(chain: &mut Chain, login: &Login<'_>) -> Result<LiveWorld> {
     let (map_directory, map_name) = map_directory(chain, landed.map)?;
     let mut live = LiveWorld {
         character: character.name.clone(),
-        realm: realm.name.clone(),
+        realm: realm_name.to_string(),
         guid: character.guid,
         map_id: landed.map,
         map_directory,

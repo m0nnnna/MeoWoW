@@ -19,8 +19,11 @@
 //!
 //! - [`element`] -- where a frame sits: anchor, offset, scale, visibility.
 //! - [`style`] -- what every frame draws with.
+//! - [`theme`] -- named palettes, written *into* the file rather than under it.
 //! - [`layout`] -- the whole layout, and the file it lives in.
 //! - [`frames`] -- the frames themselves.
+//! - [`login`] -- the sign-in screen, the one thing here drawn before there is
+//!   a world.
 //! - [`edit`] -- rearranging it all without leaving the world.
 //! - [`Hud`] -- what a caller actually holds.
 
@@ -29,7 +32,9 @@ pub mod edit;
 pub mod element;
 pub mod frames;
 pub mod layout;
+pub mod login;
 pub mod style;
+pub mod theme;
 
 use std::path::PathBuf;
 
@@ -49,7 +54,9 @@ pub use frames::{
     TradeOfferView, TradeSquare, TradeSquareItem, TradeView, TrainerRow, TrainerRowState, TrainerView, UnitView,
 };
 pub use layout::{default_path, CharacterBars, ElementId, Profile};
+pub use login::{CharacterRow, RealmRow, SignIn, Stage as SignInStage, Tone};
 pub use style::{Color, PowerType, Style};
+pub use theme::Theme;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

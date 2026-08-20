@@ -86,6 +86,7 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | Shadows | **A directional shadow map from the sun**, cast by terrain, models and alpha-keyed foliage, received by everything but liquid. One cascade around the camera; `--no-shadows` and `--shadow-dump` are the instruments |
 | Appearance | NPCs, other players and the viewer's own character are all dressed from their replicated fields. Weapons draw and sheathe. No shoulders, helms or ranged weapons on others |
 | Interface | Native, fully customisable, **no addons** — see the decision below. Player/target/party frames, click-to-target, chat, spellbook, action bars per character, `F1` to rearrange, saved to `ui.toml` |
+| Sign-in | **The viewer opens a login screen with no arguments**, so double-clicking it is the ordinary way to start: account, password, server, a folder picker for the `Data` directory, then a realm list and a character list. Remembers everything but the password, in `%APPDATA%\open-wow\login.toml`. **Creates no characters** — the original client does that. Four themes (`slate`, `neko`, `void`, `calico`) that *write their colours into `ui.toml`* rather than sitting under it. Its own cat-head icon, drawn in code, on the window and on the executable |
 | Game | Melee, spells with real tooltips and a cast bar, cooldowns, combat log, corpse and loot end to end, inventory with slot moves, character panel, quests taken and handed in, quest log with progress counters |
 | Map | `M` opens the zone page with the character and quest objectives on it; fills in as explored. **Minimap** in the corner with party dots and objective rings. **Questgiver pins** as diamonds — `!` and `?` told apart, and a *remembered* one drawn faded, because it is a fact about the past. No zoom, panning, continent view or rotation |
 | Tracker | **Always on, no key**, top right under the minimap: five quests of however many, by distance with the finished ones first, each with its objective counters and yards to the nearest marker. States the count in every state. A quest the realm gave no markers for sorts **last, not as zero**, and shows no distance at all |
@@ -95,6 +96,14 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | Collision | Walls stop you, floors and stairs hold you up, M2 collision meshes are obstacles. Tiles are selected by the **bounds of what they hold**, not by where the character is — Stormwind is one placement covering nine tiles. Transitions cut rather than blend; a stair stutter is instrumented, not solved |
 
 ### At the window
+
+**`wow-viewer` with no arguments opens the sign-in screen**, which asks for
+everything below and remembers all of it but the password. `--data` is
+therefore optional now. A command line that already says what to draw
+(`--texture`, `--model`, `--creature`, `--wmo`, `--map`) or what to connect to
+(`--realm-host` **and** `--user` **and** `--character`) skips the screen
+entirely, which is what keeps every probe here reproducible; anything less
+opens it with those parts filled in. See `Args::is_self_contained`.
 
 `wow-viewer --realm-host <host> --user <account> --character <name>` logs in,
 enters the world and streams the map around where the server says the character
@@ -766,6 +775,13 @@ the full account is in `docs/ROADMAP.md`.
   tests discoverability as much as correctness.** And all four refusal paths in
   `offer_item` returned silently, so three causes shared one sentence — they
   each log now.
+- **A headless click test needs more passes than a headless draw test.** egui
+  matches a press against the widget rectangles from the pass *before* it, so
+  on a fresh context the first press lands on nothing. Two passes is right for
+  asserting what was painted and wrong for asserting what was clicked: the
+  sign-in panel's click test, written with two, reported the panel's *initial*
+  state for every control and read exactly like a hit test that was simply
+  wrong. Four. The HUD's own harness already carried the split and said why.
 - **A frame that never receives clicks looks exactly like one whose handler is
   broken.** Frames opt into `Sense::click()` by appearing in one `matches!`,
   and one left out draws correctly, hit-tests correctly, and never reports a
@@ -1020,6 +1036,14 @@ the full account is in `docs/ROADMAP.md`.
 
 ## Traps already hit
 
+- **`mem::zeroed` on a struct holding a `String` takes the whole test binary
+  down.** A zeroed `String` is a null pointer wearing a `String`'s shape, and
+  the `Vec` behind it must be non-null: `wow-viewer`'s test binary died with
+  `STATUS_STACK_BUFFER_OVERRUN` and no failing test name, which reads as a
+  compiler or harness fault rather than as one line in one fixture. The
+  compiler warns (`invalid_value`) and the warning was in the same output as
+  the crash. Wire structs here have no `Default` on purpose; a fixture that
+  wants one writes the fields out.
 - **Never rewrite a file with a script that can throw mid-write.** A Python
   `write_text` containing a character the console codec could not encode
   truncated `docs/ROADMAP.md` to zero bytes. Prefer the editing tools; if a

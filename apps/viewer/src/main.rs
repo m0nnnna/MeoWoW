@@ -11,6 +11,8 @@
 mod character;
 mod emitters;
 mod hud;
+mod icon;
+mod icon_art;
 mod items;
 mod liquid;
 mod live;
@@ -19,6 +21,7 @@ mod minimap;
 mod model;
 mod scene;
 mod sky;
+mod signin;
 mod sound;
 mod spells;
 mod taxi;
@@ -54,8 +57,15 @@ const DEFAULT_TEXTURE: &str = r"Interface\Icons\Spell_Fire_Fireball02.blp";
 #[command(name = "wow-viewer", about = "View WoW 3.3.5a client assets")]
 struct Args {
     /// Path to the installation's `Data` directory.
+    ///
+    /// **Optional since the sign-in screen exists.** Without it the viewer
+    /// opens the screen, which remembers the directory in
+    /// `%APPDATA%\open-wow\login.toml` and can be pointed at one with a folder
+    /// picker -- so the ordinary way to run this client is now to double-click
+    /// it. Given here it wins, because a flag typed on purpose outranks a
+    /// setting typed once: that is what makes a probe reproducible.
     #[arg(long, short, env = "WOW_DATA")]
-    data: PathBuf,
+    data: Option<PathBuf>,
 
     #[arg(long, default_value = "enUS")]
     locale: String,
@@ -284,6 +294,28 @@ struct Args {
     entities: bool,
 }
 
+impl Args {
+    /// Whether the command line already answered everything the sign-in
+    /// screen would ask.
+    ///
+    /// **Three separate answers, not one flag.** `--texture`, `--model`,
+    /// `--creature`, `--wmo` and `--map` each name something to draw off
+    /// disk; `--realm-host` with a user and a character names a session to
+    /// open. Either is a complete instruction, and a client that stopped to
+    /// ask again would break every probe in `docs/ROADMAP.md`. Anything less
+    /// -- including the bare double-click this whole screen exists for --
+    /// falls through to asking.
+    fn is_self_contained(&self) -> bool {
+        let offline = self.texture.is_some()
+            || self.model.is_some()
+            || self.creature.is_some()
+            || self.wmo.is_some()
+            || self.map.is_some();
+        let live = self.realm_host.is_some() && self.user.is_some() && self.character.is_some();
+        offline || live
+    }
+}
+
 /// What the viewer is currently showing.
 enum Scene {
     Texture(Box<UploadedTexture>),
@@ -410,10 +442,34 @@ fn main() -> Result<()> {
     }
     install_panic_hook();
 
-    let mut chain = Chain::open_wow_data(&args.data, &args.locale)
-        .with_context(|| format!("opening archives under {}", args.data.display()))?;
+    // The sign-in screen supplies this when the command line does not, so the
+    // archives are opened later and possibly more than once. Everything that
+    // needs them asks `App::chain`, which is empty until one is.
+    let mut chain = match &args.data {
+        Some(data) => match open_data(data, &args.locale) {
+            Ok(chain) => chain,
+            // **A bad `--data` is fatal only when nothing can ask about it.**
+            // With a sign-in screen coming there is somewhere to put the
+            // complaint and a folder picker to fix it with, and exiting
+            // instead would mean the one path a person double-clicks dies at a
+            // console they never see.
+            Err(e) if !args.is_self_contained() => {
+                tracing::warn!("{e:#}");
+                Chain::new()
+            }
+            Err(e) => return Err(e),
+        },
+        None => Chain::new(),
+    };
 
     if let Some(path) = args.screenshot.clone() {
+        // **A screenshot with no archives is refused rather than rendered.**
+        // It would produce a perfectly plausible empty picture -- the one
+        // failure mode this project has paid for repeatedly -- and there is no
+        // sign-in screen on this path to ask.
+        if args.data.is_none() {
+            anyhow::bail!("--screenshot needs --data (or WOW_DATA): there is no window to ask in");
+        }
         return screenshot(&args, &mut chain, &path);
     }
 
@@ -422,6 +478,30 @@ fn main() -> Result<()> {
     let mut app = App::new(args, chain);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// Opens the archive set, and checks that it *is* one.
+///
+/// **`Chain::open_wow_data` skips members it cannot find**, correctly -- no
+/// two installs carry the same set of optional patches -- so it answers `Ok`
+/// with nothing in it for a directory that holds no archives at all. That is
+/// exactly the mistake a folder picker makes easy: choosing the install's root
+/// rather than its `Data` folder. Reading a file that must be there separates
+/// the two, and *reading* is the right test rather than listing: an MPQ
+/// resolves by hash, so a file absent from `(listfile)` still reads perfectly
+/// and a directory check would answer about the wrong thing.
+fn open_data(data: &std::path::Path, locale: &str) -> Result<Chain> {
+    let mut chain = Chain::open_wow_data(data, locale)
+        .with_context(|| format!("opening archives under {}", data.display()))?;
+    chain.read(dbc::schema::Map::PATH).with_context(|| {
+        format!(
+            "{} does not look like a WoW 3.3.5a Data directory: the archives there \
+             hold no {}",
+            data.display(),
+            dbc::schema::Map::PATH
+        )
+    })?;
+    Ok(chain)
 }
 
 /// Resolves the command line into something to draw.
@@ -472,6 +552,26 @@ fn build_live_scene(
     };
 
     let live = live::connect(chain, &login)?;
+    let scene = world_for_live(gpu, meshes, chain, args, &live)?;
+    Ok((scene, Some(live)))
+}
+
+/// Builds the streaming world around a character that is already in it.
+///
+/// Split out of [`build_live_scene`] because the sign-in screen reaches this
+/// point by a different road: it has chosen a realm and a character through
+/// two lists rather than off the command line, and by then the window, the GPU
+/// and the archives all already exist. **One function so both roads build the
+/// same world** -- a second copy of this would be the place a feature added
+/// for one path quietly failed to reach the other, which is how
+/// `--screenshot` ended up not posing a single creature.
+fn world_for_live(
+    gpu: &Gpu,
+    meshes: &mut MeshRenderer,
+    chain: &mut Chain,
+    args: &Args,
+    live: &live::LiveWorld,
+) -> Result<Scene> {
     if let Some(path) = &args.skin_out {
         match &live.look.skin {
             Some(skin) => {
@@ -502,7 +602,7 @@ fn build_live_scene(
         let placements: Vec<world::EntityPlacement> =
             // A headless render has no movement driver to have decided, and
             // the character is standing still: not swimming.
-            drawable_with_own(&live, (0.0, 0.0), 0.0, false, false)
+            drawable_with_own(live, (0.0, 0.0), 0.0, false, false)
                 .iter()
                 .map(|entity| {
                     // Same three sources as the windowed path -- see `redraw`.
@@ -559,7 +659,7 @@ fn build_live_scene(
         world.update_animations(gpu, meshes);
     }
 
-    Ok((Scene::Streaming(Box::new(world)), Some(live)))
+    Ok(Scene::Streaming(Box::new(world)))
 }
 
 fn build_offline_scene(
@@ -2627,6 +2727,21 @@ impl ChatChannel {
 struct App {
     args: Args,
     chain: Chain,
+    /// The sign-in screen, present until a character has been entered as.
+    ///
+    /// **Its presence is the mode**, so nothing can be both signing in and in
+    /// the world -- the same reason `swimming` is an `Option<Liquid>` rather
+    /// than a bool beside a liquid. While it is here the world is not drawn,
+    /// the HUD is not built, and the keyboard belongs to the panel.
+    ///
+    /// `None` from the start when the command line said what to connect to:
+    /// `--realm-host --user --character` is a complete answer to everything
+    /// this screen would ask, and a probe that stopped to ask again would not
+    /// be a probe.
+    signin: Option<signin::SignIn>,
+    /// Set by the sign-in screen's Quit button and acted on where the event
+    /// loop is in scope -- see the `RedrawRequested` arm.
+    quit: bool,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     camera: Camera,
@@ -3814,6 +3929,14 @@ impl App {
         // map needs are small and, unlike a spellbook, they do not depend on
         // anything the server sends -- so `M` works before the character has
         // finished logging in, and the arrow simply has nowhere to be yet.
+        //
+        // **All three read whatever the chain holds, including nothing.** A
+        // client started with no data directory has an empty chain until the
+        // sign-in screen supplies one, so these come back empty and are read
+        // again by `reload_tables` when it does. Each already tolerates a file
+        // that will not read -- that is what makes an install missing an
+        // optional table a client that draws less rather than one that will
+        // not start -- so an empty chain needs no new case.
         let mut chain = chain;
         let maps = maps::Maps::load(&mut chain);
         let taxi_network = taxi::Network::load(&mut chain);
@@ -3821,7 +3944,41 @@ impl App {
         // tile's picture, which does not depend on the server and would
         // otherwise be parsed on the frame the player first looks at it.
         let minimap = minimap::Minimap::load(&mut chain);
+        let signin = (!args.is_self_contained()).then(|| {
+            let mut signin = signin::SignIn::new();
+            // The command line's data directory outranks the remembered one,
+            // and is shown in the settings panel as the answer already given
+            // -- rather than silently used while the panel displays something
+            // else, which is a setting that lies about itself.
+            if let Some(data) = args.data.clone() {
+                signin.screen.settings.data = Some(data);
+            }
+            // The same rule for a partly-given session: `--realm-host` with no
+            // `--character` is not enough to skip the screen, but it is an
+            // answer to one of its questions, and making somebody retype what
+            // they just passed on the command line would be absurd.
+            if let Some(host) = &args.realm_host {
+                signin.screen.settings.server = if args.realm_port == auth::client::DEFAULT_PORT {
+                    host.clone()
+                } else {
+                    format!("{host}:{}", args.realm_port)
+                };
+            }
+            if let Some(user) = &args.user {
+                signin.screen.settings.account = user.clone();
+            }
+            if let Some(realm) = &args.realm {
+                signin.screen.settings.realm = Some(realm.clone());
+            }
+            if let Some(character) = &args.character {
+                signin.screen.settings.character = Some(character.clone());
+            }
+            signin.set_names(signin::Names::load(&mut chain));
+            signin
+        });
         Self {
+            signin,
+            quit: false,
             // The saved preference, which the wheel then moves from. Kept as
             // live state rather than read from the profile every frame: the
             // wheel must not rewrite a saved setting on every scroll.
@@ -3940,6 +4097,276 @@ impl App {
             modifiers: Default::default(),
         }
     }
+
+    /// Reopens the archives from whatever the sign-in screen currently says.
+    ///
+    /// **A failure empties the chain rather than leaving the old one.** The
+    /// alternative is a client reading Elwynn out of the directory somebody
+    /// just navigated away from while the settings panel shows a path it never
+    /// opened -- a setting that lies about itself, which is the one thing a
+    /// settings panel must not do.
+    fn reopen_data(&mut self) {
+        let Some(screen) = self.signin.as_ref().map(|s| &s.screen) else {
+            return;
+        };
+        let (data, locale) = (screen.settings.data.clone(), screen.settings.locale.clone());
+        let opened = match &data {
+            Some(data) => open_data(data, &locale).map_err(|e| format!("{e:#}")),
+            None => Err("no data directory chosen yet".to_string()),
+        };
+        match opened {
+            Ok(chain) => {
+                self.chain = chain;
+                self.reload_tables();
+                if let Some(signin) = self.signin.as_mut() {
+                    signin.screen.note(format!(
+                        "reading {}",
+                        data.as_ref().expect("Ok implies a path").display()
+                    ));
+                }
+            }
+            Err(message) => {
+                self.chain = Chain::new();
+                self.reload_tables();
+                if let Some(signin) = self.signin.as_mut() {
+                    signin.screen.failed(message);
+                }
+            }
+        }
+    }
+
+    /// Re-reads everything that comes off disk and depends on no session.
+    ///
+    /// Called at startup through [`App::new`] and again whenever the data
+    /// directory changes. Each of these tolerates an archive set that holds
+    /// nothing -- which is what an empty chain is -- so this is also how they
+    /// are *cleared* when a directory turns out not to be an installation.
+    fn reload_tables(&mut self) {
+        self.maps = maps::Maps::load(&mut self.chain);
+        self.taxi_network = taxi::Network::load(&mut self.chain);
+        self.minimap = minimap::Minimap::load(&mut self.chain);
+        let names = signin::Names::load(&mut self.chain);
+        if let Some(signin) = self.signin.as_mut() {
+            signin.set_names(names);
+        }
+    }
+
+    /// Enters the world as the character chosen on the sign-in screen, and
+    /// puts the screen away.
+    ///
+    /// **The screen is only dismissed once the world is standing.** Every
+    /// failure below leaves it up with the reason on it, because the
+    /// alternative is a black window and a line in a log file nobody has open
+    /// -- and one of these failures, `world_for_live`, reads a couple of
+    /// hundred megabytes of terrain and can genuinely fail on a bad install.
+    fn enter_world(&mut self, entering: signin::Entering) {
+        let signin::Entering {
+            realm,
+            connection,
+            character,
+        } = entering;
+        let live = match live::enter(&mut self.chain, connection, &realm, &character) {
+            Ok(live) => live,
+            Err(e) => {
+                tracing::error!("entering the world failed: {e:#}");
+                if let Some(signin) = self.signin.as_mut() {
+                    signin.screen.failed(format!("{e:#}"));
+                }
+                return;
+            }
+        };
+
+        // The same three clocks `resumed` starts on the command-line path, and
+        // for the same reason: they measure from the moment the connection is
+        // ready to drive, not from whenever the window was created -- which on
+        // this path was however long ago somebody started typing.
+        self.last_heartbeat = Instant::now();
+        self.last_ping = Instant::now();
+        self.last_undrawable_warned = 0;
+        let started = Instant::now();
+        self.lighting = dbc::light::Lighting::load(|path| self.chain.read(path).ok());
+        tracing::info!(
+            "lighting tables loaded in {:?} ({})",
+            started.elapsed(),
+            if self.lighting.is_some() { "ok" } else { "unavailable" }
+        );
+        self.camera = live_camera(&live, &self.args);
+
+        let Some(r) = self.renderer.as_mut() else {
+            // No window means no GPU to build a world on, and there is no
+            // sign-in screen without one either: unreachable, and it says so
+            // rather than unwrapping.
+            tracing::error!("entered the world with no renderer; nothing will be drawn");
+            return;
+        };
+        let scene = match world_for_live(&r.gpu, &mut r.meshes, &mut self.chain, &self.args, &live)
+        {
+            Ok(scene) => scene,
+            Err(e) => {
+                tracing::error!("building the world failed: {e:#}");
+                if let Some(signin) = self.signin.as_mut() {
+                    signin.screen.failed(format!("{e:#}"));
+                }
+                return;
+            }
+        };
+        r.meshes.prepare(&r.gpu, scene_states(&scene));
+        // Sized for the largest skeleton rather than for this character's,
+        // exactly as `resumed` does -- see BIND_POSE_BONES. Written to the
+        // bind pose rather than left zeroed, because a zero matrix collapses
+        // a model to the origin *silently*.
+        let bones = r.meshes.create_bones(&r.gpu, BIND_POSE_BONES);
+        r.meshes
+            .update_bones(&r.gpu, &bones, &bind_pose(BIND_POSE_BONES));
+        r.bones = Some(bones);
+        r.world_binds = world_bind_groups(&r.gpu, &r.meshes, &scene);
+        r.material_binds = material_bind_groups(&r.gpu, &r.meshes, &scene);
+        r.scene = Some(scene);
+
+        tracing::info!(
+            "in the world as {} on {} ({})",
+            live.character,
+            live.realm,
+            live.map_name
+        );
+        self.live = Some(live);
+        // Last, and only now: this is what switches the client out of the
+        // sign-in mode, and every early return above deliberately did not.
+        self.signin = None;
+    }
+
+    /// Draws the sign-in screen, and does whatever it asked for.
+    ///
+    /// Its own frame rather than a branch inside `redraw`'s: there is no
+    /// scene, no camera, no world to stream and no HUD to build, so what this
+    /// shares with the ordinary path is the surface and the egui pass and
+    /// nothing else.
+    fn draw_sign_in(&mut self, window: &Arc<Window>) {
+        // Taken out of `self` for the closure below, and put back unless the
+        // world was entered. A screen that draws itself while borrowing the
+        // renderer is a borrow this is not worth fighting.
+        let Some(mut signin) = self.signin.take() else {
+            return;
+        };
+        let style = self.hud.profile.style;
+        let Some(r) = self.renderer.as_mut() else {
+            self.signin = Some(signin);
+            return;
+        };
+        let input = r.egui_state.take_egui_input(window);
+        let ctx = r.egui_ctx.clone();
+        let mut outcome = signin::Outcome::Continue;
+        let output = ctx.run_ui(input, |ctx| {
+            outcome = signin.update(ctx, &style);
+        });
+        r.egui_state
+            .handle_platform_output(window, output.platform_output.clone());
+        self.signin = Some(signin);
+
+        self.paint_sign_in(output);
+
+        match outcome {
+            signin::Outcome::Continue => {}
+            signin::Outcome::Quit => self.quit = true,
+            signin::Outcome::Theme(theme) => {
+                // **The whole style is written and saved.** A theme here is a
+                // way of filling the layout file in, not a second set of
+                // defaults sitting under it -- see `ui::theme`.
+                self.hud.profile.style = theme.style();
+                self.minimap_range = self.hud.profile.style.minimap_range;
+                self.hud.save();
+                tracing::info!("theme set to {}", theme.name());
+            }
+            signin::Outcome::DataChanged => self.reopen_data(),
+            signin::Outcome::Enter(entering) => self.enter_world(*entering),
+        }
+    }
+
+    /// Clears the window and draws one egui pass over it.
+    ///
+    /// **The clear is the point.** The ordinary path leaves the colour target
+    /// written by the scene and egui loads it; with no scene nothing writes it
+    /// at all, and `LoadOp::Load` over an unwritten surface is whatever the
+    /// driver last had there -- which is to say a panel floating over
+    /// garbage, intermittently, on some machines and not others.
+    fn paint_sign_in(&mut self, output: egui::FullOutput) {
+        let Some(r) = self.renderer.as_mut() else {
+            return;
+        };
+        use wgpu::CurrentSurfaceTexture as Acquired;
+        let frame = match r.surface.get_current_texture() {
+            Acquired::Success(frame) => frame,
+            Acquired::Suboptimal(frame) => {
+                r.surface.configure(&r.gpu.device, &r.config);
+                frame
+            }
+            Acquired::Lost | Acquired::Outdated => {
+                r.surface.configure(&r.gpu.device, &r.config);
+                return;
+            }
+            Acquired::Timeout | Acquired::Occluded => return,
+            Acquired::Validation => {
+                tracing::error!("surface validation error while acquiring a frame");
+                return;
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = r
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sign-in"),
+            });
+
+        let clipped = r.egui_ctx.tessellate(output.shapes, output.pixels_per_point);
+        for (id, deltas) in &output.textures_delta.set {
+            for delta in deltas {
+                r.egui_renderer
+                    .update_texture(&r.gpu.device, &r.gpu.queue, *id, delta);
+            }
+        }
+        let desc = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [r.config.width, r.config.height],
+            pixels_per_point: output.pixels_per_point,
+        };
+        r.egui_renderer
+            .update_buffers(&r.gpu.device, &r.gpu.queue, &mut encoder, &clipped, &desc);
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sign-in"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Near-black rather than the panel's own colour: the
+                        // panel is a lit thing on a dark screen, and a
+                        // backdrop matching it would leave it with no edge.
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.012,
+                            g: 0.012,
+                            b: 0.018,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                multiview_mask: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            r.egui_renderer
+                .render(&mut pass.forget_lifetime(), &clipped, &desc);
+        }
+        for id in &output.textures_delta.free {
+            r.egui_renderer.free_texture(id);
+        }
+        r.gpu.queue.submit([encoder.finish()]);
+        r.gpu.queue.present(frame);
+    }
 }
 
 impl ApplicationHandler for App {
@@ -3949,6 +4376,7 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title("MeoWoW")
+            .with_window_icon(icon::window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(
                 self.args.width,
                 self.args.height,
@@ -4028,42 +4456,52 @@ impl ApplicationHandler for App {
         let mut liquid_types = liquid::LiquidTypes::default();
         let depth = DepthBuffer::new(&gpu, config.width, config.height);
 
-        let scene = match build_scene(
-            &gpu,
-            &terrain_renderer,
-            &liquid_renderer,
-            &mut liquid_types,
-            &mut meshes,
-            &mut self.chain,
-            &self.args,
-        ) {
-            Ok((scene, live)) => {
-                self.offline_map = offline_map_id(&mut self.chain, self.args.map.as_deref());
-                if live.is_some() || (self.offline_map.is_some() && self.args.hour.is_some()) {
-                    // Start the movement and keepalive clocks from the moment
-                    // the connection is actually ready to drive, not from
-                    // whenever the window happened to be created.
-                    self.last_heartbeat = Instant::now();
-                    self.last_ping = Instant::now();
-                    self.last_undrawable_warned = 0;
-                    // Only a live world has a map and an hour to light.
-                    let started = Instant::now();
-                    self.lighting =
-                        dbc::light::Lighting::load(|path| self.chain.read(path).ok());
-                    tracing::info!(
-                        "lighting tables loaded in {:?} ({})",
-                        started.elapsed(),
-                        if self.lighting.is_some() { "ok" } else { "unavailable" }
-                    );
+        // **Nothing is built while the sign-in screen is up**, and that is the
+        // whole reason the scene is an `Option` on this path rather than a
+        // failure: there is no data directory to read, no realm to connect to
+        // and nothing to draw until somebody has said. What replaces it is one
+        // clear pass and one panel -- see `redraw`.
+        let scene = match self.signin {
+            Some(_) => None,
+            None => match build_scene(
+                &gpu,
+                &terrain_renderer,
+                &liquid_renderer,
+                &mut liquid_types,
+                &mut meshes,
+                &mut self.chain,
+                &self.args,
+            ) {
+                Ok((scene, live)) => {
+                    self.offline_map =
+                        offline_map_id(&mut self.chain, self.args.map.as_deref());
+                    if live.is_some() || (self.offline_map.is_some() && self.args.hour.is_some())
+                    {
+                        // Start the movement and keepalive clocks from the
+                        // moment the connection is actually ready to drive,
+                        // not from whenever the window happened to be created.
+                        self.last_heartbeat = Instant::now();
+                        self.last_ping = Instant::now();
+                        self.last_undrawable_warned = 0;
+                        // Only a live world has a map and an hour to light.
+                        let started = Instant::now();
+                        self.lighting =
+                            dbc::light::Lighting::load(|path| self.chain.read(path).ok());
+                        tracing::info!(
+                            "lighting tables loaded in {:?} ({})",
+                            started.elapsed(),
+                            if self.lighting.is_some() { "ok" } else { "unavailable" }
+                        );
+                    }
+                    self.live = live;
+                    Some(scene)
                 }
-                self.live = live;
-                Some(scene)
-            }
-            Err(e) => {
-                self.error = Some(format!("{e:#}"));
-                tracing::error!("{e:#}");
-                None
-            }
+                Err(e) => {
+                    self.error = Some(format!("{e:#}"));
+                    tracing::error!("{e:#}");
+                    None
+                }
+            },
         };
         if let Some(scene) = &scene {
             self.camera = match (scene, &self.live) {
@@ -4271,6 +4709,29 @@ impl ApplicationHandler for App {
             );
         }
         if consumed {
+            window.request_redraw();
+            return;
+        }
+
+        // **The sign-in screen owns the keyboard and the mouse outright**, the
+        // same way a chat line being typed does -- and for a stronger reason
+        // than tidiness. egui reports a key as consumed only when one of *its*
+        // widgets has focus, and this panel reads the event queue itself, so
+        // every key it handles arrives here unconsumed as well. Without this
+        // return, typing an account name walks a character that does not
+        // exist, and `F1` opens the layout editor over a screen with no
+        // layout in it.
+        //
+        // Redraw and close still get through, because those are the window's
+        // business rather than the world's.
+        if self.signin.is_some()
+            && !matches!(
+                event,
+                WindowEvent::RedrawRequested
+                    | WindowEvent::CloseRequested
+                    | WindowEvent::Resized(_)
+            )
+        {
             window.request_redraw();
             return;
         }
@@ -4745,6 +5206,14 @@ impl ApplicationHandler for App {
                     self.release_cursor(&window);
                 }
                 self.redraw(&window);
+                // The sign-in screen's Quit button, honoured here because
+                // this is where the event loop is in scope. `redraw` itself
+                // takes no `ActiveEventLoop`, and threading one through it
+                // for one button would put an exit path in every frame.
+                if self.quit {
+                    event_loop.exit();
+                    return;
+                }
                 window.request_redraw();
             }
             _ => {}
@@ -4757,6 +5226,14 @@ impl App {
         let now = Instant::now();
         self.frame_ms = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
         self.last_frame = now;
+
+        // **Its own frame, and it returns.** Nothing below here has anything
+        // to draw before a character has been chosen: no scene, no camera to
+        // move, no connection to pump and no HUD to build.
+        if self.signin.is_some() {
+            self.draw_sign_in(window);
+            return;
+        }
 
         let ui_output = self.build_ui(window);
         let camera = self.camera;
@@ -12130,5 +12607,48 @@ mod swim_tests {
         );
         // But not so high the body rides on top of the water like a boat.
         assert!(head - surface < 0.5, "the character is floating too high");
+    }
+}
+
+#[cfg(test)]
+mod sign_in_tests {
+    use super::*;
+
+    /// **The one decision that can break every probe in the tree.** A command
+    /// line that already says what to draw or what to connect to must not stop
+    /// to ask, and one that does not must. Both halves are asserted, because
+    /// each fails in a way the other cannot see: too eager and
+    /// `docs/ROADMAP.md`'s screenshots hang on a login panel forever, too shy
+    /// and a double-click opens a fireball icon nobody asked for.
+    #[test]
+    fn the_command_line_decides_whether_to_ask() {
+        let asks = |argv: &[&str]| {
+            let mut full = vec!["wow-viewer"];
+            full.extend_from_slice(argv);
+            !Args::parse_from(full).is_self_contained()
+        };
+
+        // Nothing at all: the double-click this screen exists for.
+        assert!(asks(&[]));
+        // A data directory says where the archives are and nothing about what
+        // to draw with them.
+        assert!(asks(&["--data", "D:/Games/WoW/Data"]));
+
+        // Each offline scene is a complete instruction on its own.
+        assert!(!asks(&["--texture", r"Interface\Icons\Foo.blp"]));
+        assert!(!asks(&["--model", r"Creature\Wolf\Wolf.m2"]));
+        assert!(!asks(&["--creature", "49"]));
+        assert!(!asks(&["--wmo", r"World\wmo\a.wmo"]));
+        assert!(!asks(&["--map", "Azeroth"]));
+
+        // A session needs all three parts. Two of them is a half-typed
+        // command line, and the screen is a better answer to that than an
+        // error is -- it arrives with those two already filled in.
+        assert!(!asks(&[
+            "--realm-host", "127.0.0.1", "--user", "OWC33", "--character", "Testwolf"
+        ]));
+        assert!(asks(&["--realm-host", "127.0.0.1"]));
+        assert!(asks(&["--realm-host", "127.0.0.1", "--user", "OWC33"]));
+        assert!(asks(&["--user", "OWC33", "--character", "Testwolf"]));
     }
 }

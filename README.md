@@ -111,13 +111,24 @@ and why. See [docs/RENDERING.md](docs/RENDERING.md).
 
 ## Playing on a realm
 
-Point the same viewer at a running 3.3.5a-compatible server instead of a bare
-tile, and it logs in, enters the world, and streams whatever the server says
-is around you:
+Run `wow-viewer` with no arguments -- double-clicking it counts -- and it opens
+a sign-in screen: account, password, realm server, and a cat-headed button that
+asks where your `Data` folder is. Sign in and it lists the characters on the
+account for you to pick one. It remembers everything but the password, which it
+never writes anywhere.
+
+**It does not create characters.** Make those in the original client; this one
+plays them.
+
+The command line still says the whole thing, which is what every probe and
+screenshot in `docs/` relies on:
 
 ```console
 cargo run -p wow-viewer -- --realm-host <host> --user <account> --character <name>
 ```
+
+Given all three it connects straight away and never shows the screen. Given
+some of them it shows the screen with those parts filled in.
 
 `W`/`S` walk, `A`/`D` turn, `Q`/`E` strafe, `Space` jumps, right-drag steers
 while left-drag swings the camera, left-click selects and right-click
@@ -125,6 +136,11 @@ attacks. `Enter` opens a chat line, `P` opens the spellbook, `F1` unlocks the
 interface for dragging. `wow-cli world` and `wow-cli auth` do the login half
 headlessly, for scripting or for checking a capture without a window. See
 [docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+The interface comes in four palettes -- `slate`, `neko`, `void` and `calico` --
+picked from the sign-in screen's settings. Choosing one **writes the colours
+into `ui.toml`**, so a theme is a starting point you then edit rather than a
+layer hiding under the file. See [docs/UI.md](docs/UI.md).
 
 ## Getting started
 

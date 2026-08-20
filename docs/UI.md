@@ -50,8 +50,10 @@ overlay, and the layout editor. Those are meant to look like tools.
 |---|---|
 | `element` | Where a frame sits: anchor, offset, scale, visibility |
 | `style` | Every dimension and colour the frames draw with |
+| `theme` | Named palettes, written *into* the file rather than under it |
 | `layout` | The whole profile, and the file it lives in |
 | `frames` | The frames themselves: `unit`, `party`, `party_invite`, `chat`, `action_bar`, `cast_bar`, `spellbook`, `marker`, `combat_text` |
+| `login` | The sign-in screen, and the settings it remembers |
 | `edit` | Rearranging it from inside the running client |
 | `Hud` | What a caller holds: profile + edit state + the draw call |
 
@@ -503,6 +505,84 @@ below the minimap has the spellbook centred on it, and a log pushed down would
 start 150 pixels clear of it and grow *towards* it as quests are taken --
 correct on an empty log and wrong on a full one, which is the half nobody
 tests.
+
+## The sign-in screen, and the two habits it inverts
+
+Everything else this crate draws is a *second view of something already on the
+wire*: the caller rebuilds `HudData` from the world every frame, and nothing
+here holds state that could go stale without the world going stale with it.
+
+The sign-in screen is the opposite of that in both directions, and it is worth
+naming which:
+
+- **It is not an `Element`.** No anchor, no offset, no scale. It is drawn
+  centred on an empty window, and the layout editor that would drag it around
+  cannot be opened until it has been dismissed. `login_width` and `login_row`
+  are the whole of its geometry.
+- **It holds state.** A half-typed password has no world to be rebuilt from.
+  `SignIn` owns what has been typed, which panel is showing, and which box has
+  the keyboard.
+
+What stayed the same is the split that matters: `crates/ui` still opens no
+sockets and reads no archives. The panel emits a `login::Action` -- *sign in*,
+*choose row 3*, *set the neko theme*, *ask the OS for a folder* -- and
+`apps/viewer/src/signin.rs` does all of it. Which is why the panel's geometry,
+its focus ring, its refusals and its clicks are all tested without a connection
+or a GPU.
+
+**Geometry is stated once.** `SignIn::panel` builds a list of items each
+carrying its rectangle; the drawing walks that list and so does the hit test.
+That is the party invite's lesson applied before it could bite again: two
+separately computed rectangles a few pixels apart leave a press between them
+answering nothing, and this panel has nine controls where the invite prompt had
+two.
+
+**A control that cannot act does not answer.** An offline realm, a character
+the server would demand be renamed, and a greyed-out *Enter World* all return
+`None` from the hit test, the same rule every list frame here follows -- the
+alternative ships a request the server declines in silence.
+
+### What it will not do
+
+**It does not create characters**, and that is a decision rather than a gap.
+Character creation is a race and class list, an appearance picker, a
+name-validity dialogue, and a server verdict carrying a dozen refusal codes --
+every one of which is a *string* nobody here has verified, and this project
+does not transcribe a table it has not checked. The original client does it
+correctly today. The panel says so, in as many words, under the character list.
+
+### The password
+
+Never written to disk. Not as a setting, not obfuscated, not behind a "remember
+me": `login::Settings` has no field for it, and a test asserts on the
+*serialised text* rather than on the struct, because the struct not having the
+field is what a reviewer sees and the bytes are what a person's disk gets.
+
+Everything else is remembered in `%APPDATA%\open-wow\login.toml` -- a separate
+file from `ui.toml`, so swapping layouts with somebody does not swap which
+account you sign in as.
+
+## Themes
+
+Four palettes: `slate` (what this client has always looked like, and still the
+default), `neko`, `void` and `calico`.
+
+**A theme is not an overlay.** Choosing one writes its colours into `ui.toml`.
+That is the whole design, and it follows from `Profile`'s own rule: there is no
+second set of defaults the file only partly overrides, because a user who
+cannot see why their change had no effect concludes the feature is broken. A
+theme stored as a name, supplying colours from underneath, would be exactly
+that hidden second set.
+
+The consequence is that **nothing records which theme is in force**.
+`Theme::of` answers by comparing the style to each palette, so after a hand
+edit the answer is honestly `None` and the settings panel highlights nothing --
+the same call the tracker makes about a quest with no distance, and
+`describe_cast_failure` about a status code nobody has confirmed. A number
+nobody can check is worse than a blank.
+
+A theme sets colours and never dimensions. Resetting how wide somebody's chat
+frame is because they liked a different pink is not theming, and a test says so.
 
 ## What is deliberately not here yet
 

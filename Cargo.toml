@@ -34,6 +34,18 @@ glam = "0.33"
 # is why it is TOML and not a binary blob -- see docs/UI.md.
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
+# The operating system's own folder picker, for the one setting a person has to
+# supply before this client can do anything: where their WoW install is. The
+# field beside it stays editable, so this is a convenience rather than a
+# dependency the feature rests on. Passes the reuse test easily -- asking an OS
+# for a directory has nothing to do with WoW.
+#
+# `default-features = false` deliberately: rfd's defaults are the *Linux*
+# backend (`xdg-portal`, and an async runtime to drive it), and on Windows the
+# native dialogue needs neither. A Linux build of the viewer has to turn
+# `xdg-portal` back on -- said here rather than discovered, because the feature
+# it disables is not one this platform can notice missing.
+rfd = { version = "0.15", default-features = false }
 
 [profile.dev]
 # Format parsing on multi-GB archives is unusable in a fully unoptimized build,

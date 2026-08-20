@@ -7,6 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[build-dependencies]
+# Attaches the icon to the executable. A Windows resource table is not
+# something a Rust compiler writes, so this shells out to the SDK's rc.exe --
+# and `build.rs` treats a missing one as a warning. Passes the reuse test: it
+# is the operating system's own packaging, nothing to do with WoW.
+embed-resource = "3"
+
 [dependencies]
 mpq = { path = "../../crates/mpq" }
 blp = { path = "../../crates/blp" }
@@ -34,4 +41,5 @@ adt = { version = "0.0.1", path = "../../crates/adt" }
 auth = { version = "0.0.1", path = "../../crates/auth" }
 world = { version = "0.0.1", path = "../../crates/world" }
 ui = { version = "0.0.1", path = "../../crates/ui" }
+rfd.workspace = true
 rodio = { version = "0.21.1", default-features = false, features = ["mp3", "playback", "symphonia-mp3", "symphonia-wav", "wav"] }

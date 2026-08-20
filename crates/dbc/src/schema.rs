@@ -954,6 +954,77 @@ dbc_table! {
 }
 
 dbc_table! {
+    /// The eleven playable classes, and what to call one.
+    ///
+    /// Read for exactly one thing: the character-selection screen, which has a
+    /// class id off `SMSG_CHAR_ENUM` and nothing to turn it into a word. That
+    /// makes the localised name the only column here that matters, and it is
+    /// also the one that identifies the rest -- **a name is the one thing in a
+    /// binary format that cannot be a coincidence**, and a wrong offset here
+    /// would print `PET` or `WARRIOR` rather than `Warrior`.
+    ///
+    /// Those two neighbours are what make the offset worth stating. Field 3 is
+    /// a *pet* name token (`PET`, `DEMON`) and field 55 is the uppercase
+    /// filename token (`WARRIOR`) -- both strings, both plausible, and both
+    /// wrong for a screen a person reads. The localised block starts at 4, and
+    /// the arithmetic says so independently of the text: a `loc` block is
+    /// sixteen locale slots and a flags word, so the mask at 20 places its
+    /// first slot at 4, exactly as the masks at 37 and 54 place the female and
+    /// male name blocks that follow.
+    ChrClasses, ChrClassesRow, path = r"DBFilesClient\ChrClasses.dbc", fields = 60, {
+        0 id: u32,
+        /// Which power the class spends -- 0 mana, 1 rage, 2 focus, 3 energy.
+        /// **Not read anywhere**: a live unit's power type arrives in its
+        /// `BYTES_0` field, which is a fact about the unit rather than about
+        /// its class, and a druid disagrees with this column in three forms.
+        2 display_power: u32,
+        /// `PET` on nine of the ten rows and `DEMON` on the warlock. Named
+        /// only so the neighbouring offset is documented rather than
+        /// mysterious -- see the note above.
+        3 pet_name_token: str,
+        /// What the class is called, e.g. `Warrior`.
+        4 name: loc,
+        /// The uppercase token, e.g. `WARRIOR`. The form the original client
+        /// uses as a key; kept for the same reason as `pet_name_token`.
+        55 filename: str,
+    }
+}
+
+dbc_table! {
+    /// Every race, playable and NPC-only, and what to call one.
+    ///
+    /// The companion to [`ChrClasses`] and read for the same one reason. Ids
+    /// run 1..=21 in this build; 12 and up are NPC-only (fel orc, naga,
+    /// broken, and so on) and never arrive from a character list, but they are
+    /// in the table and nothing here filters them -- a row that cannot be
+    /// asked for costs nothing, and inventing a "playable" predicate would be
+    /// transcribing a rule this project has not measured.
+    ///
+    /// The name block starts at 14 by the same arithmetic that places
+    /// [`ChrClasses`]'s: its locale mask sits at 30, sixteen slots later.
+    ChrRaces, ChrRacesRow, path = r"DBFilesClient\ChrRaces.dbc", fields = 69, {
+        0 id: u32,
+        1 flags: u32,
+        /// The race's own faction, which is what decides who it can speak to.
+        /// Not read here; named because it is what a later "can these two
+        /// group" question would want and it is otherwise an unlabelled small
+        /// integer.
+        2 faction_id: u32,
+        /// `CreatureDisplayInfo` for a male and a female of this race. The
+        /// character screen does not use them -- a character list carries its
+        /// own display ids -- but they are what makes this table's identity
+        /// checkable against a model that already renders.
+        4 male_display_id: u32,
+        5 female_display_id: u32,
+        /// The prefix the client puts in front of a texture name, e.g. `Hu`
+        /// for human. The same key `CharSections` rows are built around.
+        6 client_prefix: str,
+        /// What the race is called, e.g. `Night Elf`.
+        14 name: loc,
+    }
+}
+
+dbc_table! {
     /// A character's skin, face, hair and facial-hair textures.
     ///
     /// Players do not get their appearance from `CreatureDisplayInfo` the way
