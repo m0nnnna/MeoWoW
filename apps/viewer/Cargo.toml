@@ -31,15 +31,15 @@ anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-m2 = { version = "0.0.1", path = "../../crates/m2" }
-collision = { version = "0.0.1", path = "../../crates/collision" }
-dbc = { version = "0.0.1", path = "../../crates/dbc" }
+m2 = { path = "../../crates/m2" }
+collision = { path = "../../crates/collision" }
+dbc = { path = "../../crates/dbc" }
 glam.workspace = true
-wmo = { version = "0.0.1", path = "../../crates/wmo" }
-adt = { version = "0.0.1", path = "../../crates/adt" }
+wmo = { path = "../../crates/wmo" }
+adt = { path = "../../crates/adt" }
 # The viewer can stand in a live world, not only in one read off disk.
-auth = { version = "0.0.1", path = "../../crates/auth" }
-world = { version = "0.0.1", path = "../../crates/world" }
-ui = { version = "0.0.1", path = "../../crates/ui" }
+auth = { path = "../../crates/auth" }
+world = { path = "../../crates/world" }
+ui = { path = "../../crates/ui" }
 rfd.workspace = true
 rodio = { version = "0.21.1", default-features = false, features = ["mp3", "playback", "symphonia-mp3", "symphonia-wav", "wav"] }

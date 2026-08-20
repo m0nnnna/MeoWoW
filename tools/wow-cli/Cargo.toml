@@ -16,9 +16,9 @@ anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-m2 = { version = "0.0.1", path = "../../crates/m2" }
-wmo = { version = "0.0.1", path = "../../crates/wmo" }
-adt = { version = "0.0.1", path = "../../crates/adt" }
-auth = { version = "0.0.1", path = "../../crates/auth" }
-world = { version = "0.0.1", path = "../../crates/world" }
+m2 = { path = "../../crates/m2" }
+wmo = { path = "../../crates/wmo" }
+adt = { path = "../../crates/adt" }
+auth = { path = "../../crates/auth" }
+world = { path = "../../crates/world" }
 glam.workspace = true
