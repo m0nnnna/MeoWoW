@@ -1157,14 +1157,24 @@ impl World {
     /// tile's answer -- a segment near a tile edge crosses two, and taking
     /// whichever came first in the map would let the camera through a wall
     /// depending on which way the character was facing.
-    pub fn first_obstruction(&self, from: Vec3, to: Vec3) -> Option<f32> {
-        let mut nearest: Option<f32> = None;
+    ///
+    /// The surface normal travels with the winning hit, the same reasoning
+    /// [`Self::floor_under_footing`] already carries a tag with its winning
+    /// height: a second, separate lookup for "which way does the *nearest*
+    /// triangle face" could disagree with this one about which triangle that
+    /// was. It is what lets the camera tell a wall from a low ceiling -- see
+    /// `collision::World::first_hit_with_normal`.
+    pub fn first_obstruction(&self, from: Vec3, to: Vec3) -> Option<(f32, Vec3)> {
+        let mut nearest: Option<(f32, Vec3)> = None;
         for tile in self.tiles_touching(from, to) {
             if tile.solid.is_empty() {
                 continue;
             }
-            if let Some(t) = tile.solid.first_hit(from, to) {
-                nearest = Some(nearest.map_or(t, |best: f32| best.min(t)));
+            if let Some((t, normal)) = tile.solid.first_hit_with_normal(from, to) {
+                nearest = Some(match nearest {
+                    Some(best) if best.0 <= t => best,
+                    _ => (t, normal),
+                });
             }
         }
         nearest

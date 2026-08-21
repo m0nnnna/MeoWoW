@@ -20,6 +20,20 @@ use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec
 
 use crate::style::Style;
 
+/// One plain speech line in a gossip menu -- "I'd like to browse your
+/// goods.", or a custom NPC's own scripted choices. Not a quest: choosing one
+/// answers `CMSG_GOSSIP_SELECT_OPTION` and, on a scripted NPC, very often
+/// gets back a *new* menu rather than closing anything -- which is what
+/// lets a multi-step gossip tree be clicked through one line at a time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuestgiverOption {
+    /// **The server's own option id**, not a position in the list -- the
+    /// same rule [`QuestgiverRow::id`] follows, and for the identical
+    /// reason: a filtered menu leaves holes in the numbering.
+    pub index: u32,
+    pub message: String,
+}
+
 /// One quest in a questgiver's list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuestgiverRow {
@@ -64,9 +78,11 @@ impl QuestgiverAction {
 /// What the window is showing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QuestgiverView {
-    /// Several quests: pick one.
+    /// A menu: speech lines to click through, quests to pick, or both --
+    /// options drawn first, in the order this NPC sent them, quests after.
     List {
         npc: String,
+        options: Vec<QuestgiverOption>,
         quests: Vec<QuestgiverRow>,
     },
     /// One quest's text and its action.
@@ -87,8 +103,11 @@ pub enum QuestgiverView {
 /// Which button the user pressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QuestgiverClick {
-    /// A row in the list was chosen, by quest id.
+    /// A quest row in the list was chosen, by quest id.
     pub picked: Option<u32>,
+    /// A speech option was chosen, by the **server's own option id** --
+    /// never a row position. See [`QuestgiverOption::index`].
+    pub chosen_option: Option<u32>,
     /// The action button was pressed for this quest.
     pub acted: Option<u32>,
     /// The window was dismissed.
@@ -150,16 +169,17 @@ fn wrap(text: &str, style: &Style, scale: f32) -> Vec<String> {
 /// cannot disagree about how many there are.
 fn body_lines(view: &QuestgiverView, style: &Style, scale: f32) -> Vec<String> {
     match view {
-        QuestgiverView::List { quests, .. } => quests
+        QuestgiverView::List { options, quests, .. } => options
             .iter()
-            .map(|row| {
+            .map(|option| option.message.clone())
+            .chain(quests.iter().map(|row| {
                 let prefix = if row.turn_in { "? " } else { "! " };
                 if row.level > 0 {
                     format!("{prefix}[{}] {}", row.level, row.title)
                 } else {
                     format!("{prefix}{}", row.title)
                 }
-            })
+            }))
             .collect(),
         QuestgiverView::Quest {
             body,
@@ -210,13 +230,15 @@ pub fn size(view: &QuestgiverView, style: &Style, scale: f32) -> Vec2 {
     Vec2::new(style.questgiver_width * scale, height)
 }
 
-fn has_buttons(view: &QuestgiverView) -> bool {
-    match view {
-        // A list closes by picking something or by walking away; a row is not
-        // a button, so the strip is not drawn.
-        QuestgiverView::List { .. } => false,
-        QuestgiverView::Quest { action, .. } => action.label().is_some(),
-    }
+/// **Every state gets a button strip, unconditionally.** This used to be
+/// `false` for a `List` and for a `Quest` with nothing to press
+/// (`Unfinished`, `Waiting`) -- on the theory that a list closes by picking
+/// something or by walking away. In play that is exactly "stuck open with no
+/// way to close it": a vendor or a gossip-only NPC opens a `List` with no
+/// rows worth picking, and a quest still loading opens a `Waiting` view that
+/// used to have no button at all. Reported back from live play, twice.
+fn has_buttons(_view: &QuestgiverView) -> bool {
+    true
 }
 
 /// Where the list's rows sit, when it is showing one.
@@ -260,6 +282,18 @@ pub fn button_rects(rect: Rect, style: &Style, scale: f32) -> (Rect, Rect) {
     (action, dismiss)
 }
 
+/// Where the lone Close button sits when there is no action beside it to
+/// share the row with -- a `List`, or a `Quest` whose action has no label
+/// (`Unfinished`, `Waiting`). Full width rather than half of one, because
+/// nothing else is drawn on this row.
+pub fn close_only_rect(rect: Rect, style: &Style, scale: f32) -> Rect {
+    let pad = style.padding * scale;
+    let height = button_height(style, scale);
+    let bottom = rect.max.y - pad;
+    let width = (rect.width() - pad * 2.0).max(0.0);
+    Rect::from_min_size(Pos2::new(rect.min.x + pad, bottom - height), Vec2::new(width, height))
+}
+
 /// What a click at `point` means, if anything.
 pub fn click_at(
     rect: Rect,
@@ -270,17 +304,29 @@ pub fn click_at(
 ) -> QuestgiverClick {
     let mut click = QuestgiverClick::default();
     match view {
-        QuestgiverView::List { quests, .. } => {
-            if let Some(index) =
-                row_rects(rect, quests.len(), style, scale)
-                    .into_iter()
-                    .position(|row| row.contains(point))
+        QuestgiverView::List { options, quests, .. } => {
+            let total = options.len() + quests.len();
+            if let Some(index) = row_rects(rect, total, style, scale)
+                .into_iter()
+                .position(|row| row.contains(point))
             {
-                click.picked = quests.get(index).map(|row| row.id);
+                // Options are drawn first, so an index inside their range is
+                // one of them; anything past it is a quest, offset back down
+                // to a position in `quests`.
+                if index < options.len() {
+                    click.chosen_option = options.get(index).map(|option| option.index);
+                } else {
+                    click.picked = quests.get(index - options.len()).map(|row| row.id);
+                }
+            } else if close_only_rect(rect, style, scale).contains(point) {
+                click.closed = true;
             }
         }
         QuestgiverView::Quest { id, action, .. } => {
             if action.label().is_none() {
+                if close_only_rect(rect, style, scale).contains(point) {
+                    click.closed = true;
+                }
                 return click;
             }
             let (accept, dismiss) = button_rects(rect, style, scale);
@@ -338,20 +384,25 @@ pub fn draw(painter: &Painter, rect: Rect, view: &QuestgiverView, style: &Style,
         y += line;
     }
 
-    if let QuestgiverView::Quest { action, .. } = view {
-        if let Some(label) = action.label() {
+    let buttons: Vec<(Rect, &str)> = match view {
+        QuestgiverView::Quest { action, .. } if action.label().is_some() => {
             let (accept, dismiss) = button_rects(rect, style, scale);
-            for (bounds, label) in [(accept, label), (dismiss, "Close")] {
-                painter.rect_filled(bounds, corner_radius(style.corner * scale * 0.5), style.spellbook_selected);
-                painter.rect_stroke(
-                    bounds,
-                    corner_radius(style.corner * scale * 0.5),
-                    Stroke::new(style.border_width * scale, style.border),
-                    StrokeKind::Inside,
-                );
-                painter.text(bounds.center(), Align2::CENTER_CENTER, label, font.clone(), text);
-            }
+            // `action.label()` was just checked `Some`, so this cannot panic.
+            vec![(accept, action.label().unwrap()), (dismiss, "Close")]
         }
+        // A `List`, or a `Quest` with nothing to press: one full-width Close
+        // button, so there is always a way out of the window.
+        _ => vec![(close_only_rect(rect, style, scale), "Close")],
+    };
+    for (bounds, label) in buttons {
+        painter.rect_filled(bounds, corner_radius(style.corner * scale * 0.5), style.spellbook_selected);
+        painter.rect_stroke(
+            bounds,
+            corner_radius(style.corner * scale * 0.5),
+            Stroke::new(style.border_width * scale, style.border),
+            StrokeKind::Inside,
+        );
+        painter.text(bounds.center(), Align2::CENTER_CENTER, label, font.clone(), text);
     }
 }
 
@@ -409,15 +460,19 @@ mod tests {
     }
 
     /// A quest already in the log and unfinished has nothing to press, and
-    /// must not offer a button that would send a request the server refuses.
+    /// must not offer a button that would send a request the server refuses
+    /// -- but it must still be closable, or the window is stuck open until
+    /// the quest is finished.
     #[test]
-    fn an_unfinished_quest_has_no_button() {
+    fn an_unfinished_quest_has_no_action_but_can_be_closed() {
         let style = Style::default();
         let view = quest(QuestgiverAction::Unfinished);
         assert_eq!(QuestgiverAction::Unfinished.label(), None);
         let rect = Rect::from_min_size(Pos2::ZERO, size(&view, &style, 1.0));
         // Nothing anywhere in the window reports an action.
         assert_eq!(click_at(rect, &view, &style, 1.0, rect.center()).acted, None);
+        let close = close_only_rect(rect, &style, 1.0);
+        assert!(click_at(rect, &view, &style, 1.0, close.center()).closed);
     }
 
     /// **A window that has not been told what the quest is must not offer
@@ -437,6 +492,13 @@ mod tests {
         assert_eq!(QuestgiverAction::Waiting.label(), None);
         let lines = body_lines(&view, &style, 1.0).join(" ");
         assert!(lines.contains("Asking the server"), "{lines}");
+        // **Reported from live play: a window stuck on "Asking the
+        // server..." had no way to close it.** Whatever is holding the
+        // reply up -- a lost packet, a realm that will not answer -- the
+        // player must still be able to walk away from the conversation.
+        let rect = Rect::from_min_size(Pos2::ZERO, size(&view, &style, 1.0));
+        let close = close_only_rect(rect, &style, 1.0);
+        assert!(click_at(rect, &view, &style, 1.0, close.center()).closed);
     }
 
     /// A list reports the quest **id** a row names, not its position -- the
@@ -446,6 +508,7 @@ mod tests {
         let style = Style::default();
         let view = QuestgiverView::List {
             npc: "Marshal McBride".into(),
+            options: Vec::new(),
             quests: vec![
                 QuestgiverRow {
                     id: 7,
@@ -471,6 +534,83 @@ mod tests {
             click_at(rect, &view, &style, 1.0, rows[0].center()).picked,
             Some(7)
         );
+    }
+
+    /// **A list with nothing pickable must still close.** A pure vendor or a
+    /// gossip-only NPC opens a `List` with zero quests and no rows worth
+    /// picking -- reported from live play as a window that opened and then
+    /// could not be gotten rid of.
+    #[test]
+    fn an_empty_list_can_still_be_closed() {
+        let style = Style::default();
+        let view = QuestgiverView::List {
+            npc: "A Vendor".into(),
+            options: Vec::new(),
+            quests: Vec::new(),
+        };
+        let rect = Rect::from_min_size(Pos2::ZERO, size(&view, &style, 1.0));
+        let close = close_only_rect(rect, &style, 1.0);
+        assert!(click_at(rect, &view, &style, 1.0, close.center()).closed);
+        // And a list that *does* have rows is closable too, without the
+        // close button being confused for one of them.
+        let view = QuestgiverView::List {
+            npc: "Marshal McBride".into(),
+            options: Vec::new(),
+            quests: vec![QuestgiverRow {
+                id: 7,
+                title: "Kobold Camp Cleanup".into(),
+                level: 1,
+                turn_in: false,
+            }],
+        };
+        let rect = Rect::from_min_size(Pos2::ZERO, size(&view, &style, 1.0));
+        let close = close_only_rect(rect, &style, 1.0);
+        let click = click_at(rect, &view, &style, 1.0, close.center());
+        assert!(click.closed);
+        assert_eq!(click.picked, None);
+    }
+
+    /// **Reported from live play**: a gossip menu's speech lines -- "I'd
+    /// like to browse your goods.", or a custom scripted NPC's own choices
+    /// -- were parsed and simply never drawn. Options are drawn first, so
+    /// this is the test that the row-index math correctly offsets into
+    /// `quests` once it walks past them, using the server's own ids for
+    /// both rather than positions in either list.
+    #[test]
+    fn options_and_quests_share_one_list_and_report_their_own_ids() {
+        let style = Style::default();
+        let view = QuestgiverView::List {
+            npc: "Farley".into(),
+            options: vec![
+                QuestgiverOption {
+                    index: 1,
+                    message: "I'd like to browse your goods.".into(),
+                },
+                QuestgiverOption {
+                    index: 2,
+                    message: "Can I rent a room?".into(),
+                },
+            ],
+            quests: vec![QuestgiverRow {
+                id: 333,
+                title: "Harlan Needs a Resupply".into(),
+                level: 1,
+                turn_in: false,
+            }],
+        };
+        let rect = Rect::from_min_size(Pos2::ZERO, size(&view, &style, 1.0));
+        let rows = row_rects(rect, 3, &style, 1.0);
+
+        let first = click_at(rect, &view, &style, 1.0, rows[0].center());
+        assert_eq!(first.chosen_option, Some(1));
+        assert_eq!(first.picked, None);
+
+        let second = click_at(rect, &view, &style, 1.0, rows[1].center());
+        assert_eq!(second.chosen_option, Some(2));
+
+        let third = click_at(rect, &view, &style, 1.0, rows[2].center());
+        assert_eq!(third.picked, Some(333));
+        assert_eq!(third.chosen_option, None);
     }
 
     /// The window grows with its text, so a long quest is not clipped -- and

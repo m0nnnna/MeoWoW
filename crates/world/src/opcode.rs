@@ -38,6 +38,24 @@ pub enum ClientOpcode {
     /// of fact until this is asked. Mail is the first feature that needs the
     /// difference.
     GameObjectQuery = 0x005E,
+    /// Interacts with a game object -- opens the door, pulls the lever, takes
+    /// the harvest basket. `foss-wow#141`: a quest like *Milly's Harvest*
+    /// places a plain object in the world with nothing to loot and nothing
+    /// to gossip about, and clicking it was previously indistinguishable
+    /// from a click that missed nothing at all, because this client only
+    /// ever asked a game object what it *was* ([`Self::GameObjectQuery`]),
+    /// never told it to *do* anything.
+    ///
+    /// **From AzerothCore's `HandleGameObjectUseOpcode`, not yet confirmed
+    /// against a live realm.** Body is the target's guid, sent **unpacked**
+    /// like [`Self::GossipHello`]'s -- `ObjectGuid::operator>>` reads a plain
+    /// `u64`, not the packed form. The server resolves what "use" means
+    /// per object (a chest opens loot, a goober grants a quest item, a door
+    /// swings) and answers with whatever effect that implies rather than a
+    /// reply of its own; the viewer deliberately does not route a mailbox
+    /// click through this, since that flow already works without it and
+    /// changing a confirmed path to test an unconfirmed one would risk both.
+    GameObjectUse = 0x00B1,
     /// What is item entry N? `Item.dbc` carries an item's *model*, and this
     /// client already reads it -- but not its **name**, which is server data
     /// and reaches a client only in answer to this. Every bag square,
@@ -143,6 +161,33 @@ pub enum ClientOpcode {
     /// slot landed at each other's positions, a real two-way swap, nothing
     /// left in between.
     SwapItemCandidate = 0x010C,
+
+    /// Destroys a carried item outright -- what a bag drag that ends nowhere
+    /// (not a slot, not a vendor, not any other window) means.
+    ///
+    /// **From public documentation, not yet confirmed against a live
+    /// realm** -- unlike every neighbouring opcode in this block, which was
+    /// checked by watching a specific guid move. `0x0111` sits exactly where
+    /// the table says it should, one below `SwapItemCandidate` and one above
+    /// `INVENTORY_CHANGE_FAILURE` (`0x0112`, already confirmed and parsed in
+    /// this crate as the generic refusal every inventory write shares), and
+    /// the body is silent on success the same way `BuyItem` and `SellItem`
+    /// are; a refusal answers on the shared `INVENTORY_CHANGE_FAILURE`
+    /// opcode instead of a reply of its own.
+    ///
+    /// `{bag, slot, count}` plus three trailing zero bytes the documented
+    /// handler reads and never uses -- six in total. Sent whole rather than
+    /// as three, deliberately: packets are length-framed, so extra trailing
+    /// bytes a handler does not read are merely unread within this one
+    /// packet, where three bytes *short* risks the read running past this
+    /// packet's own bound if the six-byte body is the real one -- the safer
+    /// side to be wrong on between the two candidate lengths.
+    ///
+    /// What would confirm it the way `SwapItemCandidate` was confirmed: sending it
+    /// against a known slot and watching the item actually leave
+    /// `PLAYER_FIELD_PACK_SLOT_n` in the next object update, with no
+    /// `INVENTORY_CHANGE_FAILURE` in between.
+    DestroyItem = 0x0111,
 
     /// Take one slot off the corpse currently open, letting the server choose
     /// where it goes in the bags.

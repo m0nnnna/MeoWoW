@@ -45,13 +45,15 @@ pub use frames::chat::{ChatEntry, ChatKind};
 pub use frames::combat_text::{CombatTextKind, FloatingText};
 pub use frames::{
     AuctionClick, AuctionRow, AuctionTab, AuctionView,
-    CastBarView, InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
-    QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverRow,
+    CastBarView, DestroyAnswer, DestroyPromptView,
+    InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
+    QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverOption, QuestgiverRow,
     GuildRow, GuildView, MailAttachment, MailRow, MailRowState, OfficerNotes, MailView,
     Difficulty, MapMarker, MapPatch, MapView, MarkerKind, MinimapTile, MinimapView,
     QuestgiverView,
     SpellbookEntry, TaxiRow, TaxiView, TrackedQuest, TrackerView, TradeClick, TradeOfferAnswer,
     TradeOfferView, TradeSquare, TradeSquareItem, TradeView, TrainerRow, TrainerRowState, TrainerView, UnitView,
+    VendorRow, VendorView,
 };
 pub use layout::{default_path, CharacterBars, ElementId, Profile};
 pub use login::{CharacterRow, RealmRow, SignIn, Stage as SignInStage, Tone};
@@ -172,6 +174,10 @@ pub struct HudData<'a> {
     /// and questgiver windows -- and unlike them it can be open *beside* a
     /// questgiver's scroll, because a class trainer usually carries both bits.
     pub trainer: Option<&'a frames::TrainerView>,
+    /// The open vendor's stock, or `None`. Existence is the flag, like the
+    /// trainer and loot windows -- and it too can be open beside a
+    /// questgiver's scroll, since a vendor is very often also a gossip NPC.
+    pub vendor: Option<&'a frames::VendorView>,
     /// The open flight master's list, or `None`. Existence is the flag, like
     /// the trainer and loot windows.
     pub taxi: Option<&'a frames::TaxiView>,
@@ -311,6 +317,16 @@ pub struct HudResponse {
     /// was offered to the equipment slots, refused, and appeared to do
     /// nothing at all.
     pub activate_item: Option<usize>,
+    /// The player confirmed destroying a carried item, reported as the same
+    /// **row position** [`Self::move_item`] and [`Self::activate_item`] use --
+    /// the caller resolves it through the same `bags_where` list.
+    ///
+    /// Reached by picking an item up and then clicking somewhere this crate
+    /// drew nothing at all: not a bag square, not any other window, the
+    /// world behind the interface. A confirmation prompt stands between that
+    /// click and this field, so it is set only once the player has pressed
+    /// Destroy on it, never on the drop itself.
+    pub destroy_item: Option<usize>,
     /// A quest log row was clicked, reported as the **quest id** rather than
     /// as the row's position. Same reasoning as [`Self::take_loot`] carrying a
     /// loot slot: a row number means nothing outside the list this crate was
@@ -329,6 +345,15 @@ pub struct HudResponse {
     /// malformed request, so an inert row reports nothing at all rather than
     /// reporting a click the caller would have to remember to ignore.
     pub learn_spell: Option<u32>,
+    /// A vendor row was clicked, reported as **`(slot, entry)`** rather than
+    /// a row position -- both travel because the server checks they still
+    /// agree, and neither is safe to derive from where the row sits: the
+    /// vendor's own slot is free to leave holes, and the entry names which
+    /// item this client is asking to buy.
+    ///
+    /// Only ever set for a row still in stock. A sold-out row is inert, the
+    /// same decision the trainer window makes about a spell already known.
+    pub buy_item: Option<(u32, u32)>,
     /// A flight was chosen, reported as the **`TaxiNodes` id** rather than a
     /// row position -- the list is filtered per character by the known-node
     /// mask, so a position names a different place to two readers standing at
@@ -477,6 +502,16 @@ pub struct Hud {
     /// the cursor is in -- a `(spell, item)` pair of options would let both
     /// be `Some` at once, a state nothing here could make sense of.
     held: Option<Held>,
+    /// A bag row waiting on a yes/no answer for whether to destroy what is
+    /// in it, or `None`.
+    ///
+    /// Reached only one way: a bag item was held and then a click landed
+    /// nowhere this crate drew anything -- see [`Hud::show`]'s handling
+    /// after the per-element loop. `held` and this are mutually exclusive by
+    /// construction, the same reasoning [`Held`] itself is one enum rather
+    /// than two options: a cursor cannot simultaneously be carrying an item
+    /// and asking whether to destroy one.
+    destroy_confirm: Option<usize>,
     /// The first spell shown in the book, as it is scrolled.
     spellbook_scroll: usize,
 }
@@ -491,6 +526,7 @@ impl Default for Hud {
             character: None,
             occupied: Vec::new(),
             held: None,
+            destroy_confirm: None,
             spellbook_scroll: 0,
         }
     }
@@ -594,7 +630,22 @@ impl Hud {
     /// Answered from the rectangles this crate drew last frame plus egui's own
     /// opinion about its windows -- see [`Hud::occupied`] for why the second
     /// alone is not enough.
+    ///
+    /// **A held item or spell claims the pointer everywhere, not just over
+    /// drawn rectangles.** `foss-wow#139`: dropping a bag item on open ground
+    /// used to fall through to the viewer's own camera-drag handling, which
+    /// grabs and hides the cursor the instant a left button goes down over
+    /// anything this crate did not claim -- so the ordinary human imprecision
+    /// between a press and a release read as a drag instead of the click
+    /// [`Hud::show`]'s ground-drop handling is waiting for, and the item
+    /// stayed stuck. A hold redefines what a click anywhere means -- see the
+    /// module doc on [`Held`] -- so it has to redefine this too, the same way
+    /// a right-click already cancels a hold "anywhere" rather than only over
+    /// a window.
     pub fn captures_pointer(&self, ctx: &egui::Context) -> bool {
+        if self.held.is_some() || self.destroy_confirm.is_some() {
+            return true;
+        }
         if ctx.egui_wants_pointer_input() {
             return true;
         }
@@ -725,6 +776,7 @@ impl Hud {
             let quest_log_placeholder;
             let questgiver_placeholder;
             let trainer_placeholder;
+            let vendor_placeholder;
             let taxi_placeholder;
             let mail_placeholder;
             let guild_placeholder;
@@ -839,6 +891,14 @@ impl Hud {
                     None if editing => {
                         trainer_placeholder = frames::trainer::placeholder();
                         Content::Trainer(&trainer_placeholder)
+                    }
+                    None => continue,
+                },
+                ElementId::Vendor => match data.vendor {
+                    Some(view) => Content::Vendor(view),
+                    None if editing => {
+                        vendor_placeholder = frames::vendor::placeholder();
+                        Content::Vendor(&vendor_placeholder)
                     }
                     None => continue,
                 },
@@ -1005,6 +1065,9 @@ impl Hud {
                 }
                 Content::Trainer(view) => {
                     frames::trainer::size(view.rows.len(), &style, element.scale)
+                }
+                Content::Vendor(view) => {
+                    frames::vendor::size(view.rows.len(), &style, element.scale)
                 }
                 Content::Mail(view) => {
                     frames::mail::size(view.rows.len(), &style, element.scale)
@@ -1230,6 +1293,13 @@ impl Hud {
                             response.rect,
                             &view.greeting,
                             &view.rows,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::Vendor(view) => frames::vendor::draw(
+                            &painter,
+                            response.rect,
+                            view,
                             &style,
                             element.scale,
                         ),
@@ -1514,6 +1584,26 @@ impl Hud {
                             ) {
                                 response_out.learn_spell =
                                     view.rows.get(row).map(|row| row.spell);
+                            }
+                        }
+                    }
+                }
+                (false, Content::Vendor(view)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            // Same shape as the trainer's: `row_at` answers
+                            // only for rows still in stock, so a sold-out row
+                            // cannot report a click the server would decline
+                            // in silence.
+                            if let Some(row) = frames::vendor::row_at(
+                                drawn_rect,
+                                &view.rows,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                response_out.buy_item =
+                                    view.rows.get(row).map(|row| (row.slot, row.entry));
                             }
                         }
                     }
@@ -1991,6 +2081,13 @@ impl Hud {
                             &style,
                             scale,
                         ),
+                        ElementId::Vendor => frames::vendor::size(
+                            data.vendor
+                                .map(|view| view.rows.len())
+                                .unwrap_or_else(|| frames::vendor::placeholder().rows.len()),
+                            &style,
+                            scale,
+                        ),
                         ElementId::Mailbox => frames::mail::size(
                             data.mail
                                 .map(|view| view.rows.len())
@@ -2077,6 +2174,83 @@ impl Hud {
             }
         }
 
+        // A primary click this frame, at its position -- or `None` if there
+        // was not one. Both branches below want the same fact, so it is read
+        // once rather than at each site.
+        let click_at_point = ctx.input(|i| {
+            i.pointer
+                .primary_clicked()
+                .then(|| i.pointer.interact_pos())
+                .flatten()
+        });
+
+        // **The confirmation between a bag drag that missed everything and
+        // an item actually being destroyed.** Drawn and hit-tested directly
+        // rather than through the `ElementId` system -- see the module doc
+        // on `frames::destroy_prompt` for why this one is not a
+        // customisable element. Checked before the drop detection below, so
+        // the two states stay mutually exclusive by construction.
+        if let Some(row) = self.destroy_confirm {
+            let view = data
+                .bags
+                .and_then(|slots| slots.get(row))
+                .and_then(|slot| slot.item.as_ref())
+                .map(|item| frames::DestroyPromptView {
+                    name: item.name.clone(),
+                    icon: item.icon,
+                });
+            match view {
+                Some(view) => {
+                    let rect = egui::Rect::from_center_size(
+                        screen.center(),
+                        frames::destroy_prompt::size(&style, 1.0),
+                    );
+                    // Claimed so a click meant for this prompt cannot also
+                    // reach the creature standing behind it.
+                    self.occupied.push(rect);
+                    // `Order::Middle`, drawn last: this needs to sit over
+                    // every ordinary window without reaching for
+                    // `Order::Foreground`, which is reserved for the edit
+                    // and debug windows -- see `ElementId::layer`.
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::new("hud-destroy-prompt"),
+                    ));
+                    frames::destroy_prompt::draw(&painter, rect, &view, &style, 1.0);
+                    if let Some(point) = click_at_point {
+                        match frames::destroy_prompt::click_at(rect, &style, 1.0, point) {
+                            Some(frames::DestroyAnswer::Confirm) => {
+                                response_out.destroy_item = Some(row);
+                                self.destroy_confirm = None;
+                            }
+                            Some(frames::DestroyAnswer::Cancel) => self.destroy_confirm = None,
+                            None => {}
+                        }
+                    }
+                }
+                // Whatever was there is gone by some other means -- moved,
+                // sold, already destroyed -- so there is nothing left to
+                // confirm.
+                None => self.destroy_confirm = None,
+            }
+        } else if !editing {
+            // **A held item, and a click that landed nowhere this crate drew
+            // anything.** Not a bag square, not any other window -- the
+            // world behind the interface, which is exactly what dragging an
+            // item out of the bag window and letting go over open ground
+            // means. `occupied` is this frame's, fully rebuilt by the loop
+            // above, so this is the same rectangle set `captures_pointer`
+            // would answer from on the next frame.
+            if let Some(Held::Item(row)) = self.held {
+                if let Some(point) = click_at_point {
+                    if !self.occupied.iter().any(|rect| rect.contains(point)) {
+                        self.held = None;
+                        self.destroy_confirm = Some(row);
+                    }
+                }
+            }
+        }
+
         response_out
     }
 }
@@ -2100,6 +2274,7 @@ enum Content<'a> {
     QuestLog(&'a [frames::QuestLogEntry]),
     Questgiver(&'a frames::QuestgiverView),
     Trainer(&'a frames::TrainerView),
+    Vendor(&'a frames::VendorView),
     Mail(&'a frames::MailView),
     Guild(&'a frames::GuildView),
     Auction(&'a frames::AuctionView),
@@ -2882,6 +3057,46 @@ mod tests {
             hud.captures_pointer(&ctx),
             "`captures_pointer` must claim the bag window even where egui does \
              not -- this is what `foss-wow#79` turned on"
+        );
+    }
+
+    /// **`foss-wow#139`.** A held item redefines what a click anywhere means
+    /// -- see [`Hud::captures_pointer`]'s doc comment -- so it has to claim
+    /// the pointer even over open ground, where nothing is drawn and egui
+    /// itself has no opinion. Before this, that press fell through to the
+    /// viewer's own camera-drag handling, which grabs and hides the cursor
+    /// before it is known whether the gesture is a click or a drag; ordinary
+    /// hand tremor between press and release then read as a drag, and
+    /// dropping the item on the ground never worked.
+    #[test]
+    fn a_held_item_claims_the_pointer_even_over_open_ground() {
+        let ctx = egui::Context::default();
+        let mut hud = Hud::default();
+        assert!(
+            !hud.captures_pointer(&ctx),
+            "an empty hold must not claim the pointer -- every ordinary world \
+             click would stop working"
+        );
+        hud.held = Some(Held::Item(0));
+        assert!(
+            hud.captures_pointer(&ctx),
+            "a held item must claim the pointer everywhere, not just the \
+             rectangles this crate drew"
+        );
+    }
+
+    /// The same property, for the other half of [`Held`]'s mutual exclusion:
+    /// the destroy-prompt state that dropping a held item on the ground
+    /// produces.
+    #[test]
+    fn an_open_destroy_prompt_claims_the_pointer_even_over_open_ground() {
+        let ctx = egui::Context::default();
+        let mut hud = Hud::default();
+        hud.destroy_confirm = Some(0);
+        assert!(
+            hud.captures_pointer(&ctx),
+            "an open destroy prompt must claim the pointer everywhere -- a \
+             miss must cancel it, not swing the camera behind it"
         );
     }
 
@@ -4571,6 +4786,127 @@ mod tests {
         assert_eq!(hud.held, None);
     }
 
+    /// **Reported from live play**: picking an item up and then clicking
+    /// somewhere this crate drew nothing at all -- not a bag square, not any
+    /// other window, the game world behind the interface -- must offer to
+    /// destroy it rather than silently doing nothing and leaving the item
+    /// stuck to the cursor.
+    #[test]
+    fn dropping_a_held_item_outside_every_window_asks_to_destroy_it() {
+        let slots = bag_slots(&[(2589, "Linen Cloth", 3)]);
+        let data = HudData {
+            bags: Some(&slots),
+            ..Default::default()
+        };
+        let profile = Profile::default();
+        let positions = bag_slot_positions(&profile, slots.len());
+
+        let mut hud = Hud::default();
+        let mut script = click_script(positions[0], egui::PointerButton::Primary);
+        // Far outside every default frame's rectangle on any screen size
+        // this suite uses.
+        script.extend(click_script(
+            egui::Pos2::new(-5000.0, -5000.0),
+            egui::PointerButton::Primary,
+        ));
+        let response = drive(&mut hud, &data, &script);
+
+        assert_eq!(
+            response.destroy_item, None,
+            "a drop must ask before destroying, not destroy outright"
+        );
+        assert_eq!(hud.held, None, "the item must leave the cursor's hand");
+        assert_eq!(
+            hud.destroy_confirm,
+            Some(0),
+            "the prompt must remember which row is at stake"
+        );
+    }
+
+    /// A drop over another window -- the chat box is as good an example as
+    /// any -- is not a drop into the world, and must not ask to destroy
+    /// anything. Only the bag square gesture and the confirmation prompt
+    /// itself are dismissable places for a held item to go quietly; anywhere
+    /// else this crate drew something is neither of those.
+    #[test]
+    fn dropping_a_held_item_over_another_window_does_not_ask_to_destroy_it() {
+        let slots = bag_slots(&[(2589, "Linen Cloth", 3)]);
+        let entries = vec![ChatEntry {
+            kind: ChatKind::Say,
+            who: Some("Testwolf".into()),
+            text: "hello".into(),
+            prefix: None,
+        }];
+        let data = HudData {
+            bags: Some(&slots),
+            chat: &entries,
+            ..Default::default()
+        };
+        let profile = Profile::default();
+        let positions = bag_slot_positions(&profile, slots.len());
+        let chat_centre = profile
+            .get(ElementId::ChatFrame)
+            .rect(screen(), frames::chat::size(&profile.style, 1.0))
+            .center();
+
+        let mut hud = Hud::default();
+        let mut script = click_script(positions[0], egui::PointerButton::Primary);
+        script.extend(click_script(chat_centre, egui::PointerButton::Primary));
+        let response = drive(&mut hud, &data, &script);
+
+        assert_eq!(response.destroy_item, None);
+        assert_eq!(hud.destroy_confirm, None);
+        // The item is still held: a click over an unrelated window is not
+        // one of the two gestures (a bag square, or nowhere at all) that end
+        // a hold, so it stays exactly where `held` already put it.
+        assert_eq!(hud.held, Some(Held::Item(0)));
+    }
+
+    /// Pressing Destroy on the prompt reports the row and clears the
+    /// prompt; pressing Cancel clears it and reports nothing. Both read the
+    /// same rectangle `Hud::show` draws the prompt at, which is the only way
+    /// this test and the code under test cannot silently disagree about
+    /// where the buttons are.
+    #[test]
+    fn the_destroy_prompt_answers_only_the_button_pressed() {
+        let slots = bag_slots(&[(2589, "Linen Cloth", 3)]);
+        let data = HudData {
+            bags: Some(&slots),
+            ..Default::default()
+        };
+        let profile = Profile::default();
+        let positions = bag_slot_positions(&profile, slots.len());
+        let prompt_rect = egui::Rect::from_center_size(
+            screen().center(),
+            frames::destroy_prompt::size(&profile.style, 1.0),
+        );
+        let (confirm, cancel) = frames::destroy_prompt::buttons(prompt_rect, &profile.style, 1.0);
+
+        // Confirm: destroys row 0.
+        let mut hud = Hud::default();
+        let mut script = click_script(positions[0], egui::PointerButton::Primary);
+        script.extend(click_script(
+            egui::Pos2::new(-5000.0, -5000.0),
+            egui::PointerButton::Primary,
+        ));
+        script.extend(click_script(confirm.center(), egui::PointerButton::Primary));
+        let response = drive(&mut hud, &data, &script);
+        assert_eq!(response.destroy_item, Some(0));
+        assert_eq!(hud.destroy_confirm, None);
+
+        // Cancel: reports nothing and clears the prompt just the same.
+        let mut hud = Hud::default();
+        let mut script = click_script(positions[0], egui::PointerButton::Primary);
+        script.extend(click_script(
+            egui::Pos2::new(-5000.0, -5000.0),
+            egui::PointerButton::Primary,
+        ));
+        script.extend(click_script(cancel.center(), egui::PointerButton::Primary));
+        let response = drive(&mut hud, &data, &script);
+        assert_eq!(response.destroy_item, None);
+        assert_eq!(hud.destroy_confirm, None);
+    }
+
     /// A right-click with nothing held asks to auto-equip, and does not also
     /// pick the item up -- the two gestures answer different questions and a
     /// right-click starting a hold would leave the next left-click meaning
@@ -4740,6 +5076,11 @@ mod tests {
             ElementId::TradeOffer => frames::trade::offer_size(&profile.style, scale),
             ElementId::Trainer => frames::trainer::size(
                 frames::trainer::placeholder().rows.len(),
+                &profile.style,
+                scale,
+            ),
+            ElementId::Vendor => frames::vendor::size(
+                frames::vendor::placeholder().rows.len(),
                 &profile.style,
                 scale,
             ),

@@ -51,6 +51,7 @@ pub enum ElementId {
     PartyFrame,
     PartyInvite,
     Trainer,
+    Vendor,
     Taxi,
     Trade,
     TradeOffer,
@@ -61,7 +62,7 @@ pub enum ElementId {
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 26] = [
+    pub const ALL: [ElementId; 27] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -81,6 +82,7 @@ impl ElementId {
         ElementId::PartyFrame,
         ElementId::PartyInvite,
         ElementId::Trainer,
+        ElementId::Vendor,
         ElementId::Taxi,
         ElementId::Trade,
         ElementId::TradeOffer,
@@ -152,6 +154,10 @@ impl ElementId {
             // the map is one the player cannot buy from, which is exactly the
             // bug the questgiver's Accept button had.
             | ElementId::Trainer
+            // With the trainer, and for the identical reason: a vendor
+            // window is the answer to the same right-click, and one sealed
+            // under the map is stock nobody can buy.
+            | ElementId::Vendor
             | ElementId::Taxi
             // With them: a mailbox window is the answer to walking up to
             // an object and pressing a key, exactly as the trainer window
@@ -258,6 +264,7 @@ impl ElementId {
             ElementId::PartyFrame => "party-frame",
             ElementId::PartyInvite => "party-invite",
             ElementId::Trainer => "trainer",
+            ElementId::Vendor => "vendor",
             ElementId::Taxi => "taxi",
             ElementId::Trade => "trade",
             ElementId::TradeOffer => "trade-offer",
@@ -294,6 +301,7 @@ impl ElementId {
             ElementId::PartyFrame => "Party frame",
             ElementId::PartyInvite => "Party invite",
             ElementId::Trainer => "Trainer",
+            ElementId::Vendor => "Vendor",
             ElementId::Taxi => "Flight master",
             ElementId::Trade => "Trade",
             ElementId::TradeOffer => "Trade offer",
@@ -480,6 +488,17 @@ impl ElementId {
             ElementId::Taxi => Element {
                 anchor: Anchor::Left,
                 offset: [270.0, 130.0],
+                ..Default::default()
+            },
+            // Below the taxi window, same column, same reasoning: a vendor
+            // and a trainer or flight master can be the identical NPC --
+            // Innkeeper Farley is a vendor and nothing else in this
+            // fixture's data, but nothing stops a private realm pairing a
+            // vendor bit with either of the other two -- and a window sealed
+            // under one it is stacked with is stock nobody can reach.
+            ElementId::Vendor => Element {
+                anchor: Anchor::Left,
+                offset: [270.0, 280.0],
                 ..Default::default()
             },
             // Dead centre, and the only window here that wants to be: a map

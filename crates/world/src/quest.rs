@@ -789,6 +789,70 @@ pub fn parse_questgiver_details(body: &[u8]) -> Result<QuestgiverDetails, Error>
     Ok(QuestgiverDetails { npc, quest })
 }
 
+/// Parses the head of `SMSG_QUESTGIVER_OFFER_REWARD` or
+/// `SMSG_QUESTGIVER_REQUEST_ITEMS` -- both open `{npc, quest}`, the same
+/// shape `SMSG_QUESTGIVER_QUEST_DETAILS` does once its own extra originator
+/// guid is skipped, and both were treated as pure events with no body read
+/// at all until this. Everything after those twelve bytes is title, text,
+/// item requirements and reward choices this client's own quest cache and
+/// replicated log already answer for -- see [`parse_questgiver_details`]'s
+/// doc for why deriving from a second, independent parse of the same
+/// content is the wrong move.
+///
+/// **Not yet confirmed by a capture the way [`parse_questgiver_details`]
+/// was**, unlike that one. What is reused rather than guessed: the
+/// `{npc, quest}` header shape every other questgiver packet in this module
+/// shares, and the `rest()` + `finish()` pattern that makes a wrong guess
+/// about anything *past* those twelve bytes harmless, because none of it is
+/// read. A wrong guess about the twelve bytes themselves would show up as
+/// `finish` failing on too little input (the guid or id running past the
+/// body) rather than as a wrong quest silently drawn -- see
+/// [`crate::protocol::Reader`].
+///
+/// Reached from a questgiver with exactly one thing to do: a real client
+/// skips the gossip menu and `SMSG_QUESTGIVER_QUEST_DETAILS` alike for a
+/// quest that is ready to complete with nothing left to hand in, and this
+/// client had no handler for either arriving that way -- see `foss-wow`'s
+/// Eagan Peltskinner report, where the window opened and stayed completely
+/// empty on a quest a real client turns in without trouble.
+pub fn parse_questgiver_event(body: &[u8], what: &'static str) -> Result<QuestgiverDetails, Error> {
+    let mut r = Reader::new(body, what);
+    let npc = r.u64()?;
+    let quest = r.u32()?;
+    let _ = r.rest();
+    r.finish()?;
+    Ok(QuestgiverDetails { npc, quest })
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    /// The header is twelve bytes, not twenty: unlike
+    /// `SMSG_QUESTGIVER_QUEST_DETAILS` there is no second guid before the
+    /// quest id here. Whatever follows -- title, text, item rows -- is taken
+    /// wholesale rather than read.
+    #[test]
+    fn the_quest_id_sits_right_after_the_npc_guid() {
+        let body = [
+            0x8f, 0x2f, 0x01, 0x37, 0x03, 0x00, 0x30, 0xf1, // npc guid
+            0x0f, 0x03, 0x00, 0x00, // quest 783
+            b'A', 0x00, // a title begins; taken, not read
+        ];
+        let parsed = parse_questgiver_event(&body, "test").unwrap();
+        assert_eq!(parsed.quest, 783);
+        assert_eq!(parsed.npc, 0xf130_0003_3701_2f8f);
+    }
+
+    /// A body too short to hold the header is an error rather than a quest
+    /// id read out of whatever followed -- the same guarantee
+    /// `parse_questgiver_details` makes.
+    #[test]
+    fn a_short_body_is_an_error() {
+        assert!(parse_questgiver_event(&[0u8; 11], "test").is_err());
+    }
+}
+
 /// What mark belongs over an NPC's head.
 ///
 /// **Every value here was produced by a state this project created, one change

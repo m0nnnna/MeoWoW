@@ -19,6 +19,7 @@ pub mod bags;
 pub mod cast_bar;
 pub mod character;
 pub mod chat;
+pub mod destroy_prompt;
 pub mod guild;
 pub mod loot;
 pub mod combat_text;
@@ -38,6 +39,7 @@ pub mod trade;
 pub mod mail;
 pub mod trainer;
 pub mod unit;
+pub mod vendor;
 pub mod world_map;
 
 pub use auction::{AuctionClick, AuctionRow, AuctionTab, AuctionView};
@@ -46,12 +48,15 @@ pub use character::EquipSlot;
 pub use guild::{GuildRow, GuildView, OfficerNotes};
 pub use loot::{LootRow, Take};
 pub use cast_bar::CastBarView;
+pub use destroy_prompt::{DestroyAnswer, DestroyPromptView};
 pub use release::ReleasePromptView;
 pub use quest_log::{QuestDetail, QuestLogEntry};
 pub use party::{LootRuleView, PartyMemberView};
 pub use party_invite::{InviteAnswer, PartyInviteView};
 pub use quest_mark::QuestMark;
-pub use questgiver::{QuestgiverAction, QuestgiverClick, QuestgiverRow, QuestgiverView};
+pub use questgiver::{
+    QuestgiverAction, QuestgiverClick, QuestgiverOption, QuestgiverRow, QuestgiverView,
+};
 pub use spellbook::SpellbookEntry;
 pub use taxi::{TaxiRow, TaxiView};
 pub use tracker::{Difficulty, TrackedQuest, TrackerView};
@@ -61,5 +66,6 @@ pub use trade::{
 pub use mail::{MailAttachment, MailRow, MailRowState, MailView};
 pub use trainer::{TrainerRow, TrainerRowState, TrainerView};
 pub use unit::UnitView;
+pub use vendor::{VendorRow, VendorView};
 pub use minimap::{MinimapTile, MinimapView};
 pub use world_map::{MapMarker, MapPatch, MapView, MarkerKind};

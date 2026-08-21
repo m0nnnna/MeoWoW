@@ -26,7 +26,15 @@ use glam::{Vec2, Vec3};
 /// -- the abbey's steps and the hills around it are walkable while its walls
 /// are not, which is what the constant is for. A surface whose normal has less
 /// vertical component than this is climbed *around* rather than up.
-const FLOOR_NORMAL_Z: f32 = 0.5;
+///
+/// **Public so the camera can ask the identical question.** It tells a floor
+/// from a wall for a walking body; the camera needs the same distinction for
+/// a different reason -- a near-horizontal hit (floor *or* ceiling, by the
+/// same `abs(normal.z)` test) wants ducking under or over, where a wall wants
+/// pulling in front of. Using a second, locally-chosen threshold there would
+/// let the two disagree about which is which for the exact triangles this
+/// number already answers for.
+pub const FLOOR_NORMAL_Z: f32 = 0.5;
 
 /// The tag of a triangle nobody labelled.
 ///
@@ -499,6 +507,46 @@ impl World {
             })
     }
 
+    /// [`World::first_hit`], plus the surface normal of whichever triangle
+    /// answered.
+    ///
+    /// **What lets a caller tell a wall from a floor or a ceiling** among the
+    /// shapes `first_hit` already treats alike -- everything solid, by
+    /// design. A wall wants the eye pulled in front of it; a low ceiling
+    /// wants the eye ducked under it instead, and doing the first for the
+    /// second reads as the camera collapsing onto the character rather than
+    /// as a tunnel with a low roof. The normal is what tells the two apart,
+    /// the same `abs(normal.z)` test [`Triangle::is_floor`] already makes.
+    ///
+    /// Every stored triangle has a normal by construction -- [`World::add_tagged`]
+    /// refuses a degenerate one before it is ever kept -- so this answers
+    /// whenever `first_hit` would.
+    pub fn first_hit_with_normal(&self, from: Vec3, to: Vec3) -> Option<(f32, Vec3)> {
+        if self.triangles.is_empty() {
+            return None;
+        }
+        let span = (to.truncate() - from.truncate()).length();
+        let middle = (from.truncate() + to.truncate()) * 0.5;
+        self.near(middle, span * 0.5 + CELL)
+            .into_iter()
+            .filter_map(|index| {
+                self.triangles[index as usize]
+                    .hit_at(from, to)
+                    .map(|t| (t, index))
+            })
+            .fold(None, |nearest: Option<(f32, u32)>, (t, index)| {
+                Some(match nearest {
+                    Some(best) if best.0 <= t => best,
+                    _ => (t, index),
+                })
+            })
+            .and_then(|(t, index)| {
+                self.triangles[index as usize]
+                    .normal()
+                    .map(|normal| (t, normal))
+            })
+    }
+
     /// Whether a cylinder here overlaps anything solid.
     pub fn blocked(&self, at: Vec3, radius: f32, height: f32, step: f32) -> bool {
         let (low, high) = (at.z + step, at.z + height);
@@ -597,7 +645,14 @@ mod tests {
             c(a.x, b.y, b.z),
         ];
         const FACES: [[usize; 4]; 6] = [
-            [0, 1, 2, 3], // bottom
+            // Wound the opposite way from every other face here on purpose:
+            // the naive [0,1,2,3] order gives this face the same +Z normal
+            // the top face has, which is outward for the top and *inward*
+            // for the bottom. Nothing before `first_hit_with_normal` ever
+            // asked a box which way its faces pointed -- `is_floor` and
+            // `floor_hit` both take `abs(normal.z)`, so the sign was free to
+            // be wrong -- and this is the first test that reads it.
+            [0, 3, 2, 1], // bottom
             [4, 5, 6, 7], // top
             [0, 1, 5, 4],
             [1, 2, 6, 5],
@@ -659,6 +714,37 @@ mod tests {
             world.first_hit(Vec3::new(0.0, 0.0, 8.0), Vec3::new(10.0, 0.0, 8.0)),
             None,
             "a line clearing the wall was stopped by it"
+        );
+    }
+
+    /// **What separates a wall from a ceiling.** Both can stop the camera --
+    /// `a_floor_blocks_the_camera_but_not_a_walker` below covers that a floor
+    /// does too -- but only the normal says which is which, and that is the
+    /// one thing a caller needs to duck the eye under a low roof instead of
+    /// pulling it all the way in to the character, which is what treating
+    /// every hit alike used to do.
+    #[test]
+    fn first_hit_with_normal_tells_a_wall_from_a_ceiling() {
+        // The same wall as `the_first_hit_is_found_and_measured`: near
+        // vertical, its normal close to horizontal.
+        let wall = world_with(box_at(Vec3::new(4.0, -10.0, 0.0), Vec3::new(6.0, 10.0, 5.0)));
+        let (t, normal) = wall
+            .first_hit_with_normal(Vec3::new(0.0, 0.0, 2.0), Vec3::new(10.0, 0.0, 2.0))
+            .expect("the wall was missed");
+        assert!((t - 0.4).abs() < 1e-3, "hit reported at {t}");
+        assert!(
+            normal.z.abs() < 0.1,
+            "a wall's normal should be close to horizontal: {normal:?}"
+        );
+
+        // A low ceiling: a thin slab overhead, hit from directly below.
+        let ceiling = world_with(box_at(Vec3::new(-5.0, -5.0, 3.0), Vec3::new(5.0, 5.0, 3.2)));
+        let (_, normal) = ceiling
+            .first_hit_with_normal(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 5.0))
+            .expect("the ceiling was missed");
+        assert!(
+            normal.z < -0.9,
+            "a ceiling's outward normal should point down, into the room under it: {normal:?}"
         );
     }
 
@@ -765,6 +851,45 @@ mod tests {
         assert_eq!(world.floor_under(at, 5.0, 0.5), Some(5.0));
         // Nothing under a point outside the box at all.
         assert_eq!(world.floor_under(Vec2::new(50.0, 50.0), 0.0, 0.5), None);
+    }
+
+    /// A margin sized to reach a low ceiling finds one; a margin sized only
+    /// for stair-stepping does not -- foss-wow#137's second bug.
+    ///
+    /// `floor_under_tagged` bounds candidates from *above*
+    /// (`ceiling = from_z + step`) and leaves the depth below unlimited, so a
+    /// generous `step` does not search "deeper", it searches "higher" -- and
+    /// `is_floor`/`floor_hit` take `abs(normal.z)`, so a downward-facing
+    /// ceiling passes the same near-horizontal test a floor does (see
+    /// `the_floor_under_you_is_the_one_you_are_standing_on`, which depends on
+    /// that same ambiguity for a box's underside). A camera querying near a
+    /// character's own head with a five-unit margin -- chosen to comfortably
+    /// reach a floor several units *below* -- ends up just as able to reach a
+    /// tunnel roof five units *above*.
+    #[test]
+    fn a_small_step_does_not_mistake_a_ceiling_for_a_floor() {
+        let mut world = World::new();
+        // A floor at z = 0.0, normal +Z.
+        world.add(Triangle::new(
+            Vec3::new(-5.0, -5.0, 0.0),
+            Vec3::new(5.0, -5.0, 0.0),
+            Vec3::new(0.0, 5.0, 0.0),
+        ));
+        // A low ceiling at z = 5.0, normal -Z.
+        world.add(Triangle::new(
+            Vec3::new(-5.0, -5.0, 5.0),
+            Vec3::new(0.0, 5.0, 5.0),
+            Vec3::new(5.0, -5.0, 5.0),
+        ));
+        let at = Vec2::ZERO;
+        // Querying near head height (2.2) with a margin generous enough to
+        // reach a floor below reproduces the misread: the ceiling is the
+        // only candidate within it, and wins.
+        assert_eq!(world.floor_under(at, 2.2, 5.0), Some(5.0));
+        // A margin sized for stair-stepping and terrain noise, not for
+        // reaching a room's ceiling, finds the real floor instead -- and
+        // still finds it, because the search below has no limit at all.
+        assert_eq!(world.floor_under(at, 2.2, 1.0), Some(0.0));
     }
 
     /// A step up is climbed; a wall of the same shape is not.

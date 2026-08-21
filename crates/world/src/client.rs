@@ -625,6 +625,12 @@ impl Connection {
         )
     }
 
+    /// Interacts with a game object -- see [`ClientOpcode::GameObjectUse`]
+    /// for what "interact" resolves to and why it is unpacked.
+    pub fn use_gameobject(&mut self, guid: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::GameObjectUse, &guid.to_le_bytes())
+    }
+
     /// Asks what an item entry is -- its name, quality and the rest.
     ///
     /// `guid` may be `0`: the server keys the answer on the entry alone, and
@@ -1358,6 +1364,19 @@ impl Connection {
         body.extend_from_slice(&item.to_le_bytes());
         body.extend_from_slice(&count.to_le_bytes());
         self.send(ClientOpcode::SellItem, &body)
+    }
+
+    /// Destroys `count` of a carried item outright, addressed by slot rather
+    /// than by guid -- unlike [`Connection::sell_item`]. See
+    /// [`ClientOpcode::DestroyItem`] for what is and is not confirmed here,
+    /// including why the body carries three trailing zero bytes nothing in
+    /// this crate reads back.
+    ///
+    /// `bag` is [`crate::inventory::OWN_SLOT_ARRAY`] for the player's own
+    /// array, the same convention every other slot-addressed send in this
+    /// module uses.
+    pub fn destroy_item(&mut self, bag: u8, slot: u8, count: u8) -> Result<(), Error> {
+        self.send(ClientOpcode::DestroyItem, &[bag, slot, count, 0, 0, 0])
     }
 
     /// Asks a player to join this character's group, naming them by the name

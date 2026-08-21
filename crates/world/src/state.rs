@@ -3905,6 +3905,33 @@ mod tests {
         assert!(!world.get(10).expect("created").lootable());
     }
 
+    /// **`foss-wow#141`: a creature can be lootable while `is_dead_or_ghost`
+    /// says no, and the two questions have to be asked separately.**
+    /// `is_dead_or_ghost`'s `max > 0` guard exists so an unreplicated health
+    /// bar cannot masquerade as a kill (see its own doc comment) -- but a
+    /// quest prop like *Milly's Harvest*'s grapes has a **genuinely** zero
+    /// max health, not merely a missing one, and that guard cannot tell the
+    /// two apart from the value alone. The lootable bit does not need to: the
+    /// server sets it independent of health entirely. A caller deciding
+    /// whether to attack or loot a right-clicked unit has to check both.
+    #[test]
+    fn a_zero_max_health_creature_can_be_lootable_though_not_dead_or_ghost() {
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            9,
+            ObjectType::Unit,
+            None,
+            &[(crate::update::fields::UNIT_DYNAMIC_FLAGS, 13)],
+        )]);
+        let entity = world.get(9).expect("created");
+        assert!(entity.lootable(), "the server marked it loot");
+        assert!(
+            !entity.is_dead_or_ghost(),
+            "no health field ever arrived, genuinely or not -- this is exactly \
+             the ambiguity `lootable` exists to answer instead"
+        );
+    }
+
     /// Only the lootable bit gates the sparkle -- `TAPPED`/`TAPPED_BY_PLAYER`
     /// alone (a creature fought but not yet dead, or fought by someone else)
     /// must not.

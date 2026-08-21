@@ -1156,6 +1156,43 @@ fn live_camera(live: &live::LiveWorld, args: &Args) -> Camera {
 /// at a character standing on a slope shoves the eye out into the open.
 const CAMERA_GROUND_CLEARANCE: f32 = 0.5;
 
+/// How far above the found floor the terrain field must sit before a ray is
+/// treated as underground and the terrain fallback is refused for it.
+///
+/// **No longer the search bound for `floor_under_footing` itself** -- it was,
+/// and that was foss-wow#137's second bug. `floor_under_footing`'s own `step`
+/// parameter was built for climbing a stair: it bounds candidates from
+/// *above* (`ceiling = from_z + step`) and leaves the depth below completely
+/// unlimited, which is the opposite of what this constant's old doc comment
+/// promised ("how far below"). Passed as that `step`, 5.0 units of upward
+/// slack was "nowhere near large enough to reach a cave's ceiling" right up
+/// until it measured one: a tunnel whose roof sits five units above the
+/// walking floor lets `floor_under_footing` admit the roof itself as a
+/// candidate floor whenever the character's head and the local ceiling
+/// happen to be within reach of each other -- and `is_floor`/`floor_hit` take
+/// `abs(normal.z)`, so a downward-facing ceiling passes the same near-
+/// horizontal test a floor does (see `the_floor_under_you_is_the_one_you_are_
+/// standing_on`, which depends on exactly that for a box's underside -- the
+/// sign cannot be trusted to tell floor from ceiling here any more than it
+/// could for the wall duck/pull-in decision). The real floor never needed an
+/// upper bound at all: it is always *below* the query point, so any margin
+/// admits it. `CAMERA_FLOOR_STEP` is that margin now, kept deliberately
+/// small; this constant keeps its one remaining job, the underground
+/// threshold below.
+const CAMERA_FLOOR_REACH: f32 = 5.0;
+
+/// The upper margin `floor_under_footing` is searched with from the camera
+/// path -- how far above the query point a candidate floor may sit and still
+/// be accepted, not how deep the search reaches (that is unlimited, and
+/// covers whatever `CAMERA_FLOOR_REACH` used to be trying to promise).
+///
+/// Comfortably larger than ordinary terrain noise and a stair's `STEP_HEIGHT`
+/// (0.8), and nowhere near `CAMERA_FLOOR_REACH`: a five-unit margin is what
+/// let a low cave ceiling answer for a query aimed at the character's own
+/// head. The true floor under an indoor or underground character sits below
+/// `focus.z`, never above it, so shrinking this cannot lose it.
+const CAMERA_FLOOR_STEP: f32 = 1.0;
+
 /// Pulls the camera in until it is not underground.
 ///
 /// **The eye moves along its own view ray, never sideways or upward.** Lifting
@@ -1175,28 +1212,61 @@ fn pull_camera_out_of_the_ground(
     ground_at: impl Fn(f32, f32) -> Option<f32>,
 ) -> glam::Vec3 {
     const STEPS: usize = 12;
+    const REFINE: usize = 6;
     let span = eye - focus;
+    // Unknown terrain (not streamed in yet) is treated as clear, the same
+    // direction the rest of the streaming code fails in -- stopping short on
+    // a tile that has not loaded would yank the camera into the character
+    // every time the world was still catching up.
+    let clear = |t: f32| -> bool {
+        let at = focus + span * t;
+        match ground_at(at.x, at.y) {
+            Some(ground) => at.z >= ground + CAMERA_GROUND_CLEARANCE,
+            None => true,
+        }
+    };
     let mut allowed = 1.0f32;
     for step in 1..=STEPS {
         let t = step as f32 / STEPS as f32;
-        let at = focus + span * t;
-        let Some(ground) = ground_at(at.x, at.y) else {
-            // No terrain loaded there yet. Stopping short on a tile that has
-            // not streamed in would yank the camera into the character every
-            // time the world was still catching up, so an unknown height is
-            // treated as clear -- the same direction the rest of the streaming
-            // code fails in.
-            continue;
-        };
-        if at.z < ground + CAMERA_GROUND_CLEARANCE {
-            // Stop just before the offending sample rather than at it, so the
-            // eye ends up above the ground rather than exactly on the surface
-            // that rejected it.
-            allowed = ((step - 1) as f32 / STEPS as f32).max(0.0);
+        if !clear(t) {
+            // The coarse pass only brackets *which* twelfth the ground comes
+            // up in; snapping `allowed` to that twelfth is what a cave ceiling
+            // turned into a visible pop -- a step at the surrounding rock's
+            // edge (present in one frame, absent from `ground_at` in the
+            // next) flipped the bracket by a whole twelfth on its own, with
+            // nothing else about the camera having moved. Bisecting inside
+            // the bracket makes `allowed` a continuous function of the ray
+            // instead of one quantised to n/STEPS.
+            let mut lo = (step - 1) as f32 / STEPS as f32;
+            let mut hi = t;
+            for _ in 0..REFINE {
+                let mid = (lo + hi) * 0.5;
+                if clear(mid) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            allowed = lo;
             break;
         }
     }
-    focus + span * allowed
+    let pulled = focus + span * allowed;
+    // **Logged whenever this pass actually shortens the ray**, the same
+    // reasoning `pull_camera_in_front_of_walls` carries its own two lines
+    // for -- this is the pass that turned out to be the real cause the
+    // three attempts at that one never touched: unlogged, it silently
+    // walked the eye back to the character every time `ground_at` answered
+    // for the wrong surface (the report a cave floor read as "eighteen
+    // units underground" against the outdoor terrain field, before this
+    // pass learned to ask the collision mesh first).
+    if allowed < 1.0 {
+        tracing::debug!(
+            "camera ground clearance: allowed={allowed:.3} of the ray, eye {:.2},{:.2},{:.2} -> {:.2},{:.2},{:.2}",
+            eye.x, eye.y, eye.z, pulled.x, pulled.y, pulled.z
+        );
+    }
+    pulled
 }
 
 /// How close a ghost has to be to its body before the server will hand it
@@ -1220,9 +1290,22 @@ const CAMERA_WALL_CLEARANCE: f32 = 0.35;
 ///
 /// A wall directly behind the character would otherwise put the eye inside the
 /// head, and this client *draws* that head -- a screenful of the inside of a
-/// face. The original hides the model at that range instead; until this one
-/// does, stopping short is the smaller of the two wrongs.
+/// face. See [`HIDE_OWN_MODEL_DISTANCE`], which is what stops that from
+/// happening now.
 const CAMERA_MIN_PULL_IN: f32 = 1.5;
+
+/// Below this, the character's own body is left out of the drawn list
+/// entirely, the way the original hides it in first person.
+///
+/// **Strictly under [`ui::camera::MIN_DISTANCE`] (2.5) on purpose.** Zooming
+/// the wheel in as far as it goes never gets closer than that, so this can
+/// only be reached by [`pull_camera_in_front_of_walls`] shortening the ray
+/// against something solid -- a wall directly behind the character, or a
+/// cave ceiling close overhead, down to [`CAMERA_MIN_PULL_IN`] at the
+/// closest. Reported from live play as the camera "going first person" in a
+/// low tunnel: correct once the body is out of the way, and a screenful of
+/// the inside of a face until then.
+const HIDE_OWN_MODEL_DISTANCE: f32 = 2.0;
 
 /// Pulls the camera in until nothing solid is between it and the character.
 ///
@@ -1232,26 +1315,74 @@ const CAMERA_MIN_PULL_IN: f32 = 1.5;
 /// outside it -- the view passing through a wall and looking back in -- is what
 /// this fixes, and no amount of ground sampling could.
 ///
-/// **Along the view ray and nowhere else**, for the same reason as the ground
-/// version: shortening the distance is the only move that leaves the picture
-/// pointing where it did. The subject stays centred; only the range changes.
+/// **A wall is pulled in front of; a near-horizontal hit is ducked under or
+/// over instead**, and only the second half is new. Both used to get the
+/// identical response -- shorten the ray toward the character -- which is
+/// right for a wall behind them and wrong for a low tunnel roof: a ceiling a
+/// stride above the character's head reads, on that response, as the eye
+/// landing on the character's own face, reported from live play as the
+/// camera "going first person" in the Northshire cave. "Near-horizontal" is
+/// the same `abs(normal.z)` test that already tells a floor from a wall for
+/// a walking body -- see `collision::FLOOR_NORMAL_Z`.
+///
+/// **Which way to duck is read from the hit's *position*, not the
+/// triangle's normal sign.** The magnitude test is trustworthy regardless of
+/// which way a triangle winds -- `abs` cannot disagree with itself -- but
+/// the sign is a claim about which side of the mesh is "outside", and this
+/// crate never checked it: every use up to now only ever asked how steep a
+/// surface was, never which way it faced, so a WMO wound the other way from
+/// what a test cube happens to produce would silently invert "ceiling" and
+/// "floor" here specifically. A hit above the focus point is something
+/// overhead whichever way its normal claims to point, and a hit below it is
+/// something underfoot -- the question this needs an answer to, asked in
+/// terms nothing about the source data has to be trusted for.
 fn pull_camera_in_front_of_walls(
     focus: glam::Vec3,
     eye: glam::Vec3,
-    first_hit: impl Fn(glam::Vec3, glam::Vec3) -> Option<f32>,
+    first_hit: impl Fn(glam::Vec3, glam::Vec3) -> Option<(f32, glam::Vec3)>,
 ) -> glam::Vec3 {
     let span = eye - focus;
     let length = span.length();
     if length < 1e-3 {
         return eye;
     }
-    let Some(t) = first_hit(focus, eye) else {
+    let Some((t, normal)) = first_hit(focus, eye) else {
         return eye;
     };
+    if normal.z.abs() >= collision::FLOOR_NORMAL_Z {
+        let hit = focus + span * t;
+        let ducked = if hit.z >= focus.z {
+            // Something overhead: stay at or below the hit, minus a little air.
+            glam::Vec3::new(eye.x, eye.y, eye.z.min(hit.z - CAMERA_WALL_CLEARANCE))
+        } else {
+            // Something underfoot, in the way from below: rise above it.
+            glam::Vec3::new(eye.x, eye.y, eye.z.max(hit.z + CAMERA_WALL_CLEARANCE))
+        };
+        // **Logged because three guesses at this exact report is the
+        // alternative.** Every earlier attempt reasoned about a low ceiling
+        // from first principles and shipped without a single number from the
+        // actual archway that keeps triggering it -- this is what the next
+        // report should carry back instead: the hit fraction, the normal
+        // this client read off the real geometry, and where the duck put the
+        // eye, in one line rather than another guess.
+        tracing::debug!(
+            "camera duck: t={t:.3} normal=({:.2},{:.2},{:.2}) hit.z={:.2} \
+             focus.z={:.2} eye {:.2},{:.2},{:.2} -> {:.2},{:.2},{:.2}",
+            normal.x, normal.y, normal.z, hit.z, focus.z,
+            eye.x, eye.y, eye.z, ducked.x, ducked.y, ducked.z
+        );
+        return ducked;
+    }
     // The hit is a fraction of the way out; back off a fixed distance from it
     // and never come closer to the character than the floor above.
     let stopped = (t * length - CAMERA_WALL_CLEARANCE).clamp(CAMERA_MIN_PULL_IN, length);
-    focus + span * (stopped / length)
+    let pulled = focus + span * (stopped / length);
+    tracing::debug!(
+        "camera pull-in: t={t:.3} normal=({:.2},{:.2},{:.2}) stopped={stopped:.2} of \
+         {length:.2} eye {:.2},{:.2},{:.2} -> {:.2},{:.2},{:.2}",
+        normal.x, normal.y, normal.z, eye.x, eye.y, eye.z, pulled.x, pulled.y, pulled.z
+    );
+    pulled
 }
 
 /// Places the eye on a sphere around a character, looking at them.
@@ -2778,6 +2909,18 @@ struct App {
     /// character's own -- see [`App::camera_follow_z`]. `None` until the first
     /// frame places it.
     camera_z: Option<f32>,
+    /// How far the eye actually ended up from the character this frame,
+    /// after `pull_camera_out_of_the_ground` and `pull_camera_in_front_of_
+    /// walls` have both had their say -- as opposed to `camera_distance`,
+    /// which is the *nominal* orbit distance the wheel sets and says
+    /// nothing about a low ceiling or a wall shortening it. Read by the
+    /// draw call that decides whether to include the character's own body
+    /// among the entities placed this frame: a wall directly behind the
+    /// character, or a cave ceiling close overhead, pulls this well inside
+    /// the model, and drawing it there is a screenful of the inside of a
+    /// face rather than a character standing in a tight space. `None`
+    /// before the first frame has placed a camera at all.
+    camera_eye_distance: Option<f32>,
     /// When the client started, which is the only clock the weather has.
     started: Instant,
     frame_ms: f32,
@@ -3166,6 +3309,13 @@ struct App {
     /// Cleared by the questgiver window's Close button, since the same click
     /// opened both, and replaced whenever another NPC is greeted.
     trainer: Option<TrainerSession>,
+    /// The open vendor's stock, or `None`. Same shape as [`Self::trainer`]
+    /// and for the same reason: a vendor is very often also a gossip NPC,
+    /// and Innkeeper Farley carries both the vendor and the questgiver bits
+    /// alongside her innkeeper one -- so this is a separate field rather
+    /// than a variant of one "NPC window" state, cleared by the questgiver
+    /// window's Close button and replaced whenever another NPC is greeted.
+    vendor: Option<VendorSession>,
 
     /// The open auction window, or `None`. See [`AuctionSession`].
     auction: Option<AuctionSession>,
@@ -3735,6 +3885,21 @@ struct TrainerSession {
     list: Option<::world::TrainerList>,
 }
 
+/// An open vendor's stock, held the same way [`TrainerSession`] is and for
+/// the identical reason: every field the server sent -- the discounted
+/// price, what remains in stock -- was computed for this character at this
+/// moment, and this client has no way to recompute any of it.
+struct VendorSession {
+    npc: u64,
+    /// Resolved at request time, like the trainer's and the questgiver's.
+    name: String,
+    /// `None` between the request and the reply. Drawn as an empty window
+    /// rather than as nothing, for the same reason the trainer's is: a
+    /// window that appeared only once the reply arrived would make a slow
+    /// realm look like a click that did not register.
+    list: Option<::world::VendorList>,
+}
+
 
 /// The open auction window, and everything about it the wire does not carry.
 ///
@@ -3792,6 +3957,17 @@ struct Questgiver {
     name: String,
     /// What the greeting said this NPC has, in the order it said it.
     offered: Vec<u32>,
+    /// The gossip menu's own speech lines -- "I'd like to browse your
+    /// goods.", or a custom NPC's own scripted choices -- as sent, in order.
+    /// Kept whole rather than reduced to labels: a click needs the option's
+    /// own id back, and `menu_id` below.
+    options: Vec<::world::GossipOption>,
+    /// The menu id the current `options` came from. Sent back with a
+    /// selection so the server knows which menu is being answered -- see
+    /// `Connection::gossip_select`. A submenu's reply carries its own id,
+    /// which is what makes clicking through a multi-step gossip tree work:
+    /// each answer updates this before the next one is sent.
+    menu_id: u32,
     /// The one quest whose text is on screen, if the player has picked one or
     /// the server volunteered it.
     showing: Option<u32>,
@@ -3816,10 +3992,23 @@ impl Questgiver {
             return;
         }
         self.offered = gossip.quests.iter().map(|quest| quest.quest_id).collect();
-        // One quest and nothing else to choose between: show it straight away
-        // rather than making the player click a list of one.
-        if self.offered.len() == 1 {
+        self.options = gossip.options.clone();
+        self.menu_id = gossip.menu_id;
+        // One quest and nothing else to choose between: show it straight
+        // away rather than making the player click a list of one. **Only
+        // when there are no speech options too** -- a menu offering both a
+        // line to click and a quest to take is not "nothing else to choose
+        // between", and jumping straight to the quest would hide the lines
+        // the player never got to read.
+        if self.options.is_empty() && self.offered.len() == 1 {
             self.showing = self.offered.first().copied();
+        }
+    }
+
+    /// Answers a speech line, whatever menu it came from.
+    fn choose_option(&self, live: &mut live::LiveWorld, index: u32) {
+        if let Err(e) = live.connection.gossip_select(self.npc, self.menu_id, index) {
+            tracing::warn!("choosing gossip option {index} at {:#018x} failed: {e:#}", self.npc);
         }
     }
 
@@ -4008,6 +4197,7 @@ impl App {
             error: None,
             last_frame: Instant::now(),
             camera_z: None,
+            camera_eye_distance: None,
             // The weather's own clock. Separate from `last_frame` because that
             // one is reset every frame, and a falling drop needs a monotone
             // total rather than a delta.
@@ -4094,6 +4284,7 @@ impl App {
             quest_saved_at: Instant::now(),
             questgiver: None,
             trainer: None,
+            vendor: None,
             auction: None,
             mailbox: None,
             guild_open: false,
@@ -5346,6 +5537,18 @@ impl App {
                     // See `App::own_body_drawn`: submitted-and-not-drawn and
                     // never-submitted are the same report from the window.
                     let own_drawn = drawn.iter().any(|entity| entity.guid == live.guid);
+                    // **Measured before this, not after.** `own_drawn` and
+                    // `App::own_body_drawn`'s diagnostic ask whether the body
+                    // was *available* to draw -- a real disappearance, not a
+                    // choice made about one that is fine. Removing it here
+                    // keeps that question and this one from being conflated
+                    // into a warning about a body that never went missing.
+                    if self
+                        .camera_eye_distance
+                        .is_some_and(|distance| distance < HIDE_OWN_MODEL_DISTANCE)
+                    {
+                        drawn.retain(|entity| entity.guid != live.guid);
+                    }
                     live.ease_facings(&mut drawn, self.frame_ms / 1000.0);
                     let placements: Vec<crate::world::EntityPlacement> =
                         drawn
@@ -5876,23 +6079,34 @@ impl App {
             let ground = world.height_at(live.position.x, live.position.y);
             let underfoot = world.floor_under_footing(live.position, STEP_HEIGHT);
             let floor = underfoot.map(|(z, _)| z);
-            // The higher of the two, so a floor laid over ground holds the
-            // character up -- but only a floor at or below head height, which
-            // `floor_under` has already enforced.
-            let stand = match (ground, floor) {
-                (Some(g), Some(f)) => Some(g.max(f)),
-                (some, None) | (None, some) => some,
-            };
-            // **Read off the very comparison above**, not asked again. The
-            // character is on the building's floor exactly when the floor won
-            // that `max`, so deriving the surface from a second test would be
-            // two answers to one question -- and the frame they disagree on is
-            // a footstep that sounds like the ground under the floorboards.
-            self.floor_material = match (ground, underfoot) {
-                (Some(g), Some((f, surface))) if f >= g => surface,
-                (None, Some((_, surface))) => surface,
-                _ => None,
-            };
+            // **The floor outranks the terrain whenever it answered at all --
+            // not merely when it happens to be the taller of the two.** This
+            // was `ground.max(floor)`, on the reasoning that "a floor laid
+            // over ground holds the character up", which is true of a
+            // building -- its floor sits *above* the ground it is built on --
+            // and false of a cave: a cave's walkable floor sits *below* the
+            // surface directly overhead, so `max` picked the surface every
+            // time, and a character walking deeper underground was carried
+            // back up to daylight the moment the real cave floor read lower
+            // than the terrain above it. Reported from live play as a
+            // "teleport" out of the Northshire cave.
+            //
+            // `floor_under_footing` has already done the one check that
+            // matters -- whether the collision mesh answers for this spot at
+            // all, bounded to a step above where the character already is,
+            // so a roof or an upper floor is never returned as `floor` in
+            // the first place. Once it has answered, that answer is what the
+            // character is standing on; the terrain height field is the
+            // fallback for everywhere the collision mesh has nothing to say,
+            // indoors or out.
+            let stand = floor.or(ground);
+            // **Read off the same preference**, not asked again. The
+            // character is on the collision mesh's floor exactly when
+            // `underfoot` answered, so deriving the surface from a second
+            // test would be two answers to one question -- and the frame
+            // they disagree on is a footstep that sounds like the ground
+            // under the floorboards.
+            self.floor_material = underfoot.and_then(|(_, surface)| surface);
             // **Logged because the alternative is guessing.** A character
             // that judders going up steps has at least three candidate causes
             // -- two surfaces alternating, a floor and the terrain trading
@@ -6261,10 +6475,58 @@ impl App {
                 // pass marches outwards and can only ever shorten the ray, so
                 // the wall test that follows is asking about a line the eye
                 // could actually have reached.
+                // **Whether the raw terrain field is worth asking at all this
+                // frame, decided once rather than per sample.** A cave is a
+                // hollow shell -- the solid rock it is carved into carries no
+                // collision geometry of its own, because nothing needs it --
+                // so a sample that steps past the tunnel's modelled walls
+                // finds no floor there and, unchallenged, falls back to the
+                // terrain field, which answers for the hillside overhead
+                // instead. That is exactly the shape of the report that came
+                // back after the first fix: pitched down, the desired eye
+                // stays close over the character and inside the tunnel;
+                // levelled or looking up, the orbit swings it out behind the
+                // character and past the modelled shell. The tell is the same
+                // one `foss-wow#135` used for the character's own feet --
+                // terrain sitting well *above* the floor, the opposite of
+                // what a building's elevated floor looks like -- checked once
+                // at the focus point and trusted for the whole ray, since a
+                // tunnel's local extent is short enough that "underground
+                // here" means "underground for this ray".
+                let underground = world
+                    .floor_under_footing(focus, CAMERA_FLOOR_STEP)
+                    .zip(world.height_at(focus.x, focus.y))
+                    .is_some_and(|((floor_z, _), terrain_z)| {
+                        terrain_z > floor_z + CAMERA_FLOOR_REACH
+                    });
                 let above_ground = pull_camera_out_of_the_ground(
                     focus,
                     placed.position,
-                    |x, y| world.height_at(x, y),
+                    |x, y| {
+                        // **The floor outranks the terrain here for the same
+                        // reason it does for the character's own feet** --
+                        // see `foss-wow#135`. `focus.z`, not each sample's own
+                        // height: a fixed reference is enough, because the
+                        // floor this is ever going to matter for is the one
+                        // already known to be within `FOLLOW_HEIGHT` of it.
+                        let floor = world
+                            .floor_under_footing(
+                                glam::Vec3::new(x, y, focus.z),
+                                CAMERA_FLOOR_STEP,
+                            )
+                            .map(|(z, _)| z);
+                        match (floor, underground) {
+                            (Some(z), _) => Some(z),
+                            // Underground with no floor of its own at this
+                            // exact point: outside the tunnel's shell, in
+                            // unmodelled rock. The terrain field is not a
+                            // fact about this point and must not stand in
+                            // for one -- treated as clear, the same as a
+                            // tile that has not streamed in yet.
+                            (None, true) => None,
+                            (None, false) => world.height_at(x, y),
+                        }
+                    },
                 );
                 pull_camera_in_front_of_walls(focus, above_ground, |from, to| {
                     world.first_obstruction(from, to)
@@ -6272,6 +6534,7 @@ impl App {
             }
             _ => placed.position,
         };
+        self.camera_eye_distance = Some((eye - focus).length());
         if let Camera::Fly(fly) = &mut self.camera {
             // Only the placement, so the free-camera fields a screenshot or the
             // overlay may have set are left alone.
@@ -6965,6 +7228,16 @@ impl App {
     /// friendly NPC sends a swing the server refuses; the alternative was
     /// guessing, and a wrong guess here is an unprovoked attack rather than a
     /// blank.
+    ///
+    /// **`entity.lootable()` also rules a unit out, and not for the reason
+    /// `is_dead_or_ghost()` already covers.** `foss-wow#141`: *Milly's
+    /// Harvest*'s grapes are a creature with a **zero max health**, not a
+    /// missing one -- `is_dead_or_ghost` requires `max > 0` precisely so an
+    /// unreplicated health bar cannot masquerade as a kill, and that guard
+    /// correctly reads a *genuine* zero the same way. `UNIT_DYNAMIC_FLAGS`'
+    /// lootable bit is the server's own answer to "can this be looted right
+    /// now", independent of health entirely, and something the server marked
+    /// lootable is never something to swing at.
     fn is_attack_candidate(&self, guid: u64) -> bool {
         let Some(live) = self.live.as_ref() else {
             return false;
@@ -6979,6 +7252,7 @@ impl App {
             entity.object_type,
             ::world::ObjectType::Unit | ::world::ObjectType::Player
         ) && !entity.is_dead_or_ghost()
+            && !entity.lootable()
     }
 
     /// Starts, stops or leaves alone the zone's music and ambience.
@@ -7636,6 +7910,31 @@ impl App {
         };
         self.set_target(picked);
         if let Some(guid) = picked {
+            // **Print the fields the branches below decide on, every time --
+            // not only when none of them match.** `foss-wow#141`'s grapes
+            // were guessed to be a zero-max-health, lootable quest prop and
+            // the guess was wrong: a live report came back describing
+            // ordinary alive-creature behaviour, which means either the
+            // health or the lootable half of that guess (or both) does not
+            // hold for this entry, and there is no way to tell which from
+            // outside. "Nothing happened" is two findings wearing one
+            // sentence, and so is "the wrong branch ran" -- both want the
+            // actual field values, not another guess.
+            if let Some(live) = self.live.as_ref() {
+                if let Some(entity) = live.state.get(guid) {
+                    tracing::info!(
+                        "right-click {guid:#018x}: entry {:?}, type {:?}, health {:?}/{:?}, \
+                         dead_or_ghost {}, lootable {}, npc_flags {:?}",
+                        entity.entry(),
+                        entity.object_type,
+                        entity.health(),
+                        entity.max_health(),
+                        entity.is_dead_or_ghost(),
+                        entity.lootable(),
+                        entity.npc_flags(),
+                    );
+                }
+            }
             // **Before the talk branch, because a mailbox is not an NPC and
             // would fall through every one of the tests below to nothing.**
             // A game object carries no `UNIT_NPC_FLAGS`, so `will_talk` says
@@ -7673,8 +7972,49 @@ impl App {
                 // `is_attack_candidate` already rules out anything dead -- so
                 // this cannot both attack and loot.
                 self.open_loot(guid);
+            } else if self.is_usable_gameobject(guid) {
+                // **Last, and deliberately a catch-all.** Every branch above
+                // this one already ruled itself in or out for a specific
+                // reason; whatever reaches here is a game object this client
+                // has no bespoke window for -- a quest object like `foss-wow
+                // #141`'s harvest basket, a door, a lever -- and "use it" is
+                // the one thing right-click means for all of them. A mailbox
+                // never reaches this arm: `is_mailbox` above already claimed
+                // it, once its name query has answered.
+                self.use_gameobject(guid);
             }
         }
+    }
+
+    /// Whether this guid is a game object this client can send
+    /// [`ClientOpcode::GameObjectUse`] at.
+    ///
+    /// Unlike [`Self::is_mailbox`], this asks nothing about *what kind* of
+    /// game object it is -- the server decides what "use" means per object,
+    /// and every kind answers the same request. So this only has to rule out
+    /// what is not a game object at all, and does not need the name query
+    /// mailboxes wait on.
+    fn is_usable_gameobject(&self, guid: u64) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        let Some(object) = live.state.get(guid) else {
+            return false;
+        };
+        object.object_type == ::world::ObjectType::GameObject
+    }
+
+    /// Sends the interact request for a game object -- see
+    /// [`ClientOpcode::GameObjectUse`].
+    fn use_gameobject(&mut self, guid: u64) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live.connection.use_gameobject(guid) {
+            tracing::warn!("using game object {guid:#018x} failed: {e:#}");
+            return;
+        }
+        tracing::info!("used game object {guid:#018x}");
     }
 
     /// What the questgiver window should be showing, or `None` when no
@@ -7700,6 +8040,14 @@ impl App {
             // offer this character genuinely has.
             return Some(ui::QuestgiverView::List {
                 npc: questgiver.name.clone(),
+                options: questgiver
+                    .options
+                    .iter()
+                    .map(|option| ui::QuestgiverOption {
+                        index: option.index,
+                        message: option.message.clone(),
+                    })
+                    .collect(),
                 quests: questgiver
                     .offered
                     .iter()
@@ -8160,6 +8508,8 @@ impl App {
             npc: guid,
             name: name.clone(),
             offered: Vec::new(),
+            options: Vec::new(),
+            menu_id: 0,
             showing: None,
         });
         // **Cleared before the new one is decided, not overwritten after.**
@@ -8169,6 +8519,7 @@ impl App {
         // no longer considers open -- refused in silence, which is the one
         // failure this client cannot diagnose.
         self.trainer = None;
+        self.vendor = None;
         self.taxi = None;
         // And the auction window with them, for the identical reason: bids
         // sent to an auctioneer the server no longer considers open are
@@ -8217,11 +8568,31 @@ impl App {
                     Ok(()) => {
                         self.trainer = Some(TrainerSession {
                             npc: guid,
-                            name,
+                            name: name.clone(),
                             list: None,
                         })
                     }
                     Err(e) => tracing::warn!("asking {guid:#x} for a trainer list failed: {e:#}"),
+                }
+            }
+        }
+
+        // **A vendor is asked in the same breath as it is greeted**, exactly
+        // like the trainer and the flight master above. `CMSG_LIST_INVENTORY`
+        // is the one request in this block that is answered even for an NPC
+        // with nothing to sell -- see `world::vendor` -- so there is no
+        // silence to interpret the way there is for a trainer's.
+        if self.is_vendor(guid) {
+            if let Some(live) = self.live.as_mut() {
+                match live.connection.list_inventory(guid) {
+                    Ok(()) => {
+                        self.vendor = Some(VendorSession {
+                            npc: guid,
+                            name,
+                            list: None,
+                        })
+                    }
+                    Err(e) => tracing::warn!("asking {guid:#x} for its stock failed: {e:#}"),
                 }
             }
         }
@@ -8521,6 +8892,30 @@ impl App {
             .is_some_and(|flags| flags & TRAINER != 0)
     }
 
+    /// Whether this unit's replicated flags say it sells anything.
+    ///
+    /// Its own predicate beside [`Self::offers_training`], for the identical
+    /// reason: the one place naming these bits is the place that can carry
+    /// the evidence for what they mean. Innkeeper Farley's `0x10283` is the
+    /// evidence here rather than for the trainer -- `0x283` is exactly
+    /// `VENDOR (0x80) | VENDOR_FOOD (0x200) | QUESTGIVER (0x2) | GOSSIP
+    /// (0x1)`, and she sells food and drink from behind the bar. All five
+    /// vendor sub-flags are checked together rather than the base bit alone,
+    /// because nothing here has yet seen a vendor of a *narrower* kind
+    /// (ammunition, poison, reagents) carrying anything but its own bit --
+    /// see [`Self::offers_training`]'s two-sided confirmation for why a
+    /// single flag word is not proof enough on its own to lean on only one.
+    fn is_vendor(&self, guid: u64) -> bool {
+        /// `VENDOR | VENDOR_AMMO | VENDOR_FOOD | VENDOR_POISON |
+        /// VENDOR_REAGENT`. See [`App::is_vendor`].
+        const VENDOR_MASK: u32 = 0x80 | 0x100 | 0x200 | 0x400 | 0x800;
+        self.live
+            .as_ref()
+            .and_then(|live| live.state.get(guid))
+            .and_then(|entity| entity.npc_flags())
+            .is_some_and(|flags| flags & VENDOR_MASK != 0)
+    }
+
     /// Whether right-clicking this thing should open its loot.
     ///
     /// The mirror of [`Self::is_attack_candidate`] and deliberately as narrow:
@@ -8529,6 +8924,14 @@ impl App {
     /// know that until it asks -- and asking about an empty corpse is answered
     /// with a release rather than an error, so the cost of being wrong is one
     /// packet and no window.
+    ///
+    /// **`entity.lootable()` also qualifies a unit, on its own, and this is
+    /// the other half of `is_attack_candidate`'s `foss-wow#141` fix.**
+    /// *Milly's Harvest*'s grapes never satisfy `is_dead_or_ghost` -- their
+    /// max health is genuinely zero, not merely unreplicated, and that guard
+    /// cannot tell the two apart from the value alone. The lootable bit does
+    /// not need to: it is the server's own statement that this is loot right
+    /// now, independent of what the health fields say.
     fn is_loot_candidate(&self, guid: u64) -> bool {
         let Some(live) = self.live.as_ref() else {
             return false;
@@ -8539,7 +8942,8 @@ impl App {
         let Some(entity) = live.state.get(guid) else {
             return false;
         };
-        matches!(entity.object_type, ::world::ObjectType::Unit) && entity.is_dead_or_ghost()
+        matches!(entity.object_type, ::world::ObjectType::Unit)
+            && (entity.is_dead_or_ghost() || entity.lootable())
     }
 
     /// Asks what is on a corpse.
@@ -8776,6 +9180,49 @@ impl App {
         // here, so this is the only thing our half of the window is drawn
         // from. See `world::trade`.
         live.state.note_trade_item(slot, item);
+        true
+    }
+
+    /// Sells one carried item to the open vendor.
+    ///
+    /// **The same modal rule `offer_item` established, on a vendor window
+    /// instead of a trade one.** Reported from live play: while a vendor's
+    /// stock is open, a right-click in the bag window has to sell rather
+    /// than equip or use -- a player standing at a vendor deciding what to
+    /// sell has already committed to that gesture meaning "sell", and
+    /// treating it as "equip" would put the item on with nothing left to
+    /// undo it with.
+    fn sell_item_to_vendor(&mut self, at: Option<::world::inventory::Where>) -> bool {
+        let Some(at) = at else {
+            return false;
+        };
+        let Some(session) = self.vendor.as_ref() else {
+            return false;
+        };
+        let npc = session.npc;
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        let Some(carried) = ::world::inventory::carried(&live.state, live.guid)
+            .into_iter()
+            .find(|carried| carried.at == at)
+        else {
+            tracing::debug!("right-click at {at:?}: nothing carried there");
+            return false;
+        };
+        let item = carried.item.guid;
+
+        let Some(live) = self.live.as_mut() else {
+            return true;
+        };
+        tracing::info!("selling item {item:#018x} to vendor {npc:#018x}");
+        // Zero means the whole stack -- see `Connection::sell_item` -- which
+        // is what a right-click with no quantity prompt anywhere in this
+        // interface has to mean, the same choice `AutoStoreLootItem` and
+        // every other one-click inventory gesture here makes.
+        if let Err(e) = live.connection.sell_item(npc, item, 0) {
+            tracing::warn!("selling item {item:#018x} failed: {e:#}");
+        }
         true
     }
 
@@ -9134,6 +9581,9 @@ impl App {
         // gossip messages above use -- the connection is borrowed for the
         // whole loop, so nothing inside it may touch `self` again.
         let mut trainer_lists: Vec<::world::TrainerList> = Vec::new();
+        // Same shape again: a vendor's stock, collected during the drain and
+        // filed after it for the reason every other list in this pump is.
+        let mut vendor_lists: Vec<::world::VendorList> = Vec::new();
         // Whether a guild event arrived that makes an open roster stale.
         // Collected rather than acted on inside the loop for the reason every
         // other flag here is: the connection is borrowed for the whole drain.
@@ -9664,19 +10114,82 @@ impl App {
                             tracing::debug!("a spell was learned");
                             learned_a_spell = true;
                         }
-                        // The reward screen. Its body is not read: the quest
-                        // it is about is the one already on screen, and its
-                        // text and rewards are in the cache. What matters is
-                        // that it *arrived*, which is the server saying the
-                        // hand-in is legal.
-                        ::world::opcode::server::QUESTGIVER_OFFER_REWARD => {
-                            tracing::debug!("the reward screen is open");
+                        // A vendor's stock. Answered even for an NPC with
+                        // nothing to sell -- see `world::vendor` -- so unlike
+                        // the trainer's this one needs no silence to
+                        // interpret.
+                        ::world::opcode::server::LIST_INVENTORY => {
+                            match ::world::vendor::parse_vendor_list(&packet.body) {
+                                Ok(list) => {
+                                    tracing::debug!(
+                                        "vendor {:#018x} sells {} item(s)",
+                                        list.vendor,
+                                        list.items.len()
+                                    );
+                                    vendor_lists.push(list);
+                                }
+                                Err(error) => {
+                                    tracing::warn!("a vendor list would not parse: {error}")
+                                }
+                            }
                         }
-                        // The opposite answer to the same request: understood,
-                        // and the quest is not finished. A statement about the
-                        // character rather than about the send.
+                        // The reward screen. **Not purely an event any
+                        // more.** It usually arrives while the quest it is
+                        // about is already showing -- the answer to an
+                        // explicit `CMSG_QUESTGIVER_COMPLETE_QUEST` -- but a
+                        // questgiver with exactly one thing to do, and
+                        // nothing left to hand in, skips the gossip menu
+                        // *and* the request-items screen and sends this as
+                        // the very first reply to a greeting. `showing` was
+                        // still `None` for that case, so nothing ever drew
+                        // -- reported live as Eagan Peltskinner's window
+                        // opening and staying completely empty. Filing the
+                        // quest id here the same way `QUESTGIVER_QUEST_
+                        // DETAILS` already does costs nothing when the quest
+                        // was already on screen -- `note_quest_offered` just
+                        // re-affirms what `showing` already held.
+                        ::world::opcode::server::QUESTGIVER_OFFER_REWARD => {
+                            match ::world::quest::parse_questgiver_event(
+                                &packet.body,
+                                "SMSG_QUESTGIVER_OFFER_REWARD",
+                            ) {
+                                Ok(event) => {
+                                    tracing::debug!(
+                                        "the reward screen is open for quest {}",
+                                        event.quest
+                                    );
+                                    offered.push(event.quest);
+                                }
+                                Err(error) => {
+                                    tracing::warn!("a reward screen would not parse: {error}")
+                                }
+                            }
+                        }
+                        // The same shape as the reward screen just above,
+                        // and the same fix for the identical reason: a
+                        // questgiver whose one quest is not yet ready to
+                        // turn in -- still missing a kill count, say --
+                        // likewise skips the gossip menu and sends this
+                        // directly, and `showing` needs to be set for the
+                        // window to draw anything at all rather than stay
+                        // empty while quietly logging that nothing is
+                        // wrong.
                         ::world::opcode::server::QUESTGIVER_REQUEST_ITEMS => {
-                            tracing::debug!("that quest is not finished yet");
+                            match ::world::quest::parse_questgiver_event(
+                                &packet.body,
+                                "SMSG_QUESTGIVER_REQUEST_ITEMS",
+                            ) {
+                                Ok(event) => {
+                                    tracing::debug!(
+                                        "quest {} is not finished yet",
+                                        event.quest
+                                    );
+                                    offered.push(event.quest);
+                                }
+                                Err(error) => {
+                                    tracing::warn!("a request-items screen would not parse: {error}")
+                                }
+                            }
                         }
                         // What mark belongs over one NPC. Nine bytes, and the
                         // guid coming back is what confirms the request went
@@ -9835,6 +10348,22 @@ impl App {
             }
         }
 
+        // Filed by guid, like the trainer's: two vendors can be in reach at
+        // once, and a stock list filed against the wrong session would put
+        // one NPC's wares in a window belonging to another.
+        for list in vendor_lists {
+            match self
+                .vendor
+                .as_mut()
+                .filter(|session| session.npc == list.vendor)
+            {
+                Some(session) => session.list = Some(list),
+                None => tracing::debug!(
+                    "a vendor list for {:#018x} arrived with no window open for it",
+                    list.vendor
+                ),
+            }
+        }
 
         // **Filed by guid, like the trainer's**, and for a reason with more
         // teeth here: `.npc add` stacks auctioneers at a foot, two auctioneers
@@ -9964,12 +10493,40 @@ impl App {
             }
         }
 
+        let had_offer = !offered.is_empty();
         if let Some(questgiver) = self.questgiver.as_mut() {
             for gossip in &greetings {
                 questgiver.note_gossip(gossip);
             }
             for quest in offered {
                 questgiver.note_quest_offered(quest);
+            }
+        }
+        // **Whatever a greeting or an unrequested offer just put on screen
+        // needs the same two requests a clicked list row gets.** `note_gossip`
+        // shows a menu of exactly one straight away, and `note_quest_offered`
+        // is the server volunteering a quest with nobody having asked -- both
+        // can set `showing` with no `CMSG_QUEST_QUERY` ever sent for it, which
+        // otherwise leaves the window saying "Asking the server..." forever:
+        // the only other place that sends it is the click handler for a
+        // multi-quest list. Gated on this frame actually having produced a
+        // greeting or an offer, so an open window does not resend the scroll
+        // request every frame while it waits.
+        if !greetings.is_empty() || had_offer {
+            if let Some(quest) = self.questgiver.as_ref().and_then(|g| g.showing) {
+                if let Some(npc) = self.questgiver.as_ref().map(|g| g.npc) {
+                    if let Err(e) = live.connection.query_quest(npc, quest) {
+                        tracing::warn!("asking for quest {quest}'s scroll failed: {e:#}");
+                    }
+                }
+                for quest in self.quests.take_unknown(&[quest], 1) {
+                    if let Err(e) = live.connection.query_quest_info(quest) {
+                        tracing::warn!("asking what quest {quest} is failed: {e:#}");
+                        self.quests.give_up(quest);
+                    } else {
+                        self.quest_asked_at.insert(quest, Instant::now());
+                    }
+                }
             }
         }
 
@@ -10925,6 +11482,40 @@ impl App {
             }
         });
 
+        let vendor: Option<ui::VendorView> = self.vendor.as_ref().map(|session| {
+            let rows = session
+                .list
+                .as_ref()
+                .map(|list| {
+                    list.items
+                        .iter()
+                        .map(|item| {
+                            let icon = self.items.icon(
+                                &r.gpu,
+                                &mut r.egui_renderer,
+                                &mut self.chain,
+                                item.entry,
+                            );
+                            let name = Self::item_name(self.live.as_ref(), &self.items, item.entry);
+                            ui::VendorRow {
+                                slot: item.slot,
+                                entry: item.entry,
+                                name,
+                                price: item.price,
+                                buy_count: item.buy_count,
+                                remaining: item.remaining,
+                                icon,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            ui::VendorView {
+                name: session.name.clone(),
+                rows,
+            }
+        });
+
         // The mailbox. Built here beside the trainer's because it needs the
         // renderer for the attachment icons, and rebuilt every frame from
         // `WorldState::mail` rather than kept: the inbox is replaced whole by
@@ -11653,6 +12244,7 @@ impl App {
                     // is on screen exactly while a conversation is open.
                     questgiver: questgiver_view.as_ref(),
                     trainer: trainer.as_ref(),
+                    vendor: vendor.as_ref(),
                     mail: mail.as_ref(),
                     guild: guild.as_ref(),
                     auction: auction_view.as_ref(),
@@ -11791,12 +12383,48 @@ impl App {
             let at = bags_where.get(index).copied().flatten();
             // **Modal, and deliberately so.** While a trade window is open a
             // right-click puts the item on the table instead of equipping or
-            // using it. `offer_item` returns whether it took the gesture, so
-            // the ordinary path is not also run -- a click that both offered
-            // an item and equipped it would be two requests from one press,
-            // and the second would cancel the trade the first started.
-            if !self.offer_item(at) {
+            // using it, and while a vendor's stock is open it sells instead.
+            // Both return whether they took the gesture, so the ordinary
+            // path is not also run -- a click that both offered an item and
+            // equipped it would be two requests from one press, and the
+            // second would cancel the trade the first started.
+            if !self.offer_item(at) && !self.sell_item_to_vendor(at) {
                 self.activate_item(at);
+            }
+        }
+
+        // **Reported from live play**: a bag item dragged out of the window
+        // and dropped over open ground used to just sit there, stuck to the
+        // cursor, with no way to let go of it. The confirmation prompt
+        // stands between that drop and this -- `destroy_item` is only ever
+        // set once the player has pressed Destroy on it. `index` is the same
+        // square-position-not-a-slot `activate_item` resolves above.
+        if let Some(index) = hud_response.destroy_item {
+            let at = bags_where.get(index).copied().flatten();
+            let carried = at.zip(self.live.as_ref()).and_then(|(at, live)| {
+                ::world::inventory::carried(&live.state, live.guid)
+                    .into_iter()
+                    .find(|carried| carried.at == at)
+            });
+            match carried {
+                Some(carried) => {
+                    let (bag, slot) = carried.at.address();
+                    // The whole stack: nothing in this interface offers a
+                    // quantity to destroy only part of one.
+                    let count = carried.item.count.min(u8::MAX as u32) as u8;
+                    tracing::info!("destroying item at bag {bag} slot {slot} (count {count})");
+                    if let Some(live) = self.live.as_mut() {
+                        if let Err(e) = live.connection.destroy_item(bag, slot, count) {
+                            tracing::warn!("destroying an item failed: {e:#}");
+                        }
+                    }
+                }
+                // Moved, sold, already gone by the time the player answered
+                // the prompt -- nothing left to destroy, and nothing wrong
+                // either.
+                None => tracing::debug!(
+                    "destroy confirmed for row {index}, but nothing is carried there any more"
+                ),
             }
         }
 
@@ -11935,6 +12563,29 @@ impl App {
             }
         }
 
+        // A vendor row was clicked. Same reasoning as the trainer row above:
+        // the window only reports rows still in stock, and both the slot and
+        // the entry are carried from the row rather than invented, because
+        // the server checks the two still agree.
+        if let Some((slot, entry)) = hud_response.buy_item {
+            let npc = self.vendor.as_ref().map(|session| session.npc);
+            match (npc, self.live.as_mut()) {
+                (Some(npc), Some(live)) => {
+                    tracing::debug!("buying item {entry} (slot {slot}) from {npc:#018x}");
+                    if let Err(e) = live.connection.buy_item(
+                        npc,
+                        slot,
+                        entry,
+                        1,
+                        ::world::inventory::OWN_SLOT_ARRAY,
+                    ) {
+                        tracing::warn!("buying item {entry} failed: {e:#}");
+                    }
+                }
+                _ => tracing::warn!("a vendor row was clicked with no vendor open"),
+            }
+        }
+
         // A letter was clicked. The window reports only letters it said had
         // something in them, and it carries the **mail id** rather than a row
         // position -- the inbox is filtered, so positions do not close up.
@@ -11992,12 +12643,14 @@ impl App {
         // that reached the frame and one that never did can be told apart
         // from the log alone. Rare -- a press of a button, not a frame event.
         if hud_response.questgiver.picked.is_some()
+            || hud_response.questgiver.chosen_option.is_some()
             || hud_response.questgiver.acted.is_some()
             || hud_response.questgiver.closed
         {
             tracing::info!(
-                "questgiver window: picked {:?}, acted {:?}, closed {}",
+                "questgiver window: picked {:?}, chosen_option {:?}, acted {:?}, closed {}",
                 hud_response.questgiver.picked,
+                hud_response.questgiver.chosen_option,
                 hud_response.questgiver.acted,
                 hud_response.questgiver.closed
             );
@@ -12011,6 +12664,19 @@ impl App {
             // quest, and skipping straight to the accept would work or not for
             // reasons nothing here could tell apart.
             self.ask_for_quest_scroll(quest);
+        }
+        // A speech line was chosen. Left in `List` view rather than moved to
+        // `showing` -- it is not a quest -- so the window simply waits for
+        // whatever the server sends back: a new menu (`note_gossip` replaces
+        // `options` and `quests` in place, which is what lets a multi-step
+        // gossip tree be clicked through one line at a time), or nothing at
+        // all for a line that only ever meant "close the conversation".
+        if let Some(index) = hud_response.questgiver.chosen_option {
+            if let (Some(questgiver), Some(live)) =
+                (self.questgiver.as_ref(), self.live.as_mut())
+            {
+                questgiver.choose_option(live, index);
+            }
         }
         if let Some(quest) = hud_response.questgiver.acted {
             self.act_on_quest(quest);
@@ -12026,6 +12692,7 @@ impl App {
             // an NPC the player has walked away from -- which the server
             // refuses in silence, the one failure this client cannot explain.
             self.trainer = None;
+            self.vendor = None;
             self.taxi = None;
         }
 
@@ -12139,6 +12806,10 @@ mod gesture_tests {
     fn a_wall_pulls_the_camera_in_and_open_air_does_not() {
         let focus = glam::Vec3::new(0.0, 0.0, 2.0);
         let eye = glam::Vec3::new(-10.0, 0.0, 2.0);
+        // Facing along -X, so a wall crossing the ray has a normal close to
+        // the X axis -- near-vertical, the shape that takes the shorten-the-
+        // ray branch rather than the ceiling-duck one.
+        let wall_normal = glam::Vec3::new(1.0, 0.0, 0.0);
 
         assert_eq!(
             pull_camera_in_front_of_walls(focus, eye, |_, _| None),
@@ -12147,7 +12818,8 @@ mod gesture_tests {
         );
 
         // Something four units out along a ten-unit ray.
-        let pulled = pull_camera_in_front_of_walls(focus, eye, |_, _| Some(0.4));
+        let pulled =
+            pull_camera_in_front_of_walls(focus, eye, |_, _| Some((0.4, wall_normal)));
         let range = (pulled - focus).length();
         assert!(
             (range - (4.0 - CAMERA_WALL_CLEARANCE)).abs() < 1e-3,
@@ -12162,8 +12834,85 @@ mod gesture_tests {
 
         // A wall against the character's back must not put the eye inside the
         // head this client draws.
-        let against_the_back = pull_camera_in_front_of_walls(focus, eye, |_, _| Some(0.02));
+        let against_the_back =
+            pull_camera_in_front_of_walls(focus, eye, |_, _| Some((0.02, wall_normal)));
         assert!((against_the_back - focus).length() >= CAMERA_MIN_PULL_IN - 1e-3);
+    }
+
+    /// **A low ceiling ducks the eye down; it does not pull the eye in to the
+    /// character.** Reported from live play as the camera "going first
+    /// person" in a cave -- a near-horizontal hit used to get the identical
+    /// treatment a wall does, which reads as the eye landing on the
+    /// character's own face rather than as a tunnel with a low roof.
+    ///
+    /// The normal handed in here points down, the way a real ceiling's
+    /// should -- but the assertions never look at the *sign* the function
+    /// was given, only at where the eye ends up, because that is also true
+    /// of the function under test now. See the next one for why that
+    /// distinction earned its own test rather than being incidental.
+    #[test]
+    fn a_low_ceiling_ducks_the_camera_rather_than_pulling_it_in() {
+        let focus = glam::Vec3::new(0.0, 0.0, 2.0);
+        // Up and back, the ordinary orbit shape: the eye sits above and
+        // behind the character.
+        let eye = glam::Vec3::new(-6.0, 0.0, 5.0);
+        // A ceiling's outward normal points down, into the room under it.
+        let ceiling_normal = glam::Vec3::new(0.0, 0.0, -1.0);
+        // Hit two fifths of the way out, at z = 2.0 + 0.4*3.0 = 3.2.
+        let pulled = pull_camera_in_front_of_walls(focus, eye, |_, _| {
+            Some((0.4, ceiling_normal))
+        });
+
+        assert!(
+            (pulled.z - (3.2 - CAMERA_WALL_CLEARANCE)).abs() < 1e-3,
+            "the eye should sit just under the ceiling, at {:?}",
+            pulled
+        );
+        // The horizontal offset the orbit asked for survives untouched --
+        // ducking is not the same move as pulling in, and a camera that also
+        // crept forward on a low ceiling would zoom in over a whole cave
+        // passage exactly the way this was reported to.
+        assert_eq!((pulled.x, pulled.y), (eye.x, eye.y));
+        assert!(
+            pulled.z < eye.z,
+            "a ceiling that was hit must lower the eye, not leave it alone"
+        );
+    }
+
+    /// **The fix that actually closed the report.** The first attempt read
+    /// which way to duck off the hit triangle's own normal, on the
+    /// assumption that a WMO's winding gives an outward-facing one the way a
+    /// hand-built test cube does -- and nothing in this crate had ever
+    /// actually checked that assumption before, because every earlier user
+    /// of a floor-like normal only ever took its magnitude. Reported back
+    /// from the same cave with the fix in place: the camera still cut in
+    /// close. This is the version after that -- ducking decided from where
+    /// the hit sits relative to the character, not from which way its
+    /// triangle claims to face -- and this test is what a mis-wound ceiling
+    /// looks like: the normal handed in points *up*, the wrong way for a
+    /// ceiling, and the eye must still duck down rather than rise into the
+    /// rock that was just hit.
+    #[test]
+    fn ducking_reads_the_hits_position_not_its_normals_claimed_side() {
+        let focus = glam::Vec3::new(0.0, 0.0, 2.0);
+        let eye = glam::Vec3::new(-6.0, 0.0, 5.0);
+        // Backwards from what a real ceiling's normal should be -- exactly
+        // the shape a WMO wound the other way from this crate's test cubes
+        // would produce.
+        let inverted_normal = glam::Vec3::new(0.0, 0.0, 1.0);
+        let pulled = pull_camera_in_front_of_walls(focus, eye, |_, _| {
+            Some((0.4, inverted_normal))
+        });
+
+        assert!(
+            pulled.z < eye.z,
+            "a hit above the character must duck the eye down regardless of \
+             which way its normal points, but the eye ended up at {pulled:?}"
+        );
+        assert!(
+            (pulled.z - (3.2 - CAMERA_WALL_CLEARANCE)).abs() < 1e-3,
+            "should duck to the same height a correctly-wound ceiling would: {pulled:?}"
+        );
     }
 
     /// **A sidestep turns the drawn body towards where it is going; a
@@ -12444,6 +13193,30 @@ mod camera_tests {
         assert!(
             eye.distance(focus) < wanted.distance(focus),
             "the camera did not come in at all"
+        );
+    }
+
+    /// The clearance boundary is a continuous point on the ray, not one of
+    /// twelve fixed stops -- foss-wow#137's "stutter" was the eye snapping
+    /// between adjacent n/12 fractions of the ray as the true crossing point
+    /// drifted back and forth across a step boundary under a cave ceiling.
+    #[test]
+    fn ground_clearance_is_not_snapped_to_a_twelfth() {
+        let focus = glam::Vec3::new(0.0, 0.0, 10.0);
+        let wanted = focus + glam::Vec3::new(0.0, 0.0, -1.0) * 20.0;
+        // Flat ground at z = 8: the true clearance boundary sits at
+        // t = (10 - 8.5) / 20 = 0.075, inside the coarse pass's very first
+        // twelfth (0..0.083). The old code always answered t = 0 here --
+        // right back on the subject -- because it could not stop anywhere
+        // inside a bracket, only at its edges.
+        let ground = |_x: f32, _y: f32| Some(8.0f32);
+        let eye = pull_camera_out_of_the_ground(focus, wanted, ground);
+        let expected_z = 8.0 + CAMERA_GROUND_CLEARANCE;
+        assert!(
+            (eye.z - expected_z).abs() < 0.05,
+            "ground clearance was snapped to a coarse step: eye.z={:.3}, expected close to {:.3}",
+            eye.z,
+            expected_z
         );
     }
 
