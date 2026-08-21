@@ -3925,25 +3925,7 @@ impl App {
         // rather than inline because the camera's starting distance is one of
         // the settings it carries.
         let hud = ui::Hud::load();
-        // Read at startup rather than with the spellbook: the two tables the
-        // map needs are small and, unlike a spellbook, they do not depend on
-        // anything the server sends -- so `M` works before the character has
-        // finished logging in, and the arrow simply has nowhere to be yet.
-        //
-        // **All three read whatever the chain holds, including nothing.** A
-        // client started with no data directory has an empty chain until the
-        // sign-in screen supplies one, so these come back empty and are read
-        // again by `reload_tables` when it does. Each already tolerates a file
-        // that will not read -- that is what makes an install missing an
-        // optional table a client that draws less rather than one that will
-        // not start -- so an empty chain needs no new case.
         let mut chain = chain;
-        let maps = maps::Maps::load(&mut chain);
-        let taxi_network = taxi::Network::load(&mut chain);
-        // Read at startup for the same reason: 1.5MB of text naming every
-        // tile's picture, which does not depend on the server and would
-        // otherwise be parsed on the frame the player first looks at it.
-        let minimap = minimap::Minimap::load(&mut chain);
         let signin = (!args.is_self_contained()).then(|| {
             let mut signin = signin::SignIn::new();
             // The command line's data directory outranks the remembered one,
@@ -3973,9 +3955,35 @@ impl App {
             if let Some(character) = &args.character {
                 signin.screen.settings.character = Some(character.clone());
             }
+            if chain.archives().next().is_none() {
+                if let Some(data) = signin.screen.settings.data.clone() {
+                    match open_data(&data, &signin.screen.settings.locale) {
+                        Ok(opened) => chain = opened,
+                        Err(e) => signin.screen.failed(format!("{e:#}")),
+                    }
+                }
+            }
             signin.set_names(signin::Names::load(&mut chain));
             signin
         });
+        // Read at startup rather than with the spellbook: the two tables the
+        // map needs are small and, unlike a spellbook, they do not depend on
+        // anything the server sends -- so `M` works before the character has
+        // finished logging in, and the arrow simply has nowhere to be yet.
+        //
+        // **All three read whatever the chain holds, including nothing.** A
+        // client started with no data directory has an empty chain until the
+        // sign-in screen supplies one, so these come back empty and are read
+        // again by `reload_tables` when it does. Each already tolerates a file
+        // that will not read -- that is what makes an install missing an
+        // optional table a client that draws less rather than one that will
+        // not start -- so an empty chain needs no new case.
+        let maps = maps::Maps::load(&mut chain);
+        let taxi_network = taxi::Network::load(&mut chain);
+        // Read at startup for the same reason: 1.5MB of text naming every
+        // tile's picture, which does not depend on the server and would
+        // otherwise be parsed on the frame the player first looks at it.
+        let minimap = minimap::Minimap::load(&mut chain);
         Self {
             signin,
             quit: false,
