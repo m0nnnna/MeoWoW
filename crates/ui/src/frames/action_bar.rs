@@ -62,6 +62,16 @@ pub struct SlotSpell {
     /// of a ready instant ability looks identical to a keypress that never
     /// registered.
     pub press_fraction: f32,
+    /// Whether this slot is in a sustained "on" state -- as opposed to
+    /// [`Self::press_fraction`], which only ever says "this was just
+    /// pressed" and fades out over a fixed window regardless of what
+    /// happened next. Auto-attack is the one thing on a bar today that has
+    /// this distinction at all: it stays true for as long as the character
+    /// is swinging, which can be seconds or minutes, and a fading flash
+    /// cannot say "still true" -- only "true a moment ago". Drawn as a
+    /// steady border rather than reusing the press ring, so the two states
+    /// (just pressed, currently on) never look identical mid-fade.
+    pub active: bool,
 }
 
 /// How much room a bar wants.
@@ -145,6 +155,9 @@ pub fn draw(painter: &Painter, rect: Rect, slots: &[SlotView], style: &Style, sc
                     Stroke::new(style.border_width * scale, style.border),
                     StrokeKind::Inside,
                 );
+                if spell.active {
+                    draw_active_ring(painter, bounds, slot_corner, scale);
+                }
                 draw_press_flash(painter, bounds, slot_corner, spell.press_fraction);
             }
             None => {
@@ -192,6 +205,21 @@ fn draw_cooldown(painter: &Painter, bounds: Rect, fraction: f32) {
         egui::pos2(bounds.max.x, bounds.min.y + bounds.height() * fraction),
     );
     painter.rect_filled(covered, 0, Color32::from_black_alpha(170));
+}
+
+/// A steady gold border round a slot that is in a sustained "on" state --
+/// see [`SlotSpell::active`]. Full opacity and no fade, unlike
+/// [`draw_press_flash`], because the two answer different questions: a flash
+/// says "this was just pressed" and a ring says "this is still true", and a
+/// player glancing at the bar mid-fight has to be able to tell which one they
+/// are looking at without watching it for a second.
+fn draw_active_ring(painter: &Painter, bounds: Rect, corner: egui::CornerRadius, scale: f32) {
+    painter.rect_stroke(
+        bounds,
+        corner,
+        Stroke::new(2.5 * scale, Color32::from_rgb(255, 210, 60)),
+        StrokeKind::Inside,
+    );
 }
 
 /// A bright ring around a slot, fading with the fraction the caller supplies

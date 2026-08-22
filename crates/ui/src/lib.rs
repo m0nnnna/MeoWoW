@@ -2521,6 +2521,7 @@ mod tests {
                 icon: None,
                 cooldown_fraction: fraction,
                 press_fraction: 0.0,
+                active: false,
             });
             vec![slots]
         }
@@ -2568,6 +2569,7 @@ mod tests {
                 icon: None,
                 cooldown_fraction: 0.0,
                 press_fraction: fraction,
+                active: false,
             });
             vec![slots]
         }
@@ -2595,6 +2597,54 @@ mod tests {
         assert!(
             pressed_shapes > idle_shapes,
             "the press flash painted no extra shape: {pressed_shapes} vs {idle_shapes}"
+        );
+    }
+
+    /// `SlotSpell::active` paints an extra shape the same way the cooldown
+    /// sweep and the press flash do -- see `a_cooldown_darkens_the_slot`. This
+    /// is what an auto-attack toggle relies on to read as "on" for as long as
+    /// the fight lasts, not merely for the 200ms the press flash already
+    /// covers.
+    #[test]
+    fn an_active_slot_paints_a_ring() {
+        fn bars_with_active(active: bool) -> Vec<Vec<frames::action_bar::SlotView>> {
+            let mut slots = frames::action_bar::placeholder(0);
+            slots[0].spell = Some(frames::action_bar::SlotSpell {
+                id: 6603,
+                name: "Auto Attack".into(),
+                rank: String::new(),
+                description: String::new(),
+                icon: None,
+                cooldown_fraction: 0.0,
+                press_fraction: 0.0,
+                active,
+            });
+            vec![slots]
+        }
+
+        let mut off = Hud::default();
+        let off_shapes = painted(
+            &mut off,
+            &HudData {
+                bars: &bars_with_active(false),
+                ..Default::default()
+            },
+        )
+        .len();
+
+        let mut on = Hud::default();
+        let on_shapes = painted(
+            &mut on,
+            &HudData {
+                bars: &bars_with_active(true),
+                ..Default::default()
+            },
+        )
+        .len();
+
+        assert!(
+            on_shapes > off_shapes,
+            "the active ring painted no extra shape: {on_shapes} vs {off_shapes}"
         );
     }
 
@@ -2751,6 +2801,7 @@ mod tests {
             icon: None,
             cooldown_fraction: 0.0,
             press_fraction: 0.0,
+            active: false,
         });
         let bars = vec![slots];
         let data = HudData {

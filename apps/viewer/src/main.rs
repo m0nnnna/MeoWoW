@@ -7057,6 +7057,11 @@ impl App {
                     Instant::now(),
                     self.spells.cooldown_ms(spell),
                 );
+                // A spell with no cooldown of its own -- most of them -- still
+                // sits behind the global one, and without this the bar shows
+                // nothing at all for pressing it. See
+                // `WorldState::start_global_cooldown`'s doc comment.
+                live.state.start_global_cooldown(Instant::now());
             }
             Err(e) => {
                 tracing::warn!("casting {spell} failed: {e:#}");
@@ -11307,10 +11312,23 @@ impl App {
             for slot in 0..ui::frames::action_bar::SLOTS {
                 let spell = self.hud.profile.bars.get(bar, slot).map(|id| {
                     let icon = self.spells.icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, id);
+                    // Auto-attack is a toggle, not a cast, and never sits
+                    // behind the global cooldown -- see
+                    // `WorldState::start_global_cooldown`'s doc comment. Its
+                    // own sweep would otherwise flash every time an unrelated
+                    // spell is cast, which reads as "attacking is on
+                    // cooldown" and is not a sentence that means anything.
                     let cooldown_fraction = self
                         .live
                         .as_ref()
-                        .map(|live| live.state.cooldown_fraction(id, now))
+                        .map(|live| {
+                            let own = live.state.cooldown_fraction(id, now);
+                            if id == spells::AUTO_ATTACK {
+                                own
+                            } else {
+                                own.max(live.state.global_cooldown_fraction(now))
+                            }
+                        })
                         .unwrap_or(0.0);
                     let press_fraction = match self.action_flash {
                         Some(((f_bar, f_slot), pressed)) if (f_bar, f_slot) == (bar, slot) => {
@@ -11319,6 +11337,14 @@ impl App {
                         }
                         _ => 0.0,
                     };
+                    // The one persistent state a slot can be in, as opposed to
+                    // a momentary flash: auto-attack stays "on" for as long as
+                    // the character is swinging, which a 200ms flash cannot
+                    // say. See `ui::frames::action_bar::SlotSpell::active`.
+                    let active = id == spells::AUTO_ATTACK
+                        && self.live.as_ref().is_some_and(|live| {
+                            live.state.attacking.contains_key(&live.guid)
+                        });
                     ui::frames::action_bar::SlotSpell {
                         id,
                         name: self.spells.name(id),
@@ -11327,6 +11353,7 @@ impl App {
                         icon,
                         cooldown_fraction,
                         press_fraction,
+                        active,
                     }
                 });
                 slots.push(ui::frames::action_bar::SlotView {

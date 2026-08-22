@@ -831,6 +831,15 @@ fn lerp_angle(from: f32, to: f32, t: f32) -> f32 {
     from + delta * t
 }
 
+/// The length of the global cooldown every ordinary cast starts, in
+/// milliseconds. `1500` is the constant every WotLK class uses before haste;
+/// this client tracks no haste stat, so the fixed value is what it predicts.
+/// Unlike a hardcoded spell id, this number needs no per-realm evidence -- it
+/// is a rule of the game client, not a fact read off the wire, the same way
+/// the viewer's own `ACTION_FLASH` (200ms) is a rule of the interface rather
+/// than a measurement.
+pub const GLOBAL_COOLDOWN_MS: u32 = 1500;
+
 /// A spell mid-cooldown, timed from when this client learned about it rather
 /// than from the server's own clock, which the client never sees.
 #[derive(Debug, Clone, Copy)]
@@ -1196,6 +1205,16 @@ pub struct WorldState {
     /// `Cooldown::remaining_fraction` reads `0.0` for it either way, and there
     /// are at most a few dozen spells, so nothing is gained by removing it.
     pub cooldowns: HashMap<u32, Cooldown>,
+    /// The shared 1.5s lockout an ordinary cast puts on every other spell,
+    /// separate from [`Self::cooldowns`] because it is not keyed by spell id
+    /// at all -- it is one clock, not one per spell. `SMSG_SPELL_COOLDOWN`
+    /// was never observed on the wire for this realm (see the note on
+    /// [`WorldState::predict_cooldown`]), so this is predicted the same way:
+    /// [`WorldState::start_global_cooldown`] is called by the same cast that
+    /// starts the spell's own cooldown, and the caller decides which id the
+    /// resulting sweep is drawn on -- a toggle like auto-attack is never a
+    /// cast and never touches this clock.
+    global_cooldown: Option<Cooldown>,
     /// Casts in progress, keyed by caster guid. `SMSG_SPELL_START` inserts an
     /// entry; `SMSG_SPELL_GO` removes it. An instant-cast spell goes straight
     /// to `SMSG_SPELL_GO` with no bar ever worth showing, so removing an
@@ -1952,6 +1971,34 @@ impl WorldState {
                 duration_ms,
             },
         );
+    }
+
+    /// Starts the shared 1.5s lockout an ordinary cast puts on every spell,
+    /// not only the one just cast.
+    ///
+    /// Called alongside [`Self::predict_cooldown`], not instead of it: a
+    /// spell with a real cooldown of its own still starts the global one too,
+    /// and [`Self::global_cooldown_fraction`] is a separate reading a caller
+    /// combines with [`Self::cooldown_fraction`] itself, the way the action
+    /// bar does. This exists because a spell whose *own* cooldown is `0` --
+    /// most of them -- otherwise shows no feedback at all when pressed: the
+    /// cast either lands with nothing on screen saying so, or is silently
+    /// refused by the server for being too soon, and the two look identical.
+    /// Real WoW never leaves that gap, because every class ability sits
+    /// behind this same clock.
+    pub fn start_global_cooldown(&mut self, now: std::time::Instant) {
+        self.global_cooldown = Some(Cooldown {
+            started: now,
+            duration_ms: GLOBAL_COOLDOWN_MS,
+        });
+    }
+
+    /// How much of the shared global cooldown remains, `0.0` once it has
+    /// cleared or if nothing has started it this session.
+    pub fn global_cooldown_fraction(&self, now: std::time::Instant) -> f32 {
+        self.global_cooldown
+            .map(|cooldown| cooldown.remaining_fraction(now))
+            .unwrap_or(0.0)
     }
 
     /// The cast a given caster is in the middle of, if any -- `None` once
@@ -4401,6 +4448,37 @@ mod tests {
             (world.cooldown_fraction(78, now + std::time::Duration::from_millis(2000)) - 0.5)
                 .abs()
                 < 0.01
+        );
+    }
+
+    /// The global cooldown is its own clock, not an entry in `cooldowns`, and
+    /// it has to be readable for a spell that never had one of its own --
+    /// `Heroic Strike`'s `78` is GCD-only, `cooldown_fraction` reads `0.0` for
+    /// it forever, and `global_cooldown_fraction` is the only thing that ever
+    /// says pressing it did something.
+    #[test]
+    fn global_cooldown_is_shared_and_independent_of_spell_cooldowns() {
+        let mut world = WorldState::new();
+        let now = std::time::Instant::now();
+
+        assert_eq!(world.global_cooldown_fraction(now), 0.0, "nothing started it yet");
+
+        world.start_global_cooldown(now);
+        assert_eq!(world.global_cooldown_fraction(now), 1.0);
+        assert_eq!(
+            world.cooldown_fraction(78, now),
+            0.0,
+            "the global cooldown must not leak into a spell-keyed lookup"
+        );
+        assert!(
+            (world.global_cooldown_fraction(now + std::time::Duration::from_millis(750)) - 0.5)
+                .abs()
+                < 0.01
+        );
+        assert_eq!(
+            world.global_cooldown_fraction(now + std::time::Duration::from_secs(10)),
+            0.0,
+            "must clamp at zero rather than go negative"
         );
     }
 
