@@ -52,6 +52,18 @@ pub enum Take {
 /// Sized to its contents rather than to a fixed height: a corpse with one item
 /// on it should not open a window with five empty lines, which would read as
 /// loot that failed to load.
+///
+/// **Unchanged by `foss-wow#140`'s Close control, deliberately.** This
+/// window is one of several anchored to screen centre (see
+/// `ElementId::Loot`'s layout entry, and `ReleasePrompt`/`PartyInvite`
+/// beside it) with just enough clearance between their default positions
+/// and no more -- `tests::the_default_frames_do_not_overlap` pins exactly
+/// that. Growing loot's height to fit a bottom button pushed its top edge
+/// up into the party-invite prompt above it, and there is no headroom left
+/// in that stack to give back: nudging any one of the three only moved the
+/// collision onto the next thing already tight against *it*. The header
+/// row already has unused width to the right of "Loot", so the close
+/// control lives there instead -- see [`close_rect`].
 pub fn size(rows: usize, style: &Style, scale: f32) -> Vec2 {
     let row = style.spellbook_row;
     let header = style.font_size + style.gap;
@@ -61,6 +73,29 @@ pub fn size(rows: usize, style: &Style, scale: f32) -> Vec2 {
 
 fn header_height(style: &Style, scale: f32) -> f32 {
     (style.font_size + style.gap) * scale
+}
+
+/// Where the Close control sits -- a square in the header's top-right
+/// corner, beside the "Loot" title rather than below every row.
+///
+/// The single source of truth for its geometry, the same reasoning
+/// [`row_rects`] documents: drawn and hit-tested from the same rectangle so
+/// a mismatch cannot make a press land on the row underneath it instead.
+///
+/// **A hair shorter than the header, not exactly as tall as it.** Row 0
+/// starts at exactly `header_height` down from the top, by the same
+/// arithmetic this uses -- so a square that *filled* the header would share
+/// a boundary with row 0 rather than clear it, and `Rect::intersects`
+/// counts a shared edge as touching. The shrink is proportional to `scale`
+/// rather than a fixed pixel count, so it stays a visually negligible sliver
+/// at every scale instead of vanishing at 0.25 or ballooning at 4.
+pub fn close_rect(rect: Rect, style: &Style, scale: f32) -> Rect {
+    let pad = style.padding * scale;
+    let side = (header_height(style, scale) - scale).max(1.0);
+    Rect::from_min_size(
+        Pos2::new(rect.max.x - pad - side, rect.min.y + pad),
+        Vec2::splat(side),
+    )
 }
 
 /// Where each row sits.
@@ -156,6 +191,21 @@ pub fn draw(painter: &Painter, rect: Rect, rows: &[LootRow], style: &Style, scal
             text,
         );
     }
+
+    // A square in the header corner rather than a full-width row below the
+    // list -- see `size`'s doc comment for why this window cannot afford to
+    // grow. "X" rather than "Close": there is no room in a header-height
+    // square for the longer word at this font size.
+    let close = close_rect(rect, style, scale);
+    let close_corner = corner_radius(style.corner * scale * 0.5);
+    painter.rect_filled(close, close_corner, style.spellbook_selected);
+    painter.rect_stroke(
+        close,
+        close_corner,
+        Stroke::new(style.border_width * scale, style.border),
+        StrokeKind::Inside,
+    );
+    painter.text(close.center(), Align2::CENTER_CENTER, "X", font, text);
 }
 
 fn corner_radius(radius: f32) -> egui::CornerRadius {
@@ -249,6 +299,27 @@ mod tests {
         let style = Style::default();
         assert!(size(3, &style, 1.0).y > size(1, &style, 1.0).y);
         assert_eq!(size(1, &style, 1.0).x, size(3, &style, 1.0).x);
+    }
+
+    /// **`foss-wow#140`.** The Close button has to sit clear of every row --
+    /// a click meant to leave the window releasing whatever row happened to
+    /// be underneath it would look like the wrong item vanishing.
+    #[test]
+    fn the_close_button_does_not_overlap_any_row() {
+        let style = Style::default();
+        for scale in [0.5, 1.0, 2.0] {
+            for count in [1usize, 3, 8] {
+                let rect = window(count, &style, scale);
+                let close = close_rect(rect, &style, scale);
+                for (index, row) in row_rects(rect, count, &style, scale).enumerate() {
+                    assert!(
+                        !close.intersects(row),
+                        "close button overlaps row {index} of {count} at scale {scale}"
+                    );
+                }
+                assert!(rect.contains_rect(close), "close button escapes at scale {scale}");
+            }
+        }
     }
 
     #[test]

@@ -292,6 +292,11 @@ pub struct HudResponse {
     /// are different numbers, and the difference is invisible until a corpse
     /// has been partly looted.
     pub take_loot: Option<frames::Take>,
+    /// The loot window's Close button was clicked. `foss-wow#140`: before
+    /// this existed, the only way the window ever went away was the server
+    /// saying the corpse was empty -- there was no way to leave items behind
+    /// on purpose.
+    pub loot_closed: bool,
     /// The release-spirit prompt was clicked. Carried as a bare flag rather
     /// than a guid or a slot -- unlike a loot row there is nothing to choose
     /// between, the whole frame is the one thing it can ask for.
@@ -1484,7 +1489,19 @@ impl Hud {
                 (false, Content::Loot(rows)) => {
                     if response.clicked() {
                         if let Some(pointer) = response.interact_pointer_pos() {
-                            if let Some(row) = frames::loot::row_at(
+                            if frames::loot::close_rect(drawn_rect, &style, element.scale)
+                                .contains(pointer)
+                            {
+                                // **Checked before row_at, not after.** The
+                                // button sits below every row by
+                                // construction (see
+                                // `frames::loot::tests::the_close_button_does_not_overlap_any_row`),
+                                // but checking it first means a future
+                                // layout bug fails as "the close button also
+                                // takes an item" rather than as a close that
+                                // silently never works.
+                                response_out.loot_closed = true;
+                            } else if let Some(row) = frames::loot::row_at(
                                 drawn_rect,
                                 rows.len(),
                                 &style,

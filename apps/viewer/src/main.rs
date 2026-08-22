@@ -12458,6 +12458,15 @@ impl App {
             self.take_loot(take);
         }
 
+        // **`foss-wow#140`.** The window used to close only when the server
+        // said the corpse was empty, which left no way to walk away from one
+        // with items still on it. `release_loot` already existed for exactly
+        // this -- its own doc comment says "sent on closing the window" --
+        // it just had no caller until the window grew a button to press.
+        if hud_response.loot_closed {
+            self.release_loot();
+        }
+
         // A right-clicked bag square auto-equips whatever is there. `index`
         // is a square position, not a slot -- resolved back through
         // `bags_where`, built alongside `bags` a moment ago.
