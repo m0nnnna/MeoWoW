@@ -7972,15 +7972,23 @@ impl App {
                 // `is_attack_candidate` already rules out anything dead -- so
                 // this cannot both attack and loot.
                 self.open_loot(guid);
+            } else if self.is_chest(guid) {
+                // **Before the generic game-object arm, and for the same
+                // reason mailbox and auction sit above talk/attack/loot.**
+                // `foss-wow#141`: `CMSG_GAMEOBJ_USE` -- what the arm below
+                // sends -- does nothing at all for a chest, because
+                // AzerothCore's `GameObject::Use()` has no case for
+                // `GAMEOBJECT_TYPE_CHEST`. A chest is opened by casting a
+                // spell at it instead.
+                self.open_chest(guid);
             } else if self.is_usable_gameobject(guid) {
                 // **Last, and deliberately a catch-all.** Every branch above
                 // this one already ruled itself in or out for a specific
                 // reason; whatever reaches here is a game object this client
-                // has no bespoke window for -- a quest object like `foss-wow
-                // #141`'s harvest basket, a door, a lever -- and "use it" is
-                // the one thing right-click means for all of them. A mailbox
-                // never reaches this arm: `is_mailbox` above already claimed
-                // it, once its name query has answered.
+                // has no bespoke window for -- a door, a lever -- and "use
+                // it" is the one thing right-click means for all of them. A
+                // mailbox and a chest never reach this arm: both claimed
+                // above, once their name query has answered.
                 self.use_gameobject(guid);
             }
         }
@@ -8015,6 +8023,26 @@ impl App {
             return;
         }
         tracing::info!("used game object {guid:#018x}");
+    }
+
+    /// Opens a chest -- see [`::world::spell::OPEN_LOCK_KNEELING`] for why
+    /// this is a spell cast rather than [`Self::use_gameobject`], and for
+    /// the scope this does not yet cover: a chest gated behind a real
+    /// gathering or lockpicking skill will be refused by this same spell,
+    /// correctly, since this client does not read `Lock.dbc` and cannot
+    /// tell the two kinds of chest apart before asking.
+    fn open_chest(&mut self, guid: u64) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Err(e) = live
+            .connection
+            .cast_spell_at_gameobject(::world::spell::OPEN_LOCK_KNEELING, guid)
+        {
+            tracing::warn!("opening chest {guid:#018x} failed: {e:#}");
+            return;
+        }
+        tracing::info!("opening chest {guid:#018x}");
     }
 
     /// What the questgiver window should be showing, or `None` when no
@@ -8375,6 +8403,27 @@ impl App {
             .entry()
             .and_then(|entry| live.state.names.gameobject(entry).flatten())
             .is_some_and(|info| info.is_mailbox())
+    }
+
+    /// Whether this guid is a chest -- see
+    /// [`::world::query::GameObjectInfo::is_chest`] for why a chest needs a
+    /// different right-click action from every other game object, and
+    /// [`Self::is_mailbox`]'s doc comment for the identical
+    /// first-click-can-miss reasoning this shares.
+    fn is_chest(&self, guid: u64) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        let Some(object) = live.state.get(guid) else {
+            return false;
+        };
+        if object.object_type != ::world::ObjectType::GameObject {
+            return false;
+        }
+        object
+            .entry()
+            .and_then(|entry| live.state.names.gameobject(entry).flatten())
+            .is_some_and(|info| info.is_chest())
     }
 
     /// Opens a mailbox and asks it what is inside.

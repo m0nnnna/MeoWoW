@@ -11,6 +11,13 @@ mod light;
 use clap::{Parser, Subcommand};
 use mpq::{Archive, Chain};
 
+/// A guid typed as bare hex, e.g. `f11002771500069d` -- what the viewer's own
+/// `tracing::info!` logging prints for a picked entity, so a guid copied
+/// straight out of a log line parses without editing.
+fn parse_hex_guid(s: &str) -> Result<u64, String> {
+    u64::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| e.to_string())
+}
+
 #[derive(Parser)]
 #[command(name = "wow-cli", about = "Inspect WoW 3.3.5a client data")]
 struct Cli {
@@ -989,6 +996,14 @@ enum Command {
         cast: Option<u32>,
         #[arg(long)]
         cast_self: bool,
+        /// Cast `--cast`'s spell at this game object guid (hex, e.g.
+        /// `f11002771500069d`) instead of a unit -- a lock-opening probe for
+        /// `foss-wow#141`, which candidate "Opening" spell (of several in
+        /// `Spell.dbc` with the same name) satisfies a given lock's
+        /// `EffectMiscValue` is not derivable from this project's own
+        /// transcribed columns and has to be found by trying one live.
+        #[arg(long, value_parser = parse_hex_guid)]
+        cast_at_object: Option<u64>,
         /// Whisper `--say` to this character instead of speaking aloud.
         ///
         /// The only chat with no range at all, which makes it the one that
@@ -1650,6 +1665,7 @@ fn main() -> Result<()> {
             spells,
             cast,
             cast_self,
+            cast_at_object,
             port,
             timeout,
         } => {
@@ -1749,6 +1765,7 @@ fn main() -> Result<()> {
                 spells: *spells,
                 cast: *cast,
                 cast_self: *cast_self,
+                cast_at_object: *cast_at_object,
                 host,
                 port: *port,
                 user,
@@ -1975,6 +1992,7 @@ struct WorldRequest<'a> {
     spells: bool,
     cast: Option<u32>,
     cast_self: bool,
+    cast_at_object: Option<u64>,
     locale: &'a str,
     timeout: u64,
     /// Only touched by `--visible-items`, which is a game-file question
@@ -2128,6 +2146,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         spells,
         cast,
         cast_self,
+        cast_at_object,
         locale,
         data,
         timeout,
@@ -2776,7 +2795,7 @@ nothing replicated matches {wanted:?}"),
             report_spells(&state);
         }
 
-        if let Some(spell_id) = cast {
+        if let (Some(spell_id), None) = (cast, cast_at_object) {
             let target = if cast_self {
                 None
             } else {
@@ -2883,6 +2902,53 @@ cast {spell_id} at {} (attempt {attempt})",
                     }
                     break;
                 }
+            }
+        }
+
+        // A lock-opening probe for `foss-wow#141`: which of several
+        // identically-named `Spell.dbc` "Opening" candidates actually
+        // satisfies a given lock is not derivable from this project's own
+        // transcribed columns, so this tries one live and reports the
+        // server's own answer -- `SMSG_CAST_FAILED` naming a reason, or
+        // silence plus a lootable state, which is what success looks like
+        // for a spell nothing acknowledges directly.
+        if let (Some(spell_id), Some(guid)) = (cast, cast_at_object) {
+            connection.set_selection(guid)?;
+            connection.cast_spell_at_gameobject(spell_id, guid)?;
+            println!("\ncast {spell_id} at game object {guid:#018x}");
+            let batch = connection.drain(std::time::Duration::from_millis(900), 128)?;
+            let report = state.replicate(&batch, None);
+            for start in &report.cast_starts {
+                println!(
+                    "  SMSG_SPELL_START: caster {:#018x}, spell {}, cast_time_ms {}, target {:#018x}",
+                    start.caster, start.spell_id, start.cast_time_ms, start.target
+                );
+            }
+            for (opcode, error, _) in &report.failures {
+                println!("  parse failure on {}: {error}", world::opcode::describe(*opcode));
+            }
+            if report.cast_failures.is_empty() {
+                let lootable = state
+                    .get(guid)
+                    .is_some_and(|entity| entity.lootable());
+                println!(
+                    "  not refused -- lootable now: {lootable}, loot open: {}",
+                    state.loot.is_some()
+                );
+                let mut seen: std::collections::BTreeMap<u16, usize> = Default::default();
+                for packet in &batch {
+                    *seen.entry(packet.opcode).or_default() += 1;
+                }
+                for (opcode, count) in &seen {
+                    println!("    {:<32} x{count}", world::opcode::describe(*opcode));
+                }
+            }
+            for failure in &report.cast_failures {
+                println!(
+                    "  refused: {} (spell {})",
+                    world::spell::describe_cast_failure(failure.reason),
+                    failure.spell_id
+                );
             }
         }
 

@@ -498,6 +498,9 @@ pub fn gameobject_query(entry: u32, guid: u64) -> Vec<u8> {
 /// A mailbox. See [`GameObjectInfo::kind`].
 pub const GAMEOBJECT_TYPE_MAILBOX: u32 = 19;
 
+/// A chest. See [`GameObjectInfo::kind`] and [`GameObjectInfo::is_chest`].
+pub const GAMEOBJECT_TYPE_CHEST: u32 = 3;
+
 /// What `SMSG_GAMEOBJECT_QUERY_RESPONSE` said about one game object entry.
 ///
 /// **This is the first thing in the client that asks what an object *is*
@@ -532,6 +535,20 @@ impl GameObjectInfo {
     /// Whether this is something a letter can be posted at.
     pub fn is_mailbox(&self) -> bool {
         self.kind == GAMEOBJECT_TYPE_MAILBOX
+    }
+
+    /// Whether this is a chest -- the one game object type
+    /// [`crate::opcode::ClientOpcode::GameObjectUse`] cannot open.
+    ///
+    /// **AzerothCore's `GameObject::Use()` has no case for
+    /// `GAMEOBJECT_TYPE_CHEST` at all** -- confirmed by reading its switch
+    /// exhaustively, not inferred -- so `CMSG_GAMEOBJ_USE` against one is a
+    /// silent no-op every time, `foss-wow#141`'s actual root cause. A chest
+    /// is opened by *casting a spell at it* instead
+    /// (`Spell::EffectOpenLock` → `Spell::SendLoot`), which is why right-click
+    /// routing needs to tell this apart from every other object type.
+    pub fn is_chest(&self) -> bool {
+        self.kind == GAMEOBJECT_TYPE_CHEST
     }
 }
 
@@ -596,6 +613,36 @@ pub fn parse_gameobject_query_response(body: &[u8]) -> Result<GameObjectInfo, Er
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gameobject_info(kind: u32) -> GameObjectInfo {
+        GameObjectInfo {
+            entry: 161557,
+            name: Some("Milly's Harvest".into()),
+            kind,
+            display_id: 3012,
+            icon_name: String::new(),
+            cast_bar_caption: String::new(),
+            size: 1.0,
+        }
+    }
+
+    /// `foss-wow#141`: a chest needs a different right-click action from a
+    /// mailbox and from everything else, so the two predicates must not
+    /// agree with each other on the same object.
+    #[test]
+    fn a_chest_is_a_chest_and_nothing_else() {
+        let chest = gameobject_info(GAMEOBJECT_TYPE_CHEST);
+        assert!(chest.is_chest());
+        assert!(!chest.is_mailbox());
+
+        let mailbox = gameobject_info(GAMEOBJECT_TYPE_MAILBOX);
+        assert!(mailbox.is_mailbox());
+        assert!(!mailbox.is_chest());
+
+        let door = gameobject_info(0);
+        assert!(!door.is_chest());
+        assert!(!door.is_mailbox());
+    }
 
     /// Built with the real writer, so the packed encoding these tests feed in
     /// is the one the wire actually uses rather than this test's idea of it.

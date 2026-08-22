@@ -679,6 +679,15 @@ impl Connection {
         )
     }
 
+    /// Casts a spell at a game object -- opening a lock, per
+    /// [`crate::spell::target_flags::GAMEOBJECT`].
+    pub fn cast_spell_at_gameobject(&mut self, spell_id: u32, guid: u64) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::CastSpell,
+            &crate::spell::cast_spell_at_gameobject(spell_id, guid),
+        )
+    }
+
     /// Starts auto-attacking a target.
     ///
     /// A bare unpacked guid, the same encoding `CMSG_SET_SELECTION` uses --

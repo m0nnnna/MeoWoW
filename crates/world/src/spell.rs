@@ -85,7 +85,7 @@ pub fn parse_initial_spells(body: &[u8]) -> Result<InitialSpells, Error> {
 
 /// Which of a spell's possible targets the client is supplying.
 ///
-/// Only the two this client can currently mean. The mask has a dozen more
+/// Only the three this client can currently mean. The mask has a dozen more
 /// bits, each adding its own field to the packet, so naming only what is sent
 /// keeps the writer honest about what it can actually express.
 pub mod target_flags {
@@ -93,9 +93,16 @@ pub mod target_flags {
     pub const SELF: u32 = 0x0000_0000;
     /// A unit, whose guid follows packed.
     pub const UNIT: u32 = 0x0000_0002;
+    /// A game object, whose guid follows packed -- confirmed against
+    /// AzerothCore's `SpellInfo.h` (`TARGET_FLAG_GAMEOBJECT`). What
+    /// [`foss-wow#141`]'s lock-opening cast needs: a chest is not a unit,
+    /// and sending [`UNIT`] at one would claim a shape the server does not
+    /// read the same way -- `Spell::EffectOpenLock` reads `gameObjTarget`,
+    /// which only a `GameObject`-flagged guid populates.
+    pub const GAMEOBJECT: u32 = 0x0000_0800;
 }
 
-/// `CMSG_CAST_SPELL`'s body.
+/// `CMSG_CAST_SPELL`'s body, on yourself or at a unit.
 ///
 /// `target` is `None` for a spell on yourself. A wrong target mask here is the
 /// dangerous kind of mistake: the server reads the following bytes according
@@ -109,6 +116,51 @@ pub fn cast_spell(spell_id: u32, target: Option<u64>) -> Vec<u8> {
     body.extend_from_slice(&spell_id.to_le_bytes());
     body.push(0u8); // cast flags
     write_cast_targets(target, &mut body);
+    body
+}
+
+/// The universal, no-skill "Opening" spell that satisfies `Lock.dbc`'s
+/// `LOCKTYPE_OPEN_KNEELING` (13) -- what an ordinary quest pickup object
+/// (a chest with `chest.lockId` pointing at a `LOCK_KEY_SKILL` case of that
+/// type) needs cast at it, rather than [`crate::opcode::ClientOpcode::GameObjectUse`],
+/// which `GameObject::Use()` does nothing at all with for a chest.
+///
+/// **Not read out of `Spell.dbc` -- found live, because it could not be
+/// found any other way.** `Spell.dbc`'s effect-type and effect-misc-value
+/// columns are not transcribed anywhere in this project (`Spell` in
+/// `crates/dbc/src/schema.rs` names 234 fields down to a handful; those two
+/// are not among them), and `CanOpenLock` on the server matches a cast
+/// against a lock by comparing exactly those two numbers -- so the only
+/// candidates available were fifteen-odd same-named `Spell.dbc` rows titled
+/// "Opening", indistinguishable from outside. Tried against `Lock` id 43
+/// (`foss-wow#141`'s "Milly's Harvest", `chest.lockId = 43`,
+/// `Type[1] = LOCK_KEY_SKILL`, `Index[1] = 13`) on the local AzerothCore
+/// realm via `wow-cli --cast 6478 --cast-at-object <guid>`: every other
+/// candidate was refused (`SMSG_CAST_FAILED`, mostly `SPELL_FAILED_BAD_TARGETS`);
+/// this one was not, and produced `SMSG_SPELL_START` → `SMSG_SPELL_GO` →
+/// `SMSG_LOOT_RESPONSE` in order -- a real cast, landing, then loot. The
+/// `SMSG_SPELL_START` is also what answers Kake's "there's a pause, it's
+/// not instant": this cast has a real wind-up, and the cast bar this client
+/// already draws for any caster (see `apps/viewer/src/main.rs`'s cast-bar
+/// construction) will show it without needing to know that.
+///
+/// **Scope, stated rather than silently assumed**: this satisfies exactly
+/// one `LockType`, `OPEN_KNEELING`. A chest gated behind an actual skill
+/// (`LOCKTYPE_PICKLOCK`, `LOCKTYPE_MINING`, ...) will be refused by this
+/// same spell, correctly -- `Lock.dbc` is not read here, so this client
+/// cannot yet tell the two kinds of chest apart in advance and only finds
+/// out from the refusal.
+pub const OPEN_LOCK_KNEELING: u32 = 6478;
+
+/// `CMSG_CAST_SPELL`'s body, aimed at a game object -- opening a lock, per
+/// [`target_flags::GAMEOBJECT`].
+pub fn cast_spell_at_gameobject(spell_id: u32, guid: u64) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(0u8);
+    body.extend_from_slice(&spell_id.to_le_bytes());
+    body.push(0u8); // cast flags
+    body.extend_from_slice(&target_flags::GAMEOBJECT.to_le_bytes());
+    write_packed_guid(guid, &mut body);
     body
 }
 
@@ -239,19 +291,38 @@ fn read_cast_header(r: &mut Reader) -> Result<(u64, u64, u8, u32), Error> {
     Ok((cast_item, caster, cast_count, spell_id))
 }
 
-/// The target-flags-then-guid-then-trailing-u32 tail shared by both packets,
-/// past whatever each puts before it. Refuses anything other than
-/// `target_flags::UNIT` -- see [`SpellStart`]'s doc comment for why.
-fn read_unit_target_tail(r: &mut Reader, what: &'static str) -> Result<(u64, u32), Error> {
+/// The target-flags-then-guid-then-optional-trailing-u32 tail shared by both
+/// packets, past whatever each puts before it. Refuses anything other than
+/// `target_flags::UNIT` or `target_flags::GAMEOBJECT` -- see [`SpellStart`]'s
+/// doc comment for why.
+///
+/// **`GAMEOBJECT` confirmed the same way `UNIT` was, live -- and the trailing
+/// `u32` turned out not to be unconditional.** `foss-wow#141`'s lock-opening
+/// cast (`crate::spell::OPEN_LOCK_KNEELING` at a chest) echoes back the same
+/// flags-then-packed-guid shape on both `SMSG_SPELL_START` and
+/// `SMSG_SPELL_GO` against the local AzerothCore realm, but the packet ends
+/// there -- no trailing word at all, where the one `UNIT`-targeted capture on
+/// hand always had four bytes left. [`SpellStart::trailing`]'s own doc
+/// comment already guessed this might be a mana cost gated on *something*;
+/// the two live shapes now on hand say that something is at least partly the
+/// target kind, not only `cast_flags` -- a cost to spend mana against makes
+/// sense for a unit and not for a chest. So this reads it only when the
+/// packet actually has it left, rather than assuming a fixed width the
+/// gameobject shape does not have.
+fn read_unit_target_tail(r: &mut Reader, what: &'static str) -> Result<(u64, Option<u32>), Error> {
     let target_flags = r.u32()?;
-    if target_flags != target_flags::UNIT {
+    if target_flags != target_flags::UNIT && target_flags != target_flags::GAMEOBJECT {
         return Err(Error::UnsupportedSpellTarget {
             what,
             flags: target_flags,
         });
     }
     let target = crate::update::read_packed_guid(r)?;
-    let trailing = r.u32()?;
+    let trailing = if r.remaining() > 0 {
+        Some(r.u32()?)
+    } else {
+        None
+    };
     Ok((target, trailing))
 }
 
@@ -287,10 +358,13 @@ pub struct SpellStart {
     /// Who the cast is aimed at -- see the struct's own doc comment for why
     /// this is unconditionally a unit rather than an `Option`.
     pub target: u64,
-    /// A u32 that followed the target in the one capture on hand: `100`,
-    /// suspiciously close to a mana cost, but not confirmed to be one, and
-    /// possibly gated by a `cast_flags` bit rather than always present.
-    pub trailing: u32,
+    /// A u32 that followed the target in the one `UNIT`-targeted capture on
+    /// hand: `100`, suspiciously close to a mana cost, but not confirmed to
+    /// be one. **Confirmed absent, not merely zero, for a `GAMEOBJECT`
+    /// target** -- `foss-wow#141`'s live chest cast ends right after the
+    /// guid, which is what an `Option` here is for for rather than a `0`
+    /// that would claim the field was present and happened to read zero.
+    pub trailing: Option<u32>,
 }
 
 /// Parses `SMSG_SPELL_START`. See [`SpellStart`] for what is and is not
@@ -323,7 +397,7 @@ pub fn parse_spell_start(body: &[u8]) -> Result<SpellStart, Error> {
 /// re-deriving it. Past the header this packet carries no cast time; instead
 /// it carries a hit list, a miss list, and a server timestamp, then the same
 /// target tail as `SMSG_SPELL_START`, refused on the same terms for anything
-/// but `target_flags::UNIT`.
+/// but `target_flags::UNIT` or `target_flags::GAMEOBJECT`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpellGo {
     pub cast_item: u64,
@@ -343,11 +417,10 @@ pub struct SpellGo {
     /// shows clearly: eight bytes reading `33 00 00 00 00 00 00 00`, not a
     /// packed mask.
     pub hits: Vec<u64>,
-    /// Who the cast is aimed at, and the same trailing u32 as `SpellStart`.
-    /// See [`SpellStart`]'s doc comment for why this is unconditionally a
-    /// unit target.
+    /// Who the cast is aimed at, and the same trailing u32 as `SpellStart` --
+    /// see [`SpellStart::trailing`]'s doc comment for why it is an `Option`.
     pub target: u64,
-    pub trailing: u32,
+    pub trailing: Option<u32>,
 }
 
 /// Parses `SMSG_SPELL_GO`. See [`SpellGo`] for what is and is not confirmed
@@ -612,7 +685,29 @@ mod tests {
         assert_eq!(parsed.cast_flags, 0x0802);
         assert_eq!(parsed.cast_time_ms, 1500);
         assert_eq!(parsed.target, 0x33);
-        assert_eq!(parsed.trailing, 100);
+        assert_eq!(parsed.trailing, Some(100));
+    }
+
+    /// **`foss-wow#141`, confirmed live against the local realm.** Casting
+    /// [`OPEN_LOCK_KNEELING`] at a chest echoes `target_flags::GAMEOBJECT`
+    /// (`0x800`) back with the same flags-then-packed-guid shape -- but the
+    /// packet ends right there, four bytes shorter than the `UNIT`-targeted
+    /// capture above. Before this, `read_unit_target_tail` refused the flag
+    /// outright: the loot still worked (a separate code path), but nothing
+    /// populated `self.casts`, so the cast bar this client already draws for
+    /// any caster silently never appeared. Built by editing the
+    /// captured-unit-cast fixture above at the flags word and truncating the
+    /// trailing four bytes it does not have, rather than from a second
+    /// capture, since the two packets otherwise share one shape.
+    #[test]
+    fn a_spell_start_at_a_gameobject_parses_with_no_trailing_word() {
+        let body: [u8; 23] = [
+            0x01, 0x33, 0x01, 0x33, 0x00, 0x41, 0x14, 0x00, 0x00, 0x02, 0x08, 0x00, 0x00, 0xdc,
+            0x05, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x01, 0x33,
+        ];
+        let parsed = parse_spell_start(&body).unwrap();
+        assert_eq!(parsed.target, 0x33);
+        assert_eq!(parsed.trailing, None);
     }
 
     /// Pinned to the `SMSG_SPELL_GO` captured in the same batch as the
@@ -633,7 +728,7 @@ mod tests {
         assert_eq!(parsed.timestamp, 0x5a37d474);
         assert_eq!(parsed.hits, vec![0x33]);
         assert_eq!(parsed.target, 0x33);
-        assert_eq!(parsed.trailing, 0x51);
+        assert_eq!(parsed.trailing, Some(0x51));
     }
 
     /// Both parsers assert full consumption, the same cursor discipline as
@@ -646,10 +741,21 @@ mod tests {
             0x01, 0x33, 0x01, 0x33, 0x00, 0x41, 0x14, 0x00, 0x00, 0x02, 0x08, 0x00, 0x00, 0xdc,
             0x05, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x33, 0x64, 0x00, 0x00, 0x00,
         ];
+        // Exactly one shorter length is not an error any more: 23 bytes ends
+        // right after the packed guid, which `foss-wow#141` confirmed live
+        // is the whole `GAMEOBJECT`-targeted packet -- see
+        // `a_spell_start_at_a_gameobject_parses_with_no_trailing_word`. Every
+        // *other* length still has to fail: a cursor invariant that only
+        // held for one specific width was never the real invariant.
+        const NO_TRAILING_WORD: usize = 23;
         let mut extra = start.to_vec();
         extra.push(0);
         assert!(parse_spell_start(&extra).is_err());
         for cut in 0..start.len() {
+            if cut == NO_TRAILING_WORD {
+                assert_eq!(parse_spell_start(&start[..cut]).unwrap().trailing, None);
+                continue;
+            }
             assert!(
                 parse_spell_start(&start[..cut]).is_err(),
                 "{cut} bytes parsed as a whole SMSG_SPELL_START"
@@ -661,10 +767,15 @@ mod tests {
             0xd4, 0x37, 0x5a, 0x01, 0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
             0x00, 0x00, 0x00, 0x01, 0x33, 0x51, 0x00, 0x00, 0x00,
         ];
+        const GO_NO_TRAILING_WORD: usize = 33;
         let mut extra = go.to_vec();
         extra.push(0);
         assert!(parse_spell_go(&extra).is_err());
         for cut in 0..go.len() {
+            if cut == GO_NO_TRAILING_WORD {
+                assert_eq!(parse_spell_go(&go[..cut]).unwrap().trailing, None);
+                continue;
+            }
             assert!(
                 parse_spell_go(&go[..cut]).is_err(),
                 "{cut} bytes parsed as a whole SMSG_SPELL_GO"
@@ -742,6 +853,26 @@ mod tests {
     fn the_spell_id_survives_the_write() {
         let body = cast_spell(0x1234_5678, None);
         assert_eq!(&body[1..5], &0x1234_5678u32.to_le_bytes());
+    }
+
+    /// `foss-wow#141`: a chest is opened by casting at it, not by
+    /// [`crate::opcode::ClientOpcode::GameObjectUse`], and the flag has to
+    /// say `GAMEOBJECT` rather than `UNIT` -- a unit-flagged guid at
+    /// `Spell::EffectOpenLock` never populates `gameObjTarget`, so the cast
+    /// would silently do nothing to the chest at all.
+    #[test]
+    fn a_gameobject_cast_carries_the_gameobject_flag_and_a_guid() {
+        let body = cast_spell_at_gameobject(OPEN_LOCK_KNEELING, 0xF110_0277_1500_05A8);
+        assert_eq!(&body[1..5], &OPEN_LOCK_KNEELING.to_le_bytes());
+        assert_eq!(&body[6..10], &target_flags::GAMEOBJECT.to_le_bytes());
+        assert_ne!(target_flags::GAMEOBJECT, target_flags::UNIT);
+
+        let mut r = Reader::new(&body[10..], "guid");
+        assert_eq!(
+            crate::update::read_packed_guid(&mut r).unwrap(),
+            0xF110_0277_1500_05A8
+        );
+        r.finish().unwrap();
     }
 
     /// A failure this client has not observed keeps its number.
