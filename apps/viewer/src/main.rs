@@ -4717,12 +4717,9 @@ impl App {
             return;
         };
         use wgpu::CurrentSurfaceTexture as Acquired;
-        let frame = match r.surface.get_current_texture() {
-            Acquired::Success(frame) => frame,
-            Acquired::Suboptimal(frame) => {
-                r.surface.configure(&r.gpu.device, &r.config);
-                frame
-            }
+        let (frame, reconfigure) = match r.surface.get_current_texture() {
+            Acquired::Success(frame) => (frame, false),
+            Acquired::Suboptimal(frame) => (frame, true),
             Acquired::Lost | Acquired::Outdated => {
                 r.surface.configure(&r.gpu.device, &r.config);
                 output.textures_delta.clear();
@@ -4795,6 +4792,9 @@ impl App {
         r.gpu.queue.submit([encoder.finish()]);
         r.gpu.queue.present(frame);
         output.textures_delta.clear();
+        if reconfigure {
+            r.surface.configure(&r.gpu.device, &r.config);
+        }
     }
 }
 
@@ -5904,14 +5904,11 @@ impl App {
         }
 
         use wgpu::CurrentSurfaceTexture as Acquired;
-        let frame = match r.surface.get_current_texture() {
-            Acquired::Success(frame) => frame,
-            // Suboptimal still yields a usable frame; reconfiguring restores
-            // the fast path next time without dropping this one.
-            Acquired::Suboptimal(frame) => {
-                r.surface.configure(&r.gpu.device, &r.config);
-                frame
-            }
+        let (frame, reconfigure) = match r.surface.get_current_texture() {
+            Acquired::Success(frame) => (frame, false),
+            // Suboptimal still yields a usable frame. Present it before
+            // reconfiguring: wgpu forbids configuring an acquired surface.
+            Acquired::Suboptimal(frame) => (frame, true),
             // Routine on resize and display changes: reconfigure, skip a frame.
             Acquired::Lost | Acquired::Outdated => {
                 r.surface.configure(&r.gpu.device, &r.config);
@@ -6044,6 +6041,9 @@ impl App {
         r.gpu.queue.submit([encoder.finish()]);
         r.gpu.queue.present(frame);
         ui_output.textures_delta.clear();
+        if reconfigure {
+            r.surface.configure(&r.gpu.device, &r.config);
+        }
     }
 
     /// Turns and walks the live character from held keys, sending whatever the
