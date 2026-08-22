@@ -1280,6 +1280,87 @@ const CAMERA_WALL_CLEARANCE: f32 = 0.35;
 /// happening now.
 const CAMERA_MIN_PULL_IN: f32 = 1.5;
 
+/// The farthest the follow camera's nominal orbit may reach while the
+/// character is standing on a modelled building floor.
+///
+/// **`pull_camera_in_front_of_walls` tests one ray, and a single ray cannot
+/// tell "this room's wall stopped me" from "I slipped through a gap and
+/// eventually grazed something else."** Reported from Northshire Abbey's
+/// bell-tower stairs as the camera ending up outside the building, looking
+/// back at its own roof -- and the trace this client did not yet have showed
+/// why neither existing pass caught it: the wheel was zoomed to
+/// [`ui::camera::MAX_DISTANCE`] (30 units, the maximum it allows), and
+/// `pull_camera_in_front_of_walls` reported a hit 23 units out and pulled the
+/// eye in to just short of it. That hit was real -- the function did exactly
+/// what it always does -- it just was not the near wall of the small room the
+/// character was standing in; the ray had already left through an opening and
+/// only found *something* solid, far enough away for a rooftop and the forest
+/// beyond it to fill the frame. The default distance is 9 (see
+/// `ui::Camera::default`), which is what every earlier indoor milestone
+/// happened to be tested at and why none of them saw this. 15 is generous
+/// room for an interior view without reopening the 23-unit gap a full
+/// zoom-out proved possible.
+const CAMERA_INDOOR_DISTANCE_CAP: f32 = 15.0;
+
+/// How far to either side of dead centre the follow camera samples an
+/// additional ray, in radians, when deciding how close a wall or ceiling has
+/// pulled it in.
+///
+/// **The wall/ceiling test only ever asks about the one ray to the
+/// character, and a clear centre ray says nothing about the rest of what is
+/// on screen.** Reported live as a "bleed" -- the character framed correctly
+/// in a stairwell, and open valley visible through what should have been a
+/// wall, off to one side. The eye itself was close and reasonably placed;
+/// the corner it was sitting next to just was not visible along the one ray
+/// this client had ever asked about. Two side samples at a plausible edge of
+/// the field of view (the follow camera's is 65 degrees, see [`Fly::fov_y`]'s
+/// default; half of that is 32.5, so this sits a little inside the true
+/// edge rather than at it) and taking whichever pulled hardest is not a
+/// proof the whole frustum is clear -- three rays are not infinitely many --
+/// but it catches a corner the size of the one reported, which spanned a
+/// third of the frame.
+const CAMERA_FOV_SAMPLE_ANGLE: f32 = 25f32 * (std::f32::consts::PI / 180.0);
+
+/// Samples `eye_at` at `center_yaw` and at [`CAMERA_FOV_SAMPLE_ANGLE`] to
+/// either side, and returns whichever pulled the eye in hardest -- placed on
+/// the *centre* ray, not left at the angled sample's own position, so the
+/// character stays framed dead centre.
+///
+/// A free function taking `eye_at` as a parameter, rather than three calls
+/// inlined at the one call site, so the policy -- sample a few angles, keep
+/// the strictest, apply it to the centre -- has something to be tested
+/// against without a live world behind it. See [`CAMERA_FOV_SAMPLE_ANGLE`]
+/// for what this is guarding against.
+fn tightest_eye_at_center(
+    center_yaw: f32,
+    distance: f32,
+    focus: glam::Vec3,
+    eye_at: impl Fn(f32, f32) -> glam::Vec3,
+) -> glam::Vec3 {
+    let tightest = [
+        center_yaw,
+        center_yaw + CAMERA_FOV_SAMPLE_ANGLE,
+        center_yaw - CAMERA_FOV_SAMPLE_ANGLE,
+    ]
+    .into_iter()
+    .map(|yaw| (eye_at(yaw, distance) - focus).length())
+    .fold(f32::INFINITY, f32::min);
+    eye_at(center_yaw, tightest.min(distance))
+}
+
+/// The orbit distance to actually build the camera at, capped indoors.
+///
+/// A free function rather than inlined at the one call site so the cap has
+/// something to be tested against without a live world -- see
+/// [`CAMERA_INDOOR_DISTANCE_CAP`].
+fn indoor_capped_distance(distance: f32, standing_on_a_floor: bool) -> f32 {
+    if standing_on_a_floor {
+        distance.min(CAMERA_INDOOR_DISTANCE_CAP)
+    } else {
+        distance
+    }
+}
+
 /// Below this, the character's own body is left out of the drawn list
 /// entirely, the way the original hides it in first person.
 ///
@@ -1333,6 +1414,17 @@ fn pull_camera_in_front_of_walls(
         return eye;
     }
     let Some((t, normal)) = first_hit(focus, eye) else {
+        // **The previously-silent branch.** Reported live as the camera
+        // ending up outside the abbey while the character stood in an upper
+        // room -- every other frame in that session logged a `camera duck`
+        // or `camera pull-in` line, which means the one frame that actually
+        // escaped took *this* path and left no trace of it. `trace`, not
+        // `debug`: this is the ordinary case everywhere outdoors, and would
+        // drown a `debug` capture the way the other two lines never do.
+        tracing::trace!(
+            "camera clear: nothing between focus {:.2},{:.2},{:.2} and eye {:.2},{:.2},{:.2} ({:.2} units)",
+            focus.x, focus.y, focus.z, eye.x, eye.y, eye.z, length
+        );
         return eye;
     };
     if normal.z.abs() >= collision::FLOOR_NORMAL_Z {
@@ -1361,7 +1453,21 @@ fn pull_camera_in_front_of_walls(
     }
     // The hit is a fraction of the way out; back off a fixed distance from it
     // and never come closer to the character than the floor above.
-    let stopped = (t * length - CAMERA_WALL_CLEARANCE).clamp(CAMERA_MIN_PULL_IN, length);
+    //
+    // **`CAMERA_MIN_PULL_IN` is a floor on `stopped`, not a fact about
+    // `length`.** A single call always had `length` starting at the full
+    // nominal orbit distance, comfortably above 1.5, so `clamp`'s two bounds
+    // never crossed. `pull_camera_clear_of_the_building` feeds this
+    // function's own output back in as the next call's `eye` -- and a duck
+    // is bounded by nothing but a nearby ceiling, so a second pass can be
+    // handed a `length` already under 1.5. `clamp(min, max)` panics the
+    // moment `min > max`, live, mid-frame: crashed the client entirely,
+    // reported back as "same issue, no improvement" because from outside a
+    // crash and an uncaught escape look identical for one frame. Capping the
+    // floor at `length` itself is the only sane answer at that range anyway
+    // -- closer than 1.5 is impossible without leaving the segment.
+    let stopped =
+        (t * length - CAMERA_WALL_CLEARANCE).clamp(CAMERA_MIN_PULL_IN.min(length), length);
     let pulled = focus + span * (stopped / length);
     tracing::debug!(
         "camera pull-in: t={t:.3} normal=({:.2},{:.2},{:.2}) stopped={stopped:.2} of \
@@ -1369,6 +1475,40 @@ fn pull_camera_in_front_of_walls(
         normal.x, normal.y, normal.z, eye.x, eye.y, eye.z, pulled.x, pulled.y, pulled.z
     );
     pulled
+}
+
+/// Applies [`pull_camera_in_front_of_walls`] until it stops moving the eye,
+/// rather than once.
+///
+/// **The wall pass proves the segment it returns is clear; the duck branch
+/// does not.** A wall-shortened eye is provably fine, because it only ever
+/// slides in along the very ray that was just tested. A *ducked* eye is a
+/// different segment entirely -- straight down from wherever the orbit's
+/// horizontal offset happened to land -- and nothing has asked whether
+/// *that* line crosses a wall. In a small room it usually does: two
+/// live-captured frames one mouse-tick apart aimed almost the same ray, one
+/// found a low roof far out and ducked under it, x and y untouched, ending
+/// up 11 units from the character; the other found the room's own nearby
+/// wall first and pulled in to 2. Both were the same wall -- the duck had
+/// simply never been asked about it. Bounded rather than run to a fixed
+/// point: two ducks trading places every pass is possible in principle
+/// (nothing here proves it terminates), and a bounded loop degrades to "not
+/// perfectly caught" instead of hanging a frame.
+fn pull_camera_clear_of_the_building(
+    focus: glam::Vec3,
+    eye: glam::Vec3,
+    first_hit: impl Fn(glam::Vec3, glam::Vec3) -> Option<(f32, glam::Vec3)>,
+) -> glam::Vec3 {
+    const MAX_PASSES: usize = 4;
+    let mut candidate = eye;
+    for _ in 0..MAX_PASSES {
+        let next = pull_camera_in_front_of_walls(focus, candidate, &first_hit);
+        if (next - candidate).length() < 1e-3 {
+            return next;
+        }
+        candidate = next;
+    }
+    candidate
 }
 
 /// Places the eye on a sphere around a character, looking at them.
@@ -1391,6 +1531,32 @@ fn orbit_around(feet: glam::Vec3, yaw: f32, pitch: f32, distance: f32) -> Fly {
         pitch,
         ..Default::default()
     }
+}
+
+/// Rebuilds yaw and pitch so the camera looks at `focus` from wherever `eye`
+/// actually ended up.
+///
+/// `pull_camera_out_of_the_ground` and the wall-pulling half of
+/// `pull_camera_in_front_of_walls` only ever slide `eye` along the orbit's own
+/// view ray, so the original yaw and pitch still happen to aim at `focus`
+/// afterwards. **The ceiling-duck half does not** -- it deliberately moves
+/// `eye` straight down in `z` and leaves `x`/`y` alone, on purpose, so a low
+/// roof lowers the camera instead of zooming it in over the character's
+/// shoulder. `follow_camera_to_character` used to hand that adjusted `eye`
+/// to the `Fly` camera while keeping the *pre-adjustment* yaw and pitch, so
+/// the position moved but the aim did not: a duck left the eye somewhere new
+/// while the view kept pointing where the un-ducked position would have
+/// looked, past the character rather than at them. In a tight stairwell with
+/// a low, sloped roof the duck engages on nearly every frame, and each
+/// step's slightly different hit point moves the eye again without ever
+/// correcting where it looks -- reported from Northshire Abbey's stairs as
+/// the camera swinging wildly through the walls on the way up.
+fn face_focus_from(eye: glam::Vec3, focus: glam::Vec3) -> (f32, f32) {
+    let to_focus = focus - eye;
+    (
+        to_focus.y.atan2(to_focus.x),
+        to_focus.z.atan2(to_focus.truncate().length()),
+    )
 }
 
 /// Places the camera over a streaming world's starting tile.
@@ -2905,6 +3071,11 @@ struct App {
     /// character's own -- see [`App::camera_follow_z`]. `None` until the first
     /// frame places it.
     camera_z: Option<f32>,
+    /// How far the wall/ceiling-avoiding eye currently sits from the
+    /// character, easing towards whatever `tightest_eye_at_center` asks for
+    /// this frame -- see [`App::camera_follow_wall_distance`]. `None` until
+    /// the first frame places it.
+    camera_wall_distance: Option<f32>,
     /// How far the eye actually ended up from the character this frame,
     /// after `pull_camera_out_of_the_ground` and `pull_camera_in_front_of_
     /// walls` have both had their say -- as opposed to `camera_distance`,
@@ -4248,6 +4419,7 @@ impl App {
             error: None,
             last_frame: Instant::now(),
             camera_z: None,
+            camera_wall_distance: None,
             camera_eye_distance: None,
             // The weather's own clock. Separate from `last_frame` because that
             // one is reset every frame, and a falling drop needs a monotone
@@ -5901,15 +6073,42 @@ impl App {
         const TAU: f32 = 0.09;
         /// Past this it is not a step, and easing it would be a slide.
         const SNAP: f32 = 3.0;
+        Self::ease_towards(state, target, dt, TAU, SNAP)
+    }
 
+    /// A fraction of the remaining error per second, not a maximum rate --
+    /// see [`Self::camera_follow_z`], which this generalises. Extracted once
+    /// a second caller needed the identical shape with different constants:
+    /// see [`Self::camera_follow_wall_distance`].
+    fn ease_towards(state: &mut Option<f32>, target: f32, dt: f32, tau: f32, snap: f32) -> f32 {
         let smoothed = match *state {
-            Some(z) if (target - z).abs() <= SNAP && dt > 0.0 => {
-                z + (target - z) * (1.0 - (-dt / TAU).exp())
+            Some(v) if (target - v).abs() <= snap && dt > 0.0 => {
+                v + (target - v) * (1.0 - (-dt / tau).exp())
             }
             _ => target,
         };
         *state = Some(smoothed);
         smoothed
+    }
+
+    /// How far the wall/ceiling-avoiding eye orbits, easing towards whatever
+    /// [`tightest_eye_at_center`] asks for.
+    ///
+    /// **The same shake `camera_follow_z` was written for, one layer up.**
+    /// `first_obstruction` answers with whichever triangle is nearest, and a
+    /// position shifting by a fraction of a unit near a mesh seam can flip
+    /// that answer, or flip a hit between the duck and pull-in branches --
+    /// each one perfectly correct on its own frame, and rigidly followed, a
+    /// visible judder as the character merely turns. Reported live as the
+    /// camera feeling "stuck" once the worst of the escape itself was fixed.
+    /// `SNAP` is larger than `camera_follow_z`'s: walking through a doorway
+    /// from a cramped stairwell into a real hall is a legitimate double-digit
+    /// jump in one step, and easing that over a tenth of a second would read
+    /// as the camera lagging rather than as attached.
+    fn camera_follow_wall_distance(state: &mut Option<f32>, target: f32, dt: f32) -> f32 {
+        const TAU: f32 = 0.09;
+        const SNAP: f32 = 5.0;
+        Self::ease_towards(state, target, dt, TAU, SNAP)
     }
 
     /// What the character's own body should be *animating* at: how fast along
@@ -6492,23 +6691,31 @@ impl App {
         let (position, orientation) = (live.position, live.orientation);
         let follow_z = Self::camera_follow_z(&mut self.camera_z, position.z, dt);
         let camera_at = glam::Vec3::new(position.x, position.y, follow_z);
-        let placed = orbit_around(
-            camera_at,
-            orientation + self.camera_yaw_offset,
-            self.camera_pitch,
-            self.camera_distance,
-        );
         // Kept off the terrain. Sampled here, while the scene is still
         // borrowed, because the camera is behind `&mut self` and the world
         // behind the renderer -- and the alternative, cloning a height field
         // per frame, would be absurd for twelve lookups.
         let focus = camera_at + glam::Vec3::Z * FOLLOW_HEIGHT;
+        // Read once, before the orbit itself is even built: see
+        // `CAMERA_INDOOR_DISTANCE_CAP` for why the *distance* the wall/ceiling
+        // ray gets asked to check has to be bounded before that ray is cast,
+        // not corrected after the fact.
+        let standing_on = match self.renderer.as_ref().and_then(|r| r.scene.as_ref()) {
+            Some(Scene::Streaming(world)) => world.floor_under_footing(focus, CAMERA_FLOOR_STEP),
+            _ => None,
+        };
+        let distance = indoor_capped_distance(self.camera_distance, standing_on.is_some());
+        let center_yaw = orientation + self.camera_yaw_offset;
+        let pitch = self.camera_pitch;
+        // A plain local, not `&mut self.camera_wall_distance` -- the eye
+        // closures below borrow `self.renderer` for the whole match, and the
+        // borrow checker cannot see the two fields are disjoint through a
+        // method call any better here than it could for `camera_follow_z`.
+        // Written back to the real field once the match, and the borrow it
+        // holds, are both done.
+        let mut wall_distance_state = self.camera_wall_distance;
         let eye = match self.renderer.as_ref().and_then(|r| r.scene.as_ref()) {
             Some(Scene::Streaming(world)) => {
-                // Ground first, then walls, and the order matters: the ground
-                // pass marches outwards and can only ever shorten the ray, so
-                // the wall test that follows is asking about a line the eye
-                // could actually have reached.
                 // **Whether the raw terrain field is worth asking at all this
                 // frame, decided once rather than per sample.** A cave is a
                 // hollow shell -- the solid rock it is carved into carries no
@@ -6527,54 +6734,73 @@ impl App {
                 // at the focus point and trusted for the whole ray, since a
                 // tunnel's local extent is short enough that "underground
                 // here" means "underground for this ray".
-                let underground = world
-                    .floor_under_footing(focus, CAMERA_FLOOR_STEP)
+                let underground = standing_on
                     .zip(world.height_at(focus.x, focus.y))
                     .is_some_and(|((floor_z, _), terrain_z)| {
                         terrain_z > floor_z + CAMERA_FLOOR_REACH
                     });
-                let above_ground = pull_camera_out_of_the_ground(
-                    focus,
-                    placed.position,
-                    |x, y| {
-                        // **The floor outranks the terrain here for the same
-                        // reason it does for the character's own feet** --
-                        // see `foss-wow#135`. `focus.z`, not each sample's own
-                        // height: a fixed reference is enough, because the
-                        // floor this is ever going to matter for is the one
-                        // already known to be within `FOLLOW_HEIGHT` of it.
-                        let floor = world
-                            .floor_under_footing(
-                                glam::Vec3::new(x, y, focus.z),
-                                CAMERA_FLOOR_STEP,
-                            )
-                            .map(|(z, _)| z);
-                        match (floor, underground) {
-                            (Some(z), _) => Some(z),
-                            // Underground with no floor of its own at this
-                            // exact point: outside the tunnel's shell, in
-                            // unmodelled rock. The terrain field is not a
-                            // fact about this point and must not stand in
-                            // for one -- treated as clear, the same as a
-                            // tile that has not streamed in yet.
-                            (None, true) => None,
-                            (None, false) => world.height_at(x, y),
-                        }
-                    },
-                );
-                pull_camera_in_front_of_walls(focus, above_ground, |from, to| {
-                    world.first_obstruction(from, to)
-                })
+                let ground_at = |x: f32, y: f32| {
+                    // **The floor outranks the terrain here for the same
+                    // reason it does for the character's own feet** -- see
+                    // `foss-wow#135`. `focus.z`, not each sample's own
+                    // height: a fixed reference is enough, because the floor
+                    // this is ever going to matter for is the one already
+                    // known to be within `FOLLOW_HEIGHT` of it.
+                    let floor = world
+                        .floor_under_footing(glam::Vec3::new(x, y, focus.z), CAMERA_FLOOR_STEP)
+                        .map(|(z, _)| z);
+                    match (floor, underground) {
+                        (Some(z), _) => Some(z),
+                        // Underground with no floor of its own at this exact
+                        // point: outside the tunnel's shell, in unmodelled
+                        // rock. The terrain field is not a fact about this
+                        // point and must not stand in for one -- treated as
+                        // clear, the same as a tile that has not streamed in
+                        // yet.
+                        (None, true) => None,
+                        (None, false) => world.height_at(x, y),
+                    }
+                };
+                let wall_at = |from, to| world.first_obstruction(from, to);
+                // Ground first, then walls, and the order matters: the
+                // ground pass marches outwards and can only ever shorten the
+                // ray, so the wall test that follows is asking about a line
+                // the eye could actually have reached.
+                let eye_at = |yaw: f32, distance: f32| -> glam::Vec3 {
+                    let placed = orbit_around(camera_at, yaw, pitch, distance);
+                    let above_ground = pull_camera_out_of_the_ground(focus, placed.position, ground_at);
+                    pull_camera_clear_of_the_building(focus, above_ground, wall_at)
+                };
+                // **A clear centre ray says nothing about the rest of the
+                // frame.** See `tightest_eye_at_center` and
+                // `CAMERA_FOV_SAMPLE_ANGLE`.
+                let raw = tightest_eye_at_center(center_yaw, distance, focus, eye_at);
+                // **And a clean answer this frame says nothing about the
+                // last one.** See `camera_follow_wall_distance`: eased the
+                // same way the vertical follow already was, for the same
+                // reason -- a wall/ceiling classification flipping between
+                // two adjacent, individually-correct frames is a judder, not
+                // a fact worth reproducing instantly.
+                let eased = Self::camera_follow_wall_distance(
+                    &mut wall_distance_state,
+                    (raw - focus).length(),
+                    dt,
+                )
+                .min(distance);
+                eye_at(center_yaw, eased)
             }
-            _ => placed.position,
+            _ => orbit_around(camera_at, center_yaw, pitch, distance).position,
         };
+        self.camera_wall_distance = wall_distance_state;
         self.camera_eye_distance = Some((eye - focus).length());
         if let Camera::Fly(fly) = &mut self.camera {
             // Only the placement, so the free-camera fields a screenshot or the
             // overlay may have set are left alone.
             fly.position = eye;
-            fly.yaw = placed.yaw;
-            fly.pitch = placed.pitch;
+            // Re-derived from where `eye` actually ended up, not copied from
+            // `placed` -- see `face_focus_from` for why the ceiling duck needs
+            // this and the ground/wall passes merely tolerate it.
+            (fly.yaw, fly.pitch) = face_focus_from(eye, focus);
         }
     }
 
@@ -13234,6 +13460,86 @@ mod gesture_tests {
         );
     }
 
+    /// **Crashed the client, live.** `CAMERA_MIN_PULL_IN` (1.5) was a floor
+    /// on `stopped` that assumed `length` -- the distance to whatever `eye`
+    /// this call was given -- always started at the *full* nominal orbit
+    /// distance, comfortably above it. True for a single call; false once
+    /// `pull_camera_clear_of_the_building` started feeding one call's output
+    /// back in as the next call's `eye`, because a duck is bounded by a
+    /// nearby ceiling and nothing else, so a second pass can be handed an
+    /// `eye` under 1.5 units from `focus`. `clamp(1.5, length)` with
+    /// `length` under 1.5 panics -- reported back as "same issue, no
+    /// improvement" because a crash and an uncaught escape look identical
+    /// for the one frame a player sees before either happens.
+    #[test]
+    fn a_wall_closer_than_the_minimum_pull_in_does_not_panic() {
+        let focus = glam::Vec3::new(0.0, 0.0, 2.0);
+        // Already well under `CAMERA_MIN_PULL_IN` before the wall test even
+        // runs -- exactly what a prior duck can hand this function.
+        let eye = focus + glam::Vec3::X * 1.0;
+        let wall_normal = glam::Vec3::new(1.0, 0.0, 0.0);
+        // A hit near the far end, so `t * length` alone would also clamp
+        // below `length` -- this is not about `CAMERA_WALL_CLEARANCE`.
+        let pulled = pull_camera_in_front_of_walls(focus, eye, |_, _| Some((0.9, wall_normal)));
+        assert!(
+            (pulled - focus).length() <= 1.0 + 1e-3,
+            "must not overshoot the segment it was given: {pulled:?}"
+        );
+    }
+
+    /// **The escape a single pass cannot see.** Modelled on a real capture:
+    /// an open window at head height with a solid sill below it. The
+    /// original, higher orbit ray sails straight through the open window and
+    /// only finds a roof far outside; ducking under that roof preserves the
+    /// window's horizontal offset untouched, because ducking only ever
+    /// touches height. The *lower*, ducked ray now aims at the solid sill
+    /// instead of the open window -- a wall this test's mock reports only
+    /// when asked about a line passing below `z=2.8` at `x=-3`. A single
+    /// [`pull_camera_in_front_of_walls`] pass never asks that second
+    /// question; [`pull_camera_clear_of_the_building`] does, by construction.
+    #[test]
+    fn a_duck_that_lands_past_a_sill_is_caught_on_the_next_pass() {
+        let focus = glam::Vec3::new(0.0, 0.0, 2.0);
+        // The nominal orbit's own choice -- far and a little above the
+        // window -- comes from wherever the wheel and the drag left it, and
+        // is not itself the bug.
+        let nominal = glam::Vec3::new(-11.0, 0.0, 6.0);
+
+        let sill_and_window = |_from: glam::Vec3, to: glam::Vec3| -> Option<(f32, glam::Vec3)> {
+            let span = to - focus;
+            if span.x.abs() > 1e-6 {
+                let t_wall = -3.0 / span.x;
+                if (0.0..=1.0).contains(&t_wall) && focus.z + t_wall * span.z <= 2.8 {
+                    return Some((t_wall, glam::Vec3::new(1.0, 0.0, 0.0)));
+                }
+            }
+            // Through the open window: nothing here until a distant roof,
+            // reachable only by a ray that still points roughly where the
+            // nominal orbit did.
+            (to.x <= -10.0).then_some((0.5, glam::Vec3::new(0.0, 0.0, -1.0)))
+        };
+
+        // Control: a single pass really does reproduce the escape, so the
+        // fix below is not just agreeing with an untriggered mock.
+        let single_pass = pull_camera_in_front_of_walls(focus, nominal, sill_and_window);
+        assert!(
+            (single_pass.x - nominal.x).abs() < 1e-3,
+            "the control should still show the duck leaving x untouched: {single_pass:?}"
+        );
+
+        let clear = pull_camera_clear_of_the_building(focus, nominal, sill_and_window);
+        assert!(
+            (clear - focus).length() < 5.0,
+            "a second pass should catch the sill and pull the eye back near the room, \
+             not leave it {:.1} units out at {clear:?}",
+            (clear - focus).length()
+        );
+        assert!(
+            clear.x > -4.0,
+            "the eye should end up on the near side of the sill, not past it: {clear:?}"
+        );
+    }
+
     /// **A sidestep turns the drawn body towards where it is going; a
     /// straight run and a straight retreat turn nothing.**
     ///
@@ -13604,6 +13910,179 @@ mod camera_tests {
     fn the_pitch_limit_avoids_the_poles() {
         assert!(FOLLOW_PITCH_LIMIT < std::f32::consts::FRAC_PI_2);
         assert!(FOLLOW_PITCH_LIMIT > 1.0, "the camera can barely tilt");
+    }
+
+    /// When `eye` never left the orbit's own view ray -- the ground pass and
+    /// the wall-pulling half of the ceiling/wall test both only ever shorten
+    /// it -- re-deriving yaw and pitch from `eye` must reproduce the angles
+    /// the orbit was already given, not merely something that also happens to
+    /// look at `focus`.
+    #[test]
+    fn face_focus_from_agrees_with_the_orbit_it_came_from() {
+        let feet = glam::Vec3::new(4.0, -7.0, 12.0);
+        let focus = feet + glam::Vec3::Z * FOLLOW_HEIGHT;
+        for (yaw, pitch) in [(0.0, 0.0), (1.2, 0.4), (-2.1, -0.6), (0.3, FOLLOW_PITCH_LIMIT)] {
+            let placed = orbit_around(feet, yaw, pitch, 8.0);
+            let (got_yaw, got_pitch) = face_focus_from(placed.position, focus);
+            assert!(
+                (got_yaw - yaw).abs() < 1e-4 && (got_pitch - pitch).abs() < 1e-4,
+                "on-ray eye should give back the same angles: wanted ({yaw}, {pitch}), got ({got_yaw}, {got_pitch})"
+            );
+        }
+    }
+
+    /// **The duck bug.** `pull_camera_in_front_of_walls` deliberately steps
+    /// `eye` straight down and off the orbit's view ray under a low ceiling --
+    /// see `ducking_reads_the_hits_position_not_its_normals_claimed_side` --
+    /// so an eye built that way is no longer looking at `focus` under the
+    /// stale angles the orbit was given. Reproduced here without a live world:
+    /// take an ordinary up-and-back orbit eye and duck it straight down, the
+    /// exact shape `pull_camera_in_front_of_walls` produces, then check the
+    /// re-derived angles actually point at the character instead of past
+    /// them.
+    #[test]
+    fn face_focus_from_recovers_a_ducked_eye() {
+        let focus = glam::Vec3::new(0.0, 0.0, 2.0);
+        let placed = orbit_around(focus - glam::Vec3::Z * FOLLOW_HEIGHT, 0.0, 0.3, 6.0);
+        // The duck only ever touches z, per
+        // `a_low_ceiling_ducks_the_camera_rather_than_pulling_it_in`.
+        let ducked = glam::Vec3::new(placed.position.x, placed.position.y, focus.z + 0.4);
+        assert!(
+            (ducked - focus).normalize().z > (placed.position - focus).normalize().z,
+            "the test fixture is not actually a duck"
+        );
+
+        let (yaw, pitch) = face_focus_from(ducked, focus);
+        let (sp, cp) = pitch.sin_cos();
+        let (sy, cy) = yaw.sin_cos();
+        let forward = glam::Vec3::new(cp * cy, cp * sy, sp);
+        let to_focus = (focus - ducked).normalize();
+        assert!(
+            forward.dot(to_focus) > 0.9999,
+            "the re-derived angles do not look at the character: forward {forward:?} vs {to_focus:?}"
+        );
+
+        // The bug this replaces: the stale, pre-duck pitch aimed well past the
+        // character from the ducked position.
+        let (stale_sp, stale_cp) = placed.pitch.sin_cos();
+        let (stale_sy, stale_cy) = placed.yaw.sin_cos();
+        let stale_forward = glam::Vec3::new(stale_cp * stale_cy, stale_cp * stale_sy, stale_sp);
+        assert!(
+            stale_forward.dot(to_focus) < forward.dot(to_focus),
+            "the stale angles should be a worse aim at the character than the re-derived ones"
+        );
+    }
+
+    /// **The escape this reproduces.** `RUST_LOG=wow_viewer=debug` on a live
+    /// Northshire Abbey attic showed `camera pull-in: t=0.782 ... stopped=23.11
+    /// of 30.00` -- the wheel was at `ui::camera::MAX_DISTANCE` (30), and the
+    /// single ray the wall test casts found nothing until 23 units out, well
+    /// past any wall of the small room the character stood in. Outdoors the
+    /// same 30 must survive untouched -- an open field is exactly where a full
+    /// zoom-out is a reasonable thing to want.
+    #[test]
+    fn the_indoor_cap_only_applies_indoors() {
+        assert!(
+            (indoor_capped_distance(30.0, true) - CAMERA_INDOOR_DISTANCE_CAP).abs() < 1e-5,
+            "30 units indoors is exactly the escape this exists to prevent"
+        );
+        assert!(
+            (indoor_capped_distance(30.0, false) - 30.0).abs() < 1e-5,
+            "outdoors must keep the full zoom range"
+        );
+        // Below the cap, indoors changes nothing -- a normal room at the
+        // default distance (9, see `ui::Camera::default`) must look identical
+        // to how every earlier indoor milestone was tested.
+        assert!((indoor_capped_distance(9.0, true) - 9.0).abs() < 1e-5);
+    }
+
+    /// **The bleed.** A live capture showed the character correctly framed
+    /// and close to a wall, with open valley visible through a corner off to
+    /// one side -- a centre ray that never crossed anything, next to a
+    /// corner only a few degrees off centre. This fixture makes that corner
+    /// literal: `eye_at` returns a point far from `focus` for every yaw
+    /// except the one matching a side sample, which it reports as very
+    /// close instead.
+    #[test]
+    fn a_corner_only_a_side_sample_sees_still_pulls_in_the_centre() {
+        let focus = glam::Vec3::new(0.0, 0.0, 0.0);
+        let center_yaw = 0.5;
+        let corner_yaw = center_yaw + CAMERA_FOV_SAMPLE_ANGLE;
+        let eye_at = |yaw: f32, distance: f32| -> glam::Vec3 {
+            let effective = if (yaw - corner_yaw).abs() < 1e-4 {
+                2.0
+            } else {
+                distance
+            };
+            focus + glam::Vec3::new(yaw.cos(), yaw.sin(), 0.0) * effective
+        };
+
+        let result = tightest_eye_at_center(center_yaw, 10.0, focus, eye_at);
+        assert!(
+            (result - focus).length() < 2.5,
+            "the corner only the side sample saw should still have pulled the \
+             centre in, not left it at {result:?}"
+        );
+        // Pulled in along the *centre* direction, not moved to the corner's.
+        let expected_direction = glam::Vec3::new(center_yaw.cos(), center_yaw.sin(), 0.0);
+        assert!(
+            (result - focus).normalize().dot(expected_direction) > 0.999,
+            "the character must stay framed dead centre: {result:?}"
+        );
+    }
+
+    /// A centre ray that is already the tightest must be left alone -- this
+    /// is the ordinary case, and it must not cost anything or wobble.
+    #[test]
+    fn an_unobstructed_view_is_unaffected_by_the_side_samples() {
+        let focus = glam::Vec3::new(0.0, 0.0, 0.0);
+        let center_yaw = 1.1;
+        let eye_at = |yaw: f32, distance: f32| {
+            focus + glam::Vec3::new(yaw.cos(), yaw.sin(), 0.0) * distance
+        };
+        let result = tightest_eye_at_center(center_yaw, 10.0, focus, eye_at);
+        assert!((result - eye_at(center_yaw, 10.0)).length() < 1e-4);
+    }
+
+    /// **The judder.** `first_obstruction` flipping which triangle answers,
+    /// or a hit flipping between the duck and pull-in branches, moved the
+    /// wall-avoiding distance a little every frame even while the character
+    /// stood still and merely turned -- reported live as the camera feeling
+    /// "stuck" once the escape itself was fixed. A small back-and-forth must
+    /// not read on screen as two large snaps.
+    #[test]
+    fn small_frame_to_frame_noise_is_smoothed_not_snapped() {
+        let mut state = Some(6.0);
+        // A one-unit flicker, the shape a flipped classification produces,
+        // not a real change in the room.
+        let eased = App::camera_follow_wall_distance(&mut state, 5.0, 1.0 / 60.0);
+        assert!(
+            eased > 5.0 && eased < 6.0,
+            "one frame of noise moved the camera to {eased}, not partway towards it"
+        );
+    }
+
+    /// A real change of room -- walking out of a cramped stairwell into a
+    /// hall -- is not noise, and gliding it over a tenth of a second would
+    /// read as lag rather than as the camera being attached to the
+    /// character. Larger than `camera_follow_z`'s own threshold on purpose:
+    /// see `camera_follow_wall_distance`.
+    #[test]
+    fn a_large_jump_snaps_instead_of_gliding() {
+        let mut state = Some(2.0);
+        let eased = App::camera_follow_wall_distance(&mut state, 14.0, 1.0 / 60.0);
+        assert!(
+            (eased - 14.0).abs() < 1e-4,
+            "a real room change should snap, not ease: got {eased}"
+        );
+    }
+
+    /// The very first frame has nothing to ease from.
+    #[test]
+    fn the_first_frame_has_no_history_to_ease_from() {
+        let mut state = None;
+        let eased = App::camera_follow_wall_distance(&mut state, 7.0, 1.0 / 60.0);
+        assert_eq!(eased, 7.0);
     }
 }
 
