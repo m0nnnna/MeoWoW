@@ -93,7 +93,8 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | World | Day/night from `Light.dbc`, a real sky gradient, sun and moon, weather that falls, game objects drawn. **A star dome, a cloud band and the zone skybox `LightSkybox` names** — which on Azeroth and Kalimdor is none, measured. No moon texture, one cloud layer |
 | Shadows | **A directional shadow map from the sun**, cast by terrain, models and alpha-keyed foliage, received by everything but liquid. One cascade around the camera; `--no-shadows` and `--shadow-dump` are the instruments |
 | Appearance | NPCs, other players and the viewer's own character are all dressed from their replicated fields. Weapons draw and sheathe. No shoulders, helms or ranged weapons on others |
-| Player states | **Shapeshifting and stealth, on ourselves and on other players.** A transform is `UNIT_FIELD_DISPLAYID != UNIT_FIELD_NATIVEDISPLAYID` — *not* a non-zero shapeshift form, which every warrior carries — and it drops the player look so a bear is dressed as a bear. Stealth is `UNIT_FIELD_BYTES_1`'s `CREEP` bit: the body draws at 45% through a forced blend and plays the crouch cycles. **A stealthed player is simply not replicated to an observer who cannot detect them**, so this is visible for your own character, your party and detectors. Stand state and animation tier are named and unread; no aura system, so no buff bar |
+| Player states | **Shapeshifting and stealth, on ourselves and on other players.** A transform is `UNIT_FIELD_DISPLAYID != UNIT_FIELD_NATIVEDISPLAYID` — *not* a non-zero shapeshift form, which every warrior carries — and it drops the player look so a bear is dressed as a bear. Stealth is `UNIT_FIELD_BYTES_1`'s `CREEP` bit: the body draws at 45% through a forced blend and plays the crouch cycles. **A stealthed player is simply not replicated to an observer who cannot detect them**, so this is visible for your own character, your party and detectors. Stand state and animation tier are named and unread |
+| Auras | Both aura opcodes parse and the list is kept per unit. **It exists to answer one question — which spell id `CMSG_CANCEL_AURA` should be given — and nothing draws it**, so there is no buff bar. Pressing a bar slot for a spell the character already holds cancels it rather than casting: **re-casting a toggle is silently discarded by the server**, which is what made stealth look one-way |
 | Interface | Native, fully customisable, **no addons** — see the decision below. Player/target/party frames, click-to-target, chat, spellbook, action bars per character, `F1` to rearrange, saved to `ui.toml` |
 | Sign-in | **The viewer opens a login screen with no arguments** — confirmed at the window — so double-clicking it is the ordinary way to start: account, password, server, a folder picker for the `Data` directory, then a realm list and a character list. Remembers everything but the password, in `%APPDATA%\open-wow\login.toml`. **Creates no characters and deletes none** — the original client does that. Four themes (`slate`, `neko`, `void`, `calico`) that *write their colours into `ui.toml`* rather than sitting under it. Its own cat-head icon, drawn in code, on the window and on the executable. No queue handling, no return to the screen after a disconnect |
 | Game | Melee, spells with real tooltips and a cast bar, cooldowns, combat log, corpse and loot end to end, inventory with slot moves, character panel, quests taken and handed in, quest log with progress counters |
@@ -448,6 +449,21 @@ the full account is in `docs/ROADMAP.md`.
   that merges successive pages builds a union of snapshots that was never true
   at any instant. Ask whether the count at the front of a packet is the
   subject's length or the packet's.
+- **…and a count that over-reports poisons the stride you derive from it.**
+  `SMSG_INITIAL_SPELLS`' cooldown entry was read as 8 bytes for two milestones
+  because one packet announced `4` entries in `32` bytes. The server writes the
+  map's size and *then* skips entries, so the count was 4 and the records were
+  2 — the entry is 16. Both of this file's rules were being broken at once: one
+  packet cannot give a stride, and a leading count is not the length of what it
+  counts. What refuted it was a second sample (`5` announced in `16` bytes,
+  which divides by nothing) and then **content**: at 8 bytes the original
+  capture yields entries naming **spell zero**, which is not a thing the server
+  writes. Those zeroes were the wider record's padding read as records.
+- **A magic value in a numeric field is not a number.** The same entry reports
+  `0x80000000` for a toggle that is currently on — the server's "no end"
+  marker. Believed, it is a 24.8-day cooldown and the button is greyed out for
+  the session. `remaining_ms` returns an `Option` so no caller can take the
+  larger of two words without deciding what the marker means.
 - **The difference of two lengths over the difference of two counts is a
   stride, and it is the only measurement that does not assume the header and
   the footer.** `(16440 - 7412) / (111 - 50) = 148`, and neither the four-byte
@@ -513,6 +529,14 @@ the full account is in `docs/ROADMAP.md`.
   circle.** "Already in the log, clear it first" is right for a stale character
   and useless for an auto-accept quest. The tell is advice that would not
   change if the other cause were true.
+- **A request the server discards before it has anything to say is not a
+  refusal, and it looks like one.** `CMSG_CAST_SPELL` for a spell whose aura is
+  already held draws no reply of *any* opcode — a toggle is switched off with
+  `CMSG_CANCEL_AURA`, not by casting it again. Reported from play as "the
+  stealth took but the recast doesn't unstealth", which is exactly what a
+  request nothing answers looks like from the outside. The opcode census is
+  what separated it from a wrong body; that instrument has now been needed
+  **six** times.
 - **Bound a silent send with an answered one from the same block.** A write
   nothing acknowledges fails identically whether the opcode, the body or the
   request was wrong. `CMSG_LIST_INVENTORY` bounded `CMSG_BUY_ITEM`;

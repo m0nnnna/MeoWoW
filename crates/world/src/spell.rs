@@ -22,36 +22,102 @@ pub struct KnownSpell {
     pub slot: u16,
 }
 
-/// A spell or category that is not ready yet.
+/// A spell or category that is not ready yet. **Sixteen bytes.**
 ///
-/// **The width here is confirmed against a live realm; the second field's
-/// meaning is not.** The obvious shape to transcribe from public 3.3.5a
-/// documentation is `item_id: u16, category: u16, cooldown_ms: u32,
-/// category_cooldown_ms: u32` -- 16 bytes -- and that is what this struct
-/// held until a login actually carried a real cooldown. It never had before:
-/// every prior observation was an empty list, which exercises none of a
-/// list's own entry width. When one arrived (a level-one warrior who had just
-/// cast spell `59752`, "Every Man for Himself"), the packet held a count of
-/// `4` entries in exactly `32` remaining bytes -- divisible evenly only at
-/// `8` bytes each, not `16` -- and the first entry's first word decoded to
-/// `59752` itself, confirming the split. What the second word *is* stays
-/// open: it read `0` for that same active cooldown, which rules out "whole
-/// milliseconds remaining" read verbatim, and this project's rule against
-/// transcribing an unverified table applies as much to a field's meaning as
-/// to a status code's name -- so it keeps a neutral name rather than a
-/// guessed one until a clearer observation names it.
+/// **This was read as eight bytes for two milestones, and the reasoning that
+/// got it wrong is worth more than the correction.** The width was derived
+/// from a single packet: a level-one warrior who had just cast `59752` logged
+/// in with a cooldown count of `4` and exactly `32` bytes left, which divides
+/// evenly only at 8 -- and the first word decoded to `59752`, which looked
+/// like confirmation. Every earlier observation had been an *empty* list,
+/// which exercises no entry width at all.
+///
+/// Both steps are the traps this project has already written down. A count at
+/// the front of a packet need not be the length of the thing it counts: the
+/// server writes `m_spellCooldowns.size()` and then `continue`s past any entry
+/// that is flagged not to be sent or has no `SpellInfo`, so **the count
+/// over-reports and dividing by it is not a stride measurement**. And one
+/// packet cannot give a stride anyway -- it can only say which candidate
+/// accounts for the body, given assumptions about everything else.
+///
+/// What settled it was a second sample with different numbers, and content
+/// rather than arithmetic. `Roguetest` logged in holding Stealth: count `5`,
+/// **sixteen** bytes remaining, which the old reading takes as two entries --
+/// `(1784, 0)` and `(0, 0)`. **A cooldown entry for spell zero is not a
+/// thing.** The 16-byte reading takes the same bytes as one entry for spell
+/// 1784 with no cast item, no category and both cooldowns at zero, and that is
+/// what the server's own builder writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpellCooldown {
     pub spell_id: u32,
-    /// The cooldown entry's second word. Not yet confirmed to be a duration.
-    pub second: u32,
+    /// The item that triggered it, or zero for a spell cast directly.
+    pub item_id: u16,
+    /// Which shared category the cooldown belongs to; zero for none.
+    pub category: u16,
+    /// Milliseconds left on this spell's own cooldown.
+    ///
+    /// **The server puts the time in exactly one of this and
+    /// [`category_cooldown_ms`](Self::category_cooldown_ms), chosen by whether
+    /// the spell has a category** -- a categorised spell reads zero here and
+    /// carries its remaining time in the other field. A reader that took this
+    /// one alone would report every potion and every categorised ability as
+    /// ready. See [`SpellCooldown::remaining_ms`].
+    pub cooldown_ms: u32,
+    /// Milliseconds left on the shared category, under the same rule.
+    pub category_cooldown_ms: u32,
 }
+
+/// What the server writes in the category word to mean "no end".
+///
+/// **Not a duration, and read as one it is 24.8 days.** The builder has a
+/// special case for a cooldown running past its infinity horizon and emits a
+/// literal `(1, 0x80000000)` pair rather than a time. A toggle uses it: a rogue
+/// holding Stealth reports exactly this against spell `1784`, which is the
+/// server saying "this is on", not "this is unavailable until September".
+pub const INDEFINITE: u32 = 0x8000_0000;
+
+impl SpellCooldown {
+    /// Whether this entry is the server's "no end" marker rather than a time.
+    pub fn is_indefinite(&self) -> bool {
+        self.category_cooldown_ms == INDEFINITE
+    }
+
+    /// How long until this spell can be used, whichever field the server chose
+    /// to put it in, and `None` when the entry is not a duration at all.
+    ///
+    /// **An `Option` rather than a number, because both wrong answers here are
+    /// silent.** The server puts the time in the spell's own word *or* in its
+    /// category's, never both, so a reader taking `cooldown_ms` alone reports
+    /// every categorised ability as ready. And taking the larger of the two
+    /// without checking [`is_indefinite`](Self::is_indefinite) turns a toggle's
+    /// marker into a twenty-four-day cooldown, which draws as a button greyed
+    /// out for the rest of the session -- observed against a stealthed rogue
+    /// before anything believed it.
+    pub fn remaining_ms(&self) -> Option<u32> {
+        if self.is_indefinite() {
+            return None;
+        }
+        Some(self.cooldown_ms.max(self.category_cooldown_ms))
+    }
+}
+
+/// How many bytes one cooldown entry occupies.
+const COOLDOWN_RECORD: usize = 16;
 
 /// The spellbook, as it arrives at login.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InitialSpells {
     pub spells: Vec<KnownSpell>,
     pub cooldowns: Vec<SpellCooldown>,
+    /// How many cooldown entries the packet *said* it held.
+    ///
+    /// Kept beside the entries rather than discarded because the two routinely
+    /// disagree and the disagreement is the server's, not a parse error: the
+    /// count is written before a loop that skips entries. Carrying it lets a
+    /// caller report the gap instead of a reader silently deciding the packet
+    /// was fine -- the same call [`crate::mail`] makes about a record size that
+    /// is wrong by a fixed amount.
+    pub cooldowns_announced: u16,
 }
 
 /// Parses `SMSG_INITIAL_SPELLS`.
@@ -70,17 +136,40 @@ pub fn parse_initial_spells(body: &[u8]) -> Result<InitialSpells, Error> {
         });
     }
 
-    let cooldown_count = r.u16()?;
-    let mut cooldowns = Vec::with_capacity(cooldown_count as usize);
-    for _ in 0..cooldown_count {
+    let cooldowns_announced = r.u16()?;
+    // **Read by what is there, not by what the count claims.** Looping to the
+    // count runs off the end of the packet whenever the server skipped an
+    // entry, which fails the whole spellbook -- and losing the spellbook is
+    // how this was noticed: the action bar has nothing to draw.
+    let present = r.remaining() / COOLDOWN_RECORD;
+    if present > cooldowns_announced as usize {
+        // The count only ever over-reports, so more entries than announced
+        // means the entry width is wrong rather than that the server was
+        // generous. That is a parse error and must not be absorbed.
+        return Err(Error::Trailing {
+            what: "SMSG_INITIAL_SPELLS cooldowns",
+            got: r.remaining(),
+        });
+    }
+    let mut cooldowns = Vec::with_capacity(present);
+    for _ in 0..present {
         cooldowns.push(SpellCooldown {
             spell_id: r.u32()?,
-            second: r.u32()?,
+            item_id: r.u16()?,
+            category: r.u16()?,
+            cooldown_ms: r.u32()?,
+            category_cooldown_ms: r.u32()?,
         });
     }
 
+    // Still exact: whatever is left over is not a whole entry, and a body that
+    // ends mid-entry is the evidence of a wrong width.
     r.finish()?;
-    Ok(InitialSpells { spells, cooldowns })
+    Ok(InitialSpells {
+        spells,
+        cooldowns,
+        cooldowns_announced,
+    })
 }
 
 /// Which of a spell's possible targets the client is supplying.
@@ -528,7 +617,10 @@ mod tests {
         body.extend((cooldowns.len() as u16).to_le_bytes());
         for id in cooldowns {
             body.extend(id.to_le_bytes());
-            body.extend(1500u32.to_le_bytes()); // second word
+            body.extend(0u16.to_le_bytes()); // cast item
+            body.extend(0u16.to_le_bytes()); // category
+            body.extend(1500u32.to_le_bytes()); // the spell's own cooldown
+            body.extend(0u32.to_le_bytes()); // the category's
         }
         body
     }
@@ -541,7 +633,61 @@ mod tests {
             vec![6603, 78, 2457]
         );
         assert_eq!(parsed.cooldowns.len(), 1);
-        assert_eq!(parsed.cooldowns[0].second, 1500);
+        assert_eq!(parsed.cooldowns[0].cooldown_ms, 1500);
+        assert_eq!(parsed.cooldowns[0].remaining_ms(), Some(1500));
+    }
+
+    /// The server's "no end" marker is not a twenty-four-day cooldown.
+    ///
+    /// Taken verbatim from the entry a stealthed `Roguetest` logs in with:
+    /// spell 1784, own cooldown `1`, category cooldown `0x80000000`. Read as a
+    /// duration that is 2,147,483,648ms, and the Stealth button would be greyed
+    /// out for the rest of the session -- which reads as the toggle being
+    /// broken rather than as a misparsed field.
+    #[test]
+    fn an_indefinite_cooldown_is_a_marker_and_not_a_duration() {
+        let mut body = vec![0u8];
+        body.extend(0u16.to_le_bytes());
+        body.extend(1u16.to_le_bytes());
+        body.extend(1784u32.to_le_bytes());
+        body.extend(0u16.to_le_bytes()); // cast item
+        body.extend(0u16.to_le_bytes()); // category
+        body.extend(1u32.to_le_bytes()); // the literal 1 the builder writes
+        body.extend(INDEFINITE.to_le_bytes());
+
+        let parsed = parse_initial_spells(&body).unwrap();
+        let entry = parsed.cooldowns[0];
+        assert_eq!(entry.spell_id, 1784);
+        assert!(entry.is_indefinite());
+        assert_eq!(
+            entry.remaining_ms(),
+            None,
+            "the marker was read as a duration"
+        );
+    }
+
+    /// A categorised spell carries its time in the *other* word, and
+    /// `remaining_ms` has to find it there.
+    ///
+    /// **The half a reader taking `cooldown_ms` alone would get wrong**, and
+    /// it would get it wrong silently: every potion and every categorised
+    /// ability would report as ready, which draws as an action bar with no
+    /// sweep on it rather than as an error.
+    #[test]
+    fn a_categorised_cooldown_carries_its_time_in_the_category_word() {
+        let mut body = vec![0u8];
+        body.extend(0u16.to_le_bytes());
+        body.extend(1u16.to_le_bytes());
+        body.extend(6603u32.to_le_bytes());
+        body.extend(0u16.to_le_bytes()); // cast item
+        body.extend(11u16.to_le_bytes()); // a category
+        body.extend(0u32.to_le_bytes()); // the spell's own: zero, as the server writes it
+        body.extend(9000u32.to_le_bytes()); // the category's
+
+        let parsed = parse_initial_spells(&body).unwrap();
+        assert_eq!(parsed.cooldowns[0].cooldown_ms, 0);
+        assert_eq!(parsed.cooldowns[0].category, 11);
+        assert_eq!(parsed.cooldowns[0].remaining_ms(), Some(9000));
     }
 
     #[test]
@@ -551,31 +697,85 @@ mod tests {
         assert!(parsed.cooldowns.is_empty());
     }
 
-    /// Pinned to an actual `SMSG_INITIAL_SPELLS` captured from the live test
-    /// realm (`wow1.nekos.farm`) after casting spell `59752`, "Every Man for
-    /// Himself" -- the packet that first exercised a non-empty cooldown list
-    /// and found the 16-byte entry this module used to assume was wrong. Its
-    /// cooldown section, verbatim: count `4`, then four `(spell_id, second)`
-    /// pairs at 8 bytes each. The first entry's first word is `59752` itself,
-    /// which is what proved the split; this test guards against silently
-    /// reverting to the wider, never-actually-observed shape.
+    /// **The same captured bytes that were once read as eight-byte entries,
+    /// now read as sixteen -- and they are their own refutation.**
+    ///
+    /// Captured from `wow1.nekos.farm` after casting `59752`, "Every Man for
+    /// Himself", and kept verbatim through the correction because that is what
+    /// makes the correction checkable. Count `4`, thirty-two bytes.
+    ///
+    /// Read at 8 bytes it gives four entries: `59752`, **`0`**, `72752`,
+    /// **`0`**. A cooldown entry for spell zero is not a thing the server
+    /// writes, and two of the four were exactly that -- the padding of the
+    /// wider record, read as records. At 16 it gives two entries, both real
+    /// spells, with a count that over-reports by two because the server writes
+    /// the map's size and then skips entries.
+    ///
+    /// Asserted as *two* entries with the announced count kept beside them, so
+    /// a revert to the narrow reading fails on the count of entries rather
+    /// than on a value nobody would look at.
     #[test]
     fn the_cooldown_list_matches_a_captured_live_packet() {
         let mut body = vec![0u8]; // unknown leading byte
         body.extend(0u16.to_le_bytes()); // no known spells, to keep this focused
         body.extend(4u16.to_le_bytes()); // cooldown_count, as captured
         body.extend([
-            0x68, 0xe9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // (59752, 0)
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // (0, 0)
-            0x30, 0x1c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // (72752, 0)
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // (0, 0)
+            0x68, 0xe9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // spell 59752
+            0x30, 0x1c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // spell 72752
         ]);
 
         let parsed = parse_initial_spells(&body).unwrap();
         assert_eq!(
-            parsed.cooldowns.iter().map(|c| (c.spell_id, c.second)).collect::<Vec<_>>(),
-            vec![(59752, 0), (0, 0), (72752, 0), (0, 0)]
+            parsed.cooldowns.iter().map(|c| c.spell_id).collect::<Vec<_>>(),
+            vec![59752, 72752],
+            "no entry may name spell zero"
         );
+        assert_eq!(
+            parsed.cooldowns_announced, 4,
+            "the count over-reports and the packet is not wrong for it"
+        );
+    }
+
+    /// The second sample, and the one that could not be explained away.
+    ///
+    /// `Roguetest` logging in holding Stealth: count `5`, **sixteen** bytes.
+    /// The narrow reading takes that as two entries, the second of which names
+    /// spell zero; and unlike the capture above, sixteen bytes cannot be
+    /// divided by the announced count at all, under either reading. **When a
+    /// population cannot separate two candidates, change the population** --
+    /// this is the sample that did.
+    #[test]
+    fn a_count_of_five_arrives_with_one_entry() {
+        let mut body = vec![0u8];
+        body.extend(0u16.to_le_bytes());
+        body.extend(5u16.to_le_bytes());
+        body.extend([
+            0xf8, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // spell 1784, Stealth
+        ]);
+
+        let parsed = parse_initial_spells(&body).unwrap();
+        assert_eq!(parsed.cooldowns.len(), 1);
+        assert_eq!(parsed.cooldowns[0].spell_id, 1784);
+        assert_eq!(parsed.cooldowns_announced, 5);
+    }
+
+    /// More entries than the count announced means the width is wrong, and
+    /// that is refused rather than absorbed.
+    ///
+    /// The count only ever over-reports -- the server writes the map's size
+    /// and then skips -- so the other direction cannot happen legitimately.
+    /// Without this check a halved entry width would read every packet as
+    /// "twice as many cooldowns, all fine".
+    #[test]
+    fn more_entries_than_announced_is_refused() {
+        let mut body = vec![0u8];
+        body.extend(0u16.to_le_bytes());
+        body.extend(1u16.to_le_bytes()); // one announced
+        body.extend([0u8; 32]); // two entries' worth
+        assert!(parse_initial_spells(&body).is_err());
     }
 
     /// Two counted lists back to back is the whole risk: a wrong width in the

@@ -8025,16 +8025,106 @@ characters in different places produce a confident-looking null result.
   headlessly and the model carries all three cycles with keyed bones, but
   nothing has watched a rogue actually crouch.
 
+### The toggle that would not switch off, and the two bugs behind it
+
+The first live report was *"the stealth took but the recast doesn't unstealth"* —
+one sentence, and it turned out to be sitting on top of three separate faults.
+
+**Re-casting is not how a toggle is cancelled.** `CMSG_CAST_SPELL` for a spell
+whose aura is already held produces *nothing*: four attempts in one session drew
+no `SMSG_CAST_FAILED`, no `SMSG_SPELL_START`, and no opcode of any number. The
+server discards the request before it has anything to say. This is the instrument
+earning its keep for the sixth time — "print every opcode seen, decoded or not"
+is what turned "the recast does nothing" into "the recast is not a request the
+server answers", which are different investigations.
+
+`CMSG_CANCEL_AURA` (`0x0136`) is the opcode, and it wants one `u32`: the **spell
+id of the aura to drop**. Nothing acknowledges it either — every path in the
+server's handler returns silently — so it is confirmed by consequence, the way
+`CMSG_SET_SHEATHED` was: both state fields clear in the next object update, and
+they clear only when the id names an aura actually held.
+
+**Which is the fact the client did not have.** `UNIT_FIELD_BYTES_1` says the
+character *is* stealthed and cannot say which of the several spells that produce
+that state to cancel: a rogue's Stealth and a druid's Prowl set the same bit, and
+two ranks of one spell are two different ids. So the aura list stopped being
+optional, and `crates/world/src/aura.rs` parses the two opcodes that had been
+arriving in every capture this project has ever taken and being logged as bare
+numbers — 56 of them in one eight-second window.
+
+Their layout is a record of five fixed fields with two conditional blocks (a
+caster guid unless the target cast it on itself, two duration words if it has a
+duration), and **the conditionals are the risk**: the common case has neither, so
+a reader that ignored both parses every ordinary aura perfectly. The cursor is
+what catches it, against three captures that exercise different shapes — a
+stealth apply at 10 bytes, a removal at 7, and a creature's list under a six-byte
+packed guid at 15. Each consumed to the last byte.
+
+One more thing the opcode pair gets wrong on purpose: `SMSG_AURA_UPDATE_ALL` is
+`0x0495` and `SMSG_AURA_UPDATE` is `0x0496`, which is the opposite order from
+what the names suggest. A one-record `_ALL` and a one-record amendment are
+byte-identical bodies; only the opcode says whether everything else the unit had
+is now gone.
+
+### The cooldown record that was eight bytes for two milestones
+
+Chasing the above turned up a `SMSG_INITIAL_SPELLS` that would not parse —
+`needed 4 bytes at offset 297, packet holds 297` — and it failed **only for a
+character holding a cooldown**, which no earlier probe had been. Losing that
+packet loses the whole spellbook, so the action bar has nothing to draw.
+
+The entry is sixteen bytes: spell id, cast item, category, the spell's own
+cooldown, the category's. This module read it as eight, and the reasoning that
+got there is worth more than the fix.
+
+It was derived from a single packet. A warrior who had just cast `59752` logged
+in with a cooldown count of `4` and exactly `32` bytes left, which divides evenly
+only at 8 — and the first word decoded to `59752`, which looked like
+confirmation. Two of this document's own rules were being broken at once. **One
+packet cannot give a stride**; and **a count at the front of a packet need not be
+the length of the thing it counts** — the server writes `m_spellCooldowns.size()`
+and then `continue`s past any entry flagged not to be sent, so the count
+over-reports and dividing by it is not a measurement at all.
+
+What settled it was a second sample with different numbers: `Roguetest` holding
+Stealth, count `5`, **sixteen** bytes — which no reading divides by 5. And then
+content rather than arithmetic. At 8 bytes the old capture gives four entries —
+`59752`, **`0`**, `72752`, **`0`** — and *a cooldown entry for spell zero is not a
+thing*. Those two zeroes were the wider record's own padding, read as records.
+The old fixture is kept verbatim in the test that now asserts the opposite of
+what it used to, because bytes that refute a reading are the most useful bytes
+there are.
+
+### And a number that is not a number
+
+With the record right, the entry for a stealthed rogue read **2,147,483,648ms
+left** — 24.8 days, and the Stealth button greyed out for the rest of the
+session.
+
+`0x80000000` is the server's "no end" marker: the builder has a special case that
+emits a literal `(1, 0x80000000)` pair instead of a time when a cooldown runs
+past its infinity horizon, and a toggle uses it to say *this is currently on*.
+`remaining_ms` therefore returns an `Option` rather than a number, because both
+wrong answers here are silent — reading `cooldown_ms` alone reports every
+categorised ability as ready, and taking the larger of the two without the check
+turns a marker into a month.
+
+Caught before it ever reached the window, by a probe that printed the number
+beside the fields it came from. It would have arrived as a second bug report
+reading "the stealth button is stuck".
+
 ### Still not done
 
 * **Stand state.** The byte is named and unread — no `/sit`, no
   `CMSG_STANDSTATECHANGE`, and a sitting NPC draws standing.
 * **The animation tier**, byte 3 of the same field: hover, flying, submerged.
   Named for the same reason and left for whenever flight is.
-* **No aura system.** `SMSG_AURA_UPDATE` (`0x0496`) and `SMSG_AURA_UPDATE_ALL`
-  (`0x0495`) both arrive and neither is parsed. Every state here is read from a
-  replicated *field*, which is enough for stealth and for shapeshifting and is
-  not enough for a buff bar.
+* **No buff bar.** Both aura opcodes are parsed now and the list is kept per
+  unit, but nothing draws it. It exists to answer one question -- which spell
+  id to cancel -- and that is all it is used for.
+* **Nothing cancels a shapeshift.** The same `CMSG_CANCEL_AURA` should drop a
+  druid's form, and pressing the form's own button will now try it, but no
+  druid has been sat in front of a bar to check.
 * **No form names.** `Entity::shapeshift_form` returns the raw byte. Two values
   have been watched arrive and thirty have not, and naming a table that only
   produces text is the mistake `describe_cast_failure` exists to refuse.

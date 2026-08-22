@@ -1308,6 +1308,19 @@ pub struct WorldState {
     /// the server answers an empty corpse with a release rather than an empty
     /// window, so storing it would leave a window nothing will clear.
     pub loot: Option<crate::loot::Loot>,
+    /// Which spells are sitting on each unit, by guid.
+    ///
+    /// **Kept beside the entity table rather than inside it**, because auras
+    /// and update fields arrive by unrelated routes and have different
+    /// lifetimes: `SMSG_AURA_UPDATE` names a guid whose object may not be
+    /// replicated yet, and an entity dropping out of view should not be the
+    /// thing that decides what is known about its buffs. The same reasoning
+    /// that keeps `loot` here.
+    ///
+    /// Read by the one question the interface asks of it: pressing a spell the
+    /// character already holds means "stop doing this", and the spell id to
+    /// cancel comes from here. See [`crate::aura`].
+    pub auras: std::collections::HashMap<u64, crate::aura::Auras>,
     /// The realm's clock, from `SMSG_LOGIN_SETTIMESPEED` at login, together
     /// with when this client learned it.
     ///
@@ -2501,6 +2514,35 @@ impl WorldState {
                 // arrived and been thrown away. Centralising the producer does
                 // not centralise the consumers, so anything a window needs to
                 // read lives in the state instead.
+                // **The opcode chooses which of the two this is, and the body
+                // cannot.** A one-record `_ALL` and a one-record amendment are
+                // byte-identical; only the first is a statement that
+                // everything else is gone.
+                opcode @ (crate::opcode::server::AURA_UPDATE
+                | crate::opcode::server::AURA_UPDATE_ALL) => {
+                    let replaces_all = opcode == crate::opcode::server::AURA_UPDATE_ALL;
+                    match crate::aura::parse_aura_update(&packet.body, replaces_all) {
+                        Ok(update) => {
+                            let known = self.auras.entry(update.guid).or_default();
+                            crate::aura::apply(known, &update);
+                            // An empty entry is not the same as an absent one
+                            // to a `HashMap`, and keeping one per unit that
+                            // ever had an aura would grow for the life of the
+                            // session in a zone where every critter carries
+                            // one. Dropped rather than left as an empty map.
+                            if known.is_empty() {
+                                self.auras.remove(&update.guid);
+                            }
+                        }
+                        Err(error) => {
+                            report.failures.push((
+                                packet.opcode,
+                                error,
+                                Ok(packet.body.clone()),
+                            ));
+                        }
+                    }
+                }
                 crate::opcode::server::LOOT_RESPONSE => {
                     match crate::loot::parse_loot_response(&packet.body) {
                         Ok(loot) => {
@@ -2840,20 +2882,35 @@ impl WorldState {
                         Ok(book) => {
                             report.spells = book.spells.len();
                             let now = std::time::Instant::now();
-                            // `SpellCooldown::second` is not yet confirmed to
-                            // be a millisecond duration -- see its doc
-                            // comment -- so this seeds nothing visible today
-                            // (`Cooldown::remaining_fraction` reads `0.0` for
-                            // a `0` duration, which is what every observation
-                            // so far has held). Folded in anyway because a
-                            // later, better-understood value here should not
-                            // need a second wiring-up to take effect.
+                            // **Through `remaining_ms`, not off either field.**
+                            // The server puts the time in the spell's own
+                            // cooldown or in its category's, never both, and
+                            // reading the first alone reports every
+                            // categorised ability and every potion as ready.
+                            //
+                            // An entry with nothing left is skipped rather
+                            // than inserted: seeding a zero-length cooldown
+                            // starting *now* is a statement that the spell
+                            // just became ready, which is indistinguishable
+                            // from one that has been ready for an hour and
+                            // costs a sweep on the action bar for nothing.
                             for cooldown in &book.cooldowns {
+                                // An indefinite entry is a toggle's marker,
+                                // not a time -- see `spell::INDEFINITE`. The
+                                // aura list is what says the toggle is on;
+                                // seeding this would grey the button for
+                                // twenty-four days.
+                                let Some(remaining) = cooldown.remaining_ms() else {
+                                    continue;
+                                };
+                                if remaining == 0 {
+                                    continue;
+                                }
                                 self.cooldowns.insert(
                                     cooldown.spell_id,
                                     Cooldown {
                                         started: now,
-                                        duration_ms: cooldown.second,
+                                        duration_ms: remaining,
                                     },
                                 );
                             }
@@ -4741,21 +4798,39 @@ mod tests {
         );
     }
 
-    /// The login burst's own cooldown list must take effect immediately, not
-    /// only once a fresh `SMSG_SPELL_COOLDOWN` happens to arrive -- a
-    /// character who logs in mid-cooldown should see that on the bar from the
-    /// first frame, once `SpellCooldown::second` is confirmed to actually
-    /// carry a duration. This tests the wiring on that assumption; it does
-    /// not claim the assumption itself is true yet.
+    /// The login burst's own cooldown list must take effect immediately,
+    /// rather than only once a fresh `SMSG_SPELL_COOLDOWN` happens to arrive:
+    /// a character who logs in mid-cooldown should see that on the bar from
+    /// the first frame.
+    ///
+    /// **A zero-length entry is deliberately included and must not be
+    /// seeded.** The server sends an entry for every spell in its cooldown
+    /// map, including ones whose time has already run out, and inserting a
+    /// zero-length cooldown *starting now* claims the spell became ready this
+    /// instant -- which draws a sweep on the action bar for a spell that has
+    /// been ready for an hour.
     #[test]
     fn replicate_seeds_cooldowns_from_the_login_burst() {
         use crate::client::Packet;
 
+        let entry = |spell: u32, remaining: u32| {
+            let mut bytes = Vec::new();
+            bytes.extend(spell.to_le_bytes());
+            bytes.extend(0u16.to_le_bytes()); // cast item
+            bytes.extend(0u16.to_le_bytes()); // category
+            bytes.extend(remaining.to_le_bytes());
+            bytes.extend(0u32.to_le_bytes());
+            bytes
+        };
+
         let mut body = vec![0u8]; // unknown/always-zero leading byte
         body.extend(0u16.to_le_bytes()); // no known spells
-        body.extend(1u16.to_le_bytes()); // one cooldown
-        body.extend(172u32.to_le_bytes()); // spell id
-        body.extend(6000u32.to_le_bytes()); // second word
+        // **Announced three, two present.** The real packet over-reports for
+        // exactly this reason, so the fixture does too -- a parser that loops
+        // to the count runs off the end and loses the whole spellbook.
+        body.extend(3u16.to_le_bytes());
+        body.extend(entry(172, 6000));
+        body.extend(entry(686, 0));
 
         let mut world = WorldState::new();
         let report = world.replicate(
@@ -4766,8 +4841,14 @@ mod tests {
             None,
         );
 
-        assert!(report.failures.is_empty());
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(world.spells.cooldowns_announced, 3);
         assert_eq!(world.cooldown_fraction(172, std::time::Instant::now()), 1.0);
+        assert_eq!(
+            world.cooldown_fraction(686, std::time::Instant::now()),
+            0.0,
+            "an entry with nothing left is not a cooldown that just started"
+        );
     }
 
     #[test]

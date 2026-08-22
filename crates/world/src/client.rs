@@ -725,6 +725,16 @@ impl Connection {
         )
     }
 
+    /// Drops an aura this character is carrying, by spell id.
+    ///
+    /// **The way to switch a toggle off.** See
+    /// [`ClientOpcode::CancelAura`](crate::ClientOpcode::CancelAura): casting
+    /// the spell a second time is silently ignored, so this is not an
+    /// optimisation over a recast, it is the only thing that works.
+    pub fn cancel_aura(&mut self, spell_id: u32) -> Result<(), Error> {
+        self.send(ClientOpcode::CancelAura, &spell_id.to_le_bytes())
+    }
+
     /// Wears the item in a slot of the character's own inventory array.
     ///
     /// The server chooses which equipment slot it goes to, refuses politely if

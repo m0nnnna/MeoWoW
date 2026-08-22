@@ -7070,6 +7070,46 @@ impl App {
         let Some(live) = self.live.as_mut() else {
             return;
         };
+        // **A spell already sitting on the character is switched off, not cast
+        // again**, and that is not an optimisation over a recast -- a recast
+        // does nothing at all. `CMSG_CAST_SPELL` for a spell whose aura is
+        // held draws no reply of any number: not a refusal, not an
+        // acknowledgement, nothing to log and nothing to show. Reported from
+        // play as "the stealth took but the recast doesn't unstealth", which
+        // is precisely what a request the server discards before it has
+        // anything to say looks like from the outside.
+        //
+        // **Asked of the aura list rather than of the state fields**, and the
+        // difference is the whole reason `world::aura` exists.
+        // `UNIT_FIELD_BYTES_1` says the character *is* stealthed and cannot
+        // say which of the several spells that produce that state to cancel --
+        // a rogue's Stealth and a druid's Prowl set the same bit, and two
+        // ranks of one spell are two different ids. `CMSG_CANCEL_AURA` wants
+        // the id.
+        if live
+            .state
+            .auras
+            .get(&live.guid)
+            .is_some_and(|held| ::world::aura::holds(held, spell))
+        {
+            match live.connection.cancel_aura(spell) {
+                Ok(()) => {
+                    tracing::debug!("cancelled {name} ({spell})");
+                    self.action_flash = Some(((bar, slot), Instant::now()));
+                    // **No cooldown is started.** Dropping a toggle is not a
+                    // cast: predicting one here would grey the button the
+                    // player has just pressed to *stop* doing something, and
+                    // the global cooldown in particular is a property of
+                    // casting.
+                }
+                Err(e) => {
+                    tracing::warn!("cancelling {spell} failed: {e:#}");
+                    self.chat
+                        .push(Line::Chat(local_notice(format!("could not cancel: {e}"))));
+                }
+            }
+            return;
+        }
         match live.connection.cast_spell(spell, target) {
             Ok(()) => {
                 tracing::debug!("cast {name} ({spell})");

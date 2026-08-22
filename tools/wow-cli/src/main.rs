@@ -1019,6 +1019,23 @@ enum Command {
         cast: Option<u32>,
         #[arg(long)]
         cast_self: bool,
+        /// Drop this spell's aura from our own character, and report what the
+        /// state fields did about it.
+        ///
+        /// **The probe for the thing a recast cannot do.** `CMSG_CAST_SPELL`
+        /// for a spell whose aura is already held produces no reply of any
+        /// number -- not a refusal, not an acknowledgement -- so a rogue
+        /// pressing Stealth a second time stays hidden and nothing anywhere
+        /// says why. `CMSG_CANCEL_AURA` is the opcode that switches a toggle
+        /// off.
+        ///
+        /// Nothing acknowledges this either, so the report is the consequence:
+        /// the state fields are printed before and after, and the run says
+        /// which of them moved. A spell id naming an aura the character does
+        /// not hold moves nothing, which is a different printout rather than a
+        /// similar one.
+        #[arg(long)]
+        cancel_aura: Option<u32>,
         /// Cast `--cast`'s spell at this game object guid (hex, e.g.
         /// `f11002771500069d`) instead of a unit -- a lock-opening probe for
         /// `foss-wow#141`, which candidate "Opening" spell (of several in
@@ -1689,6 +1706,7 @@ fn main() -> Result<()> {
             spells,
             cast,
             cast_self,
+            cancel_aura,
             cast_at_object,
             port,
             timeout,
@@ -1790,6 +1808,7 @@ fn main() -> Result<()> {
                 spells: *spells,
                 cast: *cast,
                 cast_self: *cast_self,
+                cancel_aura: *cancel_aura,
                 cast_at_object: *cast_at_object,
                 host,
                 port: *port,
@@ -2018,6 +2037,7 @@ struct WorldRequest<'a> {
     spells: bool,
     cast: Option<u32>,
     cast_self: bool,
+    cancel_aura: Option<u32>,
     cast_at_object: Option<u64>,
     locale: &'a str,
     timeout: u64,
@@ -2173,6 +2193,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         spells,
         cast,
         cast_self,
+        cancel_aura,
         cast_at_object,
         locale,
         data,
@@ -2820,6 +2841,14 @@ nothing replicated matches {wanted:?}"),
 
         if spells {
             report_spells(&state);
+        }
+
+        // **Before `--cast`, deliberately**, so one run can switch a toggle off
+        // and then turn it back on -- which is the sequence that shows the
+        // fields moving in both directions, and a direction that only ever goes
+        // one way is half a measurement.
+        if let Some(spell_id) = cancel_aura {
+            cancel_own_aura(&mut connection, &mut state, character.guid, spell_id)?;
         }
 
         if let (Some(spell_id), None) = (cast, cast_at_object) {
@@ -3782,11 +3811,34 @@ spellbook: {} spell(s), {} cooldown(s)",
     for chunk in ids.chunks(12) {
         println!("  {}", chunk.join(" "));
     }
+    // **Both numbers, because they routinely disagree and the disagreement is
+    // the server's.** The count is written before a loop that skips entries,
+    // so "5 announced, 1 present" is the ordinary case rather than a symptom;
+    // a line printing only the entries would make that invisible, and a
+    // parser that trusted the count would fail the whole spellbook.
+    if book.cooldowns.len() != book.cooldowns_announced as usize {
+        println!(
+            "  {} cooldown entr(ies) present, {} announced -- the server skips entries \
+             after writing the count",
+            book.cooldowns.len(),
+            book.cooldowns_announced,
+        );
+    }
     for cooldown in &book.cooldowns {
-        // `second` rather than a named field: this list's entry width is
-        // confirmed against a live realm, but what its second word actually
-        // measures is not -- see `SpellCooldown`'s doc comment.
-        println!("  cooldown: spell {}, second word {}", cooldown.spell_id, cooldown.second);
+        println!(
+            "  cooldown: spell {}, {} (own {}, category {} via {})",
+            cooldown.spell_id,
+            match cooldown.remaining_ms() {
+                // Named rather than printed as a number: `2147483648ms` is
+                // what this looks like when it is believed, and it reads as a
+                // plausible if odd duration rather than as a marker.
+                None => "indefinite -- a toggle that is currently on".to_string(),
+                Some(ms) => format!("{ms}ms left"),
+            },
+            cooldown.cooldown_ms,
+            cooldown.category_cooldown_ms,
+            cooldown.category,
+        );
     }
 }
 
@@ -4426,6 +4478,68 @@ fn report_unit_fields(state: &world::WorldState, own_guid: u64) {
 /// A survey that printed only the stealthed units could not tell "nobody is
 /// hiding" from "the creep bit is never read", which are the two answers this
 /// exists to separate.
+/// Drops one aura from our own character and reports what the state fields did.
+///
+/// **A silent send confirmed by consequence, and the consequence is the
+/// report.** Nothing acknowledges `CMSG_CANCEL_AURA` -- the server's handler
+/// returns quietly from every refusal it has -- so this prints the three state
+/// fields before and after and names which of them moved. A spell id naming an
+/// aura the character does not hold moves none of them, which is a different
+/// printout rather than a fainter version of the same one.
+///
+/// Every opcode that arrives in the window is printed too, decoded or not.
+/// This whole investigation started because four `CMSG_CAST_SPELL` sends drew
+/// *no opcode of any number*, and that is only visible from a loop that says so.
+fn cancel_own_aura(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    spell_id: u32,
+) -> Result<()> {
+    use world::update::fields;
+
+    let watched = [
+        ("UNIT_BYTES_1", fields::UNIT_BYTES_1),
+        ("UNIT_BYTES_2", fields::UNIT_BYTES_2),
+        ("UNIT_DISPLAY_ID", fields::UNIT_DISPLAY_ID),
+    ];
+    let snapshot = |state: &world::WorldState| -> Vec<Option<u32>> {
+        let entity = state.get(own_guid);
+        watched
+            .iter()
+            .map(|(_, index)| entity.and_then(|e| e.fields.get(*index)))
+            .collect()
+    };
+
+    let before = snapshot(state);
+    println!("\ncancelling aura {spell_id}");
+    connection.cancel_aura(spell_id)?;
+
+    // Give the server time to act before concluding it ignored us -- a single
+    // packet sent immediately before a read is often never processed.
+    let packets = connection.drain(std::time::Duration::from_millis(2000), 128)?;
+    state.replicate(&packets, None);
+    dump_unexpected(&packets, "after CMSG_CANCEL_AURA");
+
+    let after = snapshot(state);
+    let mut moved = 0;
+    for (index, (name, _)) in watched.iter().enumerate() {
+        if before[index] != after[index] {
+            moved += 1;
+            println!(
+                "  {name}: {:?} -> {:?}",
+                before[index].map(|v| format!("{v:#010x}")),
+                after[index].map(|v| format!("{v:#010x}")),
+            );
+        }
+    }
+    // Both numbers, always. A line that appeared only when something moved
+    // could not tell "the aura was not held" from "the send was ignored".
+    println!("  {moved} of {} watched field(s) moved", watched.len());
+    report_states(state, own_guid);
+    Ok(())
+}
+
 fn report_states(state: &world::WorldState, own_guid: u64) {
     // Named here rather than in `world::state`, where only the two forms this
     // project has actually watched arrive are named. A probe may say "form 5"
@@ -4463,6 +4577,37 @@ fn report_states(state: &world::WorldState, own_guid: u64) {
         ),
         None => println!("  own object not replicated"),
     }
+    // **Printed beside the states because they answer different halves of one
+    // question.** The fields say the character is stealthed; only the aura
+    // list says which spell to hand `CMSG_CANCEL_AURA` to switch it off. A run
+    // where the first is set and the second is empty is a real and specific
+    // failure -- the toggle would be stuck on -- and it is invisible unless
+    // both are on screen together.
+    let own_auras = state.auras.get(&own_guid);
+    let held: Vec<String> = own_auras
+        .map(|auras| {
+            let mut rows: Vec<&world::aura::Aura> = auras.values().collect();
+            rows.sort_by_key(|aura| aura.slot);
+            rows.iter()
+                .map(|aura| {
+                    format!(
+                        "slot {} spell {}{}",
+                        aura.slot,
+                        aura.spell_id,
+                        match aura.duration {
+                            Some((max, left)) => format!(" ({left}/{max}ms)"),
+                            None => String::new(),
+                        }
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    println!("  own auras: {}", if held.is_empty() {
+        "none".to_string()
+    } else {
+        held.join(", ")
+    });
 
     let others: Vec<&world::state::Entity> = state
         .iter()

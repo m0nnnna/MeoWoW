@@ -9,6 +9,7 @@
 //! GPL server implementation -- see `docs/REUSE-POLICY.md`.
 
 pub mod auction;
+pub mod aura;
 pub mod chat;
 pub mod combat;
 pub mod client;

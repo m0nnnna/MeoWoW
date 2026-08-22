@@ -106,6 +106,26 @@ pub enum ClientOpcode {
     /// in turn moves that byte to the matching value and back.
     SetSheathed = 0x01E0,
 
+    /// Drop an aura this character is carrying: one `u32`, the spell id.
+    ///
+    /// **This is how a toggle is switched off, and re-casting is not.** Stealth
+    /// looked like it should toggle -- press it again and stand up -- and
+    /// `CMSG_CAST_SPELL` for a spell whose aura you already hold produces
+    /// *nothing*: four attempts in one session drew no `SMSG_CAST_FAILED`, no
+    /// `SMSG_SPELL_START`, and no opcode of any number. A silence with no
+    /// refusal in it is the server declining before it has anything to say,
+    /// and it is why the printout that lists every opcode seen was what
+    /// identified this rather than a guess about the cast path.
+    ///
+    /// Nothing acknowledges the send -- every path in the server's handler
+    /// returns silently, including the two that matter here (a spell with
+    /// `SPELL_ATTR0_NO_AURA_CANCEL`, and any aura that is passive or not
+    /// positive). Confirmed by consequence instead, the way `SetSheathed` was:
+    /// the stealth bit in `UNIT_FIELD_BYTES_1` and the form byte in
+    /// `UNIT_FIELD_BYTES_2` both clear in the next object update, and they
+    /// clear only when the spell id names an aura actually held.
+    CancelAura = 0x0136,
+
     /// Wear the item in a given inventory slot, letting the server choose
     /// which equipment slot it belongs in.
     ///
@@ -1363,6 +1383,27 @@ pub mod server {
     pub const SPELL_START: u16 = 0x0131;
     pub const SPELL_GO: u16 = 0x0132;
     pub const SPELL_COOLDOWN: u16 = 0x0134;
+
+    /// Everything sitting on one unit, replacing whatever was known about it.
+    /// See [`crate::aura`].
+    ///
+    /// **Both aura opcodes arrived in every capture this project has ever
+    /// taken and were logged as bare numbers for six milestones** -- 56 of
+    /// them in one eight-second window. That is the instrument working:
+    /// "printed every opcode seen, decoded or not" is what made them findable
+    /// the moment there was a reason to want them, rather than a discovery
+    /// that they existed at all.
+    pub const AURA_UPDATE_ALL: u16 = 0x0495;
+
+    /// One slot on one unit, amending rather than replacing. A `spell id` of
+    /// zero empties the slot.
+    ///
+    /// **The number is one higher than `_ALL`, which is the wrong way round
+    /// from the names** -- `SMSG_AURA_UPDATE_ALL` is `0x0495` and
+    /// `SMSG_AURA_UPDATE` is `0x0496`. Worth stating because the opcode is the
+    /// only thing that separates two byte-identical bodies, and swapping them
+    /// makes a single-slot update erase every other aura the unit has.
+    pub const AURA_UPDATE: u16 = 0x0496;
 
     /// Melee. All three arrived in one capture of a level-one warrior fighting
     /// a wolf, and each is named for what its body turned out to hold rather
