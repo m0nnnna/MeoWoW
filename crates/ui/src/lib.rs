@@ -4284,6 +4284,8 @@ mod tests {
                 .join("\n"),
             objectives: vec!["Speak with Marshal McBride.".into()],
             rewards: vec!["item 2224 x1".into()],
+            reward_choices: Vec::new(),
+            selected_reward: 0,
             action: frames::QuestgiverAction::Accept,
         };
         let map = map_view();
@@ -4347,6 +4349,8 @@ mod tests {
                 .join("\n"),
             objectives: vec!["Speak with Marshal McBride.".into()],
             rewards: vec!["item 2224 x1".into()],
+            reward_choices: Vec::new(),
+            selected_reward: 0,
             action: frames::QuestgiverAction::Accept,
         };
         let map = map_view();
@@ -4475,6 +4479,8 @@ mod tests {
             body: "Speak with Marshal McBride.".into(),
             objectives: Vec::new(),
             rewards: Vec::new(),
+            reward_choices: Vec::new(),
+            selected_reward: 0,
             action: frames::QuestgiverAction::Accept,
         };
         let data = HudData {
@@ -4521,6 +4527,8 @@ mod tests {
             body: "Speak with Marshal McBride.".into(),
             objectives: Vec::new(),
             rewards: Vec::new(),
+            reward_choices: Vec::new(),
+            selected_reward: 0,
             action: frames::QuestgiverAction::Accept,
         };
         let mut hud = Hud::default();

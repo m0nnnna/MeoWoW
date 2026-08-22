@@ -95,7 +95,18 @@ pub enum QuestgiverView {
         /// One line per objective, already rendered by the caller -- this
         /// crate knows nothing about creature ids or item entries.
         objectives: Vec<String>,
+        /// Rewards the quest gives unconditionally.
         rewards: Vec<String>,
+        /// Optional rewards, of which exactly one is taken -- empty for a
+        /// quest offering none. Choosing among these is what
+        /// `foss-wow#141`'s predecessor ticket asked for: this window used
+        /// to hand over `reward_choices[0]` unconditionally, silently
+        /// wrong for any quest with more than one.
+        reward_choices: Vec<String>,
+        /// Which of `reward_choices` is currently picked. Meaningless when
+        /// `reward_choices` is empty; the caller is responsible for keeping
+        /// it a valid index otherwise (see [`QuestgiverClick::chosen_reward`]).
+        selected_reward: usize,
         action: QuestgiverAction,
     },
 }
@@ -108,6 +119,11 @@ pub struct QuestgiverClick {
     /// A speech option was chosen, by the **server's own option id** --
     /// never a row position. See [`QuestgiverOption::index`].
     pub chosen_option: Option<u32>,
+    /// A reward-choice row was clicked, by index into
+    /// [`QuestgiverView::Quest::reward_choices`] -- a row position rather
+    /// than a server id, because unlike a gossip option or a quest row this
+    /// list is never filtered: the caller sent every choice the quest has.
+    pub chosen_reward: Option<usize>,
     /// The action button was pressed for this quest.
     pub acted: Option<u32>,
     /// The window was dismissed.
@@ -168,23 +184,45 @@ fn wrap(text: &str, style: &Style, scale: f32) -> Vec<String> {
 /// Every line the window will draw, in order, so the size and the painter
 /// cannot disagree about how many there are.
 fn body_lines(view: &QuestgiverView, style: &Style, scale: f32) -> Vec<String> {
+    body_lines_and_choice_range(view, style, scale).0
+}
+
+/// [`body_lines`], plus where the reward-choice rows sit within it -- a
+/// `(start, count)` pair, or `None` when there is nothing to choose.
+///
+/// **One function for both**, rather than two that have to agree on where
+/// wrapped body text and a variable-length objective list push the choice
+/// section down. `click_at` reads the range; `body_lines` (and so `size` and
+/// `draw`, which both call it) reads the lines -- the same reasoning
+/// [`row_rects`] and [`button_rects`] already apply to fixed geometry,
+/// extended to a section whose offset depends on how much text precedes it.
+fn body_lines_and_choice_range(
+    view: &QuestgiverView,
+    style: &Style,
+    scale: f32,
+) -> (Vec<String>, Option<(usize, usize)>) {
     match view {
-        QuestgiverView::List { options, quests, .. } => options
-            .iter()
-            .map(|option| option.message.clone())
-            .chain(quests.iter().map(|row| {
-                let prefix = if row.turn_in { "? " } else { "! " };
-                if row.level > 0 {
-                    format!("{prefix}[{}] {}", row.level, row.title)
-                } else {
-                    format!("{prefix}{}", row.title)
-                }
-            }))
-            .collect(),
+        QuestgiverView::List { options, quests, .. } => (
+            options
+                .iter()
+                .map(|option| option.message.clone())
+                .chain(quests.iter().map(|row| {
+                    let prefix = if row.turn_in { "? " } else { "! " };
+                    if row.level > 0 {
+                        format!("{prefix}[{}] {}", row.level, row.title)
+                    } else {
+                        format!("{prefix}{}", row.title)
+                    }
+                }))
+                .collect(),
+            None,
+        ),
         QuestgiverView::Quest {
             body,
             objectives,
             rewards,
+            reward_choices,
+            selected_reward,
             action,
             ..
         } => {
@@ -203,6 +241,23 @@ fn body_lines(view: &QuestgiverView, style: &Style, scale: f32) -> Vec<String> {
                     lines.extend(wrap(&format!("- {reward}"), style, scale));
                 }
             }
+            // **One line per choice, never wrapped.** An id-only string
+            // ("item 1234 x1") never approaches the wrap width, and a
+            // clickable row needs to stay exactly one line so its
+            // rectangle -- from `row_rects`, the same function `List` uses
+            // -- lands on the row it names rather than on half of it.
+            let choice_range = if reward_choices.is_empty() {
+                None
+            } else {
+                lines.push(String::new());
+                lines.push("Choose one:".into());
+                let start = lines.len();
+                for (index, choice) in reward_choices.iter().enumerate() {
+                    let marker = if index == *selected_reward { ">" } else { " " };
+                    lines.push(format!("{marker} {choice}"));
+                }
+                Some((start, reward_choices.len()))
+            };
             // **Said out loud rather than left as a blank window.** A player
             // looking at an empty box cannot tell a quest with no text from a
             // client that is still asking.
@@ -213,7 +268,7 @@ fn body_lines(view: &QuestgiverView, style: &Style, scale: f32) -> Vec<String> {
                 lines.push(String::new());
                 lines.push("You are not finished yet.".into());
             }
-            lines
+            (lines, choice_range)
         }
     }
 }
@@ -323,6 +378,19 @@ pub fn click_at(
             }
         }
         QuestgiverView::Quest { id, action, .. } => {
+            // Checked before the buttons: the choice rows sit in the body,
+            // the buttons at the bottom, and the two never overlap, but a
+            // reward still has to be pickable before the window has decided
+            // whether `Complete` even has a label yet.
+            if let (_, Some((start, count))) = body_lines_and_choice_range(view, style, scale) {
+                if let Some(row) = row_rects(rect, start + count, style, scale)
+                    .get(start..)
+                    .and_then(|rows| rows.iter().position(|row| row.contains(point)))
+                {
+                    click.chosen_reward = Some(row);
+                    return click;
+                }
+            }
             if action.label().is_none() {
                 if close_only_rect(rect, style, scale).contains(point) {
                     click.closed = true;
@@ -421,6 +489,8 @@ pub fn placeholder() -> QuestgiverView {
             .into(),
         objectives: vec!["Speak with Marshal McBride.".into()],
         rewards: Vec::new(),
+        reward_choices: Vec::new(),
+        selected_reward: 0,
         action: QuestgiverAction::Accept,
     }
 }
@@ -436,6 +506,8 @@ mod tests {
             body: "Some text.".into(),
             objectives: vec!["Speak with Marshal McBride.".into()],
             rewards: Vec::new(),
+            reward_choices: Vec::new(),
+            selected_reward: 0,
             action,
         }
     }
@@ -487,6 +559,8 @@ mod tests {
             body: String::new(),
             objectives: Vec::new(),
             rewards: Vec::new(),
+            reward_choices: Vec::new(),
+            selected_reward: 0,
             action: QuestgiverAction::Waiting,
         };
         assert_eq!(QuestgiverAction::Waiting.label(), None);
@@ -639,5 +713,86 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line.contains("First.")));
         assert!(lines.iter().any(|line| line.contains("Second.")));
+    }
+
+    fn quest_with_choices(choices: &[&str], selected_reward: usize) -> QuestgiverView {
+        let QuestgiverView::Quest {
+            id,
+            title,
+            body,
+            objectives,
+            rewards,
+            action,
+            ..
+        } = quest(QuestgiverAction::Complete)
+        else {
+            unreachable!()
+        };
+        QuestgiverView::Quest {
+            id,
+            title,
+            body,
+            objectives,
+            rewards,
+            reward_choices: choices.iter().map(|s| s.to_string()).collect(),
+            selected_reward,
+            action,
+        }
+    }
+
+    /// **`foss-wow#141`'s predecessor ticket: this window had no way to say
+    /// which reward the player wanted at all**, so `Complete` always sent
+    /// index `0`. A row reports its **position** in `reward_choices`, not a
+    /// server id -- unlike a gossip option or a quest row, this list is
+    /// never filtered, so a position is exactly what the caller needs to
+    /// send back.
+    #[test]
+    fn picking_a_reward_choice_reports_its_row_position() {
+        let style = Style::default();
+        let view = quest_with_choices(&["item 159 x1", "item 2589 x1"], 0);
+        let rect = Rect::from_min_size(Pos2::ZERO, size(&view, &style, 1.0));
+        let Some((start, count)) = body_lines_and_choice_range(&view, &style, 1.0).1 else {
+            panic!("expected a choice range");
+        };
+        assert_eq!(count, 2);
+        let rows = row_rects(rect, start + count, &style, 1.0);
+        assert_eq!(
+            click_at(rect, &view, &style, 1.0, rows[start].center()).chosen_reward,
+            Some(0)
+        );
+        assert_eq!(
+            click_at(rect, &view, &style, 1.0, rows[start + 1].center()).chosen_reward,
+            Some(1)
+        );
+        // A click on the action button is still the action button, not a
+        // stray third reward row -- the two regions must not bleed together.
+        let (accept, _) = button_rects(rect, &style, 1.0);
+        let accept_click = click_at(rect, &view, &style, 1.0, accept.center());
+        assert_eq!(accept_click.chosen_reward, None);
+        assert_eq!(accept_click.acted, Some(783));
+    }
+
+    /// A quest with nothing to choose between draws no picker at all --
+    /// `reward_choices` empty is a fact about the quest, not a choice with
+    /// one option forced.
+    #[test]
+    fn no_choices_means_no_picker() {
+        let style = Style::default();
+        let view = quest_with_choices(&[], 0);
+        assert_eq!(body_lines_and_choice_range(&view, &style, 1.0).1, None);
+        let lines = body_lines(&view, &style, 1.0).join(" ");
+        assert!(!lines.contains("Choose one"), "{lines}");
+    }
+
+    /// The selected row is marked in the text itself -- this window has no
+    /// other way to show state -- and only the selected one carries it.
+    #[test]
+    fn only_the_selected_reward_is_marked() {
+        let style = Style::default();
+        let view = quest_with_choices(&["item 159 x1", "item 2589 x1"], 1);
+        let lines = body_lines(&view, &style, 1.0);
+        let marked: Vec<_> = lines.iter().filter(|line| line.starts_with('>')).collect();
+        assert_eq!(marked.len(), 1, "{lines:?}");
+        assert!(marked[0].contains("item 2589 x1"), "{marked:?}");
     }
 }

@@ -3971,6 +3971,11 @@ struct Questgiver {
     /// The one quest whose text is on screen, if the player has picked one or
     /// the server volunteered it.
     showing: Option<u32>,
+    /// Which of `showing`'s optional rewards is currently picked, for a
+    /// `Complete` press to send. Reset to `0` every time `showing` changes,
+    /// including to the same quest again -- a stale pick surviving a reopen
+    /// would be a choice the player never actually made this time.
+    selected_reward: usize,
 }
 
 impl Questgiver {
@@ -4002,6 +4007,7 @@ impl Questgiver {
         // the player never got to read.
         if self.options.is_empty() && self.offered.len() == 1 {
             self.showing = self.offered.first().copied();
+            self.selected_reward = 0;
         }
     }
 
@@ -4018,6 +4024,7 @@ impl Questgiver {
             self.offered.push(quest);
         }
         self.showing = Some(quest);
+        self.selected_reward = 0;
     }
 }
 
@@ -8115,6 +8122,8 @@ impl App {
                 body: String::new(),
                 objectives: Vec::new(),
                 rewards: Vec::new(),
+                reward_choices: Vec::new(),
+                selected_reward: 0,
                 action: ui::QuestgiverAction::Waiting,
             });
         };
@@ -8156,6 +8165,21 @@ impl App {
                     (quest.money > 0).then(|| format!("{} copper", quest.money)),
                 )
                 .collect(),
+            // Same reasoning as `rewards`: ids, not names, until `foss-wow#56`
+            // sends `CMSG_ITEM_QUERY_SINGLE`.
+            reward_choices: quest
+                .reward_choices
+                .iter()
+                .map(|reward| format!("item {} x{}", reward.item, reward.count))
+                .collect(),
+            // Clamped rather than trusted: `showing` resets this to `0`
+            // whenever the quest changes, but a quest cache entry that
+            // updates its choice list under an already-open window (an
+            // edge nothing has exercised) must not index past the end of
+            // one that just got shorter.
+            selected_reward: questgiver
+                .selected_reward
+                .min(quest.reward_choices.len().saturating_sub(1)),
             action,
         })
     }
@@ -8233,7 +8257,12 @@ impl App {
         let Some(view) = self.questgiver_view() else {
             return;
         };
-        let ui::QuestgiverView::Quest { action, .. } = view else {
+        let ui::QuestgiverView::Quest {
+            action,
+            selected_reward,
+            ..
+        } = view
+        else {
             return;
         };
         let Some(npc) = self.questgiver.as_ref().map(|giver| giver.npc) else {
@@ -8244,11 +8273,6 @@ impl App {
         };
         let sent = match action {
             ui::QuestgiverAction::Accept => live.connection.accept_quest(npc, quest),
-            // `0` is the reward index. **Correct only where there is nothing
-            // to choose**: a quest offering alternatives needs the player to
-            // pick one, and this window has no way to say which yet -- so a
-            // quest with choices would hand over the first, which is a wrong
-            // answer rather than a missing feature.
             ui::QuestgiverAction::Complete => live.connection.complete_quest(npc, quest),
             // No button was drawn, so this cannot be reached by clicking one.
             ui::QuestgiverAction::Unfinished | ui::QuestgiverAction::Waiting => return,
@@ -8262,8 +8286,16 @@ impl App {
         // *or* with a still-wanted list, and it refuses the choose-reward that
         // follows in the second case -- which is exactly the right outcome,
         // and cheaper than a state machine that waits a frame to find out.
+        //
+        // `selected_reward` is whichever row the player last clicked, `0` by
+        // default -- correct on its own for a quest with nothing to choose
+        // between, and now a real choice rather than a hardcoded one for a
+        // quest that offers several. See `QuestgiverView::Quest::reward_choices`.
         if matches!(action, ui::QuestgiverAction::Complete) {
-            if let Err(e) = live.connection.choose_quest_reward(npc, quest, 0) {
+            if let Err(e) = live
+                .connection
+                .choose_quest_reward(npc, quest, selected_reward as u32)
+            {
                 tracing::warn!("taking quest {quest}'s reward failed: {e:#}");
             }
         }
@@ -8560,6 +8592,7 @@ impl App {
             options: Vec::new(),
             menu_id: 0,
             showing: None,
+            selected_reward: 0,
         });
         // **Cleared before the new one is decided, not overwritten after.**
         // Greeting a plain NPC while a trainer's list is open would otherwise
@@ -12693,13 +12726,16 @@ impl App {
         // from the log alone. Rare -- a press of a button, not a frame event.
         if hud_response.questgiver.picked.is_some()
             || hud_response.questgiver.chosen_option.is_some()
+            || hud_response.questgiver.chosen_reward.is_some()
             || hud_response.questgiver.acted.is_some()
             || hud_response.questgiver.closed
         {
             tracing::info!(
-                "questgiver window: picked {:?}, chosen_option {:?}, acted {:?}, closed {}",
+                "questgiver window: picked {:?}, chosen_option {:?}, chosen_reward {:?}, \
+                 acted {:?}, closed {}",
                 hud_response.questgiver.picked,
                 hud_response.questgiver.chosen_option,
+                hud_response.questgiver.chosen_reward,
                 hud_response.questgiver.acted,
                 hud_response.questgiver.closed
             );
@@ -12707,6 +12743,7 @@ impl App {
         if let Some(quest) = hud_response.questgiver.picked {
             if let Some(questgiver) = self.questgiver.as_mut() {
                 questgiver.showing = Some(quest);
+                questgiver.selected_reward = 0;
             }
             // Ask for the scroll as a real client does, in that order: the
             // server checks at each step that this NPC actually offers the
@@ -12725,6 +12762,15 @@ impl App {
                 (self.questgiver.as_ref(), self.live.as_mut())
             {
                 questgiver.choose_option(live, index);
+            }
+        }
+        // A reward row was clicked. Purely local -- nothing goes out until
+        // `Complete` is pressed, the same way picking a bag slot to move
+        // does not move it -- so this only has to update which row the
+        // window highlights for the next frame.
+        if let Some(index) = hud_response.questgiver.chosen_reward {
+            if let Some(questgiver) = self.questgiver.as_mut() {
+                questgiver.selected_reward = index;
             }
         }
         if let Some(quest) = hud_response.questgiver.acted {
