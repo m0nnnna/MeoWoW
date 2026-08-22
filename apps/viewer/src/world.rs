@@ -1962,14 +1962,21 @@ impl World {
             });
 
             let final_pose = match blend_from.and_then(|(from, elapsed)| {
-                pose_for(&group.model, from).map(|(old, _, _)| (old, elapsed))
+                pose_for(&group.model, from)
+                    .map(|(_, old_sequence, old_time_ms)| (old_sequence, old_time_ms, elapsed))
             }) {
-                // A linear blend of the *matrices* would shear a rotating
-                // bone rather than turn it -- `blend_poses` decomposes each
-                // one first so this crossfades a rotation instead.
-                Some((old, elapsed)) => {
-                    blend_poses(&old, &posed, elapsed as f32 / TRANSITION_BLEND_MS as f32)
-                }
+                // Bone-local translation, rotation and scale are blended
+                // before the parent chain is composed. Blending completed
+                // model-space matrices moves every child independently and
+                // changes limb lengths during the transition.
+                Some((old_sequence, old_time_ms, elapsed)) => blend_poses(
+                    &group.model.bones,
+                    old_sequence,
+                    old_time_ms,
+                    sequence,
+                    time_ms,
+                    elapsed as f32 / TRANSITION_BLEND_MS as f32,
+                ),
                 None => posed,
             };
 
@@ -3361,24 +3368,26 @@ fn bucket_transition(
 
 /// Interpolates two bone palettes, per bone.
 ///
-/// **Decomposed rather than blended as raw matrices.** A linear blend of two
-/// rotation matrices is not itself a rotation -- the result shears rather
-/// than turns, which on a swinging limb reads as the arm briefly deforming
-/// rather than smoothly moving. Translation and scale lerp; rotation slerps.
-fn blend_poses(from: &[Mat4], to: &[Mat4], t: f32) -> Vec<Mat4> {
-    let t = t.clamp(0.0, 1.0);
-    from.iter()
-        .zip(to.iter())
-        .map(|(a, b)| {
-            let (scale_a, rot_a, trans_a) = a.to_scale_rotation_translation();
-            let (scale_b, rot_b, trans_b) = b.to_scale_rotation_translation();
-            Mat4::from_scale_rotation_translation(
-                scale_a.lerp(scale_b, t),
-                rot_a.slerp(rot_b, t),
-                trans_a.lerp(trans_b, t),
-            )
-        })
-        .collect()
+/// **Local transforms rather than completed model-space matrices.** A child
+/// must remain attached to its parent while that parent turns; interpolating
+/// their model-space translations independently shortens or stretches the
+/// chain. Translation and scale lerp; rotation slerps; then parents compose.
+fn blend_poses(
+    bones: &[m2::AnimatedBone],
+    from_sequence: usize,
+    from_time_ms: u32,
+    to_sequence: usize,
+    to_time_ms: u32,
+    t: f32,
+) -> Vec<Mat4> {
+    m2::Model::blend_bones(
+        bones,
+        from_sequence,
+        from_time_ms,
+        to_sequence,
+        to_time_ms,
+        t,
+    )
 }
 
 /// Which of a model's sequences a motion plays, if it has one.
@@ -3554,6 +3563,41 @@ mod tests {
         );
     }
 
+    fn two_key_track<T: Copy>(from: T, to: T) -> m2::anim::Track<T> {
+        m2::anim::Track {
+            interpolation: m2::anim::Interpolation::Linear,
+            global_sequence: None,
+            sequences: vec![
+                m2::anim::Keyframes {
+                    times: vec![0],
+                    values: vec![from],
+                },
+                m2::anim::Keyframes {
+                    times: vec![0],
+                    values: vec![to],
+                },
+            ],
+        }
+    }
+
+    fn animated_bone(from: Mat4, to: Mat4, parent: i16) -> m2::AnimatedBone {
+        let (from_scale, from_rotation, from_translation) =
+            from.to_scale_rotation_translation();
+        let (to_scale, to_rotation, to_translation) = to.to_scale_rotation_translation();
+        m2::AnimatedBone {
+            bone: m2::Bone {
+                key_bone_id: -1,
+                flags: 0,
+                parent,
+                submesh_id: 0,
+                pivot: [0.0; 3],
+            },
+            translation: two_key_track(from_translation, to_translation),
+            rotation: two_key_track(from_rotation, to_rotation),
+            scale: two_key_track(from_scale, to_scale),
+        }
+    }
+
     /// The boundaries of a blend must be exact: a transition's first frame
     /// is entirely the outgoing pose and its last is entirely the incoming
     /// one, or a cycle that never moves would still visibly hitch at the
@@ -3562,8 +3606,9 @@ mod tests {
     fn a_blend_reaches_both_poses_exactly_at_its_ends() {
         let from = vec![Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0))];
         let to = vec![Mat4::from_translation(Vec3::new(10.0, 0.0, 0.0))];
-        assert_eq!(blend_poses(&from, &to, 0.0), from);
-        assert_eq!(blend_poses(&from, &to, 1.0), to);
+        let bones = vec![animated_bone(from[0], to[0], -1)];
+        assert_eq!(blend_poses(&bones, 0, 0, 1, 0, 0.0), from);
+        assert_eq!(blend_poses(&bones, 0, 0, 1, 0, 1.0), to);
     }
 
     /// Translation blends linearly, same as a naive matrix lerp would --
@@ -3573,7 +3618,8 @@ mod tests {
     fn a_blend_halfway_through_is_halfway_between() {
         let from = vec![Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0))];
         let to = vec![Mat4::from_translation(Vec3::new(10.0, 20.0, 0.0))];
-        let mid = blend_poses(&from, &to, 0.5)[0].transform_point3(Vec3::ZERO);
+        let bones = vec![animated_bone(from[0], to[0], -1)];
+        let mid = blend_poses(&bones, 0, 0, 1, 0, 0.5)[0].transform_point3(Vec3::ZERO);
         assert!((mid - Vec3::new(5.0, 10.0, 0.0)).length() < 1e-4, "{mid}");
     }
 
@@ -3587,9 +3633,10 @@ mod tests {
     fn a_blended_rotation_keeps_vectors_the_same_length() {
         let from = vec![Mat4::from_rotation_z(0.0)];
         let to = vec![Mat4::from_rotation_z(std::f32::consts::PI)]; // a half turn
+        let bones = vec![animated_bone(from[0], to[0], -1)];
         let arm = Vec3::new(1.0, 0.0, 0.0);
         for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            let blended = blend_poses(&from, &to, t)[0];
+            let blended = blend_poses(&bones, 0, 0, 1, 0, t)[0];
             let rotated = blended.transform_vector3(arm);
             assert!(
                 (rotated.length() - 1.0).abs() < 1e-4,
@@ -3607,8 +3654,27 @@ mod tests {
     fn an_out_of_range_t_is_clamped() {
         let from = vec![Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0))];
         let to = vec![Mat4::from_translation(Vec3::new(10.0, 0.0, 0.0))];
-        assert_eq!(blend_poses(&from, &to, -1.0), from);
-        assert_eq!(blend_poses(&from, &to, 2.0), to);
+        let bones = vec![animated_bone(from[0], to[0], -1)];
+        assert_eq!(blend_poses(&bones, 0, 0, 1, 0, -1.0), from);
+        assert_eq!(blend_poses(&bones, 0, 0, 1, 0, 2.0), to);
+    }
+
+    #[test]
+    fn a_blended_child_stays_attached_to_its_turning_parent() {
+        let root = animated_bone(
+            Mat4::IDENTITY,
+            Mat4::from_rotation_z(std::f32::consts::PI),
+            -1,
+        );
+        let child = animated_bone(
+            Mat4::from_translation(Vec3::X),
+            Mat4::from_translation(Vec3::X),
+            0,
+        );
+        let pose = blend_poses(&[root, child], 0, 0, 1, 0, 0.5);
+        let root_position = pose[0].transform_point3(Vec3::ZERO);
+        let child_position = pose[1].transform_point3(Vec3::ZERO);
+        assert!((child_position.distance(root_position) - 1.0).abs() < 1e-4);
     }
 
     /// **The bug this whole mechanism exists to prevent, pinned directly.**
