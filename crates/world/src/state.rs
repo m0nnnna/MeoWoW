@@ -1144,6 +1144,9 @@ pub struct Replication {
     pub spell_damage: Vec<crate::combat::SpellDamage>,
     /// `SMSG_POWER_UPDATE`s folded into an entity's fields this batch.
     pub power_updates: usize,
+    /// `SMSG_UPDATE_COMBO_POINTS`s folded into [`WorldState::combo_points`]
+    /// this batch.
+    pub combo_point_updates: usize,
     /// Threat lists that arrived this batch. Returned rather than stored: no
     /// part of the interface reads a threat table yet, and keeping one would
     /// be state with a lifetime to manage and no consumer to justify it.
@@ -1278,6 +1281,12 @@ pub struct WorldState {
     /// rather than sending a stop for itself in every case, and the entry
     /// would otherwise claim forever that a corpse is still attacking.
     pub attacking: HashMap<u64, u64>,
+    /// This character's combo points, as last stated by
+    /// `SMSG_UPDATE_COMBO_POINTS`. `None` before the first one ever arrives --
+    /// a class with no such resource sees nothing on this opcode at all, so
+    /// there is no zero-count packet to distinguish "never had any" from "had
+    /// some and spent them", and this stays absent rather than guess.
+    pub combo_points: Option<crate::combat::ComboPoints>,
     /// A teleport the server is waiting to be told we noticed.
     ///
     /// Stored rather than handed back, and stored as *state* rather than an
@@ -2949,6 +2958,25 @@ impl WorldState {
                 crate::opcode::server::THREAT_UPDATE => {
                     match crate::combat::parse_threat_update(&packet.body) {
                         Ok(threat) => report.threat.push(threat),
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // Replaces whatever was there outright rather than merging --
+                // the server sends the whole state every time it changes, the
+                // same as `SMSG_GROUP_LIST`, so there is no partial update to
+                // get wrong. A count of zero still carries a target rather
+                // than clearing to `None`: the points were just spent or lost,
+                // not the target.
+                crate::opcode::server::UPDATE_COMBO_POINTS => {
+                    match crate::combat::parse_combo_points(&packet.body) {
+                        Ok(combo) => {
+                            report.combo_point_updates += 1;
+                            self.combo_points = Some(combo);
+                        }
                         Err(error) => report.failures.push((
                             packet.opcode,
                             error,

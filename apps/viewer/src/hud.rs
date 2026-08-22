@@ -40,6 +40,10 @@ pub fn unit_view(entity: &::world::state::Entity, name: String) -> ui::UnitView 
         // `false` for anything that is not a player: `is_ghost` reads a
         // field nothing else ever sets.
         ghost: entity.is_ghost(),
+        // Filled in by the caller, which is the only place that knows
+        // whether this snapshot is *the* target frame -- see
+        // `ui::UnitView::combo_points`'s own doc comment.
+        combo_points: None,
     }
 }
 
@@ -80,6 +84,10 @@ pub fn party_target_view(state: &::world::WorldState, guid: u64) -> Option<ui::U
         max_power,
         power_type,
         ghost: member.status & ::world::group::MemberStatus::GHOST != 0,
+        // A party member out of view cannot be the combo target: combo
+        // points are private to the owner and only ever drawn against a
+        // replicated unit, which this frame by definition is not.
+        combo_points: None,
     })
 }
 

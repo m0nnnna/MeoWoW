@@ -1043,7 +1043,12 @@ impl Hud {
             };
 
             let size = match content {
-                Content::Unit(unit) => frames::unit::size(&style, element.scale, unit.has_power()),
+                Content::Unit(unit) => frames::unit::size(
+                    &style,
+                    element.scale,
+                    unit.has_power(),
+                    unit.has_combo_points(),
+                ),
                 Content::Chat(_) => frames::chat::size(&style, element.scale),
                 Content::Bar { .. } => frames::action_bar::size(&style, element.scale),
                 Content::CastBar(_) => frames::cast_bar::size(&style, element.scale),
@@ -2160,7 +2165,9 @@ impl Hud {
                                 data.target
                             };
                             let has_power = unit.map(|u| u.has_power()).unwrap_or(true);
-                            frames::unit::size(&style, scale, has_power)
+                            let has_combo_points =
+                                unit.map(|u| u.has_combo_points()).unwrap_or(false);
+                            frames::unit::size(&style, scale, has_power, has_combo_points)
                         }
                     };
                     (id, size)
@@ -2424,7 +2431,12 @@ mod tests {
             let element = hud.profile.get(ElementId::PlayerFrame);
             element.rect(
                 screen(),
-                frames::unit::size(&hud.profile.style, element.scale, unit.has_power()),
+                frames::unit::size(
+                    &hud.profile.style,
+                    element.scale,
+                    unit.has_power(),
+                    unit.has_combo_points(),
+                ),
             )
         };
 
@@ -5192,7 +5204,7 @@ mod tests {
             ),
             ElementId::PartyInvite => frames::party_invite::size(&profile.style, scale),
             ElementId::PlayerFrame | ElementId::TargetFrame => {
-                frames::unit::size(&profile.style, scale, true)
+                frames::unit::size(&profile.style, scale, true, false)
             }
         }
     }

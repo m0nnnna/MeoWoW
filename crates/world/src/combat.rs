@@ -389,6 +389,44 @@ pub fn describe_spell_damage(
 }
 
 
+/// A rogue's (or a druid's, in cat form) combo points, from
+/// `SMSG_UPDATE_COMBO_POINTS`.
+///
+/// **Private to the owner.** Unlike everything else in this module, this
+/// never describes anybody but the reading player -- there is no field for it
+/// in the ordinary object update, so a combo point count on another character
+/// is simply not observable. The target is carried anyway, because the count
+/// alone cannot say whether it is stacked against whatever this client
+/// currently has selected: switching targets drops it to zero server-side,
+/// and a frame that kept drawing pips through that switch would be showing a
+/// number that is no longer about anything.
+///
+/// **Confirmed live** against the local AzerothCore realm: a fresh level-2
+/// `Diseased Young Wolf` spawned at `Roguetest`'s own feet (`.npc add 299`,
+/// so it would still be alive when the cast landed -- the first two attempts
+/// at this capture picked a wolf already mid-fight with autoattack, and both
+/// died to it before any of four re-faced cast attempts could land, refused
+/// every time with `SPELL_FAILED_BAD_TARGETS` against a corpse). Sinister
+/// Strike (spell 1752) landed for 8 and this opcode arrived in the same
+/// batch as its `SMSG_SPELLNONMELEEDAMAGELOG`, naming the same creature guid
+/// the damage log did and carrying a count of 1 -- the first point of a
+/// fresh combo, which is what a builder landing on an empty combo should
+/// produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComboPoints {
+    /// Who the points are stacked against.
+    pub target: u64,
+    pub count: u8,
+}
+
+pub fn parse_combo_points(body: &[u8]) -> Result<ComboPoints, Error> {
+    let mut r = Reader::new(body, "SMSG_UPDATE_COMBO_POINTS");
+    let target = read_packed_guid(&mut r)?;
+    let count = r.u8()?;
+    r.finish()?;
+    Ok(ComboPoints { target, count })
+}
+
 /// One unit's threat list, from `SMSG_THREAT_UPDATE`.
 ///
 /// The guid is the unit whose list it is -- the *victim* -- and the entries
@@ -809,6 +847,27 @@ mod tests {
             0x00, 0x00,
         ];
         assert!(parse_threat_update(&body).is_err());
+    }
+
+    /// Verbatim from the local AzerothCore realm: `Roguetest`'s Sinister
+    /// Strike landing on a freshly spawned `Diseased Young Wolf`
+    /// (`0xf13000012b0034fb`) for the first point of a fresh combo. See
+    /// [`ComboPoints`]'s own doc comment for how the capture was won away
+    /// from two attempts that only ever saw a corpse.
+    const COMBO_POINTS: &[u8] = &[0xdb, 0xfb, 0x34, 0x2b, 0x01, 0x30, 0xf1, 0x01];
+
+    #[test]
+    fn a_captured_combo_point_update_names_its_target() {
+        let combo = parse_combo_points(COMBO_POINTS).expect("captured live");
+        assert_eq!(combo.target, 0xf130_0001_2b00_34fb, "the wolf just struck");
+        assert_eq!(combo.count, 1, "a builder landing on an empty combo");
+    }
+
+    #[test]
+    fn a_combo_point_update_with_bytes_left_over_is_an_error() {
+        let mut body = COMBO_POINTS.to_vec();
+        body.push(0);
+        assert!(parse_combo_points(&body).is_err());
     }
 
     fn named(guid: u64) -> String {

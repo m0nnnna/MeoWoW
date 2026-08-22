@@ -11044,14 +11044,25 @@ impl App {
         });
         let target = self.target.and_then(|guid| {
             let live = self.live.as_ref()?;
-            match live.state.get(guid) {
+            let mut view = match live.state.get(guid) {
                 Some(entity) => Some(hud::unit_view(entity, hud::unit_name(&live.state, entity))),
                 // Out of visibility range is not out of the group: a party
                 // member's frame falls back to the party packet, and the
                 // target frame agreeing with it is the whole point of
                 // targeting one by clicking their row rather than the world.
                 None => hud::party_target_view(&live.state, guid),
+            };
+            // Combo points name their own target on the wire, so this is the
+            // one place that can tell whether they belong on *this* frame --
+            // switching targets does not clear `WorldState::combo_points`
+            // itself (nothing tells this client to), so a stale count against
+            // whatever was targeted before must not leak onto the new target.
+            if let (Some(view), Some(combo)) = (&mut view, live.state.combo_points) {
+                if combo.target == guid {
+                    view.combo_points = Some(combo.count);
+                }
             }
+            view
         });
 
         // In egui's points rather than physical pixels, for both the marker

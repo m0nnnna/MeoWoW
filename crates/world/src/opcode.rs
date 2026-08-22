@@ -1393,6 +1393,12 @@ pub mod server {
     /// object-update path independently reported -- see
     /// [`crate::update::PowerUpdate`].
     pub const POWER_UPDATE: u16 = 0x0480;
+    /// A rogue's (or a druid's, in cat form) combo points changing: a packed
+    /// guid naming the target they are stacked against, then a `u8` count.
+    /// There is no field for this in the ordinary object update -- combo
+    /// points are private to the owner, so this is the only place they ever
+    /// appear on the wire. See [`crate::combat::parse_combo_points`].
+    pub const UPDATE_COMBO_POINTS: u16 = 0x039D;
     /// Who is on a unit's threat list. See [`crate::combat::ThreatUpdate`].
     /// Damage from a spell rather than a swing. Captured from a Wrath cast at
     /// a Young Nightsaber; see `combat::parse_spell_damage`.

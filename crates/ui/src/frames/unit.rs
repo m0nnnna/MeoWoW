@@ -29,6 +29,19 @@ pub struct UnitView {
     /// Always `false` for anything that is not a player: nothing else in this
     /// protocol ever carries the ghost flag.
     pub ghost: bool,
+    /// A rogue's (or cat-form druid's) combo points stacked against *this*
+    /// unit, `0` to `5`.
+    ///
+    /// **`None` means "not the combo target", not "zero points."** The wire
+    /// carries one combo count for the whole character, naming which unit it
+    /// is stacked against -- so whether *this* frame gets to show it is a
+    /// question the caller has to answer by comparing guids, the same way
+    /// `ghost` is a fact about a specific player rather than something this
+    /// struct can derive from health and power alone. Left `None` on the
+    /// player frame always: points are drawn against a target, never against
+    /// oneself, and a player frame that lit up whenever the target frame did
+    /// would be showing the same fact twice under two different names.
+    pub combo_points: Option<u8>,
 }
 
 impl UnitView {
@@ -48,6 +61,7 @@ impl UnitView {
             max_power: 4_000,
             power_type: PowerType::Mana,
             ghost: false,
+            combo_points: None,
         }
     }
 
@@ -80,7 +94,23 @@ impl UnitView {
     pub fn has_power(&self) -> bool {
         self.max_power > 0
     }
+
+    /// Whether this frame reserves a row for combo point pips.
+    ///
+    /// True whenever [`Self::combo_points`] is `Some`, including `Some(0)`:
+    /// the row's presence says "this is the combo target", and a target with
+    /// none built up yet is still the combo target -- the same distinction
+    /// [`Self::has_power`] draws between a class with no resource and one
+    /// sitting at zero of it.
+    pub fn has_combo_points(&self) -> bool {
+        self.combo_points.is_some()
+    }
 }
+
+/// Combo points cap at five in 3.3.5a -- no talent in this expansion raises
+/// it. A count above that is drawn as a full row rather than trusted, the
+/// same restraint [`UnitView::health_fraction`] applies to overhealing.
+const MAX_COMBO_POINTS: u8 = 5;
 
 /// A bar's fill, guarding the division that a freshly created unit would
 /// otherwise make: a unit whose fields have arrived but whose maximum has not
@@ -92,15 +122,23 @@ fn fraction(value: u32, max: u32) -> f32 {
     (value as f32 / max as f32).clamp(0.0, 1.0)
 }
 
+/// A combo point pip's height, as a fraction of the ordinary bar height --
+/// smaller than a resource bar because five of them sit in a row rather than
+/// carrying a number of their own.
+const COMBO_PIP_HEIGHT_FRACTION: f32 = 0.4;
+
 /// How much room a unit frame wants.
 ///
 /// `scale` multiplies everything, which is only true because the frame is
 /// painted rather than laid out by egui -- see [`super`].
-pub fn size(style: &Style, scale: f32, has_power: bool) -> Vec2 {
+pub fn size(style: &Style, scale: f32, has_power: bool, has_combo_points: bool) -> Vec2 {
     let name_height = style.font_size * 1.3;
     let mut height = style.padding * 2.0 + name_height + style.gap + style.bar_height;
     if has_power {
         height += style.gap + style.bar_height;
+    }
+    if has_combo_points {
+        height += style.gap + style.bar_height * COMBO_PIP_HEIGHT_FRACTION;
     }
     Vec2::new(style.frame_width, height) * scale
 }
@@ -194,6 +232,25 @@ pub fn draw(painter: &Painter, rect: Rect, unit: &UnitView, style: &Style, scale
             unit.max_power,
         );
     }
+
+    if let Some(count) = unit.combo_points {
+        top += bar_height + style.gap * scale;
+        let pip_height = bar_height * COMBO_PIP_HEIGHT_FRACTION;
+        let pip_gap = style.gap * scale;
+        let pip_width =
+            (inner.width() - pip_gap * (MAX_COMBO_POINTS as f32 - 1.0)) / MAX_COMBO_POINTS as f32;
+        let filled: Color32 = style.power_color(crate::style::PowerType::Energy).into();
+        for i in 0..MAX_COMBO_POINTS {
+            let left = inner.left() + i as f32 * (pip_width + pip_gap);
+            let pip = Rect::from_min_size(Pos2::new(left, top), Vec2::new(pip_width, pip_height));
+            let fill = if i < count.min(MAX_COMBO_POINTS) {
+                filled
+            } else {
+                style.bar_backdrop.into()
+            };
+            painter.rect_filled(pip, corner_radius(style.corner * scale * 0.25), fill);
+        }
+    }
 }
 
 /// One filled bar with its numbers.
@@ -258,6 +315,7 @@ mod dead_tests {
             max_power: 0,
             power_type: PowerType::Mana,
             ghost: false,
+            combo_points: None,
         }
     }
 
@@ -287,7 +345,7 @@ mod dead_tests {
             };
             let output = ctx.run_ui(input, |ctx| {
                 let painter = ctx.layer_painter(egui::LayerId::background());
-                let rect = Rect::from_min_size(Pos2::ZERO, size(&style, 1.0, false));
+                let rect = Rect::from_min_size(Pos2::ZERO, size(&style, 1.0, false, false));
                 draw(&painter, rect, unit, &style, 1.0);
             });
             let rendered = format!("{:?}", output.shapes);
@@ -343,6 +401,7 @@ mod tests {
             max_power: 100,
             power_type: PowerType::Mana,
             ghost: false,
+            combo_points: None,
         }
     }
 
@@ -379,8 +438,8 @@ mod tests {
     #[test]
     fn scale_multiplies_every_dimension() {
         let style = Style::default();
-        let single = size(&style, 1.0, true);
-        let double = size(&style, 2.0, true);
+        let single = size(&style, 1.0, true, false);
+        let double = size(&style, 2.0, true, false);
         assert_eq!(double, single * 2.0);
     }
 
@@ -389,10 +448,65 @@ mod tests {
     #[test]
     fn a_unit_without_power_gets_a_shorter_frame() {
         let style = Style::default();
-        let with = size(&style, 1.0, true);
-        let without = size(&style, 1.0, false);
+        let with = size(&style, 1.0, true, false);
+        let without = size(&style, 1.0, false, false);
         assert!(without.y < with.y);
         assert_eq!(without.x, with.x);
         assert_eq!(with.y - without.y, style.gap + style.bar_height);
+    }
+
+    /// A target carrying combo points gets a taller frame still, for the pip
+    /// row -- the same shape as the power-bar test above, one field over.
+    #[test]
+    fn a_combo_target_gets_a_taller_frame() {
+        let style = Style::default();
+        let without = size(&style, 1.0, true, false);
+        let with = size(&style, 1.0, true, true);
+        assert!(with.y > without.y);
+        assert_eq!(with.x, without.x);
+    }
+
+    /// The pip row itself has to reach the screen, not just the size
+    /// reservation -- the same distinction `a_dead_unit_is_drawn_differently`
+    /// draws for the health bar.
+    #[test]
+    fn combo_points_change_what_is_painted() {
+        fn painted(view: &UnitView) -> String {
+            let ctx = egui::Context::default();
+            let style = Style::default();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0))),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                let rect = Rect::from_min_size(
+                    Pos2::ZERO,
+                    size(&style, 1.0, true, view.has_combo_points()),
+                );
+                draw(&painter, rect, view, &style, 1.0);
+            });
+            let rendered = format!("{:?}", output.shapes);
+            output.drop_without_applying_deltas();
+            rendered
+        }
+
+        let none = UnitView {
+            combo_points: None,
+            ..unit()
+        };
+        let zero = UnitView {
+            combo_points: Some(0),
+            ..unit()
+        };
+        let three = UnitView {
+            combo_points: Some(3),
+            ..unit()
+        };
+        let none = painted(&none);
+        let zero = painted(&zero);
+        let three = painted(&three);
+        assert_ne!(none, zero, "a combo target with none built up still draws its row");
+        assert_ne!(zero, three, "3 of 5 pips must look different from none filled");
     }
 }
