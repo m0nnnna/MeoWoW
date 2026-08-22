@@ -761,6 +761,58 @@ impl Model {
         out
     }
 
+    /// Crossfades two sampled skeletons before composing their parent chains.
+    pub fn blend_bones(
+        bones: &[AnimatedBone],
+        from_sequence: usize,
+        from_time_ms: u32,
+        to_sequence: usize,
+        to_time_ms: u32,
+        t: f32,
+    ) -> Pose {
+        let t = t.clamp(0.0, 1.0);
+        let mut out = vec![Mat4::IDENTITY; bones.len()];
+        for &i in &bone_order(bones) {
+            let b = &bones[i];
+            let from_translation = b
+                .translation
+                .sample(from_sequence, from_time_ms)
+                .unwrap_or(Vec3::ZERO);
+            let from_rotation = b
+                .rotation
+                .sample(from_sequence, from_time_ms)
+                .unwrap_or(Quat::IDENTITY);
+            let from_scale = b
+                .scale
+                .sample(from_sequence, from_time_ms)
+                .unwrap_or(Vec3::ONE);
+            let to_translation = b
+                .translation
+                .sample(to_sequence, to_time_ms)
+                .unwrap_or(Vec3::ZERO);
+            let to_rotation = b
+                .rotation
+                .sample(to_sequence, to_time_ms)
+                .unwrap_or(Quat::IDENTITY);
+            let to_scale = b
+                .scale
+                .sample(to_sequence, to_time_ms)
+                .unwrap_or(Vec3::ONE);
+
+            let local = anim::local_transform(
+                Vec3::from(b.bone.pivot),
+                from_translation.lerp(to_translation, t),
+                from_rotation.slerp(to_rotation, t),
+                from_scale.lerp(to_scale, t),
+            );
+            out[i] = match usize::try_from(b.bone.parent) {
+                Ok(parent) if parent < bones.len() => out[parent] * local,
+                _ => local,
+            };
+        }
+        out
+    }
+
     fn u16_table(&self, what: &'static str, array: Array) -> Vec<u16> {
         self.slice(what, array, 2)
             .map(|raw| {
