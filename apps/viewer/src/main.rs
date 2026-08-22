@@ -4711,8 +4711,9 @@ impl App {
     /// at all, and `LoadOp::Load` over an unwritten surface is whatever the
     /// driver last had there -- which is to say a panel floating over
     /// garbage, intermittently, on some machines and not others.
-    fn paint_sign_in(&mut self, output: egui::FullOutput) {
+    fn paint_sign_in(&mut self, mut output: egui::FullOutput) {
         let Some(r) = self.renderer.as_mut() else {
+            output.textures_delta.clear();
             return;
         };
         use wgpu::CurrentSurfaceTexture as Acquired;
@@ -4724,11 +4725,16 @@ impl App {
             }
             Acquired::Lost | Acquired::Outdated => {
                 r.surface.configure(&r.gpu.device, &r.config);
+                output.textures_delta.clear();
                 return;
             }
-            Acquired::Timeout | Acquired::Occluded => return,
+            Acquired::Timeout | Acquired::Occluded => {
+                output.textures_delta.clear();
+                return;
+            }
             Acquired::Validation => {
                 tracing::error!("surface validation error while acquiring a frame");
+                output.textures_delta.clear();
                 return;
             }
         };
@@ -4788,6 +4794,7 @@ impl App {
         }
         r.gpu.queue.submit([encoder.finish()]);
         r.gpu.queue.present(frame);
+        output.textures_delta.clear();
     }
 }
 
@@ -5657,7 +5664,7 @@ impl App {
             return;
         }
 
-        let ui_output = self.build_ui(window);
+        let mut ui_output = self.build_ui(window);
         let camera = self.camera;
 
         // Movement integrates real elapsed time, so travel speed does not
@@ -5702,6 +5709,7 @@ impl App {
         self.update_sound();
 
         let Some(r) = self.renderer.as_mut() else {
+            ui_output.textures_delta.clear();
             return;
         };
 
@@ -5907,11 +5915,16 @@ impl App {
             // Routine on resize and display changes: reconfigure, skip a frame.
             Acquired::Lost | Acquired::Outdated => {
                 r.surface.configure(&r.gpu.device, &r.config);
+                ui_output.textures_delta.clear();
                 return;
             }
-            Acquired::Timeout | Acquired::Occluded => return,
+            Acquired::Timeout | Acquired::Occluded => {
+                ui_output.textures_delta.clear();
+                return;
+            }
             Acquired::Validation => {
                 tracing::error!("surface validation error while acquiring a frame");
+                ui_output.textures_delta.clear();
                 return;
             }
         };
@@ -6030,6 +6043,7 @@ impl App {
 
         r.gpu.queue.submit([encoder.finish()]);
         r.gpu.queue.present(frame);
+        ui_output.textures_delta.clear();
     }
 
     /// Turns and walks the live character from held keys, sending whatever the
