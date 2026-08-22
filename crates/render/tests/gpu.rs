@@ -215,6 +215,134 @@ fn render_pair(gpu: &Gpu, first_z: f32, second_z: f32) -> [u8; 4] {
     centre_pixel(&pixels, w, h)
 }
 
+/// Renders one quad of `colour` through `state` with a per-instance `tint`
+/// over a black background, and returns the centre pixel.
+fn render_tinted(gpu: &Gpu, colour: [u8; 4], tint: [f32; 4], state: RenderState) -> [u8; 4] {
+    let (w, h) = (64u32, 64u32);
+    let target = Offscreen::new(gpu, w, h, FORMAT);
+    let depth = DepthBuffer::new(gpu, w, h);
+    let mut meshes = MeshRenderer::new(gpu, FORMAT);
+
+    meshes.prepare(gpu, [state]);
+    meshes.update_camera(gpu, &identity_camera());
+    let bones = bones_with(gpu, &meshes, &[glam::Mat4::IDENTITY]);
+    let instances = InstanceBuffer::upload(
+        gpu,
+        &[Instance::tinted(
+            glam::Mat4::IDENTITY.to_cols_array_2d(),
+            tint,
+        )],
+    );
+
+    let mesh = GpuMesh::upload(gpu, &quad(0.5), &[0, 1, 2]);
+    let material = meshes.material_bind_group(gpu, &solid(gpu, colour));
+
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            multiview_mask: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(meshes.get(state).expect("pipeline"));
+        pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
+        pass.set_bind_group(1, &material, &[]);
+        pass.set_bind_group(2, &bones.bind_group, &[]);
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_vertex_buffer(1, instances.buffer.slice(..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..3, 0, 0..1);
+    }
+    gpu.queue.submit([encoder.finish()]);
+
+    let pixels = target.read_rgba(gpu).expect("readback");
+    centre_pixel(&pixels, w, h)
+}
+
+/// A per-instance tint reaches the fragment shader, and its alpha only means
+/// something through a blended pipeline.
+///
+/// **Both halves, because each passes while the other is broken and the
+/// feature needs both.** Every other test in this file draws with
+/// `Instance::IDENTITY`, whose tint is opaque white -- so a tint attribute
+/// wired to the wrong location, or dropped between the stages, would leave all
+/// of them green and this one red. And an alpha handed to an *opaque* pipeline
+/// is discarded, which is what makes a faded model draw at full strength: the
+/// bug that reads as the whole feature not being implemented.
+#[test]
+fn a_per_instance_tint_multiplies_the_texture() {
+    let gpu = require_gpu!();
+
+    let opaque = RenderState {
+        blend: BlendMode::Opaque,
+        two_sided: true,
+        depth_write: true,
+        winding: Winding::Clockwise,
+    };
+
+    // **Ordered, not exact.** The target is an sRGB format, so a tint of 0.5
+    // arrives as 188 rather than 128 -- the encoding curve, applied after the
+    // multiply, exactly as it is for every other colour this renderer
+    // produces. Pinning the number would be asserting the curve; what the
+    // tint has to do is *reduce*, monotonically, and reach black at zero.
+    let white = [255, 255, 255, 255];
+    let full = render_tinted(&gpu, white, [1.0, 1.0, 1.0, 1.0], opaque);
+    let half = render_tinted(&gpu, white, [0.5, 0.0, 0.0, 1.0], opaque);
+    let none = render_tinted(&gpu, white, [0.0, 0.0, 0.0, 1.0], opaque);
+    assert!(
+        none[0] < half[0] && half[0] < full[0],
+        "the tint does not scale the channel: {none:?} < {half:?} < {full:?}"
+    );
+    assert!(
+        half[1] < 20 && half[2] < 20,
+        "a red-only tint must zero the other channels, got {half:?}"
+    );
+
+    // Alpha through an opaque pipeline: discarded, and that is correct.
+    let px = render_tinted(&gpu, white, [1.0, 1.0, 1.0, 0.25], opaque);
+    assert_eq!(
+        px[0], full[0],
+        "an opaque pipeline must ignore the tint's alpha, got {px:?}"
+    );
+
+    // The same alpha through a blended one, over a black clear: visibly
+    // darker, because now the alpha reaches the blend.
+    let blended = render_tinted(
+        &gpu,
+        white,
+        [1.0, 1.0, 1.0, 0.25],
+        RenderState {
+            blend: BlendMode::Blend,
+            depth_write: false,
+            ..opaque
+        },
+    );
+    assert!(
+        blended[0] < full[0] - 40,
+        "a quarter-alpha tint should blend towards the background, got {blended:?}"
+    );
+}
+
 /// Nearer geometry must win regardless of draw order. Getting the depth
 /// comparison or the clip-space Z direction backwards passes one of these two
 /// cases and fails the other, which is why both are checked.

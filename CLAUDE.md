@@ -93,6 +93,7 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | World | Day/night from `Light.dbc`, a real sky gradient, sun and moon, weather that falls, game objects drawn. **A star dome, a cloud band and the zone skybox `LightSkybox` names** — which on Azeroth and Kalimdor is none, measured. No moon texture, one cloud layer |
 | Shadows | **A directional shadow map from the sun**, cast by terrain, models and alpha-keyed foliage, received by everything but liquid. One cascade around the camera; `--no-shadows` and `--shadow-dump` are the instruments |
 | Appearance | NPCs, other players and the viewer's own character are all dressed from their replicated fields. Weapons draw and sheathe. No shoulders, helms or ranged weapons on others |
+| Player states | **Shapeshifting and stealth, on ourselves and on other players.** A transform is `UNIT_FIELD_DISPLAYID != UNIT_FIELD_NATIVEDISPLAYID` — *not* a non-zero shapeshift form, which every warrior carries — and it drops the player look so a bear is dressed as a bear. Stealth is `UNIT_FIELD_BYTES_1`'s `CREEP` bit: the body draws at 45% through a forced blend and plays the crouch cycles. **A stealthed player is simply not replicated to an observer who cannot detect them**, so this is visible for your own character, your party and detectors. Stand state and animation tier are named and unread; no aura system, so no buff bar |
 | Interface | Native, fully customisable, **no addons** — see the decision below. Player/target/party frames, click-to-target, chat, spellbook, action bars per character, `F1` to rearrange, saved to `ui.toml` |
 | Sign-in | **The viewer opens a login screen with no arguments** — confirmed at the window — so double-clicking it is the ordinary way to start: account, password, server, a folder picker for the `Data` directory, then a realm list and a character list. Remembers everything but the password, in `%APPDATA%\open-wow\login.toml`. **Creates no characters and deletes none** — the original client does that. Four themes (`slate`, `neko`, `void`, `calico`) that *write their colours into `ui.toml`* rather than sitting under it. Its own cat-head icon, drawn in code, on the window and on the executable. No queue handling, no return to the screen after a disconnect |
 | Game | Melee, spells with real tooltips and a cast bar, cooldowns, combat log, corpse and loot end to end, inventory with slot moves, character panel, quests taken and handed in, quest log with progress counters |
@@ -250,6 +251,15 @@ resurrection are each one GM command, so the same scenario runs twenty times.
   character that has never held the quest and one is not reusable: `.quest
   remove` clears the log but *not* `character_queststatus_rewarded`. Creating
   another is one `--create` and is the right move.
+- **`Roguetest` (`OWC33`) and `Druidtest` (`OWC34`) are the player-state pair,
+  and the split across accounts is the point** — the interesting test is one
+  watching the other, which needs two sessions. `Druidtest` is a level-20 night
+  elf druid taught Bear, Cat, Travel and Aquatic forms, moved to Northshire so
+  it stands beside the others; `Roguetest` knows Stealth via `.learn 1784`.
+  **Auras survive a logout**, so a run that leaves one stealthed or shifted
+  contaminates the next one — `.unaura <spell>` then `.save` before trusting a
+  control. And two characters 150 units apart cannot see each other, which
+  produces a confident-looking null result.
 - **`Huntertest` (dwarf hunter on `OWC34`) is the most valuable character in
   the project — do not delete it.** A dwarf hunter is *created wearing* a gun
   and an ammo pouch with shot in it, which named equipment slot 17 and produced
@@ -302,6 +312,15 @@ the full account is in `docs/ROADMAP.md`.
   holds a duration matched 99.6% — on the wrong column. Comparing spells whose
   description says `$d` against those that do not separated it immediately,
   98.5% against 39.0%.
+- **Two fields can state one fact, and the general one is rarely the one you
+  found first.** Stealth sets `UNIT_FIELD_BYTES_1`'s `CREEP` bit *and*
+  `PLAYER_FIELD_BYTES2`'s stealth bit *and* shapeshift form 30, all in one
+  update. Only the first is set for a stealthed **creature**, because the
+  others are guarded by "is this a player" and by one spell family. Ask which
+  candidate describes the *thing* rather than the case you happened to
+  measure — and ask what refutes the tempting one: a non-zero shapeshift form
+  looks like "transformed" until a warrior in Battle Stance carries form 17
+  wearing its own body.
 - **Validity is nearly free; *variation* is the discriminator.** Two update
   fields both resolved 100% to real `GameObjectDisplayInfo` rows; one was the
   constant 33. Ask whether the candidate *varies the way the thing it names
@@ -477,7 +496,19 @@ the full account is in `docs/ROADMAP.md`.
   those five were written after the rule.
 - **"Nothing happened" is two findings wearing one sentence.** An opcode the
   server never understood and a correct opcode deliberately declined have
-  identical printouts and opposite investigations.
+  identical printouts and opposite investigations. **A third member: the object
+  may not be there to describe.** An observer 36 units from a stealthing rogue
+  reported no player at all, which reads as a client that cannot see the flag
+  — the server *removes* a stealthed unit rather than marking it. The control
+  is what named it: the identical pair with the aura cleared replicates
+  normally. **When a negative result would close off a feature, run the
+  positive case with one variable changed before believing it.**
+- **A command's name is a claim with the same weight as a comment's.**
+  AzerothCore's `.modify standstate` writes `UNIT_NPC_EMOTESTATE`, so the
+  obvious probe for the stand-state byte measures a different field entirely
+  and looks like a successful measurement. Caught by diffing: `0x53` moved and
+  `0x4a` did not. Sibling of "a schema is a fact about storage, not about a
+  wire".
 - **A diagnosis that names one cause for two situations sends the reader in a
   circle.** "Already in the log, clear it first" is right for a stale character
   and useless for an auto-accept quest. The tell is advice that would not

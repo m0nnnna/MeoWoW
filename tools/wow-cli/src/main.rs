@@ -884,6 +884,29 @@ enum Command {
         /// one state against another -- alive against dead, say.
         #[arg(long)]
         own_fields: bool,
+        /// After entering, name what state every replicated unit is in --
+        /// stealthed, transformed, which shapeshift form -- rather than
+        /// printing the fields those readings come from.
+        ///
+        /// **The half `--own-fields` cannot do.** A before/after diff of raw
+        /// fields is how these were found, and it is the wrong instrument for
+        /// checking they are still read correctly: it says `0x4a` moved to
+        /// `0x00020000` where the question is whether anything concluded
+        /// "stealthed" from it. Ordinary parse/report separation, applied to
+        /// state that lives in a field rather than in a packet.
+        ///
+        /// **Prints every unit, not only the interesting ones**, with the
+        /// counts stated. "3 of 96 units are in some state" and "0 of 96" are
+        /// both measurements; a list that only ever shows what it found cannot
+        /// tell a quiet zone from a reader that concludes nothing.
+        ///
+        /// Pair it with a second client to check the half that matters: run
+        /// this as the observer while the actor casts Stealth or a shapeshift,
+        /// and it says whether the flags crossed the wire. Our own character
+        /// is printed first and separately, because the two are answered by
+        /// different routes and only the first is proof about *replication*.
+        #[arg(long)]
+        states: bool,
         /// Keep fighting until this character dies, for capturing the death
         /// and corpse flow.
         ///
@@ -1583,6 +1606,7 @@ fn main() -> Result<()> {
             units,
             objects,
             unit_fields,
+            states,
             items,
             equip,
             swap,
@@ -1682,6 +1706,7 @@ fn main() -> Result<()> {
                 units: *units,
                 objects: *objects,
                 unit_fields: *unit_fields,
+                states: *states,
                 items: *items,
                 equip,
                 swap: swap.as_deref(),
@@ -1910,6 +1935,7 @@ struct WorldRequest<'a> {
     units: Option<usize>,
     objects: bool,
     unit_fields: bool,
+    states: bool,
     items: bool,
     equip: &'a [u16],
     swap: Option<&'a str>,
@@ -2064,6 +2090,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         units,
         objects,
         unit_fields,
+        states,
         items,
         equip,
         swap,
@@ -3207,6 +3234,10 @@ cast {spell_id} at {} (attempt {attempt})",
 
         if unit_fields {
             report_unit_fields(&state, character.guid);
+        }
+
+        if states {
+            report_states(&state, character.guid);
         }
 
         if items {
@@ -4381,6 +4412,88 @@ fn report_unit_fields(state: &world::WorldState, own_guid: u64) {
             .map(|(index, value)| format!("{index:#x}={value}"))
             .collect();
         println!("    {}", fields.join(" "));
+    }
+}
+
+/// Says what state every replicated unit is in, ours first.
+///
+/// **A report, not a dump**, and the split is the point: `--own-fields` prints
+/// the numbers these readings are made from, and this prints the readings. The
+/// two catch different things. A wrong offset shows up in the dump; a correct
+/// offset nothing acts on shows up only here.
+///
+/// One line per unit whatever it says, and a count of how many said anything.
+/// A survey that printed only the stealthed units could not tell "nobody is
+/// hiding" from "the creep bit is never read", which are the two answers this
+/// exists to separate.
+fn report_states(state: &world::WorldState, own_guid: u64) {
+    // Named here rather than in `world::state`, where only the two forms this
+    // project has actually watched arrive are named. A probe may say "form 5"
+    // and let the reader look it up; a client may not invent a name.
+    let describe = |entity: &world::state::Entity| -> String {
+        let mut parts = Vec::new();
+        if entity.stealthed() {
+            parts.push("stealthed".to_string());
+        }
+        if entity.transformed() {
+            parts.push(format!(
+                "transformed (wearing {}, native {})",
+                entity.display_id().unwrap_or(0),
+                entity.native_display_id().unwrap_or(0),
+            ));
+        }
+        match entity.shapeshift_form() {
+            Some(0) | None => {}
+            Some(form) => parts.push(format!("form {form}")),
+        }
+        if parts.is_empty() {
+            "-".to_string()
+        } else {
+            parts.join(", ")
+        }
+    };
+
+    println!("\nunit states:");
+    match state.get(own_guid) {
+        Some(own) => println!(
+            "  own {own_guid:#x}  display {}  native {}  {}",
+            own.display_id().map_or("?".into(), |id| id.to_string()),
+            own.native_display_id().map_or("?".into(), |id| id.to_string()),
+            describe(own),
+        ),
+        None => println!("  own object not replicated"),
+    }
+
+    let others: Vec<&world::state::Entity> = state
+        .iter()
+        .filter(|entity| entity.guid != own_guid)
+        .filter(|entity| {
+            matches!(
+                entity.object_type,
+                world::ObjectType::Unit | world::ObjectType::Player
+            )
+        })
+        .collect();
+    let interesting = others
+        .iter()
+        .filter(|entity| entity.stealthed() || entity.transformed())
+        .count();
+    println!(
+        "  {interesting} of {} other unit(s) are in some state",
+        others.len()
+    );
+    for entity in &others {
+        println!(
+            "    {:#018x}  {:<6}  entry {:<6} display {:<6} {}",
+            entity.guid,
+            match entity.object_type {
+                world::ObjectType::Player => "player",
+                _ => "unit",
+            },
+            entity.entry().unwrap_or(0),
+            entity.display_id().unwrap_or(0),
+            describe(entity),
+        );
     }
 }
 

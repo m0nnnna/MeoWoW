@@ -681,6 +681,8 @@ mod tests {
             fighting: false,
             appearance: None,
             visible_items: [0; ::world::inventory::EQUIPPED_COUNT as usize],
+            transformed: false,
+            stealthed: false,
             sheathed: true,
             sheath_changed_ms_ago: None,
         }

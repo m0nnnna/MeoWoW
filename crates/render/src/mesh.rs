@@ -37,12 +37,41 @@ pub struct MeshVertex {
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct Instance {
     pub model: [[f32; 4]; 4],
+    /// A colour multiplier applied to whatever this instance's texture
+    /// produces, alpha included. Opaque white leaves the model exactly as it
+    /// was, which is what every caller that does not care gets.
+    ///
+    /// **Per instance rather than per pipeline, and that is the whole reason
+    /// it exists here.** A stealthed rogue and an unstealthed one are the same
+    /// mesh, the same composed skin and the same geosets -- the only thing
+    /// that differs is how much of the world shows through. Expressing that as
+    /// a second *model* would compose a 512x512 character texture twice and
+    /// re-read the `.m2` the instant somebody crouched; expressing it as a
+    /// uniform would need a bind group per state in a pass that deliberately
+    /// binds none.
+    ///
+    /// The shadow pass reads the same buffer and declares only the four matrix
+    /// columns, so it never sees this -- which is correct rather than an
+    /// oversight. A crouching character still blocks the sun.
+    pub tint: [f32; 4],
 }
 
 impl Instance {
+    /// A placement drawn exactly as its textures paint it.
     pub fn from_cols_array_2d(model: [[f32; 4]; 4]) -> Self {
-        Self { model }
+        Self {
+            model,
+            tint: Self::OPAQUE,
+        }
     }
+
+    /// The same placement, multiplied by `tint` in the fragment shader.
+    pub fn tinted(model: [[f32; 4]; 4], tint: [f32; 4]) -> Self {
+        Self { model, tint }
+    }
+
+    /// The multiplier that changes nothing.
+    pub const OPAQUE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
     pub const IDENTITY: Self = Self {
         model: [
@@ -51,6 +80,7 @@ impl Instance {
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ],
+        tint: Self::OPAQUE,
     };
 }
 
@@ -211,6 +241,9 @@ struct VsIn {
     @location(6) model_1: vec4<f32>,
     @location(7) model_2: vec4<f32>,
     @location(8) model_3: vec4<f32>,
+    // Per-instance colour multiplier; opaque white for everything that has
+    // not asked to be tinted.
+    @location(9) tint: vec4<f32>,
 };
 
 struct VsOut {
@@ -220,6 +253,7 @@ struct VsOut {
     // Carried so the fragment stage can measure distance for fog. The clip
     // position cannot answer that after the divide.
     @location(2) world: vec3<f32>,
+    @location(3) tint: vec4<f32>,
 };
 
 @vertex
@@ -263,24 +297,32 @@ fn vs(in: VsIn) -> VsOut {
     // normals correctly without a separate inverse-transpose.
     out.normal = (model * vec4<f32>(normal, 0.0)).xyz;
     out.uv = in.uv;
+    out.tint = in.tint;
     return out;
 }
 
-fn shade(normal: vec3<f32>, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
-    let texel = textureSample(tex, samp, uv);
+fn shade(normal: vec3<f32>, uv: vec2<f32>, world: vec3<f32>, tint: vec4<f32>) -> vec4<f32> {
+    let texel = textureSample(tex, samp, uv) * tint;
     return vec4<f32>(fogged(texel.rgb * sky_light(normal, world), world), texel.a);
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    return shade(in.normal, in.uv, in.world);
+    return shade(in.normal, in.uv, in.world, in.tint);
 }
 
 // Cutout materials: reject rather than blend, so the batch can still write
 // depth and be drawn in the opaque pass.
+//
+// **The tint's alpha is deliberately not part of the cutout test.** A tinted
+// instance is asking to be seen through, and testing it here would take the
+// whole model out at once past the threshold rather than fading it -- so the
+// alpha channel is applied to the *texture's* own cutout and then discarded,
+// exactly as it was before tints existed. A caller wanting a faded cutout
+// material asks for a blended pipeline instead; see `RenderState`.
 @fragment
 fn fs_alpha_key(in: VsOut) -> @location(0) vec4<f32> {
-    let c = shade(in.normal, in.uv, in.world);
+    let c = shade(in.normal, in.uv, in.world, vec4<f32>(in.tint.rgb, 1.0));
     if (c.a < 0.5) {
         discard;
     }
@@ -788,7 +830,8 @@ fn build_pipeline(
                             5 => Float32x4,
                             6 => Float32x4,
                             7 => Float32x4,
-                            8 => Float32x4
+                            8 => Float32x4,
+                            9 => Float32x4
                         ],
                     }),
                 ],

@@ -605,23 +605,8 @@ fn world_for_live(
             drawable_with_own(live, (0.0, 0.0), 0.0, false, false)
                 .iter()
                 .map(|entity| {
-                    // Same three sources as the windowed path -- see `redraw`.
-                    // A screenshot that dressed people differently from the
-                    // window would be the wrong kind of evidence about it.
-                    let (look, look_key) = if entity.guid == live.guid {
-                        (Some(live.look.clone()), live.look_key)
-                    } else if let Some(appearance) = entity.appearance {
-                        let (look, key) = player_look(
-                            &mut player_looks,
-                            chain,
-                            &items,
-                            appearance,
-                            &entity.visible_items,
-                        );
-                        (Some(look), key)
-                    } else {
-                        (None, 0)
-                    };
+                    let (look, look_key) =
+                        entity_look(&mut player_looks, chain, &items, live, entity);
                     world::EntityPlacement {
                         guid: entity.guid,
                         display_id: entity.display_id,
@@ -643,6 +628,7 @@ fn world_for_live(
                         look_key,
                         sheathed: entity.sheathed,
                         sheath_changed_ms_ago: entity.sheath_changed_ms_ago,
+                        stealthed: entity.stealthed,
                     }
                 })
                 .collect();
@@ -2197,8 +2183,18 @@ fn draw_streaming(
                 wgpu::IndexFormat::Uint32,
             );
             for draw in &group.model.draws {
+                // **The group's override, not the material's own state**, and
+                // only where one was asked for. A tint with alpha under one is
+                // invisible through an opaque pipeline -- the blend has to be
+                // switched on for the number to mean anything -- so the two
+                // travel together. See `world::Group::translucent`.
+                let state = if group.translucent {
+                    crate::world::translucent(draw.state)
+                } else {
+                    draw.state
+                };
                 let (Some(pipeline), Some(bind)) =
-                    (meshes.get(draw.state), group.model.binds.get(draw.texture))
+                    (meshes.get(state), group.model.binds.get(draw.texture))
                 else {
                     continue;
                 };
@@ -3774,6 +3770,54 @@ fn lit_uniform(
 /// The cache key folds equipment in through [`character::look_key`], not
 /// just the face: two players sharing a race and appearance but not a
 /// wardrobe must not share a composed skin.
+/// How one replicated entity should be dressed, and the cache key that goes
+/// with it.
+///
+/// **One function because there are two call sites and they must not drift.**
+/// The windowed loop and `--screenshot` each built this inline, and a
+/// screenshot that dressed people differently from the window is evidence
+/// about neither -- the comment saying so was already in both copies, which is
+/// the shape this project keeps finding: a trap documented at one call site
+/// does not protect the next one. Making it an argument nobody can forget to
+/// pass is what the rule actually recommends.
+///
+/// Three sources, in order of what actually knows:
+///
+/// - our own body's look was resolved at login from the character list;
+/// - another player's comes off their update fields;
+/// - a creature has none, and is dressed from its display id inside the
+///   renderer.
+///
+/// **And a fourth case that overrules all three: a unit wearing a body that is
+/// not its own gets no look at all.** A druid in bear form is still a night
+/// elf and its appearance fields still say so, but none of it applies to the
+/// model on screen: the composed character skin is uploaded into whichever
+/// texture slot happens to be first, and `Look::shows` filters the bear's
+/// geosets by rules written about hairstyles, beards and glove variants --
+/// where "variant 1 is the bare body" is a fact about character models and
+/// about nothing else. Handing it `None` sends the renderer down the path
+/// every creature already takes, which is the right one: a bear's skin is a
+/// property of its display id.
+fn entity_look(
+    cache: &mut std::collections::HashMap<u64, Rc<character::Look>>,
+    chain: &mut Chain,
+    items: &crate::items::Items,
+    live: &live::LiveWorld,
+    entity: &live::Entity,
+) -> (Option<Rc<character::Look>>, u64) {
+    if entity.transformed {
+        return (None, 0);
+    }
+    if entity.guid == live.guid {
+        return (Some(live.look.clone()), live.look_key);
+    }
+    let Some(appearance) = entity.appearance else {
+        return (None, 0);
+    };
+    let (look, key) = player_look(cache, chain, items, appearance, &entity.visible_items);
+    (Some(look), key)
+}
+
 fn player_look(
     cache: &mut std::collections::HashMap<u64, Rc<character::Look>>,
     chain: &mut Chain,
@@ -5561,26 +5605,8 @@ impl App {
                         drawn
                             .iter()
                             .map(|entity| {
-                                // Three sources, in order of what actually
-                                // knows: our own body's look was resolved at
-                                // login from the character list; another
-                                // player's comes off their update fields; a
-                                // creature has none and is dressed from its
-                                // display id inside the renderer.
-                                let (look, look_key) = if entity.guid == live.guid {
-                                    (Some(live.look.clone()), live.look_key)
-                                } else if let Some(appearance) = entity.appearance {
-                                    let (look, key) = player_look(
-                                        looks,
-                                        chain,
-                                        items,
-                                        appearance,
-                                        &entity.visible_items,
-                                    );
-                                    (Some(look), key)
-                                } else {
-                                    (None, 0)
-                                };
+                                let (look, look_key) =
+                                    entity_look(looks, chain, items, live, entity);
                                 crate::world::EntityPlacement {
                                     guid: entity.guid,
                                     display_id: entity.display_id,
@@ -5608,6 +5634,7 @@ impl App {
                                     look_key,
                                     sheathed: entity.sheathed,
                                     sheath_changed_ms_ago: entity.sheath_changed_ms_ago,
+                                    stealthed: entity.stealthed,
                                 }
                             })
                             .collect();

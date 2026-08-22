@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use glam::{Mat4, Vec3};
 use mpq::Chain;
-use render::mesh::{BoneBuffer, Instance, InstanceBuffer, MeshRenderer};
+use render::mesh::{BlendMode, BoneBuffer, Instance, InstanceBuffer, MeshRenderer, RenderState};
 use render::{Gpu, TerrainRenderer, UploadedTexture};
 
 use ::world::combat::Hand;
@@ -128,6 +128,20 @@ pub struct Group {
     /// case its instance transforms are recomputed every frame from the
     /// wielder's pose. See [`Held`].
     pub held: Option<Held>,
+    /// Whether this group's draws are forced to blend, whatever their
+    /// materials say -- which is what a per-instance tint with alpha under one
+    /// needs to be visible at all.
+    ///
+    /// **A tint alone does nothing.** A character's body is an opaque material
+    /// and an opaque pipeline ignores the alpha it is handed, so a stealthed
+    /// rogue tinted to 45% draws at full strength and the whole feature looks
+    /// unimplemented. The two have to travel together, which is why this is a
+    /// property of the group rather than something the draw loop infers.
+    ///
+    /// Depth writing goes with it: translucent geometry that writes depth
+    /// hides whatever is drawn behind it later in the frame, so a crouching
+    /// rogue would punch its own silhouette out of the grass.
+    pub translucent: bool,
     /// This group's transforms, on the CPU, and **only when the model has an
     /// emitter**.
     ///
@@ -561,6 +575,17 @@ pub struct EntityPlacement {
     /// a unit that entered view already in its current state, which must
     /// not play the draw/stow transition for a change nobody watched.
     pub sheath_changed_ms_ago: Option<u32>,
+    /// Whether this unit is stealthed, and so drawn faded and crouched.
+    ///
+    /// Takes part in the *bucket* key and deliberately **not** in the model
+    /// cache key. The distinction matters here more than anywhere else it has
+    /// come up: two rogues in identical gear, one stealthed, need separate
+    /// buckets because they play different cycles and blend differently -- but
+    /// they are the same mesh, the same skin and the same geosets, and folding
+    /// stealth into the cache key would compose a second 512x512 character
+    /// texture and re-read the model the instant somebody crouched. See
+    /// `stealth_key`.
+    pub stealthed: bool,
 }
 
 pub struct World {
@@ -1014,6 +1039,9 @@ impl World {
                 count: raw.len() as u32,
                 animation: None,
                 held: None,
+                // Scenery. Nothing about a tile's doodads or buildings is
+                // ever tinted, so their materials answer for themselves.
+                translucent: false,
             });
         }
 
@@ -1453,12 +1481,19 @@ impl World {
         let mut looks: HashMap<u64, Option<std::rc::Rc<crate::character::Look>>> = HashMap::new();
         let mut kinds: HashMap<u64, ::world::ObjectType> = HashMap::new();
         let mut sheathed: HashMap<u64, bool> = HashMap::new();
-        let mut grouped: HashMap<(u32, Motion, u64), Vec<Mat4>> = HashMap::new();
+        // **Stealth is the fourth term and it is not part of `key`**, which is
+        // the whole point of it being here instead. `key` is handed to
+        // `entity_model` as the model cache's key, so anything folded into it
+        // buys a second model load; two rogues in identical gear, one crouched,
+        // are one mesh with one composed skin drawn twice. What they cannot
+        // share is the *bucket*: they play different cycles and blend
+        // differently. Four terms in the tuple, three in the cache key.
+        let mut grouped: HashMap<(u32, Motion, u64, bool), Vec<Mat4>> = HashMap::new();
         // Parallel to `grouped` and pushed in lockstep with it, so entry `i`
         // of a bucket's transforms and entry `i` of its guids are the same
         // object. Two vectors rather than a vector of pairs because the
         // transforms are uploaded wholesale and the guids never are.
-        let mut grouped_guids: HashMap<(u32, Motion, u64), Vec<u64>> = HashMap::new();
+        let mut grouped_guids: HashMap<(u32, Motion, u64, bool), Vec<u64>> = HashMap::new();
         // The same association the other way round, kept because a caller
         // holding a guid cannot search a shared bucket for it.
         let mut bucket_of_guid: HashMap<u64, (u32, Motion)> = HashMap::new();
@@ -1505,29 +1540,36 @@ impl World {
                 (Some(age), Some(rest)) => Some((age, rest)),
                 _ => None,
             };
+            let motion = Motion::resolve(
+                placement.speed,
+                placement.turning,
+                placement.airborne,
+                placement.swimming,
+                placement.dead,
+                placement.died_ms_ago,
+                placement.swung_ms_ago,
+                placement.fighting,
+                now_ms,
+                // Stowed weapons leave the hands free, so the stance only
+                // applies while something is drawn.
+                if placement.sheathed {
+                    Stance::Unarmed
+                } else {
+                    placement.stance
+                },
+                sheathing,
+                placement.spell,
+            );
             let bucket = (
                 placement.display_id,
-                Motion::resolve(
-                        placement.speed,
-                        placement.turning,
-                        placement.airborne,
-                        placement.swimming,
-                        placement.dead,
-                        placement.died_ms_ago,
-                        placement.swung_ms_ago,
-                        placement.fighting,
-                        now_ms,
-                        // Stowed weapons leave the hands free, so the stance
-                        // only applies while something is drawn.
-                        if placement.sheathed {
-                            Stance::Unarmed
-                        } else {
-                            placement.stance
-                        },
-                    sheathing,
-                    placement.spell,
-                ),
+                // Applied after rather than inside: see `Motion::crouched`.
+                if placement.stealthed {
+                    motion.crouched()
+                } else {
+                    motion
+                },
                 key,
+                placement.stealthed,
             );
             grouped_guids
                 .entry(bucket)
@@ -1565,12 +1607,12 @@ impl World {
         let mut built = Vec::new();
         let mut undrawable = 0;
         let mut wanted_bones: HashSet<(u32, Motion)> = HashSet::new();
-        for ((display_id, motion, look_key), transforms) in grouped {
+        for ((display_id, motion, look_key, stealthed), transforms) in grouped {
             // Taken rather than borrowed: `grouped` was consumed by the loop
             // and its parallel guids have exactly the same keys, so a missing
             // entry would be a bug rather than a case to handle.
             let guids = grouped_guids
-                .remove(&(display_id, motion, look_key))
+                .remove(&(display_id, motion, look_key, stealthed))
                 .unwrap_or_default();
             let look = looks.get(&look_key).cloned().flatten();
             let kind = kinds.get(&look_key).copied().unwrap_or(::world::ObjectType::Unit);
@@ -1580,10 +1622,23 @@ impl World {
                 undrawable += transforms.len();
                 continue;
             };
+            // Both the materials' own states and, for a stealthed bucket, the
+            // blended overrides the draw loop will actually ask for. A
+            // pipeline that was never prepared is a draw silently skipped, so
+            // the override is declared here rather than discovered at submit
+            // time -- the same reason `prepare` exists at all.
             meshes.prepare(gpu, model.draws.iter().map(|d| d.state));
+            if stealthed {
+                meshes.prepare(gpu, model.draws.iter().map(|d| translucent(d.state)));
+            }
+            let tint = if stealthed {
+                STEALTH_FADE
+            } else {
+                Instance::OPAQUE
+            };
             let raw: Vec<Instance> = transforms
                 .iter()
-                .map(|t| Instance::from_cols_array_2d(t.to_cols_array_2d()))
+                .map(|t| Instance::tinted(t.to_cols_array_2d(), tint))
                 .collect();
 
             // Running, walking or standing -- not every model has the cycle its
@@ -1709,10 +1764,16 @@ impl World {
                     .iter()
                     .map(|t| *t * Mat4::from_translation(Vec3::from(attachment.position)))
                     .collect();
+                // Tinted with its wielder. A dagger drawn at full strength in
+                // a hand that is 45% there is worse than either alone -- it
+                // reads as a floating weapon rather than as a hidden rogue.
                 let bind_pose: Vec<Instance> = bind_pose_transforms
                     .iter()
-                    .map(|t| Instance::from_cols_array_2d(t.to_cols_array_2d()))
+                    .map(|t| Instance::tinted(t.to_cols_array_2d(), tint))
                     .collect();
+                if stealthed {
+                    meshes.prepare(gpu, held_model.draws.iter().map(|d| translucent(d.state)));
+                }
                 built.push(Group {
                     // A torch in a hand is the case this exists for, and its
                     // placements are rewritten every frame by
@@ -1732,6 +1793,7 @@ impl World {
                     instances: InstanceBuffer::upload(gpu, &bind_pose),
                     count: raw.len() as u32,
                     animation: None,
+                    translucent: stealthed,
                     held: Some(Held {
                         wielder: animation,
                         wielders: transforms.clone(),
@@ -1753,6 +1815,7 @@ impl World {
                 count: raw.len() as u32,
                 animation,
                 held: None,
+                translucent: stealthed,
             });
         }
         // Drop bone buffers for creatures that changed bucket or left view,
@@ -2320,6 +2383,40 @@ fn sheath_key(sheathed: bool) -> u64 {
     }
 }
 
+/// How much of a stealthed unit is drawn, as a multiplier on everything its
+/// textures produce.
+///
+/// Chosen rather than measured, and stated as such: no table anywhere says how
+/// faint a hidden rogue should be. Far enough down to read as "not really
+/// there", far enough up that the silhouette, the gear and which way it is
+/// facing all stay legible -- a stealthed player is something you are meant to
+/// be able to spot.
+const STEALTH_FADE: [f32; 4] = [1.0, 1.0, 1.0, 0.45];
+
+/// The same material, drawn so a tint's alpha means something.
+///
+/// **Both halves, and only one of them is obvious.** Switching the blend on is
+/// what makes the fade visible at all; switching depth writing off is what
+/// stops the faded body from carving its own silhouette out of everything
+/// drawn after it. A translucent surface that writes depth rejects the grass
+/// behind it, so the rogue reads as a person-shaped hole rather than as a
+/// person you can see through -- which looks like a rendering fault rather
+/// than like stealth.
+///
+/// A material that already blends is left exactly as it is: additive
+/// geometry -- a glow on a weapon -- is not made more transparent by being
+/// forced through alpha blending, it is made *wrong*.
+pub fn translucent(state: RenderState) -> RenderState {
+    if state.blend.is_transparent() {
+        return state;
+    }
+    RenderState {
+        blend: BlendMode::Blend,
+        depth_write: false,
+        ..state
+    }
+}
+
 /// `AnimationData.dbc` rows for the cycles this client plays -- public spec
 /// (documented on wowdev.wiki as part of the client's own animation-id
 /// table), not derived from any server implementation. Every 3.3.5a model's
@@ -2402,6 +2499,24 @@ const READY_UNARMED_ANIMATION_ID: u16 = 25;
 /// whole reason [`animation_constants_name_the_rows_they_claim`] now exists.
 const SHEATH_ANIMATION_ID: u16 = 89;
 const HIP_SHEATH_ANIMATION_ID: u16 = 90;
+/// Crouched: `AnimationData` rows **120, 119 and 223**, `StealthStand`,
+/// `StealthWalk` and `StealthRun`.
+///
+/// Read out of the table, not off a model listing, and the difference is the
+/// one that has already cost this project two silent bugs: `HumanMale.m2`
+/// carries all three at *sequence indices* 110, 111 and 146. Transcribing
+/// those would name `SwimIdle`, `Drown` and nothing at all -- the first two of
+/// which exist, so it would have played a plausible wrong cycle rather than
+/// failing.
+///
+/// The chains below are the table's own fallback column: 223 names 119, which
+/// names 4 (`Walk`); 120 names 0 (`Stand`). Every playable model carries all
+/// three -- checked, with keyed bones and an external `.anim` behind each --
+/// so the fallbacks are for the stealthed *creature*, which the flag applies
+/// to just as much.
+const STEALTH_STAND_ANIMATION_ID: u16 = 120;
+const STEALTH_WALK_ANIMATION_ID: u16 = 119;
+const STEALTH_RUN_ANIMATION_ID: u16 = 223;
 
 /// How long any one-shot cycle is allowed to run before the unit is treated as
 /// settled.
@@ -2654,6 +2769,32 @@ pub enum Motion {
     /// asking for it, so it travels in the key rather than being decided
     /// twice.
     Sheathing(u32, RestKind),
+    /// Crouched and moving quietly, at whichever of the three stealth paces
+    /// the ground speed calls for.
+    ///
+    /// A family of its own rather than a modifier on `Stand`/`Walk`/`Run`,
+    /// because the models carry it as three separate cycles and because it has
+    /// to sit in the bucket key: two rogues side by side, one stealthed, must
+    /// not share a pose.
+    Stealth(Creep),
+}
+
+/// How fast a stealthed unit is creeping.
+///
+/// Three states because the table has three cycles, and they are not the same
+/// three as [`Pace`]: `Pace` distinguishes *direction* -- a swimmer going
+/// backwards has its own animation -- and this distinguishes *speed*, because
+/// `StealthWalk` and `StealthRun` are separate rows and there is no
+/// `StealthWalkBackwards`. Reusing `Pace` here would have made backing up out
+/// of a fight play the forward creep and thrown away the walk/run distinction
+/// in the same move.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Creep {
+    /// Crouched on the spot, including backing up: `StealthWalk` is the only
+    /// cycle there is for either direction.
+    Still,
+    Walk,
+    Run,
 }
 
 /// Where a transitioning weapon rests, which chooses between the two
@@ -2892,6 +3033,44 @@ impl Motion {
         moving
     }
 
+    /// The same motion, performed crouched.
+    ///
+    /// **A transformation applied after [`Motion::resolve`] rather than a
+    /// thirteenth argument to it**, and the reason is not only that the
+    /// argument list is already long. `resolve` answers "what is this body
+    /// doing"; stealth does not change the answer, it changes the *posture the
+    /// answer is performed in*. Separating them puts the whole precedence rule
+    /// in one `match` anybody can read, instead of an early return buried
+    /// among eleven other conditions -- and it is testable on its own, against
+    /// a `Motion` rather than against twelve arguments.
+    ///
+    /// **What passes through is the interesting half.** Dying, lying dead,
+    /// jumping and swimming are things a body is doing that a crouch cannot
+    /// describe, and the server clears the stealth flag for none of them -- so
+    /// a rogue who stealths and then jumps off a wall must play the jump, not
+    /// a creep in mid-air.
+    ///
+    /// Everything else collapses to a crouch, the combat states included. That
+    /// is not an approximation: swinging, casting, and drawing or stowing a
+    /// weapon each break stealth server-side, so the flag is already gone by
+    /// the time any of them is replicated. Mapping them anyway is what keeps
+    /// this total rather than leaving a hole for the frame in between.
+    fn crouched(self) -> Motion {
+        match self {
+            Motion::Dying(_) | Motion::Dead | Motion::Airborne | Motion::Swim(_) => self,
+            Motion::Run => Motion::Stealth(Creep::Run),
+            // Backing up creeps too. `AnimationData` has no reverse stealth
+            // cycle at all, so the choice is the forward creep or standing
+            // still while sliding -- and this project has already settled that
+            // one, three times, in `from_pace`.
+            Motion::Walk | Motion::WalkBack => Motion::Stealth(Creep::Walk),
+            // Standing, the two shuffles, and every combat state: turning on
+            // the spot while crouched has no cycle either, and `StealthStand`
+            // is at least the right posture where `ShuffleLeft` is not.
+            _ => Motion::Stealth(Creep::Still),
+        }
+    }
+
     /// Whether this cycle is about a fight or a death, and so worth a log line.
     fn is_notable(self) -> bool {
         !matches!(
@@ -2903,6 +3082,11 @@ impl Motion {
                 | Motion::Shuffle(_)
                 | Motion::Airborne
                 | Motion::Swim(_)
+                // Continuous, like walking, and this line runs on every
+                // rebuild -- which is every frame. A rogue that crouched once
+                // would otherwise write a line a frame for as long as it
+                // stayed hidden.
+                | Motion::Stealth(_)
         )
     }
 
@@ -3040,6 +3224,17 @@ impl Motion {
             // changes what the animation means, not just what plays.
             Motion::Sheathing(_, RestKind::Back) => &[SHEATH_ANIMATION_ID, STAND_ANIMATION_ID],
             Motion::Sheathing(_, RestKind::Hip) => &[HIP_SHEATH_ANIMATION_ID, STAND_ANIMATION_ID],
+            // The table's own fallback column, unedited: 120 names 0, 119
+            // names 4, and 223 names 119. A creature with no crouch at all
+            // therefore ends up walking or standing rather than frozen, which
+            // is the same answer every other family here reaches.
+            Motion::Stealth(Creep::Still) => &[STEALTH_STAND_ANIMATION_ID, STAND_ANIMATION_ID],
+            Motion::Stealth(Creep::Walk) => &[STEALTH_WALK_ANIMATION_ID, WALK_ANIMATION_ID],
+            Motion::Stealth(Creep::Run) => &[
+                STEALTH_RUN_ANIMATION_ID,
+                STEALTH_WALK_ANIMATION_ID,
+                WALK_ANIMATION_ID,
+            ],
             // Returned above, where the chain they carry is handed straight
             // back. Unreachable rather than empty, but an empty chain is the
             // honest thing to write here: there is no literal to give.
@@ -3104,6 +3299,15 @@ fn always_loops(animation_id: u16) -> bool {
             | READY_1H_ANIMATION_ID
             | READY_2H_ANIMATION_ID
             | READY_UNARMED_ANIMATION_ID
+            // All three crouch cycles loop: stealth is a state held until
+            // something breaks it, not a gesture. Absent from `plays_once`,
+            // so they would loop anyway -- listed here because this is the
+            // list that answers for an id a *spell* named, and Prowl is a
+            // spell whose `SpellVisual` could perfectly well name one of
+            // these. Held on its last frame, `StealthStand` is a statue.
+            | STEALTH_STAND_ANIMATION_ID
+            | STEALTH_WALK_ANIMATION_ID
+            | STEALTH_RUN_ANIMATION_ID
     )
 }
 
@@ -3664,6 +3868,130 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Crouching changes the posture and not what the body is doing.
+    ///
+    /// **The pass-through half is the one worth asserting.** A rogue who
+    /// stealths and then jumps off a wall keeps the flag -- the server clears
+    /// it for none of these -- so a `crouched` that mapped everything would
+    /// draw a creep in mid-air and a corpse frozen in a crouch. Both are
+    /// states the flag can genuinely coexist with, unlike the combat set
+    /// below, which cannot.
+    #[test]
+    fn crouching_replaces_the_ground_cycles_and_nothing_else() {
+        assert_eq!(Motion::Run.crouched(), Motion::Stealth(Creep::Run));
+        assert_eq!(Motion::Walk.crouched(), Motion::Stealth(Creep::Walk));
+        assert_eq!(Motion::WalkBack.crouched(), Motion::Stealth(Creep::Walk));
+        assert_eq!(Motion::Stand.crouched(), Motion::Stealth(Creep::Still));
+        assert_eq!(
+            Motion::Shuffle(Side::Left).crouched(),
+            Motion::Stealth(Creep::Still)
+        );
+
+        for airborne_or_wet in [
+            Motion::Airborne,
+            Motion::Swim(Pace::Forward),
+            Motion::Swim(Pace::Still),
+            Motion::Dying(0),
+            Motion::Dead,
+        ] {
+            assert_eq!(
+                airborne_or_wet.crouched(),
+                airborne_or_wet,
+                "{airborne_or_wet:?} is not something a crouch can describe"
+            );
+        }
+    }
+
+    /// Every crouch chain ends somewhere a model without the cycles can go.
+    ///
+    /// The chains are `AnimationData.dbc`'s own fallback column -- 223 names
+    /// 119, which names 4 -- and the last entry is the load-bearing one: the
+    /// stealth flag is set on *units*, so a stealthed creature with none of
+    /// the three reaches this code, and a chain that ended at 119 would leave
+    /// it in its bind pose sliding along the ground.
+    #[test]
+    fn the_crouch_chains_fall_back_to_ordinary_movement() {
+        assert_eq!(
+            Motion::Stealth(Creep::Run).animation_ids().first(),
+            Some(&STEALTH_RUN_ANIMATION_ID)
+        );
+        assert_eq!(
+            Motion::Stealth(Creep::Walk).animation_ids().first(),
+            Some(&STEALTH_WALK_ANIMATION_ID)
+        );
+        assert_eq!(
+            Motion::Stealth(Creep::Still).animation_ids().first(),
+            Some(&STEALTH_STAND_ANIMATION_ID)
+        );
+
+        assert_eq!(
+            Motion::Stealth(Creep::Still).animation_ids().last(),
+            Some(&STAND_ANIMATION_ID)
+        );
+        for moving in [Creep::Walk, Creep::Run] {
+            assert_eq!(
+                Motion::Stealth(moving).animation_ids().last(),
+                Some(&WALK_ANIMATION_ID),
+                "a creeping {moving:?} with no crouch cycle would freeze"
+            );
+        }
+
+        // Held rather than looped is the failure this guards: a `StealthStand`
+        // stopped on its last frame is a statue in a crouch.
+        for creep in [Creep::Still, Creep::Walk, Creep::Run] {
+            for id in Motion::Stealth(creep).animation_ids().iter() {
+                assert!(!plays_once(*id), "animation {id} would stop mid-crouch");
+            }
+        }
+    }
+
+    /// Fading a model needs the blend *and* the depth write, and must leave
+    /// anything that already blends exactly as it is.
+    ///
+    /// Each half fails differently and neither failure looks like the other.
+    /// Without the blend the tint is discarded and the rogue draws at full
+    /// strength -- the feature looks unimplemented. Without the depth change
+    /// the rogue draws as a person-shaped hole in the grass behind it, which
+    /// looks like a rendering fault. And forcing alpha blending onto an
+    /// additive glow does not make it fainter, it makes it wrong.
+    #[test]
+    fn fading_a_material_switches_the_blend_and_stops_writing_depth() {
+        let opaque = RenderState {
+            blend: BlendMode::Opaque,
+            two_sided: false,
+            depth_write: true,
+            winding: render::mesh::Winding::CounterClockwise,
+        };
+        let faded = translucent(opaque);
+        assert_eq!(faded.blend, BlendMode::Blend);
+        assert!(!faded.depth_write);
+        assert_eq!(faded.winding, opaque.winding, "culling is not a fade");
+
+        for already in [BlendMode::Blend, BlendMode::Additive] {
+            let state = RenderState {
+                blend: already,
+                ..opaque
+            };
+            assert_eq!(
+                translucent(state).blend,
+                already,
+                "{already:?} was rewritten by a fade that had nothing to do"
+            );
+        }
+
+        // A cutout material -- foliage, a beard -- is opaque as far as the
+        // pipeline is concerned and does need switching, or a stealthed
+        // character's hair stays solid while the rest of it fades.
+        assert_eq!(
+            translucent(RenderState {
+                blend: BlendMode::AlphaKey,
+                ..opaque
+            })
+            .blend,
+            BlendMode::Blend
+        );
     }
 
     /// A swing that plays once must be recognised whichever grip threw it.

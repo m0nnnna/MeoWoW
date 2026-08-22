@@ -515,6 +515,79 @@ impl Entity {
             .unwrap_or_default()
     }
 
+    /// Which shapeshift form this unit is in, as the raw byte the server sent.
+    ///
+    /// **Deliberately a number rather than an enum.** Two values have been
+    /// watched arrive here -- `30` when a rogue stealthed and `5` when a druid
+    /// took Bear Form -- and the other thirty in the server's table have not.
+    /// Naming them all would be transcribing a list that only ever produces
+    /// text, which is the mistake `combat::describe_cast_failure` exists to
+    /// refuse; naming two and returning the rest raw says exactly as much as
+    /// is known.
+    ///
+    /// **Nothing about drawing should ask this.** A form is not a model: a
+    /// warrior swapping stance changes this byte and keeps its body, and a
+    /// `.morph`ed player changes its body and keeps this byte at zero. The
+    /// question a renderer wants is [`Entity::transformed`].
+    pub fn shapeshift_form(&self) -> Option<u8> {
+        self.fields
+            .get(crate::update::fields::UNIT_BYTES_2)
+            .map(|packed| packed.to_le_bytes()[crate::update::fields::UNIT_BYTES_2_FORM])
+    }
+
+    /// The model this unit would wear if nothing were transforming it.
+    pub fn native_display_id(&self) -> Option<u32> {
+        self.fields
+            .get(crate::update::fields::UNIT_NATIVE_DISPLAY_ID)
+    }
+
+    /// Whether this unit is wearing a body that is not its own -- a druid in
+    /// bear form, a mounted player, anything the server has morphed.
+    ///
+    /// **What this answers is "is the player look still applicable", and that
+    /// is the only reason it exists.** A replicated player carries an
+    /// appearance and a set of worn items, and the renderer dresses its model
+    /// from them; a bear dressed from a night elf's numbers gets a composed
+    /// character skin its texture slots never asked for and has its geosets
+    /// filtered by rules written for hairstyles and gloves. So this is asked
+    /// where the look is chosen, not where the model is.
+    ///
+    /// Both halves are required, which is the whole subtlety: an *absent*
+    /// native display is not a statement that the unit is untransformed, so a
+    /// comparison that treated it as zero would call every creature in the
+    /// world transformed. Only two present-and-different values say anything.
+    pub fn transformed(&self) -> bool {
+        match (self.display_id(), self.native_display_id()) {
+            (Some(worn), Some(native)) => native != 0 && worn != native,
+            _ => false,
+        }
+    }
+
+    /// Whether this unit is stealthed -- a rogue in Stealth, a druid prowling,
+    /// a night elf shadowmelded.
+    ///
+    /// Reads [`crate::update::fields::UNIT_BYTES_1`]'s visibility byte rather
+    /// than the shapeshift form, though a rogue's Stealth sets both. The flag
+    /// is the general statement: the server sets it on any *unit*, so a
+    /// stealthed creature reports it too, where form `30` is one spell family's
+    /// way of saying the same thing.
+    ///
+    /// **An absent field is "not stealthed", not "unknown", and here that is
+    /// safe rather than merely convenient**: a create block omits zero fields,
+    /// so every unit that has never stealthed carries no `UNIT_BYTES_1` at all.
+    /// The distinction the rest of this module insists on -- absent means zero
+    /// for a *field*, unknown only for a dropped object -- is exactly what
+    /// makes the bare `bool` honest.
+    pub fn stealthed(&self) -> bool {
+        use crate::update::fields;
+        self.fields
+            .get(fields::UNIT_BYTES_1)
+            .map(u32::to_le_bytes)
+            .is_some_and(|bytes| {
+                bytes[fields::UNIT_BYTES_1_VIS_FLAGS] & fields::UNIT_VIS_FLAG_CREEP != 0
+            })
+    }
+
     /// Records a crossing of the alive/dead line, given what was true before
     /// the fields were merged.
     ///
@@ -3921,6 +3994,133 @@ mod tests {
             z: 0.0,
             orientation: 0.0,
         }
+    }
+
+    /// Exactly what the local realm published about `Roguetest` when the
+    /// character cast Stealth on itself, taken from the before/after field diff
+    /// of `wow-cli world --own-fields --cast 1784 --cast-self`: three fields
+    /// appeared and nothing else in 140 moved.
+    ///
+    /// Both of the fields that describe the state are asserted, because they
+    /// are two independent statements of one fact and this client deliberately
+    /// believes only one of them. If a later build reads the form byte instead,
+    /// this test says what it would be giving up.
+    #[test]
+    fn a_stealthed_rogue_reads_from_the_visibility_byte() {
+        use crate::update::fields;
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            0xb,
+            ObjectType::Player,
+            Some(at(1.0, 2.0)),
+            &[
+                (fields::UNIT_DISPLAY_ID, 49),
+                (fields::UNIT_NATIVE_DISPLAY_ID, 49),
+                (fields::UNIT_BYTES_1, 0x0002_0000),
+                (fields::UNIT_BYTES_2, 0x1e00_0000),
+            ],
+        )]);
+
+        let entity = world.get(0xb).expect("created");
+        assert!(entity.stealthed(), "the creep bit was not read");
+        assert_eq!(entity.shapeshift_form(), Some(30));
+        assert!(
+            !entity.transformed(),
+            "a stealthed rogue keeps its own body; only the form byte moved"
+        );
+        // The other end of the same field. Stealth writes byte 3 and the
+        // sheath state lives in byte 0, and a reader that took the whole word
+        // for either would report the other as garbage.
+        assert_eq!(entity.sheath(), crate::combat::SheathState::Unarmed);
+    }
+
+    /// The same measurement on a night elf druid casting Bear Form: the worn
+    /// display moved and the native one did not.
+    ///
+    /// `29415` and `55` are the values off the wire rather than round numbers,
+    /// so the assertion is about a capture and not about the test's idea of a
+    /// bear.
+    #[test]
+    fn a_druid_in_bear_form_is_transformed_but_not_stealthed() {
+        use crate::update::fields;
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            0xc,
+            ObjectType::Player,
+            Some(at(1.0, 2.0)),
+            &[
+                (fields::UNIT_DISPLAY_ID, 29415),
+                (fields::UNIT_NATIVE_DISPLAY_ID, 55),
+                (fields::UNIT_BYTES_2, 0x0500_0000),
+            ],
+        )]);
+
+        let entity = world.get(0xc).expect("created");
+        assert!(entity.transformed(), "the display ids differ and were not compared");
+        assert_eq!(entity.shapeshift_form(), Some(5));
+        assert!(
+            !entity.stealthed(),
+            "a bear is not stealthed, and it carries no UNIT_BYTES_1 at all"
+        );
+    }
+
+    /// **The case that refutes reading the form byte as "is this a
+    /// transformation".** A warrior in Battle Stance carries form 17 and its
+    /// own body, so a renderer keyed on the form would strip the character's
+    /// appearance off a perfectly ordinary human and dress it as a creature.
+    ///
+    /// Asserted next to its opposite deliberately: the two are
+    /// indistinguishable by the form byte alone, which is the whole reason
+    /// `transformed` compares display ids instead.
+    #[test]
+    fn a_stance_is_a_form_without_being_a_transformation() {
+        use crate::update::fields;
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            7,
+            ObjectType::Player,
+            Some(at(1.0, 2.0)),
+            &[
+                (fields::UNIT_DISPLAY_ID, 49),
+                (fields::UNIT_NATIVE_DISPLAY_ID, 49),
+                (fields::UNIT_BYTES_2, 0x1100_0001),
+            ],
+        )]);
+
+        let entity = world.get(7).expect("created");
+        assert_eq!(entity.shapeshift_form(), Some(17), "Battle Stance");
+        assert!(!entity.transformed());
+        assert_eq!(
+            entity.sheath(),
+            crate::combat::SheathState::Melee,
+            "byte 0 still means what it meant"
+        );
+    }
+
+    /// An ordinary creature has a display id and **no native one**, and the
+    /// absent field must not be read as a zero to compare against.
+    ///
+    /// This is the population the feature actually runs against -- a starting
+    /// zone is ninety-odd creatures and one player -- so getting it wrong would
+    /// mark the entire world transformed and undress nothing, which is the
+    /// quiet kind of wrong: the picture would be identical until the first
+    /// druid logged in.
+    #[test]
+    fn a_creature_with_no_native_display_is_not_transformed() {
+        use crate::update::fields;
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            9,
+            ObjectType::Unit,
+            Some(at(1.0, 2.0)),
+            &[(fields::UNIT_DISPLAY_ID, 603)],
+        )]);
+
+        let entity = world.get(9).expect("created");
+        assert_eq!(entity.native_display_id(), None);
+        assert!(!entity.transformed());
+        assert!(!entity.stealthed());
+        assert_eq!(entity.shapeshift_form(), None, "no UNIT_BYTES_2 was sent");
     }
 
     #[test]

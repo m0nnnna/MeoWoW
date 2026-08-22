@@ -7808,3 +7808,235 @@ signing in reaches Northshire. A person had to do that.
 * **The window does not go back to the sign-in screen on a disconnect.** A
   dropped connection still ends the session the way it always did. The screen
   exists, the state machine that would return to it does not.
+
+## 4.33: player states, and two fields that say the same thing about one of them
+
+`foss-wow#133`, in one sentence: *"Change in player states such as a rogues
+stealth or a druids transform need to be added."*
+
+Both had been invisible since players were first drawn. A druid casting Bear
+Form stayed a night elf; a rogue casting Stealth stood upright at full opacity.
+Neither failed — nothing errored, nothing warned, and the client had simply
+never asked the questions.
+
+### What is actually on the wire
+
+Measured before anything was written, by the diff this project always starts
+from: `wow-cli world --own-fields --cast-self --cast <spell>` prints every
+field of our own object before and after, and casting is the one way to make a
+state change happen on purpose.
+
+A rogue casting Stealth (1784) moved **three of 140 fields**:
+
+```text
+  0x004a: absent -> 0x00020000
+  0x007a: absent -> 0x1e000000
+  0x04cd: absent -> 0x20000000
+```
+
+A night elf druid casting Bear Form (5487) moved seventeen, of which two say
+what happened:
+
+```text
+  0x0043: 0x00000037 -> 0x000072e7     worn display: 55 -> 29415
+  0x007a: absent     -> 0x05000000     shapeshift form 5
+```
+
+`0x0044`, the native display, **did not move**. That is the whole
+identification of a transformation, and it is worth saying why the obvious
+alternative is wrong rather than merely worse.
+
+### The form byte is not the answer, and a warrior proves it
+
+`UNIT_FIELD_BYTES_2`'s top byte is the shapeshift form: `30` for the rogue, `5`
+for the bear. It is tempting to read "form is not zero" as "this unit is not
+wearing its own body", and it fails in both directions.
+
+The refutation arrived unasked, in the probe's own output. Every warrior on
+this realm reads **`form 17`** — Battle Stance — with its worn and native
+displays identical. A renderer keyed on the form would have stripped the
+character appearance off every warrior in the game and dressed it as a
+creature. In the other direction, a `.morph`ed player wears somebody else's
+model with the form byte at zero.
+
+So `Entity::transformed` compares the two display fields, and both halves must
+be **present**: an absent native display is not a statement, and reading it as
+a zero to compare against would have marked every creature in the world
+transformed — a starting zone is ninety-odd creatures and one player, so the
+picture would have been unchanged until the first druid logged in.
+
+### Two fields state the stealth, and the general one wins
+
+`0x004a` is `UNIT_FIELD_BYTES_1`, and byte 2 of it holds visibility flags; bit
+`0x02` is what the server's own source calls `CREEP`. `0x04cd` is
+`PLAYER_FIELD_BYTES2`, whose byte 3 gets a stealth bit at the same moment.
+Both are set by one handler, and this client reads only the first — because
+`SetStandFlags` is a method on *Unit* and the other is guarded by
+`if (target->IsPlayer())`. A stealthed creature carries the first and not the
+second, and the flag is meant to describe stealth rather than to describe
+players.
+
+The `--own-fields` diff cannot say which of the three fields anything concluded
+something *from*, which is why `--states` exists beside it: the dump prints the
+numbers, the report prints the readings, and a correct offset that nothing acts
+on shows up only in the second.
+
+### A command whose name is a claim
+
+The obvious probe for the *other* byte of `UNIT_FIELD_BYTES_1` — byte 0, the
+stand state — is AzerothCore's `.modify standstate`. It writes
+`UNIT_NPC_EMOTESTATE`. Running it moved `0x53` and left `0x4a` untouched, which
+is how that was found rather than believed; the handler is two lines long and
+says so.
+
+So the stand state and the animation tier are **named in the field's doc
+comment and given no accessor**. Nothing here has watched either of them move,
+and a real stand state needs `CMSG_STANDSTATECHANGE`, which this client cannot
+send. Naming a byte is not the same as reading it, and the file says which is
+which.
+
+### The look is the part that breaks, not the model
+
+A shapeshifted druid's model swapped correctly *before* any of this was
+written, because `Entity::display_id` is read fresh on every rebuild rather
+than cached at spawn. What did not work is everything layered on top of it.
+
+A replicated player carries an appearance and a set of worn items, and the
+renderer dresses its model from them: a character skin composed in memory from
+ten regions, uploaded into texture slot kind 1, and a geoset filter that keeps
+group variant 1 because **variant one of an equipment group is the bare body**.
+Every one of those is a fact about character models and about nothing else.
+Handed a bear, they compose a night elf's skin into whichever slot happens to
+be first and filter the bear's geometry by rules about hairstyles and gloves.
+
+So `entity_look` refuses to supply a look at all for a transformed unit, which
+sends it down the path every creature already takes — `npc_look`, keyed on the
+display id, which is where a bear's hide actually lives.
+
+That function is also the place the two call sites were merged. The windowed
+loop and `--screenshot` each carried their own copy of the three-source look
+decision, each with a comment saying a screenshot that dressed people
+differently from the window would be evidence about neither. **A trap
+documented at one call site does not protect the next one**; making it an
+argument nobody can forget to pass is what the rule actually recommends.
+
+### Fading a body needs the blend as well as the number
+
+Stealth draws the unit at 45% — chosen, not measured; no table says how faint
+a hidden rogue should be.
+
+`Instance` grew a `tint`, a colour multiplier the fragment shader applies to
+whatever the texture produced. Per instance rather than per pipeline for a
+reason this project has met before in the opposite direction: a stealthed rogue
+and an unstealthed one are the same mesh, the same composed 512x512 skin and
+the same geosets, so expressing the difference as a second *model* would
+compose that texture twice and re-read the `.m2` the moment somebody crouched.
+Stealth is therefore the fourth term of the bucket key and is **deliberately
+absent from the model cache key** — four terms in the tuple, three in the key.
+
+A tint alone does nothing. A character's body is an opaque material and an
+opaque pipeline ignores the alpha it is handed, so the two have to travel
+together: `Group::translucent` switches the blend on and depth writing off, and
+both halves fail differently. Without the blend the rogue draws at full
+strength and the feature looks unimplemented. Without the depth change the
+rogue draws as a person-shaped hole in the grass behind it, which looks like a
+rendering fault. Anything that already blends — an additive glow on a weapon —
+is left exactly as it is, because forcing alpha blending onto it does not make
+it fainter, it makes it wrong.
+
+The shadow pass reads the same instance buffer and declares only the four
+matrix columns, so it never sees the tint. A crouching character still blocks
+the sun.
+
+### The crouch, and a number that had to come from the table
+
+`StealthStand`, `StealthWalk` and `StealthRun` are `AnimationData.dbc` rows
+**120, 119 and 223**. On `HumanMale.m2` they are *sequence indices* 110, 111
+and 146 — and transcribing those would have named `SwimIdle`, `Drown` and
+nothing at all. Two of those exist, so the mistake would have played a
+plausible wrong cycle rather than failing, which is exactly what it did to this
+project once already with `Sheath` and `HipSheath`.
+
+The fallback chains are the table's own column, unedited: 223 names 119, which
+names 4 (`Walk`); 120 names 0 (`Stand`). The last entry in each is
+load-bearing, because the stealth flag is set on *units* and a stealthed
+creature carrying none of the three would otherwise slide along the ground in
+its bind pose.
+
+`Motion::crouched` applies it, and it is a transformation applied *after*
+`Motion::resolve` rather than a thirteenth argument to it. `resolve` answers
+"what is this body doing"; stealth does not change that answer, it changes the
+posture the answer is performed in. What passes through unchanged is the
+interesting half — dying, lying dead, jumping and swimming are things a body is
+doing that a crouch cannot describe, and the server clears the flag for none of
+them, so a rogue who stealths and then jumps off a wall must play the jump.
+Everything else collapses to a crouch, the combat states included: swinging,
+casting and sheathing each break stealth server-side, so the flag is already
+gone by the time any of them is replicated.
+
+### The observer test, and the finding that needed a control
+
+Two clients, because the ticket is about watching somebody else.
+
+A GM-sighted observer watching a rogue cast Stealth reads it exactly:
+
+```text
+  0x000000000000000b  player  entry 0  display 49     stealthed, form 30
+```
+
+and one watching a druid take Bear Form reads:
+
+```text
+  0x000000000000000c  player  entry 0  display 29415  transformed (wearing 29415, native 55), form 5
+```
+
+The first attempt reported neither. An ordinary observer standing 36 units from
+a stealthing rogue saw **no player object at all** — which is
+indistinguishable from a client that cannot read the flag, from a visibility
+range problem, and from a mistimed run. Three investigations, one printout.
+
+What separated them was clearing the aura and running the identical pair again:
+unstealthed, the rogue replicates and reads `-`; stealthed, it is not in the
+observer's world. **The server removes the object rather than flagging it**,
+which is the game's own rule and not a defect. Stealth rendering therefore
+matters for exactly the cases where the server does replicate the unit — your
+own character, your party, and anyone who can detect them — and that is a
+scoping fact no amount of client-side reasoning would have produced.
+
+The first run also failed for a duller reason worth writing down: `Testwolf`
+and `Druidtest` were 150 units apart and simply could not see each other. Two
+characters in different places produce a confident-looking null result.
+
+### What saw which half
+
+* **The protocol**, by `--states` under two clients on the local realm, with a
+  control run that makes the negative case mean something.
+* **The transformation**, by a headless render: display 29415 loads with
+  eleven `.anim` files and **no placeholder-texture warning**, which is what a
+  player look wrongly applied to a creature would have produced, and the
+  picture is a bear standing in Northshire.
+* **The fade**, by an A/B of two headless renders from one camera with the aura
+  as the only difference, measured rather than looked at: **23.8% of the pixels
+  in the rogue's own region changed at a mean delta of 87**, against **0.1% on
+  another player a hundred pixels away** and **0.0% on empty ground**. The
+  controls are the evidence; a lone difference in one region says nothing about
+  whether the whole frame moved.
+* **The crouch pose is not confirmed at the window.** The chains are asserted
+  headlessly and the model carries all three cycles with keyed bones, but
+  nothing has watched a rogue actually crouch.
+
+### Still not done
+
+* **Stand state.** The byte is named and unread — no `/sit`, no
+  `CMSG_STANDSTATECHANGE`, and a sitting NPC draws standing.
+* **The animation tier**, byte 3 of the same field: hover, flying, submerged.
+  Named for the same reason and left for whenever flight is.
+* **No aura system.** `SMSG_AURA_UPDATE` (`0x0496`) and `SMSG_AURA_UPDATE_ALL`
+  (`0x0495`) both arrive and neither is parsed. Every state here is read from a
+  replicated *field*, which is enough for stealth and for shapeshifting and is
+  not enough for a buff bar.
+* **No form names.** `Entity::shapeshift_form` returns the raw byte. Two values
+  have been watched arrive and thirty have not, and naming a table that only
+  produces text is the mistake `describe_cast_failure` exists to refuse.
+* **Mounts are untested.** A mount is a display change like any other and
+  should already work; nothing here has ridden one.

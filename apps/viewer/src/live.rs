@@ -107,6 +107,22 @@ pub struct Entity {
     /// unit that entered view already stowed must not play the transition
     /// for a change nobody watched happen.
     pub sheath_changed_ms_ago: Option<u32>,
+    /// Whether this unit is wearing a body that is not its own.
+    ///
+    /// Carried beside `appearance` rather than folded into it -- by clearing
+    /// the appearance when a player transforms -- because the two answer
+    /// different questions and the renderer asks both. The appearance is still
+    /// *true*: a druid in bear form is still a night elf with that hairstyle,
+    /// and will be one again when the form drops. What has changed is only
+    /// whether it applies to the model on screen. Blanking it here would also
+    /// have to blank `visible_items`, and the moment the form dropped both
+    /// would have to be found again.
+    pub transformed: bool,
+    /// Whether this unit is stealthed, and so drawn faded and crouched.
+    ///
+    /// True for anything the server marks, not only for players: a stealthed
+    /// creature carries the same flag. See `world::state::Entity::stealthed`.
+    pub stealthed: bool,
 }
 
 /// Where the player is and what can be seen from there.
@@ -622,6 +638,8 @@ pub fn drawable_entities(
             sheath_changed_ms_ago: entity
                 .sheath_changed_ago(now)
                 .map(|d| d.as_millis() as u32),
+            transformed: entity.transformed(),
+            stealthed: entity.stealthed(),
         });
     }
     entities
@@ -819,6 +837,17 @@ pub fn own_entity(
         sheath_changed_ms_ago: entity
             .sheath_changed_ago(std::time::Instant::now())
             .map(|d| d.as_millis() as u32),
+        // **Both of these are read from replicated state for our own body
+        // too**, and that is a statement worth making rather than an
+        // oversight: the appearance two fields up is deliberately *not*, on
+        // the grounds that the character list already answered it. The
+        // difference is that the character list is a snapshot taken at login
+        // and these two change during the session -- so for these, the fields
+        // are the only source that can be current. Shapeshifting on our own
+        // client and seeing nothing happen would be the failure, and it is the
+        // one a login-time snapshot produces.
+        transformed: entity.transformed(),
+        stealthed: entity.stealthed(),
     })
 }
 

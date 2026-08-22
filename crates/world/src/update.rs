@@ -1056,10 +1056,58 @@ pub mod fields {
     pub const UNIT_FACTION: u16 = 0x37;
     pub const UNIT_FLAGS: u16 = 0x3B;
     pub const UNIT_DISPLAY_ID: u16 = 0x43;
+
+    /// The model this unit wears **when nothing is transforming it**.
+    ///
+    /// Declared since the display fields were first named and unused until
+    /// there was a druid to point it at. It is the other half of a comparison,
+    /// not a thing to draw: [`UNIT_DISPLAY_ID`] is what a client renders, and
+    /// this says what that would have been.
+    ///
+    /// **The difference between the two is the only reliable statement on the
+    /// wire that a unit is not itself.** The obvious alternative -- read the
+    /// shapeshift form out of [`UNIT_BYTES_2`] and call anything non-zero a
+    /// transformation -- is wrong in both directions: a warrior in Battle
+    /// Stance carries form 17 with its own body, and a `.morph`ed player
+    /// carries form 0 wearing a murloc. Measured on a night elf druid casting
+    /// Bear Form: `0x43` moved 55 -> 29415 in the same update block that left
+    /// `0x44` at 55.
     pub const UNIT_NATIVE_DISPLAY_ID: u16 = 0x44;
 
+    /// Four packed bytes describing how a unit is *holding itself*, as opposed
+    /// to what it is: byte 0 the stand state, byte 2 a set of visibility
+    /// flags, byte 3 the animation tier.
+    ///
+    /// **Only byte 2 is measured here, and only one bit of it.** Casting
+    /// Stealth on a rogue set this field from absent to `0x00020000` in the
+    /// same update as the shapeshift form -- so bit `0x02` of byte 2 is the
+    /// stealth flag, which the server's own source calls `CREEP`. See
+    /// [`crate::state::Entity::stealthed`].
+    ///
+    /// The other two bytes are named from the server's enum and **nothing here
+    /// has watched either of them move**, which is why neither has an accessor.
+    /// The obvious probe for byte 0 is not the obvious command: AzerothCore's
+    /// `.modify standstate` writes [`UNIT_NPC_EMOTESTATE`] instead, which this
+    /// project found out by running it and diffing -- `0x53` moved and `0x4a`
+    /// did not. A real stand state needs `CMSG_STANDSTATECHANGE`, which this
+    /// client cannot send yet.
+    ///
+    /// Placed by arithmetic against fields already confirmed, the same check
+    /// [`UNIT_BYTES_2`] records: `OBJECT_END + 0x44` with `OBJECT_END = 6`, and
+    /// the same expression gives `0x43` for the display id and `0x52` for the
+    /// NPC flags, both of which this client already reads and both of which
+    /// hold what a live capture says they should.
+    pub const UNIT_BYTES_1: u16 = 0x4A;
+
+    /// Which byte of [`UNIT_BYTES_1`] carries the visibility flags.
+    pub const UNIT_BYTES_1_VIS_FLAGS: usize = 2;
+
+    /// The bit of [`UNIT_BYTES_1`]'s visibility byte that means "stealthed".
+    pub const UNIT_VIS_FLAG_CREEP: u8 = 0x02;
+
     /// Four packed bytes; byte 0 is the sheath state -- see
-    /// [`crate::combat::SheathState`].
+    /// [`crate::combat::SheathState`] -- and byte 3 is the shapeshift form,
+    /// see [`crate::state::Entity::shapeshift_form`].
     ///
     /// Located by arithmetic that was checked against fields already confirmed
     /// here rather than taken on trust: the index is `OBJECT_END + 0x74` with
@@ -1069,6 +1117,16 @@ pub mod fields {
     /// appearing exactly when a fight started). Then confirmed directly, by
     /// sending each sheath state and watching byte 0 follow.
     pub const UNIT_BYTES_2: u16 = 0x7A;
+
+    /// Which byte of [`UNIT_BYTES_2`] carries the shapeshift form.
+    ///
+    /// Confirmed twice from opposite ends of the same field, which is what
+    /// makes it more than an offset somebody wrote down: a rogue casting
+    /// Stealth put `30` here with byte 0 untouched, and a druid casting Bear
+    /// Form put `5` here on a field that had not been present at all. The
+    /// sheath state has occupied byte 0 since 4.22 and did not move for
+    /// either.
+    pub const UNIT_BYTES_2_FORM: usize = 3;
 
     /// Which model a game object wears -- a row in `GameObjectDisplayInfo`,
     /// which is a different table from the one units use.
