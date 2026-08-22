@@ -8021,9 +8021,12 @@ characters in different places produce a confident-looking null result.
   another player a hundred pixels away** and **0.0% on empty ground**. The
   controls are the evidence; a lone difference in one region says nothing about
   whether the whole frame moved.
-* **The crouch pose is not confirmed at the window.** The chains are asserted
-  headlessly and the model carries all three cycles with keyed bones, but
-  nothing has watched a rogue actually crouch.
+* **The crouch pose, the fade in motion and the toggle**, by Kake at the
+  window, which is the only instrument that could see any of them:
+  `--screenshot` draws a single frame and a crouch is a cycle, a fade at 45%
+  is a judgement rather than a measurement, and an action-bar press is input
+  routing that no headless test drives. The three headless instruments above
+  each saw a *different* half, and none of them saw this one.
 
 ### The toggle that would not switch off, and the two bugs behind it
 
@@ -8113,6 +8116,25 @@ Caught before it ever reached the window, by a probe that printed the number
 beside the fields it came from. It would have arrived as a second bug report
 reading "the stealth button is stuck".
 
+### Confirmed at the window
+
+Kake stealthed, crouched, faded, pressed the button again and stood up.
+
+**That is the confirmation the headless instruments could not give**, and it is
+worth naming why rather than just recording that it happened. Three separate
+measurements above each saw a real half of this milestone — the wire under two
+clients, a bear loading without a placeholder texture, 23.8% of a region's
+pixels moving against two controls — and not one of them could see a *cycle*, a
+*judgement about how faint is right*, or an *action-bar press*. `--screenshot`
+renders one frame, and a crouch that never animates and a crouch are the same
+picture; the fade's number was chosen rather than measured, so only a person can
+say 45% was right; and no headless test drives input routing.
+
+The first report was also the useful kind — *"the stealth took but the recast
+doesn't unstealth"* — which named the working half and the broken half in one
+sentence, and the broken half turned out to be three bugs, two of which nobody
+had seen yet.
+
 ### Still not done
 
 * **Stand state.** The byte is named and unread — no `/sit`, no
@@ -8122,9 +8144,10 @@ reading "the stealth button is stuck".
 * **No buff bar.** Both aura opcodes are parsed now and the list is kept per
   unit, but nothing draws it. It exists to answer one question -- which spell
   id to cancel -- and that is all it is used for.
-* **Nothing cancels a shapeshift.** The same `CMSG_CANCEL_AURA` should drop a
-  druid's form, and pressing the form's own button will now try it, but no
-  druid has been sat in front of a bar to check.
+* **Nothing cancels a *stance*.** A warrior's Battle Stance is a form and not
+  an aura, so pressing its button again goes down the cast path and is
+  discarded exactly as stealth used to be. It has not been looked at, and the
+  fix is not the same one: there is no aura to name.
 * **No form names.** `Entity::shapeshift_form` returns the raw byte. Two values
   have been watched arrive and thirty have not, and naming a table that only
   produces text is the mistake `describe_cast_failure` exists to refuse.
