@@ -288,6 +288,13 @@ pub struct Spellbook {
     /// What a cast looks like, for every spell rather than only the known
     /// ones -- see [`CastAnimations`].
     pub cast_animations: CastAnimations,
+    /// Ids [`Self::resolve_extra`] has already looked up, successfully or
+    /// not. Separate from [`Self::known`] so a spell id `Spell.dbc` genuinely
+    /// has no row for is not retried on every hover -- without this a
+    /// consumable whose entry the server never sent a use-spell for would
+    /// rescan the whole table once per frame for as long as it stayed
+    /// hovered.
+    resolved_extra: HashSet<u32>,
 }
 
 impl Spellbook {
@@ -447,6 +454,66 @@ impl Spellbook {
             book.cast_animations.len()
         );
         book
+    }
+
+    /// Reads name, rank, description and effect values for one spell
+    /// [`Self::load`] was never asked for -- an item's on-use effect, most
+    /// often, since which items exist is not known until well after login.
+    ///
+    /// A full `Spell.dbc` scan per call rather than another batch load: an
+    /// item's on-use spell is discovered one at a time, as a bag or worn
+    /// slot is first hovered, and there are only ever a handful of them in
+    /// one session (food, drink, potions, bandages). Re-running `load`'s
+    /// batch for every single one would rescan the whole fifty-thousand-row
+    /// table on every new item instead of once at login. [`Self::resolved_extra`]
+    /// makes repeat calls for the same id -- which a held-open tooltip makes
+    /// every frame -- free after the first.
+    pub fn resolve_extra(&mut self, chain: &mut Chain, spell: u32) {
+        if spell == 0 || self.known.contains_key(&spell) || self.resolved_extra.contains(&spell) {
+            return;
+        }
+        self.resolved_extra.insert(spell);
+
+        use dbc::schema::{Spell, SpellDuration, SpellRadius};
+        let Some(table) = chain.read(Spell::PATH).ok().and_then(|bytes| Spell::parse(&bytes).ok())
+        else {
+            return;
+        };
+        let Some(row) = table.iter().find(|row| row.id() == spell) else {
+            return;
+        };
+
+        // Same two small index tables `load` reads, for the same tokens --
+        // `$d` and `$a1` need them to resolve at all.
+        let durations: HashMap<u32, i32> = chain
+            .read(SpellDuration::PATH)
+            .ok()
+            .and_then(|bytes| SpellDuration::parse(&bytes).ok())
+            .map(|table| {
+                table
+                    .iter()
+                    .map(|row| (row.id(), row.duration().min(row.max_duration())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let radii: HashMap<u32, f32> = chain
+            .read(SpellRadius::PATH)
+            .ok()
+            .and_then(|bytes| SpellRadius::parse(&bytes).ok())
+            .map(|table| table.iter().map(|row| (row.id(), row.radius())).collect())
+            .unwrap_or_default();
+
+        self.values.insert(spell, values_of(&row, &durations, &radii));
+        self.known.insert(
+            spell,
+            SpellInfo {
+                name: row.name().to_string(),
+                rank: row.rank().to_string(),
+                description: row.description().to_string(),
+                icon_path: None,
+                passive: row.attributes() & ATTR_PASSIVE != 0,
+            },
+        );
     }
 
     /// What to call a spell on a bar.

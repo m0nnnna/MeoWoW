@@ -383,6 +383,11 @@ mod tests {
             buy_price: 25,
             sell_price: 5,
             max_durability: 55,
+            stats: Vec::new(),
+            armor: 0,
+            damage_min: 0.0,
+            damage_max: 0.0,
+            weapon_delay: 0,
             spells: Vec::new(),
         }
     }

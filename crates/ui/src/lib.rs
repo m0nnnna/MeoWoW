@@ -1941,6 +1941,37 @@ impl Hud {
                             }
                         }
                     }
+                    // Hovering explains what is in the square, the same
+                    // gesture as the action bar's own tooltip above.
+                    if let Some(pointer) = response.hover_pos() {
+                        if let Some(row) = frames::bags::slot_at(
+                            drawn_rect,
+                            slots.len(),
+                            &style,
+                            element.scale,
+                            pointer,
+                        ) {
+                            if let Some(item) = slots.get(row).and_then(|s| s.item.as_ref()) {
+                                frames::bags::hover_tooltip(&response, item);
+                            }
+                        }
+                    }
+                }
+                // The character panel has no click behaviour of its own --
+                // see the module comment on why there is nothing here to
+                // combine -- but a worn item wants the same explanation a
+                // bag square gets, so it borrows `bags::hover_tooltip`
+                // rather than duplicating it.
+                (false, Content::Character(slots)) => {
+                    if let Some(pointer) = response.hover_pos() {
+                        if let Some(row) =
+                            frames::character::slot_at(drawn_rect, &style, element.scale, pointer)
+                        {
+                            if let Some(item) = slots.get(row).and_then(|s| s.item.as_ref()) {
+                                frames::bags::hover_tooltip(&response, item);
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -2847,6 +2878,117 @@ mod tests {
             assert!(
                 !empty.iter().any(|text| text == wanted),
                 "hovering an empty slot painted {wanted:?} anyway"
+            );
+        }
+    }
+
+    /// The same tooltip on a bag square -- foss-wow#143. Worth its own
+    /// headless test rather than trusting the code path shared with the
+    /// action bar's, because the fields it reads (`quality`, `item_level`,
+    /// `required_level`, `description`) are new ones no other test touches.
+    #[test]
+    fn a_hovered_bag_item_names_its_quality_level_and_flavour() {
+        let mut slots = vec![frames::BagSlot::default(); 16];
+        slots[0] = frames::BagSlot {
+            item: Some(frames::BagItem {
+                entry: 2224,
+                name: "Small Dagger".into(),
+                count: 1,
+                icon: None,
+                quality: 3,
+                item_level: 5,
+                required_level: 2,
+                description: "A wicked blade.".into(),
+                armor: 0,
+                weapon: Some(frames::WeaponStats {
+                    damage_min: 2.0,
+                    damage_max: 5.0,
+                    delay_ms: 1800,
+                }),
+                stats: vec![("Agility".to_string(), 3)],
+                use_description: "Poisons the blade for 30 sec.".into(),
+            }),
+        };
+        let data = HudData {
+            bags: Some(&slots),
+            ..Default::default()
+        };
+
+        let profile = Profile::default();
+        let element = profile.get(ElementId::Bags);
+        let rect = element.rect(
+            screen(),
+            frames::bags::size(slots.len(), &profile.style, element.scale),
+        );
+        let centre = frames::bags::slot_rects(rect, slots.len(), &profile.style, element.scale)
+            .next()
+            .unwrap()
+            .center();
+
+        let mut hud = Hud::default();
+        let filled = painted_text(&shapes(&mut hud, &data, Some(centre)));
+
+        for wanted in [
+            "Small Dagger",
+            "2 - 5 Damage",
+            "Speed 1.80",
+            "+3 Agility",
+            "Use: Poisons the blade for 30 sec.",
+            "Item Level 5",
+            "Requires Level 2",
+            "A wicked blade.",
+        ] {
+            assert!(
+                filled.iter().any(|text| text == wanted),
+                "hovering the square never painted {wanted:?}; got {filled:?}"
+            );
+        }
+    }
+
+    /// The character panel senses only hover, never click -- see its module
+    /// comment. That makes it the one place a `Sense` mismatch would show up
+    /// as "the tooltip silently never appears" rather than as a failed click
+    /// test, so it gets its own check rather than trusting the bag window's.
+    #[test]
+    fn a_hovered_worn_item_explains_itself_too() {
+        let mut slots = frames::character::placeholder();
+        slots[0].item = Some(frames::BagItem {
+            entry: 100,
+            name: "Lucky Hat".into(),
+            count: 1,
+            icon: None,
+            quality: 4,
+            item_level: 10,
+            required_level: 1,
+            description: String::new(),
+            armor: 15,
+            weapon: None,
+            stats: vec![("Stamina".to_string(), 5)],
+            use_description: String::new(),
+        });
+        let data = HudData {
+            character: Some(&slots),
+            ..Default::default()
+        };
+
+        let profile = Profile::default();
+        let element = profile.get(ElementId::Character);
+        let rect = element.rect(
+            screen(),
+            frames::character::size(&profile.style, element.scale),
+        );
+        let centre = frames::character::slot_rects(rect, &profile.style, element.scale)
+            .next()
+            .unwrap()
+            .center();
+
+        let mut hud = Hud::default();
+        let filled = painted_text(&shapes(&mut hud, &data, Some(centre)));
+
+        for wanted in ["Lucky Hat", "15 Armor", "+5 Stamina", "Item Level 10"] {
+            assert!(
+                filled.iter().any(|text| text == wanted),
+                "hovering the worn item never painted {wanted:?}; got {filled:?}"
             );
         }
     }
@@ -4727,6 +4869,7 @@ mod tests {
                 name: "Linen Cloth".into(),
                 count: 3,
                 icon: None,
+                ..Default::default()
             }),
         };
         slots[1] = frames::BagSlot {
@@ -4736,6 +4879,7 @@ mod tests {
                 // A stack of one draws no number at all -- see `BagItem::count`.
                 count: 1,
                 icon: None,
+                ..Default::default()
             }),
         };
 
@@ -4819,6 +4963,7 @@ mod tests {
                     name: name.to_string(),
                     count: *count,
                     icon: None,
+                    ..Default::default()
                 }),
             };
         }

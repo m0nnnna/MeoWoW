@@ -46,7 +46,7 @@ pub struct BagSlot {
     pub item: Option<BagItem>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BagItem {
     /// The item's entry, so a caller can identify what was clicked.
     pub entry: u32,
@@ -59,6 +59,67 @@ pub struct BagItem {
     /// keeps a bag of single items from being covered in digits.
     pub count: u32,
     pub icon: Option<egui::TextureId>,
+    /// 0 poor .. 6 artifact, straight off `query::ItemInfo::quality` -- see
+    /// [`quality_color`]. `0` before the query answers, which is also poor's
+    /// own value; the tooltip's name line is briefly the wrong colour rather
+    /// than an invented one.
+    pub quality: u32,
+    /// 0 until the item query answers. The tooltip leaves the line off
+    /// entirely rather than print "Item Level 0", which is not a real item.
+    pub item_level: u32,
+    pub required_level: u32,
+    /// The flavour line. Empty for most items, and empty means "draw
+    /// nothing" -- same convention as the level fields above.
+    pub description: String,
+    /// Physical armor. `0` for anything that is not armor -- see
+    /// `query::ItemInfo::armor`.
+    pub armor: u32,
+    /// A weapon's damage range and swing speed. `None` for anything that is
+    /// not a weapon, and this crate does not try to tell "no damage" apart
+    /// from "not a weapon" -- the caller, which knows `item_class`, decides
+    /// whether to fill this in.
+    pub weapon: Option<WeaponStats>,
+    /// The stat bonuses this item grants, one line each, already resolved to
+    /// a label by the caller -- see `query::item_stat_label`. An unnamed
+    /// stat type arrives as `"Stat N"` rather than being dropped, the same
+    /// fallback `describe_cast_failure` uses for an unconfirmed status code:
+    /// this crate has no opinion about what a stat type means and only
+    /// draws what it is handed.
+    pub stats: Vec<(String, i32)>,
+    /// What a click does, for something with an on-use effect -- a potion, a
+    /// bandage, food. Empty for most items, which have none, and empty for
+    /// one that does until its spell has been resolved -- see
+    /// `spells::Spellbook::resolve_extra`. Any `$`-tokens the spell's own
+    /// description could not resolve (most often `$o`, a periodic effect's
+    /// total, which this project's `dbc::spelltext` deliberately leaves
+    /// unconfirmed) are left visible rather than guessed at, the same rule
+    /// every other tooltip in this client already follows.
+    pub use_description: String,
+}
+
+/// A weapon's damage and speed, as shown on a tooltip. See [`BagItem::weapon`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeaponStats {
+    pub damage_min: f32,
+    pub damage_max: f32,
+    /// Milliseconds between swings.
+    pub delay_ms: u32,
+}
+
+/// Everything [`BagItem`] carries beyond the icon, name and count -- a
+/// caller-side convenience so a builder assembling a bag square and a
+/// worn-item square can compute this once and hand off the same value to
+/// both, rather than repeating seven field lookups at each call site.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BagItemTooltip {
+    pub quality: u32,
+    pub item_level: u32,
+    pub required_level: u32,
+    pub description: String,
+    pub armor: u32,
+    pub weapon: Option<WeaponStats>,
+    pub stats: Vec<(String, i32)>,
+    pub use_description: String,
 }
 
 /// How many rows a given number of slots needs.
@@ -291,6 +352,60 @@ pub fn draw_held(painter: &Painter, at: Pos2, item: &BagItem, style: &Style, sca
     );
 }
 
+/// Explains what is sitting in a hovered bag or equipped square: its name,
+/// coloured by quality, its level requirements, and its flavour text if it
+/// has one.
+///
+/// The same reasoning as [`super::action_bar::hover_tooltip`] applies here,
+/// more sharply: an icon-less square already collapses to four letters (see
+/// [`super::action_bar::abbreviate`]), and even an iconned one carries
+/// nothing on its face to tell a rare sword from a common one of the same
+/// shape.
+pub fn hover_tooltip(response: &egui::Response, item: &BagItem) {
+    egui::Tooltip::for_widget(response).at_pointer().show(|ui| {
+        ui.colored_label(quality_color(item.quality), &item.name);
+        if let Some(weapon) = item.weapon {
+            ui.label(format!("{} - {} Damage", weapon.damage_min, weapon.damage_max));
+            ui.label(format!("Speed {:.2}", weapon.delay_ms as f32 / 1000.0));
+        }
+        if item.armor > 0 {
+            ui.label(format!("{} Armor", item.armor));
+        }
+        for (label, value) in &item.stats {
+            ui.label(format!("+{value} {label}"));
+        }
+        if !item.use_description.is_empty() {
+            ui.colored_label(Color32::from_rgb(25, 200, 25), format!("Use: {}", item.use_description));
+        }
+        if item.item_level > 0 {
+            ui.label(format!("Item Level {}", item.item_level));
+        }
+        if item.required_level > 0 {
+            ui.label(format!("Requires Level {}", item.required_level));
+        }
+        if !item.description.is_empty() {
+            ui.weak(&item.description);
+        }
+    });
+}
+
+/// The client's standard colour for each quality tier, `0` poor through `6`
+/// artifact -- the same numbers `query::ItemInfo::quality` carries straight
+/// off the wire. Nothing in 3.3.5 goes past artifact; an unrecognised value
+/// falls back to poor's grey rather than white, so it reads as "notice this"
+/// instead of "ordinary".
+pub fn quality_color(quality: u32) -> Color32 {
+    match quality {
+        1 => Color32::from_rgb(255, 255, 255),
+        2 => Color32::from_rgb(30, 255, 0),
+        3 => Color32::from_rgb(0, 112, 255),
+        4 => Color32::from_rgb(163, 53, 238),
+        5 => Color32::from_rgb(255, 128, 0),
+        6 => Color32::from_rgb(230, 204, 128),
+        _ => Color32::from_rgb(157, 157, 157),
+    }
+}
+
 fn corner_radius(radius: f32) -> egui::CornerRadius {
     egui::CornerRadius::same(radius.round().clamp(0.0, 255.0) as u8)
 }
@@ -313,6 +428,8 @@ pub fn placeholder() -> Vec<BagSlot> {
                 name: name.to_string(),
                 count,
                 icon: None,
+                quality: 1,
+                ..Default::default()
             }),
         };
     }

@@ -1400,6 +1400,12 @@ pub struct WorldState {
     /// table. A second one drifts, and a new opcode wired into one and not the
     /// other freezes whatever it should have moved.
     pub names: crate::names::Names,
+    /// Where the last `SMSG_BINDPOINTUPDATE` sent the player -- the server's
+    /// own login-burst packet, and again on every rebind. `None` only until
+    /// the first one arrives; unlike everything else in this crate there is
+    /// no query to retry, so a client that never sees this one simply never
+    /// answers `$z`. See [`crate::query::BindPoint`].
+    pub home_bind: Option<crate::query::BindPoint>,
     /// The group this character is in, or `None` for none.
     ///
     /// **The one piece of replicated state here that needs no accounting**,
@@ -2782,6 +2788,19 @@ impl WorldState {
                             report.names += 1;
                             self.names.apply_item(&answer);
                         }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                // Pushed unprompted, not answered -- see the doc comment on
+                // `WorldState::home_bind`. The latest received simply
+                // replaces whatever was there; there is nothing to merge.
+                crate::opcode::server::BIND_POINT_UPDATE => {
+                    match crate::query::parse_bind_point_update(&packet.body) {
+                        Ok(point) => self.home_bind = Some(point),
                         Err(error) => report.failures.push((
                             packet.opcode,
                             error,

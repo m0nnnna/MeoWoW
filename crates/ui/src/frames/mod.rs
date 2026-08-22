@@ -43,7 +43,7 @@ pub mod vendor;
 pub mod world_map;
 
 pub use auction::{AuctionClick, AuctionRow, AuctionTab, AuctionView};
-pub use bags::{BagItem, BagSlot};
+pub use bags::{BagItem, BagItemTooltip, BagSlot, WeaponStats};
 pub use character::EquipSlot;
 pub use guild::{GuildRow, GuildView, OfficerNotes};
 pub use loot::{LootRow, Take};

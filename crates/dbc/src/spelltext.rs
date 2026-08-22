@@ -24,9 +24,32 @@
 //! - `$?s12345[a][b]` conditionals, `$gmale:female;` and `$lsingular:plural;`
 //!   -- these need the player, not the spell.
 //! - `$h` proc chance, `$n` charges, `$x` chain targets, `$i` max targets,
-//!   `$u` stacks, `$o` total-over-time, and several rarer letters besides:
-//!   no column for any of them has been confirmed, so none of them is
-//!   guessed at.
+//!   `$u` stacks, and several rarer letters besides: no column for any of
+//!   them has been confirmed, so none of them is guessed at.
+//!
+//! **`$o` is the one exception, and it is arithmetic rather than a column.**
+//! A periodic effect's total is `$s` (one above the stored base) times the
+//! number of ticks the confirmed `period` and `duration` columns produce --
+//! nothing here is a fourth unconfirmed number, it is the same three
+//! multiplied together. Foss-wow#143: this was left unresolved for a
+//! session first, on the reasoning that the *formula* had not been checked
+//! against this client's own data the way every other token here was.
+//!
+//! **The first version of that formula was still wrong, and the wrongness
+//! was instructive.** Every "Food" and "Drink" spell (433, 434, 435, and
+//! `Drink`'s mana effect) stores `effect_aura_period: 0` on the very effect
+//! `$o` reads from, so a period-must-be-positive guard leaves the most
+//! common user of this token permanently unresolved -- the exact case Kake
+//! asked about. **A stored zero is not "not periodic", it is "the engine's
+//! own default applies"**: AzerothCore's `AuraEffect::CalculatePeriodic`
+//! (`SpellAuraEffects.cpp:607`) sets `m_amplitude = 1 * IN_MILLISECONDS`
+//! whenever the column reads zero, before dividing the aura's duration by
+//! it for the tick count actually applied in play -- confirmed by reading
+//! the source per `CLAUDE.md` rule 2, not by guessing at a nicer-sounding
+//! constant. (A first guess of a 5-second tick, prompted by the short
+//! `tooltip` column's `$/5;s1`, was refuted by `Drink`'s own mana effect:
+//! its real period is 2200ms and its short tooltip *also* says `/5`, so
+//! that divisor is fixed authoring boilerplate and not a real interval.)
 //!
 //! **Frequency counts deliberately do not live in this comment.** An earlier
 //! version of it hand-counted uses per construct, and running [`scan`] for
@@ -395,6 +418,30 @@ fn value_token(
             }
             format_number(value.period[slot] as f64 / 1000.0)
         }
+        // See the module comment: not a fourth unconfirmed column, the same
+        // three `$s`, `$t` and `$d` already use, multiplied together.
+        //
+        // **A stored period of zero is not "no ticking".** Every "Food" and
+        // "Drink" spell in build 12340 (433, 434, 435, and `Drink`'s mana
+        // effect) carries `effect_aura_period: 0` on the very effect their
+        // own description's `$o1` refers to -- confirmed against
+        // AzerothCore's `AuraEffect::CalculatePeriodic`
+        // (`SpellAuraEffects.cpp:607`), which defaults `m_amplitude` to
+        // exactly `1 * IN_MILLISECONDS` whenever the column reads zero,
+        // before dividing the aura's duration by it (integer division) to
+        // get the tick count actually applied in play. This is an
+        // aura-engine constant, not a per-spell guess, and only `$o`
+        // defaults it -- `$t` still reports a genuinely absent period as
+        // unresolved, because nothing here has verified retail shows "1
+        // sec" rather than nothing for a `$t` on a zero-period effect.
+        'o' | 'O' => {
+            if value.duration_ms <= 0 {
+                return None;
+            }
+            let period = if value.period[slot] > 0 { value.period[slot] } else { 1000 };
+            let ticks = value.duration_ms / period;
+            format_number((value.base[slot] + 1).abs() as f64 * ticks as f64)
+        }
         _ => return None,
     };
     Some((text, next))
@@ -506,6 +553,58 @@ mod tests {
                 &book()
             ),
             "increasing attack power of all raid and party members within 30 yards by 15.  Lasts 2 min."
+        );
+    }
+
+    /// `$o` is arithmetic over the three columns `$s`, `$t` and `$d` already
+    /// use, not a fourth captured one -- see the module comment. Synthetic
+    /// rather than a row out of `book()`, because none of the real captures
+    /// there carry a periodic effect to exercise it with: 3 sec between
+    /// ticks over a 12 sec duration is 4 ticks of (9 + 1), which is 40.
+    #[test]
+    fn total_over_time_multiplies_the_per_tick_amount_by_the_tick_count() {
+        let values = HashMap::from([(
+            27636,
+            Values {
+                base: [9, 0, 0],
+                period: [3_000, 0, 0],
+                duration_ms: 12_000,
+                ..Default::default()
+            },
+        )]);
+        assert_eq!(
+            substitute("Restores $o1 health over $d.", 27636, &values),
+            "Restores 40 health over 12 sec."
+        );
+    }
+
+    /// Without a duration there is no tick count regardless of the period,
+    /// so `$o` must stay a visible token rather than print "0 health" -- the
+    /// same rule `a_missing_value_is_not_printed_as_zero` holds `$d` and
+    /// `$a` to.
+    #[test]
+    fn total_over_time_is_unresolved_without_a_duration() {
+        assert_eq!(
+            substitute("Restores $o1 health.", 78, &book()),
+            "Restores $o1 health."
+        );
+    }
+
+    /// The real numbers off `Spell.dbc` row 433, "Food": base 16 (displayed
+    /// as 17), `effect_aura_period` **zero**, duration 18000ms. Pinned as a
+    /// literal for the same reason `book()`'s rows are, and kept separate
+    /// from it because this is the case the module comment's AzerothCore
+    /// citation exists to justify: a zero period defaults to a 1000ms tick,
+    /// so 18 ticks of 17 is 306.
+    #[test]
+    fn a_zero_period_defaults_to_a_one_second_tick_the_way_the_real_engine_does() {
+        let values = HashMap::from([(
+            433,
+            Values { base: [16, 0, 0], duration_ms: 18_000, ..Default::default() },
+        )]);
+        assert_eq!(
+            substitute("Restores $o1 health over $d.", 433, &values),
+            "Restores 306 health over 18 sec."
         );
     }
 

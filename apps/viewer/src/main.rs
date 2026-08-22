@@ -7689,6 +7689,86 @@ impl App {
             .unwrap_or_else(|| items.name(entry))
     }
 
+    /// Everything a bag or character square's tooltip draws beyond the name.
+    /// Every field answers its "not yet known" default until the same
+    /// `SMSG_ITEM_QUERY_SINGLE_RESPONSE` `item_name` reads from has arrived --
+    /// see that function's own doc comment for why the fallback is honest
+    /// rather than invented.
+    ///
+    /// Takes the spellbook, archive chain and atlas to resolve an on-use
+    /// item's effect line -- see `spells::Spellbook::resolve_extra` -- as
+    /// three more disjoint borrows alongside `live`, for the same reason
+    /// `item_name` above takes its pieces separately rather than `&self`.
+    fn item_tooltip(
+        live: Option<&live::LiveWorld>,
+        spells: &mut spells::Spellbook,
+        chain: &mut Chain,
+        maps: &maps::Maps,
+        entry: u32,
+    ) -> ui::frames::BagItemTooltip {
+        let Some(info) = live.and_then(|live| live.state.names.item(entry)).flatten() else {
+            return ui::frames::BagItemTooltip::default();
+        };
+        // `weapon_delay` is the tell rather than `item_class`: every weapon
+        // has a nonzero swing speed and nothing else does, so this needs no
+        // opinion about what `ItemClass` values mean -- it reads what the
+        // packet's own weapon-only fields say directly.
+        let weapon = (info.weapon_delay > 0).then_some(ui::frames::WeaponStats {
+            damage_min: info.damage_min,
+            damage_max: info.damage_max,
+            delay_ms: info.weapon_delay,
+        });
+        let stats = info
+            .stats
+            .iter()
+            .filter(|stat| stat.value != 0)
+            .map(|stat| {
+                let label = ::world::query::item_stat_label(stat.stat_type)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("Stat {}", stat.stat_type));
+                (label, stat.value)
+            })
+            .collect();
+        // Resolved on demand rather than at login, because which items exist
+        // is not known until well after it -- see `resolve_extra`'s own doc
+        // comment. Whatever the spell's own description could not resolve
+        // (most often food's `$o1`, a periodic total this project's
+        // `dbc::spelltext` deliberately leaves unconfirmed) stays visible as
+        // a token rather than becoming a guessed number.
+        let use_description = info
+            .use_spell()
+            .map(|spell| {
+                spells.resolve_extra(chain, spell);
+                let text = spells.description(spell);
+                // `$z` is not a spell column at all -- it names wherever
+                // this character's hearth is bound, which only
+                // `SMSG_BINDPOINTUPDATE` says. Resolved here rather than
+                // inside `dbc::spelltext`, which stays player-agnostic on
+                // purpose -- see that module's doc comment on `$g`/`$l`.
+                // Left as the literal token if the bind point has not
+                // arrived yet or names an area this build has no name for,
+                // the same fallback every other token here uses.
+                match (text.contains("$z"), live.and_then(|live| live.state.home_bind)) {
+                    (true, Some(bind)) => match maps.area_name(bind.area_id) {
+                        Some(area) => text.replace("$z", &area),
+                        None => text,
+                    },
+                    _ => text,
+                }
+            })
+            .unwrap_or_default();
+        ui::frames::BagItemTooltip {
+            quality: info.quality,
+            item_level: info.item_level,
+            required_level: info.required_level,
+            description: info.description.clone(),
+            armor: info.armor,
+            weapon,
+            stats,
+            use_description,
+        }
+    }
+
     fn quest_progress(&self, quest: &::world::quest::QuestInfo) -> Vec<String> {
         let Some(live) = self.live.as_ref() else {
             return Vec::new();
@@ -12169,6 +12249,13 @@ impl App {
                     // `self.chain` mutably: the immutable borrow this needs
                     // has to end first.
                     let name = Self::item_name(self.live.as_ref(), &self.items, entry);
+                    let tooltip = Self::item_tooltip(
+                        self.live.as_ref(),
+                        &mut self.spells,
+                        &mut self.chain,
+                        &self.maps,
+                        entry,
+                    );
                     let icon = (entry != 0).then(|| {
                         self.items
                             .icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, entry)
@@ -12179,6 +12266,14 @@ impl App {
                             name,
                             count: carried.item.count,
                             icon: icon.flatten(),
+                            quality: tooltip.quality,
+                            item_level: tooltip.item_level,
+                            required_level: tooltip.required_level,
+                            description: tooltip.description,
+                            armor: tooltip.armor,
+                            weapon: tooltip.weapon,
+                            stats: tooltip.stats,
+                            use_description: tooltip.use_description,
                         }),
                     };
                     bags_where[index] = Some(carried.at);
@@ -12232,6 +12327,13 @@ impl App {
                         // Before `icon`, as in the bag squares above.
                         let name =
                             Self::item_name(self.live.as_ref(), &self.items, entry);
+                        let tooltip = Self::item_tooltip(
+                            self.live.as_ref(),
+                            &mut self.spells,
+                            &mut self.chain,
+                            &self.maps,
+                            entry,
+                        );
                         let icon = (entry != 0).then(|| {
                             self.items
                                 .icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, entry)
@@ -12241,6 +12343,14 @@ impl App {
                             name,
                             count: held.count,
                             icon: icon.flatten(),
+                            quality: tooltip.quality,
+                            item_level: tooltip.item_level,
+                            required_level: tooltip.required_level,
+                            description: tooltip.description,
+                            armor: tooltip.armor,
+                            weapon: tooltip.weapon,
+                            stats: tooltip.stats,
+                            use_description: tooltip.use_description,
                         }
                     });
                     ui::frames::EquipSlot {

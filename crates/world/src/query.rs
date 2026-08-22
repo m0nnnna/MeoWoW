@@ -184,6 +184,25 @@ pub struct ItemInfo {
     pub buy_price: i32,
     pub sell_price: u32,
     pub max_durability: u32,
+    /// The stat bonuses this item grants while worn -- strength, a resistance,
+    /// a combat rating, and so on. Kept as the raw `(type, value)` pairs off
+    /// the wire, one per non-empty entry of the packet's stat block; naming
+    /// what each `stat_type` means is [`item_stat_label`]'s job, not this
+    /// struct's.
+    pub stats: Vec<ItemStat>,
+    /// Physical armor. `0` for anything that is not armor, which is most
+    /// items and is indistinguishable from "not yet known" -- callers gate on
+    /// [`ItemInfo::item_class`] the same way the original client's tooltip
+    /// does, not on this being non-zero.
+    pub armor: u32,
+    /// The first of a weapon's two damage entries -- see the module comment
+    /// on `parse_item_query_response` for why only one is kept. `(0.0, 0.0)`
+    /// for anything that is not a weapon.
+    pub damage_min: f32,
+    pub damage_max: f32,
+    /// Milliseconds between a weapon's swings. `0` for anything that is not a
+    /// weapon.
+    pub weapon_delay: u32,
     /// The spells this item carries, in wire order.
     ///
     /// **Kept rather than skipped because using an item needs one.**
@@ -202,6 +221,36 @@ pub struct ItemSpell {
     /// What makes it fire. [`ITEM_SPELLTRIGGER_ON_USE`] is the one a click
     /// acts on; the others go off by themselves.
     pub trigger: u32,
+}
+
+/// One entry of an item's stat block: which stat, and how much of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemStat {
+    pub stat_type: u32,
+    pub value: i32,
+}
+
+/// What to call a stat type on a tooltip.
+///
+/// **Only the five primary attributes are named.** Unlike most of the ids
+/// this project transcribes, these are not read off a private server's
+/// schema: `ITEM_MOD_STRENGTH` and its neighbours are wire values the
+/// original client itself sends, unchanged across every WotLK-era
+/// implementation, and a wrong label here would be caught by anyone who has
+/// ever looked at a piece of gear -- the same bar
+/// `ITEM_SPELLTRIGGER_ON_USE` was held to. The combat ratings past stamina
+/// (hit, crit, haste, resilience and the rest) are a longer, less certain
+/// list this project has not measured, so they fall back to the raw number
+/// rather than risk a confidently wrong name.
+pub fn item_stat_label(stat_type: u32) -> Option<&'static str> {
+    match stat_type {
+        3 => Some("Agility"),
+        4 => Some("Strength"),
+        5 => Some("Intellect"),
+        6 => Some("Spirit"),
+        7 => Some("Stamina"),
+        _ => None,
+    }
 }
 
 /// `ITEM_SPELLTRIGGER_ON_USE`: the trigger a "use this" click acts on.
@@ -269,6 +318,11 @@ pub fn parse_item_query_response(body: &[u8]) -> Result<ItemInfo, Error> {
             buy_price: 0,
             sell_price: 0,
             max_durability: 0,
+            stats: Vec::new(),
+            armor: 0,
+            damage_min: 0.0,
+            damage_max: 0.0,
+            weapon_delay: 0,
             spells: Vec::new(),
         });
     }
@@ -307,25 +361,37 @@ pub fn parse_item_query_response(body: &[u8]) -> Result<ItemInfo, Error> {
     // The one variable-length block. Everything below moves if this is
     // wrong, which is what makes `finish` the real test of this parser.
     let stats_count = r.u32()?;
+    let mut stats = Vec::with_capacity(stats_count as usize);
     for _ in 0..stats_count {
-        let _stat_type = r.u32()?;
-        let _stat_value = r.u32()? as i32;
+        let stat_type = r.u32()?;
+        let value = r.u32()? as i32;
+        stats.push(ItemStat { stat_type, value });
     }
 
     let _scaling_stat_distribution = r.u32()?;
     let _scaling_stat_value = r.u32()?;
-    for _ in 0..ITEM_DAMAGES {
-        let _min = r.f32()?;
-        let _max = r.f32()?;
+    // Only the first of the two damage entries is kept -- the second exists
+    // for a handful of items with a split elemental component this client's
+    // tooltip does not attempt to break out, the same scoping the stat block
+    // above does not extend to combat ratings.
+    let mut damage_min = 0.0;
+    let mut damage_max = 0.0;
+    for i in 0..ITEM_DAMAGES {
+        let min = r.f32()?;
+        let max = r.f32()?;
         let _damage_type = r.u32()?;
+        if i == 0 {
+            damage_min = min;
+            damage_max = max;
+        }
     }
 
-    let _armor = r.u32()?;
+    let armor = r.u32()?;
     for _ in 0..ITEM_RESISTANCES {
         r.u32()?;
     }
 
-    let _delay = r.u32()?;
+    let weapon_delay = r.u32()?;
     let _ammo_type = r.u32()?;
     let _ranged_mod_range = r.f32()?;
     let mut spells = Vec::with_capacity(ITEM_SPELLS);
@@ -387,8 +453,46 @@ pub fn parse_item_query_response(body: &[u8]) -> Result<ItemInfo, Error> {
         buy_price,
         sell_price,
         max_durability,
+        stats,
+        armor,
+        damage_min,
+        damage_max,
+        weapon_delay,
         spells,
     })
+}
+
+/// Where a rebind sent the player -- `SMSG_BINDPOINTUPDATE`.
+///
+/// Unlike every other packet in this file, nothing asked for this one: the
+/// server pushes it once during the login burst and again on every rebind,
+/// so the latest received is always the current answer. See
+/// [`crate::opcode::server::BIND_POINT_UPDATE`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BindPoint {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub map_id: u32,
+    /// An `AreaTable` id -- resolving it to a name is the caller's job, the
+    /// same division `crate::names` draws for every other id this protocol
+    /// hands back.
+    pub area_id: u32,
+}
+
+/// Parses `SMSG_BINDPOINTUPDATE`: three floats, then two `u32`s, and
+/// nothing else -- confirmed against the server's own `data << m_homebindX
+/// << m_homebindY << m_homebindZ; data << (uint32) m_homebindMapId; data <<
+/// (uint32) m_homebindAreaId;`.
+pub fn parse_bind_point_update(body: &[u8]) -> Result<BindPoint, Error> {
+    let mut r = Reader::new(body, "SMSG_BINDPOINTUPDATE");
+    let x = r.f32()?;
+    let y = r.f32()?;
+    let z = r.f32()?;
+    let map_id = r.u32()?;
+    let area_id = r.u32()?;
+    r.finish()?;
+    Ok(BindPoint { x, y, z, map_id, area_id })
 }
 
 /// What `SMSG_CREATURE_QUERY_RESPONSE` said about one creature entry.
@@ -722,6 +826,38 @@ mod tests {
         }
     }
 
+    /// The exact layout the server writes: `data << m_homebindX << Y << Z;
+    /// data << (uint32) mapId; data << (uint32) areaId;`.
+    #[test]
+    fn bind_point_update_parses() {
+        let mut body = Vec::new();
+        body.extend((-8949.95f32).to_le_bytes());
+        body.extend((-132.49f32).to_le_bytes());
+        body.extend(83.53f32.to_le_bytes());
+        body.extend(0u32.to_le_bytes()); // map id
+        body.extend(9u32.to_le_bytes()); // area id -- Northshire Abbey
+        let parsed = parse_bind_point_update(&body).unwrap();
+        assert_eq!(parsed.map_id, 0);
+        assert_eq!(parsed.area_id, 9);
+        assert_eq!(parsed.x, -8949.95);
+        assert_eq!(parsed.y, -132.49);
+        assert_eq!(parsed.z, 83.53);
+    }
+
+    #[test]
+    fn a_short_or_long_bind_point_body_is_an_error() {
+        let mut body = Vec::new();
+        for value in [0.0f32, 0.0, 0.0] {
+            body.extend(value.to_le_bytes());
+        }
+        body.extend(0u32.to_le_bytes());
+        body.extend(9u32.to_le_bytes());
+        assert!(parse_bind_point_update(&body[..body.len() - 1]).is_err());
+        let mut long = body.clone();
+        long.push(0);
+        assert!(parse_bind_point_update(&long).is_err());
+    }
+
     fn creature_response(entry: u32, name: &str) -> Vec<u8> {
         let mut body = entry.to_le_bytes().to_vec();
         body.extend(cstr(name));
@@ -853,12 +989,15 @@ mod tests {
 
         body.extend(0u32.to_le_bytes()); // scaling stat distribution
         body.extend(0u32.to_le_bytes()); // scaling stat value
-        for _ in 0..ITEM_DAMAGES {
-            body.extend(1.5f32.to_le_bytes());
-            body.extend(3.5f32.to_le_bytes());
+        // Distinguishable per entry -- see `only_the_first_damage_entry_is_kept`,
+        // which needs the two to disagree to prove the parser took entry 0
+        // and not entry 1 or a sum of both.
+        for i in 0..ITEM_DAMAGES {
+            body.extend((1.5 + i as f32 * 100.0).to_le_bytes());
+            body.extend((3.5 + i as f32 * 100.0).to_le_bytes());
             body.extend(0u32.to_le_bytes());
         }
-        body.extend(0u32.to_le_bytes()); // armor
+        body.extend(42u32.to_le_bytes()); // armor
         for _ in 0..ITEM_RESISTANCES {
             body.extend(0u32.to_le_bytes());
         }
@@ -911,7 +1050,32 @@ mod tests {
         assert_eq!(parsed.stackable, 20);
         assert_eq!(parsed.max_durability, 55);
         assert_eq!(parsed.sell_price, 5);
+        assert_eq!(parsed.armor, 42);
+        assert_eq!(parsed.damage_min, 1.5);
+        assert_eq!(parsed.damage_max, 3.5);
+        assert_eq!(parsed.weapon_delay, 1900);
+        assert_eq!(
+            parsed.stats,
+            vec![
+                ItemStat { stat_type: 1, value: 0 },
+                ItemStat { stat_type: 2, value: 2 },
+            ]
+        );
     }
+
+    /// `ITEM_DAMAGES` carries two entries and only the first is kept -- see
+    /// the doc comment on the damage loop in `parse_item_query_response`.
+    /// The fixture writes a distinguishable pair specifically so a parser
+    /// that took the second entry, or summed both, would fail here even
+    /// though it passes `an_item_parses`.
+    #[test]
+    fn only_the_first_damage_entry_is_kept() {
+        let parsed =
+            parse_item_query_response(&item_response(2224, "Two-Handed Sword", 0)).unwrap();
+        assert_eq!(parsed.damage_min, 1.5);
+        assert_eq!(parsed.damage_max, 3.5);
+    }
+
 
     /// **The test that separates a real parse from a lucky one.** The stats
     /// block is the packet's only variable-length section, and a parser that

@@ -1379,6 +1379,12 @@ pub mod server {
     /// shape was confirmed against a live realm (`foss-wow#55`).
     pub const INVENTORY_CHANGE_FAILURE: u16 = 0x0112;
     pub const INITIAL_SPELLS: u16 = 0x012A;
+    /// Where a rebind (hearthstone, innkeeper) sends the player. Sent once
+    /// unprompted during the login burst -- `SendInitialPacketsBeforeAddToMap`
+    /// on the server -- and again on every rebind, so a client that keeps only
+    /// the latest is always current. Body is `x, y, z: f32`, then `map_id,
+    /// area_id: u32`; see [`crate::query::parse_bind_point_update`].
+    pub const BIND_POINT_UPDATE: u16 = 0x0155;
     pub const CAST_FAILED: u16 = 0x0130;
     pub const SPELL_START: u16 = 0x0131;
     pub const SPELL_GO: u16 = 0x0132;
