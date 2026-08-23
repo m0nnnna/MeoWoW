@@ -348,6 +348,62 @@ fn placement_bounds_of(
     (whole, parts)
 }
 
+/// Instance buffers kept between entity rebuilds instead of being thrown away
+/// and made again.
+///
+/// **`set_entities` runs every frame and builds a fresh `Vec<Group>`**, and
+/// each `Group` used to own a brand new `wgpu::Buffer`. A zone with a few
+/// dozen buckets therefore created and destroyed that many GPU buffers sixty
+/// times a second. The bucket *set* barely changes between frames -- the same
+/// creatures playing the same cycles -- so almost every one of those
+/// allocations was replacing a buffer of exactly the right size that had just
+/// been dropped.
+///
+/// Keyed by nothing at all: a buffer holds transforms and any group's fit any
+/// buffer big enough, so this is a free list sorted by capacity rather than a
+/// cache that has to reason about identity. That also means it cannot go
+/// stale, which is the failure mode a keyed version would have.
+#[derive(Default)]
+struct InstancePool {
+    free: Vec<InstanceBuffer>,
+    /// Buffers reused against buffers created. **Both**, because a pool that
+    /// has quietly stopped pooling draws exactly the same picture and the
+    /// ratio is the only thing that says so -- the fourth counter in this
+    /// investigation written for that reason, after the collision grid, the
+    /// minimap index and the sound caches.
+    reused: u64,
+    created: u64,
+}
+
+impl InstancePool {
+    /// Hands back every buffer the previous frame's groups were holding.
+    fn reclaim(&mut self, groups: impl Iterator<Item = Group>) {
+        self.free.extend(groups.map(|group| group.instances));
+        // Smallest first, so `take` can pick the tightest fit that works and
+        // a one-instance group does not walk off with the buffer a
+        // fifty-instance one is about to need.
+        self.free.sort_unstable_by_key(|buffer| buffer.capacity());
+    }
+
+    /// A buffer holding `raw`, reused if the pool has one big enough.
+    fn take(&mut self, gpu: &Gpu, raw: &[Instance]) -> InstanceBuffer {
+        let wanted = raw.len().max(1);
+        if let Some(index) = self.free.iter().position(|b| b.capacity() >= wanted) {
+            let mut buffer = self.free.remove(index);
+            if buffer.refill(gpu, raw) {
+                self.reused += 1;
+                return buffer;
+            }
+        }
+        self.created += 1;
+        InstanceBuffer::upload(gpu, raw)
+    }
+
+    fn counts(&self) -> (u64, u64) {
+        (self.reused, self.created)
+    }
+}
+
 /// The transforms worth keeping on the CPU for a group.
 ///
 /// Empty unless the model actually emits something, which is the whole point:
@@ -832,6 +888,9 @@ pub struct World {
     /// Owned by the world rather than a tile: they move, and they do not belong
     /// to the tile they happen to be standing on.
     entities: Vec<Group>,
+    /// Instance buffers the previous frame's entity groups were holding. See
+    /// [`InstancePool`].
+    instance_pool: InstancePool,
     map_animations: HashMap<String, MapAnimation>,
     map_frame_poses: RefCell<HashMap<String, FramePose>>,
     /// Animated bone buffers for replicated-entity groups, keyed by
@@ -968,6 +1027,7 @@ impl World {
         let wdt = adt::Wdt::parse(&chain.read(&adt::wdt_path(map))?)?;
         let wmo_areas = crate::world_object::WmoAreas::load(chain);
         Ok(Self {
+            instance_pool: InstancePool::default(),
             map: map.to_string(),
             wdt,
             radius: radius.max(MIN_STREAM_RADIUS),
@@ -1827,6 +1887,12 @@ impl World {
     /// *origin*, so Ironforge is one placement 1,058 units across owned by
     /// one tile -- every query anywhere inside it reaches that one grid, and
     /// a per-tile figure would show eight quiet tiles and hide the ninth.
+    /// Instance buffers reused against created since the session began.
+    /// See [`InstancePool`].
+    pub fn instance_pool_counts(&self) -> (u64, u64) {
+        self.instance_pool.counts()
+    }
+
     pub fn collision_probe(&self) -> collision::Probe {
         let mut total = collision::Probe::default();
         for tile in self.tiles() {
@@ -1890,6 +1956,10 @@ impl World {
         // are one mesh with one composed skin drawn twice. What they cannot
         // share is the *bucket*: they play different cycles and blend
         // differently. Four terms in the tuple, three in the cache key.
+        // Held as a local for the rebuild: this method borrows `self` mutably
+        // in a dozen places and a field borrow alongside them is a fight with
+        // no prize. Put back at the end.
+        let mut pool = std::mem::take(&mut self.instance_pool);
         let mut grouped: HashMap<(u32, Motion, u64, bool), Vec<Mat4>> = HashMap::new();
         // Parallel to `grouped` and pushed in lockstep with it, so entry `i`
         // of a bucket's transforms and entry `i` of its guids are the same
@@ -2202,7 +2272,7 @@ impl World {
                         guids.iter().map(|g| g ^ 0x4845_4c44).collect()
                     },
                     model: held_model,
-                    instances: InstanceBuffer::upload(gpu, &bind_pose),
+                    instances: pool.take(gpu, &bind_pose),
                     count: raw.len() as u32,
                     animation: None,
                     map_animation: None,
@@ -2253,7 +2323,7 @@ impl World {
                         doodad_index,
                     ),
                     model: doodad_model,
-                    instances: InstanceBuffer::upload(gpu, &raw),
+                    instances: pool.take(gpu, &raw),
                     count: raw.len() as u32,
                     animation: None,
                     map_animation,
@@ -2275,7 +2345,7 @@ impl World {
                     guids.clone()
                 },
                 model,
-                instances: InstanceBuffer::upload(gpu, &raw),
+                instances: pool.take(gpu, &raw),
                 count: raw.len() as u32,
                 animation,
                 map_animation: None,
@@ -2305,7 +2375,16 @@ impl World {
         // that left view this pass must stop having a bucket, or a footstep
         // would keep being timed from a cycle nothing is drawing.
         *self.entity_buckets.borrow_mut() = bucket_of_guid;
-        self.entities = built;
+        // **Reclaimed after the new groups are built, not before.** Taking the
+        // buffers first would hand a group its own previous buffer while the
+        // old `Group` still held it, and the borrow checker is the least of
+        // the reasons that is wrong: the transforms are read out of the old
+        // group during the rebuild for held items. Swapping at the end means
+        // one frame's worth of buffers is briefly live twice, which is the
+        // trade for never reasoning about aliasing.
+        let previous = std::mem::replace(&mut self.entities, built);
+        pool.reclaim(previous.into_iter());
+        self.instance_pool = pool;
         self.refresh_stats();
         undrawable
     }

@@ -983,7 +983,13 @@ fn build_pipeline(
 /// Per-object transforms for a whole scene.
 pub struct InstanceBuffer {
     pub buffer: wgpu::Buffer,
+    /// How many instances the buffer currently *describes*, which is what the
+    /// draw call ranges over.
     pub len: usize,
+    /// How many it can hold. Distinct from `len` so a buffer can be handed
+    /// back to a pool and refilled with a smaller group without shrinking --
+    /// see [`InstanceBuffer::refill`].
+    capacity: usize,
 }
 
 impl InstanceBuffer {
@@ -1009,7 +1015,52 @@ impl InstanceBuffer {
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 }),
             len: data.len(),
+            capacity: data.len(),
         }
+    }
+
+    /// Refills this buffer with a different group's transforms, if it is big
+    /// enough to hold them.
+    ///
+    /// **Written for the entity rebuild, which happens every frame.** Every
+    /// replicated creature's instance buffer was *created* every frame --
+    /// `set_entities` builds a fresh `Vec<Group>` and each `Group` owned a
+    /// brand new `wgpu::Buffer` -- so a zone with a few dozen buckets
+    /// allocated and destroyed that many GPU buffers sixty times a second.
+    /// The cost is not only the allocation: every buffer referenced by a
+    /// command buffer is a resource `queue.submit` has to track, and `submit`
+    /// was 4.09 ms live against 1.48 ms for the same *draws* headless, where
+    /// no such churn happens.
+    ///
+    /// The code has always been ready for this -- the buffer is created
+    /// `COPY_DST` and the comment there says why -- and the entity rebuild's
+    /// own note named "updates existing instances' transforms in place rather
+    /// than reallocating every buffer" as the fix to reach for when this ever
+    /// became measurable. It has.
+    ///
+    /// Returns `false` and changes nothing when the group is too big, which
+    /// is the caller's cue to allocate. Growing here instead would make a
+    /// pooled buffer's capacity creep upwards to the largest group any bucket
+    /// ever had.
+    /// How many instances this buffer can hold.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn refill(&mut self, gpu: &Gpu, instances: &[Instance]) -> bool {
+        let fallback = [Instance::IDENTITY];
+        let data = if instances.is_empty() {
+            &fallback[..]
+        } else {
+            instances
+        };
+        if data.len() > self.capacity {
+            return false;
+        }
+        gpu.queue
+            .write_buffer(&self.buffer, 0, bytemuck::cast_slice(data));
+        self.len = data.len();
+        true
     }
 
     /// Rewrites the transforms in place.

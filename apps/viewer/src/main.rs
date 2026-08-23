@@ -1963,6 +1963,9 @@ struct FrameProfile {
     /// The same pair for music and ambience -- see `sound::Channel::reads`.
     track_reads: u64,
     track_starts: u64,
+    /// Entity instance buffers reused against created -- see `InstancePool`.
+    buffers_reused: u64,
+    buffers_created: u64,
     /// Collision work this frame -- see `collision::Probe`. Beside the times
     /// because a millisecond cannot say whether the cost is many cheap
     /// queries or a few expensive ones, and the two want different fixes.
@@ -2027,7 +2030,8 @@ impl FrameProfile {
              rest {:.1} ms; outside redraw {:.1} = {} events in {:.1} + \
              {:.1} idle + {:.1} log ms\n\
              collision: {} queries, {} candidates ({} per query) | \
-             clips {} played from {} reads, tracks {} started from {} reads{}",
+             clips {} played from {} reads, tracks {} started from {} reads | \
+             instance buffers {} reused, {} created{}",
             self.terrain_draws,
             self.model_draws,
             self.shadow_draws,
@@ -2079,6 +2083,8 @@ impl FrameProfile {
             self.clip_reads,
             self.track_starts,
             self.track_reads,
+            self.buffers_reused,
+            self.buffers_created,
             // Only where a spread was gathered, which is the log's line and
             // not the window's -- the window shows the frame that just
             // happened and has no second to average over.
@@ -6967,6 +6973,8 @@ impl App {
         // the pass would attribute their work to the next one.
         if let Some(Scene::Streaming(world)) = r.scene.as_ref() {
             profile.collision = world.collision_probe();
+            (profile.buffers_reused, profile.buffers_created) =
+                world.instance_pool_counts();
         }
         (profile.clip_reads, profile.clip_plays) = self.effects.clip_reads();
         // Music and ambience together: two channels, one number, because the
