@@ -1960,6 +1960,9 @@ struct FrameProfile {
     /// sounds exactly the same -- see `sound::Effects::reads`.
     clip_reads: u64,
     clip_plays: u64,
+    /// The same pair for music and ambience -- see `sound::Channel::reads`.
+    track_reads: u64,
+    track_starts: u64,
     /// Collision work this frame -- see `collision::Probe`. Beside the times
     /// because a millisecond cannot say whether the cost is many cheap
     /// queries or a few expensive ones, and the two want different fixes.
@@ -2024,7 +2027,7 @@ impl FrameProfile {
              rest {:.1} ms; outside redraw {:.1} = {} events in {:.1} + \
              {:.1} idle + {:.1} log ms\n\
              collision: {} queries, {} candidates ({} per query) | \
-             clips {} played from {} archive reads{}",
+             clips {} played from {} reads, tracks {} started from {} reads{}",
             self.terrain_draws,
             self.model_draws,
             self.shadow_draws,
@@ -2074,6 +2077,8 @@ impl FrameProfile {
             self.collision.candidates / self.collision.queries.max(1),
             self.clip_plays,
             self.clip_reads,
+            self.track_starts,
+            self.track_reads,
             // Only where a spread was gathered, which is the log's line and
             // not the window's -- the window shows the frame that just
             // happened and has no second to average over.
@@ -6964,6 +6969,13 @@ impl App {
             profile.collision = world.collision_probe();
         }
         (profile.clip_reads, profile.clip_plays) = self.effects.clip_reads();
+        // Music and ambience together: two channels, one number, because the
+        // question is "is anything still re-reading the archive" rather than
+        // which of the two it was.
+        let (music_reads, music_starts) = self.music.track_reads();
+        let (ambience_reads, ambience_starts) = self.ambience.track_reads();
+        profile.track_reads = music_reads + ambience_reads;
+        profile.track_starts = music_starts + ambience_starts;
         profile.redraw_ms = redraw_started.elapsed().as_secs_f32() * 1000.0;
         self.profile = profile;
 
@@ -8827,7 +8839,6 @@ impl App {
         }
         self.effects
             .tick(mixer, &self.sounds, &mut self.chain, roll);
-        self.sound_play_ms = timing_play.elapsed().as_secs_f32() * 1000.0;
         self.music.play(
             mixer,
             &self.sounds,
@@ -8844,6 +8855,7 @@ impl App {
             self.args.ambience_volume,
             roll,
         );
+        self.sound_play_ms = timing_play.elapsed().as_secs_f32() * 1000.0;
     }
 
     /// Reads names and icons for whatever the character knows, once.

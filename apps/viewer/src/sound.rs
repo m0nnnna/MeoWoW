@@ -790,6 +790,14 @@ pub struct Channel {
     /// into again one module over. A failure is an answer and gets remembered
     /// like any other.
     refused: std::collections::HashSet<u32>,
+    /// Track bytes by archive path -- see [`Channel::play`] for why a channel
+    /// re-reads at all.
+    clips: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
+    /// Archive reads against restarts. **Both**, because a channel that
+    /// restarts constantly and a cache that has stopped working sound exactly
+    /// the same, and the ratio is the only thing that separates them.
+    reads: u64,
+    starts: u64,
 }
 
 impl Channel {
@@ -798,7 +806,15 @@ impl Channel {
             sink: None,
             playing: None,
             refused: std::collections::HashSet::new(),
+            clips: std::collections::HashMap::new(),
+            reads: 0,
+            starts: 0,
         }
+    }
+
+    /// Archive reads performed, and times a track was started.
+    pub fn track_reads(&self) -> (u64, u64) {
+        (self.reads, self.starts)
     }
 
     /// What is playing, if anything.
@@ -841,12 +857,39 @@ impl Channel {
             self.refused.insert(id);
             return;
         };
-        let Ok(bytes) = chain.read(path) else {
-            // Expected: 7% of file references in this install do not resolve.
-            tracing::debug!("no audio at {path}");
-            self.refused.insert(id);
-            return;
+        // **Re-read on every restart, and a restart is not rare.** The guard
+        // at the top of this function lets a channel fall through the moment
+        // its sink empties -- which is what happens every time a music track
+        // or an ambience loop reaches its end -- and the file then comes back
+        // out of the MPQ, decompressed from scratch. Measured as `sound`
+        // sitting at 3.54 ms average with a 35.10 ms worst while the three
+        // spans *inside* `update_sound` all read under 0.15 ms: the cost was
+        // entirely in here, one line past where the timer stopped.
+        let bytes = match self.clips.get(path) {
+            Some(bytes) => std::sync::Arc::clone(bytes),
+            None => {
+                self.reads += 1;
+                let Ok(raw) = chain.read(path) else {
+                    // Expected: 7% of file references in this install do not
+                    // resolve.
+                    tracing::debug!("no audio at {path}");
+                    self.refused.insert(id);
+                    return;
+                };
+                let bytes: std::sync::Arc<[u8]> = raw.into();
+                // **A far larger cap than the effects cache**, because these
+                // are the long files by definition and there are only ever
+                // two of them alive -- one music track and one ambience loop
+                // for the area the player is standing in. Bounded all the
+                // same: a table entry naming something enormous should not be
+                // able to pin it in memory for the session.
+                if bytes.len() <= MAX_CACHED_TRACK {
+                    self.clips.insert(path.to_string(), std::sync::Arc::clone(&bytes));
+                }
+                bytes
+            }
         };
+        self.starts += 1;
 
         match rodio::Decoder::new(Cursor::new(bytes)) {
             Ok(source) => {
@@ -1033,6 +1076,12 @@ impl Effects {
         (self.reads, self.plays)
     }
 }
+
+/// Largest music or ambience track kept in memory, in bytes. Only ever two
+/// are alive at once -- the area's music and its ambience -- so this can be
+/// generous, and is bounded anyway so one enormous table entry cannot pin
+/// itself in memory for the session.
+const MAX_CACHED_TRACK: usize = 8 * 1024 * 1024;
 
 /// Largest clip kept in memory, in bytes. Comfortably above a footstep or an
 /// impact and below anything long enough to be worth streaming.
