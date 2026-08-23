@@ -602,7 +602,7 @@ fn world_for_live(
         let placements: Vec<world::EntityPlacement> =
             // A headless render has no movement driver to have decided, and
             // the character is standing still: not swimming.
-            drawable_with_own(live, (0.0, 0.0), 0.0, false, false)
+            drawable_with_own(live, live.position, (0.0, 0.0), 0.0, false, false)
                 .iter()
                 .map(|entity| {
                     let (look, look_key) =
@@ -3076,6 +3076,14 @@ struct App {
     /// this frame -- see [`App::camera_follow_wall_distance`]. `None` until
     /// the first frame places it.
     camera_wall_distance: Option<f32>,
+    /// The height the character's own *drawn* body is standing at, easing
+    /// towards `live.position.z` -- cosmetic only. `live.position.z` itself
+    /// is the authoritative height: what collision, the camera's focus
+    /// point and outgoing movement packets all use, unsmoothed, on purpose.
+    /// This is a second, purely visual copy for exactly the reason
+    /// `camera_z` exists one layer up -- see `App::camera_follow_z` and
+    /// foss-wow#53. `None` until the first frame places it.
+    drawn_own_z: Option<f32>,
     /// How far the eye actually ended up from the character this frame,
     /// after `pull_camera_out_of_the_ground` and `pull_camera_in_front_of_
     /// walls` have both had their say -- as opposed to `camera_distance`,
@@ -3635,6 +3643,12 @@ fn action_slot(code: KeyCode) -> Option<usize> {
 /// rather than anything read back from the server. See [`live::own_entity`].
 fn drawable_with_own(
     live: &live::LiveWorld,
+    // Where the *own* body is drawn -- `live.position` with its `z` eased,
+    // see `App::drawn_own_z`. `drawable_entities` below still gets
+    // `live.position` itself: only the own body's small, cosmetic wobble is
+    // being hidden here, not anything about how other entities are placed
+    // relative to the camera.
+    own_position: glam::Vec3,
     pace: (f32, f32),
     // How far to turn the drawn body towards where it is going -- see
     // [`strafe_yaw`]. Added to the orientation here rather than to
@@ -3648,7 +3662,7 @@ fn drawable_with_own(
     if let Some(own) = live::own_entity(
         &live.state,
         live.guid,
-        live.position,
+        own_position,
         live.orientation + lean,
         pace.0,
         pace.1,
@@ -4420,6 +4434,7 @@ impl App {
             last_frame: Instant::now(),
             camera_z: None,
             camera_wall_distance: None,
+            drawn_own_z: None,
             camera_eye_distance: None,
             // The weather's own clock. Separate from `last_frame` because that
             // one is reset every frame, and a falling drop needs a monotone
@@ -5748,6 +5763,19 @@ impl App {
                     // walk toggle here, and `LIVE_RUN_SPEED` is the run speed.
                     // F2. See `App::entity_flip`.
                     let flip = if self.entity_flip { std::f32::consts::PI } else { 0.0 };
+                    // **Cosmetic only** -- see `App::drawn_own_z`. `live.position.z`
+                    // itself is left untouched for collision, the camera's
+                    // focus point and outgoing movement, exactly the split
+                    // `camera_z` already makes for the camera's own follow
+                    // height.
+                    let own_z = Self::ease_towards(
+                        &mut self.drawn_own_z,
+                        live.position.z,
+                        self.frame_ms / 1000.0,
+                        0.09,
+                        3.0,
+                    );
+                    let own_position = glam::Vec3::new(live.position.x, live.position.y, own_z);
                     // Borrowed as fields rather than through `&mut self`: `r`
                     // already holds the renderer, and `live` the live world.
                     let looks = &mut self.player_looks;
@@ -5760,6 +5788,7 @@ impl App {
                     // and easing it would make the camera lag the character.
                     let mut drawn = drawable_with_own(
                         live,
+                        own_position,
                         pace,
                         lean,
                         self.jump.is_some(),
@@ -6272,7 +6301,71 @@ impl App {
             // objects. See the `collision` crate.
             live.position = match self.renderer.as_ref().and_then(|r| r.scene.as_ref()) {
                 Some(Scene::Streaming(world)) => {
-                    world.slide(live.position, wanted, BODY_RADIUS, BODY_HEIGHT, STEP_HEIGHT)
+                    let slid =
+                        world.slide(live.position, wanted, BODY_RADIUS, BODY_HEIGHT, STEP_HEIGHT);
+                    // **Previously silent.** A full block and a slow climb
+                    // look identical in the `stand` log above -- that one
+                    // only fires when the standing height *changes*, and a
+                    // character pushed flat against an un-climbable riser
+                    // never gets that far. Logged whenever `slide` granted
+                    // less than half of what was asked, which a normal walk
+                    // against open air or a gentle slope never triggers.
+                    let intended = (wanted - live.position).truncate().length();
+                    let achieved = (slid - live.position).truncate().length();
+                    if intended > 1e-4 && achieved < intended * 0.5 {
+                        // Horizontal probes at a few heights, the same way
+                        // `crosses_wall` samples -- a vertical probe at
+                        // `wanted` finds the ordinary floor first (its normal
+                        // is near `(0,0,1)`, not a wall's), which is exactly
+                        // what the first attempt at this measured. Extended
+                        // a full unit past `wanted`, in the direction of
+                        // travel, so a wall only fractions of a unit ahead is
+                        // actually crossed rather than just grazed.
+                        let direction = (wanted - live.position).truncate().normalize_or_zero();
+                        let reach = live.position.truncate() + direction;
+                        let heights: Vec<(f32, Option<f32>)> = [
+                            STEP_HEIGHT + 0.05,
+                            STEP_HEIGHT + 0.3,
+                            STEP_HEIGHT + 0.6,
+                            STEP_HEIGHT + 0.9,
+                            BODY_HEIGHT * 0.9,
+                        ]
+                        .into_iter()
+                        .map(|offset| {
+                            let from = glam::Vec3::new(
+                                live.position.x,
+                                live.position.y,
+                                live.position.z + offset,
+                            );
+                            let to = glam::Vec3::new(reach.x, reach.y, live.position.z + offset);
+                            (offset, world.first_obstruction(from, to).map(|(t, _)| t))
+                        })
+                        .collect();
+                        // What `floor_under_footing` itself says is reachable
+                        // from here and from `wanted` -- the character's feet
+                        // stayed pinned at the base the whole time this was
+                        // captured, and this says whether that is because no
+                        // floor was found at all, or because one was found
+                        // and something downstream never applied it.
+                        let floor_here =
+                            world.floor_under_footing(live.position, STEP_HEIGHT);
+                        let floor_wanted =
+                            world.floor_under_footing(wanted, STEP_HEIGHT);
+                        tracing::debug!(
+                            "slide refused: {:.2} of {:.2} requested, from {:.2},{:.2},{:.2} \
+                             towards {:.2},{:.2},{:.2} -> {:.2},{:.2},{:.2}, crossed at \
+                             heights (offset, hit-fraction) {:?}, floor_under_footing here \
+                             {:?} at wanted {:?} (radius {BODY_RADIUS})",
+                            achieved, intended,
+                            live.position.x, live.position.y, live.position.z,
+                            wanted.x, wanted.y, wanted.z,
+                            slid.x, slid.y, slid.z,
+                            heights,
+                            floor_here,
+                            floor_wanted,
+                        );
+                    }
+                    slid
                 }
                 _ => wanted,
             };
@@ -9866,8 +9959,18 @@ impl App {
         // The speed only chooses an animation, which a click test does not care
         // about -- but the same list has to come out here as the renderer drew,
         // so it is passed the same way rather than left at a default.
+        // Read, not re-eased: `self.drawn_own_z` was already advanced once
+        // this frame by the draw pass, and calling `ease_towards` a second
+        // time here would advance its state twice in one frame. Falls back
+        // to the raw height only before the first draw has ever run.
+        let own_position = glam::Vec3::new(
+            live.position.x,
+            live.position.y,
+            self.drawn_own_z.unwrap_or(live.position.z),
+        );
         let entities = drawable_with_own(
             live,
+            own_position,
             pace,
             self.strafe_lean(),
             self.jump.is_some(),

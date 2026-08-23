@@ -78,6 +78,46 @@ impl Triangle {
         self.a.min(self.b).min(self.c)
     }
 
+    /// A point just off this triangle's face, on the near side of whoever is
+    /// asking, for asking "is the floor this wall stands on itself
+    /// reachable".
+    ///
+    /// **The point on the triangle closest to `approaching_from`, not the
+    /// triangle's own lowest edge.** A real WMO riser is rarely the small,
+    /// tread-sized quad a synthetic reproduction builds -- one candidate
+    /// measured on `NSabbey.wmo`'s `Stairs1` had its lowest edge more than a
+    /// full body radius away from the body actually pressing against it, on
+    /// a different part of the same long triangle. Querying there asks about
+    /// a tread the body has nothing to do with; querying at the point
+    /// [`push_out`] itself measures distance from asks about the part of the
+    /// wall actually in contact.
+    ///
+    /// **Nudged along the wall's own normal, not straight at
+    /// `approaching_from`.** A first attempt nudged directly towards it and
+    /// broke on a wide riser: the vector towards a body standing squarely in
+    /// front is dominated by *how wide* the wall is, not by which side of it
+    /// anyone is on, and barely moves across the seam at all. The normal has
+    /// no such component by construction -- it is perpendicular to the wall,
+    /// full stop -- so only its *sign* is decided by which side
+    /// `approaching_from` is on, and the step itself is a fixed, small
+    /// distance across the seam rather than however far away the body
+    /// happens to be standing.
+    fn foot_towards(&self, approaching_from: Vec2) -> Vec2 {
+        const NUDGE: f32 = 0.02;
+        let (a, b, c) = (self.a.truncate(), self.b.truncate(), self.c.truncate());
+        let closest = closest_point_on_triangle_2d(approaching_from, a, b, c);
+        let Some(normal) = self.normal() else {
+            return closest;
+        };
+        let flat = Vec2::new(normal.x, normal.y);
+        if flat.length_squared() < 1e-9 {
+            return closest;
+        }
+        let flat = flat.normalize();
+        let sign = (approaching_from - closest).dot(flat).signum();
+        closest + flat * (NUDGE * sign)
+    }
+
     fn max(&self) -> Vec3 {
         self.a.max(self.b).max(self.c)
     }
@@ -373,6 +413,60 @@ impl World {
         best
     }
 
+    /// How high a wall may be treated as climbable rather than an obstacle,
+    /// given where its own foot sits.
+    ///
+    /// **A staircase whose treads are shallower than the body's own radius
+    /// defeats the plain single-riser allowance.** `push_out`/`blocked`
+    /// ignore anything below `from_z + step` on the theory that it is the
+    /// one riser being climbed right now -- true as long as the *next* riser
+    /// is farther away than `radius`. On a tread shallower than that
+    /// (measured: 0.33 units of run against a 0.55 body radius, on
+    /// `NSabbey.wmo`'s `Stairs1`), the second riser sits well within
+    /// `radius` while the body is still standing at the foot of the first,
+    /// so it is tested as an ordinary wall and the whole flight refuses
+    /// every step -- reported as "can't walk up them without jumping",
+    /// reproduced offline as `slide` returning `achieved: 0.000` on every
+    /// call against the real geometry.
+    ///
+    /// **The fix is not a chain -- a first attempt at one does not work,
+    /// and the reason is worth keeping.** Searching upward for a reachable
+    /// floor at one fixed `(x, y)` finds every riser stacked directly above
+    /// that point, which is the right shape for a ladder and the wrong one
+    /// for a staircase: real treads step *forward* as they rise, so the
+    /// second riser's own tread is never at the same `(x, y)` as the first
+    /// riser's. The chain found nothing past the very first hop on both the
+    /// real geometry and a synthetic reproduction of it, because there was
+    /// never anything to chain *to* from a single point.
+    ///
+    /// What actually works needs only one lookup: **if the tread this wall
+    /// itself rises from is within `step` of `from_z`, the wall is exactly
+    /// as climbable as the riser sitting on that tread would be, whether or
+    /// not the body has walked there yet** -- so it is exempted up to its
+    /// own top, `wall_top`, rather than only up to `from_z + step`.
+    /// `wall_foot` has to be asked for at the wall's own position for this
+    /// to mean anything -- see [`Triangle::foot_towards`].
+    ///
+    /// **Only ever adds an exemption, never removes one.** `wall_top` is
+    /// still floored at `from_z + step`: a wall shorter than a single step
+    /// was already fully exempt before this existed, and nothing here may
+    /// shrink that. Where no floor is found under `wall_foot` at all --
+    /// open ground, a standalone fence, a wall whose foot is not standing on
+    /// a climbable tread -- this returns exactly `from_z + step`, identical
+    /// to every case before this existed.
+    fn wall_exemption(&self, wall_foot: Vec2, wall_top: f32, from_z: f32, step: f32) -> f32 {
+        // A hair above the wall's own top, not exactly at it: `push_out`'s
+        // own exclusion test is `max().z < low`, and a wall exempted up to
+        // precisely its own top would tie that comparison and still be
+        // tested, rather than skipped.
+        const CLEARANCE: f32 = 0.05;
+        if self.floor_under(wall_foot, from_z, step).is_some() {
+            (wall_top + CLEARANCE).max(from_z + step)
+        } else {
+            from_z + step
+        }
+    }
+
     /// Moves a character from `from` towards `to`, sliding along anything
     /// solid instead of passing through it.
     ///
@@ -410,12 +504,18 @@ impl World {
         // wall, which is exactly what an inside corner is. More than two buys
         // very little and costs a lookup each.
         for _ in 0..2 {
-            let (low, high) = (at.z + step, at.z + height);
             let mut correction = Vec2::ZERO;
             for index in self.near(at.truncate(), radius) {
-                if let Some(push) =
-                    self.triangles[index as usize].push_out(at.truncate(), low, high, radius)
-                {
+                let triangle = self.triangles[index as usize];
+                // Per triangle, not once for the whole pass: see
+                // `wall_exemption`. A riser one or more steps ahead of where
+                // the body actually is can still be exempt, if the tread it
+                // rises from is itself reachable from `from.z` -- ordinarily
+                // just `from.z + step`, unchanged from before this existed.
+                let foot = triangle.foot_towards(at.truncate());
+                let ceiling = self.wall_exemption(foot, triangle.max().z, from.z, step);
+                let (low, high) = (ceiling, ceiling + height);
+                if let Some(push) = triangle.push_out(at.truncate(), low, high, radius) {
                     // Largest push wins per pass rather than summing: two faces
                     // of one wall both push the same way, and adding them
                     // ejects the character twice as far as either asked for.
@@ -549,11 +649,15 @@ impl World {
 
     /// Whether a cylinder here overlaps anything solid.
     pub fn blocked(&self, at: Vec3, radius: f32, height: f32, step: f32) -> bool {
-        let (low, high) = (at.z + step, at.z + height);
+        // See `wall_exemption` and `slide`, which this must agree with: a
+        // move `slide`'s push-out phase considers fine must not be vetoed
+        // here by a stricter idea of which walls are exempt.
         self.near(at.truncate(), radius).into_iter().any(|index| {
-            self.triangles[index as usize]
-                .push_out(at.truncate(), low, high, radius)
-                .is_some()
+            let triangle = self.triangles[index as usize];
+            let foot = triangle.foot_towards(at.truncate());
+            let ceiling = self.wall_exemption(foot, triangle.max().z, at.z, step);
+            let (low, high) = (ceiling, ceiling + height);
+            triangle.push_out(at.truncate(), low, high, radius).is_some()
         })
     }
 }
@@ -565,6 +669,139 @@ fn cell_of(v: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a straight flight of risers along `+X`, `width` wide, each
+    /// `riser_h` tall and `tread_d` deep, plus a flat approach on the ground
+    /// before the first one. Shared by the shallow- and deep-tread tests
+    /// below, which differ only in `tread_d`.
+    fn flight_of_stairs(riser_h: f32, tread_d: f32, width: f32, count: usize) -> World {
+        let mut world = World::new();
+        for i in 0..count {
+            let x0 = i as f32 * tread_d;
+            let x1 = x0 + tread_d;
+            let z0 = i as f32 * riser_h;
+            let z1 = z0 + riser_h;
+            world.add(Triangle::new(
+                Vec3::new(x0, -width, z0),
+                Vec3::new(x0, width, z0),
+                Vec3::new(x0, -width, z1),
+            ));
+            world.add(Triangle::new(
+                Vec3::new(x0, width, z0),
+                Vec3::new(x0, width, z1),
+                Vec3::new(x0, -width, z1),
+            ));
+            world.add(Triangle::new(
+                Vec3::new(x0, -width, z1),
+                Vec3::new(x1, -width, z1),
+                Vec3::new(x0, width, z1),
+            ));
+            world.add(Triangle::new(
+                Vec3::new(x1, -width, z1),
+                Vec3::new(x1, width, z1),
+                Vec3::new(x0, width, z1),
+            ));
+        }
+        world.add(Triangle::new(
+            Vec3::new(-2.0, -width, 0.0),
+            Vec3::new(0.0, -width, 0.0),
+            Vec3::new(-2.0, width, 0.0),
+        ));
+        world.add(Triangle::new(
+            Vec3::new(0.0, -width, 0.0),
+            Vec3::new(0.0, width, 0.0),
+            Vec3::new(-2.0, width, 0.0),
+        ));
+        world
+    }
+
+    /// **foss-wow#126.** A flight of risers shallower in run than the body's
+    /// own radius -- measured on `NSabbey.wmo`'s `Stairs1`: 0.33 units of
+    /// tread depth against `BODY_RADIUS`'s 0.55 -- refused every step of the
+    /// whole climb, reported as "can't walk up them without jumping". At the
+    /// foot of the first riser the second one already sits within `radius`,
+    /// so it was tested as an ordinary wall no different from a fence, and
+    /// the last-resort refusal in [`World::slide`] sent every attempted step
+    /// straight back to `from`.
+    ///
+    /// The exact geometry and starting position an offline replay of the
+    /// live report reproduced the bug against, before `wall_exemption` and
+    /// `Triangle::foot_towards` existed to fix it.
+    #[test]
+    fn a_shallow_riser_does_not_block_the_step_onto_it() {
+        let world = flight_of_stairs(0.44, 0.33, 2.0, 6);
+        let (radius, height, step) = (0.55f32, 2.0f32, 0.8f32);
+        let from = Vec3::new(-0.1, 0.0, 0.0);
+        let wanted = Vec3::new(-0.02, 0.0, 0.0);
+
+        let slid = world.slide(from, wanted, radius, height, step);
+        assert!(
+            (slid - wanted).length() < 1e-3,
+            "the step onto the first riser should have been granted in full: {slid:?}"
+        );
+    }
+
+    /// **The control.** A staircase with the same riser height but a tread
+    /// deep enough that the second riser sits outside `radius` behaves
+    /// exactly as it always did -- this is what confirms the fix only ever
+    /// *adds* an exemption, on the one specific geometry that needed it,
+    /// rather than loosening wall collision in general.
+    #[test]
+    fn an_ordinary_deep_tread_flight_is_unaffected() {
+        let world = flight_of_stairs(0.44, 1.2, 2.0, 6);
+        let (radius, height, step) = (0.55f32, 2.0f32, 0.8f32);
+        let from = Vec3::new(-0.1, 0.0, 0.0);
+        let wanted = Vec3::new(-0.02, 0.0, 0.0);
+
+        let slid = world.slide(from, wanted, radius, height, step);
+        assert!(
+            (slid - wanted).length() < 1e-3,
+            "an ordinary staircase must climb exactly as it did before: {slid:?}"
+        );
+    }
+
+    /// **The other half of "only ever adds an exemption".** A wall standing
+    /// on open ground -- nothing above it is a climbable riser stacked on a
+    /// tread within `step`, because there is no tread at all -- must still
+    /// block, exactly as before this existed.
+    #[test]
+    fn a_standalone_wall_on_open_ground_still_blocks() {
+        let mut world = World::new();
+        let width = 2.0;
+        // A single wall 1.5 units tall -- taller than any riser this file's
+        // other tests use, and taller than `step` -- with open, flat ground
+        // on both sides of it.
+        world.add(Triangle::new(
+            Vec3::new(-5.0, -width, 0.0),
+            Vec3::new(-5.0, width, 0.0),
+            Vec3::new(5.0, -width, 0.0),
+        ));
+        world.add(Triangle::new(
+            Vec3::new(-5.0, width, 0.0),
+            Vec3::new(5.0, width, 0.0),
+            Vec3::new(5.0, -width, 0.0),
+        ));
+        world.add(Triangle::new(
+            Vec3::new(0.0, -width, 0.0),
+            Vec3::new(0.0, width, 0.0),
+            Vec3::new(0.0, -width, 1.5),
+        ));
+        world.add(Triangle::new(
+            Vec3::new(0.0, width, 0.0),
+            Vec3::new(0.0, width, 1.5),
+            Vec3::new(0.0, -width, 1.5),
+        ));
+
+        let (radius, height, step) = (0.55f32, 2.0f32, 0.8f32);
+        let from = Vec3::new(-0.1, 0.0, 0.0);
+        let wanted = Vec3::new(0.3, 0.0, 0.0);
+
+        let slid = world.slide(from, wanted, radius, height, step);
+        assert!(
+            (slid - from).length() < 1e-3,
+            "a standalone wall taller than a step must still refuse the walk-through: {slid:?}"
+        );
+    }
 
     /// A tagged surface reports its tag, an untagged one reports none, and the
     /// tag belongs to the triangle that actually won.
