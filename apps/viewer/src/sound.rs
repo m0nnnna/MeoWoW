@@ -888,6 +888,29 @@ pub struct Effects {
     /// retained until it has actually finished, which is what `sweep` is for.
     playing: Vec<rodio::Sink>,
     refused: std::collections::HashSet<u32>,
+    /// Clip bytes by archive path, so a sound is read out of the archive once
+    /// rather than once per time it is heard.
+    ///
+    /// **Every footstep was re-reading and re-decompressing its own file.**
+    /// A walking character fires several a second, `chain.read` decompresses
+    /// out of the MPQ each time, and nothing kept the result -- measured at
+    /// 3.60 ms of a 17.32 ms frame on average with a 32.70 ms worst, which
+    /// made `update_sound` the largest single item in the frame once the
+    /// minimap's index scan was fixed.
+    ///
+    /// `Arc<[u8]>` rather than `Vec<u8>`: `rodio::Decoder` wants an owned
+    /// `Cursor`, and cloning an `Arc` to build one is a pointer copy where
+    /// cloning the bytes would put back most of the cost being removed.
+    clips: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
+    /// Archive reads this has actually performed, against clips played.
+    ///
+    /// **Both, always.** A cache that has quietly stopped caching plays the
+    /// same sounds and sounds identical; only the ratio says otherwise. The
+    /// same reasoning as the collision grid's probe and the minimap index's
+    /// scan counter, and the third time this session that a count -- rather
+    /// than a duration -- is what makes a fix checkable.
+    reads: u64,
+    plays: u64,
     /// Sounds waiting for their moment, and when that moment is.
     ///
     /// **A hit sound has to land with the blade, not with the packet.** The
@@ -970,9 +993,26 @@ impl Effects {
             self.refused.insert(id);
             return;
         };
-        let Ok(bytes) = chain.read(path) else {
-            self.refused.insert(id);
-            return;
+        self.plays += 1;
+        let bytes = match self.clips.get(path) {
+            Some(bytes) => std::sync::Arc::clone(bytes),
+            None => {
+                self.reads += 1;
+                let Ok(raw) = chain.read(path) else {
+                    self.refused.insert(id);
+                    return;
+                };
+                let bytes: std::sync::Arc<[u8]> = raw.into();
+                // **Only the small ones.** An effect is a footstep or a clang
+                // -- tens of kilobytes, played over and over -- while the
+                // long files in this table are the ones nothing repeats.
+                // Keeping everything would trade a frame-time problem for a
+                // memory one, which is not a trade this needs to make.
+                if bytes.len() <= MAX_CACHED_CLIP {
+                    self.clips.insert(path.to_string(), std::sync::Arc::clone(&bytes));
+                }
+                bytes
+            }
         };
         match rodio::Decoder::new(Cursor::new(bytes)) {
             Ok(source) => {
@@ -987,7 +1027,16 @@ impl Effects {
             }
         }
     }
+
+    /// Archive reads performed, and clips played. See [`Effects::reads`].
+    pub fn clip_reads(&self) -> (u64, u64) {
+        (self.reads, self.plays)
+    }
 }
+
+/// Largest clip kept in memory, in bytes. Comfortably above a footstep or an
+/// impact and below anything long enough to be worth streaming.
+const MAX_CACHED_CLIP: usize = 512 * 1024;
 
 #[cfg(test)]
 mod tests {

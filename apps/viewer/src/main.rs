@@ -1950,6 +1950,11 @@ struct FrameProfile {
     /// and this project has already been caught reading a marker printed by
     /// the expensive thing as if it were the cause.
     log_ms: f32,
+    /// Sound clips played this session, and how many of those needed an
+    /// archive read. **Both**, because a cache that has stopped caching
+    /// sounds exactly the same -- see `sound::Effects::reads`.
+    clip_reads: u64,
+    clip_plays: u64,
     /// Collision work this frame -- see `collision::Probe`. Beside the times
     /// because a millisecond cannot say whether the cost is many cheap
     /// queries or a few expensive ones, and the two want different fixes.
@@ -2012,7 +2017,8 @@ impl FrameProfile {
              present {:.1} | \
              rest {:.1} ms; outside redraw {:.1} = {} events in {:.1} + \
              {:.1} idle + {:.1} log ms\n\
-             collision: {} queries, {} candidates ({} per query){}",
+             collision: {} queries, {} candidates ({} per query) | \
+             clips {} played from {} archive reads{}",
             self.terrain_draws,
             self.model_draws,
             self.shadow_draws,
@@ -2057,6 +2063,8 @@ impl FrameProfile {
             self.collision.queries,
             self.collision.candidates,
             self.collision.candidates / self.collision.queries.max(1),
+            self.clip_plays,
+            self.clip_reads,
             // Only where a spread was gathered, which is the log's line and
             // not the window's -- the window shows the frame that just
             // happened and has no second to average over.
@@ -6937,6 +6945,7 @@ impl App {
         if let Some(Scene::Streaming(world)) = r.scene.as_ref() {
             profile.collision = world.collision_probe();
         }
+        (profile.clip_reads, profile.clip_plays) = self.effects.clip_reads();
         profile.redraw_ms = redraw_started.elapsed().as_secs_f32() * 1000.0;
         self.profile = profile;
 
