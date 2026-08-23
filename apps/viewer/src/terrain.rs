@@ -18,6 +18,18 @@ pub struct ChunkDraw {
     pub first_index: u32,
     pub index_count: u32,
     pub bind_group: wgpu::BindGroup,
+    /// The world-space box this chunk's vertices occupy, kept so the draw
+    /// loop can skip it when it is off screen.
+    ///
+    /// **Per chunk and not per tile**, which is the whole point: a tile is 256
+    /// of these and the camera stands *on* one, so a tile-level box is a box
+    /// the camera is inside and passes every frustum test there is. Recorded
+    /// here at build time rather than derived from the tile's origin and a
+    /// nominal chunk size, because the vertical extent is the height field and
+    /// nothing but the vertices knows it -- a flat box at the tile's mean
+    /// elevation would cull the top of a mountain.
+    pub min: Vec3,
+    pub max: Vec3,
 }
 
 pub struct LoadedTerrain {
@@ -133,10 +145,13 @@ pub fn load(
 
     for chunk in tile.chunks.iter() {
         let base = vertices.len() as u32;
+        let (mut chunk_min, mut chunk_max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for i in 0..chunk.heights.len() {
             let p = Vec3::from(chunk.vertex_position(i));
             min = min.min(p);
             max = max.max(p);
+            chunk_min = chunk_min.min(p);
+            chunk_max = chunk_max.max(p);
 
             let n = chunk.normals.get(i).copied().unwrap_or([0, 0, 127]);
             let normal = Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32) / 127.0;
@@ -184,6 +199,8 @@ pub fn load(
             first_index: start,
             index_count: count,
             bind_group: renderer.bind_chunk(gpu, &layers, &blend_view),
+            min: chunk_min,
+            max: chunk_max,
         });
         blend_maps.push(blend);
     }

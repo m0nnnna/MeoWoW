@@ -161,6 +161,34 @@ pub struct Group {
     /// everything else, which is 16,415 of the 22,844 models in the archives,
     /// so the memory is a rounding error rather than a copy of the scene.
     pub emitting: Vec<Mat4>,
+    /// The world-space box every placement in this group occupies, or `None`
+    /// where this client cannot say.
+    ///
+    /// **`None` means "draw it", not "it is nowhere".** A group whose model
+    /// carries no bounds at all -- a WMO whose group table did not parse, an
+    /// M2 that is nothing but an emitter -- has to keep being drawn, and the
+    /// alternative is geometry disappearing for a reason no picture can show.
+    /// The same distinction the questgiver cache makes between "the server
+    /// said nothing is here" and "nobody has asked yet".
+    pub bounds: Option<(Vec3, Vec3)>,
+    /// One world-space box per *part* of the model, indexed by
+    /// [`crate::model::Draw::submesh_id`], or `None` where per-part culling
+    /// does not apply.
+    ///
+    /// **Only ever a building, and only ever one placement of it.** A WMO's
+    /// parts are its groups -- rooms, corridors, the outside of the mountain
+    /// -- and `submesh_id` is the group index, so Ironforge's 1,162 batches
+    /// resolve to 104 boxes and the ones behind you stop being submitted.
+    /// That is the whole reason this exists: the batch list is flat and a
+    /// city's worth of it is drawn to show one room.
+    ///
+    /// It is `None` for an M2 because an M2's `submesh_id` is not an index
+    /// into anything -- the ids are sparse (0, 101, 201...) and name a
+    /// geoset, not a part with a box. It is `None` for more than one
+    /// placement because the boxes are in world space and two placements of
+    /// one building have two different sets of them, which is a per-instance
+    /// draw loop rather than a per-group one.
+    pub part_bounds: Option<Vec<(Vec3, Vec3)>>,
     /// A stable identity per entry in [`Group::emitting`].
     ///
     /// Entity groups are rebuilt **every frame** and their order changes
@@ -197,6 +225,113 @@ pub struct Held {
     /// The attachment point, in the wielder's model space. A point, not an
     /// offset -- see [`m2::Attachment`].
     pub offset: Vec3,
+}
+
+/// How far an animated model may reach outside its bind-pose box, as a
+/// fraction of that box's half-extent, plus a floor in world units.
+///
+/// **A margin, and it is not a guess dressed up as a measurement.** A group's
+/// box is built from the model's *vertices*, which are the bind pose --
+/// `crate::model::load` only falls back to the M2 header's own culling box
+/// when a model has no vertices at all. A swing, a leap or a wing-beat puts
+/// geometry outside that box, and a creature culled at the edge of the screen
+/// because its arm was the only part still on it is a disappearance nobody
+/// would attribute to culling.
+///
+/// The right fix is to carry the header's animation-aware box through the
+/// model cache and cull against that; until something does, this errs the way
+/// the whole module errs, towards drawing too much. Entities are a small part
+/// of the submission count -- the city and the terrain are the rest -- so
+/// paying a few draws here to be certain is the cheap side of the trade.
+const ANIMATION_MARGIN: f32 = 0.5;
+const ANIMATION_FLOOR: f32 = 2.0;
+
+/// The model-space box a model occupies, from whichever of its two tables
+/// knows.
+///
+/// An M2 records one box. A WMO records none -- **its groups do**, which is
+/// the same fact its draw list already states one batch at a time, and the
+/// union of them is the building. Returning `None` for a model with neither
+/// is deliberate: see [`Group::bounds`] for why that has to mean "draw it".
+fn model_extent(model: &CachedModel) -> Option<(Vec3, Vec3)> {
+    if let Some(bounds) = model.bounds {
+        return Some(bounds);
+    }
+    let mut acc = None;
+    for part in &model.group_bounds {
+        render::cull::grow(&mut acc, *part);
+    }
+    acc
+}
+
+/// The world-space boxes a group needs to be culled against: one for the
+/// whole group, and -- for a single placement of a building -- one per part.
+///
+/// `margin` inflates the model's box before it is placed, for a group whose
+/// geometry moves after this is computed. Zero for scenery, which does not.
+fn placement_bounds(
+    model: &CachedModel,
+    transforms: &[Mat4],
+    margin: bool,
+) -> (Option<(Vec3, Vec3)>, Option<Vec<(Vec3, Vec3)>>) {
+    placement_bounds_of(
+        model_extent(model),
+        // Empty for anything that is not a building, which is what turns
+        // per-part culling off for it -- see [`Group::part_bounds`].
+        if model.wmo_id.is_some() {
+            &model.group_bounds
+        } else {
+            &[]
+        },
+        transforms,
+        margin,
+    )
+}
+
+/// The arithmetic of [`placement_bounds`], with no `CachedModel` in it.
+///
+/// **Split out so it can be tested at all.** A `CachedModel` owns uploaded
+/// meshes, bind groups and textures, so asking it these questions needs a GPU
+/// -- and the mistakes this code can make are all arithmetic: a box that does
+/// not grow when its placement is rotated, per-part boxes offered for a model
+/// whose part ids are not indices, or a margin applied to scenery that never
+/// moves. Every one of those draws a picture with something missing from it
+/// and no error anywhere.
+fn placement_bounds_of(
+    extent: Option<(Vec3, Vec3)>,
+    parts: &[(Vec3, Vec3)],
+    transforms: &[Mat4],
+    margin: bool,
+) -> (Option<(Vec3, Vec3)>, Option<Vec<(Vec3, Vec3)>>) {
+    let Some((min, max)) = extent else {
+        return (None, None);
+    };
+    let (min, max) = if margin {
+        let grow = ((max - min) * 0.5 * ANIMATION_MARGIN).max(Vec3::splat(ANIMATION_FLOOR));
+        (min - grow, max + grow)
+    } else {
+        (min, max)
+    };
+
+    let mut whole = None;
+    for transform in transforms {
+        render::cull::grow(
+            &mut whole,
+            render::cull::transformed_bounds(*transform, min, max),
+        );
+    }
+
+    // One placement, and a model that has parts -- see [`Group::part_bounds`].
+    let parts = match transforms {
+        [transform] if !parts.is_empty() => Some(
+            parts
+                .iter()
+                .map(|(lo, hi)| render::cull::transformed_bounds(*transform, *lo, *hi))
+                .collect(),
+        ),
+        _ => None,
+    };
+    (whole, parts)
 }
 
 /// The transforms worth keeping on the CPU for a group.
@@ -1064,6 +1199,18 @@ impl World {
             }
         }
 
+        // **Sorted, because a `HashMap`'s order is randomised per process and
+        // this order is the order things are *drawn* in.** Blended geometry
+        // composites in submission order, so two runs of one binary on one
+        // scene produced pictures that differed in a few hundred pixels --
+        // which is exactly the size of difference a culling bug makes, and
+        // made the two indistinguishable. `--screenshot` has always promised
+        // that "two screenshots of the same weather are the same picture";
+        // this is what makes that true. The particle systems were already
+        // seeded from their placement ids for the same reason.
+        let mut groups: Vec<(String, Vec<Mat4>)> = groups.into_iter().collect();
+        groups.sort_by(|a, b| a.0.cmp(&b.0));
+
         let mut built = Vec::new();
         let mut wmos = Vec::new();
         let mut solid = collision::World::new();
@@ -1119,7 +1266,11 @@ impl World {
                 .iter()
                 .map(|t| Instance::from_cols_array_2d(t.to_cols_array_2d()))
                 .collect();
+            // Scenery does not move after this, so no margin.
+            let (bounds, part_bounds) = placement_bounds(&model, &transforms, false);
             built.push(Group {
+                bounds,
+                part_bounds,
                 emitting: emitting_placements(&model, &transforms),
                 emitting_ids: doodad_ids(&model, tile, &path, transforms.len()),
                 model,
@@ -1650,6 +1801,24 @@ impl World {
         })
     }
 
+    /// How much work every resident tile's collision grid did since this was
+    /// last called, summed and zeroed.
+    ///
+    /// **Summed across tiles rather than reported per tile, and that is the
+    /// point in a city.** A world object is filed under the tile holding its
+    /// *origin*, so Ironforge is one placement 1,058 units across owned by
+    /// one tile -- every query anywhere inside it reaches that one grid, and
+    /// a per-tile figure would show eight quiet tiles and hide the ninth.
+    pub fn collision_probe(&self) -> collision::Probe {
+        let mut total = collision::Probe::default();
+        for tile in self.tiles() {
+            let probe = tile.solid.take_probe();
+            total.queries += probe.queries;
+            total.candidates += probe.candidates;
+        }
+        total
+    }
+
     pub fn tiles(&self) -> impl Iterator<Item = &Tile> {
         self.tiles.values()
     }
@@ -1990,6 +2159,16 @@ impl World {
                     meshes.prepare(gpu, held_model.draws.iter().map(|d| translucent(d.state)));
                 }
                 built.push(Group {
+                    // **No bounds, so a held item is never culled.** Its
+                    // transforms are rewritten every frame by
+                    // `update_animations` from the wielder's current pose, so
+                    // anything computed here is a fact about a pose that has
+                    // already been replaced -- and a sword culled against its
+                    // own bind position is a sword that vanishes mid-swing.
+                    // One draw per wielder, so the cost of always drawing it
+                    // is a rounding error against the city behind it.
+                    bounds: None,
+                    part_bounds: None,
                     // A torch in a hand is the case this exists for, and its
                     // placements are rewritten every frame by
                     // `update_animations` along with the item's own transform.
@@ -2043,7 +2222,11 @@ impl World {
                     .iter()
                     .map(|transform| Instance::from_cols_array_2d(transform.to_cols_array_2d()))
                     .collect();
+                let (bounds, part_bounds) =
+                    placement_bounds(&doodad_model, &doodad_transforms, true);
                 built.push(Group {
+                    bounds,
+                    part_bounds,
                     emitting: emitting_placements(&doodad_model, &doodad_transforms),
                     emitting_ids: entity_doodad_ids(
                         &doodad_model,
@@ -2061,7 +2244,12 @@ impl World {
                 });
             }
 
+            // A margin: this one is posed after it is placed. See
+            // `ANIMATION_MARGIN`.
+            let (bounds, part_bounds) = placement_bounds(&model, &transforms, true);
             built.push(Group {
+                bounds,
+                part_bounds,
                 emitting: emitting_placements(&model, &transforms),
                 emitting_ids: if model.particles.is_empty() && model.ribbons.is_empty() {
                     Vec::new()
@@ -3796,6 +3984,88 @@ mod tests {
     /// tiles by the *query's* coordinates and would ask (31,49), which holds
     /// nothing -- and the character fell through a city drawn perfectly
     /// around them.
+    /// A model with no box at all must claim none, not an empty one at the
+    /// origin. `None` is read by the draw loop as "draw it"; a zero-sized box
+    /// at the world origin is drawn whenever the camera happens to look at
+    /// Azeroth's centre and never otherwise, which is a model that vanishes
+    /// for reasons nobody would connect to culling. Same distinction the
+    /// questgiver cache makes between "nothing is here" and "nobody asked".
+    #[test]
+    fn a_model_with_no_extent_claims_no_bounds() {
+        let (whole, parts) =
+            placement_bounds_of(None, &[], &[Mat4::IDENTITY], false);
+        assert_eq!(whole, None);
+        assert_eq!(parts, None);
+    }
+
+    /// The box has to grow when its placement turns, and this project turns
+    /// every placement -- a doodad's rotation and a building's differ by a
+    /// quarter turn and neither is the identity. Transforming two corners
+    /// instead of eight produces a box that is too small in exactly the cases
+    /// where a building faces a road, so its walls disappear at some angles
+    /// and not at others.
+    #[test]
+    fn a_turned_placement_gets_a_bigger_box_not_a_tilted_one() {
+        let long = Some((Vec3::new(-10.0, -1.0, -1.0), Vec3::new(10.0, 1.0, 1.0)));
+        let turned = Mat4::from_rotation_z(std::f32::consts::FRAC_PI_4);
+        let (whole, _) = placement_bounds_of(long, &[], &[turned], false);
+        let (_, hi) = whole.expect("a model with an extent has bounds");
+        assert!(hi.y > 7.0, "expected the box to grow in Y, got {hi:?}");
+    }
+
+    /// Two placements of one model make one box covering both, and it is the
+    /// union rather than either of them -- a group is drawn or skipped whole.
+    #[test]
+    fn several_placements_share_one_box_covering_all_of_them() {
+        let unit = Some((Vec3::splat(-1.0), Vec3::splat(1.0)));
+        let here = Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0));
+        let far = Mat4::from_translation(Vec3::new(100.0, 0.0, 0.0));
+        let (whole, parts) = placement_bounds_of(unit, &[], &[here, far], false);
+        assert_eq!(whole, Some((Vec3::new(-1.0, -1.0, -1.0), Vec3::new(101.0, 1.0, 1.0))));
+        // ...and no per-part boxes, because the parts would need one set per
+        // placement and the draw loop has one set per group. See
+        // `Group::part_bounds`.
+        assert_eq!(parts, None, "per-part culling is for a single placement only");
+    }
+
+    /// A building placed once gets one box per part, so the rooms behind you
+    /// stop being submitted. This is the test Ironforge exists to motivate:
+    /// 104 groups and 1,162 batches, all of them drawn to show one room.
+    #[test]
+    fn one_placement_of_a_building_gets_a_box_per_part() {
+        let parts_in = [
+            (Vec3::new(-10.0, -10.0, 0.0), Vec3::new(0.0, 0.0, 5.0)),
+            (Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 10.0, 5.0)),
+        ];
+        let extent = Some((Vec3::new(-10.0, -10.0, 0.0), Vec3::new(10.0, 10.0, 5.0)));
+        let moved = Mat4::from_translation(Vec3::new(1000.0, 0.0, 0.0));
+        let (whole, parts) = placement_bounds_of(extent, &parts_in, &[moved], false);
+        let parts = parts.expect("a single placement of a model with parts");
+        assert_eq!(parts.len(), 2);
+        // Each part is placed, and the two do not collapse into one another --
+        // a per-part list that is really the whole model repeated culls
+        // nothing while looking like it works.
+        assert!(parts[0].1.x <= parts[1].0.x + f32::EPSILON, "the parts must stay apart: {parts:?}");
+        assert_eq!(whole.expect("bounds").0.x, 990.0);
+    }
+
+    /// Scenery does not move after it is placed; a creature is posed after
+    /// it is. Only the second gets a margin, and the margin has to actually
+    /// widen the box -- a margin that rounds to nothing is a comment.
+    #[test]
+    fn only_a_posed_placement_gets_a_margin() {
+        let unit = Some((Vec3::splat(-1.0), Vec3::splat(1.0)));
+        let (tight, _) = placement_bounds_of(unit, &[], &[Mat4::IDENTITY], false);
+        let (loose, _) = placement_bounds_of(unit, &[], &[Mat4::IDENTITY], true);
+        let tight = tight.expect("bounds");
+        let loose = loose.expect("bounds");
+        assert_eq!(tight, (Vec3::splat(-1.0), Vec3::splat(1.0)));
+        assert!(
+            loose.1.x > tight.1.x && loose.0.x < tight.0.x,
+            "a posed placement must be given room to swing: {loose:?}"
+        );
+    }
+
     #[test]
     fn a_building_bigger_than_a_tile_is_solid_from_its_neighbours() {
         // Stormwind's shell, in world space, filed under one tile.

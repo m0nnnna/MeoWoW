@@ -190,6 +190,19 @@ struct Args {
     #[arg(long)]
     no_shadows: bool,
 
+    /// Submit every draw, culling nothing against the frustum.
+    ///
+    /// **The instrument the culling is checked with, and the reason it can be
+    /// checked at all.** Culling is only correct if it changes the frame time
+    /// and nothing else, and "nothing else" is not something a person can see
+    /// by looking at one render: a missing room, a missing hillside or a
+    /// missing doodad in a city of three thousand looks exactly like a city.
+    /// Two `--screenshot` runs differing by this flag alone must produce the
+    /// same pixels, which is an assertion a machine can make and an eye
+    /// cannot. `render::cull` has the unit tests; this has the picture.
+    #[arg(long)]
+    no_cull: bool,
+
     /// How wide the shadowed region around the camera is, in world units.
     ///
     /// Exposed because it is the only number here whose right value is a
@@ -1253,8 +1266,15 @@ fn pull_camera_out_of_the_ground(
     // for the wrong surface (the report a cave floor read as "eighteen
     // units underground" against the outdoor terrain field, before this
     // pass learned to ask the collision mesh first).
+    //
+    // **`trace`, not `debug`, for the same reason `pull_camera_in_front_of_
+    // walls`' two lines are.** `allowed < 1.0` is the ordinary case on any
+    // multi-level interior -- a balcony, a stairwell, an uneven floor -- and
+    // this pass runs once per sampled yaw, so a stairwell logged this every
+    // frame, identical value or not, right alongside the other two lines
+    // that got the same fix.
     if allowed < 1.0 {
-        tracing::debug!(
+        tracing::trace!(
             "camera ground clearance: allowed={allowed:.3} of the ray, eye {:.2},{:.2},{:.2} -> {:.2},{:.2},{:.2}",
             eye.x, eye.y, eye.z, pulled.x, pulled.y, pulled.z
         );
@@ -1450,7 +1470,16 @@ fn pull_camera_in_front_of_walls(
         // report should carry back instead: the hit fraction, the normal
         // this client read off the real geometry, and where the duck put the
         // eye, in one line rather than another guess.
-        tracing::debug!(
+        //
+        // **`trace`, not `debug`, for the same reason the clear branch above
+        // is.** Outdoors, clear is the ordinary case and duck is rare enough
+        // to be worth debug's default visibility. Indoors, near any low
+        // ceiling or stairwell, duck becomes the ordinary case instead --
+        // reported live as 4,508 of these two branches' lines in 34 seconds
+        // near a stairwell, most of them the identical result logged again
+        // because nothing had moved. A debug capture drowns in it exactly
+        // the way the outdoor comment already warned about.
+        tracing::trace!(
             "camera duck: t={t:.3} normal=({:.2},{:.2},{:.2}) hit.z={:.2} \
              focus.z={:.2} eye {:.2},{:.2},{:.2} -> {:.2},{:.2},{:.2}",
             normal.x, normal.y, normal.z, hit.z, focus.z,
@@ -1476,7 +1505,11 @@ fn pull_camera_in_front_of_walls(
     let stopped =
         (t * length - CAMERA_WALL_CLEARANCE).clamp(CAMERA_MIN_PULL_IN.min(length), length);
     let pulled = focus + span * (stopped / length);
-    tracing::debug!(
+    // `trace`, not `debug` -- see the identical note on `camera duck` above.
+    // This is the branch a stairwell hits on every one of the follow
+    // camera's three sampled rays, every frame, so at `debug` it dominated a
+    // capture with thousands of lines repeating the same static result.
+    tracing::trace!(
         "camera pull-in: t={t:.3} normal=({:.2},{:.2},{:.2}) stopped={stopped:.2} of \
          {length:.2} eye {:.2},{:.2},{:.2} -> {:.2},{:.2},{:.2}",
         normal.x, normal.y, normal.z, eye.x, eye.y, eye.z, pulled.x, pulled.y, pulled.z
@@ -1652,8 +1685,199 @@ fn shadow_centre(world: &world::World, camera: &Camera, radius: f32) -> glam::Ve
     glam::Vec3::new(at.x, at.y, ground)
 }
 
-/// Records one frame. Shared by the windowed and headless paths so the two
-/// cannot drift apart.
+/// What one frame cost: draw calls actually submitted, and the CPU
+/// milliseconds spent producing them.
+///
+/// **Counts and times together, because the fix differs by which half is
+/// large.** A frame that spends its budget *encoding* nine thousand draw
+/// calls is bound by submission and wants culling; one that spends it in
+/// `submit`/`present` is waiting on the GPU and wants fewer triangles or a
+/// cheaper shader. Reported as a single `frame_ms` those are one number and
+/// the same finding, and this project has already spent two guesses on a
+/// stutter whose visible marker was printed by the thing that cost the frame
+/// rather than by the cause -- see `CLAUDE.md`'s "a marker that a slow thing
+/// finished looks exactly like its cause".
+///
+/// Every count is gathered at the `draw_indexed` rather than derived from
+/// what is resident, because that difference *is* the question: how much of
+/// the resident world reaches the command buffer. And the phases are each
+/// measured rather than attributed -- see "a breakdown whose parts do not sum
+/// to its total is not a breakdown", which is what caught a model being
+/// re-parsed once per costume outside everything being timed. `other_ms`
+/// below is that missing third, named instead of hidden.
+#[derive(Default, Clone, Copy)]
+struct FrameProfile {
+    /// Draw calls in the sun's depth-only pass, which draws the resident
+    /// world a second time. Nothing is culled from it -- 4.29 shipped saying
+    /// so, and named this the first thing to measure if the frame rate is
+    /// short.
+    shadow_draws: u32,
+    /// Terrain chunk draws in the visible pass: 256 per resident tile, each
+    /// with a bind group of its own.
+    terrain_draws: u32,
+    /// Building, doodad and creature draws in the visible pass.
+    model_draws: u32,
+    /// Groups walked to produce those draws, whether or not they drew
+    /// anything. A group is one model and every placement of it on one tile.
+    groups: u32,
+    /// Placements those groups carry, summed. The gap between this and
+    /// `groups` is what instancing is saving; the gap between `model_draws`
+    /// and `groups` is what a model's material count is costing.
+    instances: u32,
+    /// Triangles submitted, instances included. Kept beside the draw counts
+    /// so "too much geometry" and "too many submissions" can be told apart:
+    /// the original client draws this same city at 160fps, so a triangle
+    /// count that looks ordinary points squarely at the other half.
+    triangles: u32,
+    /// Draws the frustum test skipped, across both passes.
+    ///
+    /// **Printed beside what was drawn, always, including when it is zero.**
+    /// A culling pass that has quietly stopped working and a view with
+    /// nothing off screen produce the same picture and the same three draw
+    /// counts; only this number tells them apart. Same rule as the
+    /// placeholder-texture counter, which could not distinguish "none were
+    /// wrong" from "there were none" until it printed both.
+    culled_draws: u32,
+
+    /// How long `redraw` itself took, start to finish.
+    ///
+    /// **The number that separates "our frame is slow" from "the frame loop
+    /// is slow".** `frame_ms` runs from one redraw's start to the next, so it
+    /// includes the event loop, winit's input handling and whatever waits
+    /// between presenting and being asked for the next frame. Subtracting the
+    /// phases below from `frame_ms` puts all of that in the same bucket as
+    /// untimed work inside the draw, and those two want opposite
+    /// investigations. Same rule as splitting a load's read from its parse:
+    /// timed together, either fix looked equally reasonable.
+    redraw_ms: f32,
+    /// Building the interface, which is a full egui pass over every frame.
+    ui_ms: f32,
+    /// Walking the character: collision, sliding, the outgoing movement
+    /// stream.
+    movement_ms: f32,
+    /// Placing the follow camera, which is the heaviest collision user in the
+    /// frame -- four orbit rays, each marched through up to eighteen floor
+    /// lookups, each fanned across every resident tile.
+    camera_ms: f32,
+    /// Draining the world connection.
+    network_ms: f32,
+    /// Zone music, ambience and footsteps -- the last of which asks the
+    /// collision mesh what is underfoot.
+    sound_ms: f32,
+    /// Admitting and evicting tiles.
+    stream_ms: f32,
+    /// Rebuilding every replicated entity's instance buffer, which happens
+    /// every frame by design -- see the note at the call site.
+    entities_ms: f32,
+    /// Posing skeletons.
+    animations_ms: f32,
+    /// Stepping particle and ribbon emitters.
+    emitters_ms: f32,
+    /// Waiting for a surface texture. **Its own number on purpose**: this is
+    /// where a GPU-bound frame blocks, and folded into `encode_ms` it would
+    /// read as expensive submission and send the reader to cull something
+    /// that was never the cost.
+    acquire_ms: f32,
+    /// Writing the command buffer -- every `set_pipeline`, `set_bind_group`
+    /// and `draw_indexed` above, plus egui's own pass.
+    encode_ms: f32,
+    /// `queue.submit` and `queue.present`.
+    submit_ms: f32,
+    /// Collision work this frame -- see `collision::Probe`. Beside the times
+    /// because a millisecond cannot say whether the cost is many cheap
+    /// queries or a few expensive ones, and the two want different fixes.
+    collision: collision::Probe,
+    /// Frames drawn since this profile was last reported, and the slowest and
+    /// fastest of them.
+    ///
+    /// **Because a once-a-second sample of a stutter is a lottery.** The
+    /// first version of this logged whichever frame happened to be current
+    /// when the second elapsed, and reported 79-103 fps for a session whose
+    /// complaint was that moving indoors was slow. It was not wrong; it was
+    /// answering a different question. What a person feels is the worst
+    /// frame, so that is the one kept.
+    frames: u32,
+    worst_ms: f32,
+    best_ms: f32,
+}
+
+impl FrameProfile {
+    /// Everything above that was measured separately, so `other_ms` can be
+    /// what is left rather than an attribution.
+    fn accounted_ms(&self) -> f32 {
+        self.ui_ms
+            + self.movement_ms
+            + self.camera_ms
+            + self.network_ms
+            + self.sound_ms
+            + self.stream_ms
+            + self.entities_ms
+            + self.animations_ms
+            + self.emitters_ms
+            + self.acquire_ms
+            + self.encode_ms
+            + self.submit_ms
+    }
+
+    /// Three lines: what was submitted, what it cost, and how the frame
+    /// times were spread. Shared by the debug window and the log so the two
+    /// cannot disagree.
+    fn describe(&self, frame_ms: f32) -> String {
+        let draws = self.terrain_draws + self.model_draws + self.shadow_draws;
+        // Inside `redraw` but not measured by any phase above. Kept apart
+        // from `outside` below -- see [`Self::redraw_ms`].
+        let unaccounted = (self.redraw_ms - self.accounted_ms()).max(0.0);
+        // Everything between this redraw ending and the next one starting:
+        // the event loop, winit, input, and any wait for the display.
+        let outside = (frame_ms - self.redraw_ms).max(0.0);
+        format!(
+            "{draws} draws/frame = {} terrain + {} models + {} shadow, \
+             {} culled | {} groups, {} instances, {} ktris\n\
+             redraw {:.1}: ui {:.1} | move {:.1} | camera {:.1} | net {:.1} | \
+             sound {:.1} | stream {:.1} | entities {:.1} | anim {:.1} | \
+             emitters {:.1} | acquire {:.1} | encode {:.1} | submit {:.1} | \
+             rest {:.1} ms; outside redraw {:.1} ms\n\
+             collision: {} queries, {} candidates ({} per query){}",
+            self.terrain_draws,
+            self.model_draws,
+            self.shadow_draws,
+            self.culled_draws,
+            self.groups,
+            self.instances,
+            self.triangles / 1000,
+            self.redraw_ms,
+            self.ui_ms,
+            self.movement_ms,
+            self.camera_ms,
+            self.network_ms,
+            self.sound_ms,
+            self.stream_ms,
+            self.entities_ms,
+            self.animations_ms,
+            self.emitters_ms,
+            self.acquire_ms,
+            self.encode_ms,
+            self.submit_ms,
+            unaccounted,
+            outside,
+            self.collision.queries,
+            self.collision.candidates,
+            self.collision.candidates / self.collision.queries.max(1),
+            // Only where a spread was gathered, which is the log's line and
+            // not the window's -- the window shows the frame that just
+            // happened and has no second to average over.
+            if self.frames > 0 {
+                format!(
+                    "\n{} frames in the last second, worst {:.1} ms, best {:.1} ms",
+                    self.frames, self.worst_ms, self.best_ms
+                )
+            } else {
+                String::new()
+            },
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_scene(
     gpu: &Gpu,
@@ -1696,6 +1920,12 @@ fn draw_scene(
     // scenes, which have no place and therefore no sky -- the same reason
     // they get no gradient and no weather.
     atmosphere: Option<&Atmosphere<'_>>,
+    // Filled as the pass is written, not read here. See [`FrameProfile`] for
+    // why the counts are taken at the `draw_indexed` rather than off what is
+    // resident.
+    profile: &mut FrameProfile,
+    // `false` submits everything -- see `Args::no_cull`.
+    cull: bool,
 ) {
     // Terrain has its own pipeline, so both the tile and world scenes route
     // their landscape through here.
@@ -1726,6 +1956,8 @@ fn draw_scene(
             lighting,
             seconds,
             atmosphere,
+            profile,
+            cull,
         );
         return;
     }
@@ -2187,6 +2419,8 @@ fn draw_streaming(
     lighting: Option<(dbc::light::Sample, f32)>,
     seconds: f32,
     atmosphere: Option<&Atmosphere<'_>>,
+    profile: &mut FrameProfile,
+    cull: bool,
 ) {
     let aspect = size.0 as f32 / size.1.max(1) as f32;
     // **The one uniform, kept.** The liquid pass has its own bind group and
@@ -2215,6 +2449,23 @@ fn draw_streaming(
         })
         .filter(|(a, _, _)| a.strength * clear > 0.0);
 
+    // **Built here rather than beside the pass that uses it**, because the
+    // shadow pass sits between this point and where `view_proj` used to be
+    // computed, and both passes want a frustum. One derivation, from the very
+    // matrix the scene is drawn with -- the same rule the picking ray follows,
+    // and for the same reason: a frustum rebuilt from the camera's angles
+    // agrees with the drawn image only until somebody edits one of them, and
+    // the failure is geometry vanishing at the edge of the screen.
+    let view_proj = camera.view_proj(aspect);
+    // `Frustum::everything` rather than an `Option` threaded through every
+    // test below: a frustum that admits everything is a real frustum, and one
+    // branch at the top beats six `if let`s in the hot loops.
+    let frustum = if cull {
+        render::cull::Frustum::from_view_proj(view_proj)
+    } else {
+        render::cull::Frustum::everything()
+    };
+
     let lit = lit_uniform(
         camera,
         aspect,
@@ -2233,6 +2484,18 @@ fn draw_streaming(
     // colour attachment cannot share the scene's, and the scene's fragments
     // read the map this one writes -- so the order is not a preference.
     if let Some((_, map, matrix)) = cast {
+        // **The same test the rasteriser is already making, moved earlier.**
+        // The sun's box is orthographic and depth-clipped like any other, so
+        // a caster outside it contributes nothing to the map whether or not
+        // it is submitted -- this cannot change the picture, only what it
+        // costs to draw. And it is the change the shadow milestone itself
+        // named as the first thing to measure: 110 units of box was being
+        // handed the whole resident world, nine tiles of it, every frame.
+        let shadow_frustum = if cull {
+            render::cull::Frustum::from_view_proj(matrix)
+        } else {
+            render::cull::Frustum::everything()
+        };
         map.set_matrix(gpu, matrix);
         let mut pass = map.begin(encoder);
         pass.set_pipeline(map.terrain_pipeline());
@@ -2243,6 +2506,12 @@ fn draw_streaming(
                 wgpu::IndexFormat::Uint32,
             );
             for chunk in &tile.terrain.chunks {
+                if !shadow_frustum.intersects(chunk.min, chunk.max) {
+                    profile.culled_draws += 1;
+                    continue;
+                }
+                profile.shadow_draws += 1;
+                profile.triangles += chunk.index_count / 3;
                 pass.draw_indexed(
                     chunk.first_index..chunk.first_index + chunk.index_count,
                     0,
@@ -2251,6 +2520,13 @@ fn draw_streaming(
             }
         }
         for group in world.tiles().flat_map(|t| t.groups.iter()).chain(world.entities()) {
+            if group
+                .bounds
+                .is_some_and(|(min, max)| !shadow_frustum.intersects(min, max))
+            {
+                profile.culled_draws += group.model.draws.len() as u32;
+                continue;
+            }
             // The pose the visible pass will use, not a second evaluation of
             // it: a shadow computed from the bind pose while the creature runs
             // is a silhouette standing beside its own model.
@@ -2280,6 +2556,16 @@ fn draw_streaming(
                 if draw.state.blend.is_transparent() {
                     continue;
                 }
+                // A building's rooms, one at a time -- see `Group::part_bounds`.
+                if group
+                    .part_bounds
+                    .as_ref()
+                    .and_then(|parts| parts.get(draw.submesh_id as usize))
+                    .is_some_and(|(min, max)| !shadow_frustum.intersects(*min, *max))
+                {
+                    profile.culled_draws += 1;
+                    continue;
+                }
                 let Some(bind) = group.model.binds.get(draw.texture) else {
                     continue;
                 };
@@ -2294,6 +2580,8 @@ fn draw_streaming(
                 // reads it: a pipeline layout declares the group, so leaving
                 // it unset is a validation error rather than a saved bind.
                 pass.set_bind_group(2, bind, &[]);
+                profile.shadow_draws += 1;
+                profile.triangles += (draw.index_count / 3) * group.count;
                 pass.draw_indexed(
                     draw.first_index..draw.first_index + draw.index_count,
                     0,
@@ -2302,12 +2590,6 @@ fn draw_streaming(
             }
         }
     }
-    // Built once here and handed to both the sky and the scene, rather than
-    // each asking the camera for its own: the sky's horizon has to sit exactly
-    // where the ground's does, and two derivations agree only until one of them
-    // is edited. Same reasoning as the picking ray.
-    let view_proj = camera.view_proj(aspect);
-
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("streaming world"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2373,7 +2655,17 @@ fn draw_streaming(
         pass.set_vertex_buffer(0, tile.terrain.mesh.vertices.slice(..));
         pass.set_index_buffer(tile.terrain.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
         for chunk in &tile.terrain.chunks {
+            // **Per chunk, not per tile.** The camera stands on the tile it
+            // is looking across, so a tile-level box is a box the camera is
+            // inside and it passes every test there is; 256 chunks is the
+            // grain at which "behind you" starts to mean anything.
+            if !frustum.intersects(chunk.min, chunk.max) {
+                profile.culled_draws += 1;
+                continue;
+            }
             pass.set_bind_group(1, &chunk.bind_group, &[]);
+            profile.terrain_draws += 1;
+            profile.triangles += chunk.index_count / 3;
             pass.draw_indexed(
                 chunk.first_index..chunk.first_index + chunk.index_count,
                 0,
@@ -2389,6 +2681,15 @@ fn draw_streaming(
     // for the whole pass.
     for group in world.tiles().flat_map(|t| t.groups.iter()).chain(world.entities()) {
         {
+            profile.groups += 1;
+            profile.instances += group.count;
+            if group
+                .bounds
+                .is_some_and(|(min, max)| !frustum.intersects(min, max))
+            {
+                profile.culled_draws += group.model.draws.len() as u32;
+                continue;
+            }
             let group_bones = group
                 .animation
                 .and_then(|key| world.entity_bone_buffer(key))
@@ -2409,6 +2710,19 @@ fn draw_streaming(
                 wgpu::IndexFormat::Uint32,
             );
             for (draw_index, draw) in group.model.draws.iter().enumerate() {
+                // A building's rooms, one at a time. This is the test that
+                // matters in a city: Ironforge is one placement of one model
+                // with 1,162 batches and 104 groups, and every batch of it
+                // was submitted to show one room of it.
+                if group
+                    .part_bounds
+                    .as_ref()
+                    .and_then(|parts| parts.get(draw.submesh_id as usize))
+                    .is_some_and(|(min, max)| !frustum.intersects(*min, *max))
+                {
+                    profile.culled_draws += 1;
+                    continue;
+                }
                 // **The group's override, not the material's own state**, and
                 // only where one was asked for. A tint with alpha under one is
                 // invisible through an opaque pipeline -- the blend has to be
@@ -2430,6 +2744,8 @@ fn draw_streaming(
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(1, bind, &[]);
                 pass.set_bind_group(3, texture_bind, &[]);
+                profile.model_draws += 1;
+                profile.triangles += (draw.index_count / 3) * group.count;
                 pass.draw_indexed(
                     draw.first_index..draw.first_index + draw.index_count,
                     0,
@@ -2883,6 +3199,7 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("screenshot"),
         });
+    let mut headless = FrameProfile::default();
     draw_scene(
         &gpu,
         &mut encoder,
@@ -2921,7 +3238,17 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
             radius: args.shadow_radius,
             strength: SHADOW_STRENGTH,
         }),
+        &mut headless,
+        !args.no_cull,
     );
+    // **The headless path's whole reason for carrying one.** `--screenshot`
+    // draws no HUD, so the debug window's copy of this cannot be captured
+    // here -- and the counts are the half of the reading that does not need
+    // a session at all, since what a frame *submits* is decided by what is
+    // resident and where the camera is, both of which this path sets up
+    // exactly as the windowed one does. The times are not comparable (one
+    // frame, cold caches, no present); the counts are.
+    tracing::info!("headless frame: {}", headless.describe(0.0));
     gpu.queue.submit([encoder.finish()]);
 
     if let (Some(path), Some(map)) = (&args.shadow_dump, &shadow) {
@@ -3165,6 +3492,25 @@ struct App {
     /// When the client started, which is the only clock the weather has.
     started: Instant,
     frame_ms: f32,
+    /// Exponential moving average of `1000.0 / frame_ms`, smoothed so the
+    /// debug window's FPS reading is legible rather than changing every
+    /// frame -- the raw reciprocal of a single frame's time swings wildly
+    /// even when performance is steady.
+    fps: f32,
+    /// What the last frame submitted and what each phase of it cost. Not
+    /// smoothed: the counts are exact facts about one frame and averaging
+    /// them would hide the spike that is worth seeing.
+    profile: FrameProfile,
+    /// The slowest frame since the last log line, kept so the log reports the
+    /// frame a person actually felt rather than whichever one the clock
+    /// landed on. See [`FrameProfile::frames`].
+    worst: FrameProfile,
+    /// When the breakdown was last written to the log. **It goes to the log
+    /// as well as to the window on purpose** -- `--screenshot` draws no HUD,
+    /// so a reading that exists only in the debug window cannot be captured
+    /// headlessly, and a frame-rate report from the window is exactly the
+    /// kind of thing this project has twice had to reproduce.
+    profile_logged: Instant,
     /// Selected sequence, or `None` for the bind pose.
     anim: Option<usize>,
     /// Elapsed time within the current sequence.
@@ -4508,6 +4854,10 @@ impl App {
             // total rather than a delta.
             started: Instant::now(),
             frame_ms: 0.0,
+            fps: 0.0,
+            profile: FrameProfile::default(),
+            worst: FrameProfile::default(),
+            profile_logged: Instant::now(),
             anim: None,
             anim_time_ms: 0,
             playing: true,
@@ -5739,6 +6089,14 @@ impl App {
         let now = Instant::now();
         self.frame_ms = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
         self.last_frame = now;
+        if self.frame_ms > 0.0 {
+            let instant_fps = 1000.0 / self.frame_ms;
+            self.fps = if self.fps == 0.0 {
+                instant_fps
+            } else {
+                self.fps + (instant_fps - self.fps) * 0.1
+            };
+        }
 
         // **Its own frame, and it returns.** Nothing below here has anything
         // to draw before a character has been chosen: no scene, no camera to
@@ -5748,25 +6106,39 @@ impl App {
             return;
         }
 
+        // **Reset here, before anything can add to it**, and after the
+        // sign-in return above: a profile carried over from a frame that
+        // returned early would be attributed to this one.
+        let mut profile = FrameProfile::default();
+        let redraw_started = Instant::now();
+        let phase = Instant::now();
         let mut ui_output = self.build_ui(window);
+        profile.ui_ms = phase.elapsed().as_secs_f32() * 1000.0;
         let camera = self.camera;
 
         // Movement integrates real elapsed time, so travel speed does not
         // depend on frame rate. A live world is driven by the character's
         // walk, not a free-flying camera -- see `drive_live_movement`.
         if self.live.is_some() {
+            let phase = Instant::now();
             self.drive_live_movement();
+            profile.movement_ms = phase.elapsed().as_secs_f32() * 1000.0;
             // **Unconditionally, and after movement rather than inside it.**
             // A taxi flight returns early from `drive_live_movement`, and
             // while the camera placement lived in that function's tail the
             // view stayed where the character took off from -- watching an
             // empty field while the minimap tracked them across the map.
             let dt = (self.frame_ms / 1000.0).max(0.0);
+            let phase = Instant::now();
             self.follow_camera_to_character(dt);
+            profile.camera_ms = phase.elapsed().as_secs_f32() * 1000.0;
+            let phase = Instant::now();
             self.pump_live_connection();
             // After the pump, because the spellbook it needs arrives through
-            // it, and because both want the archive chain.
+            // it, and because both want the archive chain. Timed with the
+            // pump: both are "what the connection cost this frame".
             self.load_spell_data();
+            profile.network_ms = phase.elapsed().as_secs_f32() * 1000.0;
         } else if let Camera::Fly(fly) = &mut self.camera {
             let direction = self.keys.direction();
             if direction != glam::Vec3::ZERO {
@@ -5790,7 +6162,9 @@ impl App {
         // **Before the renderer is borrowed**, because this needs the archive
         // chain and the scene at the same time and the draw below holds the
         // renderer for its whole body.
+        let phase = Instant::now();
         self.update_sound();
+        profile.sound_ms = phase.elapsed().as_secs_f32() * 1000.0;
 
         let Some(r) = self.renderer.as_mut() else {
             ui_output.textures_delta.clear();
@@ -5803,6 +6177,7 @@ impl App {
                 Camera::Fly(f) => f.position,
                 Camera::Orbit(o) => o.eye(),
             };
+            let phase = Instant::now();
             world.update(
                 &r.gpu,
                 &mut r.meshes,
@@ -5811,6 +6186,7 @@ impl App {
                 &mut self.chain,
                 eye,
             );
+            profile.stream_ms = phase.elapsed().as_secs_f32() * 1000.0;
             // Also every frame, despite rebuilding every instance buffer.
             // This was originally throttled (see git history for
             // `LIVE_ENTITY_REBUILD_EVERY`) on the reasoning that rebuilding
@@ -5825,6 +6201,7 @@ impl App {
             // updates existing instances' transforms in place rather than
             // reallocating every buffer, rather than reaching for the same
             // timer again.
+            let phase = Instant::now();
             if self.args.entities {
                 if let Some(live) = self.live.as_mut() {
                     // The keys, not the wire: the server never relays our own
@@ -5964,7 +6341,11 @@ impl App {
             // the original reason: animation and instance positions run on
             // different clocks, and tying a walk cycle to the coarser one made
             // it visibly stutter.
+            profile.entities_ms = phase.elapsed().as_secs_f32() * 1000.0;
+            let phase = Instant::now();
             world.update_animations(&r.gpu, &r.meshes);
+            profile.animations_ms = phase.elapsed().as_secs_f32() * 1000.0;
+            let phase = Instant::now();
             // ...and everything alight, after the poses it hangs off. A flame
             // on a hand is placed by the very matrix the hand was drawn with,
             // so stepping first would leave every emitter a frame behind the
@@ -5981,6 +6362,7 @@ impl App {
                 &mut r.emitters,
                 self.frame_ms / 1000.0,
             );
+            profile.emitters_ms = phase.elapsed().as_secs_f32() * 1000.0;
         }
 
         if let (Some(Scene::Model(m)), Some(bones)) = (&r.scene, &r.bones) {
@@ -6002,7 +6384,14 @@ impl App {
         }
 
         use wgpu::CurrentSurfaceTexture as Acquired;
-        let (frame, reconfigure) = match r.surface.get_current_texture() {
+        // **Timed on its own.** With a present mode that waits, this is where
+        // a GPU-bound frame blocks -- and folded into the encode below it
+        // reads as expensive submission, which sends the reader to cull
+        // geometry that was never the cost.
+        let phase = Instant::now();
+        let acquired = r.surface.get_current_texture();
+        profile.acquire_ms = phase.elapsed().as_secs_f32() * 1000.0;
+        let (frame, reconfigure) = match acquired {
             Acquired::Success(frame) => (frame, false),
             // Suboptimal still yields a usable frame. Present it before
             // reconfiguring: wgpu forbids configuring an acquired surface.
@@ -6027,6 +6416,7 @@ impl App {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let phase = Instant::now();
         let mut encoder = r
             .gpu
             .device
@@ -6094,6 +6484,8 @@ impl App {
                     radius: self.args.shadow_radius,
                     strength: SHADOW_STRENGTH,
                 }),
+                &mut profile,
+                !self.args.no_cull,
             );
         }
 
@@ -6137,11 +6529,57 @@ impl App {
             r.egui_renderer.free_texture(id);
         }
 
+        profile.encode_ms = phase.elapsed().as_secs_f32() * 1000.0;
+        let phase = Instant::now();
         r.gpu.queue.submit([encoder.finish()]);
         r.gpu.queue.present(frame);
+        profile.submit_ms = phase.elapsed().as_secs_f32() * 1000.0;
         ui_output.textures_delta.clear();
         if reconfigure {
             r.surface.configure(&r.gpu.device, &r.config);
+        }
+
+        // **Read after the draw, because the draw is not the only caller.**
+        // The camera, the character's own footing and the footstep lookup all
+        // query the same grids earlier in this frame, and a read taken before
+        // the pass would attribute their work to the next one.
+        if let Some(Scene::Streaming(world)) = r.scene.as_ref() {
+            profile.collision = world.collision_probe();
+        }
+        profile.redraw_ms = redraw_started.elapsed().as_secs_f32() * 1000.0;
+        self.profile = profile;
+
+        // **The slowest frame of the second, not the latest one.** See
+        // `FrameProfile::frames`: a once-a-second snapshot of a stutter is a
+        // lottery, and the first version of this reported 79-103 fps for a
+        // session whose complaint was that moving indoors was slow.
+        self.worst.frames += 1;
+        if self.frame_ms > self.worst.worst_ms {
+            let frames = self.worst.frames;
+            let best = self.worst.best_ms;
+            self.worst = profile;
+            self.worst.frames = frames;
+            self.worst.best_ms = best;
+            self.worst.worst_ms = self.frame_ms;
+        }
+        if self.frame_ms < self.worst.best_ms || self.worst.best_ms == 0.0 {
+            self.worst.best_ms = self.frame_ms;
+        }
+
+        // Once a second rather than per frame: at sixty frames a second this
+        // line would *be* the log, and the thing it is meant to make findable
+        // -- a zone where the frame rate collapses -- lasts far longer than
+        // one frame. Same reason the undrawable-model warning speaks on
+        // change rather than on every rebuild.
+        if self.profile_logged.elapsed() >= Duration::from_secs(1) {
+            self.profile_logged = Instant::now();
+            tracing::info!(
+                "worst frame {:.1} ms ({:.0} fps avg): {}",
+                self.worst.worst_ms,
+                self.fps,
+                self.worst.describe(self.worst.worst_ms)
+            );
+            self.worst = FrameProfile::default();
         }
     }
 
@@ -6382,7 +6820,24 @@ impl App {
                     // against open air or a gentle slope never triggers.
                     let intended = (wanted - live.position).truncate().length();
                     let achieved = (slid - live.position).truncate().length();
-                    if intended > 1e-4 && achieved < intended * 0.5 {
+                    // **`enabled!` first, and the world queries only after
+                    // it.** Everything inside this block is *argument*
+                    // evaluation -- five ray casts and two floor lookups,
+                    // each fanned across every resident tile -- so `debug!`
+                    // discarding the line does not discard the work that
+                    // built it. And the condition is not the rare case it
+                    // reads as: `slide` granting less than half is what every
+                    // frame walking up a staircase or along a wall looks
+                    // like, which is precisely the situation being reported
+                    // as slow. Sibling of the camera's own three lines, which
+                    // were moved to `trace` for flooding a log near a
+                    // stairwell -- that fixed the volume; this is the half
+                    // where the cost is in the arguments and a level change
+                    // would not have touched it.
+                    if intended > 1e-4
+                        && achieved < intended * 0.5
+                        && tracing::enabled!(tracing::Level::DEBUG)
+                    {
                         // Horizontal probes at a few heights, the same way
                         // `crosses_wall` samples -- a vertical probe at
                         // `wanted` finds the ordinary floor first (its normal
@@ -11577,7 +12032,13 @@ impl App {
             ),
             None => format!("{}\n{emitters}", describe(scene)),
         });
-        let (error, frame_ms) = (self.error.clone(), self.frame_ms);
+        let (error, frame_ms, fps) = (self.error.clone(), self.frame_ms, self.fps);
+        // The previous frame's, necessarily -- this one has not been drawn
+        // yet. That is the honest reading and not a lag worth hiding: a
+        // number a frame old is a number about a frame that finished, and
+        // smoothing it to look current would be the same mistake as sorting
+        // an absent distance as zero.
+        let profile = self.profile.describe(frame_ms);
         let camera = self.camera;
 
         // Snapshot what the picker needs, so the UI closure does not borrow the
@@ -13012,9 +13473,10 @@ impl App {
                 .show(ctx, |ui| {
                     ui.label(egui::RichText::new(&gpu_line).strong());
                     ui.label(format!(
-                        "BC compression: {} | {frame_ms:.1} ms/frame | {pipelines} pipelines",
+                        "BC compression: {} | {fps:.0} fps | {frame_ms:.1} ms/frame | {pipelines} pipelines",
                         if bc { "yes" } else { "no" }
                     ));
+                    ui.label(egui::RichText::new(&profile).monospace());
                     ui.separator();
                     match &summary {
                         Some(s) => ui.label(egui::RichText::new(s).monospace()),

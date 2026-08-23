@@ -205,13 +205,18 @@ impl Triangle {
     /// Horizontal because a character is a cylinder being pushed out of a
     /// wall, and the push has to leave its height alone -- resolving in three
     /// dimensions against a sloped wall would lift the character up it.
-    fn push_out(&self, at: Vec2, low: f32, high: f32, radius: f32) -> Option<Vec2> {
-        // Ignore anything entirely above or below the body. Without this a
-        // character standing on a floor is permanently being pushed sideways
-        // by the floor it is standing on.
-        if self.min().z > high || self.max().z < low {
-            return None;
-        }
+    ///
+    /// **Says nothing about heights, on purpose, and that is a performance
+    /// fact rather than a tidiness one.** The band this is tested against
+    /// comes from [`World::wall_exemption`], which costs a *grid lookup* --
+    /// so a caller that computes the band before knowing whether the triangle
+    /// is even within arm's reach pays that lookup for every candidate the
+    /// grid handed back. Measured live in Northshire abbey: 4,193 lookups and
+    /// **3.1 million candidate triangles in a single frame**, against 70 and
+    /// 9,274 standing outside, and 10-22ms of a 20-38ms frame. Split so the
+    /// two rejections that need no lookup -- a floor, and anything further
+    /// than `radius` away -- come first. See [`World::slide`].
+    fn push_out_horizontally(&self, at: Vec2, radius: f32) -> Option<Vec2> {
         // Floors do not block horizontal movement, whatever their extent.
         if self.is_floor() {
             return None;
@@ -236,6 +241,30 @@ impl Triangle {
             return Some(fallback * radius);
         }
         Some(away / distance * (radius - distance))
+    }
+
+    /// Whether the body standing between `low` and `high` overlaps this
+    /// triangle vertically at all.
+    ///
+    /// Without this a character standing on a floor is permanently being
+    /// pushed sideways by the floor it is standing on.
+    fn overlaps_band(&self, low: f32, high: f32) -> bool {
+        self.min().z <= high && self.max().z >= low
+    }
+
+    /// The cheapest possible statement about the band, made before the band
+    /// is known.
+    #[allow(dead_code)]
+    ///
+    /// [`World::wall_exemption`] only ever *raises* the bottom of the band --
+    /// it is documented as never removing an exemption, and returns exactly
+    /// `from_z + step` when it finds nothing. So a triangle whose top is
+    /// already under `from_z + step` is excluded whatever the exemption turns
+    /// out to be, and the lookup that would have computed it can be skipped
+    /// outright. This is the test that lets the floors and treads a body is
+    /// standing among cost nothing.
+    fn under_any_band(&self, from_z: f32, step: f32) -> bool {
+        self.max().z < from_z + step
     }
 }
 
@@ -290,8 +319,33 @@ const CELL: f32 = 8.0;
 /// Built once per streamed tile and thrown away with it: rebuilding is cheap
 /// beside reading the tile off disk, and a grid that outlived its tile would be
 /// a set of invisible walls where a building used to be.
+/// How much work the grid did, since it was last asked.
+///
+/// **Counted at [`World::near`], which is the one place every query narrows
+/// through.** A collision cost has two completely different shapes and one
+/// symptom: *many* cheap queries (a camera sampling four orbit rays at
+/// eighteen heights each, across nine tiles) and *expensive* ones (a cell
+/// holding half a city's triangles because one placement spans nine tiles).
+/// The first wants fewer callers, the second wants a better index, and a
+/// millisecond total cannot tell them apart. Both numbers, always -- the same
+/// reason the placeholder-texture counter prints its zero.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Probe {
+    /// Narrowing lookups made.
+    pub queries: u64,
+    /// Triangles those lookups handed back to be tested one at a time. This
+    /// is the number a better index would move.
+    pub candidates: u64,
+}
+
 #[derive(Default)]
 pub struct World {
+    /// Interior mutability because every query here takes `&self` and must
+    /// keep doing so -- the alternative is a `&mut` borrow on the collision
+    /// world threaded through the camera, the movement code and the footstep
+    /// lookup, which would be a real change to the design in order to count
+    /// something.
+    probe: std::cell::Cell<Probe>,
     triangles: Vec<Triangle>,
     /// One opaque label per triangle, parallel to [`Self::triangles`].
     ///
@@ -366,7 +420,17 @@ impl World {
         }
         found.sort_unstable();
         found.dedup();
+        let mut probe = self.probe.get();
+        probe.queries += 1;
+        probe.candidates += found.len() as u64;
+        self.probe.set(probe);
         found
+    }
+
+    /// Reads the work counters and zeroes them, so a caller reading once a
+    /// frame gets that frame's figure rather than the session's.
+    pub fn take_probe(&self) -> Probe {
+        self.probe.replace(Probe::default())
     }
 
     /// What height to stand at under `at`, searching downward from `from_z`.
@@ -528,6 +592,12 @@ impl World {
             let mut correction = Vec2::ZERO;
             for index in self.near(at.truncate(), radius) {
                 let triangle = self.triangles[index as usize];
+                // **The two rejections that cost nothing, first.** Everything
+                // below `wall_exemption` is a grid lookup per candidate, and
+                // the grid hands back every triangle sharing a cell -- a
+                // thousand of them in a building. A floor, and anything
+                // further away than the body can reach, is refused here for
+                // the price of a distance: see `push_out_horizontally`.
                 // Per triangle, not once for the whole pass: see
                 // `wall_exemption`. A riser one or more steps ahead of where
                 // the body actually is can still be exempt, if the tread it
@@ -536,7 +606,10 @@ impl World {
                 let foot = triangle.foot_towards(at.truncate());
                 let ceiling = self.wall_exemption(foot, triangle.max().z, from.z, step);
                 let (low, high) = (ceiling, ceiling + height);
-                if let Some(push) = triangle.push_out(at.truncate(), low, high, radius) {
+                if let Some(push) = triangle
+                    .push_out_horizontally(at.truncate(), radius)
+                    .filter(|_| triangle.overlaps_band(low, high))
+                {
                     // Largest push wins per pass rather than summing: two faces
                     // of one wall both push the same way, and adding them
                     // ejects the character twice as far as either asked for.
@@ -675,10 +748,14 @@ impl World {
         // here by a stricter idea of which walls are exempt.
         self.near(at.truncate(), radius).into_iter().any(|index| {
             let triangle = self.triangles[index as usize];
+            // The same order as `slide`, and it has to stay the same order:
+            // this and `slide`'s push-out phase must agree about which walls
+            // are exempt, so they make the identical tests in the identical
+            // sequence. See `push_out_horizontally`.
             let foot = triangle.foot_towards(at.truncate());
             let ceiling = self.wall_exemption(foot, triangle.max().z, at.z, step);
-            let (low, high) = (ceiling, ceiling + height);
-            triangle.push_out(at.truncate(), low, high, radius).is_some()
+            triangle.push_out_horizontally(at.truncate(), radius).is_some()
+                && triangle.overlaps_band(ceiling, ceiling + height)
         })
     }
 }
