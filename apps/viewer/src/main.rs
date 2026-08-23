@@ -1859,6 +1859,12 @@ struct FrameProfile {
     /// Assembling the interface's inputs before the egui pass can begin:
     /// over a thousand lines of cloning and formatting, every frame.
     ui_snapshot_ms: f32,
+    /// The four ungated parts of that snapshot. Everything else in it is
+    /// behind an "is this panel open" test and costs nothing while closed.
+    ui_markers_ms: f32,
+    ui_bars_ms: f32,
+    ui_panels_ms: f32,
+    ui_map_ms: f32,
     /// The whole egui pass, closure included. Subtracting `ui_hud_ms` and
     /// `ui_stats_ms` leaves what egui spends beginning and ending it.
     ui_egui_ms: f32,
@@ -1907,6 +1913,22 @@ struct FrameProfile {
     /// is the display path, and the honest response is to say so rather than
     /// to go and optimise geometry.
     present_ms: f32,
+    /// The gap before this frame: from the previous redraw's *end* to this
+    /// one's start, stamped at both ends rather than derived.
+    ///
+    /// **It was derived, and the derivation was wrong.** `frame_ms` runs
+    /// start-to-start, so it measures the *previous* frame's period, and
+    /// `outside = frame_ms - redraw_ms` was subtracting *this* frame's redraw
+    /// from it. Two different frames. Worse, the worst-frame picker selects
+    /// the largest `frame_ms`, which is by definition a frame whose
+    /// predecessor was slow -- so the subtraction charged that slow
+    /// predecessor's redraw to this frame's gap, every time, and reported a
+    /// 6.3 ms average gap that survived turning vsync off because it was
+    /// never about the display at all.
+    ///
+    /// A measurement that is a difference of two things measured on different
+    /// frames is not a measurement. Stamped now.
+    gap_ms: f32,
     /// Events handled in the gap before this frame, and what they cost.
     ///
     /// **Both, because the two failure modes look identical in a total.** A
@@ -1969,19 +1991,20 @@ impl FrameProfile {
     /// Three lines: what was submitted, what it cost, and how the frame
     /// times were spread. Shared by the debug window and the log so the two
     /// cannot disagree.
-    fn describe(&self, frame_ms: f32) -> String {
+    fn describe(&self) -> String {
         let draws = self.terrain_draws + self.model_draws + self.shadow_draws;
         // Inside `redraw` but not measured by any phase above. Kept apart
         // from `outside` below -- see [`Self::redraw_ms`].
         let unaccounted = (self.redraw_ms - self.accounted_ms()).max(0.0);
         // Everything between this redraw ending and the next one starting:
         // the event loop, winit, input, and any wait for the display.
-        let outside = (frame_ms - self.redraw_ms).max(0.0);
+        let outside = self.gap_ms;
         format!(
             "{draws} draws/frame = {} terrain + {} models + {} shadow, \
              {} culled | {} groups, {} instances, {} ktris\n\
-             redraw {:.1}: ui {:.1} (snapshot {:.1} + egui {:.1} [hud {:.1} \
-             + stats {:.1}] + text {:.1}) | \
+             redraw {:.1}: ui {:.1} = snapshot {:.1} (markers {:.1}, bars {:.1}, \
+             panels {:.1}, map {:.1}) + egui {:.1} (hud {:.1}, stats {:.1}) \
+             + text {:.1} | \
              move {:.1} | camera {:.1} | \
              net {:.1} | \
              sound {:.1} | stream {:.1} | entities {:.1} | anim {:.1} | \
@@ -2000,6 +2023,10 @@ impl FrameProfile {
             self.redraw_ms,
             self.ui_ms,
             self.ui_snapshot_ms,
+            self.ui_markers_ms,
+            self.ui_bars_ms,
+            self.ui_panels_ms,
+            self.ui_map_ms,
             self.ui_egui_ms,
             self.ui_hud_ms,
             self.ui_stats_ms,
@@ -3415,7 +3442,7 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     // resident and where the camera is, both of which this path sets up
     // exactly as the windowed one does. The times are not comparable (one
     // frame, cold caches, no present); the counts are.
-    tracing::info!("headless frame: {}", headless.describe(0.0));
+    tracing::info!("headless frame: {}", headless.describe());
     // **How long the GPU actually takes, measured rather than inferred.**
     // Every phase in the profile above is CPU time; none of them can say
     // whether the card is the limit. `submit` and the gap between frames are
@@ -3752,6 +3779,12 @@ struct App {
     /// What the last log line cost, drained by the next frame. See
     /// [`FrameProfile::log_ms`].
     pending_log_ms: f32,
+    /// When the last redraw arm finished, so the next one can measure the gap
+    /// rather than infer it. See [`FrameProfile::gap_ms`]. Stamped in the
+    /// event handler rather than inside `redraw`, because `redraw` has half a
+    /// dozen early returns and a stamp that misses one reports the whole of
+    /// the next frame as a gap.
+    redraw_ended: Option<Instant>,
     /// The adapter's description, asked for once. See the call site.
     gpu_line: Option<String>,
     /// Written by [`App::build_ui`] and read by the frame that called it.
@@ -3763,6 +3796,10 @@ struct App {
     ui_stats_ms: f32,
     ui_snapshot_ms: f32,
     ui_egui_ms: f32,
+    ui_markers_ms: f32,
+    ui_bars_ms: f32,
+    ui_panels_ms: f32,
+    ui_map_ms: f32,
     /// When the breakdown was last written to the log. **It goes to the log
     /// as well as to the window on purpose** -- `--screenshot` draws no HUD,
     /// so a reading that exists only in the debug window cannot be captured
@@ -5118,12 +5155,17 @@ impl App {
             gap_events: 0,
             gap_events_ms: 0.0,
             pending_log_ms: 0.0,
+            redraw_ended: None,
             gpu_line: None,
             ui_text_ms: 0.0,
             ui_hud_ms: 0.0,
             ui_stats_ms: 0.0,
             ui_snapshot_ms: 0.0,
             ui_egui_ms: 0.0,
+            ui_markers_ms: 0.0,
+            ui_bars_ms: 0.0,
+            ui_panels_ms: 0.0,
+            ui_map_ms: 0.0,
             profile_logged: Instant::now(),
             anim: None,
             anim_time_ms: 0,
@@ -5777,6 +5819,7 @@ impl ApplicationHandler for App {
         // must not also be counted here.
         if matches!(event, WindowEvent::RedrawRequested) {
             self.handle_window_event(event_loop, id, event);
+            self.redraw_ended = Some(Instant::now());
             return;
         }
         let started = Instant::now();
@@ -6439,6 +6482,9 @@ impl App {
         // reading; left until the end they would be attributed to a gap that
         // has not happened yet.
         let mut profile = FrameProfile {
+            gap_ms: self
+                .redraw_ended
+                .map_or(0.0, |end| end.elapsed().as_secs_f32() * 1000.0),
             gap_events: std::mem::take(&mut self.gap_events),
             gap_events_ms: std::mem::take(&mut self.gap_events_ms),
             log_ms: std::mem::take(&mut self.pending_log_ms),
@@ -6453,6 +6499,10 @@ impl App {
         profile.ui_stats_ms = self.ui_stats_ms;
         profile.ui_snapshot_ms = self.ui_snapshot_ms;
         profile.ui_egui_ms = self.ui_egui_ms;
+        profile.ui_markers_ms = self.ui_markers_ms;
+        profile.ui_bars_ms = self.ui_bars_ms;
+        profile.ui_panels_ms = self.ui_panels_ms;
+        profile.ui_map_ms = self.ui_map_ms;
         let camera = self.camera;
 
         // Movement integrates real elapsed time, so travel speed does not
@@ -6894,17 +6944,22 @@ impl App {
         // `FrameProfile::frames`: a once-a-second snapshot of a stutter is a
         // lottery, and the first version of this reported 79-103 fps for a
         // session whose complaint was that moving indoors was slow.
+        // **This frame's own period**: the gap before it plus its own redraw.
+        // Not `frame_ms`, which runs start-to-start and therefore describes
+        // the *previous* frame -- pairing it with this frame's phases is the
+        // mistake `FrameProfile::gap_ms` documents at length.
+        let period = profile.gap_ms + profile.redraw_ms;
         self.worst.frames += 1;
-        if self.frame_ms > self.worst.worst_ms {
+        if period > self.worst.worst_ms {
             let frames = self.worst.frames;
             let best = self.worst.best_ms;
             self.worst = profile;
             self.worst.frames = frames;
             self.worst.best_ms = best;
-            self.worst.worst_ms = self.frame_ms;
+            self.worst.worst_ms = period;
         }
-        if self.frame_ms < self.worst.best_ms || self.worst.best_ms == 0.0 {
-            self.worst.best_ms = self.frame_ms;
+        if period < self.worst.best_ms || self.worst.best_ms == 0.0 {
+            self.worst.best_ms = period;
         }
 
         // Once a second rather than per frame: at sixty frames a second this
@@ -6919,7 +6974,7 @@ impl App {
                 "worst frame {:.1} ms ({:.0} fps avg): {}",
                 self.worst.worst_ms,
                 self.fps,
-                self.worst.describe(self.worst.worst_ms)
+                self.worst.describe()
             );
             self.pending_log_ms = emitting.elapsed().as_secs_f32() * 1000.0;
             self.worst = FrameProfile::default();
@@ -12390,7 +12445,7 @@ impl App {
         // number a frame old is a number about a frame that finished, and
         // smoothing it to look current would be the same mistake as sorting
         // an absent distance as zero.
-        let profile = self.profile.describe(frame_ms);
+        let profile = self.profile.describe();
         self.ui_text_ms = text_started.elapsed().as_secs_f32() * 1000.0;
         // **Everything between here and the egui pass.** `build_ui` snapshots
         // the whole interface's inputs -- player and target frames, action
@@ -12479,6 +12534,14 @@ impl App {
         // selection bracket is -- through `marker_rect`, from the very box a
         // click is tested against, so a mark cannot float away from the
         // creature it belongs to.
+        // **The four blocks that run whatever is on screen.** Every panel
+        // below is gated on being open -- spellbook, bags, character, quest
+        // log, map -- so a closed one costs nothing. These are not: world
+        // markers, the action bars, the map/minimap group and whatever is
+        // left. 2.74 ms goes somewhere in here and four timers name it
+        // without anyone having to read a thousand lines and pick a
+        // favourite, which is how the last five guesses went.
+        let timing_markers = Instant::now();
         let quest_marks: Vec<(egui::Rect, ui::frames::QuestMark)> = match (
             self.live.as_ref(),
             r.scene.as_ref(),
@@ -12715,6 +12778,8 @@ impl App {
         // load earlier can succeed later, a rearranged bar takes effect
         // immediately, and a cooldown sweep needs to be re-measured against
         // the clock every frame regardless of anything else changing.
+        self.ui_markers_ms = timing_markers.elapsed().as_secs_f32() * 1000.0;
+        let timing_bars = Instant::now();
         let mut bars: Vec<Vec<ui::frames::action_bar::SlotView>> = Vec::new();
         for bar in 0..ui::frames::action_bar::BARS {
             let mut slots = Vec::with_capacity(ui::frames::action_bar::SLOTS);
@@ -12823,6 +12888,8 @@ impl App {
         // author -- so `session.ours` is item guids, and turning them into
         // pictures means looking each one up in this character's own
         // inventory. See `world::trade`.
+        self.ui_bars_ms = timing_bars.elapsed().as_secs_f32() * 1000.0;
+        let timing_panels = Instant::now();
         let mut trade_offer: Option<ui::frames::TradeOfferView> = None;
         let trade: Option<ui::TradeView> = match self.live.as_ref().and_then(|live| {
             live.state
@@ -13224,6 +13291,8 @@ impl App {
         // loot range check that reported fifteen units at a distance of two --
         // and a map is the one window where being wrong about it would look
         // entirely plausible. `live.position` is the walked one.
+        self.ui_panels_ms = timing_panels.elapsed().as_secs_f32() * 1000.0;
+        let timing_map = Instant::now();
         let standing = self.live.as_ref().map(|live| maps::Standing {
             map_id: live.map_id,
             x: live.position.x,
@@ -13448,6 +13517,7 @@ impl App {
         // lives on the server. `HudResponse::auto_equip` hands back a square
         // index into that same list -- see its doc comment -- and this is what
         // turns the index back into a `Where` the connection can act on.
+        self.ui_map_ms = timing_map.elapsed().as_secs_f32() * 1000.0;
         let mut bags_where: Vec<Option<::world::inventory::Where>> = Vec::new();
         let bags: Vec<ui::frames::BagSlot> = if self.bags_open {
             use ::world::inventory::{self as inv, Where};
