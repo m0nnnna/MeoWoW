@@ -254,7 +254,6 @@ impl Triangle {
 
     /// The cheapest possible statement about the band, made before the band
     /// is known.
-    #[allow(dead_code)]
     ///
     /// [`World::wall_exemption`] only ever *raises* the bottom of the band --
     /// it is documented as never removing an exemption, and returns exactly
@@ -598,6 +597,12 @@ impl World {
                 // thousand of them in a building. A floor, and anything
                 // further away than the body can reach, is refused here for
                 // the price of a distance: see `push_out_horizontally`.
+                let Some(push) = triangle.push_out_horizontally(at.truncate(), radius) else {
+                    continue;
+                };
+                if triangle.under_any_band(from.z, step) {
+                    continue;
+                }
                 // Per triangle, not once for the whole pass: see
                 // `wall_exemption`. A riser one or more steps ahead of where
                 // the body actually is can still be exempt, if the tread it
@@ -605,11 +610,7 @@ impl World {
                 // just `from.z + step`, unchanged from before this existed.
                 let foot = triangle.foot_towards(at.truncate());
                 let ceiling = self.wall_exemption(foot, triangle.max().z, from.z, step);
-                let (low, high) = (ceiling, ceiling + height);
-                if let Some(push) = triangle
-                    .push_out_horizontally(at.truncate(), radius)
-                    .filter(|_| triangle.overlaps_band(low, high))
-                {
+                if triangle.overlaps_band(ceiling, ceiling + height) {
                     // Largest push wins per pass rather than summing: two faces
                     // of one wall both push the same way, and adding them
                     // ejects the character twice as far as either asked for.
@@ -752,10 +753,14 @@ impl World {
             // this and `slide`'s push-out phase must agree about which walls
             // are exempt, so they make the identical tests in the identical
             // sequence. See `push_out_horizontally`.
+            if triangle.push_out_horizontally(at.truncate(), radius).is_none()
+                || triangle.under_any_band(at.z, step)
+            {
+                return false;
+            }
             let foot = triangle.foot_towards(at.truncate());
             let ceiling = self.wall_exemption(foot, triangle.max().z, at.z, step);
-            triangle.push_out_horizontally(at.truncate(), radius).is_some()
-                && triangle.overlaps_band(ceiling, ceiling + height)
+            triangle.overlaps_band(ceiling, ceiling + height)
         })
     }
 }
@@ -1003,6 +1008,103 @@ mod tests {
                 ]
             })
             .collect()
+    }
+
+    /// A room's worth of floor packed into the cells a body stands in, which
+    /// is what a building actually looks like to the grid.
+    ///
+    /// Deliberately floors: they are the triangles `push_out` refuses first
+    /// and cheapest, and the ones the old ordering paid a **grid lookup**
+    /// apiece for before finding that out.
+    fn a_crowded_floor(tiles: i32) -> Vec<Triangle> {
+        let mut out = Vec::new();
+        for x in 0..tiles {
+            for y in 0..tiles {
+                let (x, y) = (x as f32 * 0.25, y as f32 * 0.25);
+                let q = |dx: f32, dy: f32| Vec3::new(x + dx, y + dy, 0.0);
+                out.push(Triangle::new(q(0.0, 0.0), q(0.25, 0.0), q(0.25, 0.25)));
+                out.push(Triangle::new(q(0.0, 0.0), q(0.25, 0.25), q(0.0, 0.25)));
+            }
+        }
+        out
+    }
+
+    /// **Walking across a crowded floor must not cost a grid lookup per
+    /// triangle in the cell.**
+    ///
+    /// This is the shape of the abbey report, reduced. `slide` narrows once
+    /// through the grid and then, for every candidate that came back, asked
+    /// `wall_exemption` -- which is itself a grid lookup. That is O(n) lookups
+    /// and O(n^2) triangle tests for one step, and in a building `n` is the
+    /// thousand triangles sharing a cell. Measured live in Northshire abbey:
+    /// **4,193 lookups and 3.1 million candidate triangles in one frame**,
+    /// against 70 and 9,274 standing outside in the open, and 10-22 ms of a
+    /// 20-38 ms frame.
+    ///
+    /// **A count, not a duration.** A timing assertion would be flaky, would
+    /// pass on a fast machine with the bug present, and would say nothing
+    /// about *why* -- exactly the reasoning the model-cache regression test
+    /// already uses when it counts archive reads rather than milliseconds.
+    /// The bound is deliberately loose: this is not tuning, it is the
+    /// difference between a constant and a per-triangle cost.
+    #[test]
+    fn sliding_through_a_crowded_cell_does_not_look_up_the_grid_per_triangle() {
+        let world = world_with(a_crowded_floor(24));
+        assert!(
+            world.triangle_count() > 1000,
+            "the sample has to be crowded or it proves nothing: {} triangles",
+            world.triangle_count()
+        );
+        // The candidates one narrowing hands back, which is what the old
+        // ordering then multiplied by itself.
+        world.take_probe();
+        let from = Vec3::new(2.0, 2.0, 0.0);
+        world.slide(from, Vec3::new(2.2, 2.0, 0.0), 0.55, 2.0, 0.5);
+        let probe = world.take_probe();
+        assert!(
+            probe.queries < 40,
+            "one step should narrow through the grid a handful of times, not              once per triangle sharing the cell -- made {} lookups over {}              candidates",
+            probe.queries,
+            probe.candidates
+        );
+    }
+
+    /// The same bound for the standing-still check, which walks the identical
+    /// candidate list and made the identical mistake.
+    ///
+    /// Its own test because `slide` calls it twice and would mask it: a fix
+    /// applied to one and not the other still leaves a per-triangle lookup in
+    /// every frame, and `slide`'s own count would look two thirds better.
+    #[test]
+    fn asking_whether_a_crowded_cell_blocks_you_is_not_per_triangle_either() {
+        let world = world_with(a_crowded_floor(24));
+        world.take_probe();
+        assert!(!world.blocked(Vec3::new(2.0, 2.0, 0.0), 0.55, 2.0, 0.5));
+        let probe = world.take_probe();
+        assert!(
+            probe.queries < 10,
+            "expected a handful of lookups, got {} over {} candidates",
+            probe.queries,
+            probe.candidates
+        );
+    }
+
+    /// The counters themselves, because a probe stuck at zero would make both
+    /// tests above pass with the bug fully present -- and that is the most
+    /// likely way for this to rot. See `Probe`.
+    #[test]
+    fn the_probe_counts_something_and_resets() {
+        let world = world_with(a_crowded_floor(4));
+        world.take_probe();
+        world.floor_under(Vec2::new(0.2, 0.2), 1.0, 0.5);
+        let probe = world.take_probe();
+        assert_eq!(probe.queries, 1, "one narrowing, counted");
+        assert!(probe.candidates > 0, "the cell is not empty");
+        assert_eq!(
+            world.take_probe(),
+            Probe::default(),
+            "reading has to zero it, or a per-frame figure is a session total"
+        );
     }
 
     fn world_with(triangles: Vec<Triangle>) -> World {
