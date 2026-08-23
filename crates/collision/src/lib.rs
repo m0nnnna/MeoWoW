@@ -481,6 +481,9 @@ impl World {
         // precisely its own top would tie that comparison and still be
         // tested, rather than skipped.
         const CLEARANCE: f32 = 0.05;
+        if wall_top + CLEARANCE <= from_z + step {
+            return from_z + step;
+        }
         if self.floor_under(wall_foot, from_z, step).is_some() {
             (wall_top + CLEARANCE).max(from_z + step)
         } else {
@@ -524,10 +527,17 @@ impl World {
         // Two passes: the first push can leave the character inside a second
         // wall, which is exactly what an inside corner is. More than two buys
         // very little and costs a lookup each.
+        let base_low = from.z + step;
+        let base_high = base_low + height;
         for _ in 0..2 {
             let mut correction = Vec2::ZERO;
             for index in self.near(at.truncate(), radius) {
                 let triangle = self.triangles[index as usize];
+                let Some(base_push) =
+                    triangle.push_out(at.truncate(), base_low, base_high, radius)
+                else {
+                    continue;
+                };
                 // Per triangle, not once for the whole pass: see
                 // `wall_exemption`. A riser one or more steps ahead of where
                 // the body actually is can still be exempt, if the tread it
@@ -536,7 +546,10 @@ impl World {
                 let foot = triangle.foot_towards(at.truncate());
                 let ceiling = self.wall_exemption(foot, triangle.max().z, from.z, step);
                 let (low, high) = (ceiling, ceiling + height);
-                if let Some(push) = triangle.push_out(at.truncate(), low, high, radius) {
+                let push = (ceiling == base_low)
+                    .then_some(base_push)
+                    .or_else(|| triangle.push_out(at.truncate(), low, high, radius));
+                if let Some(push) = push {
                     // Largest push wins per pass rather than summing: two faces
                     // of one wall both push the same way, and adding them
                     // ejects the character twice as far as either asked for.

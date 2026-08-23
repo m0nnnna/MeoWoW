@@ -2159,6 +2159,33 @@ fn draw_liquid<'a>(
     }
 }
 
+fn bounds_visible(view_proj: glam::Mat4, (min, max): (glam::Vec3, glam::Vec3)) -> bool {
+    let corners = [
+        glam::Vec3::new(min.x, min.y, min.z),
+        glam::Vec3::new(max.x, min.y, min.z),
+        glam::Vec3::new(min.x, max.y, min.z),
+        glam::Vec3::new(max.x, max.y, min.z),
+        glam::Vec3::new(min.x, min.y, max.z),
+        glam::Vec3::new(max.x, min.y, max.z),
+        glam::Vec3::new(min.x, max.y, max.z),
+        glam::Vec3::new(max.x, max.y, max.z),
+    ]
+    .map(|corner| view_proj * corner.extend(1.0));
+    if corners.iter().any(|corner| corner.w <= 0.0) {
+        return true;
+    }
+    ![
+        corners.iter().all(|corner| corner.x < -corner.w),
+        corners.iter().all(|corner| corner.x > corner.w),
+        corners.iter().all(|corner| corner.y < -corner.w),
+        corners.iter().all(|corner| corner.y > corner.w),
+        corners.iter().all(|corner| corner.z < 0.0),
+        corners.iter().all(|corner| corner.z > corner.w),
+    ]
+    .into_iter()
+    .any(|outside| outside)
+}
+
 /// Draws a streaming world: terrain first, then the instanced objects on it.
 #[allow(clippy::too_many_arguments)]
 fn draw_streaming(
@@ -2214,6 +2241,9 @@ fn draw_streaming(
                 .map(|matrix| (a, map, matrix))
         })
         .filter(|(a, _, _)| a.strength * clear > 0.0);
+    let inside_wmo = world
+        .wmo_minimap_at_position(camera.eye(), 1.0)
+        .is_some();
 
     let lit = lit_uniform(
         camera,
@@ -2251,6 +2281,9 @@ fn draw_streaming(
             }
         }
         for group in world.tiles().flat_map(|t| t.groups.iter()).chain(world.entities()) {
+            if inside_wmo && group.model.wmo_id.is_some() {
+                continue;
+            }
             // The pose the visible pass will use, not a second evaluation of
             // it: a shadow computed from the bind pose while the creature runs
             // is a silhouette standing beside its own model.
@@ -2388,6 +2421,12 @@ fn draw_streaming(
     // bone buffer, so bind group 2 is chosen fresh per group instead of once
     // for the whole pass.
     for group in world.tiles().flat_map(|t| t.groups.iter()).chain(world.entities()) {
+        if group
+            .bounds
+            .is_some_and(|bounds| !bounds_visible(view_proj, bounds))
+        {
+            continue;
+        }
         {
             let group_bones = group
                 .animation
@@ -11578,6 +11617,7 @@ impl App {
             None => format!("{}\n{emitters}", describe(scene)),
         });
         let (error, frame_ms) = (self.error.clone(), self.frame_ms);
+        let fps = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
         let camera = self.camera;
 
         // Snapshot what the picker needs, so the UI closure does not borrow the
@@ -13012,7 +13052,7 @@ impl App {
                 .show(ctx, |ui| {
                     ui.label(egui::RichText::new(&gpu_line).strong());
                     ui.label(format!(
-                        "BC compression: {} | {frame_ms:.1} ms/frame | {pipelines} pipelines",
+                        "BC compression: {} | {fps:.0} fps | {frame_ms:.1} ms/frame | {pipelines} pipelines",
                         if bc { "yes" } else { "no" }
                     ));
                     ui.separator();

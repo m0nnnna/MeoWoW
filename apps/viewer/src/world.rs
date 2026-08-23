@@ -95,6 +95,7 @@ pub struct CachedModel {
     /// and the model already knows how big it is. `None` for a WMO, which is
     /// never a click target.
     pub bounds: Option<(Vec3, Vec3)>,
+    pub render_bounds: Option<(Vec3, Vec3)>,
     /// Held because the bind groups reference their views -- and read
     /// directly by the emitters, whose sprites are bound against a different
     /// pipeline layout and so cannot reuse `binds`.
@@ -123,6 +124,7 @@ pub struct Group {
     pub model: Rc<CachedModel>,
     pub instances: InstanceBuffer,
     pub count: u32,
+    pub bounds: Option<(Vec3, Vec3)>,
     /// Set only for a replicated-entity group: display id plus which cycle
     /// this bucket plays, used to look up its own animated bone buffer instead
     /// of drawing with the scene's shared bind pose. The bucket has to be part
@@ -765,6 +767,32 @@ pub struct WmoInstance {
     pub transform: Mat4,
 }
 
+fn world_bounds(model: &CachedModel, transforms: &[Mat4]) -> Option<(Vec3, Vec3)> {
+    if model.wmo_id.is_none() {
+        return None;
+    }
+    let (min, max) = model.render_bounds?;
+    let corners = [
+        Vec3::new(min.x, min.y, min.z),
+        Vec3::new(max.x, min.y, min.z),
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(min.x, min.y, max.z),
+        Vec3::new(max.x, min.y, max.z),
+        Vec3::new(min.x, max.y, max.z),
+        Vec3::new(max.x, max.y, max.z),
+    ];
+    transforms
+        .iter()
+        .flat_map(|transform| corners.iter().map(|corner| transform.transform_point3(*corner)))
+        .fold(None, |bounds, point| {
+            Some(match bounds {
+                Some((min, max)) => (min.min(point), max.max(point)),
+                None => (point, point),
+            })
+        })
+}
+
 #[derive(Clone, Copy)]
 pub struct AreaContext {
     pub area: u32,
@@ -1119,12 +1147,14 @@ impl World {
                 .iter()
                 .map(|t| Instance::from_cols_array_2d(t.to_cols_array_2d()))
                 .collect();
+            let bounds = world_bounds(&model, &transforms);
             built.push(Group {
                 emitting: emitting_placements(&model, &transforms),
                 emitting_ids: doodad_ids(&model, tile, &path, transforms.len()),
                 model,
                 instances: InstanceBuffer::upload(gpu, &raw),
                 count: raw.len() as u32,
+                bounds,
                 animation: None,
                 map_animation,
                 held: None,
@@ -1542,6 +1572,7 @@ impl World {
             wmo_id: Option<u32>,
             group_bounds: Vec<(Vec3, Vec3)>,
             group_surface_ids: Vec<u32>,
+            render_bounds: Option<(Vec3, Vec3)>,
             doodads: Vec<Vec<crate::world_object::Doodad>>,
             texture_animation: crate::model::TextureAnimation,
         }
@@ -1575,6 +1606,7 @@ impl World {
                         wmo_id: Some(w.wmo_id),
                         group_bounds: w.group_bounds,
                         group_surface_ids: w.group_surface_ids,
+                        render_bounds: Some((w.min, w.max)),
                         doodads: w.doodads,
                     }
                 })
@@ -1614,6 +1646,7 @@ impl World {
                         wmo_id: None,
                         group_bounds: Vec::new(),
                         group_surface_ids: Vec::new(),
+                        render_bounds: Some((m.min, m.max)),
                         doodads: Vec::new(),
                     }
                 })
@@ -1646,6 +1679,7 @@ impl World {
                 wmo_id: b.wmo_id,
                 group_bounds: b.group_bounds,
                 group_surface_ids: b.group_surface_ids,
+                render_bounds: b.render_bounds,
             })
         })
     }
@@ -1989,6 +2023,7 @@ impl World {
                 if stealthed {
                     meshes.prepare(gpu, held_model.draws.iter().map(|d| translucent(d.state)));
                 }
+                let bounds = world_bounds(&held_model, &bind_pose_transforms);
                 built.push(Group {
                     // A torch in a hand is the case this exists for, and its
                     // placements are rewritten every frame by
@@ -2007,6 +2042,7 @@ impl World {
                     model: held_model,
                     instances: InstanceBuffer::upload(gpu, &bind_pose),
                     count: raw.len() as u32,
+                    bounds,
                     animation: None,
                     map_animation: None,
                     translucent: stealthed,
@@ -2043,6 +2079,7 @@ impl World {
                     .iter()
                     .map(|transform| Instance::from_cols_array_2d(transform.to_cols_array_2d()))
                     .collect();
+                let bounds = world_bounds(&doodad_model, &doodad_transforms);
                 built.push(Group {
                     emitting: emitting_placements(&doodad_model, &doodad_transforms),
                     emitting_ids: entity_doodad_ids(
@@ -2054,6 +2091,7 @@ impl World {
                     model: doodad_model,
                     instances: InstanceBuffer::upload(gpu, &raw),
                     count: raw.len() as u32,
+                    bounds,
                     animation: None,
                     map_animation,
                     held: None,
@@ -2061,6 +2099,7 @@ impl World {
                 });
             }
 
+            let bounds = world_bounds(&model, &transforms);
             built.push(Group {
                 emitting: emitting_placements(&model, &transforms),
                 emitting_ids: if model.particles.is_empty() && model.ribbons.is_empty() {
@@ -2071,6 +2110,7 @@ impl World {
                 model,
                 instances: InstanceBuffer::upload(gpu, &raw),
                 count: raw.len() as u32,
+                bounds,
                 animation,
                 map_animation: None,
                 held: None,
@@ -2387,10 +2427,12 @@ impl World {
                         .copied()
                         .unwrap_or(Mat4::IDENTITY);
                     (
-                        held.wielders
-                            .iter()
-                            .map(|t| held_transform(*t, hand, held.offset))
-                            .collect::<Vec<_>>(),
+                        std::borrow::Cow::<[Mat4]>::Owned(
+                            held.wielders
+                                .iter()
+                                .map(|t| held_transform(*t, hand, held.offset))
+                                .collect(),
+                        ),
                         // The item's *own* skeleton is rigid and unposed; the
                         // movement all comes from the hand, which is already
                         // in the transform above.
@@ -2398,7 +2440,7 @@ impl World {
                     )
                 }
                 None => (
-                    group.emitting.clone(),
+                    std::borrow::Cow::<[Mat4]>::Borrowed(&group.emitting),
                     group
                         .animation
                         .and_then(|key| poses.get(&key))
@@ -2432,7 +2474,7 @@ impl World {
                 particles: &group.model.particles,
                 ribbons: &group.model.ribbons,
                 textures: &group.model.textures,
-                ids: group.emitting_ids.clone(),
+                ids: std::borrow::Cow::Borrowed(&group.emitting_ids),
                 placements,
                 pose: pose.map(|f| f.bones.as_slice()),
                 sequence,
@@ -2611,6 +2653,7 @@ impl World {
                     wmo_id: None,
                     group_bounds: Vec::new(),
                     group_surface_ids: Vec::new(),
+                    render_bounds: Some((loaded.min, loaded.max)),
                 })
             })
             // Timed on this side too: a load that *fails* still reads the
