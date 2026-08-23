@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use glam::{Mat4, Vec3};
 use mpq::Chain;
 use render::celestial::{CelestialRenderer, Placement};
-use render::mesh::{BlendMode, GpuMesh};
+use render::mesh::{BlendMode, GpuMesh, MeshRenderer};
 use render::Gpu;
 
 use crate::model;
@@ -66,11 +66,12 @@ struct SkyModel {
 impl SkyModel {
     fn load(
         gpu: &Gpu,
+        meshes: &MeshRenderer,
         chain: &mut Chain,
         celestial: &mut CelestialRenderer,
         path: &str,
     ) -> Result<Self> {
-        let model = model::load(gpu, chain, path, &model::Variations::default(), 0)
+        let model = model::load(gpu, meshes, chain, path, &model::Variations::default(), 0)
             .with_context(|| format!("loading sky model {path}"))?;
         let binds = model
             .textures
@@ -137,13 +138,14 @@ impl SkyScene {
     /// cannot read them draws the gradient it drew before, which is a sky.
     pub fn load(
         gpu: &Gpu,
+        meshes: &MeshRenderer,
         chain: &mut Chain,
         celestial: &mut CelestialRenderer,
         lighting: Option<&dbc::light::Lighting>,
     ) -> Self {
         let stars = lighting
             .and_then(|l| l.star_dome())
-            .and_then(|path| match SkyModel::load(gpu, chain, celestial, &path) {
+            .and_then(|path| match SkyModel::load(gpu, meshes, chain, celestial, &path) {
                 Ok(model) => Some(model),
                 Err(e) => {
                     tracing::warn!("no star dome: {e:#}");
@@ -177,6 +179,7 @@ impl SkyScene {
     pub fn set_skybox(
         &mut self,
         gpu: &Gpu,
+        meshes: &MeshRenderer,
         chain: &mut Chain,
         celestial: &mut CelestialRenderer,
         lighting: Option<&dbc::light::Lighting>,
@@ -188,7 +191,7 @@ impl SkyScene {
         self.skybox_id = id;
         self.skybox = lighting
             .and_then(|l| l.skybox_model(id))
-            .and_then(|path| match SkyModel::load(gpu, chain, celestial, &path) {
+            .and_then(|path| match SkyModel::load(gpu, meshes, chain, celestial, &path) {
                 Ok(model) => {
                     tracing::info!(id, %path, "skybox loaded");
                     Some(model)

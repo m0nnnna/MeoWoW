@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use glam::{Mat4, Quat, Vec3};
 use mpq::Chain;
-use render::mesh::{GpuMesh, Instance, InstanceBuffer};
+use render::mesh::{BoneBuffer, GpuMesh, Instance, InstanceBuffer, MeshRenderer};
 use render::{Gpu, UploadedTexture};
 
 use crate::model::Draw;
@@ -22,9 +22,50 @@ pub struct Placed {
     pub mesh: GpuMesh,
     pub draws: Vec<Draw>,
     pub textures: Vec<UploadedTexture>,
+    pub texture_animation: crate::model::TextureAnimation,
     /// Range within the scene's instance buffer.
     pub instance_start: u32,
     pub instance_count: u32,
+    pub animation: Option<PlacedAnimation>,
+}
+
+pub struct PlacedAnimation {
+    pub buffer: BoneBuffer,
+    bones: std::rc::Rc<Vec<m2::AnimatedBone>>,
+    global_sequences: Vec<u32>,
+    sequence: usize,
+    duration_ms: u32,
+    flags: u32,
+}
+
+impl PlacedAnimation {
+    fn new(gpu: &Gpu, meshes: &MeshRenderer, model: &crate::model::LoadedModel) -> Option<Self> {
+        let sequence = map_animation_sequence(&model.sequences)?;
+        let definition = model.sequences[sequence];
+        if !model.bones.iter().any(|bone| bone.is_animated()) {
+            return None;
+        }
+        Some(Self {
+            buffer: meshes.create_bones(gpu, model.bones.len()),
+            bones: std::rc::Rc::clone(&model.bones),
+            global_sequences: model.texture_animation.global_sequences().to_vec(),
+            sequence,
+            duration_ms: definition.duration_ms,
+            flags: definition.flags,
+        })
+    }
+
+    fn update(&self, gpu: &Gpu, meshes: &MeshRenderer, elapsed_ms: u32) {
+        let pose = m2::Model::pose_bones_with_global_loops(
+            &self.bones,
+            self.sequence,
+            map_animation_time(self.duration_ms, self.flags, elapsed_ms),
+            &self.global_sequences,
+        );
+        let upload: Vec<[[f32; 4]; 4]> =
+            pose.iter().map(|matrix| matrix.to_cols_array_2d()).collect();
+        meshes.update_bones(gpu, &self.buffer, &upload);
+    }
 }
 
 pub struct WorldScene {
@@ -44,9 +85,44 @@ pub struct WorldScene {
     pub skipped: Vec<String>,
 }
 
+impl WorldScene {
+    pub fn update_animations(&self, gpu: &Gpu, meshes: &MeshRenderer, elapsed_ms: u32) {
+        for item in &self.items {
+            if let Some(animation) = item.animation.as_ref() {
+                animation.update(gpu, meshes, elapsed_ms);
+                item.texture_animation.update(
+                    gpu,
+                    meshes,
+                    animation.sequence,
+                    map_animation_time(animation.duration_ms, animation.flags, elapsed_ms),
+                );
+            } else {
+                item.texture_animation.update(gpu, meshes, 0, elapsed_ms);
+            }
+        }
+    }
+}
+
 /// Half the world grid, in units. Placement coordinates are measured inwards
 /// from the far corner, so converting them means subtracting from this.
 const MAP_CENTRE: f32 = 32.0 * adt::TILE_SIZE;
+
+pub(crate) fn map_animation_sequence(sequences: &[m2::Sequence]) -> Option<usize> {
+    sequences
+        .iter()
+        .position(|sequence| sequence.id == 0)
+        .or_else(|| sequences.iter().position(|sequence| sequence.id == 0x93))
+        .or_else(|| (!sequences.is_empty()).then_some(0))
+}
+
+pub(crate) fn map_animation_time(duration_ms: u32, flags: u32, elapsed_ms: u32) -> u32 {
+    let duration_ms = duration_ms.max(1);
+    if flags & 1 != 0 {
+        elapsed_ms.min(duration_ms)
+    } else {
+        elapsed_ms % duration_ms
+    }
+}
 
 /// Converts an ADT placement position into world space.
 ///
@@ -60,33 +136,19 @@ pub fn placement_position(raw: [f32; 3]) -> Vec3 {
 
 /// Builds the rotation for a **doodad** placement -- an M2 on the terrain.
 ///
-/// No offset: an M2's forward is +X, so a stored yaw is already a world yaw.
-///
-/// This shipped as `-90`, was changed to `+90`, then to `+180`, and every one
-/// of those was wrong. `-90` and `+90` are a quarter turn out and lay every
-/// fence in Elwynn across its own line; `+180` was derived from a belief that
-/// an M2 faces -X, which turned out to be an artefact of inside-out culling
-/// rather than a fact about models.
-///
-/// What holds it down now is a measurement that does not care about any of
-/// that: a fence is a *run*, and the run's direction comes from the
-/// placements' own positions with no rotation involved at all. Across three
-/// runs at different angles, `direction - yaw` is one constant and
-/// `direction + yaw` is not -- so the yaw is not mirrored, and the offset is
-/// zero modulo a half turn. The half turn is then settled by entities, which
-/// are the same file format and demonstrably need none. See
-/// [`tests::a_fence_run_lies_along_its_stored_yaw`].
+/// The original client applies the stored Z, X, and Y angles about model X,
+/// Y, and Z respectively, with a half turn added to Z. Quaternion products
+/// apply right to left, hence the Z * Y * X order below.
 pub fn placement_rotation(rotation: [f32; 3]) -> Quat {
-    Quat::from_rotation_z(rotation[1].to_radians())
-        * Quat::from_rotation_y((-rotation[0]).to_radians())
+    Quat::from_rotation_z((rotation[1] + 180.0).to_radians())
+        * Quat::from_rotation_y(rotation[0].to_radians())
         * Quat::from_rotation_x(rotation[2].to_radians())
 }
 
 /// Builds the rotation for a **world object** placement -- a WMO.
 ///
-/// A half turn, where a doodad takes none. The two really do differ: WMO and
-/// M2 are different formats, authored to different forward axes, and only the
-/// M2 one matches the network's heading convention.
+/// A WMO takes the same half turn as a terrain doodad, but keeps its separate
+/// pitch convention because the two placement formats are unrelated.
 ///
 /// Northshire Abbey appeared to want a quarter turn where the fences wanted a
 /// half one, on the evidence that a quarter turn showed its portal from the
@@ -124,6 +186,7 @@ fn transform(raw_position: [f32; 3], rotation: [f32; 3], scale: f32) -> Mat4 {
 #[allow(clippy::too_many_arguments)]
 pub fn load(
     gpu: &Gpu,
+    meshes: &MeshRenderer,
     terrain_renderer: &render::TerrainRenderer,
     liquid_renderer: &render::LiquidRenderer,
     liquid_types: &mut crate::liquid::LiquidTypes,
@@ -231,6 +294,11 @@ pub fn load(
     for (path, placements) in ordered {
         match crate::world_object::load(gpu, chain, &path, None) {
             Ok(loaded) => {
+                let texture_animation = crate::model::TextureAnimation::empty(
+                    gpu,
+                    meshes,
+                    loaded.draws.len(),
+                );
                 let transforms: Vec<Mat4> = placements.iter().map(|(transform, _)| *transform).collect();
                 for (parent, set) in &placements {
                     let Some(doodads) = loaded.doodads.get(*set) else {
@@ -249,6 +317,8 @@ pub fn load(
                     loaded.mesh,
                     loaded.draws,
                     loaded.textures,
+                    texture_animation,
+                    None,
                     (loaded.min, loaded.max),
                     &transforms,
                 );
@@ -260,9 +330,9 @@ pub fn load(
     let mut ordered: Vec<(String, Vec<Mat4>)> = doodad_groups.into_iter().collect();
     ordered.sort_by(|a, b| a.0.cmp(&b.0));
     for (path, transforms) in ordered {
-        // Doodads draw in bind pose; nothing here animates yet.
-        match crate::model::load(gpu, chain, &path, &crate::model::Variations::default(), 0) {
+        match crate::model::load(gpu, meshes, chain, &path, &crate::model::Variations::default(), 0) {
             Ok(loaded) => {
+                let animation = PlacedAnimation::new(gpu, meshes, &loaded);
                 doodad_instances += transforms.len();
                 push_group(
                     &mut items,
@@ -272,6 +342,8 @@ pub fn load(
                     loaded.mesh,
                     loaded.draws,
                     loaded.textures,
+                    loaded.texture_animation,
+                    animation,
                     (loaded.min, loaded.max),
                     &transforms,
                 );
@@ -315,6 +387,8 @@ fn push_group(
     mesh: GpuMesh,
     draws: Vec<Draw>,
     textures: Vec<UploadedTexture>,
+    texture_animation: crate::model::TextureAnimation,
+    animation: Option<PlacedAnimation>,
     local_bounds: (Vec3, Vec3),
     transforms: &[Mat4],
 ) {
@@ -338,8 +412,10 @@ fn push_group(
         mesh,
         draws,
         textures,
+        texture_animation,
         instance_start: start,
         instance_count: transforms.len() as u32,
+        animation,
     });
 }
 
@@ -392,7 +468,7 @@ mod tests {
         assert!((turned - Vec3::Z).length() < 1e-5, "yaw tilted the model");
     }
 
-    /// The yaw offset, measured against real placements rather than chosen.
+    /// The yaw direction, measured against real placements rather than chosen.
     ///
     /// A rotation cannot be judged by eye: a wrong offset looks right for
     /// anything at zero or a half turn and wrong everywhere else, which is
@@ -414,8 +490,9 @@ mod tests {
     ///
     /// `direction - yaw` is the same constant for all three and
     /// `direction + yaw` is not, which is what rules out a *mirrored* yaw as
-    /// well as fixing the offset. The model is 4.3 units long in X against
-    /// 0.3 in Y, so its long axis is local X, and the constant is zero.
+    /// well as fixing the axis order. The model is 4.3 units long in X against
+    /// 0.3 in Y, so its long axis is local X. A bidirectional run cannot settle
+    /// the remaining half turn; the client matrix and asymmetric ends do.
     #[test]
     fn a_fence_run_lies_along_its_stored_yaw() {
         const RUNS: [(f32, f32); 3] = [(-130.0, 50.5), (-45.5, 313.4), (-45.0, 313.4)];
@@ -424,8 +501,8 @@ mod tests {
             let got = along.y.atan2(along.x).to_degrees();
             // A run has no near end and no far end, so the comparison is
             // modulo a half turn -- which is exactly why this test cannot
-            // settle the remaining 180 on its own. An asymmetric building
-            // does that; see `placement_rotation`.
+            // settle the remaining 180 on its own. The original client matrix
+            // and asymmetric fence ends do that; see `placement_rotation`.
             let delta = (got - direction + 90.0).rem_euclid(180.0) - 90.0;
             assert!(
                 delta.abs() < 3.0,
@@ -434,23 +511,55 @@ mod tests {
         }
     }
 
-    /// Pins the yaw offset, including its sign.
-    ///
-    /// The sign is the whole point: this test previously asserted the opposite
-    /// one and passed, because both are internally consistent and nothing here
-    /// knows which way a building faces. What decided it was a render of
-    /// Northshire Abbey showing its door rather than its back wall -- see
-    /// [`placement_rotation`]. These numbers exist so that result cannot be
-    /// undone by accident.
+    /// Pins the yaw half turn, including its sign.
     #[test]
     fn yaw_rotates_about_the_vertical_axis() {
-        // A doodad takes no offset, so a stored yaw of 90 puts +X onto +Y.
+        // A terrain doodad takes a half turn, so a stored yaw of 90 puts +X onto -Y.
         let a = placement_rotation([0.0, 90.0, 0.0]) * Vec3::X;
-        assert!((a - Vec3::Y).length() < 1e-5, "got {a:?}");
+        assert!((a + Vec3::Y).length() < 1e-5, "got {a:?}");
 
-        // A world object takes a half turn on top, which is what puts the
-        // abbey's door on the side the path arrives from.
+        // A world object uses the same yaw half turn.
         let b = object_rotation([0.0, 90.0, 0.0]) * Vec3::X;
         assert!((b + Vec3::Y).length() < 1e-4, "got {b:?}");
+    }
+    fn sequence(id: u16, duration_ms: u32, flags: u32) -> m2::Sequence {
+        m2::Sequence {
+            id,
+            variation: 0,
+            duration_ms,
+            move_speed: 0.0,
+            flags,
+            blend_time: 0,
+            variation_next: -1,
+            alias_next: 0,
+        }
+    }
+
+    #[test]
+    fn map_animation_resolves_id_zero_before_sequence_zero() {
+        let sequences = [sequence(7, 10, 0), sequence(0, 20, 0)];
+        assert_eq!(map_animation_sequence(&sequences), Some(1));
+    }
+
+    #[test]
+    fn map_animation_uses_the_client_terminal_fallbacks() {
+        let fallback = [sequence(7, 10, 0), sequence(0x93, 20, 0)];
+        assert_eq!(map_animation_sequence(&fallback), Some(1));
+        assert_eq!(map_animation_sequence(&[sequence(7, 10, 0)]), Some(0));
+    }
+
+    #[test]
+    fn map_animation_flags_choose_loop_or_hold() {
+        assert_eq!(map_animation_time(100, 0, 225), 25);
+        assert_eq!(map_animation_time(100, 1, 225), 100);
+    }
+
+    #[test]
+    fn placement_pitch_and_roll_use_the_stored_signs() {
+        let pitched = placement_rotation([90.0, 0.0, 0.0]) * Vec3::Z;
+        assert!((pitched + Vec3::X).length() < 1e-5, "got {pitched:?}");
+
+        let rolled = placement_rotation([0.0, 0.0, 90.0]) * Vec3::Y;
+        assert!((rolled - Vec3::Z).length() < 1e-5, "got {rolled:?}");
     }
 }

@@ -28,7 +28,10 @@ use ::world::combat::Hand;
 
 use crate::character::Stance;
 use crate::model::Draw;
-use crate::scene::{object_rotation, placement_position, placement_rotation};
+use crate::scene::{
+    map_animation_sequence, map_animation_time, object_rotation, placement_position,
+    placement_rotation,
+};
 use crate::terrain::LoadedTerrain;
 
 /// The smallest radius a *streaming* world may run at.
@@ -63,6 +66,7 @@ pub struct CachedModel {
     pub mesh: render::mesh::GpuMesh,
     pub draws: Vec<Draw>,
     pub binds: Vec<wgpu::BindGroup>,
+    pub texture_animation: crate::model::TextureAnimation,
     pub doodads: Vec<Vec<crate::world_object::Doodad>>,
     /// Populated whenever the loader has them (every M2, not a WMO), even
     /// though only replicated entities currently animate. Doodads and
@@ -121,10 +125,11 @@ pub struct Group {
     /// of the key, not just the display id -- a species with instances
     /// standing, walking and running at once needs three different poses live
     /// at once, and a display-id-only key would have the last of them
-    /// overwrite the others' buffers every rebuild. `None` for every
-    /// tile-owned group (doodads and buildings never animate) and when the
-    /// model has no matching sequence to play.
+    /// overwrite the others' buffers every rebuild. `None` when the model has
+    /// no matching sequence to play.
     pub animation: Option<(u32, Motion)>,
+    /// Model path for a tile-owned M2 playing its ambient sequence.
+    pub map_animation: Option<String>,
     /// Set only when this group *is* an item held by another group, in which
     /// case its instance transforms are recomputed every frame from the
     /// wielder's pose. See [`Held`].
@@ -224,6 +229,28 @@ fn doodad_ids(model: &CachedModel, tile: (i32, i32), path: &str, count: usize) -
         .collect()
 }
 
+fn entity_doodad_ids(
+    model: &CachedModel,
+    guids: &[u64],
+    path: &str,
+    doodad_index: usize,
+) -> Vec<u64> {
+    if model.particles.is_empty() && model.ribbons.is_empty() {
+        return Vec::new();
+    }
+    use std::hash::{Hash, Hasher};
+    guids
+        .iter()
+        .map(|guid| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            guid.hash(&mut hasher);
+            path.hash(&mut hasher);
+            doodad_index.hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect()
+}
+
 /// A bucket's posed skeleton this frame, with the cycle it was posed from.
 ///
 /// The sequence and the time are carried alongside the matrices because an
@@ -235,6 +262,12 @@ pub struct FramePose {
     pub bones: Vec<Mat4>,
     pub sequence: usize,
     pub time_ms: u32,
+}
+
+struct MapAnimation {
+    model: Rc<CachedModel>,
+    bones: BoneBuffer,
+    sequence: usize,
 }
 
 /// What is lying over a point on the ground.
@@ -644,6 +677,8 @@ pub struct World {
     /// Owned by the world rather than a tile: they move, and they do not belong
     /// to the tile they happen to be standing on.
     entities: Vec<Group>,
+    map_animations: HashMap<String, MapAnimation>,
+    map_frame_poses: RefCell<HashMap<String, FramePose>>,
     /// Animated bone buffers for replicated-entity groups, keyed by
     /// `Group::animation` and reused across rebuilds rather than reallocated:
     /// `update_bones` rewrites a buffer's contents in place, so the GPU
@@ -772,6 +807,8 @@ impl World {
             game_objects: None,
             game_objects_tried: false,
             entities: Vec::new(),
+            map_animations: HashMap::new(),
+            map_frame_poses: RefCell::new(HashMap::new()),
             entity_bones: HashMap::new(),
             active_motion_buckets: RefCell::new(std::collections::HashSet::new()),
             blending: RefCell::new(HashMap::new()),
@@ -1041,6 +1078,7 @@ impl World {
                 }
             }
             meshes.prepare(gpu, model.draws.iter().map(|d| d.state));
+            let map_animation = self.ensure_map_animation(gpu, meshes, &path, &model);
             let raw: Vec<Instance> = transforms
                 .iter()
                 .map(|t| Instance::from_cols_array_2d(t.to_cols_array_2d()))
@@ -1052,6 +1090,7 @@ impl World {
                 instances: InstanceBuffer::upload(gpu, &raw),
                 count: raw.len() as u32,
                 animation: None,
+                map_animation,
                 held: None,
                 // Scenery. Nothing about a tile's doodads or buildings is
                 // ever tinted, so their materials answer for themselves.
@@ -1338,6 +1377,29 @@ impl World {
         entry
     }
 
+    fn ensure_map_animation(
+        &mut self,
+        gpu: &Gpu,
+        meshes: &MeshRenderer,
+        path: &str,
+        model: &Rc<CachedModel>,
+    ) -> Option<String> {
+        let sequence = map_animation_sequence(&model.sequences)?;
+        if !model.bones.iter().any(|bone| bone.is_animated())
+            && !model.texture_animation.is_animated()
+        {
+            return None;
+        }
+        self.map_animations
+            .entry(path.to_string())
+            .or_insert_with(|| MapAnimation {
+                model: Rc::clone(model),
+                bones: meshes.create_bones(gpu, model.bones.len()),
+                sequence,
+            });
+        Some(path.to_string())
+    }
+
     /// Loads a path into a `CachedModel`, without consulting or filling a cache.
     ///
     /// Shared by the tile loader and the held-item loader, which want the same
@@ -1369,6 +1431,7 @@ impl World {
             collision: Vec<[[f32; 3]; 3]>,
             collision_footing: Vec<u8>,
             doodads: Vec<Vec<crate::world_object::Doodad>>,
+            texture_animation: crate::model::TextureAnimation,
         }
 
         let lower = path.to_lowercase();
@@ -1376,24 +1439,32 @@ impl World {
             // No skeleton to speak of, so nothing to animate and nothing to
             // hang off it.
             crate::world_object::load(gpu, chain, path, None)
-                .map(|w| Built {
-                    mesh: w.mesh,
-                    draws: w.draws,
-                    textures: w.textures,
-                    bones: Default::default(),
-                    sequences: Vec::new(),
-                    attachments: Vec::new(),
-                    particles: Vec::new(),
-                    ribbons: Vec::new(),
-                    footfalls: Default::default(),
-                    bounds: None,
-                    collision: w.collision,
-                    collision_footing: w.collision_footing,
-                    doodads: w.doodads,
+                .map(|w| {
+                    let texture_animation = crate::model::TextureAnimation::empty(
+                        gpu,
+                        meshes,
+                        w.draws.len(),
+                    );
+                    Built {
+                        mesh: w.mesh,
+                        draws: w.draws,
+                        textures: w.textures,
+                        texture_animation,
+                        bones: Default::default(),
+                        sequences: Vec::new(),
+                        attachments: Vec::new(),
+                        particles: Vec::new(),
+                        ribbons: Vec::new(),
+                        footfalls: Default::default(),
+                        bounds: None,
+                        collision: w.collision,
+                        collision_footing: w.collision_footing,
+                        doodads: w.doodads,
+                    }
                 })
                 .ok()
         } else {
-            crate::model::load(gpu, chain, path, variations, 0)
+            crate::model::load(gpu, meshes, chain, path, variations, 0)
                 .map(|m| {
                     // Named rather than dropped. `load_dressed` has always
                     // collected these and callers have always thrown them
@@ -1412,6 +1483,7 @@ impl World {
                         mesh: m.mesh,
                         draws: m.draws,
                         textures: m.textures,
+                        texture_animation: m.texture_animation,
                         bones: m.bones,
                         sequences: m.sequences,
                         attachments: m.attachments,
@@ -1438,6 +1510,7 @@ impl World {
                 mesh: b.mesh,
                 draws: b.draws,
                 binds,
+                texture_animation: b.texture_animation,
                 doodads: b.doodads,
                 bones: b.bones,
                 sequences: b.sequences,
@@ -1811,6 +1884,7 @@ impl World {
                     instances: InstanceBuffer::upload(gpu, &bind_pose),
                     count: raw.len() as u32,
                     animation: None,
+                    map_animation: None,
                     translucent: stealthed,
                     held: Some(Held {
                         wielder: animation,
@@ -1818,6 +1892,48 @@ impl World {
                         bone: attachment.bone as usize,
                         offset: Vec3::from(attachment.position),
                     }),
+                });
+            }
+
+            let child_doodads = if kind == ::world::ObjectType::GameObject {
+                model.doodads.first().cloned().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            for (doodad_index, doodad) in child_doodads.iter().enumerate() {
+                let Some(doodad_model) = self.model(gpu, meshes, chain, &doodad.path) else {
+                    continue;
+                };
+                let doodad_transforms: Vec<Mat4> = transforms
+                    .iter()
+                    .map(|transform| *transform * doodad.transform)
+                    .collect();
+                meshes.prepare(gpu, doodad_model.draws.iter().map(|d| d.state));
+                let map_animation = self.ensure_map_animation(
+                    gpu,
+                    meshes,
+                    &doodad.path,
+                    &doodad_model,
+                );
+                let raw: Vec<Instance> = doodad_transforms
+                    .iter()
+                    .map(|transform| Instance::from_cols_array_2d(transform.to_cols_array_2d()))
+                    .collect();
+                built.push(Group {
+                    emitting: emitting_placements(&doodad_model, &doodad_transforms),
+                    emitting_ids: entity_doodad_ids(
+                        &doodad_model,
+                        &guids,
+                        &doodad.path,
+                        doodad_index,
+                    ),
+                    model: doodad_model,
+                    instances: InstanceBuffer::upload(gpu, &raw),
+                    count: raw.len() as u32,
+                    animation: None,
+                    map_animation,
+                    held: None,
+                    translucent: false,
                 });
             }
 
@@ -1832,6 +1948,7 @@ impl World {
                 instances: InstanceBuffer::upload(gpu, &raw),
                 count: raw.len() as u32,
                 animation,
+                map_animation: None,
                 held: None,
                 translucent: stealthed,
             });
@@ -1882,6 +1999,46 @@ impl World {
         let mut poses: HashMap<(u32, Motion), (Vec<Mat4>, usize, u32)> = HashMap::new();
         let now_ms = self.started.elapsed().as_millis() as u32;
 
+        let active_map_animations: HashSet<&str> = self
+            .tiles
+            .values()
+            .flat_map(|tile| tile.groups.iter())
+            .chain(self.entities.iter())
+            .filter_map(|group| group.map_animation.as_deref())
+            .collect();
+        let mut map_poses = HashMap::new();
+        for path in active_map_animations {
+            let Some(animation) = self.map_animations.get(path) else {
+                continue;
+            };
+            let definition = animation.model.sequences[animation.sequence];
+            let time_ms = map_animation_time(definition.duration_ms, definition.flags, now_ms);
+            let pose = m2::Model::pose_bones_with_global_loops(
+                &animation.model.bones,
+                animation.sequence,
+                time_ms,
+                animation.model.texture_animation.global_sequences(),
+            );
+            let upload: Vec<[[f32; 4]; 4]> =
+                pose.iter().map(|matrix| matrix.to_cols_array_2d()).collect();
+            meshes.update_bones(gpu, &animation.bones, &upload);
+            animation.model.texture_animation.update(
+                gpu,
+                meshes,
+                animation.sequence,
+                time_ms,
+            );
+            map_poses.insert(
+                path.to_string(),
+                FramePose {
+                    bones: pose,
+                    sequence: animation.sequence,
+                    time_ms,
+                },
+            );
+        }
+        *self.map_frame_poses.borrow_mut() = map_poses;
+
         // Poses a single motion at its own clock -- exactly what this
         // function always computed, pulled out so a transition's outgoing
         // cycle can be posed the same way as its incoming one, below.
@@ -1925,7 +2082,12 @@ impl World {
                 now_ms % duration
             };
             Some((
-                m2::Model::pose_bones(&model.bones, sequence, time_ms),
+                m2::Model::pose_bones_with_global_loops(
+                    &model.bones,
+                    sequence,
+                    time_ms,
+                    model.texture_animation.global_sequences(),
+                ),
                 sequence,
                 time_ms,
             ))
@@ -1987,13 +2149,14 @@ impl World {
                 // before the parent chain is composed. Blending completed
                 // model-space matrices moves every child independently and
                 // changes limb lengths during the transition.
-                Some((old_sequence, old_time_ms, elapsed)) => blend_poses(
+                Some((old_sequence, old_time_ms, elapsed)) => blend_poses_with_global_loops(
                     &group.model.bones,
                     old_sequence,
                     old_time_ms,
                     sequence,
                     time_ms,
                     elapsed as f32 / TRANSITION_BLEND_MS as f32,
+                    group.model.texture_animation.global_sequences(),
                 ),
                 None => posed,
             };
@@ -2078,6 +2241,7 @@ impl World {
         dt: f32,
     ) {
         let poses = self.frame_poses.borrow();
+        let map_poses = self.map_frame_poses.borrow();
         let now_ms = self.started.elapsed().as_millis() as u32;
 
         let mut sources = Vec::new();
@@ -2111,7 +2275,15 @@ impl World {
                 }
                 None => (
                     group.emitting.clone(),
-                    group.animation.and_then(|key| poses.get(&key)),
+                    group
+                        .animation
+                        .and_then(|key| poses.get(&key))
+                        .or_else(|| {
+                            group
+                                .map_animation
+                                .as_ref()
+                                .and_then(|key| map_poses.get(key))
+                        }),
                 ),
             };
 
@@ -2150,6 +2322,10 @@ impl World {
     /// gave it one this rebuild.
     pub fn entity_bone_buffer(&self, key: (u32, Motion)) -> Option<&BoneBuffer> {
         self.entity_bones.get(&key)
+    }
+
+    pub fn map_bone_buffer(&self, key: &str) -> Option<&BoneBuffer> {
+        self.map_animations.get(key).map(|animation| &animation.bones)
     }
 
     /// Loads a weapon or shield, with the skin its item display names.
@@ -2224,8 +2400,9 @@ impl World {
         // mutably, and the model path is owned by the time the second runs.
         let resolved = crate::model::creature(&mut self.sources, chain, display_id);
         let loaded = resolved.and_then(|(path, variations)| {
-            crate::model::load_dressed_with(
-                gpu,
+                crate::model::load_dressed_with(
+                    gpu,
+                    meshes,
                 chain,
                 &mut self.sources,
                 &path,
@@ -2288,6 +2465,7 @@ impl World {
                     mesh: loaded.mesh,
                     draws: loaded.draws,
                     binds,
+                    texture_animation: loaded.texture_animation,
                     doodads: Vec::new(),
                     bones: loaded.bones,
                     sequences: loaded.sequences,
@@ -3399,13 +3577,34 @@ fn blend_poses(
     to_time_ms: u32,
     t: f32,
 ) -> Vec<Mat4> {
-    m2::Model::blend_bones(
+    blend_poses_with_global_loops(
         bones,
         from_sequence,
         from_time_ms,
         to_sequence,
         to_time_ms,
         t,
+        &[],
+    )
+}
+
+fn blend_poses_with_global_loops(
+    bones: &[m2::AnimatedBone],
+    from_sequence: usize,
+    from_time_ms: u32,
+    to_sequence: usize,
+    to_time_ms: u32,
+    t: f32,
+    global_loops: &[u32],
+) -> Vec<Mat4> {
+    m2::Model::blend_bones_with_global_loops(
+        bones,
+        from_sequence,
+        from_time_ms,
+        to_sequence,
+        to_time_ms,
+        t,
+        global_loops,
     )
 }
 

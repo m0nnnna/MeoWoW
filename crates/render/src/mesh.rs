@@ -229,6 +229,14 @@ const SHADER: &str = r#"
 // Storage rather than uniform: bone counts are per-model and reach 315, which
 // a fixed-size uniform array would have to over-allocate for.
 @group(2) @binding(0) var<storage, read> bones: array<mat4x4<f32>>;
+@group(3) @binding(0) var<storage, read> texture_transforms: array<mat4x4<f32>>;
+
+struct TextureTransformIndex {
+    index: u32,
+    padding: vec3<u32>,
+};
+
+@group(3) @binding(1) var<uniform> texture_transform_index: TextureTransformIndex;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -296,7 +304,7 @@ fn vs(in: VsIn) -> VsOut {
     // Placements are rigid with uniform scale, so the model matrix rotates
     // normals correctly without a separate inverse-transpose.
     out.normal = (model * vec4<f32>(normal, 0.0)).xyz;
-    out.uv = in.uv;
+    out.uv = (texture_transforms[texture_transform_index.index] * vec4<f32>(in.uv, 0.0, 1.0)).xy;
     out.tint = in.tint;
     return out;
 }
@@ -396,6 +404,7 @@ pub struct MeshRenderer {
     camera_bind: wgpu::BindGroup,
     material_layout: wgpu::BindGroupLayout,
     bone_layout: wgpu::BindGroupLayout,
+    texture_transform_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     /// Kept so the camera binding can be rebuilt when a shadow map is
     /// attached, and so it is not dropped while a bind group still names it.
@@ -439,6 +448,12 @@ pub struct BoneBuffer {
     pub buffer: wgpu::Buffer,
     pub bind_group: wgpu::BindGroup,
     pub count: usize,
+}
+
+pub struct TextureTransformBuffer {
+    pub buffer: wgpu::Buffer,
+    _index_buffers: Vec<wgpu::Buffer>,
+    pub binds: Vec<wgpu::BindGroup>,
 }
 
 impl MeshRenderer {
@@ -586,6 +601,34 @@ impl MeshRenderer {
                     }],
                 });
 
+        let texture_transform_layout =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("texture transforms"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
         let layout = gpu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -594,6 +637,7 @@ impl MeshRenderer {
                     Some(&camera_layout),
                     Some(&material_layout),
                     Some(&bone_layout),
+                    Some(&texture_transform_layout),
                 ],
                 immediate_size: 0,
             });
@@ -608,6 +652,7 @@ impl MeshRenderer {
             camera_bind,
             material_layout,
             bone_layout,
+            texture_transform_layout,
             sampler: crate::texture::default_sampler(gpu),
             blank_shadow,
             shadow_sampler,
@@ -707,6 +752,73 @@ impl MeshRenderer {
         if n > 0 {
             gpu.queue
                 .write_buffer(&bones.buffer, 0, bytemuck::cast_slice(&pose[..n]));
+        }
+    }
+
+    pub fn create_texture_transforms(
+        &self,
+        gpu: &Gpu,
+        count: usize,
+        indices: &[usize],
+    ) -> TextureTransformBuffer {
+        use wgpu::util::DeviceExt;
+        let identity = glam::Mat4::IDENTITY.to_cols_array_2d();
+        let contents = vec![identity; count.max(1)];
+        let buffer = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("texture transforms"),
+                contents: bytemuck::cast_slice(&contents),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+        let mut index_buffers = Vec::with_capacity(indices.len());
+        let mut binds = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let index = [index.min(count.saturating_sub(1)) as u32, 0, 0, 0, 0, 0, 0, 0];
+            let index_buffer = gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("texture transform index"),
+                    contents: bytemuck::cast_slice(&index),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("texture transforms"),
+                layout: &self.texture_transform_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: index_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            index_buffers.push(index_buffer);
+            binds.push(bind);
+        }
+        TextureTransformBuffer {
+            buffer,
+            _index_buffers: index_buffers,
+            binds,
+        }
+    }
+
+    pub fn update_texture_transforms(
+        &self,
+        gpu: &Gpu,
+        transforms: &TextureTransformBuffer,
+        matrices: &[[[f32; 4]; 4]],
+    ) {
+        let identity = glam::Mat4::IDENTITY.to_cols_array_2d();
+        if matrices.is_empty() {
+            gpu.queue
+                .write_buffer(&transforms.buffer, 0, bytemuck::bytes_of(&identity));
+        } else {
+            gpu.queue
+                .write_buffer(&transforms.buffer, 0, bytemuck::cast_slice(matrices));
         }
     }
 
