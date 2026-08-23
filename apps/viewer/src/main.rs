@@ -190,6 +190,42 @@ struct Args {
     #[arg(long)]
     no_shadows: bool,
 
+    /// Draw the headless frame this many times and report what it costs.
+    ///
+    /// **A steady-state number, which one frame cannot give.** The first
+    /// frame of a session pays for pipeline compilation, texture residency
+    /// and a cold driver -- measured at 48 ms for a frame whose repeat cost
+    /// is a fraction of that -- so a single `--screenshot` timing is a
+    /// measurement of warm-up. Repeating the same frame and taking the
+    /// *minimum* is the closest thing to what the window sees, and it is a
+    /// number this client can produce for itself rather than asking somebody
+    /// to go and play.
+    ///
+    /// Reports CPU encode time and GPU completion separately, and honours
+    /// `--width`/`--height`, so fill rate and geometry can be told apart:
+    /// a cost that scales with the pixel count is shading; one that does not
+    /// is vertices and draw calls.
+    #[arg(long)]
+    bench: Option<u32>,
+
+    /// How frames are handed to the display: `fifo` waits for the monitor,
+    /// `immediate` does not, `mailbox` replaces an undisplayed frame.
+    ///
+    /// **Exists to identify the gap between frames.** Under `fifo` a client
+    /// that misses the refresh window waits for the next one, so a frame
+    /// taking a little over budget costs a whole extra interval -- which from
+    /// inside the process is indistinguishable from the scheduler not handing
+    /// it back, and was measured at 6.4 ms on average and 38 ms at worst.
+    /// Running the same session with `immediate` answers it: if the gap
+    /// collapses, the client is being *paced* rather than starved, and the
+    /// fix is to fit inside the window rather than to hunt for a stall.
+    ///
+    /// Defaults to whatever the surface lists first, which is what it has
+    /// always done -- named here rather than changed, because the default is
+    /// not the bug and quietly picking another would hide the measurement.
+    #[arg(long)]
+    present_mode: Option<String>,
+
     /// Submit every draw, culling nothing against the frustum.
     ///
     /// **The instrument the culling is checked with, and the reason it can be
@@ -1670,6 +1706,46 @@ struct Atmosphere<'a> {
 /// surface that asked was told it was lit. A shadow box aimed at nothing and
 /// a shadow feature that does not exist are the same picture, which is
 /// exactly why the A/B was worth taking before believing the first one.
+/// The present mode asked for, if the surface supports it.
+///
+/// **Falls back rather than failing, and says so.** A mode the driver does not
+/// offer is a fact about the machine, not a mistake by the person who asked --
+/// and silently getting a different mode than the flag named is exactly how a
+/// measurement gets believed when it should not be. The warning is the point.
+fn chosen_present_mode(
+    caps: &wgpu::SurfaceCapabilities,
+    wanted: Option<&str>,
+) -> wgpu::PresentMode {
+    let Some(wanted) = wanted else {
+        return caps.present_modes[0];
+    };
+    let mode = match wanted.to_ascii_lowercase().as_str() {
+        "fifo" => Some(wgpu::PresentMode::Fifo),
+        "fiforelaxed" | "fifo-relaxed" => Some(wgpu::PresentMode::FifoRelaxed),
+        "immediate" => Some(wgpu::PresentMode::Immediate),
+        "mailbox" => Some(wgpu::PresentMode::Mailbox),
+        _ => None,
+    };
+    match mode {
+        Some(mode) if caps.present_modes.contains(&mode) => mode,
+        Some(mode) => {
+            tracing::warn!(
+                "this surface cannot present {mode:?}; using {:?} instead. Available: {:?}",
+                caps.present_modes[0],
+                caps.present_modes,
+            );
+            caps.present_modes[0]
+        }
+        None => {
+            tracing::warn!(
+                "unknown present mode {wanted:?}; using {:?}.                  Try fifo, fifo-relaxed, immediate or mailbox",
+                caps.present_modes[0],
+            );
+            caps.present_modes[0]
+        }
+    }
+}
+
 fn shadow_centre(world: &world::World, camera: &Camera, radius: f32) -> glam::Vec3 {
     let ahead = camera.forward();
     // Flattened, because the box is aimed along the ground: following the
@@ -1780,6 +1856,12 @@ struct FrameProfile {
     /// `ui_text_ms` has already ruled out *building* those strings at 0.10 ms
     /// -- laying them out is a different question.
     ui_stats_ms: f32,
+    /// Assembling the interface's inputs before the egui pass can begin:
+    /// over a thousand lines of cloning and formatting, every frame.
+    ui_snapshot_ms: f32,
+    /// The whole egui pass, closure included. Subtracting `ui_hud_ms` and
+    /// `ui_stats_ms` leaves what egui spends beginning and ending it.
+    ui_egui_ms: f32,
     /// Walking the character: collision, sliding, the outgoing movement
     /// stream.
     movement_ms: f32,
@@ -1898,7 +1980,8 @@ impl FrameProfile {
         format!(
             "{draws} draws/frame = {} terrain + {} models + {} shadow, \
              {} culled | {} groups, {} instances, {} ktris\n\
-             redraw {:.1}: ui {:.1} (hud {:.1} + stats {:.1} + text {:.1}) | \
+             redraw {:.1}: ui {:.1} (snapshot {:.1} + egui {:.1} [hud {:.1} \
+             + stats {:.1}] + text {:.1}) | \
              move {:.1} | camera {:.1} | \
              net {:.1} | \
              sound {:.1} | stream {:.1} | entities {:.1} | anim {:.1} | \
@@ -1916,6 +1999,8 @@ impl FrameProfile {
             self.triangles / 1000,
             self.redraw_ms,
             self.ui_ms,
+            self.ui_snapshot_ms,
+            self.ui_egui_ms,
             self.ui_hud_ms,
             self.ui_stats_ms,
             self.ui_text_ms,
@@ -3331,7 +3416,80 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     // exactly as the windowed one does. The times are not comparable (one
     // frame, cold caches, no present); the counts are.
     tracing::info!("headless frame: {}", headless.describe(0.0));
+    // **How long the GPU actually takes, measured rather than inferred.**
+    // Every phase in the profile above is CPU time; none of them can say
+    // whether the card is the limit. `submit` and the gap between frames are
+    // both places a GPU-bound client waits, and both look like CPU cost from
+    // the outside -- so this polls to completion and prints the real number.
+    // Run at two resolutions it separates fill rate from geometry: a cost
+    // that doubles with the pixel count is shading, one that does not is
+    // vertices and draw calls.
+    let gpu_started = Instant::now();
     gpu.queue.submit([encoder.finish()]);
+    let submitted = gpu_started.elapsed().as_secs_f32() * 1000.0;
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("the device should finish the frame");
+    tracing::info!(
+        "gpu frame at {}x{}: {:.2} ms to submit, {:.2} ms until the GPU had finished          (first frame -- pipelines and residency are still cold; use --bench)",
+        target.width,
+        target.height,
+        submitted,
+        gpu_started.elapsed().as_secs_f32() * 1000.0,
+    );
+
+    if let Some(rounds) = args.bench.filter(|n| *n > 0) {
+        let mut encode = Vec::with_capacity(rounds as usize);
+        let mut total = Vec::with_capacity(rounds as usize);
+        for _ in 0..rounds {
+            let round = Instant::now();
+            let mut encoder =
+                gpu.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("bench"),
+                    });
+            let mut counts = FrameProfile::default();
+            draw_scene(
+                &gpu, &mut encoder, &target.view, &depth.view,
+                (target.width, target.height), &scene, &camera, &blitter,
+                &meshes, &terrain_renderer, &liquid_renderer, &liquid_types,
+                &sky, &precipitation, &particles, &emitters,
+                resolve_precipitation(weather, 4.0), &binds, bones.as_ref(),
+                &world_binds, &identity, frame_lighting, 4.0,
+                Some(&Atmosphere {
+                    celestial: &celestial,
+                    sky: &sky_scene,
+                    shadow: shadow.as_ref(),
+                    radius: args.shadow_radius,
+                    strength: SHADOW_STRENGTH,
+                }),
+                &mut counts,
+                !args.no_cull,
+            );
+            gpu.queue.submit([encoder.finish()]);
+            // **Before the poll**, so this is what the CPU spent rather than
+            // what it waited for. The two are the whole question.
+            encode.push(round.elapsed().as_secs_f32() * 1000.0);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("the device should finish the frame");
+            total.push(round.elapsed().as_secs_f32() * 1000.0);
+        }
+        let stat = |v: &mut Vec<f32>| {
+            v.sort_by(f32::total_cmp);
+            (v[0], v[v.len() / 2], v[v.len() - 1])
+        };
+        let (e_min, e_mid, e_max) = stat(&mut encode);
+        let (t_min, t_mid, t_max) = stat(&mut total);
+        // **The minimum, not the mean.** Every sample is the true cost plus
+        // whatever else the machine was doing, so the smallest is the closest
+        // to the truth and the spread says how noisy the room was.
+        tracing::info!(
+            "bench {rounds} frames at {}x{}: cpu encode+submit min {e_min:.2} median              {e_mid:.2} max {e_max:.2} ms | gpu complete min {t_min:.2} median              {t_mid:.2} max {t_max:.2} ms",
+            target.width,
+            target.height,
+        );
+    }
 
     if let (Some(path), Some(map)) = (&args.shadow_dump, &shadow) {
         let depth = map.read_depth(&gpu)?;
@@ -3603,6 +3761,8 @@ struct App {
     /// [`FrameProfile::ui_hud_ms`].
     ui_hud_ms: f32,
     ui_stats_ms: f32,
+    ui_snapshot_ms: f32,
+    ui_egui_ms: f32,
     /// When the breakdown was last written to the log. **It goes to the log
     /// as well as to the window on purpose** -- `--screenshot` draws no HUD,
     /// so a reading that exists only in the debug window cannot be captured
@@ -4962,6 +5122,8 @@ impl App {
             ui_text_ms: 0.0,
             ui_hud_ms: 0.0,
             ui_stats_ms: 0.0,
+            ui_snapshot_ms: 0.0,
+            ui_egui_ms: 0.0,
             profile_logged: Instant::now(),
             anim: None,
             anim_time_ms: 0,
@@ -5371,13 +5533,27 @@ impl ApplicationHandler for App {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: caps.present_modes[0],
+            // **Whatever the surface happens to list first**, which is a
+            // choice nobody made and nobody could see. Printed below,
+            // because "the client is slow" and "the client is waiting for
+            // the monitor" are the same 6 ms of gap from the outside and
+            // want opposite responses.
+            present_mode: chosen_present_mode(&caps, self.args.present_mode.as_deref()),
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             color_space: wgpu::SurfaceColorSpace::Auto,
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&gpu.device, &config);
+        tracing::info!(
+            "surface {:?} at {}x{}, present {:?} (available {:?}), max frame latency {}",
+            format,
+            config.width,
+            config.height,
+            config.present_mode,
+            caps.present_modes,
+            config.desired_maximum_frame_latency,
+        );
 
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
@@ -6275,6 +6451,8 @@ impl App {
         profile.ui_text_ms = self.ui_text_ms;
         profile.ui_hud_ms = self.ui_hud_ms;
         profile.ui_stats_ms = self.ui_stats_ms;
+        profile.ui_snapshot_ms = self.ui_snapshot_ms;
+        profile.ui_egui_ms = self.ui_egui_ms;
         let camera = self.camera;
 
         // Movement integrates real elapsed time, so travel speed does not
@@ -12214,6 +12392,16 @@ impl App {
         // an absent distance as zero.
         let profile = self.profile.describe(frame_ms);
         self.ui_text_ms = text_started.elapsed().as_secs_f32() * 1000.0;
+        // **Everything between here and the egui pass.** `build_ui` snapshots
+        // the whole interface's inputs -- player and target frames, action
+        // bars, chat, quest marks, loot markers, the spellbook, the bags --
+        // into owned values before the closure, because the closure cannot
+        // borrow `self` while egui mutates it. That snapshot is over a
+        // thousand lines of cloning and formatting and it runs every frame,
+        // and until this timer existed it was inside `ui_ms` with no way to
+        // see it: `hud`, `stats` and `text` together came to 0.43 ms of a
+        // 3.28 ms phase, so the rest of it is here.
+        let snapshot_started = Instant::now();
         let camera = self.camera;
 
         // Snapshot what the picker needs, so the UI closure does not borrow the
@@ -13589,8 +13777,11 @@ impl App {
         // expensive operations. `ui_text` already ruled out *building* those
         // strings at 0.10 ms; laying them out is a different question and
         // this is where the answer is.
+        self.ui_snapshot_ms = snapshot_started.elapsed().as_secs_f32() * 1000.0;
+
         let hud_ms = std::cell::Cell::new(0.0f32);
         let stats_ms = std::cell::Cell::new(0.0f32);
+        let egui_started = Instant::now();
         let output = ctx.run_ui(input, |ctx| {
             let drawing_hud = Instant::now();
             hud_response = interface.show(
@@ -13737,6 +13928,9 @@ impl App {
                 });
             stats_ms.set(drawing_stats.elapsed().as_secs_f32() * 1000.0);
         });
+        // The whole pass, closure included: subtracting the two below
+        // leaves what egui itself spends beginning and ending it.
+        self.ui_egui_ms = egui_started.elapsed().as_secs_f32() * 1000.0;
         self.ui_hud_ms = hud_ms.get();
         self.ui_stats_ms = stats_ms.get();
 
