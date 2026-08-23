@@ -3569,6 +3569,11 @@ fn bucket_transition(
 /// must remain attached to its parent while that parent turns; interpolating
 /// their model-space translations independently shortens or stretches the
 /// chain. Translation and scale lerp; rotation slerps; then parents compose.
+///
+/// Production code always has a set of global loops to pass and calls
+/// `blend_poses_with_global_loops` directly; this no-loops wrapper survives
+/// only as a shorthand for the tests below.
+#[cfg(test)]
 fn blend_poses(
     bones: &[m2::AnimatedBone],
     from_sequence: usize,
