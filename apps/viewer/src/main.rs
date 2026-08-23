@@ -1950,6 +1950,11 @@ struct FrameProfile {
     /// and this project has already been caught reading a marker printed by
     /// the expensive thing as if it were the cause.
     log_ms: f32,
+    /// Where the character is standing, whether a foot landed, and starting
+    /// the sinks. See `App::update_sound`.
+    sound_area_ms: f32,
+    sound_steps_ms: f32,
+    sound_play_ms: f32,
     /// Sound clips played this session, and how many of those needed an
     /// archive read. **Both**, because a cache that has stopped caching
     /// sounds exactly the same -- see `sound::Effects::reads`.
@@ -2012,7 +2017,8 @@ impl FrameProfile {
              + text {:.1} | \
              move {:.1} | camera {:.1} | \
              net {:.1} | \
-             sound {:.1} | stream {:.1} | entities {:.1} | anim {:.1} | \
+             sound {:.1} (area {:.1}, steps {:.1}, play {:.1}) | stream {:.1} | \
+             entities {:.1} | anim {:.1} | \
              emitters {:.1} | acquire {:.1} | encode {:.1} | submit {:.1} | \
              present {:.1} | \
              rest {:.1} ms; outside redraw {:.1} = {} events in {:.1} + \
@@ -2041,6 +2047,9 @@ impl FrameProfile {
             self.camera_ms,
             self.network_ms,
             self.sound_ms,
+            self.sound_area_ms,
+            self.sound_steps_ms,
+            self.sound_play_ms,
             self.stream_ms,
             self.entities_ms,
             self.animations_ms,
@@ -3804,6 +3813,9 @@ struct App {
     ui_stats_ms: f32,
     ui_snapshot_ms: f32,
     ui_egui_ms: f32,
+    sound_area_ms: f32,
+    sound_steps_ms: f32,
+    sound_play_ms: f32,
     ui_markers_ms: f32,
     ui_bars_ms: f32,
     ui_panels_ms: f32,
@@ -5170,6 +5182,9 @@ impl App {
             ui_stats_ms: 0.0,
             ui_snapshot_ms: 0.0,
             ui_egui_ms: 0.0,
+            sound_area_ms: 0.0,
+            sound_steps_ms: 0.0,
+            sound_play_ms: 0.0,
             ui_markers_ms: 0.0,
             ui_bars_ms: 0.0,
             ui_panels_ms: 0.0,
@@ -6562,6 +6577,9 @@ impl App {
         let phase = Instant::now();
         self.update_sound();
         profile.sound_ms = phase.elapsed().as_secs_f32() * 1000.0;
+        profile.sound_area_ms = self.sound_area_ms;
+        profile.sound_steps_ms = self.sound_steps_ms;
+        profile.sound_play_ms = self.sound_play_ms;
 
         let Some(r) = self.renderer.as_mut() else {
             ui_output.textures_delta.clear();
@@ -8620,6 +8638,13 @@ impl App {
         if self.audio.is_none() {
             return;
         }
+        // **Three timers, because `sound` did not move when the obvious fix
+        // landed.** Caching clip bytes took archive reads from 145 to 2 and
+        // the phase stayed at 3.7 ms, so reading the file was never the cost
+        // -- which leaves resolving where the character is standing, deciding
+        // whether a foot landed, and actually starting the sinks. Those have
+        // nothing in common and one of them owns the number.
+        let timing_area = Instant::now();
         // Where the character actually is. Read from the live session rather
         // than from replicated state, which holds the login position forever
         // -- the trap this project has now walked into from three separate
@@ -8688,6 +8713,9 @@ impl App {
         };
         let mixer = audio.mixer();
 
+
+        self.sound_area_ms = timing_area.elapsed().as_secs_f32() * 1000.0;
+        let timing_steps = Instant::now();
 
         // **Footsteps.** The model says when its feet land -- see
         // `m2::event::FOOTFALL`, which carries the measurement -- and the
@@ -8762,6 +8790,8 @@ impl App {
         // Combat sounds queued since the last frame. Swept every frame either
         // way -- a finished sink that is never dropped is a slow leak, which
         // is the kind that survives.
+        self.sound_steps_ms = timing_steps.elapsed().as_secs_f32() * 1000.0;
+        let timing_play = Instant::now();
         self.effects.sweep();
         let volume = self.args.effects_volume;
 
@@ -8797,6 +8827,7 @@ impl App {
         }
         self.effects
             .tick(mixer, &self.sounds, &mut self.chain, roll);
+        self.sound_play_ms = timing_play.elapsed().as_secs_f32() * 1000.0;
         self.music.play(
             mixer,
             &self.sounds,
