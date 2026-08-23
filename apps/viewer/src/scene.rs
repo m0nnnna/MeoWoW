@@ -147,7 +147,7 @@ pub fn load(
     // Placements are deduplicated by unique id: an object straddling a tile
     // border is listed by *every* tile it touches, so loading a block without
     // this draws the same building several times over itself.
-    let mut object_groups: HashMap<String, Vec<Mat4>> = HashMap::new();
+    let mut object_groups: HashMap<String, Vec<(Mat4, usize)>> = HashMap::new();
     let mut doodad_groups: HashMap<String, Vec<Mat4>> = HashMap::new();
     let mut seen: HashSet<u32> = HashSet::new();
     let mut doodad_budget = max_doodads;
@@ -196,7 +196,7 @@ pub fn load(
                 object_groups
                     .entry(placement.path.to_string())
                     .or_default()
-                    .push(transform(placement.position, placement.rotation, 1.0));
+                    .push((transform(placement.position, placement.rotation, 1.0), placement.doodad_set as usize));
             }
             for placement in &parsed.doodads {
                 if doodad_budget == 0 {
@@ -226,11 +226,20 @@ pub fn load(
 
     let (mut object_instances, mut doodad_instances) = (0usize, 0usize);
 
-    let mut ordered: Vec<(String, Vec<Mat4>)> = object_groups.into_iter().collect();
+    let mut ordered: Vec<(String, Vec<(Mat4, usize)>)> = object_groups.into_iter().collect();
     ordered.sort_by(|a, b| a.0.cmp(&b.0));
-    for (path, transforms) in ordered {
+    for (path, placements) in ordered {
         match crate::world_object::load(gpu, chain, &path, None) {
             Ok(loaded) => {
+                let transforms: Vec<Mat4> = placements.iter().map(|(transform, _)| *transform).collect();
+                for (parent, set) in &placements {
+                    let Some(doodads) = loaded.doodads.get(*set) else {
+                        continue;
+                    };
+                    for doodad in doodads {
+                        doodad_groups.entry(doodad.path.clone()).or_default().push(*parent * doodad.transform);
+                    }
+                }
                 object_instances += transforms.len();
                 push_group(
                     &mut items,

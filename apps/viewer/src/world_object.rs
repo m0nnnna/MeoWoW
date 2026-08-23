@@ -6,7 +6,7 @@
 //! buffer means one bind per object.
 
 use anyhow::{Context, Result};
-use glam::Vec3;
+use glam::{Mat4, Quat, Vec3};
 use mpq::Chain;
 use render::mesh::{BlendMode, GpuMesh, MeshVertex, RenderState, Winding};
 use render::{texture::upload_blp, Gpu, UploadedTexture};
@@ -43,8 +43,15 @@ pub struct LoadedWmo {
     /// wall that declines to say" both mean this client must not claim to know
     /// what a foot landed on. See [`wmo::Material::ground_type`].
     pub collision_footing: Vec<u8>,
+    pub doodads: Vec<Vec<Doodad>>,
     pub doodad_sets: Vec<String>,
     pub missing_textures: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct Doodad {
+    pub path: String,
+    pub transform: Mat4,
 }
 
 /// The `TerrainType` row a WMO material names when it declines to say what
@@ -75,6 +82,14 @@ fn render_state(material: &wmo::Material) -> RenderState {
         // it.
         winding: Winding::CounterClockwise,
     }
+}
+
+fn doodad_transform(doodad: &wmo::DoodadDef) -> Mat4 {
+    Mat4::from_scale_rotation_translation(
+        Vec3::splat(doodad.scale),
+        Quat::from_array(doodad.rotation).normalize(),
+        Vec3::from(doodad.position),
+    )
 }
 
 pub fn load(
@@ -249,6 +264,20 @@ pub fn load(
         collision_triangles,
         collision,
         collision_footing,
+        doodads: root
+            .doodad_sets
+            .iter()
+            .map(|set| {
+                root.doodads_in_set(set)
+                    .iter()
+                    .filter(|doodad| !doodad.path.is_empty())
+                    .map(|doodad| Doodad {
+                        path: doodad.path.clone(),
+                        transform: doodad_transform(doodad),
+                    })
+                    .collect()
+            })
+            .collect(),
         doodad_sets: root
             .doodad_sets
             .iter()
@@ -279,5 +308,19 @@ mod tests {
         // Cutouts still write depth; only true blending stops.
         assert!(render_state(&material(1)).depth_write);
         assert!(!render_state(&material(2)).depth_write);
+    }
+
+    #[test]
+    fn composes_doodad_translation_rotation_and_scale() {
+        let rotation = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2).to_array();
+        let doodad = wmo::DoodadDef {
+            path: "child.m2".into(),
+            position: [3.0, 4.0, 5.0],
+            rotation,
+            scale: 2.0,
+            color: [255; 4],
+        };
+        let point = doodad_transform(&doodad).transform_point3(Vec3::X);
+        assert!((point - Vec3::new(3.0, 6.0, 5.0)).length() < 1e-5);
     }
 }

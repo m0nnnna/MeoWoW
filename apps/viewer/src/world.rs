@@ -63,6 +63,7 @@ pub struct CachedModel {
     pub mesh: render::mesh::GpuMesh,
     pub draws: Vec<Draw>,
     pub binds: Vec<wgpu::BindGroup>,
+    pub doodads: Vec<Vec<crate::world_object::Doodad>>,
     /// Populated whenever the loader has them (every M2, not a WMO), even
     /// though only replicated entities currently animate. Doodads and
     /// buildings are always drawn in the bind pose regardless, so carrying
@@ -951,21 +952,22 @@ impl World {
         // border-straddling object belongs to exactly one owner and is neither
         // drawn twice nor left behind when a neighbour is evicted.
         let mut groups: HashMap<String, Vec<Mat4>> = HashMap::new();
+        let mut wmo_placements = Vec::new();
         let mut budget = self.max_doodads;
         for placement in &parsed.objects {
             let position = placement_position(placement.position);
             if tile_at(position) != tile {
                 continue;
             }
-            groups
-                .entry(placement.path.to_string())
-                .or_default()
-                .push(Mat4::from_scale_rotation_translation(
-                    Vec3::ONE,
-                    // A WMO, not an M2: a different quarter of a turn.
-                    object_rotation(placement.rotation),
-                    position,
-                ));
+            let path = placement.path.to_string();
+            let transform = Mat4::from_scale_rotation_translation(
+                Vec3::ONE,
+                // A WMO, not an M2: a different quarter of a turn.
+                object_rotation(placement.rotation),
+                position,
+            );
+            groups.entry(path.clone()).or_default().push(transform);
+            wmo_placements.push((path, placement.doodad_set as usize, transform));
         }
         for placement in &parsed.doodads {
             if budget == 0 {
@@ -984,6 +986,18 @@ impl World {
                     placement_rotation(placement.rotation),
                     position,
                 ));
+        }
+
+        for (path, set, parent) in wmo_placements {
+            let Some(model) = self.model(gpu, meshes, chain, &path) else {
+                continue;
+            };
+            let Some(doodads) = model.doodads.get(set) else {
+                continue;
+            };
+            for doodad in doodads {
+                groups.entry(doodad.path.clone()).or_default().push(parent * doodad.transform);
+            }
         }
 
         let mut built = Vec::new();
@@ -1354,6 +1368,7 @@ impl World {
             bounds: Option<(Vec3, Vec3)>,
             collision: Vec<[[f32; 3]; 3]>,
             collision_footing: Vec<u8>,
+            doodads: Vec<Vec<crate::world_object::Doodad>>,
         }
 
         let lower = path.to_lowercase();
@@ -1374,6 +1389,7 @@ impl World {
                     bounds: None,
                     collision: w.collision,
                     collision_footing: w.collision_footing,
+                    doodads: w.doodads,
                 })
                 .ok()
         } else {
@@ -1406,6 +1422,7 @@ impl World {
                         collision: m.collision,
                         // An M2 names no surface; see `CachedModel`.
                         collision_footing: Vec::new(),
+                        doodads: Vec::new(),
                     }
                 })
                 .ok()
@@ -1421,6 +1438,7 @@ impl World {
                 mesh: b.mesh,
                 draws: b.draws,
                 binds,
+                doodads: b.doodads,
                 bones: b.bones,
                 sequences: b.sequences,
                 attachments: b.attachments,
@@ -2270,6 +2288,7 @@ impl World {
                     mesh: loaded.mesh,
                     draws: loaded.draws,
                     binds,
+                    doodads: Vec::new(),
                     bones: loaded.bones,
                     sequences: loaded.sequences,
                     attachments: loaded.attachments,
