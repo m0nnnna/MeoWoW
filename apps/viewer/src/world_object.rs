@@ -234,6 +234,7 @@ pub fn load(
                 index_count: batch_indices.len() as u32,
                 state: render_state(&material),
                 texture: (batch.material_id as usize).min(textures.len() - 1),
+                texture_transform: None,
                 submesh_id: gi as u16,
             });
             indices.extend(batch_indices.iter().map(|&i| base + i as u32));

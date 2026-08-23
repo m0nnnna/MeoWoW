@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use glam::{Mat4, Quat, Vec3};
 use mpq::Chain;
-use render::mesh::{GpuMesh, Instance, InstanceBuffer};
+use render::mesh::{BoneBuffer, GpuMesh, Instance, InstanceBuffer, MeshRenderer};
 use render::{Gpu, UploadedTexture};
 
 use crate::model::Draw;
@@ -22,9 +22,50 @@ pub struct Placed {
     pub mesh: GpuMesh,
     pub draws: Vec<Draw>,
     pub textures: Vec<UploadedTexture>,
+    pub texture_animation: crate::model::TextureAnimation,
     /// Range within the scene's instance buffer.
     pub instance_start: u32,
     pub instance_count: u32,
+    pub animation: Option<PlacedAnimation>,
+}
+
+pub struct PlacedAnimation {
+    pub buffer: BoneBuffer,
+    bones: std::rc::Rc<Vec<m2::AnimatedBone>>,
+    global_sequences: Vec<u32>,
+    sequence: usize,
+    duration_ms: u32,
+    flags: u32,
+}
+
+impl PlacedAnimation {
+    fn new(gpu: &Gpu, meshes: &MeshRenderer, model: &crate::model::LoadedModel) -> Option<Self> {
+        let sequence = map_animation_sequence(&model.sequences)?;
+        let definition = model.sequences[sequence];
+        if !model.bones.iter().any(|bone| bone.is_animated()) {
+            return None;
+        }
+        Some(Self {
+            buffer: meshes.create_bones(gpu, model.bones.len()),
+            bones: std::rc::Rc::clone(&model.bones),
+            global_sequences: model.texture_animation.global_sequences().to_vec(),
+            sequence,
+            duration_ms: definition.duration_ms,
+            flags: definition.flags,
+        })
+    }
+
+    fn update(&self, gpu: &Gpu, meshes: &MeshRenderer, elapsed_ms: u32) {
+        let pose = m2::Model::pose_bones_with_global_loops(
+            &self.bones,
+            self.sequence,
+            map_animation_time(self.duration_ms, self.flags, elapsed_ms),
+            &self.global_sequences,
+        );
+        let upload: Vec<[[f32; 4]; 4]> =
+            pose.iter().map(|matrix| matrix.to_cols_array_2d()).collect();
+        meshes.update_bones(gpu, &self.buffer, &upload);
+    }
 }
 
 pub struct WorldScene {
@@ -44,9 +85,44 @@ pub struct WorldScene {
     pub skipped: Vec<String>,
 }
 
+impl WorldScene {
+    pub fn update_animations(&self, gpu: &Gpu, meshes: &MeshRenderer, elapsed_ms: u32) {
+        for item in &self.items {
+            if let Some(animation) = item.animation.as_ref() {
+                animation.update(gpu, meshes, elapsed_ms);
+                item.texture_animation.update(
+                    gpu,
+                    meshes,
+                    animation.sequence,
+                    map_animation_time(animation.duration_ms, animation.flags, elapsed_ms),
+                );
+            } else {
+                item.texture_animation.update(gpu, meshes, 0, elapsed_ms);
+            }
+        }
+    }
+}
+
 /// Half the world grid, in units. Placement coordinates are measured inwards
 /// from the far corner, so converting them means subtracting from this.
 const MAP_CENTRE: f32 = 32.0 * adt::TILE_SIZE;
+
+pub(crate) fn map_animation_sequence(sequences: &[m2::Sequence]) -> Option<usize> {
+    sequences
+        .iter()
+        .position(|sequence| sequence.id == 0)
+        .or_else(|| sequences.iter().position(|sequence| sequence.id == 0x93))
+        .or_else(|| (!sequences.is_empty()).then_some(0))
+}
+
+pub(crate) fn map_animation_time(duration_ms: u32, flags: u32, elapsed_ms: u32) -> u32 {
+    let duration_ms = duration_ms.max(1);
+    if flags & 1 != 0 {
+        elapsed_ms.min(duration_ms)
+    } else {
+        elapsed_ms % duration_ms
+    }
+}
 
 /// Converts an ADT placement position into world space.
 ///
@@ -124,6 +200,7 @@ fn transform(raw_position: [f32; 3], rotation: [f32; 3], scale: f32) -> Mat4 {
 #[allow(clippy::too_many_arguments)]
 pub fn load(
     gpu: &Gpu,
+    meshes: &MeshRenderer,
     terrain_renderer: &render::TerrainRenderer,
     liquid_renderer: &render::LiquidRenderer,
     liquid_types: &mut crate::liquid::LiquidTypes,
@@ -231,6 +308,11 @@ pub fn load(
     for (path, placements) in ordered {
         match crate::world_object::load(gpu, chain, &path, None) {
             Ok(loaded) => {
+                let texture_animation = crate::model::TextureAnimation::empty(
+                    gpu,
+                    meshes,
+                    loaded.draws.len(),
+                );
                 let transforms: Vec<Mat4> = placements.iter().map(|(transform, _)| *transform).collect();
                 for (parent, set) in &placements {
                     let Some(doodads) = loaded.doodads.get(*set) else {
@@ -249,6 +331,8 @@ pub fn load(
                     loaded.mesh,
                     loaded.draws,
                     loaded.textures,
+                    texture_animation,
+                    None,
                     (loaded.min, loaded.max),
                     &transforms,
                 );
@@ -260,9 +344,9 @@ pub fn load(
     let mut ordered: Vec<(String, Vec<Mat4>)> = doodad_groups.into_iter().collect();
     ordered.sort_by(|a, b| a.0.cmp(&b.0));
     for (path, transforms) in ordered {
-        // Doodads draw in bind pose; nothing here animates yet.
-        match crate::model::load(gpu, chain, &path, &crate::model::Variations::default(), 0) {
+        match crate::model::load(gpu, meshes, chain, &path, &crate::model::Variations::default(), 0) {
             Ok(loaded) => {
+                let animation = PlacedAnimation::new(gpu, meshes, &loaded);
                 doodad_instances += transforms.len();
                 push_group(
                     &mut items,
@@ -272,6 +356,8 @@ pub fn load(
                     loaded.mesh,
                     loaded.draws,
                     loaded.textures,
+                    loaded.texture_animation,
+                    animation,
                     (loaded.min, loaded.max),
                     &transforms,
                 );
@@ -315,6 +401,8 @@ fn push_group(
     mesh: GpuMesh,
     draws: Vec<Draw>,
     textures: Vec<UploadedTexture>,
+    texture_animation: crate::model::TextureAnimation,
+    animation: Option<PlacedAnimation>,
     local_bounds: (Vec3, Vec3),
     transforms: &[Mat4],
 ) {
@@ -338,8 +426,10 @@ fn push_group(
         mesh,
         draws,
         textures,
+        texture_animation,
         instance_start: start,
         instance_count: transforms.len() as u32,
+        animation,
     });
 }
 
@@ -452,5 +542,36 @@ mod tests {
         // abbey's door on the side the path arrives from.
         let b = object_rotation([0.0, 90.0, 0.0]) * Vec3::X;
         assert!((b + Vec3::Y).length() < 1e-4, "got {b:?}");
+    }
+    fn sequence(id: u16, duration_ms: u32, flags: u32) -> m2::Sequence {
+        m2::Sequence {
+            id,
+            variation: 0,
+            duration_ms,
+            move_speed: 0.0,
+            flags,
+            blend_time: 0,
+            variation_next: -1,
+            alias_next: 0,
+        }
+    }
+
+    #[test]
+    fn map_animation_resolves_id_zero_before_sequence_zero() {
+        let sequences = [sequence(7, 10, 0), sequence(0, 20, 0)];
+        assert_eq!(map_animation_sequence(&sequences), Some(1));
+    }
+
+    #[test]
+    fn map_animation_uses_the_client_terminal_fallbacks() {
+        let fallback = [sequence(7, 10, 0), sequence(0x93, 20, 0)];
+        assert_eq!(map_animation_sequence(&fallback), Some(1));
+        assert_eq!(map_animation_sequence(&[sequence(7, 10, 0)]), Some(0));
+    }
+
+    #[test]
+    fn map_animation_flags_choose_loop_or_hold() {
+        assert_eq!(map_animation_time(100, 0, 225), 25);
+        assert_eq!(map_animation_time(100, 1, 225), 100);
     }
 }

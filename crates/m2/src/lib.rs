@@ -37,6 +37,7 @@ const VERTEX_SIZE: usize = 48;
 /// Bytes per `M2CompBone` in this version.
 const BONE_SIZE: usize = 88;
 const TEXTURE_SIZE: usize = 16;
+const TEXTURE_TRANSFORM_SIZE: usize = 60;
 const MATERIAL_SIZE: usize = 4;
 /// Bytes per `M2Attachment`: id, bone, two bytes of padding, a position, and a
 /// 20-byte visibility track.
@@ -111,6 +112,7 @@ struct Header {
     version: u32,
     name: Array,
     global_flags: u32,
+    global_loops: Array,
     sequences: Array,
     bones: Array,
     key_bone_lookup: Array,
@@ -123,6 +125,8 @@ struct Header {
     materials: Array,
     bone_combos: Array,
     texture_combos: Array,
+    texture_coord_combos: Array,
+    texture_transform_combos: Array,
     bounding_box: [f32; 6],
     bounding_sphere_radius: f32,
     collision_box: [f32; 6],
@@ -267,6 +271,56 @@ pub struct AnimatedBone {
     pub scale: Track<Vec3>,
 }
 
+#[derive(Clone, Debug)]
+pub struct AnimatedTextureTransform {
+    pub translation: Track<Vec3>,
+    pub rotation: Track<Quat>,
+    pub scale: Track<Vec3>,
+}
+
+impl AnimatedTextureTransform {
+    pub fn is_animated(&self) -> bool {
+        self.translation.is_animated() || self.rotation.is_animated() || self.scale.is_animated()
+    }
+
+    pub fn matrix(&self, sequence: usize, time_ms: u32, global_loops: &[u32]) -> Mat4 {
+        let translation = sample_track_with_global(
+            &self.translation,
+            sequence,
+            time_ms,
+            global_loops,
+            Vec3::ZERO,
+        );
+        let rotation = sample_track_with_global(
+            &self.rotation,
+            sequence,
+            time_ms,
+            global_loops,
+            Quat::IDENTITY,
+        );
+        let scale = sample_track_with_global(&self.scale, sequence, time_ms, global_loops, Vec3::ONE);
+        Mat4::from_translation(Vec3::new(0.5 + translation.x, 0.5 + translation.y, 0.0))
+            * Mat4::from_quat(rotation)
+            * Mat4::from_scale(Vec3::new(scale.x, scale.y, 1.0))
+            * Mat4::from_translation(Vec3::new(-0.5, -0.5, 0.0))
+    }
+}
+
+fn sample_track_with_global<T: anim::Keyframe>(
+    track: &Track<T>,
+    sequence: usize,
+    time_ms: u32,
+    global_loops: &[u32],
+    fallback: T,
+) -> T {
+    let time_ms = track
+        .global_sequence
+        .and_then(|id| global_loops.get(id as usize).copied())
+        .map(|duration| time_ms % duration.max(1))
+        .unwrap_or(time_ms);
+    track.sample(sequence, time_ms).unwrap_or(fallback)
+}
+
 impl AnimatedBone {
     /// Whether this bone moves at all.
     pub fn is_animated(&self) -> bool {
@@ -328,7 +382,7 @@ impl Model {
 
         h.name = r.array();
         h.global_flags = r.u32();
-        let _global_loops = r.array();
+        h.global_loops = r.array();
         h.sequences = r.array();
         let _sequence_lookup = r.array();
         h.bones = r.array();
@@ -343,9 +397,9 @@ impl Model {
         h.materials = r.array();
         h.bone_combos = r.array();
         h.texture_combos = r.array();
-        let _texture_coord_combos = r.array();
+        h.texture_coord_combos = r.array();
         let _texture_weight_combos = r.array();
-        let _texture_transform_combos = r.array();
+        h.texture_transform_combos = r.array();
 
         for slot in &mut h.bounding_box {
             *slot = r.f32();
@@ -526,6 +580,16 @@ impl Model {
             .collect()
     }
 
+    pub fn global_sequence_durations(&self) -> Vec<u32> {
+        self.slice("global_loops", self.header.global_loops, 4)
+            .map(|raw| {
+                raw.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn bones(&self) -> Vec<Bone> {
         let Ok(raw) = self.slice("bones", self.header.bones, BONE_SIZE) else {
             return Vec::new();
@@ -640,6 +704,35 @@ impl Model {
         self.animated_bones_with(&Default::default())
     }
 
+    pub fn animated_texture_transforms(&self) -> Vec<AnimatedTextureTransform> {
+        self.animated_texture_transforms_with(&Default::default())
+    }
+
+    pub fn animated_texture_transforms_with(
+        &self,
+        external: &std::collections::BTreeMap<usize, Vec<u8>>,
+    ) -> Vec<AnimatedTextureTransform> {
+        let Ok(raw) = self.slice(
+            "texture_transforms",
+            self.header.texture_transforms,
+            TEXTURE_TRANSFORM_SIZE,
+        ) else {
+            return Vec::new();
+        };
+        let inline: Vec<bool> = self.sequences().iter().map(|s| s.is_inline()).collect();
+        (0..raw.len() / TEXTURE_TRANSFORM_SIZE)
+            .map(|i| {
+                let base = self.header.texture_transforms.offset as usize
+                    + i * TEXTURE_TRANSFORM_SIZE;
+                AnimatedTextureTransform {
+                    translation: self.read_track(base, external, &inline),
+                    rotation: self.read_track(base + 20, external, &inline),
+                    scale: self.read_track(base + 40, external, &inline),
+                }
+            })
+            .collect()
+    }
+
     /// Bones with tracks decoded, using externally loaded `.anim` data for the
     /// sequences that need it.
     ///
@@ -740,12 +833,23 @@ impl Model {
 
     /// Poses a skeleton without needing the model it came from.
     pub fn pose_bones(bones: &[AnimatedBone], sequence: usize, time_ms: u32) -> Pose {
+        Self::pose_bones_with_global_loops(bones, sequence, time_ms, &[])
+    }
+
+    pub fn pose_bones_with_global_loops(
+        bones: &[AnimatedBone],
+        sequence: usize,
+        time_ms: u32,
+        global_loops: &[u32],
+    ) -> Pose {
         let mut out = vec![Mat4::IDENTITY; bones.len()];
         for &i in &bone_order(bones) {
             let b = &bones[i];
-            let translation = b.translation.sample(sequence, time_ms).unwrap_or(Vec3::ZERO);
-            let rotation = b.rotation.sample(sequence, time_ms).unwrap_or(Quat::IDENTITY);
-            let scale = b.scale.sample(sequence, time_ms).unwrap_or(Vec3::ONE);
+            let translation =
+                sample_track_with_global(&b.translation, sequence, time_ms, global_loops, Vec3::ZERO);
+            let rotation =
+                sample_track_with_global(&b.rotation, sequence, time_ms, global_loops, Quat::IDENTITY);
+            let scale = sample_track_with_global(&b.scale, sequence, time_ms, global_loops, Vec3::ONE);
 
             let local = anim::local_transform(
                 Vec3::from(b.bone.pivot),
@@ -770,34 +874,72 @@ impl Model {
         to_time_ms: u32,
         t: f32,
     ) -> Pose {
+        Self::blend_bones_with_global_loops(
+            bones,
+            from_sequence,
+            from_time_ms,
+            to_sequence,
+            to_time_ms,
+            t,
+            &[],
+        )
+    }
+
+    pub fn blend_bones_with_global_loops(
+        bones: &[AnimatedBone],
+        from_sequence: usize,
+        from_time_ms: u32,
+        to_sequence: usize,
+        to_time_ms: u32,
+        t: f32,
+        global_loops: &[u32],
+    ) -> Pose {
         let t = t.clamp(0.0, 1.0);
         let mut out = vec![Mat4::IDENTITY; bones.len()];
         for &i in &bone_order(bones) {
             let b = &bones[i];
-            let from_translation = b
-                .translation
-                .sample(from_sequence, from_time_ms)
-                .unwrap_or(Vec3::ZERO);
-            let from_rotation = b
-                .rotation
-                .sample(from_sequence, from_time_ms)
-                .unwrap_or(Quat::IDENTITY);
-            let from_scale = b
-                .scale
-                .sample(from_sequence, from_time_ms)
-                .unwrap_or(Vec3::ONE);
-            let to_translation = b
-                .translation
-                .sample(to_sequence, to_time_ms)
-                .unwrap_or(Vec3::ZERO);
-            let to_rotation = b
-                .rotation
-                .sample(to_sequence, to_time_ms)
-                .unwrap_or(Quat::IDENTITY);
-            let to_scale = b
-                .scale
-                .sample(to_sequence, to_time_ms)
-                .unwrap_or(Vec3::ONE);
+            let from_translation = sample_track_with_global(
+                &b.translation,
+                from_sequence,
+                from_time_ms,
+                global_loops,
+                Vec3::ZERO,
+            );
+            let from_rotation = sample_track_with_global(
+                &b.rotation,
+                from_sequence,
+                from_time_ms,
+                global_loops,
+                Quat::IDENTITY,
+            );
+            let from_scale = sample_track_with_global(
+                &b.scale,
+                from_sequence,
+                from_time_ms,
+                global_loops,
+                Vec3::ONE,
+            );
+            let to_translation = sample_track_with_global(
+                &b.translation,
+                to_sequence,
+                to_time_ms,
+                global_loops,
+                Vec3::ZERO,
+            );
+            let to_rotation = sample_track_with_global(
+                &b.rotation,
+                to_sequence,
+                to_time_ms,
+                global_loops,
+                Quat::IDENTITY,
+            );
+            let to_scale = sample_track_with_global(
+                &b.scale,
+                to_sequence,
+                to_time_ms,
+                global_loops,
+                Vec3::ONE,
+            );
 
             let local = anim::local_transform(
                 Vec3::from(b.bone.pivot),
@@ -826,6 +968,17 @@ impl Model {
     /// Maps a batch's texture slot to an index in [`Model::textures`].
     pub fn texture_combos(&self) -> Vec<u16> {
         self.u16_table("texture_combos", self.header.texture_combos)
+    }
+
+    pub fn texture_coord_combos(&self) -> Vec<u16> {
+        self.u16_table("texture_coord_combos", self.header.texture_coord_combos)
+    }
+
+    pub fn texture_transform_combos(&self) -> Vec<u16> {
+        self.u16_table(
+            "texture_transform_combos",
+            self.header.texture_transform_combos,
+        )
     }
 
     /// Maps a submesh's local bone slots to indices in [`Model::bones`].
