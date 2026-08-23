@@ -95,6 +95,14 @@ pub struct CachedModel {
     /// and the model already knows how big it is. `None` for a WMO, which is
     /// never a click target.
     pub bounds: Option<(Vec3, Vec3)>,
+    /// The box the model's *loaded geometry* occupies, in its local space.
+    ///
+    /// Distinct from `bounds` above, which is `None` for a WMO because a
+    /// building is never a click target. This one is filled for both, and for
+    /// a WMO it is the merged mesh's own extent -- tighter and truer than the
+    /// union of the group table's declared boxes, which includes groups that
+    /// failed to load. See `model_extent`, which prefers it.
+    pub render_bounds: Option<(Vec3, Vec3)>,
     /// Held because the bind groups reference their views -- and read
     /// directly by the emitters, whose sprites are bound against a different
     /// pipeline layout and so cannot reuse `binds`.
@@ -254,6 +262,12 @@ const ANIMATION_FLOOR: f32 = 2.0;
 /// union of them is the building. Returning `None` for a model with neither
 /// is deliberate: see [`Group::bounds`] for why that has to mean "draw it".
 fn model_extent(model: &CachedModel) -> Option<(Vec3, Vec3)> {
+    // The geometry's own extent first: it is filled for a building as well as
+    // a model, and for a building it beats the union below, which takes the
+    // group table's declared boxes and so includes groups that never loaded.
+    if let Some(bounds) = model.render_bounds {
+        return Some(bounds);
+    }
     if let Some(bounds) = model.bounds {
         return Some(bounds);
     }
@@ -1693,6 +1707,7 @@ impl World {
             wmo_id: Option<u32>,
             group_bounds: Vec<(Vec3, Vec3)>,
             group_surface_ids: Vec<u32>,
+            render_bounds: Option<(Vec3, Vec3)>,
             doodads: Vec<Vec<crate::world_object::Doodad>>,
             texture_animation: crate::model::TextureAnimation,
         }
@@ -1726,6 +1741,7 @@ impl World {
                         wmo_id: Some(w.wmo_id),
                         group_bounds: w.group_bounds,
                         group_surface_ids: w.group_surface_ids,
+                        render_bounds: Some((w.min, w.max)),
                         doodads: w.doodads,
                     }
                 })
@@ -1765,6 +1781,7 @@ impl World {
                         wmo_id: None,
                         group_bounds: Vec::new(),
                         group_surface_ids: Vec::new(),
+                        render_bounds: Some((m.min, m.max)),
                         doodads: Vec::new(),
                     }
                 })
@@ -1797,6 +1814,7 @@ impl World {
                 wmo_id: b.wmo_id,
                 group_bounds: b.group_bounds,
                 group_surface_ids: b.group_surface_ids,
+                render_bounds: b.render_bounds,
             })
         })
     }
@@ -2575,10 +2593,12 @@ impl World {
                         .copied()
                         .unwrap_or(Mat4::IDENTITY);
                     (
-                        held.wielders
-                            .iter()
-                            .map(|t| held_transform(*t, hand, held.offset))
-                            .collect::<Vec<_>>(),
+                        std::borrow::Cow::<[Mat4]>::Owned(
+                            held.wielders
+                                .iter()
+                                .map(|t| held_transform(*t, hand, held.offset))
+                                .collect(),
+                        ),
                         // The item's *own* skeleton is rigid and unposed; the
                         // movement all comes from the hand, which is already
                         // in the transform above.
@@ -2586,7 +2606,7 @@ impl World {
                     )
                 }
                 None => (
-                    group.emitting.clone(),
+                    std::borrow::Cow::<[Mat4]>::Borrowed(&group.emitting),
                     group
                         .animation
                         .and_then(|key| poses.get(&key))
@@ -2620,7 +2640,7 @@ impl World {
                 particles: &group.model.particles,
                 ribbons: &group.model.ribbons,
                 textures: &group.model.textures,
-                ids: group.emitting_ids.clone(),
+                ids: std::borrow::Cow::Borrowed(&group.emitting_ids),
                 placements,
                 pose: pose.map(|f| f.bones.as_slice()),
                 sequence,
@@ -2799,6 +2819,7 @@ impl World {
                     wmo_id: None,
                     group_bounds: Vec::new(),
                     group_surface_ids: Vec::new(),
+                    render_bounds: Some((loaded.min, loaded.max)),
                 })
             })
             // Timed on this side too: a load that *fails* still reads the

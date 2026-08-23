@@ -300,10 +300,16 @@ impl ParticleSystem {
     /// Separate from [`ParticleSystem::update`] so the simulation can be
     /// stepped without anything being drawn, which is what makes it testable.
     pub fn sprites(&self, emitter: &ParticleEmitter) -> Vec<Sprite> {
-        self.particles
-            .iter()
-            .map(|p| sprite(emitter, p))
-            .collect()
+        let mut sprites = Vec::with_capacity(self.particles.len());
+        self.for_each_sprite(emitter, |value| sprites.push(value));
+        sprites
+    }
+
+    /// Visits each live particle without allocating a temporary sprite list.
+    pub fn for_each_sprite(&self, emitter: &ParticleEmitter, mut visit: impl FnMut(Sprite)) {
+        for particle in &self.particles {
+            visit(sprite(emitter, particle));
+        }
     }
 }
 

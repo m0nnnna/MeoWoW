@@ -24,6 +24,8 @@
 
 use std::collections::HashMap;
 
+use std::borrow::Cow;
+
 use glam::Mat4;
 use render::particles::{Blend, ParticleRenderer, RibbonVertex, SpriteInstance};
 use render::Gpu;
@@ -41,14 +43,39 @@ struct Batch {
     blend: Blend,
 }
 
+/// Merge adjacent ranges only. Keeping the original order preserves alpha
+/// compositing while repeated placements that use the same sheet and blend
+/// mode can share one draw submission.
+fn push_batch(
+    batches: &mut Vec<Batch>,
+    range: std::ops::Range<u32>,
+    sheet: usize,
+    blend: Blend,
+) {
+    if let Some(previous) = batches.last_mut() {
+        if previous.sheet == sheet
+            && previous.blend == blend
+            && previous.range.end == range.start
+        {
+            previous.range.end = range.end;
+            return;
+        }
+    }
+    batches.push(Batch {
+        range,
+        sheet,
+        blend,
+    });
+}
+
 /// A group of placements to step this frame.
 ///
-/// The transforms are owned rather than borrowed, which looks like a wasted
-/// copy and is not: a *held* torch's placement is the wielder's transform
-/// times the animated hand, computed fresh each frame and stored nowhere, and
-/// borrowing would mean finding somewhere to keep it. Only models that
-/// actually emit reach here -- 6,429 of the archives' 22,844 -- so this is a
-/// handful of matrices, not a copy of the scene.
+/// Static groups borrow their stored arrays rather than copying them each
+/// frame. A *held* torch's placement is the wielder's transform times the
+/// animated hand, computed fresh each frame and stored nowhere, so that path
+/// owns its matrices. Only models that actually emit reach here -- 6,429 of
+/// the archives' 22,844 -- so the owned path is still a handful of matrices,
+/// not a copy of the scene.
 pub struct Source<'a> {
     /// The emitters themselves, and the textures they sample.
     ///
@@ -61,9 +88,9 @@ pub struct Source<'a> {
     pub ribbons: &'a [m2::RibbonEmitter],
     pub textures: &'a [render::UploadedTexture],
     /// One per placement, already in world space.
-    pub placements: Vec<Mat4>,
+    pub placements: Cow<'a, [Mat4]>,
     /// Identities parallel to `placements`.
-    pub ids: Vec<u64>,
+    pub ids: Cow<'a, [u64]>,
     /// The placement's posed skeleton, when it has one. `None` means the
     /// model is drawn in its bind pose, in which case every bone matrix is the
     /// identity and an emitter sits wherever its `position` says -- still, but
@@ -92,12 +119,13 @@ pub struct Emitters {
     vertices: Vec<RibbonVertex>,
     batches: Vec<Batch>,
     ribbon_batches: Vec<Batch>,
-    /// Both numbers, always. "Nothing was dropped" and "there was nothing to
+    /// All numbers, always. "Nothing was dropped" and "there was nothing to
     /// drop" are different states, and a counter that speaks only on failure
     /// cannot tell them apart -- this project has paid for that three times.
     pub live_systems: usize,
     pub live_sprites: usize,
     pub live_ribbons: usize,
+    pub live_batches: usize,
 }
 
 impl Default for Emitters {
@@ -119,6 +147,7 @@ impl Emitters {
             live_systems: 0,
             live_sprites: 0,
             live_ribbons: 0,
+            live_batches: 0,
         }
     }
 
@@ -142,7 +171,7 @@ impl Emitters {
         let mut blends: std::collections::BTreeSet<Blend> = Default::default();
 
         for source in sources {
-            for (placement, &id) in source.placements.iter().zip(&source.ids) {
+            for (placement, &id) in source.placements.iter().zip(source.ids.iter()) {
                 for (index, emitter) in source.particles.iter().enumerate() {
                     let key = (id, index as u16);
                     seen.insert(key);
@@ -171,7 +200,7 @@ impl Emitters {
 
                     let start = self.sprites.len() as u32;
                     let blend = Blend::from_m2(emitter.blend);
-                    for sprite in system.sprites(emitter) {
+                    system.for_each_sprite(emitter, |sprite| {
                         self.sprites.push(SpriteInstance {
                             position: [
                                 sprite.position[0],
@@ -183,18 +212,19 @@ impl Emitters {
                             color: renderer.encode(sprite.color),
                             uv: sprite.uv,
                         });
-                    }
+                    });
                     let end = self.sprites.len() as u32;
                     if end > start {
                         if let Some(sheet) =
                             source.textures.get(emitter.texture as usize)
                         {
                             blends.insert(blend);
-                            self.batches.push(Batch {
-                                range: start..end,
-                                sheet: std::ptr::from_ref(sheet) as usize,
+                            push_batch(
+                                &mut self.batches,
+                                start..end,
+                                std::ptr::from_ref(sheet) as usize,
                                 blend,
-                            });
+                            );
                             self.sheets.entry(std::ptr::from_ref(sheet) as usize).or_insert_with(
                                 || renderer.sheet_bind_group(gpu, &sheet.view),
                             );
@@ -257,11 +287,12 @@ impl Emitters {
                         // additive is chosen because every ribbon in the
                         // archives is a magical effect.
                         blends.insert(Blend::Additive);
-                        self.ribbon_batches.push(Batch {
-                            range: start..end,
-                            sheet: std::ptr::from_ref(sheet) as usize,
-                            blend: Blend::Additive,
-                        });
+                        push_batch(
+                            &mut self.ribbon_batches,
+                            start..end,
+                            std::ptr::from_ref(sheet) as usize,
+                            Blend::Additive,
+                        );
                         self.sheets
                             .entry(std::ptr::from_ref(sheet) as usize)
                             .or_insert_with(|| renderer.sheet_bind_group(gpu, &sheet.view));
@@ -288,6 +319,7 @@ impl Emitters {
         self.live_systems = self.particles.len() + self.ribbons.len();
         self.live_sprites = self.sprites.len();
         self.live_ribbons = self.vertices.len() / 6;
+        self.live_batches = self.batches.len() + self.ribbon_batches.len();
 
         renderer.begin(gpu, blends);
         renderer.reserve(gpu, self.sprites.len(), self.vertices.len());
@@ -315,8 +347,8 @@ impl Emitters {
     /// One line for the debug overlay.
     pub fn describe(&self) -> String {
         format!(
-            "{} emitter(s) alight, {} particles, {} trail quads",
-            self.live_systems, self.live_sprites, self.live_ribbons
+            "{} emitter(s) alight, {} particles, {} particle batches, {} trail quads",
+            self.live_systems, self.live_sprites, self.live_batches, self.live_ribbons
         )
     }
 }
@@ -381,8 +413,8 @@ pub fn single_model<'a>(
         particles: &model.particles,
         ribbons: &model.ribbons,
         textures: &model.textures,
-        placements: vec![Mat4::IDENTITY],
-        ids: vec![1],
+        placements: vec![Mat4::IDENTITY].into(),
+        ids: vec![1].into(),
         pose: Some(pose),
         sequence,
         time_ms,
@@ -450,5 +482,21 @@ mod tests {
         let tail = out.last().unwrap().color[3];
         assert!(head > tail, "head {head} is not brighter than tail {tail}");
         assert!(tail < 0.01, "the tail did not reach transparent: {tail}");
+    }
+
+    #[test]
+    fn only_adjacent_batches_with_the_same_material_are_merged() {
+        let mut batches = Vec::new();
+        push_batch(&mut batches, 0..4, 7, Blend::Alpha);
+        push_batch(&mut batches, 4..9, 7, Blend::Alpha);
+        push_batch(&mut batches, 9..11, 7, Blend::Additive);
+        push_batch(&mut batches, 11..12, 8, Blend::Additive);
+        push_batch(&mut batches, 12..13, 7, Blend::Additive);
+
+        assert_eq!(batches.len(), 4);
+        assert_eq!(batches[0].range, 0..9);
+        assert_eq!(batches[1].range, 9..11);
+        assert_eq!(batches[2].range, 11..12);
+        assert_eq!(batches[3].range, 12..13);
     }
 }
