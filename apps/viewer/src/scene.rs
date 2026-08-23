@@ -552,6 +552,7 @@ mod tests {
     fn map_animation_flags_choose_loop_or_hold() {
         assert_eq!(map_animation_time(100, 0, 225), 25);
         assert_eq!(map_animation_time(100, 1, 225), 100);
+    }
 
     #[test]
     fn placement_pitch_and_roll_use_the_stored_signs() {
