@@ -1751,7 +1751,22 @@ struct FrameProfile {
     /// timed together, either fix looked equally reasonable.
     redraw_ms: f32,
     /// Building the interface, which is a full egui pass over every frame.
+    ///
+    /// The largest single phase in the frame once culling and the collision
+    /// fix had landed -- 3.70 ms of 14.48, measured -- which is why it is
+    /// split below rather than left as one number.
     ui_ms: f32,
+    /// The part of `ui_ms` spent assembling the debug window's *text* before
+    /// the egui pass begins: the scene summary, the replicated-object census,
+    /// the emitter counts and this profile's own line.
+    ///
+    /// **Its own number because the two halves have unrelated fixes.** Text a
+    /// person reads does not need rebuilding sixty times a second and can
+    /// simply be throttled; egui's layout and tessellation of the action
+    /// bars, minimap, tracker and party frames cannot, and wants fewer or
+    /// cheaper widgets. Guessing between them is how this investigation
+    /// wasted a guess on the camera and another on draw calls.
+    ui_text_ms: f32,
     /// Walking the character: collision, sliding, the outgoing movement
     /// stream.
     movement_ms: f32,
@@ -1808,6 +1823,16 @@ struct FrameProfile {
     /// as candidates.
     gap_events: u32,
     gap_events_ms: f32,
+    /// What the previous frame's log line cost to emit.
+    ///
+    /// **Charged to this frame on purpose.** The line is written after the
+    /// draw is measured, so its cost falls in the gap `frame_ms` attributes
+    /// to the *next* frame -- where, until this existed, it was indistinguish-
+    /// able from the scheduler not handing the process back. An instrument
+    /// that quietly contributes to the thing it measures is the worst kind,
+    /// and this project has already been caught reading a marker printed by
+    /// the expensive thing as if it were the cause.
+    log_ms: f32,
     /// Collision work this frame -- see `collision::Probe`. Beside the times
     /// because a millisecond cannot say whether the cost is many cheap
     /// queries or a few expensive ones, and the two want different fixes.
@@ -1840,6 +1865,7 @@ impl FrameProfile {
             + self.animations_ms
             + self.emitters_ms
             + self.acquire_ms
+            + self.log_ms
             + self.encode_ms
             + self.submit_ms
             + self.present_ms
@@ -1859,12 +1885,13 @@ impl FrameProfile {
         format!(
             "{draws} draws/frame = {} terrain + {} models + {} shadow, \
              {} culled | {} groups, {} instances, {} ktris\n\
-             redraw {:.1}: ui {:.1} | move {:.1} | camera {:.1} | net {:.1} | \
+             redraw {:.1}: ui {:.1} (text {:.1}) | move {:.1} | camera {:.1} | \
+             net {:.1} | \
              sound {:.1} | stream {:.1} | entities {:.1} | anim {:.1} | \
              emitters {:.1} | acquire {:.1} | encode {:.1} | submit {:.1} | \
              present {:.1} | \
              rest {:.1} ms; outside redraw {:.1} = {} events in {:.1} + \
-             {:.1} idle ms\n\
+             {:.1} idle + {:.1} log ms\n\
              collision: {} queries, {} candidates ({} per query){}",
             self.terrain_draws,
             self.model_draws,
@@ -1875,6 +1902,7 @@ impl FrameProfile {
             self.triangles / 1000,
             self.redraw_ms,
             self.ui_ms,
+            self.ui_text_ms,
             self.movement_ms,
             self.camera_ms,
             self.network_ms,
@@ -1896,7 +1924,8 @@ impl FrameProfile {
             // and a `request_redraw` at the end of every frame there is
             // nothing here this client chose to wait for, so a large number is
             // the driver, the compositor or the scheduler.
-            (outside - self.gap_events_ms).max(0.0),
+            (outside - self.gap_events_ms - self.log_ms).max(0.0),
+            self.log_ms,
             self.collision.queries,
             self.collision.candidates,
             self.collision.candidates / self.collision.queries.max(1),
@@ -3546,6 +3575,14 @@ struct App {
     /// the next one. See [`FrameProfile::gap_events`].
     gap_events: u32,
     gap_events_ms: f32,
+    /// What the last log line cost, drained by the next frame. See
+    /// [`FrameProfile::log_ms`].
+    pending_log_ms: f32,
+    /// The adapter's description, asked for once. See the call site.
+    gpu_line: Option<String>,
+    /// Written by [`App::build_ui`] and read by the frame that called it.
+    /// See [`FrameProfile::ui_text_ms`].
+    ui_text_ms: f32,
     /// When the breakdown was last written to the log. **It goes to the log
     /// as well as to the window on purpose** -- `--screenshot` draws no HUD,
     /// so a reading that exists only in the debug window cannot be captured
@@ -4900,6 +4937,9 @@ impl App {
             worst: FrameProfile::default(),
             gap_events: 0,
             gap_events_ms: 0.0,
+            pending_log_ms: 0.0,
+            gpu_line: None,
+            ui_text_ms: 0.0,
             profile_logged: Instant::now(),
             anim: None,
             anim_time_ms: 0,
@@ -6203,12 +6243,14 @@ impl App {
         let mut profile = FrameProfile {
             gap_events: std::mem::take(&mut self.gap_events),
             gap_events_ms: std::mem::take(&mut self.gap_events_ms),
+            log_ms: std::mem::take(&mut self.pending_log_ms),
             ..FrameProfile::default()
         };
         let redraw_started = Instant::now();
         let phase = Instant::now();
         let mut ui_output = self.build_ui(window);
         profile.ui_ms = phase.elapsed().as_secs_f32() * 1000.0;
+        profile.ui_text_ms = self.ui_text_ms;
         let camera = self.camera;
 
         // Movement integrates real elapsed time, so travel speed does not
@@ -6670,12 +6712,14 @@ impl App {
         // change rather than on every rebuild.
         if self.profile_logged.elapsed() >= Duration::from_secs(1) {
             self.profile_logged = Instant::now();
+            let emitting = Instant::now();
             tracing::info!(
                 "worst frame {:.1} ms ({:.0} fps avg): {}",
                 self.worst.worst_ms,
                 self.fps,
                 self.worst.describe(self.worst.worst_ms)
             );
+            self.pending_log_ms = emitting.elapsed().as_secs_f32() * 1000.0;
             self.worst = FrameProfile::default();
         }
     }
@@ -12113,8 +12157,17 @@ impl App {
         };
         let input = r.egui_state.take_egui_input(window);
         let ctx = r.egui_ctx.clone();
+        let text_started = Instant::now();
 
-        let gpu_line = r.gpu.describe();
+        // **Asked once, not sixty times a second.** `Gpu::describe` calls
+        // `adapter.get_info()`, which is a driver query, and the answer is a
+        // fact about the machine that cannot change while the session runs.
+        // It was being rebuilt every frame to print one unchanging line in
+        // the debug window.
+        let gpu_line = self
+            .gpu_line
+            .get_or_insert_with(|| r.gpu.describe())
+            .clone();
         let bc = r.gpu.supports_bc();
         let pipelines = r.meshes.pipeline_count();
         // Emitters get their own line rather than being folded into the scene
@@ -12136,6 +12189,7 @@ impl App {
         // smoothing it to look current would be the same mistake as sorting
         // an absent distance as zero.
         let profile = self.profile.describe(frame_ms);
+        self.ui_text_ms = text_started.elapsed().as_secs_f32() * 1000.0;
         let camera = self.camera;
 
         // Snapshot what the picker needs, so the UI closure does not borrow the
