@@ -1781,8 +1781,22 @@ struct FrameProfile {
     /// Writing the command buffer -- every `set_pipeline`, `set_bind_group`
     /// and `draw_indexed` above, plus egui's own pass.
     encode_ms: f32,
-    /// `queue.submit` and `queue.present`.
+    /// `queue.submit`: handing the finished command buffer to the driver.
+    ///
+    /// **Split from the present below, because they answer different
+    /// questions.** This one scales with what is *in* the buffer -- draw
+    /// calls, pipeline switches, bind group switches -- so if it is the large
+    /// half, fewer and better-batched draws help. Presenting does not care
+    /// how the frame was built at all. Reported as one number they are the
+    /// same finding, and the fix for one is wasted effort on the other:
+    /// exactly the trap `other` was hiding twice already.
     submit_ms: f32,
+    /// `queue.present`: giving the frame to the swapchain and the compositor.
+    ///
+    /// Nothing this client does to the scene changes it. A large number here
+    /// is the display path, and the honest response is to say so rather than
+    /// to go and optimise geometry.
+    present_ms: f32,
     /// Events handled in the gap before this frame, and what they cost.
     ///
     /// **Both, because the two failure modes look identical in a total.** A
@@ -1828,6 +1842,7 @@ impl FrameProfile {
             + self.acquire_ms
             + self.encode_ms
             + self.submit_ms
+            + self.present_ms
     }
 
     /// Three lines: what was submitted, what it cost, and how the frame
@@ -1847,6 +1862,7 @@ impl FrameProfile {
              redraw {:.1}: ui {:.1} | move {:.1} | camera {:.1} | net {:.1} | \
              sound {:.1} | stream {:.1} | entities {:.1} | anim {:.1} | \
              emitters {:.1} | acquire {:.1} | encode {:.1} | submit {:.1} | \
+             present {:.1} | \
              rest {:.1} ms; outside redraw {:.1} = {} events in {:.1} + \
              {:.1} idle ms\n\
              collision: {} queries, {} candidates ({} per query){}",
@@ -1870,6 +1886,7 @@ impl FrameProfile {
             self.acquire_ms,
             self.encode_ms,
             self.submit_ms,
+            self.present_ms,
             unaccounted,
             outside,
             self.gap_events,
@@ -6610,8 +6627,10 @@ impl App {
         profile.encode_ms = phase.elapsed().as_secs_f32() * 1000.0;
         let phase = Instant::now();
         r.gpu.queue.submit([encoder.finish()]);
-        r.gpu.queue.present(frame);
         profile.submit_ms = phase.elapsed().as_secs_f32() * 1000.0;
+        let phase = Instant::now();
+        r.gpu.queue.present(frame);
+        profile.present_ms = phase.elapsed().as_secs_f32() * 1000.0;
         ui_output.textures_delta.clear();
         if reconfigure {
             r.surface.configure(&r.gpu.device, &r.config);
