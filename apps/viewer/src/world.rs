@@ -774,10 +774,8 @@ pub struct AreaContext {
 
 pub struct WmoMinimap {
     pub path: String,
-    pub group_index: usize,
     pub position: Vec3,
-    pub min: Vec3,
-    pub max: Vec3,
+    pub groups: Vec<(usize, Vec3, Vec3)>,
 }
 
 /// Where a held item is drawn: the wielder's placement, through the hand, at
@@ -1257,12 +1255,17 @@ impl World {
                         && (min.y..=max.y).contains(&local.y)
                         && (min.z..=max.z).contains(&local.z)
                     {
+                        let groups = instance
+                            .model
+                            .group_bounds
+                            .iter()
+                            .enumerate()
+                            .map(|(index, (min, max))| (index, *min, *max))
+                            .collect();
                         return Some(WmoMinimap {
                             path: instance.path.clone(),
-                            group_index,
                             position: local,
-                            min,
-                            max,
+                            groups,
                         });
                     }
                 }

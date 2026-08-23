@@ -80,6 +80,7 @@ pub struct WmoArea {
 #[derive(Default)]
 pub struct WmoAreas {
     by_group: HashMap<(u32, u32), WmoArea>,
+    by_root: HashMap<u32, WmoArea>,
     by_row: HashMap<u32, WmoArea>,
 }
 
@@ -93,11 +94,9 @@ impl WmoAreas {
             return Self::default();
         };
         let mut by_group = HashMap::new();
+        let mut by_root = HashMap::new();
         let mut by_row = HashMap::new();
         for row in table.iter() {
-            let Ok(group) = u32::try_from(row.wmo_group_id()) else {
-                continue;
-            };
             let area = WmoArea {
                 row_id: row.id(),
                 wmo_id: row.wmo_id(),
@@ -108,18 +107,46 @@ impl WmoAreas {
             if area.area_table_id == 0 && area.ambience_id.is_none() && area.zone_music.is_none() {
                 continue;
             }
-            by_group.insert((row.wmo_id(), group), area);
+            if row.wmo_group_id() == -1 {
+                by_root.insert(row.wmo_id(), area);
+            } else if let Ok(group) = u32::try_from(row.wmo_group_id()) {
+                by_group.insert((row.wmo_id(), group), area);
+            }
             by_row.insert(area.row_id, area);
         }
-        Self { by_group, by_row }
+        Self {
+            by_group,
+            by_root,
+            by_row,
+        }
     }
 
     fn get(&self, wmo_id: u32, group_id: u32) -> Option<WmoArea> {
-        self.by_group.get(&(wmo_id, group_id)).copied()
+        self.by_group
+            .get(&(wmo_id, group_id))
+            .copied()
+            .or_else(|| self.by_root.get(&wmo_id).copied())
+            .map(|area| self.with_root(area))
     }
 
     pub fn by_id(&self, row_id: u32) -> Option<WmoArea> {
-        self.by_row.get(&row_id).copied()
+        self.by_row.get(&row_id).copied().map(|area| self.with_root(area))
+    }
+
+    fn with_root(&self, area: WmoArea) -> WmoArea {
+        let Some(root) = self.by_root.get(&area.wmo_id).copied() else {
+            return area;
+        };
+        WmoArea {
+            row_id: area.row_id,
+            wmo_id: area.wmo_id,
+            area_table_id: (area.area_table_id != 0)
+                .then_some(area.area_table_id)
+                .or((root.area_table_id != 0).then_some(root.area_table_id))
+                .unwrap_or(0),
+            ambience_id: area.ambience_id.or(root.ambience_id),
+            zone_music: area.zone_music.or(root.zone_music),
+        }
     }
 }
 
@@ -412,5 +439,50 @@ mod tests {
         };
         let point = doodad_transform(&doodad).transform_point3(Vec3::X);
         assert!((point - Vec3::new(3.0, 6.0, 5.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn wmo_group_area_inherits_root_audio_and_keeps_its_area() {
+        let root = WmoArea {
+            row_id: 10,
+            wmo_id: 42,
+            area_table_id: 100,
+            ambience_id: Some(7),
+            zone_music: Some(9),
+        };
+        let group = WmoArea {
+            row_id: 11,
+            wmo_id: 42,
+            area_table_id: 200,
+            ambience_id: None,
+            zone_music: None,
+        };
+        let mut areas = WmoAreas::default();
+        areas.by_root.insert(root.wmo_id, root);
+        areas.by_group.insert((group.wmo_id, 3), group);
+        areas.by_row.insert(group.row_id, group);
+        let resolved = areas.get(42, 3).expect("group area");
+        assert_eq!(resolved.area_table_id, 200);
+        assert_eq!(resolved.ambience_id, Some(7));
+        assert_eq!(resolved.zone_music, Some(9));
+        assert_eq!(areas.by_id(11).map(|area| area.zone_music), Some(Some(9)));
+    }
+
+    #[test]
+    fn wmo_group_without_a_row_uses_the_root_area() {
+        let root = WmoArea {
+            row_id: 10,
+            wmo_id: 42,
+            area_table_id: 100,
+            ambience_id: Some(7),
+            zone_music: Some(9),
+        };
+        let mut areas = WmoAreas::default();
+        areas.by_root.insert(root.wmo_id, root);
+        let resolved = areas.get(42, 3).expect("root area");
+        assert_eq!(resolved.row_id, 10);
+        assert_eq!(resolved.area_table_id, 100);
+        assert_eq!(resolved.ambience_id, Some(7));
+        assert_eq!(resolved.zone_music, Some(9));
     }
 }

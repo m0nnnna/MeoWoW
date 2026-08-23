@@ -31,6 +31,13 @@ use render::{Gpu, UploadedTexture};
 
 use crate::maps::{screen_facing, Objective, PartyMemberPin, Standing};
 
+#[derive(Clone, Copy)]
+struct MinimapArt {
+    texture: egui::TextureId,
+    width: u32,
+    height: u32,
+}
+
 /// Tile art, and the index that finds it.
 #[derive(Default)]
 pub struct Minimap {
@@ -39,7 +46,7 @@ pub struct Minimap {
     /// 18,644 tiles onto 14,420 files, so two tiles that look the same share
     /// one picture, and keying this by `(map, x, y)` would upload the flat
     /// black tile a thousand times.
-    art: HashMap<String, Option<egui::TextureId>>,
+    art: HashMap<String, Option<MinimapArt>>,
     /// Kept alive because egui holds only the id.
     uploaded: Vec<UploadedTexture>,
     /// The last area name that resolved.
@@ -97,7 +104,7 @@ impl Minimap {
         y: usize,
     ) -> Option<egui::TextureId> {
         let path = self.index.tile_path(map, x, y)?;
-        self.art(gpu, renderer, chain, path)
+        self.art(gpu, renderer, chain, path).map(|art| art.texture)
     }
 
     fn art(
@@ -106,21 +113,27 @@ impl Minimap {
         renderer: &mut egui_wgpu::Renderer,
         chain: &mut Chain,
         path: String,
-    ) -> Option<egui::TextureId> {
+    ) -> Option<MinimapArt> {
         if let Some(cached) = self.art.get(&path) {
             return *cached;
         }
         let loaded = (|| {
             let bytes = chain.read(&path).ok()?;
             let image = blp::Blp::parse(&bytes).ok()?;
+            let width = image.width();
+            let height = image.height();
             let uploaded = render::texture::upload_blp(gpu, &image, &path);
-            let id = renderer.register_native_texture(
+            let texture = renderer.register_native_texture(
                 &gpu.device,
                 &uploaded.view,
                 wgpu::FilterMode::Linear,
             );
             self.uploaded.push(uploaded);
-            Some(id)
+            Some(MinimapArt {
+                texture,
+                width,
+                height,
+            })
         })();
         if loaded.is_none() {
             tracing::debug!("minimap art {path} would not load");
@@ -170,24 +183,46 @@ impl Minimap {
         let project = |x: f32, y: f32| placed.project(x, y);
         let mut tiles = Vec::new();
         if let Some(interior) = interior {
-            let entries = self.index.wmo_tiles(&interior.path, interior.group_index);
-            if !entries.is_empty() {
+            for (group_index, min, max) in &interior.groups {
+                let entries = self.index.wmo_tiles(&interior.path, *group_index);
+                if entries.is_empty() {
+                    continue;
+                }
                 let min_x = entries.iter().map(|(x, _, _)| *x).min().unwrap_or(0);
                 let max_x = entries.iter().map(|(x, _, _)| *x).max().unwrap_or(0);
                 let min_y = entries.iter().map(|(_, y, _)| *y).min().unwrap_or(0);
                 let max_y = entries.iter().map(|(_, y, _)| *y).max().unwrap_or(0);
-                let width = (interior.max.x - interior.min.x).max(1.0);
-                let height = (interior.max.y - interior.min.y).max(1.0);
-                let columns = (max_x - min_x + 1) as f32;
-                let rows = (max_y - min_y + 1) as f32;
+                let mut loaded = Vec::new();
                 for (x, y, path) in entries {
-                    let Some(texture) = self.art(gpu, renderer, chain, path) else {
+                    let Some(art) = self.art(gpu, renderer, chain, path) else {
                         continue;
                     };
-                    let x0 = interior.min.x + (x - min_x) as f32 * width / columns;
-                    let x1 = interior.min.x + (x - min_x + 1) as f32 * width / columns;
-                    let y0 = interior.min.y + (y - min_y) as f32 * height / rows;
-                    let y1 = interior.min.y + (y - min_y + 1) as f32 * height / rows;
+                    loaded.push((x, y, art));
+                }
+                if loaded.is_empty() {
+                    continue;
+                }
+                let width = (max.x - min.x).max(1.0);
+                let height = (max.y - min.y).max(1.0);
+                let single_origin = min_x == 0 && max_x == 0 && min_y == 0 && max_y == 0;
+                let composite_width = if single_origin {
+                    loaded[0].2.width as f32
+                } else {
+                    (max_x - min_x + 1) as f32 * 256.0
+                };
+                let composite_height = if single_origin {
+                    loaded[0].2.height as f32
+                } else {
+                    (max_y - min_y + 1) as f32 * 256.0
+                };
+                for (x, y, art) in loaded {
+                    let draw_x = (x - min_x) as f32 * 256.0;
+                    let draw_y = (max_y - y) as f32 * 256.0;
+                    let x0 = min.x + draw_x / composite_width * width;
+                    let x1 = min.x + (draw_x + art.width as f32) / composite_width * width;
+                    let y1 = max.y - draw_y / composite_height * height;
+                    let y0 = max.y
+                        - (draw_y + art.height as f32) / composite_height * height;
                     let p0 = (
                         0.5 + (x0 - interior.position.x) / range.max(1.0),
                         0.5 + (interior.position.y - y1) / range.max(1.0),
@@ -197,7 +232,7 @@ impl Minimap {
                         0.5 + (interior.position.y - y0) / range.max(1.0),
                     );
                     tiles.push(ui::MinimapTile {
-                        texture,
+                        texture: art.texture,
                         rect: [p0.0, p0.1, p1.0, p1.1],
                     });
                 }
