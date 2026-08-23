@@ -108,13 +108,70 @@ pub struct Draw {
     pub state: RenderState,
     /// Index into [`LoadedModel::textures`].
     pub texture: usize,
+    pub texture_transform: Option<usize>,
     pub submesh_id: u16,
+}
+
+pub struct TextureAnimation {
+    transforms: std::rc::Rc<Vec<m2::AnimatedTextureTransform>>,
+    global_sequences: std::rc::Rc<Vec<u32>>,
+    gpu: render::mesh::TextureTransformBuffer,
+}
+
+impl TextureAnimation {
+    pub fn new(gpu: &Gpu, meshes: &render::mesh::MeshRenderer, model: &m2::Model, draws: &[Draw]) -> Self {
+        let transforms = std::rc::Rc::new(model.animated_texture_transforms());
+        let global_sequences = std::rc::Rc::new(model.global_sequence_durations());
+        let indices = draws
+            .iter()
+            .map(|draw| draw.texture_transform.map_or(0, |index| index.saturating_add(1)))
+            .collect::<Vec<_>>();
+        let gpu = meshes.create_texture_transforms(gpu, transforms.len().saturating_add(1), &indices);
+        Self { transforms, global_sequences, gpu }
+    }
+
+    pub fn empty(gpu: &Gpu, meshes: &render::mesh::MeshRenderer, draws: usize) -> Self {
+        let gpu = meshes.create_texture_transforms(gpu, 1, &vec![0; draws]);
+        Self {
+            transforms: std::rc::Rc::new(Vec::new()),
+            global_sequences: std::rc::Rc::new(Vec::new()),
+            gpu,
+        }
+    }
+
+    pub fn update(&self, gpu: &Gpu, meshes: &render::mesh::MeshRenderer, sequence: usize, time_ms: u32) {
+        let mut matrices = Vec::with_capacity(self.transforms.len().saturating_add(1));
+        matrices.push(glam::Mat4::IDENTITY.to_cols_array_2d());
+        matrices.extend(self
+            .transforms
+            .iter()
+            .map(|transform| {
+                transform
+                    .matrix(sequence, time_ms, &self.global_sequences)
+                    .to_cols_array_2d()
+            })
+        );
+        meshes.update_texture_transforms(gpu, &self.gpu, &matrices);
+    }
+
+    pub fn is_animated(&self) -> bool {
+        self.transforms.iter().any(m2::AnimatedTextureTransform::is_animated)
+    }
+
+    pub fn global_sequences(&self) -> &[u32] {
+        &self.global_sequences
+    }
+
+    pub fn bind(&self, draw: usize) -> Option<&wgpu::BindGroup> {
+        self.gpu.binds.get(draw)
+    }
 }
 
 pub struct LoadedModel {
     pub mesh: GpuMesh,
     pub draws: Vec<Draw>,
     pub textures: Vec<UploadedTexture>,
+    pub texture_animation: TextureAnimation,
     /// Skeleton with animation tracks, kept so poses can be evaluated per
     /// frame rather than baked at load.
     pub bones: std::rc::Rc<Vec<m2::AnimatedBone>>,
@@ -417,17 +474,19 @@ pub fn placeholder(gpu: &Gpu) -> UploadedTexture {
 /// one that reads a file per *costume*; see [`load_dressed_with`].
 pub fn load(
     gpu: &Gpu,
+    meshes: &render::mesh::MeshRenderer,
     chain: &mut Chain,
     path: &str,
     variations: &Variations,
     lod: u32,
 ) -> Result<LoadedModel> {
-    load_dressed(gpu, chain, path, variations, lod, None)
+    load_dressed(gpu, meshes, chain, path, variations, lod, None)
 }
 
 /// The same as [`load_dressed_with`], with a cache that lives for one call.
 pub fn load_dressed(
     gpu: &Gpu,
+    meshes: &render::mesh::MeshRenderer,
     chain: &mut Chain,
     path: &str,
     variations: &Variations,
@@ -435,7 +494,7 @@ pub fn load_dressed(
     look: Option<&crate::character::Look>,
 ) -> Result<LoadedModel> {
     let mut sources = Sources::default();
-    load_dressed_with(gpu, chain, &mut sources, path, variations, lod, look)
+    load_dressed_with(gpu, meshes, chain, &mut sources, path, variations, lod, look)
 }
 
 /// The same, for a model whose textures and geosets come from a character's
@@ -447,6 +506,7 @@ pub fn load_dressed(
 /// player needs it at all.
 pub fn load_dressed_with(
     gpu: &Gpu,
+    meshes: &render::mesh::MeshRenderer,
     chain: &mut Chain,
     sources: &mut Sources,
     path: &str,
@@ -502,6 +562,7 @@ pub fn load_dressed_with(
     timings.geometry = phase.elapsed();
 
     let combos = model.texture_combos();
+    let texture_transform_combos = model.texture_transform_combos();
     let defs = model.textures();
     let materials = model.materials();
 
@@ -631,6 +692,11 @@ pub fn load_dressed_with(
                 winding: Winding::CounterClockwise,
             },
             texture,
+            texture_transform: texture_transform_combos
+                .get(batch.texture_transform_combo_index as usize)
+                .copied()
+                .filter(|&index| index != u16::MAX)
+                .map(usize::from),
             submesh_id: submesh.id,
         });
         indices.extend_from_slice(&resolved);
@@ -681,6 +747,8 @@ pub fn load_dressed_with(
 
     let triangle_count = indices.len() / 3;
     timings.geometry += phase.elapsed();
+
+    let texture_animation = TextureAnimation::new(gpu, meshes, &model, &draws);
 
     let sequences = model.sequences();
     // The whole skeleton -- the `.anim` reads, the bone tracks and the timed
@@ -759,6 +827,7 @@ pub fn load_dressed_with(
         mesh,
         draws,
         textures,
+        texture_animation,
         bones,
         sequences,
         attachments,

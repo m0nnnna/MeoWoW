@@ -523,7 +523,15 @@ fn build_scene(
     if args.realm_host.is_some() {
         return build_live_scene(gpu, meshes, chain, args);
     }
-    build_offline_scene(gpu, terrain_renderer, liquid_renderer, liquid_types, chain, args)
+    build_offline_scene(
+        gpu,
+        meshes,
+        terrain_renderer,
+        liquid_renderer,
+        liquid_types,
+        chain,
+        args,
+    )
         .map(|scene| (scene, None))
 }
 
@@ -650,6 +658,7 @@ fn world_for_live(
 
 fn build_offline_scene(
     gpu: &Gpu,
+    meshes: &MeshRenderer,
     terrain_renderer: &TerrainRenderer,
     liquid_renderer: &render::LiquidRenderer,
     liquid_types: &mut liquid::LiquidTypes,
@@ -679,7 +688,7 @@ fn build_offline_scene(
             ),
         }
         let loaded =
-            model::load_dressed(gpu, chain, &path, &variations, args.lod, look.as_ref())?;
+            model::load_dressed(gpu, meshes, chain, &path, &variations, args.lod, look.as_ref())?;
         // What this display costs the first time it comes into view, with no
         // realm and no window in the way.
         //
@@ -696,7 +705,7 @@ fn build_offline_scene(
         return Ok(Scene::Model(Box::new(loaded)));
     }
     if let Some(path) = &args.model {
-        let loaded = model::load(gpu, chain, path, &Variations::default(), args.lod)?;
+        let loaded = model::load(gpu, meshes, chain, path, &Variations::default(), args.lod)?;
         return Ok(Scene::Model(Box::new(loaded)));
     }
     if let Some(path) = &args.wmo {
@@ -712,6 +721,7 @@ fn build_offline_scene(
         if args.world {
             let loaded = scene::load(
                 gpu,
+                meshes,
                 terrain_renderer,
                 liquid_renderer,
                 liquid_types,
@@ -1724,6 +1734,9 @@ fn draw_scene(
     }
     // A world holds many meshes, so it cannot go through the single-mesh path.
     if !terrain_parts.is_empty() || matches!(scene, Scene::World(_)) {
+        if let Scene::World(world) = scene {
+            world.update_animations(gpu, meshes, (seconds * 1000.0) as u32);
+        }
         {
             let aspect = size.0 as f32 / size.1.max(1) as f32;
             meshes.update_camera(gpu, &camera.uniform(aspect));
@@ -1789,18 +1802,30 @@ fn draw_scene(
             }
 
             for (item, binds) in items.iter().zip(world_binds) {
+                if let Some(item_bones) = item
+                    .animation
+                    .as_ref()
+                    .map(|animation| &animation.buffer)
+                    .or(bones)
+                {
+                    pass.set_bind_group(2, &item_bones.bind_group, &[]);
+                }
                 pass.set_vertex_buffer(0, item.mesh.vertices.slice(..));
                 pass.set_index_buffer(item.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 let instances =
                     item.instance_start..item.instance_start + item.instance_count;
-                for draw in &item.draws {
+                for (draw_index, draw) in item.draws.iter().enumerate() {
                     let (Some(pipeline), Some(bind)) =
                         (meshes.get(draw.state), binds.get(draw.texture))
                     else {
                         continue;
                     };
+                    let Some(texture_bind) = item.texture_animation.bind(draw_index) else {
+                        continue;
+                    };
                     pass.set_pipeline(pipeline);
                     pass.set_bind_group(1, bind, &[]);
+                    pass.set_bind_group(3, texture_bind, &[]);
                     pass.draw_indexed(
                         draw.first_index..draw.first_index + draw.index_count,
                         0,
@@ -1878,14 +1903,22 @@ fn draw_scene(
             pass.set_vertex_buffer(1, identity.buffer.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
 
-            for draw in draw_list {
+            let texture_animation = match scene {
+                Scene::Model(model) => &model.texture_animation,
+                _ => return,
+            };
+            for (draw_index, draw) in draw_list.iter().enumerate() {
                 let (Some(pipeline), Some(binds)) =
                     (meshes.get(draw.state), material_binds.get(draw.texture))
                 else {
                     continue;
                 };
+                let Some(texture_bind) = texture_animation.bind(draw_index) else {
+                    continue;
+                };
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(1, binds, &[]);
+                pass.set_bind_group(3, texture_bind, &[]);
                 pass.draw_indexed(
                     draw.first_index..draw.first_index + draw.index_count,
                     0,
@@ -1922,7 +1955,12 @@ fn upload_pose(
             // Wrap into the sequence so a caller can pass a free-running clock.
             let duration = m.sequences[seq].duration_ms.max(1);
             let t = time_ms % duration;
-            m2::Model::pose_bones(&m.bones, seq, t)
+            m2::Model::pose_bones_with_global_loops(
+                &m.bones,
+                seq,
+                t,
+                m.texture_animation.global_sequences(),
+            )
                 .iter()
                 .map(|mat| mat.to_cols_array_2d())
                 .collect()
@@ -1930,6 +1968,14 @@ fn upload_pose(
         _ => vec![glam::Mat4::IDENTITY.to_cols_array_2d(); m.bones.len().max(1)],
     };
     meshes.update_bones(gpu, bones, &pose);
+    let sequence = anim.filter(|s| *s < m.sequences.len()).unwrap_or(0);
+    let duration = m
+        .sequences
+        .get(sequence)
+        .map(|s| s.duration_ms.max(1))
+        .unwrap_or(1);
+    m.texture_animation
+        .update(gpu, meshes, sequence, time_ms % duration);
 }
 
 /// Runs a lone model's emitters up to their steady state.
@@ -1969,7 +2015,12 @@ fn warm_emitters(
         let pose = if m.sequences.is_empty() {
             vec![glam::Mat4::IDENTITY; m.bones.len().max(1)]
         } else {
-            m2::Model::pose_bones(&m.bones, sequence, time_ms)
+            m2::Model::pose_bones_with_global_loops(
+                &m.bones,
+                sequence,
+                time_ms,
+                m.texture_animation.global_sequences(),
+            )
         };
         emitters.update(
             gpu,
@@ -2209,6 +2260,12 @@ fn draw_streaming(
             let Some(group_bones) = group
                 .animation
                 .and_then(|key| world.entity_bone_buffer(key))
+                .or_else(|| {
+                    group
+                        .map_animation
+                        .as_deref()
+                        .and_then(|key| world.map_bone_buffer(key))
+                })
                 .or(bones)
             else {
                 continue;
@@ -2330,14 +2387,20 @@ fn draw_streaming(
 
     // The map's own geometry and the server's objects draw identically; only
     // where the transforms came from, and which bone buffer they bind,
-    // differs. Everything is rigid except a replicated entity group with an
-    // animation to play -- see `world::Group::animation` -- so bind group 2
-    // is chosen fresh per group instead of once for the whole pass.
+    // differs. Tile M2s and replicated entities can each carry an animated
+    // bone buffer, so bind group 2 is chosen fresh per group instead of once
+    // for the whole pass.
     for group in world.tiles().flat_map(|t| t.groups.iter()).chain(world.entities()) {
         {
             let group_bones = group
                 .animation
                 .and_then(|key| world.entity_bone_buffer(key))
+                .or_else(|| {
+                    group
+                        .map_animation
+                        .as_deref()
+                        .and_then(|key| world.map_bone_buffer(key))
+                })
                 .or(bones);
             if let Some(group_bones) = group_bones {
                 pass.set_bind_group(2, &group_bones.bind_group, &[]);
@@ -2348,7 +2411,7 @@ fn draw_streaming(
                 group.model.mesh.indices.slice(..),
                 wgpu::IndexFormat::Uint32,
             );
-            for draw in &group.model.draws {
+            for (draw_index, draw) in group.model.draws.iter().enumerate() {
                 // **The group's override, not the material's own state**, and
                 // only where one was asked for. A tint with alpha under one is
                 // invisible through an opaque pipeline -- the blend has to be
@@ -2359,13 +2422,17 @@ fn draw_streaming(
                 } else {
                     draw.state
                 };
-                let (Some(pipeline), Some(bind)) =
-                    (meshes.get(state), group.model.binds.get(draw.texture))
+                let (Some(pipeline), Some(bind), Some(texture_bind)) = (
+                    meshes.get(state),
+                    group.model.binds.get(draw.texture),
+                    group.model.texture_animation.bind(draw_index),
+                )
                 else {
                     continue;
                 };
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(1, bind, &[]);
+                pass.set_bind_group(3, texture_bind, &[]);
                 pass.draw_indexed(
                     draw.first_index..draw.first_index + draw.index_count,
                     0,
@@ -2762,7 +2829,8 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     // HUD** -- which is the distinction 4.24 had to learn the hard way, and is
     // why this milestone is one of the few whose picture half a screenshot
     // really can confirm.
-    let mut sky_scene = sky::SkyScene::load(&gpu, chain, &mut celestial, lighting.as_ref());
+    let mut sky_scene =
+        sky::SkyScene::load(&gpu, &meshes, chain, &mut celestial, lighting.as_ref());
     let frame_lighting = resolve_lighting(
         lighting.as_ref(),
         live.as_ref(),
@@ -2773,6 +2841,7 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     );
     sky_scene.set_skybox(
         &gpu,
+        &meshes,
         chain,
         &mut celestial,
         lighting.as_ref(),
@@ -4980,6 +5049,7 @@ impl ApplicationHandler for App {
         // written here.
         let sky_scene = sky::SkyScene::load(
             &gpu,
+            &meshes,
             &mut self.chain,
             &mut celestial,
             self.lighting.as_ref(),
@@ -5987,6 +6057,7 @@ impl App {
         // no outdoor light on either continent names a skybox.
         r.sky_scene.set_skybox(
             &r.gpu,
+            &r.meshes,
             &mut self.chain,
             &mut r.celestial,
             self.lighting.as_ref(),

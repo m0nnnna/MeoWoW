@@ -158,6 +158,7 @@ fn render_pair(gpu: &Gpu, first_z: f32, second_z: f32) -> [u8; 4] {
     meshes.prepare(gpu, [state]);
     meshes.update_camera(gpu, &identity_camera());
     let bones = bones_with(gpu, &meshes, &[glam::Mat4::IDENTITY]);
+    let texture_transforms = meshes.create_texture_transforms(gpu, 1, &[0]);
     // Geometry is authored in clip space here, so the instance transform is
     // identity.
     let instances = InstanceBuffer::upload(gpu, &[Instance::IDENTITY]);
@@ -197,6 +198,7 @@ fn render_pair(gpu: &Gpu, first_z: f32, second_z: f32) -> [u8; 4] {
         pass.set_pipeline(meshes.get(state).expect("pipeline"));
         pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
         pass.set_bind_group(2, &bones.bind_group, &[]);
+        pass.set_bind_group(3, &texture_transforms.binds[0], &[]);
         pass.set_vertex_buffer(1, instances.buffer.slice(..));
 
         pass.set_bind_group(1, &red, &[]);
@@ -226,6 +228,7 @@ fn render_tinted(gpu: &Gpu, colour: [u8; 4], tint: [f32; 4], state: RenderState)
     meshes.prepare(gpu, [state]);
     meshes.update_camera(gpu, &identity_camera());
     let bones = bones_with(gpu, &meshes, &[glam::Mat4::IDENTITY]);
+    let texture_transforms = meshes.create_texture_transforms(gpu, 1, &[0]);
     let instances = InstanceBuffer::upload(
         gpu,
         &[Instance::tinted(
@@ -268,6 +271,7 @@ fn render_tinted(gpu: &Gpu, colour: [u8; 4], tint: [f32; 4], state: RenderState)
         pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
         pass.set_bind_group(1, &material, &[]);
         pass.set_bind_group(2, &bones.bind_group, &[]);
+        pass.set_bind_group(3, &texture_transforms.binds[0], &[]);
         pass.set_vertex_buffer(0, mesh.vertices.slice(..));
         pass.set_vertex_buffer(1, instances.buffer.slice(..));
         pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -453,6 +457,7 @@ fn skinning_moves_weighted_vertices_only() {
             &meshes,
             &[glam::Mat4::from_translation(glam::Vec3::new(10.0, 0.0, 0.0))],
         );
+        let texture_transforms = meshes.create_texture_transforms(&gpu, 1, &[0]);
         let mesh = GpuMesh::upload(&gpu, &quad_weighted(0.5, 0, weight), &[0, 1, 2]);
         let instances = InstanceBuffer::upload(&gpu, &[Instance::IDENTITY]);
         let red = meshes.material_bind_group(&gpu, &solid(&gpu, [255, 0, 0, 255]));
@@ -488,6 +493,7 @@ fn skinning_moves_weighted_vertices_only() {
             pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
             pass.set_bind_group(1, &red, &[]);
             pass.set_bind_group(2, &bones.bind_group, &[]);
+            pass.set_bind_group(3, &texture_transforms.binds[0], &[]);
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_vertex_buffer(1, instances.buffer.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -1507,6 +1513,7 @@ fn render_shadowed_ground(gpu: &Gpu, shadowed: bool) -> Vec<u8> {
     let caster = GpuMesh::upload(gpu, &caster_v, &caster_i);
     let instances = InstanceBuffer::upload(gpu, &[Instance::IDENTITY]);
     let bones = bones_with(gpu, &meshes, &[glam::Mat4::IDENTITY]);
+    let texture_transforms = meshes.create_texture_transforms(gpu, 1, &[0]);
     let white = meshes.material_bind_group(gpu, &solid(gpu, [255, 255, 255, 255]));
 
     // Straight down, so the picture is a plan of the ground.
@@ -1585,6 +1592,7 @@ fn render_shadowed_ground(gpu: &Gpu, shadowed: bool) -> Vec<u8> {
         pass.set_bind_group(0, meshes.camera_bind_group(), &[]);
         pass.set_bind_group(1, &white, &[]);
         pass.set_bind_group(2, &bones.bind_group, &[]);
+        pass.set_bind_group(3, &texture_transforms.binds[0], &[]);
         pass.set_vertex_buffer(0, ground.vertices.slice(..));
         pass.set_vertex_buffer(1, instances.buffer.slice(..));
         pass.set_index_buffer(ground.indices.slice(..), wgpu::IndexFormat::Uint32);
