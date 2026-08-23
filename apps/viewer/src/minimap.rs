@@ -104,17 +104,20 @@ impl Minimap {
         y: usize,
     ) -> Option<egui::TextureId> {
         let path = self.index.tile_path(map, x, y)?;
-        self.art(gpu, renderer, chain, path).map(|art| art.texture)
+        self.art(gpu, renderer, chain, &path).map(|art| art.texture)
     }
 
+    /// `&str` rather than `String`: this is called once per tile per frame and
+    /// all but the first are hits, so the key is only worth building on a
+    /// miss.
     fn art(
         &mut self,
         gpu: &Gpu,
         renderer: &mut egui_wgpu::Renderer,
         chain: &mut Chain,
-        path: String,
+        path: &str,
     ) -> Option<MinimapArt> {
-        if let Some(cached) = self.art.get(&path) {
+        if let Some(cached) = self.art.get(path) {
             return *cached;
         }
         let loaded = (|| {
@@ -138,7 +141,7 @@ impl Minimap {
         if loaded.is_none() {
             tracing::debug!("minimap art {path} would not load");
         }
-        self.art.insert(path, loaded);
+        self.art.insert(path.to_string(), loaded);
         loaded
     }
 
@@ -193,11 +196,11 @@ impl Minimap {
                 let min_y = entries.iter().map(|(_, y, _)| *y).min().unwrap_or(0);
                 let max_y = entries.iter().map(|(_, y, _)| *y).max().unwrap_or(0);
                 let mut loaded = Vec::new();
-                for (x, y, path) in entries {
+                for (x, y, path) in entries.iter() {
                     let Some(art) = self.art(gpu, renderer, chain, path) else {
                         continue;
                     };
-                    loaded.push((x, y, art));
+                    loaded.push((*x, *y, art));
                 }
                 if loaded.is_empty() {
                     continue;

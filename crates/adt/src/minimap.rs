@@ -52,7 +52,9 @@
 //! set is not symmetric under exchanging the two numbers. See
 //! `wow-cli minimap tiles`.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Archive path of the index.
 pub const TRANSLATE_PATH: &str = r"textures\Minimap\md5translate.trs";
@@ -75,6 +77,27 @@ pub struct Translate {
     /// is inconsistent -- `Zul'gurub` and `ZulAman` sit beside `Azjol_LowerCity`
     /// -- and a caller naming a map from `Map.dbc` has no reason to match it.
     entries: HashMap<String, String>,
+    /// Answers to [`Translate::wmo_tiles`], remembered.
+    ///
+    /// **That lookup is a linear scan of every entry** -- 18,644 of them on a
+    /// real installation -- lowercasing the root, building a prefix and
+    /// calling `strip_prefix` on each. The interior minimap asks it once per
+    /// group of the building the player is standing in, *every frame*: a few
+    /// hundred thousand string comparisons a frame in Northshire abbey, about
+    /// two million in Ironforge with its 104 groups. It measured 2.66 ms of a
+    /// 2.74 ms interface snapshot, the largest single item in the frame after
+    /// draw submission.
+    ///
+    /// The index is immutable once parsed, so an answer can never go stale.
+    /// Interior mutability rather than `&mut self` because every caller holds
+    /// this behind a shared reference and widening them all to `&mut` in
+    /// order to *read* would be a worse design than a `RefCell`.
+    memo: RefCell<HashMap<(String, usize), Rc<Vec<(usize, usize, String)>>>>,
+    /// How many times the scan actually ran, for the test that keeps the memo
+    /// honest. A cache that has quietly stopped caching produces identical
+    /// answers and identical pictures, and only a count says otherwise --
+    /// exactly the reasoning the collision grid's probe already uses.
+    scans: Cell<u64>,
 }
 
 impl Translate {
@@ -95,7 +118,7 @@ impl Translate {
             }
             entries.insert(logical.to_ascii_lowercase(), file.to_string());
         }
-        Self { entries }
+        Self { entries, memo: RefCell::default(), scans: Cell::new(0) }
     }
 
     /// How many tiles the index names, terrain and WMO alike.
@@ -116,7 +139,31 @@ impl Translate {
         self.entries.get(&key).map(|file| art_path(file))
     }
 
-    pub fn wmo_tiles(&self, root: &str, group: usize) -> Vec<(usize, usize, String)> {
+    /// How many full scans [`Translate::wmo_tiles`] has performed.
+    pub fn scans(&self) -> u64 {
+        self.scans.get()
+    }
+
+    pub fn wmo_tiles(&self, root: &str, group: usize) -> Rc<Vec<(usize, usize, String)>> {
+        // Keyed on the caller's spelling rather than the normalised one: two
+        // spellings of one path are rare, and normalising to ask would put
+        // back a slice of the string work this exists to remove.
+        if let Some(hit) = self.memo.borrow().get(&(root.to_string(), group)) {
+            return Rc::clone(hit);
+        }
+        let tiles = Rc::new(self.scan_wmo_tiles(root, group));
+        // Stored whether or not it found anything. **Most groups have no
+        // minimap art at all**, so the empty answer is the common one, and an
+        // empty answer that is not remembered is a full scan repeated every
+        // frame for every one of them -- the expensive case is the negative.
+        self.memo
+            .borrow_mut()
+            .insert((root.to_string(), group), Rc::clone(&tiles));
+        tiles
+    }
+
+    fn scan_wmo_tiles(&self, root: &str, group: usize) -> Vec<(usize, usize, String)> {
+        self.scans.set(self.scans.get() + 1);
         let root = root.replace('/', "\\").to_ascii_lowercase();
         let Some(root) = root.strip_prefix(r"world\wmo\") else {
             return Vec::new();
@@ -306,6 +353,72 @@ mod tests {
          0000000000000000000000000000dead.blp\r\n",
     );
 
+    /// **The scan happens once per group and then never again.**
+    ///
+    /// `wmo_tiles` walks every entry in the index, and the interior minimap
+    /// asks it once per group of the building the player is standing in, on
+    /// every frame. On a real installation that is 18,644 entries against 104
+    /// groups in Ironforge -- about two million string comparisons a frame,
+    /// measured at 2.66 ms and the largest single item in the frame after
+    /// draw submission.
+    ///
+    /// **A count, not a duration**, the same choice the collision grid's
+    /// probe makes: a timing assertion would be flaky, would pass on a fast
+    /// machine with the memo removed, and would say nothing about why. This
+    /// fails on the unmemoised version, which is the only thing that makes it
+    /// worth having.
+    #[test]
+    fn a_groups_tiles_are_looked_up_once_however_often_they_are_asked_for() {
+        let index = Translate::parse(SAMPLE);
+        let root = r"World\wmo\Azeroth\Buildings\Castle\castle01.wmo";
+        let first = index.wmo_tiles(root, 0);
+        assert_eq!(first.len(), 1, "the sample names one tile for group 0");
+        assert_eq!(index.scans(), 1);
+        for _ in 0..60 {
+            assert_eq!(*index.wmo_tiles(root, 0), *first);
+        }
+        assert_eq!(
+            index.scans(),
+            1,
+            "sixty frames asking the same question must not scan sixty times"
+        );
+    }
+
+    /// **The empty answer is remembered too, and that is the case that
+    /// mattered.** Most of a building's groups have no minimap art at all, so
+    /// "nothing here" is the common reply -- and an unremembered nothing is a
+    /// full scan repeated every frame for every one of them. A memo that
+    /// stored only the hits would look right, test green against the case
+    /// above, and leave the cost exactly where it was.
+    #[test]
+    fn a_group_with_no_art_is_remembered_as_having_none() {
+        let index = Translate::parse(SAMPLE);
+        let root = r"World\wmo\Azeroth\Buildings\Castle\castle01.wmo";
+        assert!(index.wmo_tiles(root, 7).is_empty());
+        let after_first = index.scans();
+        for _ in 0..60 {
+            assert!(index.wmo_tiles(root, 7).is_empty());
+        }
+        assert_eq!(
+            index.scans(),
+            after_first,
+            "an empty answer is an answer and has to be kept like one"
+        );
+    }
+
+    /// Different groups are different questions, so the memo must not answer
+    /// one with another's tiles -- a cache keyed too loosely would draw the
+    /// wrong room on the minimap and never fail anything.
+    #[test]
+    fn different_groups_get_different_answers() {
+        let index = Translate::parse(SAMPLE);
+        let root = r"World\wmo\Azeroth\Buildings\Castle\castle01.wmo";
+        assert_eq!(index.wmo_tiles(root, 0).len(), 1);
+        assert!(index.wmo_tiles(root, 1).is_empty());
+        assert_eq!(index.wmo_tiles(root, 0).len(), 1);
+        assert_eq!(index.scans(), 2, "two distinct groups, two scans");
+    }
+
     #[test]
     fn resolves_a_tile_to_its_hashed_art() {
         let index = Translate::parse(SAMPLE);
@@ -353,7 +466,7 @@ mod tests {
              WMO\\KhazModan\\Cities\\Ironforge\\ironforge_002_00_00.blp\tother.blp",
         );
         assert_eq!(
-            index.wmo_tiles(
+            *index.wmo_tiles(
                 r"World\wmo\KhazModan\Cities\Ironforge\ironforge.wmo",
                 1
             ),
