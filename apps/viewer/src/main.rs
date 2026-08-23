@@ -1767,6 +1767,19 @@ struct FrameProfile {
     /// cheaper widgets. Guessing between them is how this investigation
     /// wasted a guess on the camera and another on draw calls.
     ui_text_ms: f32,
+    /// The game's own interface -- frames, bars, minimap, tracker, chat and
+    /// whichever panels are open -- inside the egui pass.
+    ui_hud_ms: f32,
+    /// The debug window sitting on top of it, inside the same pass.
+    ///
+    /// **Separated because one of these is the product and the other is
+    /// scaffolding.** Three and a half milliseconds spent drawing the
+    /// interface a player actually uses is a design conversation; the same
+    /// spent re-laying out a stats paragraph nobody reads at sixty hertz is a
+    /// bug with an obvious fix. `ui_ms` cannot tell them apart, and
+    /// `ui_text_ms` has already ruled out *building* those strings at 0.10 ms
+    /// -- laying them out is a different question.
+    ui_stats_ms: f32,
     /// Walking the character: collision, sliding, the outgoing movement
     /// stream.
     movement_ms: f32,
@@ -1885,7 +1898,8 @@ impl FrameProfile {
         format!(
             "{draws} draws/frame = {} terrain + {} models + {} shadow, \
              {} culled | {} groups, {} instances, {} ktris\n\
-             redraw {:.1}: ui {:.1} (text {:.1}) | move {:.1} | camera {:.1} | \
+             redraw {:.1}: ui {:.1} (hud {:.1} + stats {:.1} + text {:.1}) | \
+             move {:.1} | camera {:.1} | \
              net {:.1} | \
              sound {:.1} | stream {:.1} | entities {:.1} | anim {:.1} | \
              emitters {:.1} | acquire {:.1} | encode {:.1} | submit {:.1} | \
@@ -1902,6 +1916,8 @@ impl FrameProfile {
             self.triangles / 1000,
             self.redraw_ms,
             self.ui_ms,
+            self.ui_hud_ms,
+            self.ui_stats_ms,
             self.ui_text_ms,
             self.movement_ms,
             self.camera_ms,
@@ -3583,6 +3599,10 @@ struct App {
     /// Written by [`App::build_ui`] and read by the frame that called it.
     /// See [`FrameProfile::ui_text_ms`].
     ui_text_ms: f32,
+    /// Written by [`App::build_ui`] from inside the egui closure. See
+    /// [`FrameProfile::ui_hud_ms`].
+    ui_hud_ms: f32,
+    ui_stats_ms: f32,
     /// When the breakdown was last written to the log. **It goes to the log
     /// as well as to the window on purpose** -- `--screenshot` draws no HUD,
     /// so a reading that exists only in the debug window cannot be captured
@@ -4940,6 +4960,8 @@ impl App {
             pending_log_ms: 0.0,
             gpu_line: None,
             ui_text_ms: 0.0,
+            ui_hud_ms: 0.0,
+            ui_stats_ms: 0.0,
             profile_logged: Instant::now(),
             anim: None,
             anim_time_ms: 0,
@@ -6251,6 +6273,8 @@ impl App {
         let mut ui_output = self.build_ui(window);
         profile.ui_ms = phase.elapsed().as_secs_f32() * 1000.0;
         profile.ui_text_ms = self.ui_text_ms;
+        profile.ui_hud_ms = self.ui_hud_ms;
+        profile.ui_stats_ms = self.ui_stats_ms;
         let camera = self.camera;
 
         // Movement integrates real elapsed time, so travel speed does not
@@ -13555,7 +13579,20 @@ impl App {
         let editing = interface.edit.active;
         let layout_status = interface.status.clone();
 
+        // **Two `Cell`s rather than two more phases threaded through the
+        // frame.** The egui pass is one closure that borrows most of the
+        // interface, so a timer inside it cannot write to `self`; and the
+        // question -- is the cost the game's interface or the stats window
+        // sitting on top of it -- needs exactly two numbers to answer. The
+        // debug window is the suspect: it re-lays out a paragraph of text
+        // that changes every frame, and text layout is one of egui's more
+        // expensive operations. `ui_text` already ruled out *building* those
+        // strings at 0.10 ms; laying them out is a different question and
+        // this is where the answer is.
+        let hud_ms = std::cell::Cell::new(0.0f32);
+        let stats_ms = std::cell::Cell::new(0.0f32);
         let output = ctx.run_ui(input, |ctx| {
+            let drawing_hud = Instant::now();
             hud_response = interface.show(
                 ctx,
                 &ui::HudData {
@@ -13614,6 +13651,9 @@ impl App {
                 },
             );
 
+            hud_ms.set(drawing_hud.elapsed().as_secs_f32() * 1000.0);
+
+            let drawing_stats = Instant::now();
             egui::Window::new("MeoWoW")
                 // Over the interface rather than in among it: a window's
                 // default order is now where the playing frames live, and a
@@ -13695,7 +13735,10 @@ impl App {
                         ui.weak(format!("interface: {status}"));
                     }
                 });
+            stats_ms.set(drawing_stats.elapsed().as_secs_f32() * 1000.0);
         });
+        self.ui_hud_ms = hud_ms.get();
+        self.ui_stats_ms = stats_ms.get();
 
         // Selecting a different animation restarts it; otherwise keep the
         // clock the UI may have reset.
