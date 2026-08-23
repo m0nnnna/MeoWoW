@@ -1783,6 +1783,17 @@ struct FrameProfile {
     encode_ms: f32,
     /// `queue.submit` and `queue.present`.
     submit_ms: f32,
+    /// Events handled in the gap before this frame, and what they cost.
+    ///
+    /// **Both, because the two failure modes look identical in a total.** A
+    /// hundred cheap cursor moves and one expensive event give the same
+    /// millisecond figure and want opposite fixes -- the first is a rate
+    /// problem (steering warps the pointer back to where it was pressed, and
+    /// a warp is itself motion, so that path can feed itself), the second is
+    /// a cost problem. Same reason `collision::Probe` counts lookups as well
+    /// as candidates.
+    gap_events: u32,
+    gap_events_ms: f32,
     /// Collision work this frame -- see `collision::Probe`. Beside the times
     /// because a millisecond cannot say whether the cost is many cheap
     /// queries or a few expensive ones, and the two want different fixes.
@@ -1836,7 +1847,8 @@ impl FrameProfile {
              redraw {:.1}: ui {:.1} | move {:.1} | camera {:.1} | net {:.1} | \
              sound {:.1} | stream {:.1} | entities {:.1} | anim {:.1} | \
              emitters {:.1} | acquire {:.1} | encode {:.1} | submit {:.1} | \
-             rest {:.1} ms; outside redraw {:.1} ms\n\
+             rest {:.1} ms; outside redraw {:.1} = {} events in {:.1} + \
+             {:.1} idle ms\n\
              collision: {} queries, {} candidates ({} per query){}",
             self.terrain_draws,
             self.model_draws,
@@ -1860,6 +1872,14 @@ impl FrameProfile {
             self.submit_ms,
             unaccounted,
             outside,
+            self.gap_events,
+            self.gap_events_ms,
+            // What the operating system did not hand back. **Not ours**, and
+            // saying so is the point of measuring it: with `ControlFlow::Poll`
+            // and a `request_redraw` at the end of every frame there is
+            // nothing here this client chose to wait for, so a large number is
+            // the driver, the compositor or the scheduler.
+            (outside - self.gap_events_ms).max(0.0),
             self.collision.queries,
             self.collision.candidates,
             self.collision.candidates / self.collision.queries.max(1),
@@ -3505,6 +3525,10 @@ struct App {
     /// frame a person actually felt rather than whichever one the clock
     /// landed on. See [`FrameProfile::frames`].
     worst: FrameProfile,
+    /// Accumulated by [`App::window_event`] between redraws and drained by
+    /// the next one. See [`FrameProfile::gap_events`].
+    gap_events: u32,
+    gap_events_ms: f32,
     /// When the breakdown was last written to the log. **It goes to the log
     /// as well as to the window on purpose** -- `--screenshot` draws no HUD,
     /// so a reading that exists only in the debug window cannot be captured
@@ -4857,6 +4881,8 @@ impl App {
             fps: 0.0,
             profile: FrameProfile::default(),
             worst: FrameProfile::default(),
+            gap_events: 0,
+            gap_events_ms: 0.0,
             profile_logged: Instant::now(),
             anim: None,
             anim_time_ms: 0,
@@ -5457,11 +5483,57 @@ impl ApplicationHandler for App {
         event: winit::event::DeviceEvent,
     ) {
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
+            // Counted with the window events: from the frame's point of view
+            // this is the same thing -- work done in the gap, at the mouse's
+            // rate rather than the frame's. Steering warps the pointer back
+            // to where it was pressed, and a warp is itself motion, so this
+            // is exactly the path that could feed itself.
+            let started = Instant::now();
             self.device_motion(delta.0, delta.1);
+            self.gap_events_ms += started.elapsed().as_secs_f32() * 1000.0;
+            self.gap_events += 1;
         }
     }
 
+    /// Times every event that is not the redraw itself, and hands the rest
+    /// to [`App::handle_window_event`].
+    ///
+    /// **The wrapper exists because `outside redraw` is a bucket and buckets
+    /// hide things.** `frame_ms` runs start-to-start, so it covers the gap
+    /// between one redraw ending and the next beginning as well as the redraw
+    /// -- and that gap held 26 to 36 ms in six of one session's sixty-two
+    /// seconds, with a perfectly ordinary 8-13 ms redraw underneath it. Two
+    /// completely different things live in that gap: input this client chose
+    /// to process, and time the operating system simply did not give it back.
+    /// The first is ours to fix and the second is not, and a single number
+    /// cannot say which. Same reason the frame's own phases were split out of
+    /// `other` rather than attributed to the likeliest suspect.
+    ///
+    /// A wrapper rather than a timer threaded through the body: that body has
+    /// half a dozen early returns, and a measurement that misses the paths
+    /// somebody forgets is worse than none -- it reads as a cheap event.
     fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        id: WindowId,
+        event: WindowEvent,
+    ) {
+        // The redraw is measured from the inside, by `redraw` itself, and
+        // must not also be counted here.
+        if matches!(event, WindowEvent::RedrawRequested) {
+            self.handle_window_event(event_loop, id, event);
+            return;
+        }
+        let started = Instant::now();
+        self.handle_window_event(event_loop, id, event);
+        self.gap_events_ms += started.elapsed().as_secs_f32() * 1000.0;
+        self.gap_events += 1;
+    }
+
+}
+
+impl App {
+    fn handle_window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
         _id: WindowId,
@@ -6082,9 +6154,7 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
-}
 
-impl App {
     fn redraw(&mut self, window: &Arc<Window>) {
         let now = Instant::now();
         self.frame_ms = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
@@ -6109,7 +6179,15 @@ impl App {
         // **Reset here, before anything can add to it**, and after the
         // sign-in return above: a profile carried over from a frame that
         // returned early would be attributed to this one.
-        let mut profile = FrameProfile::default();
+        // **Drained here, not at the end of the frame.** These accumulated
+        // during the gap `frame_ms` has just measured, so they belong to this
+        // reading; left until the end they would be attributed to a gap that
+        // has not happened yet.
+        let mut profile = FrameProfile {
+            gap_events: std::mem::take(&mut self.gap_events),
+            gap_events_ms: std::mem::take(&mut self.gap_events_ms),
+            ..FrameProfile::default()
+        };
         let redraw_started = Instant::now();
         let phase = Instant::now();
         let mut ui_output = self.build_ui(window);
