@@ -11,6 +11,7 @@ use glam::Vec3;
 use mpq::Chain;
 use render::mesh::{BlendMode, GpuMesh, MeshVertex, RenderState, Winding};
 use render::{texture::upload_blp, Gpu, UploadedTexture};
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 /// Where the time went loading one model.
@@ -234,6 +235,26 @@ impl Variations {
         };
         self.0.get(slot).map(String::as_str).filter(|s| !s.is_empty())
     }
+}
+
+fn has_fully_transparent_alpha(rgba: &[u8]) -> bool {
+    rgba.chunks_exact(4).any(|pixel| pixel[3] == 0)
+}
+
+fn is_particle_mesh(
+    emitter_bones: &BTreeSet<u8>,
+    vertex_bones: &BTreeSet<u8>,
+    batch_count: usize,
+    material: m2::Material,
+    has_fully_transparent_alpha: bool,
+) -> bool {
+    emitter_bones.len() >= 3
+        && vertex_bones.len() == 1
+        && emitter_bones.is_disjoint(vertex_bones)
+        && batch_count <= 2
+        && material.flags == 0
+        && material.blend == 0
+        && has_fully_transparent_alpha
 }
 
 /// The parts of a model that do not depend on how it is dressed, kept once
@@ -547,8 +568,23 @@ pub fn load_dressed_with(
     // The model's whole vertex pool goes to the GPU once; batches index into
     // it, so there is no reason to split or duplicate.
     let phase = Instant::now();
-    let vertices: Vec<MeshVertex> = model
-        .vertices()
+    let materials = model.materials();
+    let raw_vertices = model.vertices();
+    let vertex_bones: BTreeSet<u8> = raw_vertices
+        .iter()
+        .flat_map(|vertex| vertex.bone_indices)
+        .collect();
+    let emitter_bones: BTreeSet<u8> = model
+        .particle_emitters()
+        .iter()
+        .map(|emitter| emitter.bone as u8)
+        .collect();
+    let inspect_texture_alpha = emitter_bones.len() >= 3
+        && vertex_bones.len() == 1
+        && emitter_bones.is_disjoint(&vertex_bones)
+        && skin.batches().len() <= 2
+        && materials.iter().any(|material| material.flags == 0 && material.blend == 0);
+    let vertices: Vec<MeshVertex> = raw_vertices
         .iter()
         .map(|v| MeshVertex {
             position: v.position,
@@ -564,11 +600,11 @@ pub fn load_dressed_with(
     let combos = model.texture_combos();
     let texture_transform_combos = model.texture_transform_combos();
     let defs = model.textures();
-    let materials = model.materials();
 
     // One texture per model slot, resolved once and shared by every batch.
     let phase = Instant::now();
     let mut textures = Vec::new();
+    let mut texture_has_transparency = Vec::new();
     let mut missing_textures = Vec::new();
     for def in &defs {
         let file = if def.is_hardcoded() {
@@ -606,26 +642,37 @@ pub fn load_dressed_with(
                     "character skin",
                 )
             });
+        let mut texture_has_fully_transparent_alpha = false;
         let uploaded = composed.or_else(|| {
             file.as_ref().and_then(|f| {
                 let bytes = chain.read(f).ok()?;
                 let parsed = blp::Blp::parse(&bytes).ok()?;
+                if inspect_texture_alpha {
+                    texture_has_fully_transparent_alpha = parsed
+                        .decode_rgba(0)
+                        .is_some_and(|rgba| has_fully_transparent_alpha(&rgba));
+                }
                 Some(upload_blp(gpu, &parsed, f))
             })
         });
 
         match uploaded {
-            Some(t) => textures.push(t),
+            Some(t) => {
+                textures.push(t);
+                texture_has_transparency.push(texture_has_fully_transparent_alpha);
+            }
             None => {
                 missing_textures.push(
                     file.unwrap_or_else(|| format!("<runtime slot type {}>", def.kind)),
                 );
                 textures.push(placeholder(gpu));
+                texture_has_transparency.push(false);
             }
         }
     }
     if textures.is_empty() {
         textures.push(placeholder(gpu));
+        texture_has_transparency.push(false);
     }
     timings.textures = phase.elapsed();
 
@@ -660,6 +707,16 @@ pub fn load_dressed_with(
             .map(|&t| t as usize)
             .filter(|&t| t < textures.len())
             .unwrap_or(0);
+
+        if is_particle_mesh(
+            &emitter_bones,
+            &vertex_bones,
+            skin.batches().len(),
+            material,
+            texture_has_transparency.get(texture).copied().unwrap_or(false),
+        ) {
+            continue;
+        }
 
         draws.push(Draw {
             first_index: indices.len() as u32,
@@ -963,6 +1020,23 @@ mod tests {
     fn empty_variations_do_not_resolve() {
         let v = Variations(vec![String::new()]);
         assert_eq!(v.for_kind(11), None);
+    }
+
+    #[test]
+    fn particle_mesh_classifier_uses_model_structure() {
+        let emitters = BTreeSet::from([1, 2, 3]);
+        let vertices = BTreeSet::from([0]);
+        let material = m2::Material { flags: 0, blend: 0 };
+        assert!(is_particle_mesh(&emitters, &vertices, 1, material, true));
+        assert!(!is_particle_mesh(&BTreeSet::from([1, 2]), &vertices, 1, material, true));
+        assert!(!is_particle_mesh(&emitters, &vertices, 1, material, false));
+        assert!(!is_particle_mesh(
+            &emitters,
+            &vertices,
+            1,
+            m2::Material { flags: 1, blend: 0 },
+            true,
+        ));
     }
 
     /// Two humanoid display ids must not read the same model twice.
