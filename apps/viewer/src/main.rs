@@ -1400,15 +1400,29 @@ fn tightest_eye_at_center(
     focus: glam::Vec3,
     eye_at: impl Fn(f32, f32) -> glam::Vec3,
 ) -> glam::Vec3 {
+    // **The centre sample is kept, because the last line usually wants it
+    // again.** Each `eye_at` marches the ground in up to eighteen steps and
+    // then casts a wall ray, every one of them fanned across every resident
+    // tile -- so this function is four of the most expensive queries in the
+    // frame, and one of the four was a duplicate whenever nothing obstructed
+    // the view. Outdoors that is nearly always.
+    let centre = eye_at(center_yaw, distance);
     let tightest = [
-        center_yaw,
-        center_yaw + CAMERA_FOV_SAMPLE_ANGLE,
-        center_yaw - CAMERA_FOV_SAMPLE_ANGLE,
+        (centre - focus).length(),
+        (eye_at(center_yaw + CAMERA_FOV_SAMPLE_ANGLE, distance) - focus).length(),
+        (eye_at(center_yaw - CAMERA_FOV_SAMPLE_ANGLE, distance) - focus).length(),
     ]
     .into_iter()
-    .map(|yaw| (eye_at(yaw, distance) - focus).length())
     .fold(f32::INFINITY, f32::min);
-    eye_at(center_yaw, tightest.min(distance))
+    let wanted = tightest.min(distance);
+    // Exactly the arguments `centre` was computed with, so this is the same
+    // answer rather than a nearly-identical one -- the comparison is against
+    // `distance` itself and not a tolerance, because a tolerance here would
+    // silently return a stale eye for a slightly different orbit.
+    if wanted == distance {
+        return centre;
+    }
+    eye_at(center_yaw, wanted)
 }
 
 /// The orbit distance to actually build the camera at, capped indoors.
