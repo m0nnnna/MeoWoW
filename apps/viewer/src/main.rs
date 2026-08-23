@@ -699,7 +699,7 @@ fn world_for_live(
         // and a headless screenshot of a populated zone came back with no
         // creatures in it at all, which is how this was found. See
         // `MeshRenderer::create_bones`.
-        world.update_animations(gpu, meshes);
+        world.update_animations(gpu, meshes, &render::cull::Attention::everything());
     }
 
     Ok(Scene::Streaming(Box::new(world)))
@@ -3409,9 +3409,15 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     let mut emitters = emitters::Emitters::new();
     match &scene {
         Scene::Streaming(world) => {
-            world.update_animations(&gpu, &meshes);
+            // **Everything, offline.** One frame has no history to lose and
+            // the warm-up below exists precisely to build some, so refusing
+            // work here would make a headless render of a particle system
+            // draw an emitter that had just been switched on -- the trap
+            // `warm_emitters` already documents.
+            let all = render::cull::Attention::everything();
+            world.update_animations(&gpu, &meshes, &all);
             for _ in 0..60 {
-                world.update_emitters(&gpu, &mut particles, &mut emitters, 1.0 / 60.0);
+                world.update_emitters(&gpu, &mut particles, &mut emitters, 1.0 / 60.0, &all);
             }
         }
         Scene::Model(m) => warm_emitters(
@@ -6783,7 +6789,18 @@ impl App {
             // it visibly stutter.
             profile.entities_ms = phase.elapsed().as_secs_f32() * 1000.0;
             let phase = Instant::now();
-            world.update_animations(&r.gpu, &r.meshes);
+            // **Built once for both passes and for the same reason the
+            // frustum is built once inside the draw**: two derivations of
+            // "what is worth working on" agree only until somebody edits one,
+            // and the failure is a creature that animates but does not draw,
+            // or draws without animating. The radius is the shadow box's, so
+            // anything that can still cast is still posed.
+            let attention = render::cull::Attention::new(
+                camera.view_proj(r.config.width as f32 / r.config.height.max(1) as f32),
+                camera.eye(),
+                self.args.shadow_radius,
+            );
+            world.update_animations(&r.gpu, &r.meshes, &attention);
             profile.animations_ms = phase.elapsed().as_secs_f32() * 1000.0;
             let phase = Instant::now();
             // ...and everything alight, after the poses it hangs off. A flame
@@ -6801,6 +6818,7 @@ impl App {
                 &mut r.particles,
                 &mut r.emitters,
                 self.frame_ms / 1000.0,
+                &attention,
             );
             profile.emitters_ms = phase.elapsed().as_secs_f32() * 1000.0;
         }

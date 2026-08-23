@@ -2398,7 +2398,12 @@ impl World {
     /// visibly stutter -- noticed by actually watching it live, not
     /// predicted -- since it only ever advanced a few times a second instead
     /// of once per frame.
-    pub fn update_animations(&self, gpu: &Gpu, meshes: &MeshRenderer) {
+    pub fn update_animations(
+        &self,
+        gpu: &Gpu,
+        meshes: &MeshRenderer,
+        attention: &render::cull::Attention,
+    ) {
         // Poses are kept rather than discarded because a second consumer needs
         // the same matrices: an item in a hand is placed by the very bone the
         // wielder was posed with. Recomputing it separately would be the
@@ -2408,11 +2413,17 @@ impl World {
         let mut poses: HashMap<(u32, Motion), (Vec<Mat4>, usize, u32)> = HashMap::new();
         let now_ms = self.started.elapsed().as_millis() as u32;
 
+        // **Only what is worth thinking about.** These are the tile doodads
+        // with an ambient cycle -- banners, fires, wheels -- and there is one
+        // pose computed per distinct *path* across the whole resident set,
+        // whether or not any of its placements can be seen. See
+        // `render::cull::Attention`.
         let active_map_animations: HashSet<&str> = self
             .tiles
             .values()
             .flat_map(|tile| tile.groups.iter())
             .chain(self.entities.iter())
+            .filter(|group| attention.wants(group.bounds))
             .filter_map(|group| group.map_animation.as_deref())
             .collect();
         let mut map_poses = HashMap::new();
@@ -2510,6 +2521,13 @@ impl World {
             let Some((display_id, motion)) = group.animation else {
                 continue;
             };
+            // Off screen and out of reach: its bone buffer keeps whatever it
+            // last held, which nothing will read. A bucket coming back is
+            // posed in the same frame it is drawn -- `update_animations` runs
+            // before `draw_scene` -- so the picture is never a frame behind.
+            if !attention.wants(group.bounds) {
+                continue;
+            }
             let (Some(bones), Some((posed, sequence, time_ms))) = (
                 self.entity_bones.get(&(display_id, motion)),
                 pose_for(&group.model, motion),
@@ -2648,6 +2666,7 @@ impl World {
         renderer: &mut render::ParticleRenderer,
         emitters: &mut crate::emitters::Emitters,
         dt: f32,
+        attention: &render::cull::Attention,
     ) {
         let poses = self.frame_poses.borrow();
         let map_poses = self.map_frame_poses.borrow();
@@ -2656,6 +2675,12 @@ impl World {
         let mut sources = Vec::new();
         for group in self.tiles().flat_map(|t| t.groups.iter()).chain(&self.entities) {
             if group.emitting.is_empty() {
+                continue;
+            }
+            // **A held item is never refused**, because its bounds are `None`
+            // -- see `Group::bounds` -- so a torch in a hand follows its
+            // wielder's fate rather than being judged on a box nobody keeps.
+            if !attention.wants(group.bounds) {
                 continue;
             }
             // A held item's placement is *not* what was stored at build time:

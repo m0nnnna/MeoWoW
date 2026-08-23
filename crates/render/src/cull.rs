@@ -113,6 +113,74 @@ impl Frustum {
     }
 }
 
+/// What is worth doing per-frame work for.
+///
+/// **Culling decides what to *draw*; this decides what to think about**, and
+/// they are not the same question. Posing a skeleton, stepping a particle
+/// system and rebuilding a group all happen before anything is drawn and all
+/// of them scaled with the *resident* world -- nine tiles of it -- rather than
+/// with what is on screen. Measured live, posing and emitters together cost
+/// 2.8 ms of a 15 ms frame in a zone where most of that work was for things
+/// behind the camera.
+///
+/// Wider than the view frustum on purpose, by a radius. Two reasons, and both
+/// are bugs if ignored:
+///
+/// * **The sun's shadow box does not follow the camera's gaze.** A caster
+///   behind the player still casts into the map, so a skeleton left unposed
+///   because it is off screen would cast the shadow of whatever pose it last
+///   held.
+/// * **Turning is instant and posing is not.** A creature that enters the
+///   frustum is posed and drawn in the same frame, so the frame itself is
+///   correct -- but anything with *history*, a particle plume above all, has
+///   none to show, and a torch that re-ignites as you look at it is worse than
+///   one that kept burning. The radius buys that history back for everything
+///   close enough to notice.
+#[derive(Clone, Copy)]
+pub struct Attention {
+    frustum: Frustum,
+    centre: Vec3,
+    radius: f32,
+}
+
+impl Attention {
+    pub fn new(view_proj: Mat4, centre: Vec3, radius: f32) -> Self {
+        Self {
+            frustum: Frustum::from_view_proj(view_proj),
+            centre,
+            radius: radius.max(0.0),
+        }
+    }
+
+    /// Everything is worth working on -- the offline scenes, and anything that
+    /// has not been taught to ask.
+    pub fn everything() -> Self {
+        Self {
+            frustum: Frustum::everything(),
+            centre: Vec3::ZERO,
+            radius: f32::INFINITY,
+        }
+    }
+
+    /// **`None` means yes.** A group whose bounds this client cannot state
+    /// has to keep being worked on, for the same reason it keeps being drawn:
+    /// the alternative is a creature that stops animating for a reason no
+    /// picture can show. See `Frustum::intersects`.
+    pub fn wants(&self, bounds: Option<(Vec3, Vec3)>) -> bool {
+        let Some((min, max)) = bounds else {
+            return true;
+        };
+        if self.frustum.intersects(min, max) {
+            return true;
+        }
+        // Nearest point of the box to the centre, which is the box's own
+        // distance rather than its origin's -- a building is not "far away"
+        // because the corner its transform names happens to be.
+        let nearest = self.centre.clamp(min, max);
+        nearest.distance_squared(self.centre) <= self.radius * self.radius
+    }
+}
+
 /// The world-space box a model-space box occupies once transformed.
 ///
 /// All eight corners, not the two transformed endpoints. Transforming `min`
@@ -238,6 +306,49 @@ mod tests {
         // which the two-corner shortcut would report as 1.0.
         assert!(hi.y > 7.0, "expected the box to grow in Y, got {hi:?}");
         assert!(lo.y < -7.0, "expected the box to grow in Y, got {lo:?}");
+    }
+
+    #[test]
+    fn attention_reaches_behind_the_camera_but_not_across_the_map() {
+        let at = Attention::new(looking_down_the_x_axis(), Vec3::ZERO, 20.0);
+        // In view.
+        assert!(at.wants(Some(unit_box(Vec3::new(10.0, 0.0, 0.0)))));
+        // Behind the camera but close: still worked on, because the sun does
+        // not care which way the player is facing and a plume has a history.
+        assert!(at.wants(Some(unit_box(Vec3::new(-10.0, 0.0, 0.0)))));
+        // Behind the camera and far: not worth a thought.
+        assert!(!at.wants(Some(unit_box(Vec3::new(-200.0, 0.0, 0.0)))));
+        // Unknown bounds are always worth a thought.
+        assert!(at.wants(None));
+    }
+
+    /// The distance is to the *box*, not to whatever corner its transform
+    /// names. Stormwind's origin is a thousand units from the middle of it,
+    /// and a building the player is standing inside must not read as far away.
+    /// The distance is to the *box*, not to whatever corner its transform
+    /// names. Stormwind's placement origin is hundreds of units from most of
+    /// the city, so a building the player is standing beside must not read as
+    /// far away because its origin is.
+    #[test]
+    fn a_box_is_near_when_any_of_it_is_near() {
+        let at = Attention::new(looking_down_the_x_axis(), Vec3::ZERO, 20.0);
+        // Behind the camera, so only the radius can save it. Its nearest face
+        // is eight units away; its origin corner is a thousand.
+        let sprawling = (Vec3::new(-1000.0, -10.0, -10.0), Vec3::new(-8.0, 10.0, 10.0));
+        assert!(
+            at.wants(Some(sprawling)),
+            "the near face is 8 units away and the radius is 20"
+        );
+        // ...and the same box moved just out of reach is refused, so the
+        // check above is not passing for some other reason.
+        let away = (Vec3::new(-1000.0, -10.0, -10.0), Vec3::new(-25.0, 10.0, 10.0));
+        assert!(!at.wants(Some(away)));
+    }
+
+    #[test]
+    fn attention_everything_wants_everything() {
+        let at = Attention::everything();
+        assert!(at.wants(Some(unit_box(Vec3::splat(1e9)))));
     }
 
     #[test]
