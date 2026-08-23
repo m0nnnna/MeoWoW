@@ -305,6 +305,7 @@ pub struct World {
     /// type every query takes and returns by value, and widening it would put
     /// a byte nobody reads into every intersection test.
     tags: Vec<u8>,
+    surface_ids: Vec<u32>,
     /// Cell coordinate to the triangles overlapping it. A triangle spanning
     /// several cells appears in each, which is what makes a lookup a lookup
     /// rather than a search.
@@ -334,6 +335,10 @@ impl World {
     /// The label comes back from [`Self::floor_under_tagged`], and means
     /// whatever the caller decided it means -- see [`Self::tags`].
     pub fn add_tagged(&mut self, triangle: Triangle, tag: u8) {
+        self.add_tagged_with_id(triangle, tag, 0);
+    }
+
+    pub fn add_tagged_with_id(&mut self, triangle: Triangle, tag: u8, surface_id: u32) {
         if triangle.normal().is_none() {
             return;
         }
@@ -346,6 +351,7 @@ impl World {
         }
         self.triangles.push(triangle);
         self.tags.push(tag);
+        self.surface_ids.push(surface_id);
     }
 
     /// Every triangle whose cell touches the given square, without repeats.
@@ -391,8 +397,18 @@ impl World {
     /// is every M2 collision mesh and the whole world before something chose
     /// to label a surface.
     pub fn floor_under_tagged(&self, at: Vec2, from_z: f32, step: f32) -> Option<(f32, Option<u8>)> {
+        self.floor_under_tagged_with_id(at, from_z, step)
+            .map(|(z, tag, _)| (z, tag))
+    }
+
+    pub fn floor_under_tagged_with_id(
+        &self,
+        at: Vec2,
+        from_z: f32,
+        step: f32,
+    ) -> Option<(f32, Option<u8>, Option<u32>)> {
         let ceiling = from_z + step;
-        let mut best: Option<(f32, Option<u8>)> = None;
+        let mut best: Option<(f32, Option<u8>, Option<u32>)> = None;
         for index in self.near(at, 0.0) {
             let triangle = self.triangles[index as usize];
             let Some(z) = triangle.floor_hit(at) else {
@@ -401,13 +417,18 @@ impl World {
             if z > ceiling {
                 continue;
             }
-            if best.is_none_or(|(b, _)| z > b) {
+            if best.is_none_or(|(b, _, _)| z > b) {
                 let tag = self
                     .tags
                     .get(index as usize)
                     .copied()
                     .filter(|t| *t != UNTAGGED);
-                best = Some((z, tag));
+                let surface_id = self
+                    .surface_ids
+                    .get(index as usize)
+                    .copied()
+                    .filter(|id| *id != 0);
+                best = Some((z, tag, surface_id));
             }
         }
         best

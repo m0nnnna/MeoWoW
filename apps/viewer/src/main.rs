@@ -964,19 +964,16 @@ const BODY_HEIGHT: f32 = 2.0;
 /// place, if stairs still catch or fences stop catching.
 const STEP_HEIGHT: f32 = 0.8;
 
-/// How far the ground snap may lower the character in one frame **while
-/// tiles are still streaming in**.
+/// How far the ground snap may move the character in one frame.
 ///
 /// Not a physics constant and not a step height: it is the line between
 /// "settling onto the surface under you" and "being teleported to whatever
 /// answered before the real floor arrived". Generous on purpose -- a real
 /// staircase or slope moves a character a fraction of this per frame, and
-/// the only thing it needs to exclude is the seventy-unit plunge from
-/// Stormwind's gryphon platform to the terrain beneath the city.
+/// the only thing it needs to exclude is a large relocation to an incomplete
+/// or unrelated surface.
 ///
-/// It applies **only** while more tiles are coming. In a settled world the
-/// assignment is unconditional exactly as it was.
-const MAX_STREAMING_DROP: f32 = 5.0;
+const MAX_GROUND_SNAP: f32 = 5.0;
 
 /// How far a liquid surface must stand above the bed before a character swims
 /// rather than wades.
@@ -3214,6 +3211,7 @@ struct App {
     /// way and put a character on the floorboards hearing the ground beneath
     /// them.
     floor_material: Option<u8>,
+    modeled_floor: bool,
     wading: bool,
     /// Where the player's own cycle was last time footsteps were checked, as
     /// `(sequence, milliseconds into it)`.
@@ -4519,6 +4517,7 @@ impl App {
             jump: None,
             swimming: None,
             floor_material: None,
+            modeled_floor: false,
             wading: false,
             footstep_phase: None,
             autorun: false,
@@ -6518,6 +6517,7 @@ impl App {
             // they disagree on is a footstep that sounds like the ground
             // under the floorboards.
             self.floor_material = underfoot.and_then(|(_, surface)| surface);
+            self.modeled_floor = underfoot.is_some();
             // **Logged because the alternative is guessing.** A character
             // that judders going up steps has at least three candidate causes
             // -- two surfaces alternating, a floor and the terrain trading
@@ -6598,17 +6598,16 @@ impl App {
         // It is only the *assignment* that a swimmer opts out of.
         if self.swimming.is_none() {
             if let Some(z) = stand_at {
-                // **A large drop while tiles are still arriving is refused.**
+                // **A large vertical relocation is refused.**
                 //
                 // A building's collision is filed under the single tile
                 // holding its origin, and tiles are admitted a few per frame.
                 // So there is a window at login where the character's own
                 // tile is resident and answering with terrain height, while
                 // the tile carrying the floor under their feet has not
-                // arrived yet. Stormwind's gryphon platform is seventy units
-                // above the terrain beneath the city: one frame in that
-                // window drops a character logging out on the platform to the
-                // ground below it.
+                // arrived yet. An interior floor can be far below or above
+                // that incomplete terrain answer, and one frame in that
+                // window can move the character to the wrong surface.
                 //
                 // And the drop is **permanent**, which is what makes refusing
                 // it worth the special case rather than letting it settle. A
@@ -6617,20 +6616,26 @@ impl App {
                 // above the character and will never be found. They are under
                 // the city for good.
                 //
-                // Deliberately narrow. It refuses only a *downward* move,
-                // only a large one, and only while `still_streaming` says
-                // more tiles are coming -- so walking off a cliff in a
-                // settled world behaves exactly as it did, and a character
-                // genuinely standing on terrain is unaffected. Once streaming
-                // settles the ordinary assignment resumes and puts them
-                // wherever they really belong.
+                // Deliberately narrow. It refuses only a large vertical move,
+                // so walking across ordinary slopes and stairs remains
+                // unchanged while a terrain fallback cannot relocate a
+                // character onto an unrelated surface.
                 let streaming = match self.renderer.as_ref().and_then(|r| r.scene.as_ref()) {
                     Some(Scene::Streaming(world)) => world.still_streaming(),
                     _ => false,
                 };
-                let dropping_far = z < live.position.z - MAX_STREAMING_DROP;
-                if !(streaming && dropping_far) {
+                let delta = z - live.position.z;
+                if delta.abs() <= MAX_GROUND_SNAP {
                     live.position.z = z;
+                } else {
+                    tracing::debug!(
+                        "ground snap refused: current {:.3}, candidate {:.3}, delta {:.3}, \
+                         tiles streaming {}",
+                        live.position.z,
+                        z,
+                        delta,
+                        streaming,
+                    );
                 }
             }
         }
@@ -7769,13 +7774,19 @@ impl App {
                 Scene::Streaming(world) => Some(world),
                 _ => None,
             });
-        let area = match streaming_world.and_then(|world| world.area_at(at.x, at.y)) {
-            Some(area) => {
-                self.area = Some(area);
-                area
+        let context = match streaming_world
+            .and_then(|world| world.area_context_at_position(at, STEP_HEIGHT))
+        {
+            Some(context) => {
+                self.area = Some(context.area);
+                context
             }
             None => match self.area {
-                Some(area) => area,
+                Some(area) => crate::world::AreaContext {
+                    area,
+                    zone_music: None,
+                    ambience: None,
+                },
                 None => return,
             },
         };
@@ -7789,7 +7800,7 @@ impl App {
         let when = sound::TimeOfDay::at_hour(hour.unwrap_or(12.0));
         let (music, ambience) = self
             .sounds
-            .zone(area)
+            .zone_with_overrides(context.area, context.zone_music, context.ambience)
             .map(|zone| zone.for_time(when))
             .unwrap_or((None, None));
 
@@ -7803,7 +7814,8 @@ impl App {
         // project than looking has.
         if (self.music.playing(), self.ambience.playing()) != (music, ambience) {
             tracing::debug!(
-                "area {area} at {when:?}: music {:?} -> {music:?}, ambience {:?} -> {ambience:?}",
+                "area {} at {when:?}: music {:?} -> {music:?}, ambience {:?} -> {ambience:?}",
+                context.area,
                 self.music.playing(),
                 self.ambience.playing(),
             );
@@ -7849,13 +7861,14 @@ impl App {
                 // whole point: a character on the abbey's flagstones is not
                 // standing on Elwynn's grass, however directly above it they
                 // are. `floor_material` is `None` outdoors and for the 91% of
-                // WMO materials that name no terrain, and then the ground
-                // answers as before.
+                // WMO materials that name no terrain; a modeled floor still
+                // outranks the terrain even when it names no footing.
                 let footing = match self.floor_material {
                     Some(row) => Some(sound::Footing::Surface(row as u32)),
-                    None => world
+                    None if !self.modeled_floor => world
                         .footing_at(live.position.x, live.position.y)
                         .map(sound::Footing::Ground),
+                    None => None,
                 };
                 if let Some(id) = live
                     .state
@@ -12520,19 +12533,17 @@ impl App {
                 y: pin.y,
             })
             .collect();
-        // The sub-zone the ground says the character is in -- `Northshire
-        // Valley` rather than `Elwynn Forest`, which is what a minimap header
-        // has always said. Off the terrain rather than off a replicated field
-        // because the terrain is finer: every chunk names its own area, and
-        // the server replicates only the zone.
+        // The sub-zone the surface says the character is in -- a WMO floor
+        // outranks the terrain beneath it, while open ground still uses the
+        // terrain chunk's finer area.
         let area_name = r
             .scene
             .as_ref()
             .and_then(|scene| match scene {
-                Scene::Streaming(world) => world.area_at(
-                    standing.map(|at| at.x).unwrap_or_default(),
-                    standing.map(|at| at.y).unwrap_or_default(),
-                ),
+                Scene::Streaming(world) => self
+                    .live
+                    .as_ref()
+                    .and_then(|live| world.area_at_position(live.position, STEP_HEIGHT)),
                 _ => None,
             })
             .and_then(|area| self.maps.area_name(area));
@@ -12572,6 +12583,14 @@ impl App {
         // whole difference between this and a map page.
         let minimap_view = {
             let range = self.minimap_range;
+            let interior = self.live.as_ref().and_then(|live| {
+                r.scene.as_ref().and_then(|scene| match scene {
+                    Scene::Streaming(world) => {
+                        world.wmo_minimap_at_position(live.position, STEP_HEIGHT)
+                    }
+                    _ => None,
+                })
+            });
             self.minimap.build_view(
                 &r.gpu,
                 &mut r.egui_renderer,
@@ -12579,6 +12598,7 @@ impl App {
                 standing,
                 self.live.as_ref().map(|live| live.map_directory.as_str()).unwrap_or_default(),
                 area_name.as_deref(),
+                interior.as_ref(),
                 range,
                 &objectives,
                 &giver_pins,

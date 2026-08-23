@@ -275,6 +275,8 @@ pub enum Footing {
 pub struct Sounds {
     entries: std::collections::HashMap<u32, Entry>,
     zones: std::collections::HashMap<u32, ZoneSound>,
+    zone_music: std::collections::HashMap<u32, (u32, u32)>,
+    ambience: std::collections::HashMap<u32, (u32, u32)>,
     /// Creature display id to the sounds it makes.
     ///
     /// Keyed by *display* id rather than by creature entry because that is
@@ -428,6 +430,8 @@ impl Sounds {
                 }
             }
         }
+        sounds.zone_music = music;
+        sounds.ambience = ambience;
 
         // Creature voices, keyed by display id: CreatureDisplayInfo names a
         // CreatureSoundData row, and that row names the individual sounds.
@@ -742,6 +746,22 @@ impl Sounds {
     /// most of them.
     pub fn zone(&self, area_id: u32) -> Option<ZoneSound> {
         self.zones.get(&area_id).copied()
+    }
+
+    pub fn zone_with_overrides(
+        &self,
+        area_id: u32,
+        zone_music: Option<u32>,
+        ambience: Option<u32>,
+    ) -> Option<ZoneSound> {
+        let base = self.zone(area_id).unwrap_or_default();
+        let music = zone_music
+            .and_then(|id| self.zone_music.get(&id).copied())
+            .or(base.music);
+        let ambience = ambience
+            .and_then(|id| self.ambience.get(&id).copied())
+            .or(base.ambience);
+        (music.is_some() || ambience.is_some()).then_some(ZoneSound { music, ambience })
     }
 
     pub fn entry(&self, id: u32) -> Option<&Entry> {

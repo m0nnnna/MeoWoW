@@ -69,6 +69,7 @@ pub struct Group {
     pub bounding_box: ([f32; 3], [f32; 3]),
     pub name: String,
     pub descriptive_name: String,
+    pub group_id: u32,
     /// Index of the first portal referencing this group.
     pub portal_start: u16,
     pub portal_count: u16,
@@ -182,6 +183,7 @@ impl Group {
             bounding_box: (vec3_at(mogp, 12), vec3_at(mogp, 24)),
             name: name(name_offset),
             descriptive_name: name(desc_offset),
+            group_id: u32_at(mogp, 56),
             portal_start: h(36),
             portal_count: h(38),
             batch_counts: BatchCounts {

@@ -116,6 +116,31 @@ impl Translate {
         self.entries.get(&key).map(|file| art_path(file))
     }
 
+    pub fn wmo_tiles(&self, root: &str, group: usize) -> Vec<(usize, usize, String)> {
+        let root = root.replace('/', "\\").to_ascii_lowercase();
+        let Some(root) = root.strip_prefix(r"world\wmo\") else {
+            return Vec::new();
+        };
+        let Some((directory, file)) = root.rsplit_once('\\') else {
+            return Vec::new();
+        };
+        let Some(stem) = file.strip_suffix(".wmo") else {
+            return Vec::new();
+        };
+        let prefix = format!(r"wmo\{directory}\{stem}_{group:03}_");
+        let mut out = self
+            .entries
+            .iter()
+            .filter_map(|(key, file)| {
+                let suffix = key.strip_prefix(&prefix)?.strip_suffix(".blp")?;
+                let (x, y) = suffix.split_once('_')?;
+                Some((x.parse().ok()?, y.parse().ok()?, art_path(file)))
+            })
+            .collect::<Vec<_>>();
+        out.sort_unstable_by_key(|(x, y, _)| (*x, *y));
+        out
+    }
+
     /// Every terrain tile this index names for one map, as `(x, y)`.
     ///
     /// Sorted, so a comparison against [`crate::Wdt::tiles`] is a comparison
@@ -318,6 +343,25 @@ mod tests {
         assert_eq!(index.maps(), vec!["ahnqiraj".to_string(), "azeroth".into()]);
         assert_eq!(index.tiles("Azeroth"), vec![(32, 48), (32, 49)]);
         assert!(index.tiles("WMO").is_empty());
+    }
+
+    #[test]
+    fn resolves_wmo_group_art_by_root_and_tile() {
+        let index = Translate::parse(
+            "WMO\\KhazModan\\Cities\\Ironforge\\ironforge_001_00_00.blp\tfirst.blp\n\
+             WMO\\KhazModan\\Cities\\Ironforge\\ironforge_001_01_00.blp\tsecond.blp\n\
+             WMO\\KhazModan\\Cities\\Ironforge\\ironforge_002_00_00.blp\tother.blp",
+        );
+        assert_eq!(
+            index.wmo_tiles(
+                r"World\wmo\KhazModan\Cities\Ironforge\ironforge.wmo",
+                1
+            ),
+            vec![
+                (0, 0, r"Textures\Minimap\first.blp".to_string()),
+                (1, 0, r"Textures\Minimap\second.blp".to_string()),
+            ]
+        );
     }
 
     /// The header lines carry no information this parser needs, so a file

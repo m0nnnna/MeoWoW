@@ -112,6 +112,10 @@ pub struct CachedModel {
     /// planks and a boulder are the same silence. Only a WMO's materials name
     /// a surface. See `wmo::Material::ground_type`.
     pub collision_footing: Vec<u8>,
+    pub collision_area: Vec<u32>,
+    pub wmo_id: Option<u32>,
+    pub group_bounds: Vec<(Vec3, Vec3)>,
+    pub group_surface_ids: Vec<u32>,
 }
 
 /// One model and the transforms it takes on a single tile.
@@ -288,6 +292,7 @@ pub struct Liquid {
 pub struct Tile {
     pub terrain: LoadedTerrain,
     pub groups: Vec<Group>,
+    pub wmos: Vec<WmoInstance>,
     /// Everything solid on this tile, in world space.
     ///
     /// Built with the tile and evicted with it. Rebuilding costs nothing
@@ -627,6 +632,7 @@ pub struct World {
     wdt: adt::Wdt,
     radius: i32,
     max_doodads: usize,
+    wmo_areas: crate::world_object::WmoAreas,
     /// `None` marks a model that failed to load, so it is not retried on every
     /// tile that places it.
     cache: HashMap<String, Option<Rc<CachedModel>>>,
@@ -753,6 +759,27 @@ pub struct World {
     pub stats: Stats,
 }
 
+pub struct WmoInstance {
+    pub path: String,
+    pub model: Rc<CachedModel>,
+    pub transform: Mat4,
+}
+
+#[derive(Clone, Copy)]
+pub struct AreaContext {
+    pub area: u32,
+    pub zone_music: Option<u32>,
+    pub ambience: Option<u32>,
+}
+
+pub struct WmoMinimap {
+    pub path: String,
+    pub group_index: usize,
+    pub position: Vec3,
+    pub min: Vec3,
+    pub max: Vec3,
+}
+
 /// Where a held item is drawn: the wielder's placement, through the hand, at
 /// the attachment point.
 ///
@@ -792,11 +819,13 @@ impl World {
     /// [`MIN_STREAM_RADIUS`] however low it is asked for -- see there.
     pub fn new(chain: &mut Chain, map: &str, radius: i32, max_doodads: usize) -> anyhow::Result<Self> {
         let wdt = adt::Wdt::parse(&chain.read(&adt::wdt_path(map))?)?;
+        let wmo_areas = crate::world_object::WmoAreas::load(chain);
         Ok(Self {
             map: map.to_string(),
             wdt,
             radius: radius.max(MIN_STREAM_RADIUS),
             max_doodads,
+            wmo_areas,
             cache: HashMap::new(),
             entity_cache: HashMap::new(),
             held_cache: HashMap::new(),
@@ -1038,6 +1067,7 @@ impl World {
         }
 
         let mut built = Vec::new();
+        let mut wmos = Vec::new();
         let mut solid = collision::World::new();
         // Grown as triangles are added, so it costs one comparison per vertex
         // rather than a second pass over the whole set.
@@ -1046,6 +1076,13 @@ impl World {
             let Some(model) = self.model(gpu, meshes, chain, &path) else {
                 continue;
             };
+            if model.wmo_id.is_some() {
+                wmos.extend(transforms.iter().map(|transform| WmoInstance {
+                    path: path.clone(),
+                    model: Rc::clone(&model),
+                    transform: *transform,
+                }));
+            }
             // Placed into world space here rather than kept in model space and
             // transformed per query: a building is placed once and asked about
             // sixty times a second, and the grid can only index what has a
@@ -1067,13 +1104,14 @@ impl World {
                         ),
                         None => (a.min(b).min(c), a.max(b).max(c)),
                     });
-                    solid.add_tagged(
+                    solid.add_tagged_with_id(
                         collision::Triangle::new(a, b, c),
                         model
                             .collision_footing
                             .get(index)
                             .copied()
                             .unwrap_or(collision::UNTAGGED),
+                        model.collision_area.get(index).copied().unwrap_or(0),
                     );
                 }
             }
@@ -1107,6 +1145,7 @@ impl World {
         Ok(Tile {
             terrain,
             groups: built,
+            wmos,
             heights: TileHeights::new(&parsed.chunks, &parsed.liquid),
             solid_bounds,
             solid,
@@ -1175,6 +1214,61 @@ impl World {
     pub fn area_at(&self, x: f32, y: f32) -> Option<u32> {
         let tile = tile_at(Vec3::new(x, y, 0.0));
         self.tiles.get(&tile)?.heights.area_at(x, y)
+    }
+
+    pub fn area_at_position(&self, at: Vec3, step: f32) -> Option<u32> {
+        self.area_context_at_position(at, step).map(|context| context.area)
+    }
+
+    pub fn area_context_at_position(&self, at: Vec3, step: f32) -> Option<AreaContext> {
+        if let Some((_, _, surface)) = self.floor_under_surface(at, step) {
+            if let Some(area) = surface.and_then(|id| self.wmo_areas.by_id(id)) {
+                return Some(AreaContext {
+                    area: area.area_table_id,
+                    zone_music: area.zone_music,
+                    ambience: area.ambience_id,
+                });
+            }
+        }
+        self.area_at(at.x, at.y).map(|area| AreaContext {
+            area,
+            zone_music: None,
+            ambience: None,
+        })
+    }
+
+    pub fn wmo_minimap_at_position(&self, at: Vec3, step: f32) -> Option<WmoMinimap> {
+        let surface_id = self.floor_under_surface(at, step)?.2?;
+        let area = self.wmo_areas.by_id(surface_id)?;
+        for tile in self.tiles_touching(at, at) {
+            for instance in &tile.wmos {
+                if instance.model.wmo_id != Some(area.wmo_id) {
+                    continue;
+                }
+                let local = instance.transform.inverse().transform_point3(at);
+                for (group_index, group_surface) in instance.model.group_surface_ids.iter().enumerate() {
+                    if *group_surface != surface_id {
+                        continue;
+                    }
+                    let Some((min, max)) = instance.model.group_bounds.get(group_index).copied() else {
+                        continue;
+                    };
+                    if (min.x..=max.x).contains(&local.x)
+                        && (min.y..=max.y).contains(&local.y)
+                        && (min.z..=max.z).contains(&local.z)
+                    {
+                        return Some(WmoMinimap {
+                            path: instance.path.clone(),
+                            group_index,
+                            position: local,
+                            min,
+                            max,
+                        });
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// When this entity's feet are due to land in the cycle it is playing right
@@ -1310,14 +1404,25 @@ impl World {
     /// the frame they disagree on is a character standing on floorboards and
     /// hearing stone.
     pub fn floor_under_footing(&self, at: Vec3, step: f32) -> Option<(f32, Option<u8>)> {
-        let mut best: Option<(f32, Option<u8>)> = None;
+        self.floor_under_surface(at, step)
+            .map(|(z, footing, _)| (z, footing))
+    }
+
+    pub fn floor_under_surface(
+        &self,
+        at: Vec3,
+        step: f32,
+    ) -> Option<(f32, Option<u8>, Option<u32>)> {
+        let mut best: Option<(f32, Option<u8>, Option<u32>)> = None;
         for tile in self.tiles_touching(at, at) {
             if tile.solid.is_empty() {
                 continue;
             }
-            if let Some((z, tag)) = tile.solid.floor_under_tagged(at.truncate(), at.z, step) {
-                if best.is_none_or(|(b, _)| z > b) {
-                    best = Some((z, tag));
+            if let Some((z, footing, area)) =
+                tile.solid.floor_under_tagged_with_id(at.truncate(), at.z, step)
+            {
+                if best.is_none_or(|(b, _, _)| z > b) {
+                    best = Some((z, footing, area));
                 }
             }
         }
@@ -1430,6 +1535,10 @@ impl World {
             bounds: Option<(Vec3, Vec3)>,
             collision: Vec<[[f32; 3]; 3]>,
             collision_footing: Vec<u8>,
+            collision_area: Vec<u32>,
+            wmo_id: Option<u32>,
+            group_bounds: Vec<(Vec3, Vec3)>,
+            group_surface_ids: Vec<u32>,
             doodads: Vec<Vec<crate::world_object::Doodad>>,
             texture_animation: crate::model::TextureAnimation,
         }
@@ -1438,7 +1547,7 @@ impl World {
         let built = if lower.ends_with(".wmo") {
             // No skeleton to speak of, so nothing to animate and nothing to
             // hang off it.
-            crate::world_object::load(gpu, chain, path, None)
+            crate::world_object::load_with_areas(gpu, chain, path, None, Some(&self.wmo_areas))
                 .map(|w| {
                     let texture_animation = crate::model::TextureAnimation::empty(
                         gpu,
@@ -1459,6 +1568,10 @@ impl World {
                         bounds: None,
                         collision: w.collision,
                         collision_footing: w.collision_footing,
+                        collision_area: w.collision_area,
+                        wmo_id: Some(w.wmo_id),
+                        group_bounds: w.group_bounds,
+                        group_surface_ids: w.group_surface_ids,
                         doodads: w.doodads,
                     }
                 })
@@ -1494,6 +1607,10 @@ impl World {
                         collision: m.collision,
                         // An M2 names no surface; see `CachedModel`.
                         collision_footing: Vec::new(),
+                        collision_area: Vec::new(),
+                        wmo_id: None,
+                        group_bounds: Vec::new(),
+                        group_surface_ids: Vec::new(),
                         doodads: Vec::new(),
                     }
                 })
@@ -1522,6 +1639,10 @@ impl World {
                 textures: b.textures,
                 collision: b.collision,
                 collision_footing: b.collision_footing,
+                collision_area: b.collision_area,
+                wmo_id: b.wmo_id,
+                group_bounds: b.group_bounds,
+                group_surface_ids: b.group_surface_ids,
             })
         })
     }
@@ -2483,6 +2604,10 @@ impl World {
                     // world. Left empty rather than filled in unused.
                     collision: Vec::new(),
                     collision_footing: Vec::new(),
+                    collision_area: Vec::new(),
+                    wmo_id: None,
+                    group_bounds: Vec::new(),
+                    group_surface_ids: Vec::new(),
                 })
             })
             // Timed on this side too: a load that *fails* still reads the

@@ -10,6 +10,7 @@ use glam::{Mat4, Quat, Vec3};
 use mpq::Chain;
 use render::mesh::{BlendMode, GpuMesh, MeshVertex, RenderState, Winding};
 use render::{texture::upload_blp, Gpu, UploadedTexture};
+use std::collections::HashMap;
 
 use crate::model::Draw;
 
@@ -20,6 +21,9 @@ pub struct LoadedWmo {
     pub min: Vec3,
     pub max: Vec3,
     pub path: String,
+    pub wmo_id: u32,
+    pub group_bounds: Vec<(Vec3, Vec3)>,
+    pub group_surface_ids: Vec<u32>,
     pub vertex_count: usize,
     pub triangle_count: usize,
     pub group_count: usize,
@@ -43,6 +47,7 @@ pub struct LoadedWmo {
     /// wall that declines to say" both mean this client must not claim to know
     /// what a foot landed on. See [`wmo::Material::ground_type`].
     pub collision_footing: Vec<u8>,
+    pub collision_area: Vec<u32>,
     pub doodads: Vec<Vec<Doodad>>,
     pub doodad_sets: Vec<String>,
     pub missing_textures: Vec<String>,
@@ -62,6 +67,61 @@ pub struct Doodad {
 /// materials are the silent one. Reading this as 0 would make every wall in
 /// the game claim to be dirt. See [`wmo::Material::ground_type`].
 const NO_TERRAIN: u32 = 10;
+
+#[derive(Clone, Copy)]
+pub struct WmoArea {
+    pub row_id: u32,
+    pub wmo_id: u32,
+    pub area_table_id: u32,
+    pub ambience_id: Option<u32>,
+    pub zone_music: Option<u32>,
+}
+
+#[derive(Default)]
+pub struct WmoAreas {
+    by_group: HashMap<(u32, u32), WmoArea>,
+    by_row: HashMap<u32, WmoArea>,
+}
+
+impl WmoAreas {
+    pub fn load(chain: &mut Chain) -> Self {
+        let Some(table) = chain
+            .read(dbc::schema::WmoAreaTable::PATH)
+            .ok()
+            .and_then(|bytes| dbc::schema::WmoAreaTable::parse(&bytes).ok())
+        else {
+            return Self::default();
+        };
+        let mut by_group = HashMap::new();
+        let mut by_row = HashMap::new();
+        for row in table.iter() {
+            let Ok(group) = u32::try_from(row.wmo_group_id()) else {
+                continue;
+            };
+            let area = WmoArea {
+                row_id: row.id(),
+                wmo_id: row.wmo_id(),
+                area_table_id: row.area_table_id(),
+                ambience_id: (row.ambience_id() != 0).then_some(row.ambience_id()),
+                zone_music: (row.zone_music() != 0).then_some(row.zone_music()),
+            };
+            if area.area_table_id == 0 && area.ambience_id.is_none() && area.zone_music.is_none() {
+                continue;
+            }
+            by_group.insert((row.wmo_id(), group), area);
+            by_row.insert(area.row_id, area);
+        }
+        Self { by_group, by_row }
+    }
+
+    fn get(&self, wmo_id: u32, group_id: u32) -> Option<WmoArea> {
+        self.by_group.get(&(wmo_id, group_id)).copied()
+    }
+
+    pub fn by_id(&self, row_id: u32) -> Option<WmoArea> {
+        self.by_row.get(&row_id).copied()
+    }
+}
 
 /// Maps a WMO material onto pipeline state.
 ///
@@ -97,6 +157,16 @@ pub fn load(
     chain: &mut Chain,
     path: &str,
     only_group: Option<usize>,
+) -> Result<LoadedWmo> {
+    load_with_areas(gpu, chain, path, only_group, None)
+}
+
+pub fn load_with_areas(
+    gpu: &Gpu,
+    chain: &mut Chain,
+    path: &str,
+    only_group: Option<usize>,
+    areas: Option<&WmoAreas>,
 ) -> Result<LoadedWmo> {
     if wmo::is_group_path(path) {
         anyhow::bail!("{path} is a group file; load the root .wmo instead");
@@ -143,6 +213,13 @@ pub fn load(
     let (mut group_count, mut collision_triangles) = (0usize, 0usize);
     let mut collision: Vec<[[f32; 3]; 3]> = Vec::new();
     let mut collision_footing: Vec<u8> = Vec::new();
+    let mut collision_area: Vec<u32> = Vec::new();
+    let group_bounds = root
+        .groups
+        .iter()
+        .map(|group| (Vec3::from(group.bounding_box.0), Vec3::from(group.bounding_box.1)))
+        .collect();
+    let mut group_surface_ids = vec![0; root.header.group_count as usize];
 
     for gi in 0..root.header.group_count as usize {
         if only_group.is_some_and(|want| want != gi) {
@@ -159,6 +236,13 @@ pub fn load(
             continue;
         }
         group_count += 1;
+        let surface_id = areas
+            .and_then(|areas| areas.get(root.header.wmo_id, group.group_id))
+            .map(|area| area.row_id)
+            .unwrap_or(0);
+        if let Some(surface) = group_surface_ids.get_mut(gi) {
+            *surface = surface_id;
+        }
 
         // Every group indexes from zero into its own vertex array, so merging
         // means offsetting each group's indices by what came before.
@@ -208,6 +292,7 @@ pub fn load(
                         .filter(|row| *row != NO_TERRAIN && *row < u8::MAX as u32)
                         .map_or(u8::MAX, |row| row as u8),
                 );
+                collision_area.push(surface_id);
             }
         }
 
@@ -259,12 +344,16 @@ pub fn load(
         min,
         max,
         path: path.to_string(),
+        wmo_id: root.header.wmo_id,
+        group_bounds,
+        group_surface_ids,
         vertex_count: vertices.len(),
         triangle_count,
         group_count,
         collision_triangles,
         collision,
         collision_footing,
+        collision_area,
         doodads: root
             .doodad_sets
             .iter()

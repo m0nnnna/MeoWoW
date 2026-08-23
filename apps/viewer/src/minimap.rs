@@ -97,6 +97,16 @@ impl Minimap {
         y: usize,
     ) -> Option<egui::TextureId> {
         let path = self.index.tile_path(map, x, y)?;
+        self.art(gpu, renderer, chain, path)
+    }
+
+    fn art(
+        &mut self,
+        gpu: &Gpu,
+        renderer: &mut egui_wgpu::Renderer,
+        chain: &mut Chain,
+        path: String,
+    ) -> Option<egui::TextureId> {
         if let Some(cached) = self.art.get(&path) {
             return *cached;
         }
@@ -113,7 +123,7 @@ impl Minimap {
             Some(id)
         })();
         if loaded.is_none() {
-            tracing::debug!("minimap tile {map} {x},{y} ({path}) would not load");
+            tracing::debug!("minimap art {path} would not load");
         }
         self.art.insert(path, loaded);
         loaded
@@ -134,6 +144,7 @@ impl Minimap {
         standing: Option<Standing>,
         map_directory: &str,
         title: Option<&str>,
+        interior: Option<&crate::world::WmoMinimap>,
         range: f32,
         objectives: &[Objective<'_>],
         givers: &[crate::maps::QuestgiverPin],
@@ -155,21 +166,56 @@ impl Minimap {
                 ..Default::default()
             };
         };
-        // **One viewport, asked twice.** The tiles and the blips are placed
-        // by the same object rather than by two calls that happen to agree --
-        // the rule the picking ray is written to, and the reason this lives in
-        // `adt` where `wow-cli minimap stitch` can draw a picture from it.
         let placed = adt::minimap::Viewport::new(at.x, at.y, range);
         let project = |x: f32, y: f32| placed.project(x, y);
         let mut tiles = Vec::new();
-        for (x, y) in placed.tiles_touching() {
-            let Some(texture) = self.tile(gpu, renderer, chain, map_directory, x, y) else {
-                continue;
-            };
-            tiles.push(ui::MinimapTile {
-                texture,
-                rect: placed.tile_rect(x, y),
-            });
+        if let Some(interior) = interior {
+            let entries = self.index.wmo_tiles(&interior.path, interior.group_index);
+            if !entries.is_empty() {
+                let min_x = entries.iter().map(|(x, _, _)| *x).min().unwrap_or(0);
+                let max_x = entries.iter().map(|(x, _, _)| *x).max().unwrap_or(0);
+                let min_y = entries.iter().map(|(_, y, _)| *y).min().unwrap_or(0);
+                let max_y = entries.iter().map(|(_, y, _)| *y).max().unwrap_or(0);
+                let width = (interior.max.x - interior.min.x).max(1.0);
+                let height = (interior.max.y - interior.min.y).max(1.0);
+                let columns = (max_x - min_x + 1) as f32;
+                let rows = (max_y - min_y + 1) as f32;
+                for (x, y, path) in entries {
+                    let Some(texture) = self.art(gpu, renderer, chain, path) else {
+                        continue;
+                    };
+                    let x0 = interior.min.x + (x - min_x) as f32 * width / columns;
+                    let x1 = interior.min.x + (x - min_x + 1) as f32 * width / columns;
+                    let y0 = interior.min.y + (y - min_y) as f32 * height / rows;
+                    let y1 = interior.min.y + (y - min_y + 1) as f32 * height / rows;
+                    let p0 = (
+                        0.5 + (x0 - interior.position.x) / range.max(1.0),
+                        0.5 + (interior.position.y - y1) / range.max(1.0),
+                    );
+                    let p1 = (
+                        0.5 + (x1 - interior.position.x) / range.max(1.0),
+                        0.5 + (interior.position.y - y0) / range.max(1.0),
+                    );
+                    tiles.push(ui::MinimapTile {
+                        texture,
+                        rect: [p0.0, p0.1, p1.0, p1.1],
+                    });
+                }
+            }
+        } else {
+            // **One viewport, asked twice.** The tiles and the blips are placed
+            // by the same object rather than by two calls that happen to agree --
+            // the rule the picking ray is written to, and the reason this lives in
+            // `adt` where `wow-cli minimap stitch` can draw a picture from it.
+            for (x, y) in placed.tiles_touching() {
+                let Some(texture) = self.tile(gpu, renderer, chain, map_directory, x, y) else {
+                    continue;
+                };
+                tiles.push(ui::MinimapTile {
+                    texture,
+                    rect: placed.tile_rect(x, y),
+                });
+            }
         }
 
         // Objectives, then party members, then the player's arrow last so it
@@ -177,6 +223,9 @@ impl Minimap {
         // the same reason: where you are is never the thing to obscure.
         let mut markers: Vec<ui::MapMarker> = Vec::new();
         for objective in objectives {
+            if interior.is_some() {
+                break;
+            }
             for poi in objective.markers {
                 // **A marker names its own map and this does not guess.** The
                 // world map asks the same question as a page equality; there
@@ -222,6 +271,9 @@ impl Minimap {
         // because a questgiver cache holds every continent at once and this
         // loop would otherwise walk the whole of it every frame.
         for pin in givers {
+            if interior.is_some() {
+                break;
+            }
             let (u, v) = project(pin.x, pin.y);
             markers.push(ui::MapMarker {
                 u,
@@ -236,6 +288,9 @@ impl Minimap {
             });
         }
         for pin in party {
+            if interior.is_some() {
+                break;
+            }
             let (u, v) = project(pin.x, pin.y);
             markers.push(ui::MapMarker {
                 u,

@@ -205,6 +205,23 @@ dbc_table! {
 }
 
 dbc_table! {
+    /// The area associated with one group of a world model object.
+    WmoAreaTable, WmoAreaTableRow, path = r"DBFilesClient\WMOAreaTable.dbc", fields = 28, {
+        0 id: u32,
+        1 wmo_id: u32,
+        2 name_set_id: i32,
+        3 wmo_group_id: i32,
+        4 sound_provider_preferences: i32,
+        5 sound_provider_preferences_underwater: u32,
+        6 ambience_id: u32,
+        7 zone_music: u32,
+        8 intro_sound: i32,
+        9 flags: u32,
+        10 area_table_id: u32,
+    }
+}
+
+dbc_table! {
     /// Visual appearance of a creature: which model, skin, and scale to use.
     ///
     /// Indirection is deliberate -- many creatures share one model with
@@ -1829,6 +1846,7 @@ impl SoundEntriesRow<'_> {
 impl_table_info!(
     Map,
     AreaTable,
+    WmoAreaTable,
     CreatureDisplayInfo,
     CreatureModelData,
     AnimationData,

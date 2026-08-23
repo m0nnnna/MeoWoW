@@ -237,16 +237,11 @@ impl Variations {
     }
 }
 
-fn has_fully_transparent_alpha(rgba: &[u8]) -> bool {
-    rgba.chunks_exact(4).any(|pixel| pixel[3] == 0)
-}
-
 fn is_particle_mesh(
     emitter_bones: &BTreeSet<u8>,
     vertex_bones: &BTreeSet<u8>,
     batch_count: usize,
     material: m2::Material,
-    has_fully_transparent_alpha: bool,
 ) -> bool {
     emitter_bones.len() >= 3
         && vertex_bones.len() == 1
@@ -254,7 +249,6 @@ fn is_particle_mesh(
         && batch_count <= 2
         && material.flags == 0
         && material.blend == 0
-        && has_fully_transparent_alpha
 }
 
 /// The parts of a model that do not depend on how it is dressed, kept once
@@ -579,11 +573,6 @@ pub fn load_dressed_with(
         .iter()
         .map(|emitter| emitter.bone as u8)
         .collect();
-    let inspect_texture_alpha = emitter_bones.len() >= 3
-        && vertex_bones.len() == 1
-        && emitter_bones.is_disjoint(&vertex_bones)
-        && skin.batches().len() <= 2
-        && materials.iter().any(|material| material.flags == 0 && material.blend == 0);
     let vertices: Vec<MeshVertex> = raw_vertices
         .iter()
         .map(|v| MeshVertex {
@@ -604,7 +593,6 @@ pub fn load_dressed_with(
     // One texture per model slot, resolved once and shared by every batch.
     let phase = Instant::now();
     let mut textures = Vec::new();
-    let mut texture_has_transparency = Vec::new();
     let mut missing_textures = Vec::new();
     for def in &defs {
         let file = if def.is_hardcoded() {
@@ -642,16 +630,10 @@ pub fn load_dressed_with(
                     "character skin",
                 )
             });
-        let mut texture_has_fully_transparent_alpha = false;
         let uploaded = composed.or_else(|| {
             file.as_ref().and_then(|f| {
                 let bytes = chain.read(f).ok()?;
                 let parsed = blp::Blp::parse(&bytes).ok()?;
-                if inspect_texture_alpha {
-                    texture_has_fully_transparent_alpha = parsed
-                        .decode_rgba(0)
-                        .is_some_and(|rgba| has_fully_transparent_alpha(&rgba));
-                }
                 Some(upload_blp(gpu, &parsed, f))
             })
         });
@@ -659,20 +641,17 @@ pub fn load_dressed_with(
         match uploaded {
             Some(t) => {
                 textures.push(t);
-                texture_has_transparency.push(texture_has_fully_transparent_alpha);
             }
             None => {
                 missing_textures.push(
                     file.unwrap_or_else(|| format!("<runtime slot type {}>", def.kind)),
                 );
                 textures.push(placeholder(gpu));
-                texture_has_transparency.push(false);
             }
         }
     }
     if textures.is_empty() {
         textures.push(placeholder(gpu));
-        texture_has_transparency.push(false);
     }
     timings.textures = phase.elapsed();
 
@@ -713,7 +692,6 @@ pub fn load_dressed_with(
             &vertex_bones,
             skin.batches().len(),
             material,
-            texture_has_transparency.get(texture).copied().unwrap_or(false),
         ) {
             continue;
         }
@@ -1027,15 +1005,13 @@ mod tests {
         let emitters = BTreeSet::from([1, 2, 3]);
         let vertices = BTreeSet::from([0]);
         let material = m2::Material { flags: 0, blend: 0 };
-        assert!(is_particle_mesh(&emitters, &vertices, 1, material, true));
-        assert!(!is_particle_mesh(&BTreeSet::from([1, 2]), &vertices, 1, material, true));
-        assert!(!is_particle_mesh(&emitters, &vertices, 1, material, false));
+        assert!(is_particle_mesh(&emitters, &vertices, 1, material));
+        assert!(!is_particle_mesh(&BTreeSet::from([1, 2]), &vertices, 1, material));
         assert!(!is_particle_mesh(
             &emitters,
             &vertices,
             1,
             m2::Material { flags: 1, blend: 0 },
-            true,
         ));
     }
 
