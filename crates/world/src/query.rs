@@ -654,6 +654,28 @@ impl GameObjectInfo {
     pub fn is_chest(&self) -> bool {
         self.kind == GAMEOBJECT_TYPE_CHEST
     }
+
+    /// Whether opening this wants `OPEN_LOCK_KNEELING` cast at it rather
+    /// than a plain [`crate::opcode::ClientOpcode::GameObjectUse`] --
+    /// [`Self::is_chest`] generalised.
+    ///
+    /// **`cast_bar_caption` is the server's own signal, not a guess.** This
+    /// client does not read `Lock.dbc`, so it cannot know in advance which
+    /// `LockType` a given lock id needs -- but `cast_bar_caption` ("what
+    /// appears in the cast bar while it is being used", see the field's own
+    /// doc comment) is non-empty on exactly the objects the server itself
+    /// expects a cast for, and empty on a plain door or lever `GameObjectUse`
+    /// already opens correctly. A locked, quest-pickup `GAMEOBJECT_TYPE_
+    /// GOOBER` node (a gathering node, reported live as showing no cast bar
+    /// at all through the plain-use path) carries the same non-empty caption
+    /// a chest does; only its `kind` differs.
+    ///
+    /// `is_chest` stays folded in rather than superseded -- it is separately
+    /// tested, and this must not regress it if some chest's template ever
+    /// ships an empty caption.
+    pub fn needs_kneeling_cast(&self) -> bool {
+        self.is_chest() || !self.cast_bar_caption.is_empty()
+    }
 }
 
 /// Parses `SMSG_GAMEOBJECT_QUERY_RESPONSE`.
@@ -746,6 +768,28 @@ mod tests {
         let door = gameobject_info(0);
         assert!(!door.is_chest());
         assert!(!door.is_mailbox());
+    }
+
+    /// A locked gathering node (a `GAMEOBJECT_TYPE_GOOBER`, reported live as
+    /// looting with no cast bar at all) wants the same kneel-cast treatment
+    /// as a chest, and a plain door still does not -- `needs_kneeling_cast`
+    /// has to separate the two using only `cast_bar_caption`, since neither
+    /// is a chest by `kind`.
+    #[test]
+    fn a_captioned_gameobject_wants_a_kneeling_cast_whatever_its_kind() {
+        let chest = gameobject_info(GAMEOBJECT_TYPE_CHEST);
+        assert!(chest.needs_kneeling_cast());
+
+        let mut gathering_node = gameobject_info(10);
+        gathering_node.cast_bar_caption = "Collecting".into();
+        assert!(gathering_node.needs_kneeling_cast());
+
+        let door = gameobject_info(0);
+        assert!(!door.needs_kneeling_cast());
+
+        let mut uncaptioned_goober = gameobject_info(10);
+        uncaptioned_goober.cast_bar_caption = String::new();
+        assert!(!uncaptioned_goober.needs_kneeling_cast());
     }
 
     /// Built with the real writer, so the packed encoding these tests feed in

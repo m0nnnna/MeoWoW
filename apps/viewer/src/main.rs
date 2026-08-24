@@ -9729,23 +9729,28 @@ impl App {
                 // `is_attack_candidate` already rules out anything dead -- so
                 // this cannot both attack and loot.
                 self.open_loot(guid);
-            } else if self.is_chest(guid) {
+            } else if self.wants_kneeling_cast(guid) {
                 // **Before the generic game-object arm, and for the same
                 // reason mailbox and auction sit above talk/attack/loot.**
                 // `foss-wow#141`: `CMSG_GAMEOBJ_USE` -- what the arm below
                 // sends -- does nothing at all for a chest, because
                 // AzerothCore's `GameObject::Use()` has no case for
                 // `GAMEOBJECT_TYPE_CHEST`. A chest is opened by casting a
-                // spell at it instead.
-                self.open_chest(guid);
+                // spell at it instead -- and a locked gathering node wants
+                // the same cast for the same reason `needs_kneeling_cast`
+                // checks a caption rather than a type: reported live as
+                // looting with no animation or cast bar through this same
+                // catch-all arm.
+                self.open_with_kneeling_cast(guid);
             } else if self.is_usable_gameobject(guid) {
                 // **Last, and deliberately a catch-all.** Every branch above
                 // this one already ruled itself in or out for a specific
                 // reason; whatever reaches here is a game object this client
                 // has no bespoke window for -- a door, a lever -- and "use
                 // it" is the one thing right-click means for all of them. A
-                // mailbox and a chest never reach this arm: both claimed
-                // above, once their name query has answered.
+                // mailbox and anything wanting a kneeling cast never reach
+                // this arm: both claimed above, once their name query has
+                // answered.
                 self.use_gameobject(guid);
             }
         }
@@ -9782,13 +9787,14 @@ impl App {
         tracing::info!("used game object {guid:#018x}");
     }
 
-    /// Opens a chest -- see [`::world::spell::OPEN_LOCK_KNEELING`] for why
-    /// this is a spell cast rather than [`Self::use_gameobject`], and for
-    /// the scope this does not yet cover: a chest gated behind a real
-    /// gathering or lockpicking skill will be refused by this same spell,
-    /// correctly, since this client does not read `Lock.dbc` and cannot
-    /// tell the two kinds of chest apart before asking.
-    fn open_chest(&mut self, guid: u64) {
+    /// Opens a chest, or anything else [`Self::wants_kneeling_cast`] --
+    /// see [`::world::spell::OPEN_LOCK_KNEELING`] for why this is a spell
+    /// cast rather than [`Self::use_gameobject`], and for the scope this
+    /// does not yet cover: an object gated behind a real gathering or
+    /// lockpicking skill will be refused by this same spell, correctly,
+    /// since this client does not read `Lock.dbc` and cannot tell the
+    /// different lock types apart before asking.
+    fn open_with_kneeling_cast(&mut self, guid: u64) {
         let Some(live) = self.live.as_mut() else {
             return;
         };
@@ -9796,10 +9802,10 @@ impl App {
             .connection
             .cast_spell_at_gameobject(::world::spell::OPEN_LOCK_KNEELING, guid)
         {
-            tracing::warn!("opening chest {guid:#018x} failed: {e:#}");
+            tracing::warn!("opening game object {guid:#018x} failed: {e:#}");
             return;
         }
-        tracing::info!("opening chest {guid:#018x}");
+        tracing::info!("opening game object {guid:#018x}");
     }
 
     /// What the questgiver window should be showing, or `None` when no
@@ -10187,12 +10193,14 @@ impl App {
             .is_some_and(|info| info.is_mailbox())
     }
 
-    /// Whether this guid is a chest -- see
-    /// [`::world::query::GameObjectInfo::is_chest`] for why a chest needs a
-    /// different right-click action from every other game object, and
-    /// [`Self::is_mailbox`]'s doc comment for the identical
-    /// first-click-can-miss reasoning this shares.
-    fn is_chest(&self, guid: u64) -> bool {
+    /// Whether this guid wants `OPEN_LOCK_KNEELING` cast at it rather than a
+    /// plain [`Self::use_gameobject`] -- see
+    /// [`::world::query::GameObjectInfo::needs_kneeling_cast`] for why that
+    /// is not only chests (`foss-wow`, reported live: a locked gathering
+    /// node looted with no cast bar and no animation at all through the
+    /// plain-use path), and [`Self::is_mailbox`]'s doc comment for the
+    /// identical first-click-can-miss reasoning this shares.
+    fn wants_kneeling_cast(&self, guid: u64) -> bool {
         let Some(live) = self.live.as_ref() else {
             return false;
         };
@@ -10205,7 +10213,7 @@ impl App {
         object
             .entry()
             .and_then(|entry| live.state.names.gameobject(entry).flatten())
-            .is_some_and(|info| info.is_chest())
+            .is_some_and(|info| info.needs_kneeling_cast())
     }
 
     /// Opens a mailbox and asks it what is inside.
