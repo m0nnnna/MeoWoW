@@ -1908,6 +1908,10 @@ struct FrameProfile {
     /// read as expensive submission and send the reader to cull something
     /// that was never the cost.
     acquire_ms: f32,
+    /// Tessellating the interface, uploading its geometry and encoding its
+    /// render pass -- the part of the frame the headless path never does.
+    /// Carved out of `encode_ms`, which contained it unnamed.
+    interface_ms: f32,
     /// Writing the command buffer -- every `set_pipeline`, `set_bind_group`
     /// and `draw_indexed` above, plus egui's own pass.
     encode_ms: f32,
@@ -2044,7 +2048,8 @@ impl FrameProfile {
              net {:.1} | \
              sound {:.1} (area {:.1}, steps {:.1}, play {:.1}) | stream {:.1} | \
              entities {:.1} | anim {:.1} | \
-             emitters {:.1} | acquire {:.1} | encode {:.1} | submit {:.1} | \
+             emitters {:.1} | acquire {:.1} | encode {:.1} (interface {:.1}) | \
+             submit {:.1} | \
              present {:.1} | \
              rest {:.1} ms; outside redraw {:.1} = {} events in {:.1} + \
              {:.1} idle + {:.1} log ms\n\
@@ -2083,6 +2088,7 @@ impl FrameProfile {
             self.emitters_ms,
             self.acquire_ms,
             self.encode_ms,
+            self.interface_ms,
             self.submit_ms,
             self.present_ms,
             unaccounted,
@@ -6955,6 +6961,15 @@ impl App {
             );
         }
 
+        // **Everything from here to the end of the pass is the interface**,
+        // and none of it exists in the headless path -- which encodes and
+        // submits the *whole world* in 0.73 ms for Northshire and 1.93 ms for
+        // Ironforge, against 5.51 ms of `encode` plus `submit` live. The world
+        // is not the difference. Tessellation, egui's own buffer uploads and
+        // its render pass all sat inside `encode` and `submit` with nothing
+        // naming them, which is exactly how the minimap's index scan hid
+        // inside `ui` for six rounds.
+        let interface_started = Instant::now();
         let clipped = r
             .egui_ctx
             .tessellate(ui_output.shapes, ui_output.pixels_per_point);
@@ -6994,6 +7009,7 @@ impl App {
         for id in &ui_output.textures_delta.free {
             r.egui_renderer.free_texture(id);
         }
+        profile.interface_ms = interface_started.elapsed().as_secs_f32() * 1000.0;
 
         profile.encode_ms = phase.elapsed().as_secs_f32() * 1000.0;
         let phase = Instant::now();
