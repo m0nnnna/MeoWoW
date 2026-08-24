@@ -8321,6 +8321,27 @@ The two structural reasons it holds up both predate this rung.
 
 Per unit: 0.165 us per instance, 0.159 us per sprite. Both cheap, both linear.
 
+### Confirmed at the window
+
+*"I never saw the plumes restart, just kept on like normal."*
+
+That is the one thing in this rung a measurement could not have settled, and
+it is the check `render::cull::Attention` was written around. Refusing to step
+an emitter that is off screen saves the work; the risk is that a particle
+system has a *history* and cannot show one when it comes back, so a torch
+behind you would re-ignite from nothing the moment you turned. The radius --
+`--shadow-radius`, chosen so that anything still able to cast a shadow is
+still being posed -- is what buys that history back, and the only way to know
+whether it was wide enough was for somebody to stand near a brazier and turn
+round quickly.
+
+Also confirmed live, and worth separating from the numbers: **it stayed
+smooth**. Under `--stress 20`, which is roughly two hundred bodies and ten
+thousand particles, the report was that nothing juddered -- not that the
+average was acceptable, which is what the log says, but that no frame stood
+out enough to notice. Those are different claims and only one of them is in a
+profile.
+
 ### Still not done
 
 * **No portal culling.** Frustum culling only, so indoors this draws every room
