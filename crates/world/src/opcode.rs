@@ -327,6 +327,8 @@ pub enum ClientOpcode {
     /// Found because a released ghost reclaimed its corpse from 58 yards away
     /// when the limit is 39: the ghost had never actually left the body.
     MoveTeleportAck = 0x00C7,
+    /// Confirming a transfer to another map after `SMSG_NEW_WORLD`.
+    MoveWorldportAck = 0x00DC,
 
     /// Open a conversation with an NPC: the greeting that produces a menu.
     ///
@@ -978,6 +980,12 @@ pub mod server {
     pub const ADDON_INFO: u16 = 0x02EF;
     pub const CLIENTCACHE_VERSION: u16 = 0x04AB;
     pub const LOGIN_VERIFY_WORLD: u16 = 0x0236;
+    /// The destination map and position for a world transfer.
+    pub const NEW_WORLD: u16 = 0x003E;
+    /// Announces that a world transfer is about to begin.
+    pub const TRANSFER_PENDING: u16 = 0x003F;
+    /// Cancels a world transfer before the destination is entered.
+    pub const TRANSFER_ABORTED: u16 = 0x0040;
 
     /// What is on a corpse, in answer to `CMSG_LOOT`. See [`crate::loot`] for
     /// the layout and how it was confirmed.
@@ -1542,6 +1550,9 @@ pub fn describe(opcode: u16) -> String {
         server::ADDON_INFO => "SMSG_ADDON_INFO",
         server::CLIENTCACHE_VERSION => "SMSG_CLIENTCACHE_VERSION",
         server::LOGIN_VERIFY_WORLD => "SMSG_LOGIN_VERIFY_WORLD",
+        server::NEW_WORLD => "SMSG_NEW_WORLD",
+        server::TRANSFER_PENDING => "SMSG_TRANSFER_PENDING",
+        server::TRANSFER_ABORTED => "SMSG_TRANSFER_ABORTED",
         server::LOOT_RESPONSE => "SMSG_LOOT_RESPONSE",
         server::LOOT_RELEASE_RESPONSE => "SMSG_LOOT_RELEASE_RESPONSE",
         server::LOOT_REMOVED => "SMSG_LOOT_REMOVED",

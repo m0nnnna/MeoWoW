@@ -5542,6 +5542,34 @@ impl App {
         self.signin = None;
     }
 
+    fn reload_live_world(&mut self) {
+        let Some(live) = self.live.as_ref() else {
+            return;
+        };
+        let Some(r) = self.renderer.as_mut() else {
+            tracing::error!("reloaded the world with no renderer; nothing will be drawn");
+            return;
+        };
+        let scene = match world_for_live(&r.gpu, &mut r.meshes, &mut self.chain, &self.args, live) {
+            Ok(scene) => scene,
+            Err(e) => {
+                tracing::error!("building the transferred world failed: {e:#}");
+                r.scene = None;
+                return;
+            }
+        };
+        r.meshes.prepare(&r.gpu, scene_states(&scene));
+        let bones = r.meshes.create_bones(&r.gpu, BIND_POSE_BONES);
+        r.meshes
+            .update_bones(&r.gpu, &bones, &bind_pose(BIND_POSE_BONES));
+        r.bones = Some(bones);
+        r.world_binds = world_bind_groups(&r.gpu, &r.meshes, &scene);
+        r.material_binds = material_bind_groups(&r.gpu, &r.meshes, &scene);
+        r.scene = Some(scene);
+        self.camera = live_camera(live, &self.args);
+        tracing::info!("loaded transferred world {} ({})", live.map_id, live.map_name);
+    }
+
     /// Draws the sign-in screen, and does whatever it asked for.
     ///
     /// Its own frame rather than a branch inside `redraw`'s: there is no
@@ -11321,6 +11349,7 @@ impl App {
         // Same shape again: pushing a line into the scrollback touches
         // `self.chat`, and `live` is borrowed for the whole drain.
         let mut party_results: Vec<String> = Vec::new();
+        let mut worldport_changed = false;
         match live.connection.drain(Duration::from_millis(1), 64) {
             // Every batch has to go through all the kinds of change replicate
             // handles -- object updates, relayed movement, monster moves,
@@ -11349,6 +11378,20 @@ impl App {
                     self.chat.push(Line::Chat(local_notice(
                         "You have been moved.".to_string(),
                     )));
+                }
+                match live::answer_worldport(&mut self.chain, live) {
+                    Ok(true) => {
+                        worldport_changed = true;
+                        tracing::info!(
+                            "world-port acknowledged at map {} ({:.1}, {:.1}, {:.1})",
+                            live.map_id,
+                            live.position.x,
+                            live.position.y,
+                            live.position.z
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!("world-port acknowledgement failed: {e:#}"),
                 }
                 // **Mail arrived, and a sentence is the whole of what can
                 // honestly be drawn for it.**
@@ -12558,6 +12601,9 @@ impl App {
             if outcome.succeeded() {
                 self.ask_auctions();
             }
+        }
+        if worldport_changed {
+            self.reload_live_world();
         }
     }
 

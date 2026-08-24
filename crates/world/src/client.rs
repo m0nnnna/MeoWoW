@@ -1578,6 +1578,11 @@ impl Connection {
         self.send(ClientOpcode::MoveTeleportAck, &body)
     }
 
+    /// Acknowledges a transfer to another map.
+    pub fn acknowledge_worldport(&mut self) -> Result<(), Error> {
+        self.send(ClientOpcode::MoveWorldportAck, &[])
+    }
+
     /// Asks where this character's body is. The request has no body at all.
     pub fn query_corpse(&mut self) -> Result<(), Error> {
         self.send(ClientOpcode::CorpseQuery, &[])

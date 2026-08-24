@@ -765,8 +765,8 @@ pub struct WorldPosition {
     pub orientation: f32,
 }
 
-pub fn parse_login_verify_world(body: &[u8]) -> Result<WorldPosition, Error> {
-    let mut reader = Reader::new(body, "SMSG_LOGIN_VERIFY_WORLD");
+fn parse_world_position(body: &[u8], packet: &'static str) -> Result<WorldPosition, Error> {
+    let mut reader = Reader::new(body, packet);
     let position = WorldPosition {
         map: reader.u32()?,
         x: reader.f32()?,
@@ -776,6 +776,14 @@ pub fn parse_login_verify_world(body: &[u8]) -> Result<WorldPosition, Error> {
     };
     reader.finish()?;
     Ok(position)
+}
+
+pub fn parse_login_verify_world(body: &[u8]) -> Result<WorldPosition, Error> {
+    parse_world_position(body, "SMSG_LOGIN_VERIFY_WORLD")
+}
+
+pub fn parse_new_world(body: &[u8]) -> Result<WorldPosition, Error> {
+    parse_world_position(body, "SMSG_NEW_WORLD")
 }
 
 /// The keepalive. `latency` is the client's own estimate, in milliseconds.

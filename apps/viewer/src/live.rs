@@ -529,6 +529,23 @@ pub fn answer_teleport(live: &mut LiveWorld) -> bool {
     true
 }
 
+/// Acknowledges a transfer to another map and applies its destination to the
+/// live world.
+pub fn answer_worldport(chain: &mut Chain, live: &mut LiveWorld) -> Result<bool> {
+    let Some(position) = live.state.pending_worldport else {
+        return Ok(false);
+    };
+    let (directory, name) = map_directory(chain, position.map)?;
+    live.connection.acknowledge_worldport()?;
+    live.state.pending_worldport = None;
+    live.map_id = position.map;
+    live.map_directory = directory;
+    live.map_name = name;
+    live.position = Vec3::new(position.x, position.y, position.z);
+    live.orientation = position.orientation;
+    Ok(true)
+}
+
 pub fn replicate(
     state: &mut world::WorldState,
     packets: &[world::client::Packet],

@@ -1051,6 +1051,9 @@ pub struct Replication {
     /// Teleports the server is waiting to have acknowledged. Any number above
     /// zero means the caller owes it a reply before movement works again.
     pub teleports: usize,
+    /// Cross-map transfers folded this batch and waiting for their world-port
+    /// acknowledgement.
+    pub worldports: usize,
     pub destroys: usize,
     /// Names that arrived this batch, already folded into [`WorldState::names`].
     pub names: usize,
@@ -1382,6 +1385,9 @@ pub struct WorldState {
     /// then silently discards every movement packet the client sends and the
     /// character is frozen while appearing to walk.
     pub pending_teleport: Option<crate::protocol::Teleport>,
+    /// The destination of a cross-map transfer, waiting for the client to
+    /// acknowledge it and rebuild the local world.
+    pub pending_worldport: Option<crate::protocol::WorldPosition>,
     /// Where the server sent this character's ghost, while a marker should be
     /// showing. `None` both before dying and once the server clears it.
     pub release_location: Option<crate::death::ReleaseLocation>,
@@ -1554,6 +1560,19 @@ pub struct WorldState {
 impl WorldState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn begin_worldport(&mut self, position: crate::protocol::WorldPosition) {
+        self.entities.clear();
+        self.casts.clear();
+        self.auras.clear();
+        self.mirror_timers.clear();
+        self.attacking.clear();
+        self.pending_teleport = None;
+        self.loot = None;
+        self.release_location = None;
+        self.corpse_location = None;
+        self.pending_worldport = Some(position);
     }
 
     /// Remember where the auction search that is going out was asked to
@@ -2487,6 +2506,19 @@ impl WorldState {
 
         for packet in packets {
             match packet.opcode {
+                crate::opcode::server::NEW_WORLD => {
+                    match crate::protocol::parse_new_world(&packet.body) {
+                        Ok(position) => {
+                            report.worldports += 1;
+                            self.begin_worldport(position);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
                 crate::opcode::server::UPDATE_OBJECT
                 | crate::opcode::server::COMPRESSED_UPDATE_OBJECT => {
                     let compressed =
