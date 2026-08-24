@@ -822,6 +822,13 @@ impl Channel {
         self.playing
     }
 
+    pub fn stop(&mut self) {
+        if let Some(sink) = self.sink.take() {
+            sink.stop();
+        }
+        self.playing = None;
+    }
+
     /// Starts `wanted` if it is not already playing, or stops everything when
     /// `wanted` is `None`.
     ///
@@ -976,6 +983,13 @@ impl Effects {
     pub fn sweep(&mut self) -> usize {
         self.playing.retain(|sink| !sink.empty());
         self.playing.len()
+    }
+
+    pub fn stop(&mut self) {
+        for sink in self.playing.drain(..) {
+            sink.stop();
+        }
+        self.delayed.clear();
     }
 
     /// Queues a sound to play once `delay` has passed.

@@ -23,6 +23,7 @@ pub mod destroy_prompt;
 pub mod guild;
 pub mod loot;
 pub mod combat_text;
+pub mod status_text;
 pub mod loot_sparkle;
 pub mod marker;
 pub mod minimap;

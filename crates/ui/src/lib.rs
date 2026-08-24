@@ -43,6 +43,7 @@ pub use edit::{EditAction, EditState};
 pub use element::{Anchor, Element};
 pub use frames::chat::{ChatEntry, ChatKind};
 pub use frames::combat_text::{CombatTextKind, FloatingText};
+pub use frames::status_text::{StatusText, ACTION_STATUS_FADE_TIME};
 pub use frames::{
     AuctionClick, AuctionRow, AuctionTab, AuctionView,
     CastBarView, DestroyAnswer, DestroyPromptView,
@@ -110,6 +111,7 @@ pub struct HudData<'a> {
     /// Damage numbers in flight, world-anchored like the target marker rather
     /// than placed by an [`Element`] -- see [`frames::combat_text`].
     pub combat_text: &'a [frames::combat_text::FloatingText],
+    pub status_text: Option<&'a frames::status_text::StatusText>,
     /// The chat scrollback, oldest first. Owned and capped by the caller: this
     /// crate must not accumulate an unbounded log nobody drains.
     pub chat: &'a [frames::chat::ChatEntry],
@@ -754,6 +756,14 @@ impl Hud {
                 egui::Id::new("hud-combat-text"),
             ));
             frames::combat_text::draw(&painter, data.combat_text, &style);
+        }
+
+        if let Some(status_text) = data.status_text {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new("hud-action-status"),
+            ));
+            frames::status_text::draw(&painter, status_text);
         }
 
         // **Bottom of the interface first**, so a window that wants an answer

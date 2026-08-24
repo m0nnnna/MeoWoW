@@ -4118,6 +4118,7 @@ struct App {
     /// Damage numbers currently rising and fading, oldest first. Pruned every
     /// frame once a number's age passes `1.0` -- see [`PendingCombatText`].
     combat_text: Vec<PendingCombatText>,
+    status_text: Option<PendingStatusText>,
     /// The action slot most recently activated, and when -- a brief flash so
     /// a *click* has something to show for itself.
     ///
@@ -4271,6 +4272,8 @@ struct App {
     /// true. A guid that is in it now and was not before has just noticed
     /// somebody.
     attackers: std::collections::HashSet<u64>,
+    sound_enabled: bool,
+    music_enabled: bool,
     audio: Option<rodio::OutputStream>,
     music: sound::Channel,
     ambience: sound::Channel,
@@ -5112,6 +5115,11 @@ struct PendingCombatText {
     spawned: Instant,
 }
 
+struct PendingStatusText {
+    text: String,
+    spawned: Instant,
+}
+
 /// A line this client generated itself, shaped like one off the wire.
 ///
 /// Sharing the wire type means the scrollback has one thing in it and one way
@@ -5342,6 +5350,7 @@ impl App {
             steering: false,
             chat: Vec::new(),
             combat_text: Vec::new(),
+            status_text: None,
             action_flash: None,
             entity_flip: false,
             flip_winding: false,
@@ -5370,6 +5379,8 @@ impl App {
             pending_sounds: Vec::new(),
             impact_delay_ms,
             attackers: std::collections::HashSet::new(),
+            sound_enabled: true,
+            music_enabled: true,
             // Opened once, here, rather than on the first sound: enumerating
             // devices takes long enough to be a visible hitch, and doing it
             // mid-play would put that hitch on a zone boundary.
@@ -6263,6 +6274,21 @@ impl App {
                             self.activate_slot(bar, slot);
                             window.request_redraw();
                             return;
+                        }
+                        if self.modifiers.control_key() {
+                            match code {
+                                KeyCode::KeyS => {
+                                    self.toggle_sound();
+                                    window.request_redraw();
+                                    return;
+                                }
+                                KeyCode::KeyM => {
+                                    self.toggle_music();
+                                    window.request_redraw();
+                                    return;
+                                }
+                                _ => {}
+                            }
                         }
                         // Space jumps in the world and raises a free camera.
                         // Handled before the toggles so it can fall through to
@@ -8827,6 +8853,12 @@ impl App {
         if self.audio.is_none() {
             return;
         }
+        if !self.sound_enabled {
+            self.effects.stop();
+            self.ambience.stop();
+            self.footstep_phase = None;
+            self.pending_sounds.clear();
+        }
         // **Three timers, because `sound` did not move when the obvious fix
         // landed.** Caching clip bytes took archive reads from 145 to 2 and
         // the phase stayed at 3.7 ms, so reading the file was never the cost
@@ -8879,6 +8911,8 @@ impl App {
             .zone_with_overrides(context.area, context.zone_music, context.ambience)
             .map(|zone| zone.for_time(when))
             .unwrap_or((None, None));
+        let music = music.filter(|_| self.music_enabled);
+        let ambience = ambience.filter(|_| self.sound_enabled);
 
         // One roll per call is fine: a channel only consults it when it is
         // actually starting something, which is rare.
@@ -9003,19 +9037,23 @@ impl App {
             }
             self.attackers = now;
         }
-        for (id, impact) in std::mem::take(&mut self.pending_sounds) {
-            if impact {
-                // Held back so the clang lands with the blade rather than with
-                // the packet -- see `Effects::delayed`.
-                self.effects
-                    .play_after(Duration::from_millis(self.impact_delay_ms), id, volume);
-            } else {
-                self.effects
-                    .play(mixer, &self.sounds, &mut self.chain, id, volume, roll);
+        if self.sound_enabled {
+            for (id, impact) in std::mem::take(&mut self.pending_sounds) {
+                if impact {
+                    // Held back so the clang lands with the blade rather than with
+                    // the packet -- see `Effects::delayed`.
+                    self.effects
+                        .play_after(Duration::from_millis(self.impact_delay_ms), id, volume);
+                } else {
+                    self.effects
+                        .play(mixer, &self.sounds, &mut self.chain, id, volume, roll);
+                }
             }
+            self.effects
+                .tick(mixer, &self.sounds, &mut self.chain, roll);
+        } else {
+            self.pending_sounds.clear();
         }
-        self.effects
-            .tick(mixer, &self.sounds, &mut self.chain, roll);
         self.music.play(
             mixer,
             &self.sounds,
@@ -9033,6 +9071,43 @@ impl App {
             roll,
         );
         self.sound_play_ms = timing_play.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    fn toggle_sound(&mut self) {
+        self.sound_enabled = !self.sound_enabled;
+        if !self.sound_enabled {
+            self.effects.stop();
+            self.ambience.stop();
+            self.footstep_phase = None;
+            self.pending_sounds.clear();
+        }
+        let text = if self.sound_enabled {
+            "Sound Effects Enabled"
+        } else {
+            "Sound Effects Disabled"
+        };
+        tracing::info!("{text}");
+        self.status_text = Some(PendingStatusText {
+            text: text.to_string(),
+            spawned: Instant::now(),
+        });
+    }
+
+    fn toggle_music(&mut self) {
+        self.music_enabled = !self.music_enabled;
+        if !self.music_enabled {
+            self.music.stop();
+        }
+        let text = if self.music_enabled {
+            "Music Enabled"
+        } else {
+            "Music Disabled"
+        };
+        tracing::info!("{text}");
+        self.status_text = Some(PendingStatusText {
+            text: text.to_string(),
+            spawned: Instant::now(),
+        });
     }
 
     /// Reads names and icons for whatever the character knows, once.
@@ -12985,6 +13060,13 @@ impl App {
                 })
             })
             .collect();
+        let status_text = self.status_text.as_ref().and_then(|entry| {
+            let elapsed = now.saturating_duration_since(entry.spawned).as_secs_f32();
+            (elapsed < ui::ACTION_STATUS_FADE_TIME).then(|| ui::StatusText {
+                text: entry.text.clone(),
+                elapsed,
+            })
+        });
 
         // Rendered fresh every frame from the messages that arrived, so names
         // that resolve after a line was received still reach it.
@@ -14112,6 +14194,7 @@ impl App {
                     loot_sparkle_time: self.started.elapsed().as_secs_f32(),
                     corpse_marker,
                     combat_text: &combat_text,
+                    status_text: status_text.as_ref(),
                     chat: &chat,
                     composing: composing.as_deref(),
                     bars: &bars,
