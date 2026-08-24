@@ -1887,6 +1887,19 @@ impl World {
     /// *origin*, so Ironforge is one placement 1,058 units across owned by
     /// one tile -- every query anywhere inside it reaches that one grid, and
     /// a per-tile figure would show eight quiet tiles and hide the ninth.
+    /// How many distinct skeletons are being posed, and how many entity
+    /// groups are being drawn.
+    ///
+    /// **The numbers that predict a crowd.** Posing is per *bucket* -- one
+    /// per (display, motion) pair -- so forty players in forty different
+    /// animations is forty skeletons a frame, while forty in the same idle is
+    /// one. Nothing in the profile said which of those was happening, so
+    /// there was no way to tell a frame that is busy from a frame that is
+    /// merely full. See `update_animations`.
+    pub fn entity_load(&self) -> (usize, usize) {
+        (self.entity_bones.len(), self.entities.len())
+    }
+
     /// Instance buffers reused against created since the session began.
     /// See [`InstancePool`].
     pub fn instance_pool_counts(&self) -> (u64, u64) {

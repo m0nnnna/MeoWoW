@@ -190,6 +190,26 @@ struct Args {
     #[arg(long)]
     no_shadows: bool,
 
+    /// Duplicate every replicated creature this many times, spread around
+    /// where it stands.
+    ///
+    /// **Because the question has moved from "is it fast" to "what happens
+    /// when it is busy".** A hundred frames a second in an empty abbey says
+    /// nothing about a city with forty people throwing spells, and waiting to
+    /// find out is not a measurement -- it is a report. This makes the
+    /// crowded case reproducible on a realm with four characters on it, at a
+    /// number somebody chose.
+    ///
+    /// Duplicates rather than invented creatures: every copy goes through the
+    /// same look resolution, the same bucketing, the same instance buffer and
+    /// the same pose as the thing it was copied from, so what it measures is
+    /// the real path rather than a model of it. `1` is off.
+    ///
+    /// **Not a benchmark of the server.** Nothing here is sent anywhere; the
+    /// copies exist for exactly as long as one frame's drawn list.
+    #[arg(long, default_value_t = 1)]
+    stress: u32,
+
     /// Draw the headless frame this many times and report what it costs.
     ///
     /// **A steady-state number, which one frame cannot give.** The first
@@ -1720,6 +1740,39 @@ struct Atmosphere<'a> {
 /// surface that asked was told it was lit. A shadow box aimed at nothing and
 /// a shadow feature that does not exist are the same picture, which is
 /// exactly why the A/B was worth taking before believing the first one.
+/// Multiplies the drawn list, spreading the copies out. See [`Args::stress`].
+///
+/// **Jittered, and by a hash rather than a counter.** Copies stacked at one
+/// point would share a tile, a cell and very likely a bucket, so the load
+/// would be a hundred creatures the client can treat as one -- which is the
+/// cheap case, not the expensive one. Spread out they stream, cull, collide
+/// and pose independently, the way a crowd does.
+///
+/// The guid is offset into a range the server cannot use, because every cache
+/// downstream is keyed by it -- bone buffers, emitter identities, remembered
+/// looks. A copy that collided with a real guid would quietly replace a real
+/// creature's state and the measurement would be of something else.
+fn stress_crowd(drawn: &mut Vec<live::Entity>, factor: u32) {
+    if factor <= 1 || drawn.is_empty() {
+        return;
+    }
+    let original = drawn.len();
+    for copy in 1..factor as u64 {
+        for index in 0..original {
+            let mut clone = drawn[index].clone();
+            // A cheap spatial hash of (guid, copy): far enough apart to land
+            // in different grid cells, close enough to stay in view.
+            let mix = clone.guid.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ copy.wrapping_mul(0x1234_5678_9ABC_DEF);
+            let dx = ((mix >> 8) & 0x3F) as f32 - 32.0;
+            let dy = ((mix >> 20) & 0x3F) as f32 - 32.0;
+            clone.position.x += dx;
+            clone.position.y += dy;
+            clone.guid = clone.guid.wrapping_add(copy << 56);
+            drawn.push(clone);
+        }
+    }
+}
+
 /// The present mode asked for, if the surface supports it.
 ///
 /// **Falls back rather than failing, and says so.** A mode the driver does not
@@ -1984,6 +2037,21 @@ struct FrameProfile {
     /// Entity instance buffers reused against created -- see `InstancePool`.
     buffers_reused: u64,
     buffers_created: u64,
+    /// What a crowd costs, counted rather than inferred.
+    ///
+    /// **The frame is fine at a hundred and something and the question has
+    /// moved on**: what happens in a city with forty people throwing spells.
+    /// Every phase left is roughly a millisecond, and which of them explodes
+    /// depends on things nothing was reporting -- how many *distinct*
+    /// skeletons are being posed, how many particle systems are alive, how
+    /// many sprites they are producing. A frame that is busy and a frame that
+    /// is merely full look identical in a millisecond total, and they have
+    /// completely different futures.
+    skeletons: usize,
+    entity_groups: usize,
+    live_systems: usize,
+    live_sprites: usize,
+    live_ribbons: usize,
     /// Buffer writes staged this frame, and their bytes -- see `Gpu::writes`.
     /// **The staging belt is flushed at `submit`**, so every one of these is
     /// paid for in a phase that names none of them.
@@ -2056,7 +2124,9 @@ impl FrameProfile {
              collision: {} queries, {} candidates ({} per query) | \
              clips {} played from {} reads, tracks {} started from {} reads | \
              instance buffers {} reused, {} created | \
-             {} buffer writes staging {} KiB{}",
+             {} buffer writes staging {} KiB\
+             load: {} skeletons over {} entity groups, {} emitters alive \
+             ({} sprites, {} trail quads){}",
             self.terrain_draws,
             self.model_draws,
             self.shadow_draws,
@@ -2113,6 +2183,11 @@ impl FrameProfile {
             self.buffers_created,
             self.write_calls,
             self.write_bytes / 1024,
+            self.skeletons,
+            self.entity_groups,
+            self.live_systems,
+            self.live_sprites,
+            self.live_ribbons,
             // Only where a spread was gathered, which is the log's line and
             // not the window's -- the window shows the frame that just
             // happened and has no second to average over.
@@ -6716,6 +6791,8 @@ impl App {
                         drawn.retain(|entity| entity.guid != live.guid);
                     }
                     live.ease_facings(&mut drawn, self.frame_ms / 1000.0);
+                    // **A crowd, on demand.** See `Args::stress`.
+                    stress_crowd(&mut drawn, self.args.stress);
                     let placements: Vec<crate::world::EntityPlacement> =
                         drawn
                             .iter()
@@ -7031,6 +7108,7 @@ impl App {
             profile.collision = world.collision_probe();
             (profile.buffers_reused, profile.buffers_created) =
                 world.instance_pool_counts();
+            (profile.skeletons, profile.entity_groups) = world.entity_load();
         }
         // **Read here, after the draw and before the submit that pays for
         // them.** Taken any earlier and the frame's own writes would be
@@ -7044,6 +7122,9 @@ impl App {
         let (ambience_reads, ambience_starts) = self.ambience.track_reads();
         profile.track_reads = music_reads + ambience_reads;
         profile.track_starts = music_starts + ambience_starts;
+        profile.live_systems = r.emitters.live_systems;
+        profile.live_sprites = r.emitters.live_sprites;
+        profile.live_ribbons = r.emitters.live_ribbons;
         profile.redraw_ms = redraw_started.elapsed().as_secs_f32() * 1000.0;
         self.profile = profile;
 

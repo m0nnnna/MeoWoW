@@ -20,6 +20,11 @@ use glam::Vec3;
 use mpq::Chain;
 
 /// One thing standing in the world near the player.
+///
+/// `Clone` for one reason: `--stress` multiplies the drawn list to make a
+/// crowd reproducible on a realm with four characters on it. Nothing in the
+/// ordinary path copies these.
+#[derive(Clone)]
 pub struct Entity {
     pub guid: u64,
     /// `CreatureDisplayInfo` id, which is what selects a model and its skins.
