@@ -8153,3 +8153,190 @@ had seen yet.
   produces text is the mistake `describe_cast_failure` exists to refuse.
 * **Mounts are untested.** A mount is a display change like any other and
   should already work; nothing here has ridden one.
+
+## 4.34: the frame, and eight hypotheses that were wrong
+
+`foss-wow#146` and `#147`, in one sentence: *"a user on an actual client can
+get 160+ but on ours they get 13 frames per second"* -- in Ironforge.
+
+This rung is different from every other one in this file. Nothing was
+discovered about a format, no opcode was read for the first time, and the
+client does not do anything it could not do before. What changed is that the
+frame got **four and a half times faster in the worst case**, and the useful
+record is not the list of fixes. It is how they were found, because the first
+eight guesses were wrong and every one was killed by a number that cost less
+to gather than the argument for it took to make.
+
+### The arc
+
+    Ironforge, at the report            13 fps
+    Northshire abbey, first measured    78.8 fps, 18.79 ms redraw
+    ...after                           111.7 fps, 12.96 ms redraw
+    ...400 bodies and 17,000 particles  76.9 fps
+
+Ironforge's draw calls went **11,506 to 2,322** and its triangles 3.43M to
+1.0M. The abbey route's frame lost six milliseconds, and its slow seconds -- a
+worst frame over 25 ms -- went from six in fifty-one to two in eighty-four.
+
+### What was actually wrong
+
+Five things, and only the first is a rendering problem.
+
+* **Nothing was culled, anywhere.** Every resident tile's 256 terrain chunks,
+  every model group and all 1,162 of Ironforge's WMO batches were submitted
+  every frame -- and the sun's depth pass, which covers a 110-unit box, was
+  handed the whole nine-tile resident world a second time. 4.29 shipped naming
+  that as the first thing to measure if the frame rate was short, and it was
+  right.
+* **`collision::World::slide` was O(n) grid lookups and O(n^2) triangle tests
+  per footstep.** It narrows through the grid once and then, for *every
+  candidate that came back*, called `wall_exemption` -- which is itself a
+  `floor_under`, which is another grid lookup. In a building that is a thousand
+  triangles per step. Measured live at **4,193 lookups and 3.1 million
+  candidate triangles in one frame**.
+* **The interior minimap rescanned the whole index once per WMO group, per
+  frame.** `Translate::wmo_tiles` walks all 18,644 entries; Ironforge has 104
+  groups. About two million string comparisons a frame, for a picture in the
+  corner of the screen.
+* **Music and ambience were re-read from the MPQ every time a loop ended.**
+  `Channel::play` returns early only while the sink is still running, so the
+  moment a short ambience loop finished it decompressed the file again.
+* **Every entity group allocated a fresh `wgpu::Buffer` every frame.**
+  `set_entities` rebuilds the drawn list sixty times a second and each `Group`
+  owned a new buffer -- a few dozen GPU allocations and destructions per frame,
+  every one of them a resource `queue.submit` then had to track.
+
+### The eight wrong guesses
+
+In order, with what refuted each. This is the part worth keeping.
+
+1. **The camera.** It samples four orbit rays with eighteen ground steps each;
+   obviously the cost. It was 3.4 ms at worst and never the largest thing.
+2. **Draw calls, after culling.** `encode` went flat at 0.8-1.6 ms while frames
+   swung between 10 and 39 ms. The draw was innocent and the profile said so.
+3. **String building.** The debug window walks every replicated object and
+   formats a paragraph every frame. 0.10 ms.
+4. **Text layout.** If not building the strings then surely laying them out --
+   egui re-lays text that changes every frame. The stats window is 0.23 ms.
+5. **Vsync pacing.** A 6.4 ms gap between frames with a 38 ms worst looked
+   exactly like a client missing its refresh window. `--present-mode immediate`
+   against the default: 6.30 ms versus 6.67. It was never the display.
+6. **The staging belt.** `write_buffer` stages rather than copies and the belt
+   is flushed at submit, so 275 writes a frame ought to land there. Fitting
+   submit against draws *and* writes together -- they are confounded at
+   r = +0.62 -- gives 3.46 ms from draws and **0.07 ms from staging**.
+7. **The interface.** Headless encodes and submits the entire world in 0.73 ms
+   for Northshire; live `encode` plus `submit` is 5.51 ms, and the only thing
+   the live path does that headless does not is draw the HUD. The interface is
+   **0.37 ms**.
+8. **Seven hundred allocations a frame.** The most-called function in the frame
+   allocated a `Vec` to hold one grid cell. Removing it moved `camera` by
+   nothing at all -- and this one had been *measured* first, which makes it the
+   worst of the eight.
+
+### The instrument was the bug, once
+
+Worth its own heading, because it wasted more time than any of the eight.
+
+`outside = frame_ms - redraw_ms` subtracted *this* frame's redraw from
+`frame_ms`, which runs start-to-start and therefore describes the **previous**
+frame. Two different frames. Worse, the worst-frame picker selects the largest
+`frame_ms` -- by definition a frame whose predecessor was slow -- so the
+subtraction charged that slow predecessor's redraw to this frame's gap, every
+single time.
+
+It manufactured a 6.3 ms phantom gap, which is what hypothesis 5 was chasing,
+and which survived turning vsync off **because it was never about vsync**.
+Measured at both ends instead, the gap is 0.37 ms and the frame loop is very
+nearly gapless.
+
+**A duration that is the difference of two things measured on different frames
+is not a measurement.** Stamp both ends.
+
+### What replaced guessing
+
+The method, stated plainly, because it is the transferable part.
+
+* **Split the bucket; do not name a suspect.** Every fix here was found by
+  taking one phase apart, never by reasoning about which it must be. `other`
+  hid the collision cost behind a plausible story about draw calls; `ui` hid
+  the minimap's index scan for six rounds; `sound` hid the music re-read one
+  line past where a timer stopped.
+* **Count, do not time.** Six probes exist now -- the collision grid, the
+  minimap index, the two sound caches, the instance pool and the staging belt
+  -- and every one reports **two numbers**. A cache that has quietly stopped
+  caching produces an identical picture and an identical frame; only a ratio
+  says otherwise. A timing assertion would be flaky, would pass on a fast
+  machine with the bug present, and would say nothing about why.
+* **The negative control is the point.** `--no-cull` proves the culling changes
+  no pixels, but that only means something because deliberately pushing the
+  frustum planes 12 units inward makes the same comparison report 1,907
+  differing pixels against 0. Likewise the collision tests: on the old
+  ordering, one footstep reports 2,307 lookups against a bound of 40.
+* **Workload variance eats small wins.** Two runs of "the same route" differed
+  by 19% in draw count, which is more than any single fix here was worth.
+  `--bench` has +/-40% spread *between* runs even taking the minimum within
+  one. Compare within a session, or say that you cannot.
+
+### What was measured and left alone
+
+* **Terrain batching.** 596 of 1,516 draws are terrain chunks, each with a
+  bind-group switch, and a texture array would take a tile from 256 draws to
+  about one. Bounded by *disabling terrain draws outright and benching*:
+  Northshire 1,150 draws at 0.73 ms against 420 at 0.40, Ironforge 2,322 at
+  1.93 against 1,569 at 1.34. **0.3 to 0.6 ms**, for the riskiest change on the
+  list. Deferred, after being wrongly talked up twice.
+* **GPU compute.** Asked directly: can more go to the card. `--bench` says the
+  world costs **2 ms of GPU**, and quadrupling the pixel count moves it 0.2 ms,
+  so nothing is fill-rate bound and the card is asleep. Only `anim` and
+  `emitters` are genuinely movable, about 2.7 ms, and both are multi-day
+  changes with readback problems. `submit` cannot move because it *is* the CPU
+  talking to the GPU.
+
+### Does it survive a crowd
+
+The question the frame rate was actually about: what happens in a city with
+forty people throwing spells. `--stress N` duplicates every replicated creature
+N times, spread by a hash rather than stacked -- copies at one point share a
+tile, a cell and an animation bucket, which is the cheap case.
+
+    multiplier   instances   sprites   entity groups   skeletons     fps
+    x1               5,962         0               0           0   111.7
+    x20             13,427     9,565             210          39    87.4
+    x40             20,982    17,186             215          39    76.9
+
+**Every phase scales with the thing it should and nothing is superlinear.**
+Doubling the crowd multiplies instances by 1.56 and `entities` by 1.56;
+sprites by 1.80 and `emitters` by 1.81; skeletons by 1.01 and `anim` by 0.99.
+Draw calls went *down*, because the extra copies spread out and were culled.
+
+The two structural reasons it holds up both predate this rung.
+
+* **Posing is per bucket, not per creature** -- one pose per (display, motion)
+  pair. Thirty-nine skeletons for four hundred bodies, and `anim` is flat
+  across the whole range. It does not care how many creatures there are, only
+  how many distinct animations.
+* **Instancing and frustum culling**, which is why four hundred bodies draw in
+  fewer calls than two hundred packed into a smaller area.
+
+Per unit: 0.165 us per instance, 0.159 us per sprite. Both cheap, both linear.
+
+### Still not done
+
+* **No portal culling.** Frustum culling only, so indoors this draws every room
+  inside the frustum where the original draws the room you are in plus what is
+  visible through the doorways. In Ironforge the city *is* the frustum, which
+  is why it remains the worst case. The parser already reads the portal chunks
+  -- Ironforge has 134 portals -- and nothing uses them.
+* **No level of detail, anywhere.** M2s always load LOD 0 and terrain has one
+  resolution. This is most of how the original draws a city cheaply.
+* **A fixed-cost spike of 43 to 48 ms**, two or three per run, present at every
+  crowd size and therefore not a load problem. Almost certainly tile streaming
+  or a first-time model load. It is the only thing in the profile that does not
+  scale with anything, and it has not been looked at.
+* **The interface snapshot is still rebuilt every frame** -- a thousand lines
+  of cloning and formatting -- but it measures 0.11 ms now that the minimap is
+  fixed, so there is nothing left there to win.
+* **`--screenshot` is still not perfectly reproducible.** Tile draw order is
+  sorted now, but `World::update_emitters` reads a wall clock, leaving about
+  76 pixels differing at delta <= 2 between runs.

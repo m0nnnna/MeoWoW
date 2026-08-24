@@ -65,6 +65,17 @@ Two scoping facts that were decided before it started, and held:
   have seen them; that is solved by recording what the client already streams,
   keyed by realm, starting empty.
 
+**4.34 is the frame, and it is the one rung that discovered nothing.** No
+format was measured and no opcode was read; Ironforge simply went from 13
+frames a second to a frame that holds 77 with four hundred bodies and
+seventeen thousand particles on screen. What is worth reading there is not the
+list of fixes but **the eight hypotheses that were wrong before them** —
+the camera, draw calls, string building, text layout, vsync, the staging belt,
+the interface, and finally an allocation count that had already been measured.
+Every one died to a counter. The rules that came out of it are under "Making
+it fast" below, and the one that matters most is that the *instrument* was the
+bug once, and cost more than any of the eight.
+
 **4.32 is the way in, and it is confirmed at the window**: `wow-viewer` with no
 arguments opens a sign-in screen, so double-clicking the executable is now the
 ordinary way to start this client. Everything above it was reachable only by
@@ -89,6 +100,7 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation, timed events, particles/ribbons), WMO, ADT/WDT, MH2O — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming, liquids, M2 emitters, sun shadows — done. **`--screenshot` renders one frame headless and draws NO HUD** (see the instrument rule below). Model files, skeletons and the creature tables are cached **per file** as well as per display id, so a zone of humanoids loads one `HumanMale.m2` rather than one per NPC; every load prints its own cost breakdown |
+| Frame time | **Frustum culling on terrain chunks, model groups and each WMO *room*, in the visible pass and the sun's.** Ironforge went 11,506 draws/frame to 2,322 and 13fps to a frame that holds 77fps with 400 bodies and 17,000 particles on screen. Drawing the world costs **2ms of GPU**; everything else in the frame is CPU. **No portal culling and no level of detail** — the two systems the original has and this does not, and why Ironforge is still the worst case. See 4.34 |
 | Protocol | 3.1–3.5 done against a live realm, two clients at once. Replicated creatures interpolate, turn and animate; **other players do not** — see the defect below |
 | World | Day/night from `Light.dbc`, a real sky gradient, sun and moon, weather that falls, game objects drawn. **A star dome, a cloud band and the zone skybox `LightSkybox` names** — which on Azeroth and Kalimdor is none, measured. No moon texture, one cloud layer |
 | Shadows | **A directional shadow map from the sun**, cast by terrain, models and alpha-keyed foliage, received by everything but liquid. One cascade around the camera; `--no-shadows` and `--shadow-dump` are the instruments |
@@ -148,6 +160,33 @@ findings: the second one is not a Rust fault at all.
 **the host is positional and the character is `--enter`**, where the viewer
 takes `--character`. `--walk 20`, `--say`, `--units` and the per-milestone
 probes hang off it.
+
+**The frame instruments, and what each is for.** Every one exists because a
+guess was wrong; see 4.34, where eight of them were.
+
+* **`--log-file`** now carries a per-frame breakdown once a second, reporting
+  **the worst frame of that second** rather than whichever one the clock landed
+  on — a once-a-second snapshot of a stutter is a lottery, and the first
+  version of this reported 79-103fps for a session whose complaint was that
+  moving indoors was slow.
+* **`--bench N`** renders the headless frame N times and polls the GPU to
+  completion, reporting CPU and GPU separately. Takes the **minimum** of N,
+  because the first frame of a session pays for pipeline compilation and cold
+  residency — 48ms against a 1.8ms repeat, so one `--screenshot` timing
+  measures warm-up and nothing else. It still has **±40% spread between
+  runs**: compare within one session or say that you cannot.
+* **`--no-cull`** submits everything. Two `--screenshot` runs differing by that
+  flag alone must produce the same pixels, and the negative control is what
+  makes that mean anything — pushing the planes 12 units inward makes the
+  same comparison report 1,907 differing pixels against 0.
+* **`--present-mode`** names what the surface has silently been doing
+  (`caps.present_modes[0]`, which is `Fifo` here) and lets it be changed. It
+  exists to tell "the client is slow" from "the client is waiting for the
+  monitor".
+* **`--stress N`** duplicates every replicated creature N times, spread by a
+  hash rather than stacked, so a crowd is reproducible on a realm with four
+  characters on it. Copies at one point share a tile, a cell and an animation
+  bucket, which is the *cheap* case.
 
 **Known defect: replicated *players* do not interpolate.** A creature moves by
 `SMSG_MONSTER_MOVE`, which carries a start, an end and a duration; a player
@@ -921,6 +960,49 @@ the full account is in `docs/ROADMAP.md`.
 - **Per character, not per client.** One shared action-bar set meant a rogue
   logged in holding a warrior's bar: every icon drew, every key pressed, every
   cast was refused, and it read as "the bars are broken".
+
+### Making it fast
+
+Eight hypotheses were wrong in a row in 4.34 and every one died to a counter.
+These are what replaced guessing.
+
+- **Split the bucket; do not name a suspect.** Every fix in that rung came from
+  taking one phase apart, never from reasoning about which it must be. `other`
+  hid an O(n²) in collision behind a plausible story about draw calls; `ui`
+  hid the minimap rescanning its whole index for six rounds; `sound` hid the
+  music re-read one line past where a timer stopped. **The suspect that looks
+  obvious is the one already accounted for** — it looks obvious because you
+  can see it.
+- **Count, do not time.** Six probes report **two numbers** each: the collision
+  grid, the minimap index, the two sound caches, the instance pool and the
+  staging belt. A cache that has quietly stopped caching draws an identical
+  picture and takes an identical frame; only a ratio says otherwise. A timing
+  assertion is flaky, passes on a fast machine with the bug present, and says
+  nothing about why. The regression tests assert *lookups*, not milliseconds.
+- **A duration that is the difference of two things measured on different
+  frames is not a measurement.** `outside = frame_ms - redraw_ms` subtracted
+  this frame's redraw from the previous frame's period, and the worst-frame
+  picker selected frames whose *predecessor* was slow — manufacturing a
+  6.3ms phantom gap that survived turning vsync off, because it was never about
+  vsync. Stamp both ends.
+- **A single-variable fit on confounded inputs will name the wrong cause.**
+  `submit` against draw count alone implied a 2.1ms fixed cost and sent the
+  investigation after the staging belt. Fitting draws *and* write-calls
+  together — they correlate at r = +0.62 — gives 3.46ms from draws and
+  **0.07ms from staging**. If two candidates move together, one regression
+  cannot tell them apart.
+- **Bound the win before building the fix.** Terrain batching was talked up
+  twice on reasoning. Disabling the terrain draws outright and benching put its
+  ceiling at **0.3-0.6ms**, for the riskiest change on the list. Deleting the
+  work is nearly always cheaper than optimising it, and it answers exactly.
+- **Workload variance eats small wins.** Two runs of "the same route" differed
+  19% in draw count — more than any single fix in that rung was worth. Two
+  fixes were credited and then withdrawn for this. Check the *scene* matches
+  before comparing the frame.
+- **The absence of a system is not a pathology.** Once the O(n²)s and the
+  rescans are gone, what is left is what this client does not have: no portal
+  culling, no LOD. Those are features with milestones, not optimisations, and
+  saying so is more useful than grinding another tenth of a millisecond.
 
 ### Writing the code around it
 
