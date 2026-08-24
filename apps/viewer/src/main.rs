@@ -3847,6 +3847,15 @@ struct App {
     /// read as the drag "sticking" rather than as the mouse having gone
     /// somewhere.
     cursor_captured: bool,
+    /// Set from a `Resized` event reporting a zero-area window -- what
+    /// Windows sends a minimized window's client area as, rather than any
+    /// `Occluded` event, which this platform does not deliver. While set,
+    /// `redraw` skips the surface acquire and present entirely instead of
+    /// repeatedly configuring a degenerate swapchain and blocking on
+    /// `get_current_texture` against a surface nothing can present to --
+    /// `foss-wow#138`, seen live as the window "closing itself out for a few
+    /// moments" on minimize.
+    minimized: bool,
     /// Where a captured pointer is pinned, and where it is put back when the
     /// button comes up. The press position, so the cursor reappears where the
     /// gesture started rather than wherever the warping left it.
@@ -5283,6 +5292,7 @@ impl App {
             dragging: false,
             last_cursor: None,
             cursor_captured: false,
+            minimized: false,
             capture_anchor: None,
             left_travel: 0.0,
             right_travel: 0.0,
@@ -6163,10 +6173,15 @@ impl App {
                 event_loop.exit()
             }
             WindowEvent::Resized(size) => {
-                r.config.width = size.width.max(1);
-                r.config.height = size.height.max(1);
-                r.surface.configure(&r.gpu.device, &r.config);
-                r.depth.resize(&r.gpu, r.config.width, r.config.height);
+                // A zero-area size is Windows' report of a minimized window,
+                // not a real target to render into -- see `App::minimized`.
+                self.minimized = size.width == 0 || size.height == 0;
+                if !self.minimized {
+                    r.config.width = size.width.max(1);
+                    r.config.height = size.height.max(1);
+                    r.surface.configure(&r.gpu.device, &r.config);
+                    r.depth.resize(&r.gpu, r.config.width, r.config.height);
+                }
                 window.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } if button == MouseButton::Left => {
@@ -6759,6 +6774,15 @@ impl App {
             ui_output.textures_delta.clear();
             return;
         };
+
+        // A minimized window has no surface worth acquiring -- movement,
+        // the network pump and sound above have already run, so the world
+        // does not desync while minimized; only the GPU work below, which
+        // nothing could see anyway, is skipped. See `App::minimized`.
+        if self.minimized {
+            ui_output.textures_delta.clear();
+            return;
+        }
 
         // Stream before drawing, so newly admitted tiles appear this frame.
         if let Some(Scene::Streaming(world)) = r.scene.as_mut() {
