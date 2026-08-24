@@ -407,6 +407,29 @@ impl World {
         self.surface_ids.push(surface_id);
     }
 
+    /// The one cell a point falls in, borrowed rather than collected.
+    ///
+    /// **A point query touches exactly one cell**, so there is nothing to
+    /// merge and nothing to deduplicate -- and `near` would nevertheless
+    /// allocate a `Vec`, copy the cell into it, sort it and dedup it. That is
+    /// the whole of `floor_under_tagged_with_id`, which is the single most
+    /// called function in the frame: the follow camera marches the ground in
+    /// up to eighteen steps per sampled yaw, three yaws per frame, each fanned
+    /// across every resident tile, and the character's own footing and the
+    /// footstep lookup ask as well. Measured at roughly seven hundred calls a
+    /// frame, all of them allocating.
+    ///
+    /// Returning a borrow rather than filling a scratch buffer is deliberate:
+    /// `slide` iterates a candidate list and calls `wall_exemption` -- and so
+    /// this -- from inside that loop, so a single shared scratch would be
+    /// corrupted by its own re-entry. An immutable borrow cannot be.
+    fn cell_at(&self, centre: Vec2) -> &[u32] {
+        self.cells
+            .get(&(cell_of(centre.x), cell_of(centre.y)))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
     /// Every triangle whose cell touches the given square, without repeats.
     fn near(&self, centre: Vec2, radius: f32) -> Vec<u32> {
         let mut found: Vec<u32> = Vec::new();
@@ -472,7 +495,13 @@ impl World {
     ) -> Option<(f32, Option<u8>, Option<u32>)> {
         let ceiling = from_z + step;
         let mut best: Option<(f32, Option<u8>, Option<u32>)> = None;
-        for index in self.near(at, 0.0) {
+        // The counters still see this: one narrowing, whatever it hands back.
+        let candidates = self.cell_at(at);
+        let mut probe = self.probe.get();
+        probe.queries += 1;
+        probe.candidates += candidates.len() as u64;
+        self.probe.set(probe);
+        for &index in candidates {
             let triangle = self.triangles[index as usize];
             let Some(z) = triangle.floor_hit(at) else {
                 continue;
@@ -1087,6 +1116,34 @@ mod tests {
             probe.queries,
             probe.candidates
         );
+    }
+
+    /// **A point query must not pay for merging cells it never touched.**
+    ///
+    /// `floor_under_tagged_with_id` is the most called function in the frame
+    /// -- the follow camera alone marches the ground eighteen times per
+    /// sampled yaw, three yaws a frame, fanned across every resident tile --
+    /// and it asks about a single point, which is a single cell. It used to
+    /// go through `near`, which allocates, copies, sorts and deduplicates.
+    ///
+    /// Asserting the *answer* is unchanged rather than that it is fast: the
+    /// fast path is only allowed to exist because one cell cannot contain a
+    /// duplicate, and the thing that would break is the height it returns.
+    #[test]
+    fn the_single_cell_path_answers_exactly_as_the_general_one_does() {
+        let world = world_with(a_crowded_floor(24));
+        for (x, y) in [(0.1, 0.1), (2.0, 2.0), (3.7, 1.2), (5.9, 5.9)] {
+            let at = Vec2::new(x, y);
+            let fast = world.floor_under_tagged_with_id(at, 1.0, 0.5);
+            // The general path, reached through the same grid.
+            let slow = world
+                .near(at, 0.0)
+                .into_iter()
+                .filter_map(|i| world.triangles[i as usize].floor_hit(at))
+                .filter(|z| *z <= 1.5)
+                .fold(None, |b: Option<f32>, z| Some(b.map_or(z, |b| b.max(z))));
+            assert_eq!(fast.map(|(z, _, _)| z), slow, "at {at:?}");
+        }
     }
 
     /// The counters themselves, because a probe stuck at zero would make both
