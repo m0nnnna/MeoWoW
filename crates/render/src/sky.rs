@@ -315,7 +315,7 @@ impl SkyRenderer {
         // is why one colour band serves both.
         let body = if sun.z >= 0.0 { sun } else { -sun };
         let [br, bg, bb] = self.encode(disc);
-        gpu.queue.write_buffer(
+        gpu.write_buffer(
             &self.params,
             0,
             bytemuck::bytes_of(&Params {

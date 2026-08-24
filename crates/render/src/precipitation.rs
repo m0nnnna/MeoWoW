@@ -390,7 +390,7 @@ impl PrecipitationRenderer {
         // nothing. The clamp lives at the point it cannot be skipped, the same
         // reason `Camera::radians_per_pixel` guards on every call.
         let seconds = seconds.rem_euclid(600.0);
-        gpu.queue.write_buffer(
+        gpu.write_buffer(
             &self.params,
             0,
             bytemuck::bytes_of(&Params {

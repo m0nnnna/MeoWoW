@@ -398,7 +398,7 @@ impl ParticleRenderer {
         right: glam::Vec3,
         up: glam::Vec3,
     ) {
-        gpu.queue.write_buffer(
+        gpu.write_buffer(
             &self.params,
             0,
             bytemuck::bytes_of(&Params {
@@ -500,7 +500,7 @@ impl ParticleRenderer {
         self.skipped += (sprites.len() - fitting) as u32;
         self.drawn += fitting as u32;
         if fitting > 0 {
-            gpu.queue
+            gpu
                 .write_buffer(&self.instances, 0, bytemuck::cast_slice(&sprites[..fitting]));
         }
         fitting
@@ -511,7 +511,7 @@ impl ParticleRenderer {
         let fitting = vertices.len().min(self.vertex_capacity);
         self.skipped += (vertices.len() - fitting) as u32;
         if fitting > 0 {
-            gpu.queue
+            gpu
                 .write_buffer(&self.vertices, 0, bytemuck::cast_slice(&vertices[..fitting]));
         }
         fitting

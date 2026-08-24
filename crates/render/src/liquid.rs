@@ -384,7 +384,7 @@ impl LiquidRenderer {
             fog: [fog[0], fog[1], fog[2], 1.0],
             fog_range: [fog_range.0, fog_range.1, seconds, 0.0],
         };
-        gpu.queue
+        gpu
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.params_bind, &[]);

@@ -224,7 +224,7 @@ impl CelestialRenderer {
         tint: [f32; 4],
         uv_offset: [f32; 2],
     ) {
-        gpu.queue.write_buffer(
+        gpu.write_buffer(
             &placement.params,
             0,
             bytemuck::bytes_of(&Params {

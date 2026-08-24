@@ -750,7 +750,7 @@ impl MeshRenderer {
     pub fn update_bones(&self, gpu: &Gpu, bones: &BoneBuffer, pose: &[[[f32; 4]; 4]]) {
         let n = pose.len().min(bones.count);
         if n > 0 {
-            gpu.queue
+            gpu
                 .write_buffer(&bones.buffer, 0, bytemuck::cast_slice(&pose[..n]));
         }
     }
@@ -814,10 +814,10 @@ impl MeshRenderer {
     ) {
         let identity = glam::Mat4::IDENTITY.to_cols_array_2d();
         if matrices.is_empty() {
-            gpu.queue
+            gpu
                 .write_buffer(&transforms.buffer, 0, bytemuck::bytes_of(&identity));
         } else {
-            gpu.queue
+            gpu
                 .write_buffer(&transforms.buffer, 0, bytemuck::cast_slice(matrices));
         }
     }
@@ -833,7 +833,7 @@ impl MeshRenderer {
     }
 
     pub fn update_camera(&self, gpu: &Gpu, camera: &CameraUniform) {
-        gpu.queue
+        gpu
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
     }
 
@@ -1057,7 +1057,7 @@ impl InstanceBuffer {
         if data.len() > self.capacity {
             return false;
         }
-        gpu.queue
+        gpu
             .write_buffer(&self.buffer, 0, bytemuck::cast_slice(data));
         self.len = data.len();
         true
@@ -1071,7 +1071,7 @@ impl InstanceBuffer {
     pub fn write(&self, gpu: &Gpu, instances: &[Instance]) {
         let n = instances.len().min(self.len);
         if n > 0 {
-            gpu.queue
+            gpu
                 .write_buffer(&self.buffer, 0, bytemuck::cast_slice(&instances[..n]));
         }
     }

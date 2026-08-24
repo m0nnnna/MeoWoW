@@ -1980,6 +1980,11 @@ struct FrameProfile {
     /// Entity instance buffers reused against created -- see `InstancePool`.
     buffers_reused: u64,
     buffers_created: u64,
+    /// Buffer writes staged this frame, and their bytes -- see `Gpu::writes`.
+    /// **The staging belt is flushed at `submit`**, so every one of these is
+    /// paid for in a phase that names none of them.
+    write_calls: u64,
+    write_bytes: u64,
     /// Collision work this frame -- see `collision::Probe`. Beside the times
     /// because a millisecond cannot say whether the cost is many cheap
     /// queries or a few expensive ones, and the two want different fixes.
@@ -2045,7 +2050,8 @@ impl FrameProfile {
              {:.1} idle + {:.1} log ms\n\
              collision: {} queries, {} candidates ({} per query) | \
              clips {} played from {} reads, tracks {} started from {} reads | \
-             instance buffers {} reused, {} created{}",
+             instance buffers {} reused, {} created | \
+             {} buffer writes staging {} KiB{}",
             self.terrain_draws,
             self.model_draws,
             self.shadow_draws,
@@ -2099,6 +2105,8 @@ impl FrameProfile {
             self.track_reads,
             self.buffers_reused,
             self.buffers_created,
+            self.write_calls,
+            self.write_bytes / 1024,
             // Only where a spread was gathered, which is the log's line and
             // not the window's -- the window shows the frame that just
             // happened and has no second to average over.
@@ -7008,6 +7016,10 @@ impl App {
             (profile.buffers_reused, profile.buffers_created) =
                 world.instance_pool_counts();
         }
+        // **Read here, after the draw and before the submit that pays for
+        // them.** Taken any earlier and the frame's own writes would be
+        // charged to the next one.
+        (profile.write_calls, profile.write_bytes) = r.gpu.take_writes();
         (profile.clip_reads, profile.clip_plays) = self.effects.clip_reads();
         // Music and ambience together: two channels, one number, because the
         // question is "is anything still re-reading the archive" rather than

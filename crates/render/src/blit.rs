@@ -189,7 +189,7 @@ impl Blitter {
         texture: &wgpu::TextureView,
         texture_size: (u32, u32),
     ) {
-        gpu.queue.write_buffer(
+        gpu.write_buffer(
             &self.params,
             0,
             bytemuck::bytes_of(&Params {

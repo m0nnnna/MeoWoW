@@ -453,7 +453,7 @@ impl ShadowMap {
 
     /// Uploads the matrix the pass will be recorded with.
     pub fn set_matrix(&self, gpu: &Gpu, view_proj: glam::Mat4) {
-        gpu.queue.write_buffer(
+        gpu.write_buffer(
             &self.light_buffer,
             0,
             bytemuck::bytes_of(&LightUniform {

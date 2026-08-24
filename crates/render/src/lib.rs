@@ -48,9 +48,50 @@ pub struct Gpu {
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// Staged writes since this was last read: calls and bytes.
+    ///
+    /// **Because `queue.submit` is 2.1 ms before it has drawn anything.**
+    /// Correlating submission against draw count across a live session gives
+    /// r = +0.41 -- a 26% rise in draws moves it 12% -- so most of it is a
+    /// fixed cost that has nothing to do with the scene. `write_buffer` does
+    /// not copy when it is called; it stages, and the staging belt is flushed
+    /// at submit. Every bone palette, every instance buffer and every uniform
+    /// this client rewrites per frame therefore shows up *there* rather than
+    /// where it was written, which is the one place nobody was looking.
+    ///
+    /// Calls and bytes both, for the reason every other counter here reports
+    /// two numbers: a hundred small writes and one large one cost differently
+    /// and want different fixes -- batching versus writing less.
+    /// Atomics rather than a `Cell` because `Gpu` is shared across threads --
+    /// the GPU tests hold one in a `OnceLock`, which is what stopped eleven
+    /// concurrent DX12 device creations from deadlocking. `Relaxed` is right:
+    /// nothing orders on these, they are only ever read once a frame by the
+    /// thread that wrote them.
+    write_calls: std::sync::atomic::AtomicU64,
+    write_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl Gpu {
+    /// Stages a buffer write and counts it. **Use this rather than
+    /// `gpu.queue.write_buffer` directly** -- see [`Gpu::writes`]; a write
+    /// that is not counted is a cost that reappears inside `submit` with
+    /// nothing naming it.
+    pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.write_calls.fetch_add(1, Relaxed);
+        self.write_bytes.fetch_add(data.len() as u64, Relaxed);
+        self.queue.write_buffer(buffer, offset, data);
+    }
+
+    /// Reads the staging counters and zeroes them.
+    pub fn take_writes(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.write_calls.swap(0, Relaxed),
+            self.write_bytes.swap(0, Relaxed),
+        )
+    }
+
     /// Creates a device, optionally constrained to one that can present to
     /// `surface`. Pass `None` for headless work.
     pub async fn new(surface: Option<&wgpu::Surface<'_>>) -> Result<Self, Error> {
@@ -100,6 +141,8 @@ impl Gpu {
             adapter,
             device,
             queue,
+            write_calls: std::sync::atomic::AtomicU64::new(0),
+            write_bytes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
