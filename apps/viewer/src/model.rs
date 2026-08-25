@@ -605,6 +605,7 @@ pub fn load_dressed_with(
             // that does not exist and a silently untextured model.
             let dressed = look.and_then(|look| match def.kind {
                 1 => look.body.clone(),
+                2 => look.cape.clone(),
                 6 => look.hair.clone(),
                 _ => None,
             });

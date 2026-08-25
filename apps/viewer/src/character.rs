@@ -102,6 +102,8 @@ pub struct Look {
     pub body: Option<String>,
     /// The hair texture.
     pub hair: Option<String>,
+    /// The texture-only cape assigned to the character model's object slot.
+    pub cape: Option<String>,
     /// Geosets to draw, one per group. A group absent from this list is left
     /// alone rather than hidden -- see [`Look::shows`].
     pub geosets: Vec<u32>,
@@ -565,6 +567,9 @@ pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[(u32, u
     if items.is_none() && equipment.iter().any(|(id, _)| *id != 0) {
         tracing::warn!("no ItemDisplayInfo: equipment will not be drawn");
     }
+    let cape = items
+        .as_ref()
+        .and_then(|table| cape_texture(table, equipment));
     // `Item.dbc` is read only when something is actually held, and only for
     // the sheath position: it is 46,000 rows, and a character carrying nothing
     // has no use for it. Everything else about equipment comes from
@@ -617,6 +622,7 @@ pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[(u32, u
         skin,
         body,
         hair,
+        cape,
         geosets: geosets.into_iter().chain(equipped).collect(),
         decided_groups: decided,
         // The two-handed grip wins if anything calls for it: a character
@@ -632,6 +638,17 @@ pub fn resolve_wearing(chain: &mut Chain, look: Appearance, equipment: &[(u32, u
             .unwrap_or_default(),
         held,
     }
+}
+
+fn cape_texture(table: &dbc::schema::ItemDisplayInfo, equipment: &[(u32, u8)]) -> Option<String> {
+    equipment
+        .iter()
+        .filter(|(_, inventory_type)| *inventory_type == 16)
+        .filter_map(|(display_id, _)| table.iter().find(|row| row.id() == *display_id))
+        .find_map(|row| {
+            let texture = row.model_texture_left();
+            (!texture.is_empty()).then(|| format!(r"Item\ObjectComponents\Cape\{texture}.blp"))
+        })
 }
 
 /// The sheath type of whatever item wears a display id.
@@ -941,6 +958,7 @@ impl NpcAppearances {
             skin: None,
             body,
             hair,
+            cape: None,
             geosets: geosets.into_iter().chain(worn).collect(),
             decided_groups: decided,
             // Empty, and not for want of data: `NPC_ITEM_SLOTS` carries no
