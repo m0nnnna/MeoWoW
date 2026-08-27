@@ -6527,10 +6527,14 @@ impl App {
                             window.request_redraw();
                             return;
                         }
-                        // Autorun, on the key 3.3.5a uses for it. Pressing it
-                        // again, or pressing a key that means "stop", clears
-                        // it -- see `drive_live_movement`.
-                        if code == KeyCode::NumLock && self.live.is_some() {
+                        // Autorun, on the key 3.3.5a uses for it -- and on `R`
+                        // as well, `foss-wow#153`: a keyboard with no Num Lock
+                        // key (or one whose Fn layer reports it unreliably)
+                        // otherwise has no way to reach this at all. Pressing
+                        // either again, or pressing a key that means "stop",
+                        // clears it -- see `drive_live_movement`.
+                        if matches!(code, KeyCode::NumLock | KeyCode::KeyR) && self.live.is_some()
+                        {
                             self.autorun = !self.autorun;
                             window.request_redraw();
                             return;
@@ -14732,8 +14736,9 @@ impl App {
                         "F1: stop editing the interface"
                     } else {
                         "left-click to target, right-click to target and attack, \
-                         right-drag to steer, wheel to zoom, Q/E strafe, space \
-                         jumps, Num Lock autoruns, Z draws or stows the weapon. \
+                         Tab targets the nearest, right-drag to steer, wheel to \
+                         zoom, Q/E strafe, space jumps, Num Lock or R autoruns, \
+                         Z draws or stows the weapon. \
                          P for the spellbook (click a spell then a slot; \
                          right-click a slot to clear it), B for the bags, \
                          C for the character panel, right-click a body to \
