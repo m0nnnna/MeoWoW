@@ -4239,11 +4239,17 @@ struct App {
     /// about once rather than once a frame, and an unanswered request is
     /// eventually sent again.
     quest_marks_asked: std::collections::HashMap<u64, Instant>,
-    /// The quest log the marks were asked against. **Every mark is stale the
-    /// moment the log changes** -- accepting a quest turns its giver's
-    /// exclamation into nothing and its ender's nothing into a question mark,
-    /// and neither NPC sends anything to say so.
-    quest_marks_log: Vec<u32>,
+    /// The quest log the marks were asked against, paired with each quest's
+    /// completion as last read from `Entity::quest_is_complete`. **Every mark
+    /// is stale the moment either half changes** -- accepting a quest turns
+    /// its giver's exclamation into nothing and its ender's nothing into a
+    /// question mark, and neither NPC sends anything to say so. The
+    /// completion half exists because `foss-wow#152`: finishing a quest's
+    /// last objective does not add or remove an id, so an id-only key never
+    /// noticed the flip from grey to gold and the ender kept its stale
+    /// `Incomplete` mark until the whole log changed for some other reason
+    /// -- which a relog always does, by re-asking everything from scratch.
+    quest_marks_log: Vec<(u32, bool)>,
     /// The sound tables, and the two channels that play them.
     ///
     /// The output stream is held for its whole life on purpose: dropping it
@@ -12813,10 +12819,18 @@ impl App {
         // a genuinely unanswered id stops being drawn as "asking..." forever.
         const QUEST_ANSWER_WINDOW: Duration = Duration::from_secs(10);
 
-        let log: Vec<u32> = live
-            .state
-            .get(live.guid)
+        let player = live.state.get(live.guid);
+        let log: Vec<u32> = player
             .map(|player| player.quest_log_ids())
+            .unwrap_or_default();
+        // Paired with each quest's completion, for `quest_marks_log` below --
+        // see that field's doc for why the id alone is not enough.
+        let mark_log: Vec<(u32, bool)> = player
+            .map(|player| {
+                log.iter()
+                    .map(|&quest| (quest, player.quest_is_complete(quest).unwrap_or(false)))
+                    .collect()
+            })
             .unwrap_or_default();
         for quest in self.quests.take_unknown(&log, QUESTS_PER_FRAME) {
             match live.connection.query_quest_info(quest) {
@@ -12853,14 +12867,14 @@ impl App {
         }
         // What mark belongs over each nearby NPC's head, a few per frame.
         //
-        // **The whole set is thrown away whenever the quest log changes**, and
-        // that is not caution: taking a quest turns its giver's exclamation
-        // into nothing and its ender's nothing into a question mark, and the
-        // server does not volunteer either. A client that asked once would
-        // leave an exclamation over an NPC with nothing left to give, which is
-        // worse than no mark at all.
-        if self.quest_marks_log != log {
-            self.quest_marks_log = log.clone();
+        // **The whole set is thrown away whenever the quest log or a quest's
+        // completion changes**, and that is not caution: taking a quest turns
+        // its giver's exclamation into nothing, finishing one turns its
+        // ender's grey question mark gold, and the server volunteers none of
+        // it. A client that asked once would leave a stale mark over an NPC
+        // whose answer has since changed, which is worse than no mark at all.
+        if self.quest_marks_log != mark_log {
+            self.quest_marks_log = mark_log.clone();
             self.quest_marks.clear();
             self.quest_marks_asked.clear();
         }
