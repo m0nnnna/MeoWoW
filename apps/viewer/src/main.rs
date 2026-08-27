@@ -5317,6 +5317,78 @@ fn local_notice(text: String) -> ::world::ChatMessage {
     }
 }
 
+/// Which guid a combat-text number should anchor to, and where: `primary` if
+/// it has a replicated position, `fallback` otherwise.
+///
+/// **Falls back rather than dropping the number.** A swing's victim (or a
+/// spell's target) can have left replicated state by the time this batch is
+/// processed -- a corpse despawning, a creature leashing home -- and
+/// dropping the number silently is exactly the gap that made floating combat
+/// text read as missing far more of a fight than the chat scrollback did,
+/// which renders every swing and spell hit unconditionally with no position
+/// to lose. The attacker (or caster) must already be visible, or the event
+/// that produced this number could not have arrived at all, so falling back
+/// to them always lands the number somewhere in the fight rather than
+/// nowhere.
+fn combat_text_position(
+    state: &::world::WorldState,
+    primary: u64,
+    fallback: u64,
+) -> Option<(u64, ::world::Position)> {
+    [primary, fallback].into_iter().find_map(|guid| {
+        let pos = state.get(guid)?.interpolated_position(Instant::now())?;
+        Some((guid, pos))
+    })
+}
+
+/// Where a floating combat-text number should start on `guid`'s body, roughly
+/// at chest height rather than at the feet.
+///
+/// **`interpolated_position` names the ground, not the target.** Every
+/// replicated entity is anchored at its feet -- see `EntityPlacement` -- so a
+/// number starting exactly there reads as rising out of the floor instead of
+/// off the thing that was hit. Reuses the same per-display bounds the target
+/// bracket and click-to-target use (`World::entity_bounds`), scaled by the
+/// same `OBJECT_SCALE` `hud::hit_box` scales them by, so a number over a wolf
+/// and one over a giant start at proportionally the same place on each body.
+/// Falls back to a flat guess, scaled the same way, when the model has not
+/// loaded or the world is not available at all -- a number a little too low
+/// or high is still a number, where refusing to draw one is the bug this
+/// exists to fix.
+fn combat_text_height(
+    world: Option<&crate::world::World>,
+    state: &::world::WorldState,
+    guid: u64,
+) -> f32 {
+    let entity = state.get(guid);
+    let scale = entity
+        .and_then(|e| e.fields.get_f32(::world::update::fields::OBJECT_SCALE))
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(1.0);
+    let extent = entity
+        .and_then(|e| e.display_id())
+        .zip(world)
+        .and_then(|(id, world)| world.entity_bounds(id))
+        .map(|(min, max)| (min.z, max.z));
+    body_spawn_height(extent, scale)
+}
+
+/// The numeric core of [`combat_text_height`]: given a body's vertical
+/// extent (or `None`, when the model has not loaded or there is no world at
+/// all) and its scale, where along it a combat-text number should start.
+/// Pulled out so the curve is checkable without a `World` or a
+/// `WorldState` -- see [`combat_text_height`] for why the fallback exists at
+/// all.
+fn body_spawn_height(z_extent: Option<(f32, f32)>, scale: f32) -> f32 {
+    const DEFAULT_HEIGHT: f32 = 1.6;
+    const BODY_FRACTION: f32 = 0.75;
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    match z_extent {
+        Some((min, max)) => (min + (max - min) * BODY_FRACTION) * scale,
+        None => DEFAULT_HEIGHT * scale,
+    }
+}
+
 impl App {
     fn new(args: Args, chain: Chain) -> Self {
         // Read before `args` is moved into the struct below.
@@ -11797,6 +11869,17 @@ impl App {
                     );
                     self.chat.push(Line::Chat(local_notice(text)));
                 }
+                // The model cache, for `combat_text_height` below -- shared
+                // by every combat-text-producing loop from here on, so it is
+                // resolved once rather than once per event.
+                let world = self
+                    .renderer
+                    .as_ref()
+                    .and_then(|r| r.scene.as_ref())
+                    .and_then(|scene| match scene {
+                        Scene::Streaming(world) => Some(world.as_ref()),
+                        _ => None,
+                    });
                 // **Lava, slime, drowning and falling.** The same shape again,
                 // and the fifth chance to parse a category and drop it -- but
                 // this one matters differently: nothing else in the client
@@ -11824,6 +11907,23 @@ impl App {
                     let text = hit.describe(&who, ours);
                     tracing::debug!("environmental damage -- {text}");
                     self.chat.push(Line::Chat(local_notice(text)));
+                    // Chat-only until now, unlike every other combat category
+                    // here -- a fall or a lava tick is exactly the sort of
+                    // "chat has it, the floating number does not" gap this
+                    // whole pass was written to close.
+                    if let Some(pos) = live
+                        .state
+                        .get(hit.victim)
+                        .and_then(|entity| entity.interpolated_position(Instant::now()))
+                    {
+                        let height = combat_text_height(world, &live.state, hit.victim);
+                        self.combat_text.push(PendingCombatText {
+                            world_pos: glam::Vec3::new(pos.x, pos.y, pos.z + height),
+                            text: hit.amount.to_string(),
+                            kind: ui::CombatTextKind::Damage,
+                            spawned: Instant::now(),
+                        });
+                    }
                 }
                 // Fourth category this crate returns rather than stores, and
                 // the fourth chance to drop one on the floor. Logged as well
@@ -11838,13 +11938,13 @@ impl App {
                     // Spawned above whoever was hit, missed and all -- a whiff
                     // wants a number just as much as a landed swing, or the
                     // fight looks like it stalled every time an attack fails
-                    // to connect. Silently skipped if the victim's position
-                    // has not replicated yet; the swing is still logged and
-                    // still in the scrollback either way.
-                    if let Some(pos) = live
-                        .state
-                        .get(swing.victim)
-                        .and_then(|entity| entity.interpolated_position(Instant::now()))
+                    // to connect. Falls back to the attacker's own position
+                    // (see `combat_text_position`) rather than dropping the
+                    // number outright when the victim itself has left
+                    // replicated state; the swing is still logged and still
+                    // in the scrollback regardless.
+                    if let Some((anchor, pos)) =
+                        combat_text_position(&live.state, swing.victim, swing.attacker)
                     {
                         let (text, kind) = if swing.missed() {
                             ("Miss".to_string(), ui::CombatTextKind::Miss)
@@ -11853,8 +11953,9 @@ impl App {
                         } else {
                             (swing.damage.to_string(), ui::CombatTextKind::Damage)
                         };
+                        let height = combat_text_height(world, &live.state, anchor);
                         self.combat_text.push(PendingCombatText {
-                            world_pos: glam::Vec3::new(pos.x, pos.y, pos.z),
+                            world_pos: glam::Vec3::new(pos.x, pos.y, pos.z + height),
                             text,
                             kind,
                             spawned: Instant::now(),
@@ -11937,13 +12038,15 @@ impl App {
                         hud::spell_combat_entry(hit, live.guid, &live.state, Some(&self.spells))
                             .rendered()
                     );
-                    if let Some(pos) = live
-                        .state
-                        .get(hit.target)
-                        .and_then(|entity| entity.interpolated_position(Instant::now()))
+                    // Falls back to the caster's own position for the same
+                    // reason the swing loop above does -- see
+                    // `combat_text_position`.
+                    if let Some((anchor, pos)) =
+                        combat_text_position(&live.state, hit.target, hit.caster)
                     {
+                        let height = combat_text_height(world, &live.state, anchor);
                         self.combat_text.push(PendingCombatText {
-                            world_pos: glam::Vec3::new(pos.x, pos.y, pos.z),
+                            world_pos: glam::Vec3::new(pos.x, pos.y, pos.z + height),
                             text: hit.damage.to_string(),
                             // No critical flag is read: whatever marks one
                             // lives in the twenty trailing bytes that were all
@@ -16026,5 +16129,53 @@ mod ground_snap_tests {
     #[test]
     fn a_creature_meaningfully_above_the_ground_is_left_alone() {
         assert!(!entity_is_standing_on(120.0, 100.0));
+    }
+}
+
+#[cfg(test)]
+mod combat_text_tests {
+    use super::*;
+
+    /// **The bug, as numbers rather than a screenshot.** Combat text used to
+    /// spawn at `entity.interpolated_position()`'s own `z`, which is the
+    /// ground every replicated entity is anchored to -- a number starting
+    /// there reads as rising out of the floor rather than off the target.
+    /// A 2-unit-tall wolf should start its numbers noticeably above zero.
+    #[test]
+    fn a_number_starts_above_the_feet_not_at_them() {
+        let height = body_spawn_height(Some((0.0, 2.0)), 1.0);
+        assert!(height > 0.5, "expected a real height above the feet, got {height}");
+        assert!(height < 2.0, "must not start above the model's own head");
+    }
+
+    /// A giant and a wolf sharing one model must not share one spawn height:
+    /// the fraction up the body is what has to stay constant, not the raw
+    /// number of units.
+    #[test]
+    fn a_bigger_body_gets_a_proportionally_bigger_offset() {
+        let wolf = body_spawn_height(Some((0.0, 2.0)), 1.0);
+        let giant = body_spawn_height(Some((0.0, 2.0)), 3.0);
+        assert!(giant > wolf, "a 3x scale should spawn higher than a 1x one");
+        // Proportionally identical: both are the same fraction of a
+        // differently-scaled body.
+        assert!((giant / wolf - 3.0).abs() < 1e-4, "giant/wolf = {}", giant / wolf);
+    }
+
+    /// No bounds at all -- the model has not loaded, or there is no world --
+    /// still has to produce *something* rather than a number nobody can draw.
+    #[test]
+    fn missing_bounds_fall_back_to_a_flat_guess() {
+        assert!(body_spawn_height(None, 1.0) > 0.0);
+    }
+
+    /// A degenerate scale (zero, negative, non-finite) must not zero out or
+    /// invert the height -- the same guard `hud::hit_box` applies to the
+    /// same `OBJECT_SCALE` field for the same reason.
+    #[test]
+    fn a_degenerate_scale_is_treated_as_one() {
+        let normal = body_spawn_height(Some((0.0, 2.0)), 1.0);
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(body_spawn_height(Some((0.0, 2.0)), bad), normal, "scale {bad}");
+        }
     }
 }
