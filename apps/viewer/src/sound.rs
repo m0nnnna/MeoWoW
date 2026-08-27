@@ -42,6 +42,43 @@ use mpq::Chain;
 /// this one on a guess.
 pub const INTERFACE_CLICK: u32 = 83;
 
+/// A rain or snow ambience loop, one tier at a time.
+///
+/// Sound-only, so this module does not need `world`'s dependency graph -- a
+/// caller already holding a `world::Weather` translates it, the same split
+/// `render::precipitation::Kind` draws against `world::Precipitation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeatherAmbience {
+    RainLight,
+    RainMedium,
+    RainHeavy,
+    SnowLight,
+    SnowMedium,
+    SnowHeavy,
+}
+
+impl WeatherAmbience {
+    /// `SoundEntries` id for this loop.
+    ///
+    /// Found, not guessed: `wow-cli sound list "weather - "` names exactly
+    /// nine rows in this build, each labelled `Weather - <Kind><Intensity>`
+    /// and resolving to precisely the file that name promises --
+    /// `Sound\Ambience\Weather\RainHeavyLoop.wav` for `Weather - RainHeavy`,
+    /// and so on for every tier below. Three of the nine (the sandstorms)
+    /// are left unused: nothing in this client draws a sandstorm particle,
+    /// see `world::Weather::precipitation`.
+    pub fn sound_id(self) -> u32 {
+        match self {
+            Self::RainLight => 8533,
+            Self::RainMedium => 8534,
+            Self::RainHeavy => 8535,
+            Self::SnowLight => 8536,
+            Self::SnowMedium => 8537,
+            Self::SnowHeavy => 8538,
+        }
+    }
+}
+
 /// Which of a zone's two tracks to use.
 ///
 /// `ZoneMusic` and `SoundAmbience` each carry a day and a night id, and often
@@ -1444,5 +1481,61 @@ mod tests {
             row.sound_type()
         );
         assert_eq!(row.name(), "GAMESPELLBUTTONMOUSEDOWN");
+    }
+
+    /// Six hardcoded ids sharing one copy-pasted match arm are exactly the
+    /// shape of bug a collision in this table would hide silently -- two
+    /// tiers landing on the same id would still compile and still play
+    /// *something*. No `WOW_DATA` needed for this half; see the next test for
+    /// the half that checks each id is still the row it claims to be.
+    #[test]
+    fn every_weather_ambience_id_is_distinct() {
+        let all = [
+            WeatherAmbience::RainLight,
+            WeatherAmbience::RainMedium,
+            WeatherAmbience::RainHeavy,
+            WeatherAmbience::SnowLight,
+            WeatherAmbience::SnowMedium,
+            WeatherAmbience::SnowHeavy,
+        ];
+        let ids: Vec<u32> = all.iter().map(|w| w.sound_id()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "{ids:?} has a repeated id");
+    }
+
+    /// `WeatherAmbience::sound_id`'s six ids, checked the same way
+    /// `INTERFACE_CLICK` is: against the archive's own name for the row,
+    /// not merely against "it parses". A renumbered `SoundEntries.dbc` would
+    /// otherwise start playing a footstep or a door creak in the middle of a
+    /// storm and nothing would say why.
+    #[test]
+    fn every_weather_ambience_id_still_names_its_own_loop() {
+        let Some(data) = std::env::var_os("WOW_DATA") else {
+            eprintln!("skipping: WOW_DATA not set");
+            return;
+        };
+        let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
+        let table = SoundEntries::parse(&chain.read(SoundEntries::PATH).unwrap()).unwrap();
+        let expect = |ambience: WeatherAmbience, name: &str| {
+            let id = ambience.sound_id();
+            let row = table
+                .iter()
+                .find(|row| row.id() == id)
+                .unwrap_or_else(|| panic!("{ambience:?}'s id {id} must name a real row"));
+            assert_eq!(
+                row.name(),
+                name,
+                "{ambience:?}'s id {id} is now named {:?}, not {name:?}",
+                row.name()
+            );
+        };
+        expect(WeatherAmbience::RainLight, "Weather - RainLight");
+        expect(WeatherAmbience::RainMedium, "Weather - RainMedium");
+        expect(WeatherAmbience::RainHeavy, "Weather - RainHeavy");
+        expect(WeatherAmbience::SnowLight, "Weather - SnowLight");
+        expect(WeatherAmbience::SnowMedium, "Weather - SnowMedium");
+        expect(WeatherAmbience::SnowHeavy, "Weather - SnowHeavy");
     }
 }

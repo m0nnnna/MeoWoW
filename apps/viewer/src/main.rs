@@ -4286,6 +4286,11 @@ struct App {
     audio: Option<rodio::OutputStream>,
     music: sound::Channel,
     ambience: sound::Channel,
+    /// The rain or snow loop, independent of the zone's own ambience: a
+    /// storm is a state of the *sky*, not of the area, and can start or stop
+    /// under a zone that never changes what it otherwise sounds like. See
+    /// `weather_ambience`.
+    weather_channel: sound::Channel,
     /// Whether the bag window is open, on the same reasoning as
     /// `spellbook_open`.
     bags_open: bool,
@@ -4618,7 +4623,7 @@ fn sky_colour(
 }
 
 /// What is coming down this frame, and how hard.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Falling {
     kind: render::precipitation::Kind,
     /// 0 to 1, as `SMSG_WEATHER` reports it.
@@ -4674,6 +4679,51 @@ fn resolve_precipitation(weather: ::world::WeatherChange, seconds: f32) -> Optio
         intensity: weather.intensity,
         seconds,
     })
+}
+
+/// What actually falls this frame, once indoors is accounted for.
+///
+/// `SMSG_WEATHER` is a *zone* state -- the realm does not stop sending rain
+/// the moment a character steps through a doorway, and `resolve_precipitation`
+/// has no notion of a roof at all: the field is a camera-relative box with no
+/// world geometry in it (see `render::precipitation`), so nothing there would
+/// ever have stopped it. `indoors` is `App::modeled_floor`, the same signal
+/// footsteps already use to fall back from the terrain to a building's own
+/// floor material -- "a building's floor outranks the terrain under it,
+/// which is what makes an interior an interior" (see `drive_live_movement`),
+/// so a rained-on abbey interior is the same class of bug as a footstep that
+/// sounds like grass indoors.
+fn precipitation_for_frame(
+    weather: ::world::WeatherChange,
+    seconds: f32,
+    indoors: bool,
+) -> Option<Falling> {
+    if indoors {
+        return None;
+    }
+    resolve_precipitation(weather, seconds)
+}
+
+/// Which rain/snow ambience loop this weather wants, if any.
+///
+/// A separate mapping from `resolve_precipitation`'s, and deliberately not
+/// reusing `Weather::precipitation`: the renderer only has an intensity float
+/// to scale one shared box of billboards by, but the archive has a *named*
+/// loop per tier (`Weather - RainHeavy`, not "rain, hard"), and the wire
+/// already tells us which one via the `Weather` variant itself. `BlackRain`/
+/// `BlackSnow` fold onto the heavy loop -- there is no `Weather - BlackRain`
+/// row, and black rain is the more violent of the two rains regardless.
+fn weather_ambience(weather: ::world::Weather) -> Option<sound::WeatherAmbience> {
+    use ::world::Weather::*;
+    match weather {
+        LightRain => Some(sound::WeatherAmbience::RainLight),
+        MediumRain => Some(sound::WeatherAmbience::RainMedium),
+        HeavyRain | BlackRain => Some(sound::WeatherAmbience::RainHeavy),
+        LightSnow => Some(sound::WeatherAmbience::SnowLight),
+        MediumSnow => Some(sound::WeatherAmbience::SnowMedium),
+        HeavySnow | BlackSnow => Some(sound::WeatherAmbience::SnowHeavy),
+        _ => None,
+    }
 }
 
 /// What colour to draw a drop.
@@ -5403,6 +5453,7 @@ impl App {
             },
             music: sound::Channel::new(),
             ambience: sound::Channel::new(),
+            weather_channel: sound::Channel::new(),
             bags_open: false,
             character_open: false,
             quest_log_open: false,
@@ -7097,7 +7148,11 @@ impl App {
                 &r.precipitation,
                 &r.particles,
                 &r.emitters,
-                resolve_precipitation(weather, self.started.elapsed().as_secs_f32()),
+                precipitation_for_frame(
+                    weather,
+                    self.started.elapsed().as_secs_f32(),
+                    self.modeled_floor,
+                ),
                 &r.material_binds,
                 r.bones.as_ref(),
                 &r.world_binds,
@@ -7193,13 +7248,14 @@ impl App {
         // charged to the next one.
         (profile.write_calls, profile.write_bytes) = r.gpu.take_writes();
         (profile.clip_reads, profile.clip_plays) = self.effects.clip_reads();
-        // Music and ambience together: two channels, one number, because the
-        // question is "is anything still re-reading the archive" rather than
-        // which of the two it was.
+        // Music, ambience and weather together: three channels, one number,
+        // because the question is "is anything still re-reading the
+        // archive" rather than which of the three it was.
         let (music_reads, music_starts) = self.music.track_reads();
         let (ambience_reads, ambience_starts) = self.ambience.track_reads();
-        profile.track_reads = music_reads + ambience_reads;
-        profile.track_starts = music_starts + ambience_starts;
+        let (weather_reads, weather_starts) = self.weather_channel.track_reads();
+        profile.track_reads = music_reads + ambience_reads + weather_reads;
+        profile.track_starts = music_starts + ambience_starts + weather_starts;
         profile.live_systems = r.emitters.live_systems;
         profile.live_sprites = r.emitters.live_sprites;
         profile.live_ribbons = r.emitters.live_ribbons;
@@ -8880,6 +8936,7 @@ impl App {
         if !self.sound_enabled {
             self.effects.stop();
             self.ambience.stop();
+            self.weather_channel.stop();
             self.footstep_phase = None;
             self.pending_sounds.clear();
         }
@@ -8937,6 +8994,15 @@ impl App {
             .unwrap_or((None, None));
         let music = music.filter(|_| self.music_enabled);
         let ambience = ambience.filter(|_| self.sound_enabled);
+        // A storm is a state of the sky, not of the zone: it can start or
+        // stop under an area whose own ambience never changes, and it must
+        // stop the moment the character is under a roof -- `modeled_floor`
+        // is exactly the signal `precipitation_for_frame` already uses for
+        // the same reason, so the drops stop falling and the loop stops
+        // playing on the same frame. See `weather_ambience`.
+        let weather_sound = weather_ambience(frame_weather(self.live.as_ref(), &self.args).weather)
+            .filter(|_| !self.modeled_floor && self.sound_enabled)
+            .map(sound::WeatherAmbience::sound_id);
 
         // One roll per call is fine: a channel only consults it when it is
         // actually starting something, which is rare.
@@ -8946,12 +9012,16 @@ impl App {
         // "obviously" needs an ear -- so this leaves a trail that says what it
         // decided, which is readable without one. That has caught more in this
         // project than looking has.
-        if (self.music.playing(), self.ambience.playing()) != (music, ambience) {
+        if (self.music.playing(), self.ambience.playing(), self.weather_channel.playing())
+            != (music, ambience, weather_sound)
+        {
             tracing::debug!(
-                "area {} at {when:?}: music {:?} -> {music:?}, ambience {:?} -> {ambience:?}",
+                "area {} at {when:?}: music {:?} -> {music:?}, ambience {:?} -> {ambience:?}, \
+                 weather {:?} -> {weather_sound:?}",
                 context.area,
                 self.music.playing(),
                 self.ambience.playing(),
+                self.weather_channel.playing(),
             );
         }
 
@@ -9094,6 +9164,17 @@ impl App {
             self.args.ambience_volume,
             roll,
         );
+        // Same volume knob as the zone's own ambience: a storm's patter is
+        // that same kind of background loop, not a third category a player
+        // would expect its own slider for.
+        self.weather_channel.play(
+            mixer,
+            &self.sounds,
+            &mut self.chain,
+            weather_sound,
+            self.args.ambience_volume,
+            roll,
+        );
         self.sound_play_ms = timing_play.elapsed().as_secs_f32() * 1000.0;
     }
 
@@ -9102,6 +9183,7 @@ impl App {
         if !self.sound_enabled {
             self.effects.stop();
             self.ambience.stop();
+            self.weather_channel.stop();
             self.footstep_phase = None;
             self.pending_sounds.clear();
         }
@@ -15719,5 +15801,81 @@ mod sign_in_tests {
         assert!(asks(&["--realm-host", "127.0.0.1"]));
         assert!(asks(&["--realm-host", "127.0.0.1", "--user", "OWC33"]));
         assert!(asks(&["--user", "OWC33", "--character", "Testwolf"]));
+    }
+}
+
+#[cfg(test)]
+mod weather_tests {
+    use super::*;
+
+    fn rain(intensity: f32) -> ::world::WeatherChange {
+        ::world::WeatherChange {
+            weather: ::world::Weather::HeavyRain,
+            intensity,
+            abrupt: false,
+        }
+    }
+
+    /// **The bug, as a test that fails on the old rule.** A guard standing in
+    /// a building reported rain falling around them: `resolve_precipitation`
+    /// has no notion of a roof (the field is a camera-relative box, see
+    /// `render::precipitation`), so it produced the exact same `Falling`
+    /// indoors as out. `precipitation_for_frame` is the fix, and this is the
+    /// one comparison that matters -- everything else about the weather is
+    /// unchanged by the roof.
+    #[test]
+    fn indoors_suppresses_precipitation_regardless_of_weather() {
+        let weather = rain(0.8);
+        assert!(precipitation_for_frame(weather, 4.0, false).is_some());
+        assert!(
+            precipitation_for_frame(weather, 4.0, true).is_none(),
+            "rain must not fall indoors"
+        );
+    }
+
+    /// Outdoors, gating on `indoors` must not have changed anything about
+    /// *what* falls -- only `resolve_precipitation`'s existing answer passed
+    /// through unmodified. A test that only checked "indoors is None" could
+    /// pass by suppressing outdoor rain too.
+    #[test]
+    fn outdoors_is_untouched() {
+        let weather = rain(0.8);
+        assert_eq!(
+            precipitation_for_frame(weather, 4.0, false),
+            resolve_precipitation(weather, 4.0)
+        );
+    }
+
+    /// Every rain and snow tier maps to the loop the archive actually names
+    /// for it -- see `sound::WeatherAmbience::sound_id` for where the ids
+    /// themselves are confirmed against `SoundEntries.dbc`. `BlackRain` and
+    /// `BlackSnow` are asserted here specifically because there is no
+    /// `Weather - BlackRain` row for them to fall through to on their own;
+    /// the heavy tier is a deliberate choice, not a default.
+    #[test]
+    fn every_rain_and_snow_tier_names_a_loop() {
+        use ::world::Weather::*;
+        use sound::WeatherAmbience::*;
+        assert_eq!(weather_ambience(LightRain), Some(RainLight));
+        assert_eq!(weather_ambience(MediumRain), Some(RainMedium));
+        assert_eq!(weather_ambience(HeavyRain), Some(RainHeavy));
+        assert_eq!(weather_ambience(BlackRain), Some(RainHeavy));
+        assert_eq!(weather_ambience(LightSnow), Some(SnowLight));
+        assert_eq!(weather_ambience(MediumSnow), Some(SnowMedium));
+        assert_eq!(weather_ambience(HeavySnow), Some(SnowHeavy));
+        assert_eq!(weather_ambience(BlackSnow), Some(SnowHeavy));
+    }
+
+    /// Fine weather, fog, the sandstorms and thunder are all dry as far as
+    /// this client is concerned (see `world::Weather::precipitation`'s own
+    /// doc comment) and must not start a rain or snow loop playing over
+    /// silence.
+    #[test]
+    fn dry_weather_names_no_loop() {
+        use ::world::Weather::*;
+        assert_eq!(weather_ambience(Fine), None);
+        assert_eq!(weather_ambience(Fog), None);
+        assert_eq!(weather_ambience(Thunders), None);
+        assert_eq!(weather_ambience(LightSandstorm), None);
     }
 }
