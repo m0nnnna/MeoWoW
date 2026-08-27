@@ -6295,6 +6295,31 @@ impl App {
         let Some(r) = self.renderer.as_mut() else {
             return;
         };
+        // `Tab` is a gameplay hotkey (`App::tab_target`), not a UI control --
+        // and egui claims it unconditionally for its own focus-cycling the
+        // moment *any* focusable widget is on screen, which the action bar
+        // and bag buttons always are while the HUD is drawn. Fed to egui
+        // first, a press would move focus onto whatever widget egui found
+        // first and never reach the match below at all -- reported as "tab
+        // doesn't tab target". Worse, once egui holds focus that way it can
+        // keep intercepting the arrow keys afterwards, which reads as
+        // movement suddenly not responding. So this is decided before egui
+        // ever sees the event, the same way a captured drag is resolved
+        // before egui gets a look at it.
+        if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
+            if key_event.physical_key == PhysicalKey::Code(KeyCode::Tab) {
+                if self.composing.is_none()
+                    && self.live.is_some()
+                    && key_event.state == ElementState::Pressed
+                    && !key_event.repeat
+                {
+                    self.tab_target();
+                    window.request_redraw();
+                }
+                return;
+            }
+        }
+
         // **Two mechanisms used to answer "is the pointer over the interface"
         // and they disagreed, which is `foss-wow#79`.**
         //
@@ -6543,7 +6568,33 @@ impl App {
                         // what every game with one does: a player reaching for
                         // the keys to dodge something should not have to
                         // remember to switch it off first.
-                        if self.autorun && matches!(code, KeyCode::KeyS | KeyCode::ArrowDown) {
+                        //
+                        // **This comment claimed "the movement keys" for as
+                        // long as the check only tested two of them.** `W`
+                        // pressed while autorunning left the flag set and
+                        // `drive_live_movement` still forcing forward, which
+                        // reads as the character ignoring the keyboard --
+                        // reported as "W should stop autorun, it doesn't".
+                        // Every directional and strafe key `KeyState::set`
+                        // recognises is listed here now; `Space`, `Ctrl` and
+                        // `Shift` are deliberately left out, because jumping
+                        // or sprinting mid-autorun is not "taking back
+                        // control" the way turning or reversing is.
+                        if self.autorun
+                            && matches!(
+                                code,
+                                KeyCode::KeyW
+                                    | KeyCode::ArrowUp
+                                    | KeyCode::KeyS
+                                    | KeyCode::ArrowDown
+                                    | KeyCode::KeyA
+                                    | KeyCode::ArrowLeft
+                                    | KeyCode::KeyD
+                                    | KeyCode::ArrowRight
+                                    | KeyCode::KeyQ
+                                    | KeyCode::KeyE
+                            )
+                        {
                             self.autorun = false;
                         }
                         match code {
@@ -6642,15 +6693,6 @@ impl App {
                             // `M` for the world map, as 3.3.5a binds it.
                             KeyCode::KeyM => {
                                 self.map_open = !self.map_open;
-                                window.request_redraw();
-                                return;
-                            }
-                            // `Tab` targets the nearest attackable thing, and
-                            // cycles to the next-nearest on each repeated
-                            // press, as 3.3.5a binds it. See
-                            // `App::tab_target`.
-                            KeyCode::Tab if self.live.is_some() => {
-                                self.tab_target();
                                 window.request_redraw();
                                 return;
                             }
