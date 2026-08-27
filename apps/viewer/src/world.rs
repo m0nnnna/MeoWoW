@@ -847,8 +847,18 @@ pub struct World {
     /// its model path, so two display ids sharing one path are different-looking
     /// creatures. Keying by path would give the second one the first one's hide.
     /// Keyed by display *and* look: two players of one race share a display
-    /// id and not a face. Zero is the undressed key every creature uses.
+    /// id and not a face.
+    ///
+    /// **Zero is not "the undressed key every creature uses" any more** -- the
+    /// comment used to say so, and it stopped being true the moment
+    /// `sheath_key`/`game_object_key` were folded into this same key. See
+    /// `entity_display_bounds` and `remember_display_bounds`.
     entity_cache: HashMap<(u32, u64), Option<Rc<CachedModel>>>,
+    /// The same models' bounds, keyed by display id alone rather than by
+    /// `entity_cache`'s `(display_id, look_key)` -- see
+    /// `remember_display_bounds`, which fills this, and `entity_bounds`,
+    /// which is the only thing that reads it.
+    entity_display_bounds: HashMap<u32, (Vec3, Vec3)>,
     /// Weapons and shields, keyed by path *and* texture.
     ///
     /// The texture has to be in the key: `Sword_1H_Short_A_02` is one file and
@@ -1035,6 +1045,7 @@ impl World {
             wmo_areas,
             cache: HashMap::new(),
             entity_cache: HashMap::new(),
+            entity_display_bounds: HashMap::new(),
             held_cache: HashMap::new(),
             sources: crate::model::Sources::default(),
             liquid_types: crate::liquid::LiquidTypes::default(),
@@ -1931,9 +1942,14 @@ impl World {
     /// entity whose model has not loaded is not on screen either, and letting
     /// a click select something invisible would be worse than letting it miss.
     pub fn entity_bounds(&self, display_id: u32) -> Option<(Vec3, Vec3)> {
-        // Bounds are a property of the mesh, not of how it is dressed, so the
-        // undressed entry answers for every look of the same model.
-        self.entity_cache.get(&(display_id, 0))?.as_ref()?.bounds
+        // Bounds are a property of the mesh, not of how it is dressed, so
+        // whichever variant loaded first answers for every look of the same
+        // model -- see `entity_display_bounds`. Reading `entity_cache` at a
+        // guessed key here was the bug: a display id whose only instances
+        // seen so far were sheathed has nothing at `(display_id, 0)`, and a
+        // click-to-target or a world marker silently fell back to a
+        // one-unit placeholder box sitting at the entity's feet.
+        self.entity_display_bounds.get(&display_id).copied()
     }
 
     /// Replaces the server-placed objects.
@@ -2946,6 +2962,12 @@ impl World {
             .map_err(|e| tracing::debug!("display id {display_id}: {e} (after {:?})", began.elapsed()))
             .ok();
 
+        remember_display_bounds(
+            &mut self.entity_display_bounds,
+            display_id,
+            entry.as_ref().and_then(|model| model.bounds),
+        );
+
         self.entity_cache.insert((display_id, look_key), entry.clone());
         entry
     }
@@ -3011,6 +3033,31 @@ fn game_object_key(kind: ::world::ObjectType) -> u64 {
     match kind {
         ::world::ObjectType::GameObject => 0x9111_0b1e_0000_0000,
         _ => 0,
+    }
+}
+
+/// Remembers a display id's bounds the first time any variant of it loads,
+/// independent of which `(display_id, look_key)` that variant happened to
+/// hash to.
+///
+/// `entity_cache` is keyed by display *and* look/sheath/game-object variant,
+/// so a display id whose only instances seen so far were sheathed has no
+/// entry at the key `entity_bounds` used to assume -- `(display_id, 0)`,
+/// "the undressed key every creature uses", which stopped being true the
+/// moment `sheath_key` started xoring a non-zero constant into it for a
+/// calm, weapon-stowed unit. That is the ordinary resting state for the
+/// humanoid NPCs a player stands in front of indoors -- guards, trainers,
+/// innkeepers -- so their world markers and target brackets fell back to a
+/// one-unit placeholder box sitting at the entity's feet. `or_insert` rather
+/// than overwriting: bounds barely vary between a creature's variants, so
+/// the first one seen stands in for all of them.
+fn remember_display_bounds(
+    display_bounds: &mut HashMap<u32, (Vec3, Vec3)>,
+    display_id: u32,
+    bounds: Option<(Vec3, Vec3)>,
+) {
+    if let Some(bounds) = bounds {
+        display_bounds.entry(display_id).or_insert(bounds);
     }
 }
 
@@ -5726,5 +5773,61 @@ mod tests {
         for z in [-500.0, 0.0, 1000.0] {
             assert_eq!(tile_at(centre + Vec3::new(0.0, 0.0, z)), (40, 30));
         }
+    }
+
+    /// **The low-target-bracket bug, as a test that fails on the old rule.**
+    ///
+    /// `entity_bounds` used to read `entity_cache` at a guessed key,
+    /// `(display_id, 0)`, on the strength of a comment claiming zero was
+    /// always "the undressed key". A display id whose only instance seen so
+    /// far is sheathed hashes to `sheath_key(true)` instead, never zero --
+    /// which is the ordinary resting state for a calm guard or a trainer
+    /// standing in a building, and reads live as the target bracket and the
+    /// questgiver mark both floating near the entity's feet instead of
+    /// around its whole body.
+    #[test]
+    fn a_display_ids_bounds_are_remembered_regardless_of_which_variant_loaded() {
+        let mut bounds: HashMap<u32, (Vec3, Vec3)> = HashMap::new();
+        let head_to_toe = (Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 2.0));
+
+        // Only the sheathed variant of this display id has loaded so far --
+        // exactly the guard standing at ease that reported the bug -- and
+        // the old code's guessed key would never see it.
+        remember_display_bounds(&mut bounds, 197, Some(head_to_toe));
+
+        assert_eq!(
+            bounds.get(&197),
+            Some(&head_to_toe),
+            "a sheathed-only display id must still answer for its bounds"
+        );
+    }
+
+    /// Bounds barely vary between a creature's variants, so the first one
+    /// recorded stands in for all of them -- a later load must not overwrite
+    /// it with a slightly different measurement and make the answer depend
+    /// on load order.
+    #[test]
+    fn the_first_recorded_bounds_for_a_display_id_are_not_overwritten() {
+        let mut bounds: HashMap<u32, (Vec3, Vec3)> = HashMap::new();
+        let first = (Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 2.0));
+        let second = (Vec3::new(-9.0, -9.0, -9.0), Vec3::new(9.0, 9.0, 9.0));
+
+        remember_display_bounds(&mut bounds, 197, Some(first));
+        remember_display_bounds(&mut bounds, 197, Some(second));
+
+        assert_eq!(bounds.get(&197), Some(&first));
+    }
+
+    /// A failed load carries no bounds and must not plant a `None` in place
+    /// of a real measurement recorded by an earlier variant.
+    #[test]
+    fn a_failed_load_does_not_erase_an_earlier_variants_bounds() {
+        let mut bounds: HashMap<u32, (Vec3, Vec3)> = HashMap::new();
+        let known = (Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 2.0));
+
+        remember_display_bounds(&mut bounds, 197, Some(known));
+        remember_display_bounds(&mut bounds, 197, None);
+
+        assert_eq!(bounds.get(&197), Some(&known));
     }
 }
