@@ -6635,6 +6635,15 @@ impl App {
                                 window.request_redraw();
                                 return;
                             }
+                            // `Tab` targets the nearest attackable thing, and
+                            // cycles to the next-nearest on each repeated
+                            // press, as 3.3.5a binds it. See
+                            // `App::tab_target`.
+                            KeyCode::Tab if self.live.is_some() => {
+                                self.tab_target();
+                                window.request_redraw();
+                                return;
+                            }
                             // `Z` draws and stows, as 3.3.5a binds it. The
                             // weapon's resting place comes from the item, so
                             // this only says drawn or not.
@@ -9078,6 +9087,51 @@ impl App {
             ::world::ObjectType::Unit | ::world::ObjectType::Player
         ) && !entity.is_dead_or_ghost()
             && !entity.lootable()
+    }
+
+    /// Tab-target candidates, nearest first.
+    ///
+    /// Read off the same drawable list the renderer drew this frame --
+    /// interpolated positions, not raw replicated state, so the ordering
+    /// matches what is actually on screen -- and filtered through
+    /// `is_attack_candidate` so Tab never offers a target right-click's swing
+    /// would refuse. "Mobs" reads literally as `ObjectType::Unit`, but this
+    /// client still has no hostility test (`is_attack_candidate`'s own doc
+    /// explains why), so a hostile player is exactly as unlabelled as a
+    /// hostile creature and both are offered, the same way the real client
+    /// tab-targets a would-be attacker in either case.
+    fn tab_target_candidates(&self) -> Vec<u64> {
+        let Some(live) = self.live.as_ref() else {
+            return Vec::new();
+        };
+        let mut candidates: Vec<(u64, f32)> =
+            live::drawable_entities(&live.state, live.guid, live.position)
+                .into_iter()
+                .filter(|entity| self.is_attack_candidate(entity.guid))
+                .map(|entity| (entity.guid, entity.position.distance_squared(live.position)))
+                .collect();
+        candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
+        candidates.into_iter().map(|(guid, _)| guid).collect()
+    }
+
+    /// `Tab`: selects the nearest candidate, then the next-nearest on each
+    /// repeated press, wrapping back to the closest past the end of the
+    /// list -- the list is rebuilt from scratch every press, so a target that
+    /// died or walked out of range simply drops out of the rotation rather
+    /// than getting stuck on it.
+    fn tab_target(&mut self) {
+        let candidates = self.tab_target_candidates();
+        if candidates.is_empty() {
+            return;
+        }
+        let next = match self
+            .target
+            .and_then(|current| candidates.iter().position(|&guid| guid == current))
+        {
+            Some(index) => candidates[(index + 1) % candidates.len()],
+            None => candidates[0],
+        };
+        self.set_target(Some(next));
     }
 
     /// Starts, stops or leaves alone the zone's music and ambience.
