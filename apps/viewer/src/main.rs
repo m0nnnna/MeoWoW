@@ -6313,7 +6313,14 @@ impl App {
                     && key_event.state == ElementState::Pressed
                     && !key_event.repeat
                 {
-                    self.tab_target();
+                    // `Ctrl+Tab` targets the party instead of a mob -- a
+                    // healer or support player cycling their group rather
+                    // than picking a fight. See `App::party_target`.
+                    if self.modifiers.control_key() {
+                        self.party_target();
+                    } else {
+                        self.tab_target();
+                    }
                     window.request_redraw();
                 }
                 return;
@@ -9141,17 +9148,52 @@ impl App {
             && !entity.lootable()
     }
 
+    /// Whether `guid` is a plain mob -- not a player, not a talkable NPC, not
+    /// a critter. `is_attack_candidate` alone cannot tell any of the three
+    /// from an ordinary creature, which is why Tab was landing on players,
+    /// vendors, questgivers and rabbits alike (`foss-wow#151`, reported from
+    /// play).
+    ///
+    /// **Players are excluded outright.** This client has no hostility test
+    /// (`is_attack_candidate`'s own doc explains why), so on a PvE realm a
+    /// player showing up in the mob rotation is never anything but another
+    /// adventurer -- the PvP case where that would be wanted gets its own
+    /// pool, see `party_target_candidates`.
+    ///
+    /// `entity.will_talk()` is immediate -- `UNIT_NPC_FLAGS` arrives in the
+    /// object's own create block -- but a critter needs `creature_type`,
+    /// which needs a query. Unknown fails **open** rather than closed:
+    /// excluding every creature until its type answers would make Tab miss
+    /// anything that just spawned, and the type resolves within a frame or
+    /// two of the ordinary name-query sweep -- see `hud::names_to_ask`.
+    fn is_mob(&self, guid: u64) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        let Some(entity) = live.state.get(guid) else {
+            return false;
+        };
+        if entity.is_player() {
+            return false;
+        }
+        if entity.will_talk() {
+            return false;
+        }
+        let Some(entry) = entity.entry() else {
+            return true;
+        };
+        const CRITTER: u32 = 8;
+        !matches!(live.state.names.creature_type(entry), Some(Some(CRITTER)))
+    }
+
     /// Tab-target candidates, nearest first.
     ///
     /// Read off the same drawable list the renderer drew this frame --
     /// interpolated positions, not raw replicated state, so the ordering
     /// matches what is actually on screen -- and filtered through
     /// `is_attack_candidate` so Tab never offers a target right-click's swing
-    /// would refuse. "Mobs" reads literally as `ObjectType::Unit`, but this
-    /// client still has no hostility test (`is_attack_candidate`'s own doc
-    /// explains why), so a hostile player is exactly as unlabelled as a
-    /// hostile creature and both are offered, the same way the real client
-    /// tab-targets a would-be attacker in either case.
+    /// would refuse, and `is_mob` so it never offers a player, a vendor, a
+    /// questgiver or a rabbit either.
     fn tab_target_candidates(&self) -> Vec<u64> {
         let Some(live) = self.live.as_ref() else {
             return Vec::new();
@@ -9160,19 +9202,48 @@ impl App {
             live::drawable_entities(&live.state, live.guid, live.position)
                 .into_iter()
                 .filter(|entity| self.is_attack_candidate(entity.guid))
+                .filter(|entity| self.is_mob(entity.guid))
                 .map(|entity| (entity.guid, entity.position.distance_squared(live.position)))
                 .collect();
         candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
         candidates.into_iter().map(|(guid, _)| guid).collect()
     }
 
-    /// `Tab`: selects the nearest candidate, then the next-nearest on each
-    /// repeated press, wrapping back to the closest past the end of the
-    /// list -- the list is rebuilt from scratch every press, so a target that
-    /// died or walked out of range simply drops out of the rotation rather
-    /// than getting stuck on it.
-    fn tab_target(&mut self) {
-        let candidates = self.tab_target_candidates();
+    /// `Ctrl+Tab` candidates, nearest first: party members currently
+    /// replicated in view.
+    ///
+    /// A separate pool from `tab_target_candidates` rather than a filter atop
+    /// it, because the two disagree about a dead member: a corpse is exactly
+    /// who a healer reaches for this to select, since deciding who to
+    /// resurrect is the whole point, and `is_attack_candidate` would refuse
+    /// it outright. Bounded to the party rather than every nearby player --
+    /// there is no raid support yet (`foss-wow#97`), so "party" is the whole
+    /// group this can offer.
+    fn party_target_candidates(&self) -> Vec<u64> {
+        let Some(live) = self.live.as_ref() else {
+            return Vec::new();
+        };
+        let Some(party) = live.state.party.as_ref() else {
+            return Vec::new();
+        };
+        let mut candidates: Vec<(u64, f32)> =
+            live::drawable_entities(&live.state, live.guid, live.position)
+                .into_iter()
+                .filter(|entity| party.member(entity.guid).is_some())
+                .map(|entity| (entity.guid, entity.position.distance_squared(live.position)))
+                .collect();
+        candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
+        candidates.into_iter().map(|(guid, _)| guid).collect()
+    }
+
+    /// Selects the nearest candidate in `candidates`, then the next-nearest
+    /// on each repeated call, wrapping back to the closest past the end of
+    /// the list -- shared by `Tab` and `Ctrl+Tab`. The list is rebuilt from
+    /// scratch on every call, so a target that died (for `Tab`; a dead party
+    /// member stays selectable on purpose, see `party_target_candidates`) or
+    /// walked out of range simply drops out of the rotation rather than
+    /// getting stuck on it.
+    fn cycle_target(&mut self, candidates: Vec<u64>) {
         if candidates.is_empty() {
             return;
         }
@@ -9184,6 +9255,17 @@ impl App {
             None => candidates[0],
         };
         self.set_target(Some(next));
+    }
+
+    /// `Tab`: cycles the nearest attackable mobs.
+    fn tab_target(&mut self) {
+        self.cycle_target(self.tab_target_candidates());
+    }
+
+    /// `Ctrl+Tab`: cycles the nearest party members, for a healer or support
+    /// player who wants their group rather than a fight.
+    fn party_target(&mut self) {
+        self.cycle_target(self.party_target_candidates());
     }
 
     /// Starts, stops or leaves alone the zone's music and ambience.
@@ -14778,8 +14860,9 @@ impl App {
                         "F1: stop editing the interface"
                     } else {
                         "left-click to target, right-click to target and attack, \
-                         Tab targets the nearest, right-drag to steer, wheel to \
-                         zoom, Q/E strafe, space jumps, Num Lock or R autoruns, \
+                         Tab targets the nearest mob, Ctrl+Tab the nearest \
+                         party member, right-drag to steer, wheel to zoom, \
+                         Q/E strafe, space jumps, Num Lock or R autoruns, \
                          Z draws or stows the weapon. \
                          P for the spellbook (click a spell then a slot; \
                          right-click a slot to clear it), B for the bags, \

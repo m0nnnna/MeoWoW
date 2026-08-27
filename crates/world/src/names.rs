@@ -57,7 +57,10 @@ enum Entry<T> {
 #[derive(Debug, Default)]
 pub struct Names {
     players: HashMap<u64, Entry<String>>,
-    creatures: HashMap<u32, Entry<String>>,
+    /// The whole answer, not just the name -- `creature_type` is what tells a
+    /// mob from a critter, and nothing else on the wire says so. See
+    /// [`Self::creature_type`].
+    creatures: HashMap<u32, Entry<CreatureInfo>>,
     /// Keyed by entry, like creatures: every Small Dagger in the game shares
     /// one answer, so a bag of twenty stacks costs one query per *kind*.
     items: HashMap<u32, Entry<ItemInfo>>,
@@ -106,7 +109,18 @@ impl Names {
 
     pub fn creature(&self, entry: u32) -> Option<Option<&str>> {
         match self.creatures.get(&entry)? {
-            Entry::Known(name) => Some(name.as_deref()),
+            Entry::Known(info) => Some(info.as_ref().and_then(|info| info.name.as_deref())),
+            Entry::Pending(_) => None,
+        }
+    }
+
+    /// `CreatureType.dbc`'s row for this entry, straight off
+    /// `SMSG_CREATURE_QUERY_RESPONSE` -- `8` is Critter. The same three-state
+    /// answer as [`Self::player`]: `None` is "not asked yet or still
+    /// waiting", `Some(None)` is "the server says there is no such entry".
+    pub fn creature_type(&self, entry: u32) -> Option<Option<u32>> {
+        match self.creatures.get(&entry)? {
+            Entry::Known(info) => Some(info.as_ref().map(|info| info.creature_type)),
             Entry::Pending(_) => None,
         }
     }
@@ -187,8 +201,12 @@ impl Names {
         if !matches!(self.creatures.get(&answer.entry), Some(Entry::Pending(_))) {
             self.stats.unsolicited += 1;
         }
-        self.creatures
-            .insert(answer.entry, Entry::Known(answer.name.clone()));
+        // `name: None` is the wire's "no such entry" -- see
+        // `parse_creature_query_response` -- and is exactly the case this
+        // stores as `Known(None)`, the same "settled, and the answer is
+        // nothing" state `player`/`item` already use.
+        let known = answer.name.is_some().then(|| answer.clone());
+        self.creatures.insert(answer.entry, Entry::Known(known));
     }
 
     /// Everything the server said about a game object entry.
@@ -348,6 +366,36 @@ mod tests {
         names.apply_creature(&creature(299, Some("Young Wolf")));
         assert_eq!(names.creature(299), Some(Some("Young Wolf")));
         assert_eq!(names.stats.queries_issued, 1);
+    }
+
+    /// `creature_type` rides the same answer as the name, and answers the
+    /// same three ways: not asked, asked and refused, or known -- a critter
+    /// is `CreatureType.dbc` row 8, and this is the only thing on the wire
+    /// that tells one from an ordinary mob of the same object type.
+    #[test]
+    fn creature_type_answers_the_same_three_ways_as_the_name() {
+        let mut names = Names::new();
+        assert_eq!(names.creature_type(1234), None, "never asked");
+        names.claim_creature(1234, Instant::now());
+        assert_eq!(names.creature_type(1234), None, "asked, still waiting");
+        names.apply_creature(&CreatureInfo {
+            entry: 1234,
+            name: Some("Prairie Dog".to_string()),
+            sub_name: String::new(),
+            type_flags: 0,
+            creature_type: 8,
+            family: 0,
+            rank: 0,
+        });
+        assert_eq!(names.creature_type(1234), Some(Some(8)));
+
+        names.claim_creature(9999, Instant::now());
+        names.apply_creature(&creature(9999, None));
+        assert_eq!(
+            names.creature_type(9999),
+            Some(None),
+            "refused entries carry no type either"
+        );
     }
 
     /// An answer to something never asked is counted rather than ignored: a
