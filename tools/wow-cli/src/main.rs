@@ -6079,7 +6079,7 @@ fn approach_talker(
     // Every unit that will talk, not the nearest unit of any kind. Choosing by
     // proximity is what makes a silence ambiguous: the nearest thing to a
     // starting character is usually a wolf, and a wolf has nothing to say.
-    let mut talkers: Vec<(u64, u32, u32, f32)> = state
+    let mut talkers: Vec<(u64, u32, u32, f32, world::Position)> = state
         .iter()
         .filter(|entity| entity.guid != own_guid)
         .filter(|entity| is_a_legal_test_target(entity))
@@ -6091,7 +6091,7 @@ fn approach_talker(
                 .fields
                 .get(world::update::fields::OBJECT_ENTRY)
                 .unwrap_or(0);
-            Some((entity.guid, entry, entity.npc_flags().unwrap_or(0), d))
+            Some((entity.guid, entry, entity.npc_flags().unwrap_or(0), d, there))
         })
         .collect();
     talkers.sort_by(|a, b| a.3.total_cmp(&b.3));
@@ -6100,9 +6100,14 @@ fn approach_talker(
         "\n{} replicated unit(s) with any UNIT_NPC_FLAGS bit set:",
         talkers.len()
     );
-    for (guid, entry, flags, distance) in &talkers {
+    // The position is printed alongside the flags for the same reason
+    // `--units` names every field it reads: a "floating NPC" report needs the
+    // wire's own Z beside whatever the database says, not a guess at whether
+    // the two agree.
+    for (guid, entry, flags, distance, there) in &talkers {
         println!(
-            "  {guid:#018x}  entry {entry:>6}  flags {flags:>10} ({flags:#x})  {distance:>6.1} units"
+            "  {guid:#018x}  entry {entry:>6}  flags {flags:>10} ({flags:#x})  {distance:>6.1} units  at {:.2},{:.2},{:.2}",
+            there.x, there.y, there.z
         );
     }
     if talkers.is_empty() {
@@ -6118,7 +6123,7 @@ fn approach_talker(
     // answer as the requested one's is precisely how a flag bit would get
     // named wrongly, and the printout would look completely normal.
     let Some(&(mut chosen, ..)) = (match prefer {
-        Some(wanted) => talkers.iter().find(|(_, entry, _, _)| *entry == wanted),
+        Some(wanted) => talkers.iter().find(|(_, entry, _, _, _)| *entry == wanted),
         None => talkers.first(),
     }) else {
         println!("\nno replicated talker has entry {:?}.", prefer);

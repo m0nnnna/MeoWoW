@@ -1647,6 +1647,18 @@ impl World {
             .map(|(z, footing, _)| (z, footing))
     }
 
+    /// What a grounded thing at `at` should be standing on: a modelled
+    /// floor if one answers, the open terrain otherwise -- the same
+    /// preference `drive_live_movement` gives the player's own footing,
+    /// pulled out so a replicated entity's *drawn* position can be corrected
+    /// against it too. See `grounded_position` at the call site for why
+    /// that correction exists.
+    pub fn stand_height(&self, at: Vec3, step: f32) -> Option<f32> {
+        self.floor_under_footing(at, step)
+            .map(|(z, _)| z)
+            .or_else(|| self.height_at(at.x, at.y))
+    }
+
     pub fn floor_under_surface(
         &self,
         at: Vec3,

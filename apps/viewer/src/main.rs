@@ -4622,6 +4622,67 @@ fn sky_colour(
     wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }
 }
 
+/// How far a stationary entity's stated `z` may sit off the resolved ground
+/// before this client trusts it as deliberate elevation -- a perched or
+/// hovering creature -- rather than correcting it. See [`grounded_position`].
+///
+/// **Chosen, not measured, but bounded by what was actually found.** Eagan
+/// Peltskinner's stock Northshire spawn sits 0.77 units above this client's
+/// own terrain query at that point; Marshal McBride's stock spawn a few dozen
+/// units away sits 1.68 above; a GM-added fixture at the same spot as the
+/// player's login matches the ground to four decimal places. Comfortably
+/// above the largest of those and comfortably below a creature actually
+/// standing on something -- a rooftop gargoyle, a ledge -- which this project
+/// has no way to distinguish from bad spawn data except by how far off the
+/// ground it is.
+const ENTITY_STAND_TOLERANCE: f32 = 2.5;
+
+/// Where a replicated entity should actually be drawn, once the ground is
+/// accounted for.
+///
+/// **The real client corrects for this and this one did not, confirmed at
+/// the window on the same server.** Eagan Peltskinner reported floating; his
+/// wire position matches the local database's stored spawn height exactly
+/// (`80.97`), and this client's own terrain query at that same point answers
+/// `80.21` -- and a real 3.3.5a client, against the very same realm, still
+/// drew him standing on the ground. Nothing there is a hole or a parsing bug
+/// (`wow-cli adt tile` finds none near either spawn); the raw `position_z`
+/// genuinely sits above the ground by a small, spawn-specific amount, which
+/// is the signature of imprecise placement data rather than of intentional
+/// elevation -- and the real client is evidently more forgiving of it than
+/// trusting the wire outright.
+///
+/// **Airborne and swimming entities are left exactly where the wire put
+/// them.** A falling creature and a swimmer are both meant to be off the
+/// ground; snapping them down would undo the one thing those states exist to
+/// show. Every caller of this asks about a *replicated* entity, never the
+/// player's own body: that already has its own continuous ground tracking in
+/// `drive_live_movement`, and `App::drawn_own_z`'s cosmetic ease would only
+/// fight with a second, harder correction layered on top of it.
+fn grounded_position(
+    world: &crate::world::World,
+    position: glam::Vec3,
+    airborne: bool,
+    swimming: bool,
+) -> glam::Vec3 {
+    if airborne || swimming {
+        return position;
+    }
+    match world.stand_height(position, STEP_HEIGHT) {
+        Some(ground) if entity_is_standing_on(position.z, ground) => {
+            glam::Vec3::new(position.x, position.y, ground)
+        }
+        _ => position,
+    }
+}
+
+/// The comparison [`grounded_position`] makes, pulled out so it is checkable
+/// without a `World` -- see there for why the tolerance is chosen rather
+/// than measured.
+fn entity_is_standing_on(z: f32, ground: f32) -> bool {
+    (z - ground).abs() <= ENTITY_STAND_TOLERANCE
+}
+
 /// What is coming down this frame, and how hard.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Falling {
@@ -6931,7 +6992,23 @@ impl App {
                                 crate::world::EntityPlacement {
                                     guid: entity.guid,
                                     display_id: entity.display_id,
-                                    position: entity.position,
+                                    // The own body is excluded: it is already
+                                    // `own_position`, ground-tracked and
+                                    // eased by `drive_live_movement`/
+                                    // `App::drawn_own_z`, and a second,
+                                    // harder correction on top would only
+                                    // fight that easing. See
+                                    // `grounded_position`.
+                                    position: if entity.guid == live.guid {
+                                        entity.position
+                                    } else {
+                                        grounded_position(
+                                            world,
+                                            entity.position,
+                                            entity.airborne,
+                                            entity.swimming,
+                                        )
+                                    },
                                     orientation: entity.orientation + flip,
                                     scale: entity.scale,
                                     speed: entity.speed,
@@ -13016,10 +13093,22 @@ impl App {
                         .get_f32(::world::update::fields::OBJECT_SCALE)
                         .filter(|s| *s > 0.0)
                         .unwrap_or(1.0);
+                    // Grounded the same way the model itself is drawn (see
+                    // `grounded_position`), or a corrected model would stand
+                    // on the ground with its own quest mark still floating
+                    // above where the raw wire position used to put it --
+                    // the same drift this project's own rules warn a marker
+                    // and its model must never be allowed.
+                    let at = grounded_position(
+                        world,
+                        glam::Vec3::new(at.x, at.y, at.z),
+                        false,
+                        entity.swimming(),
+                    );
                     let rect = hud::marker_rect(
                         &self.camera,
                         viewport,
-                        glam::Vec3::new(at.x, at.y, at.z),
+                        at,
                         scale,
                         world.entity_bounds(display_id),
                     )?;
@@ -13047,13 +13136,13 @@ impl App {
                         .get_f32(::world::update::fields::OBJECT_SCALE)
                         .filter(|s| *s > 0.0)
                         .unwrap_or(1.0);
-                    hud::marker_rect(
-                        &self.camera,
-                        viewport,
+                    let at = grounded_position(
+                        world,
                         glam::Vec3::new(at.x, at.y, at.z),
-                        scale,
-                        world.entity_bounds(display_id),
-                    )
+                        false,
+                        entity.swimming(),
+                    );
+                    hud::marker_rect(&self.camera, viewport, at, scale, world.entity_bounds(display_id))
                 })
                 .collect(),
             _ => Vec::new(),
@@ -13071,10 +13160,16 @@ impl App {
                 .get_f32(::world::update::fields::OBJECT_SCALE)
                 .filter(|s| *s > 0.0)
                 .unwrap_or(1.0);
+            let at = grounded_position(
+                world,
+                glam::Vec3::new(at.x, at.y, at.z),
+                false,
+                entity.swimming(),
+            );
             hud::marker_rect(
                 &self.camera,
                 viewport,
-                glam::Vec3::new(at.x, at.y, at.z),
+                at,
                 scale,
                 world.entity_bounds(display_id),
             )
@@ -15877,5 +15972,59 @@ mod weather_tests {
         assert_eq!(weather_ambience(Fog), None);
         assert_eq!(weather_ambience(Thunders), None);
         assert_eq!(weather_ambience(LightSandstorm), None);
+    }
+}
+
+#[cfg(test)]
+mod ground_snap_tests {
+    use super::*;
+
+    /// **The bug, as numbers rather than a screenshot.** Eagan Peltskinner's
+    /// stock spawn sits at 80.97 against a resolved ground of 80.21 -- 0.77
+    /// off, well inside the tolerance a real client evidently accepts. Marshal
+    /// McBride's stock spawn is 1.68 off and is accepted too; both are
+    /// confirmed real numbers, not made up for the test.
+    #[test]
+    fn spawns_within_tolerance_are_accepted() {
+        assert!(entity_is_standing_on(80.9719, 80.205));
+        assert!(entity_is_standing_on(82.0223, 80.338));
+    }
+
+    /// The GM-added fixture, which matched the ground to four decimal
+    /// places, is the ordinary case this whole mechanism must leave alone:
+    /// snapping a position that was already correct to the *same* ground it
+    /// already agreed with is a no-op, not a special case.
+    #[test]
+    fn an_already_grounded_position_is_still_accepted() {
+        assert!(entity_is_standing_on(83.5312, 83.531));
+    }
+
+    /// The tolerance has to have an edge, or "chosen" would mean "unbounded".
+    /// Symmetric: a position sunk slightly into the ground is exactly as
+    /// ordinary as one floating slightly above it, and both sides of
+    /// `ENTITY_STAND_TOLERANCE` are asserted so a sign error in the
+    /// comparison cannot pass by only ever being exercised from one side.
+    #[test]
+    fn the_tolerance_has_a_symmetric_edge() {
+        assert!(entity_is_standing_on(100.0 + ENTITY_STAND_TOLERANCE, 100.0));
+        assert!(entity_is_standing_on(100.0 - ENTITY_STAND_TOLERANCE, 100.0));
+        assert!(!entity_is_standing_on(
+            100.0 + ENTITY_STAND_TOLERANCE + 0.01,
+            100.0
+        ));
+        assert!(!entity_is_standing_on(
+            100.0 - ENTITY_STAND_TOLERANCE - 0.01,
+            100.0
+        ));
+    }
+
+    /// A creature genuinely standing somewhere elevated -- a rooftop, a
+    /// ledge -- has to survive this unmolested. This client cannot ask "is
+    /// this creature supposed to be up here", so the only guard against
+    /// snapping it down is distance, and this is the case that guard exists
+    /// for.
+    #[test]
+    fn a_creature_meaningfully_above_the_ground_is_left_alone() {
+        assert!(!entity_is_standing_on(120.0, 100.0));
     }
 }
