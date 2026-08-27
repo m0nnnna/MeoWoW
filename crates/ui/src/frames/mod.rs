@@ -25,6 +25,7 @@ pub mod loot;
 pub mod combat_text;
 pub mod status_text;
 pub mod loot_sparkle;
+pub mod level_up;
 pub mod marker;
 pub mod minimap;
 pub mod party;

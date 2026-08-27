@@ -44,6 +44,7 @@ pub use element::{Anchor, Element};
 pub use frames::chat::{ChatEntry, ChatKind};
 pub use frames::combat_text::{CombatTextKind, FloatingText};
 pub use frames::status_text::{StatusText, ACTION_STATUS_FADE_TIME};
+pub use frames::level_up::{LevelUpEffect, LEVEL_UP_DURATION};
 pub use frames::{
     AuctionClick, AuctionRow, AuctionTab, AuctionView,
     CastBarView, DestroyAnswer, DestroyPromptView,
@@ -112,6 +113,12 @@ pub struct HudData<'a> {
     /// than placed by an [`Element`] -- see [`frames::combat_text`].
     pub combat_text: &'a [frames::combat_text::FloatingText],
     pub status_text: Option<&'a frames::status_text::StatusText>,
+    /// The level-up burst, or `None` outside the few seconds it plays for.
+    /// Existence is the flag, as it is for `status_text` -- the caller stops
+    /// handing this crate `Some` once `entry.elapsed` passes
+    /// [`frames::level_up::LEVEL_UP_DURATION`], rather than this crate
+    /// deciding for itself when its own effect is over.
+    pub level_up: Option<&'a frames::level_up::LevelUpEffect>,
     /// The chat scrollback, oldest first. Owned and capped by the caller: this
     /// crate must not accumulate an unbounded log nobody drains.
     pub chat: &'a [frames::chat::ChatEntry],
@@ -764,6 +771,14 @@ impl Hud {
                 egui::Id::new("hud-action-status"),
             ));
             frames::status_text::draw(&painter, status_text);
+        }
+
+        if let Some(level_up) = data.level_up {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new("hud-level-up"),
+            ));
+            frames::level_up::draw(&painter, level_up);
         }
 
         // **Bottom of the interface first**, so a window that wants an answer

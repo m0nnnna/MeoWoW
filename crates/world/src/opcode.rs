@@ -1255,6 +1255,10 @@ pub mod server {
     /// abruptly. Sent on entering a zone and whenever the zone's weather turns.
     pub const WEATHER: u16 = 0x02F4;
 
+    /// Sent to the character it happened to, and nobody else -- see
+    /// [`crate::levelup`].
+    pub const LEVELUP_INFO: u16 = 0x01D4;
+
     /// The breath, fatigue and lava bars -- see [`crate::environment`].
     ///
     /// **These are how a client learns that standing in lava costs anything.**

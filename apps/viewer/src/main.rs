@@ -4128,6 +4128,9 @@ struct App {
     /// frame once a number's age passes `1.0` -- see [`PendingCombatText`].
     combat_text: Vec<PendingCombatText>,
     status_text: Option<PendingStatusText>,
+    /// The level-up burst, or `None` outside the few seconds it plays for.
+    /// See [`PendingLevelUp`].
+    level_up_effect: Option<PendingLevelUp>,
     /// The action slot most recently activated, and when -- a brief flash so
     /// a *click* has something to show for itself.
     ///
@@ -5240,6 +5243,15 @@ struct PendingStatusText {
     spawned: Instant,
 }
 
+/// A level-up in progress, from the moment `SMSG_LEVELUP_INFO` arrives until
+/// `ui::LEVEL_UP_DURATION` has passed. Its own state rather than reusing
+/// `PendingStatusText`: a level-up is the one moment this client is supposed
+/// to make memorable, not another line of the same toast a sound toggle uses.
+struct PendingLevelUp {
+    level: u32,
+    spawned: Instant,
+}
+
 /// A line this client generated itself, shaped like one off the wire.
 ///
 /// Sharing the wire type means the scrollback has one thing in it and one way
@@ -5544,6 +5556,7 @@ impl App {
             chat: Vec::new(),
             combat_text: Vec::new(),
             status_text: None,
+            level_up_effect: None,
             action_flash: None,
             entity_flip: false,
             flip_winding: false,
@@ -11925,6 +11938,22 @@ impl App {
                         });
                     }
                 }
+                // Sent to the character it happened to and nobody else, so
+                // every entry here is about *us* -- no guid to check against
+                // `live.guid` the way `environmental_damage` has to. See
+                // `world::levelup`.
+                for level_up in &report.level_ups {
+                    tracing::info!("levelled up to {}", level_up.new_level);
+                    self.chat.push(Line::Chat(local_notice(format!(
+                        "Congratulations, you have reached level {}!",
+                        level_up.new_level
+                    ))));
+                    self.pending_sounds.push((sound::LEVEL_UP_CHIME, false));
+                    self.level_up_effect = Some(PendingLevelUp {
+                        level: level_up.new_level,
+                        spawned: Instant::now(),
+                    });
+                }
                 // Fourth category this crate returns rather than stores, and
                 // the fourth chance to drop one on the floor. Logged as well
                 // as drawn, so "did the fight reach the client" is answerable
@@ -13379,6 +13408,13 @@ impl App {
                 elapsed,
             })
         });
+        let level_up_effect = self.level_up_effect.as_ref().and_then(|entry| {
+            let elapsed = now.saturating_duration_since(entry.spawned).as_secs_f32();
+            (elapsed < ui::LEVEL_UP_DURATION).then(|| ui::LevelUpEffect {
+                level: entry.level,
+                elapsed,
+            })
+        });
 
         // Rendered fresh every frame from the messages that arrived, so names
         // that resolve after a line was received still reach it.
@@ -14507,6 +14543,7 @@ impl App {
                     corpse_marker,
                     combat_text: &combat_text,
                     status_text: status_text.as_ref(),
+                    level_up: level_up_effect.as_ref(),
                     chat: &chat,
                     composing: composing.as_deref(),
                     bars: &bars,

@@ -1198,6 +1198,14 @@ pub struct Replication {
     /// separately. Storing them would make a client either draw the same tick
     /// twice or have to remember which ones it had already read.
     pub environmental_damage: Vec<crate::environment::EnvironmentalDamageLog>,
+    /// `SMSG_LEVELUP_INFO`s this batch -- see [`crate::levelup`].
+    ///
+    /// An event rather than a field for the same reason `chat` is: the
+    /// server sends this once, to the character it happened to, and nothing
+    /// about "you levelled up a moment ago" is a fact that stays true past
+    /// the frame it arrives on. A caller that wants a level-up effect reacts
+    /// to it here rather than diffing `UNIT_FIELD_LEVEL` across updates.
+    pub level_ups: Vec<crate::levelup::LevelUp>,
     /// Chat received this batch.
     ///
     /// Handed back rather than stored: chat is a stream of events, not state,
@@ -2720,6 +2728,27 @@ impl WorldState {
                                 hit.victim
                             );
                             report.environmental_damage.push(hit);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                crate::opcode::server::LEVELUP_INFO => {
+                    match crate::levelup::parse(&packet.body) {
+                        Ok(level_up) => {
+                            // Sent to the character it happened to and
+                            // nobody else -- worth a line at debug for the
+                            // same reason `WEATHER` gets one: it changes
+                            // something a player would notice missing.
+                            tracing::debug!(
+                                "levelled up to {} (+{} health)",
+                                level_up.new_level,
+                                level_up.health_delta
+                            );
+                            report.level_ups.push(level_up);
                         }
                         Err(error) => report.failures.push((
                             packet.opcode,

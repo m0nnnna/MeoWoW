@@ -42,6 +42,19 @@ use mpq::Chain;
 /// this one on a guess.
 pub const INTERFACE_CLICK: u32 = 83;
 
+/// `SoundEntries` id for the level-up chime.
+///
+/// `wow-cli sound list levelup` finds three rows resolving to the identical
+/// file, `Sound\Spells\LevelUp.wav`: `LEVELUPSOUND` (124, type 2),
+/// `LEVELUP` (888, type 2) and, filed under the spell type instead of
+/// interface, `Level Up` (1440, type 1). This one is picked over the other
+/// two because it is an exact name match *and* filed as an interface sound
+/// -- the same type 2 `INTERFACE_CLICK` is -- which is the right category
+/// for a ding the client plays on its own the instant the packet arrives,
+/// not something a spell cast or a creature triggers. All three would sound
+/// identical if this guess is wrong, since they share one file.
+pub const LEVEL_UP_CHIME: u32 = 888;
+
 /// A rain or snow ambience loop, one tier at a time.
 ///
 /// Sound-only, so this module does not need `world`'s dependency graph -- a
@@ -1481,6 +1494,33 @@ mod tests {
             row.sound_type()
         );
         assert_eq!(row.name(), "GAMESPELLBUTTONMOUSEDOWN");
+    }
+
+    /// `LEVEL_UP_CHIME`, checked the same way: against the archive's own
+    /// name and type for the row, not merely against "it parses". The file
+    /// it resolves to is also asserted, since three rows in this table
+    /// share it and only the path proves which one was actually picked.
+    #[test]
+    fn the_level_up_chime_id_is_still_a_level_up_sound() {
+        let Some(data) = std::env::var_os("WOW_DATA") else {
+            eprintln!("skipping: WOW_DATA not set");
+            return;
+        };
+        let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
+        let table = SoundEntries::parse(&chain.read(SoundEntries::PATH).unwrap()).unwrap();
+        let row = table
+            .iter()
+            .find(|row| row.id() == LEVEL_UP_CHIME)
+            .expect("LEVEL_UP_CHIME must name a real SoundEntries row");
+        assert_eq!(
+            SoundType::from_raw(row.sound_type()),
+            SoundType::Other(2),
+            "row {} is no longer an interface sound (type {})",
+            row.id(),
+            row.sound_type()
+        );
+        assert_eq!(row.name(), "LEVELUP");
+        assert_eq!(row.paths(), vec!["Sound\\Spells\\LevelUp.wav".to_string()]);
     }
 
     /// Six hardcoded ids sharing one copy-pasted match arm are exactly the
