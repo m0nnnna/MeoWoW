@@ -36,6 +36,7 @@ pub enum ElementId {
     TargetFrame,
     ChatFrame,
     CastBar,
+    XpBar,
     ActionBar1,
     ActionBar2,
     ActionBar3,
@@ -62,11 +63,12 @@ pub enum ElementId {
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 27] = [
+    pub const ALL: [ElementId; 28] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
         ElementId::CastBar,
+        ElementId::XpBar,
         ElementId::ActionBar1,
         ElementId::ActionBar2,
         ElementId::ActionBar3,
@@ -127,6 +129,10 @@ impl ElementId {
             | ElementId::TargetFrame
             | ElementId::ChatFrame
             | ElementId::CastBar
+            // With the action bars it sits under: always there, never
+            // opened or closed, the same rank the minimap and tracker are
+            // in for the identical reason.
+            | ElementId::XpBar
             | ElementId::ActionBar1
             | ElementId::ActionBar2
             | ElementId::ActionBar3
@@ -249,6 +255,7 @@ impl ElementId {
             ElementId::TargetFrame => "target-frame",
             ElementId::ChatFrame => "chat-frame",
             ElementId::CastBar => "cast-bar",
+            ElementId::XpBar => "xp-bar",
             ElementId::ActionBar1 => "action-bar-1",
             ElementId::ActionBar2 => "action-bar-2",
             ElementId::ActionBar3 => "action-bar-3",
@@ -286,6 +293,7 @@ impl ElementId {
             ElementId::TargetFrame => "Target frame",
             ElementId::ChatFrame => "Chat",
             ElementId::CastBar => "Cast bar",
+            ElementId::XpBar => "Experience bar",
             ElementId::ActionBar1 => "Action bar (no modifier)",
             ElementId::ActionBar2 => "Action bar (Shift)",
             ElementId::ActionBar3 => "Action bar (Ctrl)",
@@ -342,6 +350,18 @@ impl ElementId {
             ElementId::CastBar => Element {
                 anchor: Anchor::Bottom,
                 offset: [0.0, -74.0],
+                ..Default::default()
+            },
+            // Just under the first action bar's own bottom edge, in the
+            // 16-pixel margin that bar already leaves above the true screen
+            // edge -- so the two read as one stack without moving the action
+            // bar anybody may already have dragged elsewhere. A 2-pixel gap
+            // on both sides rather than flush: `the_default_frames_do_not_overlap`
+            // treats touching edges as overlapping, and two frames that share
+            // a border are one dragged pixel away from actually doing so.
+            ElementId::XpBar => Element {
+                anchor: Anchor::Bottom,
+                offset: [0.0, -2.0],
                 ..Default::default()
             },
             // Stacked upward from the bottom centre. Only the unmodified bar

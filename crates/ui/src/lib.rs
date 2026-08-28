@@ -55,7 +55,7 @@ pub use frames::{
     QuestgiverView,
     SpellbookEntry, TaxiRow, TaxiView, TrackedQuest, TrackerView, TradeClick, TradeOfferAnswer,
     TradeOfferView, TradeSquare, TradeSquareItem, TradeView, TrainerRow, TrainerRowState, TrainerView, UnitView,
-    VendorRow, VendorView,
+    VendorRow, VendorView, XpBarView,
 };
 pub use layout::{default_path, CharacterBars, ElementId, Profile};
 pub use login::{CharacterRow, RealmRow, SignIn, Stage as SignInStage, Tone};
@@ -132,6 +132,10 @@ pub struct HudData<'a> {
     /// is absent outside edit mode exactly the way the target frame is
     /// absent with nothing targeted.
     pub cast_bar: Option<&'a frames::CastBarView>,
+    /// The player's own experience toward the next level, or `None` outside
+    /// a live session -- the same "absent, not zero" shape [`Self::player`]
+    /// uses for the identical reason: no character, nothing to show.
+    pub xp_bar: Option<&'a frames::XpBarView>,
     /// Everything the character can put on a bar, or `None` when the book is
     /// closed. Like the cast bar, "closed" is expressed by having nothing to
     /// draw rather than by a flag: the caller already decides when the book is
@@ -798,6 +802,7 @@ impl Hud {
             let unit_placeholder;
             let chat_placeholder;
             let cast_bar_placeholder;
+            let xp_bar_placeholder;
             let bar_placeholder;
             let spellbook_placeholder;
             let bags_placeholder;
@@ -852,6 +857,17 @@ impl Hud {
                     None if editing => {
                         cast_bar_placeholder = frames::CastBarView::placeholder();
                         Content::CastBar(&cast_bar_placeholder)
+                    }
+                    None => continue,
+                },
+                // Absent exactly when the player frame is: no live character,
+                // no experience to show. Present in edit mode regardless, the
+                // same reason every other always-there frame is.
+                ElementId::XpBar => match data.xp_bar {
+                    Some(view) => Content::XpBar(view),
+                    None if editing => {
+                        xp_bar_placeholder = frames::XpBarView::placeholder();
+                        Content::XpBar(&xp_bar_placeholder)
                     }
                     None => continue,
                 },
@@ -1077,6 +1093,7 @@ impl Hud {
                 Content::Chat(_) => frames::chat::size(&style, element.scale),
                 Content::Bar { .. } => frames::action_bar::size(&style, element.scale),
                 Content::CastBar(_) => frames::cast_bar::size(&style, element.scale),
+                Content::XpBar(_) => frames::xp_bar::size(&style, element.scale),
                 Content::Spellbook(_) => frames::spellbook::size(&style, element.scale),
                 // The only frame whose size depends on its contents: a
                 // character with bags carries more than one without, and a
@@ -1271,6 +1288,13 @@ impl Hud {
                             element.scale,
                         ),
                         Content::CastBar(view) => frames::cast_bar::draw(
+                            &painter,
+                            response.rect,
+                            view,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::XpBar(view) => frames::xp_bar::draw(
                             &painter,
                             response.rect,
                             view,
@@ -2100,6 +2124,7 @@ impl Hud {
                     let size = match id {
                         ElementId::ChatFrame => frames::chat::size(&style, scale),
                         ElementId::CastBar => frames::cast_bar::size(&style, scale),
+                        ElementId::XpBar => frames::xp_bar::size(&style, scale),
                         ElementId::ActionBar1 | ElementId::ActionBar2 | ElementId::ActionBar3 => {
                             frames::action_bar::size(&style, scale)
                         }
@@ -2347,6 +2372,7 @@ enum Content<'a> {
         slots: &'a [frames::action_bar::SlotView],
     },
     CastBar(&'a frames::CastBarView),
+    XpBar(&'a frames::XpBarView),
     Spellbook(&'a [frames::SpellbookEntry]),
     Bags(&'a [frames::BagSlot]),
     Character(&'a [frames::EquipSlot]),
@@ -2845,6 +2871,78 @@ mod tests {
         assert!(
             midway_shapes > starting_shapes,
             "the cast bar's fill painted no extra shape: {midway_shapes} vs {starting_shapes}"
+        );
+    }
+
+    /// The XP bar's absence/presence rule matches the player frame's, not the
+    /// cast bar's: no live character, no experience to show, and edit mode
+    /// always has something to drag. `hide_bars` first, or an empty action bar
+    /// (which always draws) would swamp the "nothing painted" assertion the
+    /// same way `unit_frames_appear_without_data_only_while_editing` guards
+    /// against for the player and target frames.
+    #[test]
+    fn an_xp_bar_appears_only_with_data_or_while_editing() {
+        let mut quiet = Hud::default();
+        hide_bars(&mut quiet);
+        assert!(
+            painted(&mut quiet, &HudData::default()).is_empty(),
+            "the xp bar was painted with no character logged in"
+        );
+
+        let view = frames::XpBarView {
+            current: 500,
+            next_level: 1000,
+        };
+        let mut with_data = Hud::default();
+        hide_bars(&mut with_data);
+        assert!(
+            !painted(
+                &mut with_data,
+                &HudData {
+                    xp_bar: Some(&view),
+                    ..Default::default()
+                }
+            )
+            .is_empty(),
+            "an xp bar with real data painted nothing"
+        );
+
+        let mut editing = Hud::default();
+        hide_bars(&mut editing);
+        editing.edit.active = true;
+        assert!(
+            !painted(&mut editing, &HudData::default()).is_empty(),
+            "edit mode has nothing to drag for the xp bar"
+        );
+    }
+
+    /// The `current / next_level` numbers are gated by `style.show_values`,
+    /// the same flag every other bar's numbers answer to -- not a toggle of
+    /// its own. Proved by shape count, the same way
+    /// `a_cast_bar_fills_as_the_cast_progresses` proves its fill paints.
+    #[test]
+    fn an_xp_bars_numbers_answer_to_show_values() {
+        let view = frames::XpBarView {
+            current: 500,
+            next_level: 1000,
+        };
+        let data = HudData {
+            xp_bar: Some(&view),
+            ..Default::default()
+        };
+
+        let mut shown = Hud::default();
+        hide_bars(&mut shown);
+        let with_numbers = painted(&mut shown, &data).len();
+
+        let mut hidden = Hud::default();
+        hide_bars(&mut hidden);
+        hidden.profile.style.show_values = false;
+        let without_numbers = painted(&mut hidden, &data).len();
+
+        assert!(
+            with_numbers > without_numbers,
+            "show_values = false still painted the xp bar's numbers"
         );
     }
 
@@ -5311,6 +5409,7 @@ mod tests {
         match id {
             ElementId::ChatFrame => frames::chat::size(&profile.style, scale),
             ElementId::CastBar => frames::cast_bar::size(&profile.style, scale),
+            ElementId::XpBar => frames::xp_bar::size(&profile.style, scale),
             ElementId::ActionBar1 | ElementId::ActionBar2 | ElementId::ActionBar3 => {
                 frames::action_bar::size(&profile.style, scale)
             }

@@ -692,6 +692,13 @@ mod tests {
         Some((Vec3::new(-0.4, -0.9, 0.0), Vec3::new(0.4, 0.9, 2.2)))
     }
 
+    fn player(guid: u64, position: Vec3) -> live::Entity {
+        live::Entity {
+            kind: ::world::ObjectType::Player,
+            ..entity(guid, position)
+        }
+    }
+
     /// A model reporting nothing useful about its own size still has to be
     /// clickable, or a handful of creatures are permanently unselectable and
     /// the cause is a field nobody thinks to look at.
@@ -747,6 +754,37 @@ mod tests {
             entity(1, Vec3::new(5.0, 0.0, 0.0)),
         ];
         assert_eq!(pick(&ray, &entities, &bounds_of), Some(1));
+    }
+
+    /// **The mechanism `App::pick_at`'s `skip_players` relies on.** A
+    /// right-click must pass through a player standing in front of an NPC or
+    /// a mob, not select the player -- so `pick_at` drops every
+    /// `ObjectType::Player` entity from the candidate list before calling
+    /// `pick`. This proves both halves: with the player filtered out, the
+    /// thing behind it is selectable; and the control -- run the *same* ray
+    /// against the *unfiltered* list -- shows the closer player would
+    /// otherwise have won, so the filter is doing something rather than
+    /// nothing.
+    #[test]
+    fn a_filtered_out_player_leaves_the_thing_behind_it_selectable() {
+        let ray = Ray {
+            origin: Vec3::new(-10.0, 0.0, 1.0),
+            direction: Vec3::X,
+        };
+        let entities = [player(1, Vec3::new(5.0, 0.0, 0.0)), entity(2, Vec3::new(20.0, 0.0, 0.0))];
+
+        let without_players: Vec<live::Entity> = entities
+            .iter()
+            .filter(|e| e.kind != ::world::ObjectType::Player)
+            .cloned()
+            .collect();
+        assert_eq!(pick(&ray, &without_players, &bounds_of), Some(2));
+
+        assert_eq!(
+            pick(&ray, &entities, &bounds_of),
+            Some(1),
+            "control: unfiltered, the nearer player should still win"
+        );
     }
 
     /// And a click at nothing selects nothing, rather than the closest thing

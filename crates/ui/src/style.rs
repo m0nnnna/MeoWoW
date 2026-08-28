@@ -349,6 +349,14 @@ pub struct Style {
     /// Fill colour of the cast bar as it progresses.
     pub casting: Color,
 
+    /// Height of the XP bar at scale 1.0. Its own dimension rather than a
+    /// reuse of `bar_height` -- a health bar is read across a room and an XP
+    /// bar sits flush under the action bars, where the WoW this is modelled
+    /// on has always drawn it as a thin sliver rather than a bar's height.
+    pub xp_bar_height: f32,
+    /// Fill colour of the XP bar.
+    pub xp_fill: Color,
+
     pub chat_width: f32,
     pub chat_height: f32,
     pub chat_background: Color,
@@ -597,6 +605,9 @@ impl Default for Style {
             cast_bar_width: 260.0,
             casting: Color::rgb(220, 170, 60),
 
+            xp_bar_height: 12.0,
+            xp_fill: Color::rgb(140, 90, 220),
+
             chat_width: 440.0,
             chat_height: 170.0,
             chat_background: Color::rgba(8, 10, 14, 160),
@@ -693,6 +704,7 @@ impl Style {
         self.slot_size = self.slot_size.clamp(12.0, 200.0);
         self.slot_gap = self.slot_gap.clamp(0.0, 40.0);
         self.cast_bar_width = self.cast_bar_width.clamp(60.0, 1200.0);
+        self.xp_bar_height = self.xp_bar_height.clamp(2.0, 200.0);
         self.release_prompt_width = self.release_prompt_width.clamp(60.0, 1200.0);
         self.character_label_width = self.character_label_width.clamp(0.0, 400.0);
         self.loot_width = self.loot_width.clamp(100.0, 900.0);

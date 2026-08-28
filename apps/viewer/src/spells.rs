@@ -456,9 +456,11 @@ impl Spellbook {
         book
     }
 
-    /// Reads name, rank, description and effect values for one spell
+    /// Reads name, rank, description, icon and effect values for one spell
     /// [`Self::load`] was never asked for -- an item's on-use effect, most
-    /// often, since which items exist is not known until well after login.
+    /// often, since which items exist is not known until well after login;
+    /// or a trainer's whole offered list, which by definition is spells the
+    /// character does not have yet and so was never in `wanted` either.
     ///
     /// A full `Spell.dbc` scan per call rather than another batch load: an
     /// item's on-use spell is discovered one at a time, as a bag or worn
@@ -474,7 +476,7 @@ impl Spellbook {
         }
         self.resolved_extra.insert(spell);
 
-        use dbc::schema::{Spell, SpellDuration, SpellRadius};
+        use dbc::schema::{Spell, SpellDuration, SpellIcon, SpellRadius};
         let Some(table) = chain.read(Spell::PATH).ok().and_then(|bytes| Spell::parse(&bytes).ok())
         else {
             return;
@@ -482,6 +484,25 @@ impl Spellbook {
         let Some(row) = table.iter().find(|row| row.id() == spell) else {
             return;
         };
+
+        // Same lookup `load` does for every spell in `wanted`, just for one
+        // id: without it a trainer's or an on-use item's icon square would
+        // stay blank forever, the same silent gap `name` had before this
+        // function existed at all.
+        let icon_path = chain
+            .read(SpellIcon::PATH)
+            .ok()
+            .and_then(|bytes| SpellIcon::parse(&bytes).ok())
+            .and_then(|icons| {
+                let wanted_icon = row.spell_icon_id();
+                // The table stores the path without an extension, same as
+                // `load`. Mapped to an owned string inside this closure,
+                // before `icons` itself goes out of scope.
+                icons
+                    .iter()
+                    .find(|icon| icon.id() == wanted_icon)
+                    .map(|icon| format!("{}.blp", icon.texture()))
+            });
 
         // Same two small index tables `load` reads, for the same tokens --
         // `$d` and `$a1` need them to resolve at all.
@@ -510,7 +531,7 @@ impl Spellbook {
                 name: row.name().to_string(),
                 rank: row.rank().to_string(),
                 description: row.description().to_string(),
-                icon_path: None,
+                icon_path,
                 passive: row.attributes() & ATTR_PASSIVE != 0,
             },
         );
@@ -731,6 +752,34 @@ mod tests {
             "a referenced spell's duration did not resolve: {shield}"
         );
         assert!(!shield.contains('$'), "a token survived: {shield}");
+    }
+
+    /// **A trainer's whole list, reproduced exactly.** `wanted` is the
+    /// character's *own* spells; a trainer's rows are, by definition, spells
+    /// it does not have, so `Spellbook::load` never sees them and `name`
+    /// fell through to `#{id}` for every single row -- reported live as a
+    /// trainer window showing nothing but numbers. Spell 1784 is `Stealth`,
+    /// the entry-level rogue trainer spell this project's own fixtures teach
+    /// with `.learn 1784` (see `CLAUDE.md`'s `Roguetest`).
+    #[test]
+    fn a_trainer_spell_never_in_wanted_still_gets_a_name_and_an_icon() {
+        let mut chain = match chain() {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping: WOW_DATA not set");
+                return;
+            }
+        };
+
+        let mut book = Spellbook::load(&mut chain, &HashSet::new());
+        assert_eq!(book.name(1784), "#1784", "sanity: not resolved yet");
+
+        book.resolve_extra(&mut chain, 1784);
+        assert_eq!(book.name(1784), "Stealth");
+        assert!(
+            book.known.get(&1784).unwrap().icon_path.is_some(),
+            "a trainer row's icon square must not stay blank forever"
+        );
     }
 
     /// Auto-attack survives the filter that exists to reject everything it

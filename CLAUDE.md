@@ -107,7 +107,7 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | Appearance | NPCs, other players and the viewer's own character are all dressed from their replicated fields. Weapons draw and sheathe. No shoulders, helms or ranged weapons on others |
 | Player states | **Shapeshifting and stealth, on ourselves and on other players.** A transform is `UNIT_FIELD_DISPLAYID != UNIT_FIELD_NATIVEDISPLAYID` — *not* a non-zero shapeshift form, which every warrior carries — and it drops the player look so a bear is dressed as a bear. Stealth is `UNIT_FIELD_BYTES_1`'s `CREEP` bit: the body draws at 45% through a forced blend and plays the crouch cycles. **A stealthed player is simply not replicated to an observer who cannot detect them**, so this is visible for your own character, your party and detectors. Stand state and animation tier are named and unread |
 | Auras | Both aura opcodes parse and the list is kept per unit. **It exists to answer one question — which spell id `CMSG_CANCEL_AURA` should be given — and nothing draws it**, so there is no buff bar. Pressing a bar slot for a spell the character already holds cancels it rather than casting: **re-casting a toggle is silently discarded by the server**, which is what made stealth look one-way. Confirmed at the window. A warrior's *stance* is a form and not an aura, so it still has no way off |
-| Interface | Native, fully customisable, **no addons** — see the decision below. Player/target/party frames, click-to-target, chat, spellbook, action bars per character, `F1` to rearrange, saved to `ui.toml` |
+| Interface | Native, fully customisable, **no addons** — see the decision below. Player/target/party frames, click-to-target, chat, spellbook, action bars per character, an XP bar under them, `F1` to rearrange, saved to `ui.toml` |
 | Sign-in | **The viewer opens a login screen with no arguments** — confirmed at the window — so double-clicking it is the ordinary way to start: account, password, server, a folder picker for the `Data` directory, then a realm list and a character list. Remembers everything but the password, in `%APPDATA%\open-wow\login.toml`. **Creates no characters and deletes none** — the original client does that. Four themes (`slate`, `neko`, `void`, `calico`) that *write their colours into `ui.toml`* rather than sitting under it. Its own cat-head icon, drawn in code, on the window and on the executable. No queue handling, no return to the screen after a disconnect |
 | Game | Melee, spells with real tooltips and a cast bar, cooldowns, combat log, corpse and loot end to end, inventory with slot moves, character panel, quests taken and handed in, quest log with progress counters |
 | Map | `M` opens the zone page with the character and quest objectives on it; fills in as explored. **Minimap** in the corner with party dots and objective rings. **Questgiver pins** as diamonds — `!` and `?` told apart, and a *remembered* one drawn faded, because it is a fact about the past. No zoom, panning, continent view or rotation |
@@ -154,7 +154,12 @@ to a file** — the console scrollback dies with the window, which is why no
 crash report so far has reached the moment of death. A panic hook forces the
 backtrace, so `RUST_BACKTRACE` does not have to have been remembered on the run
 that crashed. A log ending in a panic and a log ending mid-frame are different
-findings: the second one is not a Rust fault at all.
+findings: the second one is not a Rust fault at all. **Unnamed is not "no
+file"**: the ordinary double-click launch (`Args::is_self_contained` false)
+defaults it to `%APPDATA%\open-wow\viewer.log`, beside `ui.toml` and
+`login.toml`, because nobody is watching a console on that path either. A
+self-contained command line — every probe in this file — keeps the old
+stdout-only default, so the reproducible probes stay exactly reproducible.
 
 `wow-cli world <host> --enter <character>` is the CLI-driven equivalent —
 **the host is positional and the character is `--enter`**, where the viewer

@@ -43,6 +43,7 @@ pub mod trainer;
 pub mod unit;
 pub mod vendor;
 pub mod world_map;
+pub mod xp_bar;
 
 pub use auction::{AuctionClick, AuctionRow, AuctionTab, AuctionView};
 pub use bags::{BagItem, BagItemTooltip, BagSlot, WeaponStats};
@@ -71,3 +72,4 @@ pub use unit::UnitView;
 pub use vendor::{VendorRow, VendorView};
 pub use minimap::{MinimapTile, MinimapView};
 pub use world_map::{MapMarker, MapPatch, MapView, MarkerKind};
+pub use xp_bar::XpBarView;

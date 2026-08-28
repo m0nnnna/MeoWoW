@@ -4338,16 +4338,24 @@ fn report_units(state: &world::WorldState, own_guid: u64, limit: usize) {
     rows.append(&mut others);
 
     println!(
-        "  {:<22} {:<9} {:>5}  {:>13}  {:>13}  {}",
-        "name", "kind", "level", "health", "power", "race/class/gender/power"
+        "  {:<22} {:<9} {:>5}  {:>13}  {:>13}  {:>13}  {}",
+        "name", "kind", "level", "health", "power", "xp/next", "race/class/gender/power"
     );
     for (distance, entity) in rows {
         let bytes = entity
             .bytes_0()
             .map(|b| format!("{} / {} / {} / {}", b[0], b[1], b[2], b[3]))
             .unwrap_or_else(|| "-".into());
+        // `PLAYER_XP`/`PLAYER_NEXT_LEVEL_XP` are `PRIVATE` -- only ever set on
+        // the row that is `(you)`. Printed as `-` for everyone else, the same
+        // "not this row's business" shape `bytes_0` already uses when a field
+        // is absent for a different reason.
+        let xp = match (entity.xp(), entity.next_level_xp()) {
+            (Some(xp), Some(next)) => format!("{xp}/{next}"),
+            _ => "-".into(),
+        };
         println!(
-            "  {:<22} {:<9} {:>5}  {:>6}/{:<6}  {:>6}/{:<6}  {bytes}{}",
+            "  {:<22} {:<9} {:>5}  {:>6}/{:<6}  {:>6}/{:<6}  {xp:>13}  {bytes}{}",
             unit_label(state, entity),
             entity.object_type.name(),
             entity

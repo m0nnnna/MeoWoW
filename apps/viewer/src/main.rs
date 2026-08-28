@@ -283,6 +283,18 @@ struct Args {
     /// Opened for append and *checked* at startup rather than on first write:
     /// a log file that silently went nowhere is worse than none, because it is
     /// believed. See the panic hook in `main`.
+    ///
+    /// **Unset is not "no file".** The ordinary way to start this client is a
+    /// double-click with nothing on the command line at all
+    /// (`Args::is_self_contained`), and nobody is watching a console that
+    /// closes with the crash. For that path `main` fills this in with
+    /// `default_log_path` -- `%APPDATA%\open-wow\viewer.log`, beside
+    /// `ui.toml` and `login.toml` -- so a crash from a double-click is no
+    /// longer the one thing this client cannot report on. A self-contained
+    /// command line (every probe in `docs/ROADMAP.md`) keeps the old
+    /// stdout-only default, and a failure to open the *default* path falls
+    /// back to stdout rather than failing the run -- only a path named
+    /// explicitly by `--log-file` is fatal to open.
     #[arg(long)]
     log_file: Option<PathBuf>,
 
@@ -462,6 +474,18 @@ fn unix_now() -> u64 {
 /// leave nothing here. A log that ends with a panic and one that ends
 /// mid-frame are therefore different findings -- the second says to look
 /// outside Rust.
+/// Where the log goes when nothing was named by `--log-file`.
+///
+/// `%APPDATA%\open-wow\viewer.log` on Windows, beside `ui.toml` and
+/// `login.toml` -- the same probing `ui::default_path` already does, so
+/// there is one answer to "where does open-wow keep its files" rather than
+/// two. `None` when no config directory can be found at all, which the
+/// caller treats the same as an explicit `--log-file` that failed to open:
+/// fall back to stdout, do not fail the run.
+fn default_log_path() -> Option<PathBuf> {
+    ui::default_path().ok().map(|path| path.with_file_name("viewer.log"))
+}
+
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -482,32 +506,44 @@ fn install_panic_hook() {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info".into());
-    match &args.log_file {
-        // Opened here, so a path that cannot be written fails the run instead
-        // of producing a client that looks instrumented and is not.
-        Some(path) => {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .with_context(|| format!("opening log file {}", path.display()))?;
-            use tracing_subscriber::fmt::writer::MakeWriterExt;
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .with_ansi(false)
-                .with_writer(std::io::stdout.and(std::sync::Arc::new(file)))
-                .init();
-            tracing::info!("logging to {}", path.display());
-        }
-        None => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .init();
-        }
+    let make_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())
+    };
+    let named = args.log_file.is_some();
+    let log_path = args
+        .log_file
+        .clone()
+        .or_else(|| (!args.is_self_contained()).then(default_log_path).flatten());
+    let stdout_only = || {
+        tracing_subscriber::fmt()
+            .with_env_filter(make_filter())
+            .with_target(false)
+            .init();
+    };
+    match &log_path {
+        // A path named explicitly by `--log-file` is opened here, so it fails
+        // the run instead of producing a client that looks instrumented and
+        // is not. The default path (nobody asked for one by name) is not held
+        // to that: a double-click has nobody watching a startup error, so a
+        // default that cannot be opened falls back to stdout rather than
+        // refusing to start.
+        Some(path) => match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => {
+                use tracing_subscriber::fmt::writer::MakeWriterExt;
+                tracing_subscriber::fmt()
+                    .with_env_filter(make_filter())
+                    .with_target(false)
+                    .with_ansi(false)
+                    .with_writer(std::io::stdout.and(std::sync::Arc::new(file)))
+                    .init();
+                tracing::info!("logging to {}", path.display());
+            }
+            Err(e) if named => {
+                return Err(e).with_context(|| format!("opening log file {}", path.display()));
+            }
+            Err(_) => stdout_only(),
+        },
+        None => stdout_only(),
     }
     install_panic_hook();
 
@@ -1926,12 +1962,20 @@ struct FrameProfile {
     /// Assembling the interface's inputs before the egui pass can begin:
     /// over a thousand lines of cloning and formatting, every frame.
     ui_snapshot_ms: f32,
+    /// `player` and `target`, ahead of the four below -- see `timing_target`.
+    /// Added after a live 578 ms `snapshot` spike reported all four of them
+    /// near zero, right after a right-click changed the target.
+    ui_target_ms: f32,
     /// The four ungated parts of that snapshot. Everything else in it is
     /// behind an "is this panel open" test and costs nothing while closed.
     ui_markers_ms: f32,
     ui_bars_ms: f32,
     ui_panels_ms: f32,
     ui_map_ms: f32,
+    /// Everything from the bag grid to the tracker, after the four above --
+    /// see `timing_windows`. The other half of the same blind spot
+    /// `ui_target_ms` covers the first half of.
+    ui_windows_ms: f32,
     /// The whole egui pass, closure included. Subtracting `ui_hud_ms` and
     /// `ui_stats_ms` leaves what egui spends beginning and ending it.
     ui_egui_ms: f32,
@@ -2109,8 +2153,9 @@ impl FrameProfile {
         format!(
             "{draws} draws/frame = {} terrain + {} models + {} shadow, \
              {} culled | {} groups, {} instances, {} ktris\n\
-             redraw {:.1}: ui {:.1} = snapshot {:.1} (markers {:.1}, bars {:.1}, \
-             panels {:.1}, map {:.1}) + egui {:.1} (hud {:.1}, stats {:.1}) \
+             redraw {:.1}: ui {:.1} = snapshot {:.1} (target {:.1}, markers {:.1}, \
+             bars {:.1}, panels {:.1}, map {:.1}, windows {:.1}) + egui {:.1} \
+             (hud {:.1}, stats {:.1}) \
              + text {:.1} | \
              move {:.1} | camera {:.1} | \
              net {:.1} | \
@@ -2137,10 +2182,12 @@ impl FrameProfile {
             self.redraw_ms,
             self.ui_ms,
             self.ui_snapshot_ms,
+            self.ui_target_ms,
             self.ui_markers_ms,
             self.ui_bars_ms,
             self.ui_panels_ms,
             self.ui_map_ms,
+            self.ui_windows_ms,
             self.ui_egui_ms,
             self.ui_hud_ms,
             self.ui_stats_ms,
@@ -3945,10 +3992,12 @@ struct App {
     sound_area_ms: f32,
     sound_steps_ms: f32,
     sound_play_ms: f32,
+    ui_target_ms: f32,
     ui_markers_ms: f32,
     ui_bars_ms: f32,
     ui_panels_ms: f32,
     ui_map_ms: f32,
+    ui_windows_ms: f32,
     /// When the breakdown was last written to the log. **It goes to the log
     /// as well as to the window on purpose** -- `--screenshot` draws no HUD,
     /// so a reading that exists only in the debug window cannot be captured
@@ -5335,8 +5384,45 @@ fn local_notice(text: String) -> ::world::ChatMessage {
     }
 }
 
+/// `guid`'s position right now, aware that a live guid's own replicated
+/// entity never moves.
+///
+/// **The server does not relay a player's own movement back to them**, so
+/// `WorldState::get(own_guid)` holds the position the character logged in
+/// at, forever -- the trap documented beside `App::update_sound` and the
+/// map's `standing`, which by that count had already caught four separate
+/// callers (the thing that draws the player, the thing that aims at it, a
+/// loot range check, and the map) before this one: the target marker and
+/// every floating combat-text number, which is why targeting yourself froze
+/// the selection bracket at the login spot and any damage you took drew its
+/// number there too.
+///
+/// Takes the walked position and its owning guid as plain parameters rather
+/// than a whole `live::LiveWorld` for two reasons: a caller cannot repeat the
+/// mistake by reaching past this function into `state.get(guid)` directly,
+/// and the self case -- the one this function exists for -- is then checkable
+/// with a bare `WorldState` and no live session at all.
+fn live_aware_position(
+    state: &::world::WorldState,
+    own_guid: u64,
+    own_position: glam::Vec3,
+    own_orientation: f32,
+    guid: u64,
+    now: Instant,
+) -> Option<::world::Position> {
+    if guid == own_guid {
+        return Some(::world::Position {
+            x: own_position.x,
+            y: own_position.y,
+            z: own_position.z,
+            orientation: own_orientation,
+        });
+    }
+    state.get(guid)?.interpolated_position(now)
+}
+
 /// Which guid a combat-text number should anchor to, and where: `primary` if
-/// it has a replicated position, `fallback` otherwise.
+/// it has a position, `fallback` otherwise.
 ///
 /// **Falls back rather than dropping the number.** A swing's victim (or a
 /// spell's target) can have left replicated state by the time this batch is
@@ -5349,12 +5435,19 @@ fn local_notice(text: String) -> ::world::ChatMessage {
 /// to them always lands the number somewhere in the fight rather than
 /// nowhere.
 fn combat_text_position(
-    state: &::world::WorldState,
+    live: &live::LiveWorld,
     primary: u64,
     fallback: u64,
 ) -> Option<(u64, ::world::Position)> {
     [primary, fallback].into_iter().find_map(|guid| {
-        let pos = state.get(guid)?.interpolated_position(Instant::now())?;
+        let pos = live_aware_position(
+            &live.state,
+            live.guid,
+            live.position,
+            live.orientation,
+            guid,
+            Instant::now(),
+        )?;
         Some((guid, pos))
     })
 }
@@ -5524,10 +5617,12 @@ impl App {
             sound_area_ms: 0.0,
             sound_steps_ms: 0.0,
             sound_play_ms: 0.0,
+            ui_target_ms: 0.0,
             ui_markers_ms: 0.0,
             ui_bars_ms: 0.0,
             ui_panels_ms: 0.0,
             ui_map_ms: 0.0,
+            ui_windows_ms: 0.0,
             profile_logged: Instant::now(),
             anim: None,
             anim_time_ms: 0,
@@ -6976,10 +7071,12 @@ impl App {
         profile.ui_stats_ms = self.ui_stats_ms;
         profile.ui_snapshot_ms = self.ui_snapshot_ms;
         profile.ui_egui_ms = self.ui_egui_ms;
+        profile.ui_target_ms = self.ui_target_ms;
         profile.ui_markers_ms = self.ui_markers_ms;
         profile.ui_bars_ms = self.ui_bars_ms;
         profile.ui_panels_ms = self.ui_panels_ms;
         profile.ui_map_ms = self.ui_map_ms;
+        profile.ui_windows_ms = self.ui_windows_ms;
         let camera = self.camera;
 
         // Movement integrates real elapsed time, so travel speed does not
@@ -10078,7 +10175,7 @@ impl App {
 
     /// Selects whatever is under the cursor, and tells the server.
     fn click_at(&mut self, at: (f64, f64)) {
-        if let Some(picked) = self.pick_at(at) {
+        if let Some(picked) = self.pick_at(at, false) {
             self.set_target(picked);
         }
     }
@@ -10093,8 +10190,13 @@ impl App {
     /// Clicking empty ground still clears the selection, exactly as a left
     /// click does. What it must not do is leave the previous target selected
     /// and attack *that* -- the click said "this", and "this" was nothing.
+    ///
+    /// **Passes through other players.** Right-click is select-and-attack,
+    /// and a friendly player standing between the camera and an auctioneer
+    /// or a mob is never the thing being aimed at -- unlike left-click, which
+    /// is asked to select a player just as often as anything else.
     fn right_click_at(&mut self, at: (f64, f64)) {
-        let Some(picked) = self.pick_at(at) else {
+        let Some(picked) = self.pick_at(at, true) else {
             return;
         };
         self.set_target(picked);
@@ -11629,7 +11731,13 @@ impl App {
     /// was over the interface -- which is different from `Some(None)`, the
     /// answer "nothing is there". Collapsing the two would make a click on a
     /// health bar clear the selection.
-    fn pick_at(&self, at: (f64, f64)) -> Option<Option<u64>> {
+    /// `skip_players` drops every `Player`-kind entity from the candidate
+    /// list before the raycast runs, so a right-click that lands on another
+    /// player's body falls through to whatever is standing behind them
+    /// instead of selecting the player. Left-click passes `false`: it is the
+    /// pure "select whatever is here" gesture, and a player standing in a
+    /// crowd is exactly the thing somebody might be trying to select.
+    fn pick_at(&self, at: (f64, f64), skip_players: bool) -> Option<Option<u64>> {
         let r = self.renderer.as_ref()?;
         // A click on the interface belongs to the interface: clicking a health
         // bar must not target whatever is standing behind it.
@@ -11673,7 +11781,7 @@ impl App {
             live.position.y,
             self.drawn_own_z.unwrap_or(live.position.z),
         );
-        let entities = drawable_with_own(
+        let mut entities = drawable_with_own(
             live,
             own_position,
             pace,
@@ -11681,6 +11789,9 @@ impl App {
             self.jump.is_some(),
             self.swimming.is_some(),
         );
+        if skip_players {
+            entities.retain(|entity| entity.kind != ::world::ObjectType::Player);
+        }
         Some(hud::pick(&ray, &entities, &|display_id| {
             world.entity_bounds(display_id)
         }))
@@ -12112,11 +12223,19 @@ impl App {
                     // here -- a fall or a lava tick is exactly the sort of
                     // "chat has it, the floating number does not" gap this
                     // whole pass was written to close.
-                    if let Some(pos) = live
-                        .state
-                        .get(hit.victim)
-                        .and_then(|entity| entity.interpolated_position(Instant::now()))
-                    {
+                    //
+                    // Almost always `ours`, which makes `live_aware_position`
+                    // load-bearing here rather than defensive: read straight
+                    // off replicated state, a fall or a lava tick would draw
+                    // its number at the login spot on every single occurrence.
+                    if let Some(pos) = live_aware_position(
+                        &live.state,
+                        live.guid,
+                        live.position,
+                        live.orientation,
+                        hit.victim,
+                        Instant::now(),
+                    ) {
                         let height = combat_text_height(world, &live.state, hit.victim);
                         self.combat_text.push(PendingCombatText {
                             world_pos: glam::Vec3::new(pos.x, pos.y, pos.z + height),
@@ -12161,7 +12280,7 @@ impl App {
                     // replicated state; the swing is still logged and still
                     // in the scrollback regardless.
                     if let Some((anchor, pos)) =
-                        combat_text_position(&live.state, swing.victim, swing.attacker)
+                        combat_text_position(live, swing.victim, swing.attacker)
                     {
                         let (text, kind) = if swing.missed() {
                             ("Miss".to_string(), ui::CombatTextKind::Miss)
@@ -12259,7 +12378,7 @@ impl App {
                     // reason the swing loop above does -- see
                     // `combat_text_position`.
                     if let Some((anchor, pos)) =
-                        combat_text_position(&live.state, hit.target, hit.caster)
+                        combat_text_position(live, hit.target, hit.caster)
                     {
                         let height = combat_text_height(world, &live.state, anchor);
                         self.combat_text.push(PendingCombatText {
@@ -13300,6 +13419,18 @@ impl App {
         let snapshot_started = Instant::now();
         let camera = self.camera;
 
+        // **The fifth timer, added after a live 578 ms spike landed in
+        // `snapshot` with the other four all reporting near zero.** `markers`,
+        // `bars`, `panels` and `map` were believed to be the whole story --
+        // see the comment on `timing_markers` below -- but they only cover
+        // 13473-13753 and 13754-14492 of a 13388-14822 span; `player` and
+        // `target` sit in the untimed head, and `bags` through `tracker_view`
+        // sit in an untimed tail (see `timing_windows`). The spike followed a
+        // right-click that changed the target, which makes this the first
+        // place to look rather than a guess: see `live_aware_position`, added
+        // the same day, in `target`'s construction below.
+        let timing_target = Instant::now();
+
         // Snapshot what the picker needs, so the UI closure does not borrow the
         // renderer while it mutates animation state.
         let animations: Vec<(usize, String, u32)> = match &r.scene {
@@ -13335,6 +13466,18 @@ impl App {
             live.state
                 .get(live.guid)
                 .map(|entity| hud::unit_view(entity, live.character.clone()))
+        });
+        // Both `PLAYER_XP` and `PLAYER_NEXT_LEVEL_XP` are `PRIVATE` -- absent
+        // rather than zero until the login burst has actually replicated our
+        // own object, the same "no data yet" shape every other field on this
+        // frame uses. `?` on either drops the bar for that one frame instead
+        // of drawing a momentarily-wrong one at 0%.
+        let xp_bar = self.live.as_ref().and_then(|live| {
+            let entity = live.state.get(live.guid)?;
+            Some(ui::XpBarView {
+                current: entity.xp()?,
+                next_level: entity.next_level_xp()?,
+            })
         });
         let target = self.target.and_then(|guid| {
             let live = self.live.as_ref()?;
@@ -13375,6 +13518,8 @@ impl App {
         // selection bracket is -- through `marker_rect`, from the very box a
         // click is tested against, so a mark cannot float away from the
         // creature it belongs to.
+        self.ui_target_ms = timing_target.elapsed().as_secs_f32() * 1000.0;
+
         // **The four blocks that run whatever is on screen.** Every panel
         // below is gated on being open -- spellbook, bags, character, quest
         // log, map -- so a closed one costs nothing. These are not: world
@@ -13480,8 +13625,19 @@ impl App {
             let Some(Scene::Streaming(world)) = r.scene.as_ref() else {
                 return None;
             };
-            let entity = self.live.as_ref()?.state.get(guid)?;
-            let at = entity.interpolated_position(std::time::Instant::now())?;
+            let live = self.live.as_ref()?;
+            let entity = live.state.get(guid)?;
+            // Not `entity.interpolated_position` -- targeting yourself asks
+            // this for `live.guid`, whose replicated entity holds the login
+            // spot forever. See `live_aware_position`.
+            let at = live_aware_position(
+                &live.state,
+                live.guid,
+                live.position,
+                live.orientation,
+                guid,
+                std::time::Instant::now(),
+            )?;
             let display_id = entity.display_id()?;
             let scale = entity
                 .fields
@@ -13888,6 +14044,17 @@ impl App {
                     list.spells
                         .iter()
                         .map(|spell| {
+                            // **Trainer spells were never in `Spellbook::load`'s
+                            // `wanted` set** -- that set is built from what the
+                            // character already knows, and the whole point of a
+                            // trainer is offering spells it does not. Without
+                            // this, `name` below falls through to its "no game
+                            // data" answer for every single row, which is not
+                            // an absence: it looked exactly like the trainer had
+                            // sent numbers instead of names. Same call
+                            // `item_tooltip` makes for an on-use item's effect
+                            // spell, and free after the first ask per id.
+                            self.spells.resolve_extra(&mut self.chain, spell.spell);
                             let icon = self.spells.icon(
                                 &r.gpu,
                                 &mut r.egui_renderer,
@@ -14391,6 +14558,17 @@ impl App {
         // index into that same list -- see its doc comment -- and this is what
         // turns the index back into a `Where` the connection can act on.
         self.ui_map_ms = timing_map.elapsed().as_secs_f32() * 1000.0;
+
+        // The other untimed span -- see `timing_target` above. Bags and the
+        // character panel are gated on being open like `panels` above them,
+        // but everything from `loot` on is not: it runs whether or not any
+        // window is showing it, on the same "costs nothing while closed"
+        // assumption `timing_markers`'s comment makes for its own four. One
+        // timer for all of it rather than one each, on the same reasoning
+        // `timing_target` uses -- find out first whether this half of the
+        // frame is the one that balloons before spending more timers
+        // narrowing down which piece of it does.
+        let timing_windows = Instant::now();
         let mut bags_where: Vec<Option<::world::inventory::Where>> = Vec::new();
         let bags: Vec<ui::frames::BagSlot> = if self.bags_open {
             use ::world::inventory::{self as inv, Where};
@@ -14699,6 +14877,7 @@ impl App {
         });
 
         let tracker = self.tracker_view();
+        self.ui_windows_ms = timing_windows.elapsed().as_secs_f32() * 1000.0;
 
         let mut hud_response = ui::HudResponse::default();
         let spellbook_open = self.spellbook_open;
@@ -14744,6 +14923,7 @@ impl App {
                     composing: composing.as_deref(),
                     bars: &bars,
                     cast_bar: cast_bar.as_ref(),
+                    xp_bar: xp_bar.as_ref(),
                     // `None` when closed rather than an empty list: an empty
                     // book and a closed one are different things, and the
                     // interface draws the first and hides the second.
@@ -16412,5 +16592,38 @@ mod combat_text_tests {
         for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
             assert_eq!(body_spawn_height(Some((0.0, 2.0)), bad), normal, "scale {bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod live_aware_position_tests {
+    use super::*;
+
+    /// **The bug this fixes: targeting yourself froze the selection bracket,
+    /// and any damage you took drew its floating number, at the login
+    /// spot.** Both the target marker and every combat-text number read a
+    /// guid's position through `live_aware_position`, and the self case must
+    /// not touch replicated state at all -- proved here by handing it a
+    /// `WorldState` that does not even contain the guid.
+    #[test]
+    fn a_live_guids_own_position_never_reads_replicated_state() {
+        let state = ::world::WorldState::new();
+        let walked = glam::Vec3::new(10.0, 20.0, 30.0);
+        let pos = live_aware_position(&state, 42, walked, 1.5, 42, Instant::now())
+            .expect("the self case must not depend on the guid being in state at all");
+        assert_eq!(
+            (pos.x, pos.y, pos.z, pos.orientation),
+            (walked.x, walked.y, walked.z, 1.5)
+        );
+    }
+
+    /// Anyone else still falls through to replicated state -- and to
+    /// nothing, when that guid was never seen, the ordinary "not visible"
+    /// case every caller here already handles via `?`.
+    #[test]
+    fn another_guids_position_falls_through_to_replicated_state() {
+        let state = ::world::WorldState::new();
+        let walked = glam::Vec3::new(10.0, 20.0, 30.0);
+        assert!(live_aware_position(&state, 42, walked, 1.5, 99, Instant::now()).is_none());
     }
 }

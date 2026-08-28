@@ -134,6 +134,18 @@ impl Entity {
         self.fields.get(crate::update::fields::UNIT_LEVEL)
     }
 
+    /// Current experience toward the next level, and how much the next level
+    /// takes. `None` for anyone but the local player -- see
+    /// [`crate::update::fields::PLAYER_XP`]'s doc comment on why the field is
+    /// private to its owner.
+    pub fn xp(&self) -> Option<u32> {
+        self.fields.get(crate::update::fields::PLAYER_XP)
+    }
+
+    pub fn next_level_xp(&self) -> Option<u32> {
+        self.fields.get(crate::update::fields::PLAYER_NEXT_LEVEL_XP)
+    }
+
     /// Which model this object wears.
     ///
     /// The field depends on what the object *is*, and the two tables it indexes
@@ -6478,6 +6490,29 @@ mod tests {
         ]);
         assert_eq!(world.get(1).unwrap().target(), None);
         assert_eq!(world.get(2).unwrap().target(), Some(0x0000_0F13_0000_1234));
+    }
+
+    /// `PLAYER_XP`/`PLAYER_NEXT_LEVEL_XP`'s own real values -- `Testwolf`,
+    /// level 5 on the local realm, read `1783/2800` at these fields, and
+    /// the realm's own `characters.xp` and `player_xp_for_level` columns
+    /// independently agree. See the constants' own doc comments for why
+    /// that is stronger evidence than the offset merely parsing.
+    #[test]
+    fn xp_and_next_level_xp_read_their_own_fields() {
+        use crate::update::fields;
+        let mut world = WorldState::new();
+        world.apply(&[create(
+            1,
+            ObjectType::Player,
+            None,
+            &[
+                (fields::PLAYER_XP, 1783),
+                (fields::PLAYER_NEXT_LEVEL_XP, 2800),
+            ],
+        )]);
+        let entity = world.get(1).unwrap();
+        assert_eq!(entity.xp(), Some(1783));
+        assert_eq!(entity.next_level_xp(), Some(2800));
     }
 
     fn packed_bytes_0(race: u8, class: u8, gender: u8, power: u8) -> u32 {

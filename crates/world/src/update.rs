@@ -1503,6 +1503,35 @@ pub mod fields {
     /// inside that span.
     pub const EXPLORED_ZONES_WORDS: u16 = 128;
 
+    /// Current experience toward the next level. `PRIVATE`: this arrives only
+    /// in the *owner's* own update, never in what an observer is told about
+    /// somebody else -- unlike [`UNIT_LEVEL`], which is `PUBLIC`.
+    ///
+    /// **Not read off `UpdateFields.h` and trusted -- derived from three
+    /// fields this client had already confirmed live, and cross-checked
+    /// against a fourth.** `PLAYER_GUILDID` (`0x97`), `PLAYER_FIELD_COINAGE`
+    /// (`0x492`) and `PLAYER_EXPLORED_ZONES` (`0x411`) are each `UNIT_END +`
+    /// a documented delta; solving for `UNIT_END` from any one of the three
+    /// gives `0x94`, and it reproduces the other two exactly. `PLAYER_XP` is
+    /// `UNIT_END + 0x1E6`, which is `0x27A` under that same `UNIT_END` --
+    /// the fourth field this arithmetic was asked to predict rather than
+    /// confirm.
+    ///
+    /// **Confirmed live against a value this project does not control.**
+    /// `Testwolf`, level 5 on the local realm, reads `1783/2800` at this
+    /// field and the next -- and the realm's own `characters.xp` column
+    /// independently says `1783`, with `player_xp_for_level` independently
+    /// giving `2800` for level 5. Two sources this client never touches
+    /// agreeing with the wire, at a level and an XP total nobody chose to
+    /// make round, is the same class of evidence `PLAYER_FIELD_COINAGE`
+    /// rests on.
+    pub const PLAYER_XP: u16 = 0x027A;
+
+    /// How much experience the next level takes, alongside [`PLAYER_XP`].
+    /// `UNIT_END + 0x1E7` under the same derivation, confirmed by the same
+    /// `Testwolf` reading.
+    pub const PLAYER_NEXT_LEVEL_XP: u16 = 0x027B;
+
     /// `UNIT_NPC_FLAGS`: what this creature will do if you talk to it --
     /// gossip, hand out quests, sell things, train, repair.
     ///
