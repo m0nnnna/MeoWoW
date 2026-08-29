@@ -251,8 +251,30 @@ impl Jump {
         }
     }
 
-    /// Advances the arc by `dt` seconds, reporting whether the ground was
-    /// reached.
+    /// Leaves the ground with no upward impulse: the arc of a character who
+    /// has walked off a ledge rather than pushed off one.
+    ///
+    /// The same integration as [`Jump::begin`] from a standing start, which
+    /// is what a fall is -- and why both are one type. The caller decides
+    /// what a body meets on the way down; see the viewer's `jump_landing`.
+    pub fn stepping_off(direction: (f32, f32), speed: f32) -> Self {
+        Self {
+            velocity: 0.0,
+            ..Self::begin(direction, speed)
+        }
+    }
+
+    /// Advances the arc by `dt` seconds, reporting whether it has come back
+    /// down to or below the height it started from.
+    ///
+    /// **That report is not a landing, and the arc is not clamped there.**
+    /// It used to be both: `height` stopped at zero and said "the ground was
+    /// reached", which silently made take-off height the lowest a body could
+    /// ever be. A character who walked off a ledge therefore could not fall
+    /// -- there was no arc able to express it -- and the only thing left to
+    /// move them down was the ground snap, which teleports. Reported live as
+    /// "falling is instant". What a body meets on the way down is the
+    /// caller's business, because only the caller knows what is under it.
     ///
     /// Integrated with the midpoint term (`v*t - g*t^2/2`) rather than by
     /// adding `-g*dt` to the velocity and then stepping the height by it. At
@@ -266,11 +288,7 @@ impl Jump {
         self.height += self.velocity * dt - 0.5 * GRAVITY * dt * dt;
         self.velocity -= GRAVITY * dt;
         self.elapsed_ms = self.elapsed_ms.saturating_add((dt * 1000.0) as u32);
-        if self.height <= 0.0 {
-            self.height = 0.0;
-            return true;
-        }
-        false
+        self.height <= 0.0
     }
 }
 
@@ -401,13 +419,47 @@ mod tests {
             (peak - expected_peak).abs() < 0.05,
             "peaked at {peak}, expected about {expected_peak}"
         );
-        assert_eq!(jump.height, 0.0, "a landed jump is on the ground");
+        assert!(
+            jump.height <= 0.0,
+            "a jump that has run its course is back at or below take-off, not {}",
+            jump.height
+        );
         // 2v/g seconds in the air, in milliseconds.
         let expected_ms = (2.0 * JUMP_VELOCITY / GRAVITY * 1000.0) as u32;
         assert!(
             jump.elapsed_ms.abs_diff(expected_ms) < 50,
             "airborne {}ms, expected about {expected_ms}ms",
             jump.elapsed_ms
+        );
+    }
+
+    /// **An arc has to be able to pass below where it began, or nothing can
+    /// fall.** The height used to clamp at zero, which made take-off the
+    /// floor of the whole model: a character who walked off a ledge had no
+    /// arc that could carry them down, and the ground snap teleported them
+    /// instead. Reported live as "falling is instant".
+    #[test]
+    fn an_arc_carries_on_below_the_height_it_started_from() {
+        let mut fall = Jump::stepping_off((1.0, 0.0), 7.0);
+        assert_eq!(fall.velocity, 0.0, "a fall begins with no upward push");
+        assert_eq!(fall.height, 0.0);
+
+        // A second of falling, at sixty frames to the second.
+        for _ in 0..60 {
+            fall.advance(1.0 / 60.0);
+        }
+        // s = -gt^2/2, a little under ten units in the first second.
+        let expected = -0.5 * GRAVITY;
+        assert!(
+            (fall.height - expected).abs() < 0.2,
+            "fell to {} in a second, expected about {expected}",
+            fall.height
+        );
+        assert!(fall.velocity < 0.0, "a falling body is still gaining speed");
+        assert!(
+            fall.elapsed_ms.abs_diff(1000) < 50,
+            "airborne {}ms, expected about a second",
+            fall.elapsed_ms
         );
     }
 

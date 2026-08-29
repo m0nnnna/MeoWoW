@@ -24,6 +24,15 @@ pub struct LoadedWmo {
     pub wmo_id: u32,
     pub group_bounds: Vec<(Vec3, Vec3)>,
     pub group_surface_ids: Vec<u32>,
+    /// Whether each group is enclosed -- lit by the WMO's own lighting
+    /// rather than the outdoor sun. See [`wmo::GroupInfo::is_interior`].
+    ///
+    /// **What tells a building's floor from a fence's rail.** Both carry
+    /// ordinary walkable collision, so "a modelled floor was found here" --
+    /// what `App::modeled_floor` used to mean, on its own -- cannot tell an
+    /// abbey interior from a garden fence the character has jumped onto.
+    /// Reported live as rain cutting out while jumping a fence outdoors.
+    pub group_interior: Vec<bool>,
     pub vertex_count: usize,
     pub triangle_count: usize,
     pub group_count: usize,
@@ -246,6 +255,10 @@ pub fn load_with_areas(
         .iter()
         .map(|group| (Vec3::from(group.bounding_box.0), Vec3::from(group.bounding_box.1)))
         .collect();
+    // Off the root's own lightweight per-group table, not the group file --
+    // the same source `group_bounds` above already reads, so this costs
+    // nothing extra to open.
+    let group_interior = root.groups.iter().map(|group| group.is_interior()).collect();
     let mut group_surface_ids = vec![0; root.header.group_count as usize];
 
     for gi in 0..root.header.group_count as usize {
@@ -374,6 +387,7 @@ pub fn load_with_areas(
         wmo_id: root.header.wmo_id,
         group_bounds,
         group_surface_ids,
+        group_interior,
         vertex_count: vertices.len(),
         triangle_count,
         group_count,

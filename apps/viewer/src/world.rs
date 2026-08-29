@@ -124,6 +124,9 @@ pub struct CachedModel {
     pub wmo_id: Option<u32>,
     pub group_bounds: Vec<(Vec3, Vec3)>,
     pub group_surface_ids: Vec<u32>,
+    /// Parallel to `group_bounds`. Empty for an M2, which has no groups to
+    /// speak of. See `world_object::LoadedWmo::group_interior`.
+    pub group_interior: Vec<bool>,
 }
 
 /// One model and the transforms it takes on a single tile.
@@ -1647,6 +1650,65 @@ impl World {
             .map(|(z, footing, _)| (z, footing))
     }
 
+    /// [`Self::floor_under_footing`], widened to a body's own footprint --
+    /// see `collision::World::floor_under_footprint_tagged_with_id` for why
+    /// the player's own standing query needs this and a single point does
+    /// not: reported live as a stutter that pulled the character down while
+    /// jumping onto or over an object.
+    pub fn floor_under_footprint(&self, at: Vec3, step: f32, radius: f32) -> Option<(f32, Option<u8>)> {
+        let mut best: Option<(f32, Option<u8>, Option<u32>)> = None;
+        for tile in self.tiles_touching(at, at) {
+            if tile.solid.is_empty() {
+                continue;
+            }
+            if let Some((z, footing, area)) = tile
+                .solid
+                .floor_under_footprint_tagged_with_id(at.truncate(), at.z, step, radius)
+            {
+                if best.is_none_or(|(b, _, _)| z > b) {
+                    best = Some((z, footing, area));
+                }
+            }
+        }
+        best.map(|(z, footing, _)| (z, footing))
+    }
+
+    /// Whether `at` sits inside an *interior* WMO group -- enclosed, lit by
+    /// the building's own lighting rather than the outdoor sun. See
+    /// `world_object::LoadedWmo::group_interior`.
+    ///
+    /// **Not the same question `floor_under_footprint` answers.** That asks
+    /// "what holds a body up here", which a fence rail answers exactly as
+    /// well as an abbey floor. This asks "is there a roof", which the fence
+    /// never has -- confirmed live, where using the former for rain-gating
+    /// cut the ambience off and on again on every jump over an outdoor
+    /// fence. See `App::indoors`'s own doc comment at the call site.
+    ///
+    /// Tests group *bounding boxes* in each WMO instance's local space, the
+    /// same approximation `wmo_minimap_at_position` already makes for a
+    /// different purpose -- cheap enough to ask every frame, and exact
+    /// portal geometry is a feature this client does not have (see
+    /// `docs/ROADMAP.md`'s note on portal culling).
+    pub fn is_indoors_at(&self, at: Vec3) -> bool {
+        for tile in self.tiles_touching(at, at) {
+            for instance in &tile.wmos {
+                let local = instance.transform.inverse().transform_point3(at);
+                for (index, &(min, max)) in instance.model.group_bounds.iter().enumerate() {
+                    if !instance.model.group_interior.get(index).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    if (min.x..=max.x).contains(&local.x)
+                        && (min.y..=max.y).contains(&local.y)
+                        && (min.z..=max.z).contains(&local.z)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// What a grounded thing at `at` should be standing on: a modelled
     /// floor if one answers, the open terrain otherwise -- the same
     /// preference `drive_live_movement` gives the player's own footing,
@@ -1790,6 +1852,7 @@ impl World {
             wmo_id: Option<u32>,
             group_bounds: Vec<(Vec3, Vec3)>,
             group_surface_ids: Vec<u32>,
+            group_interior: Vec<bool>,
             render_bounds: Option<(Vec3, Vec3)>,
             doodads: Vec<Vec<crate::world_object::Doodad>>,
             texture_animation: crate::model::TextureAnimation,
@@ -1824,6 +1887,7 @@ impl World {
                         wmo_id: Some(w.wmo_id),
                         group_bounds: w.group_bounds,
                         group_surface_ids: w.group_surface_ids,
+                        group_interior: w.group_interior,
                         render_bounds: Some((w.min, w.max)),
                         doodads: w.doodads,
                     }
@@ -1864,6 +1928,7 @@ impl World {
                         wmo_id: None,
                         group_bounds: Vec::new(),
                         group_surface_ids: Vec::new(),
+                        group_interior: Vec::new(),
                         render_bounds: Some((m.min, m.max)),
                         doodads: Vec::new(),
                     }
@@ -1897,6 +1962,7 @@ impl World {
                 wmo_id: b.wmo_id,
                 group_bounds: b.group_bounds,
                 group_surface_ids: b.group_surface_ids,
+                group_interior: b.group_interior,
                 render_bounds: b.render_bounds,
             })
         })
@@ -2964,6 +3030,7 @@ impl World {
                     wmo_id: None,
                     group_bounds: Vec::new(),
                     group_surface_ids: Vec::new(),
+                    group_interior: Vec::new(),
                     render_bounds: Some((loaded.min, loaded.max)),
                 })
             })

@@ -1069,6 +1069,30 @@ const BODY_HEIGHT: f32 = 2.0;
 /// place, if stairs still catch or fences stop catching.
 const STEP_HEIGHT: f32 = 0.8;
 
+/// How far above the character's own feet a *footprint* sample may still be
+/// treated as the surface holding them up.
+///
+/// Deliberately tiny: it exists to absorb float noise and the fraction of a
+/// unit a body settles by between frames, **not** to allow any climbing.
+/// See [`footing_under`] for why the difference matters -- a footprint
+/// search reaches a body radius sideways, so anything it is allowed to
+/// lift the character onto can be climbed from beside it rather than from
+/// on top of it.
+const FOOTPRINT_SUPPORT_TOLERANCE: f32 = 0.05;
+
+/// How far the ground may drop under a walking character in one frame
+/// before it is a fall rather than a step down.
+///
+/// **Chosen, and stated as chosen.** It has to clear the largest honest
+/// per-frame drop -- a run down a steep slope covers a little over a tenth
+/// of a unit between frames at sixty of them a second -- with enough room
+/// that a stutter does not launch somebody into a fall on flat ground. It
+/// also has to sit below the shallowest thing that should read as a real
+/// drop, which is a stair tread. Half of [`STEP_HEIGHT`] is comfortably
+/// inside both, and it is the number to move if walking down slopes starts
+/// hopping or stepping off kerbs stops falling.
+const FALL_THRESHOLD: f32 = 0.4;
+
 /// How far the ground snap may move the character in one frame.
 ///
 /// Not a physics constant and not a step height: it is the line between
@@ -4021,6 +4045,31 @@ struct App {
     /// landing and believes the client in between -- so this is the only copy
     /// of it, and it is why the landing has to be sent explicitly.
     jump: Option<::world::motion::Jump>,
+    /// Where the jump in progress left the ground. Meaningless while `jump`
+    /// is `None`.
+    ///
+    /// **The reference the whole arc is measured from.**
+    /// [`Jump::height`] is a height *above take-off*, so this plus that
+    /// height is where the character actually is -- an absolute
+    /// trajectory that owes nothing to the ground beneath it. See
+    /// `jump_landing` for why that matters and for the four rounds of
+    /// live reports that came from the ground-relative arc it replaced.
+    ///
+    /// [`Jump::height`]: ::world::motion::Jump::height
+    jump_takeoff_z: f32,
+    /// Rejects a one-frame spike in the standing-height query -- see
+    /// [`FloorFilter`]. `foss-wow#158`: even widened to the body's own
+    /// footprint, a query can still land on the wrong triangle at a seam
+    /// for exactly one frame while jumping across a modelled surface.
+    floor_filter: FloorFilter,
+    /// Rejects a one-frame flip in whether a modelled floor was found at
+    /// all -- see [`FloorPresenceFilter`]. Gates `App::modeled_floor`,
+    /// which the footstep-material fallback reads.
+    floor_presence_filter: FloorPresenceFilter,
+    /// The same debounce, over `App::indoors` instead -- see that field's
+    /// own doc comment for why it is a second, narrower question from
+    /// `modeled_floor` and needs its own filter rather than sharing one.
+    indoors_filter: FloorPresenceFilter,
     /// Whether the character is currently swimming, and in what.
     ///
     /// **A remembered state rather than a fresh test each frame**, because the
@@ -4049,8 +4098,60 @@ struct App {
     /// are compared once, and asking again later could break the tie the other
     /// way and put a character on the floorboards hearing the ground beneath
     /// them.
+    /// The last accepted standing height -- what `stand_at` resolved to,
+    /// the moment it was last within `MAX_GROUND_SNAP` of this. `None`
+    /// only before the very first sample, so the server's login altitude is
+    /// never overwritten by a default before anything real has been
+    /// measured.
+    ///
+    /// **Deliberately not the same variable `live.position.z` is.** A
+    /// severe bug lived in that conflation: the ground-snap block used to
+    /// write `stand_at` straight into `live.position.z`, and the *jump*
+    /// block separately did `live.position.z += jump.height` every frame
+    /// unconditionally. That is correct only because the snap normally
+    /// resets `live.position.z` to a clean base first -- but the instant a
+    /// snap was refused (a legitimate large drop, mid-jump, past a
+    /// platform's edge), nothing reset it, and `jump.height` started
+    /// compounding onto an already-inflated total forever after, since nothing
+    /// ever subtracted the previous frame's addition back out. Reported live
+    /// as being launched into the sky and stuck there: one capture landed at
+    /// **z 131** from a take-off at z 72, climbing a steady ~1.6 units every
+    /// single frame for the rest of the flight once the first refusal hit --
+    /// exactly `jump.height` re-added on top of itself, over and over.
+    ///
+    /// This field is the fix: it is *only* the ground/floor reference,
+    /// updated by the snap gate and nothing else. `live.position.z` is
+    /// derived fresh from it every frame -- `ground_base`, plus the arc's
+    /// own height if a jump is in progress -- never accumulated onto
+    /// directly, so a held-steady base during a refusal cannot compound
+    /// with anything.
+    ///
+    /// **Every other writer of `live.position` has to resync this, or the
+    /// bug returns from a different direction.** A stale base compared
+    /// against a position that moved *some other way* refuses exactly as
+    /// hard as one compared against a jump-inflated total does -- the snap
+    /// cannot tell "this is wrong" from "this is a legitimate teleport".
+    /// Three other places write `live.position` directly and each resets
+    /// this immediately after: `advance_flight` (a taxi's own route
+    /// replaces the whole function, ground-snap included, until it lands),
+    /// `live::answer_teleport` and `live::answer_worldport` (both write
+    /// straight from a server packet). Grep `live.position.z =` and
+    /// `live.position =` before adding a fourth.
+    ground_base: Option<f32>,
     floor_material: Option<u8>,
     modeled_floor: bool,
+    /// Whether the character is inside an *interior* WMO group -- enclosed,
+    /// lit by the building's own lighting rather than the outdoor sun. See
+    /// `world::World::is_indoors_at`.
+    ///
+    /// **Deliberately not the same question `modeled_floor` answers.**
+    /// `modeled_floor` is "was any modelled surface found underfoot", which
+    /// a garden fence satisfies exactly as well as an abbey's own floor --
+    /// and `weather_ambience`/`precipitation_for_frame` used to be handed
+    /// that, which is why rain used to cut out the moment a jump landed on
+    /// a fence rail. This is the narrower question they actually need:
+    /// specifically a *roof*, not merely *something solid underfoot*.
+    indoors: bool,
     wading: bool,
     /// Where the player's own cycle was last time footsteps were checked, as
     /// `(sequence, milliseconds into it)`.
@@ -4734,6 +4835,552 @@ fn grounded_position(
     }
 }
 
+/// The next value for [`App::ground_base`], gated by `max_snap` exactly as
+/// the original single-field version was -- except this only ever touches
+/// the *base*, never the character's drawn position, which is what makes it
+/// safe to call every frame regardless of what else is happening to
+/// `live.position.z`.
+///
+/// **The bug this exists for.** Reported live as being launched into the
+/// sky and stuck there. `App::ground_base`'s own doc comment has the full
+/// account; the short version is that `live.position.z` used to be both
+/// "the tracked ground reference" and "the drawn position" at once, and a
+/// refused snap left the *drawn* position (already including a jump's
+/// height) untouched -- so the next frame's unconditional `+= jump.height`
+/// added another jump's worth of height on top of a total that already
+/// had one. Ten such frames added ten jump-heights. Fifty added fifty. One
+/// live capture landed at z 131 from a take-off at z 72. Separating "the
+/// base" from "the drawn position" makes that impossible *by construction*:
+/// this function only ever returns `previous` or `candidate`, never a sum
+/// of the two, so nothing here can accumulate across calls.
+fn updated_ground_base(previous: Option<f32>, candidate: f32, max_snap: f32) -> f32 {
+    match previous {
+        None => candidate,
+        Some(base) if (candidate - base).abs() <= max_snap => candidate,
+        Some(base) => base,
+    }
+}
+
+#[cfg(test)]
+mod ground_base_tests {
+    use super::*;
+
+    /// The bug itself, reproduced directly: a long run of refused frames --
+    /// exactly what a jump landing past a platform's edge produces -- must
+    /// leave the base exactly where it was, not accumulating anything.
+    #[test]
+    fn a_long_run_of_refusals_does_not_drift() {
+        let max_snap = 5.0;
+        let mut base = updated_ground_base(None, 72.0, max_snap);
+        assert_eq!(base, 72.0, "the first sample is always accepted");
+
+        // A candidate far below -- the terrain under an open ledge, once the
+        // fence's floor is lost -- refused for fifty consecutive frames.
+        for _ in 0..50 {
+            base = updated_ground_base(Some(base), 10.0, max_snap);
+        }
+        assert_eq!(
+            base, 72.0,
+            "fifty refusals in a row must leave the base exactly where it started, \
+             not fifty jump-heights higher"
+        );
+    }
+
+    /// A candidate within reach is still accepted immediately -- this is
+    /// not a blanket freeze, only a refusal of the specific large jump.
+    #[test]
+    fn a_candidate_within_reach_is_still_accepted() {
+        let max_snap = 5.0;
+        let base = updated_ground_base(Some(72.0), 74.0, max_snap);
+        assert_eq!(base, 74.0);
+    }
+
+    /// A genuine large drop is accepted once it is within reach again --
+    /// refusal is not permanent, only a per-frame bound.
+    #[test]
+    fn a_large_drop_is_eventually_accepted_once_in_reach() {
+        let max_snap = 5.0;
+        // Refused: 20 units away.
+        let base = updated_ground_base(Some(72.0), 52.0, max_snap);
+        assert_eq!(base, 72.0);
+        // Accepted: now only 4 units away from the held base.
+        let base = updated_ground_base(Some(base), 68.0, max_snap);
+        assert_eq!(base, 68.0);
+    }
+}
+
+/// What is holding the character up: the surface under their own feet,
+/// widened to the whole footprint *only where that keeps them where they
+/// already are*.
+///
+/// **Two jobs that look like one, and only the first wants a footprint.**
+/// `centre` is the surface directly under the character; `footprint` is the
+/// highest surface anywhere under a body-radius ring around them (see
+/// `collision::World::floor_under_footprint_tagged_with_id`). The ring
+/// exists because a point query at the very edge of a platform can fall a
+/// hair *off* it and report the kerb below, dropping a character whose body
+/// is plainly still standing on the platform. That is a fix about **not
+/// falling**.
+///
+/// Used unfiltered, though, the same ring is also a fix about **climbing**
+/// -- and a disastrous one, because it reaches a body radius *sideways*.
+/// Anything it can see, it can lift the character onto without their ever
+/// being over it. Reported live: "I can just walk up the fence without
+/// jumping, like it's a ramp." A fence's rails are stacked within
+/// `STEP_HEIGHT` of one another, so with a ring reaching half a body width
+/// ahead, each rail in turn was found, climbed onto, and used as the
+/// footing for finding the next.
+///
+/// So the ring may hold the character up, and may never lift them: a
+/// footprint answer above where they already stand is discarded in favour
+/// of the centre point, which has to be genuinely over a surface to report
+/// it. `FOOTPRINT_SUPPORT_TOLERANCE` is float noise only, far below
+/// anything climbable.
+fn footing_under(
+    centre: Option<(f32, Option<u8>)>,
+    footprint: Option<(f32, Option<u8>)>,
+    current_z: f32,
+) -> Option<(f32, Option<u8>)> {
+    match footprint {
+        Some((z, _)) if z > current_z + FOOTPRINT_SUPPORT_TOLERANCE => centre,
+        found => found,
+    }
+}
+
+#[cfg(test)]
+mod footing_under_tests {
+    use super::*;
+
+    /// **The bug the footprint search was added for.** Standing at the very
+    /// edge of a platform, the centre point falls off it and reports the
+    /// kerb below; the ring still finds the platform the body is standing
+    /// on, and that must win -- it is not a lift, it is where the character
+    /// already is.
+    #[test]
+    fn the_footprint_keeps_a_character_on_the_edge_of_a_platform() {
+        let standing_at = 76.19;
+        assert_eq!(
+            footing_under(Some((73.80, None)), Some((76.19, None)), standing_at),
+            Some((76.19, None)),
+            "the platform under the body must hold it up, not the kerb beside it"
+        );
+    }
+
+    /// **The regression that fix caused.** Walking up to a fence, the ring
+    /// reaches its rail half a body width before the character is over it.
+    /// Taking that as footing is what let a fence be walked up like a ramp,
+    /// one rail at a time.
+    #[test]
+    fn the_footprint_never_lifts_a_character_onto_a_rail_beside_them() {
+        let standing_at = 71.30;
+        assert_eq!(
+            footing_under(Some((71.30, None)), Some((72.10, None)), standing_at),
+            Some((71.30, None)),
+            "a rail the ring can see but the body is not over must not be climbed"
+        );
+    }
+
+    /// And with nothing under the centre point at all, a rail beside the
+    /// character is still not something to stand on -- the honest answer is
+    /// the centre's, whatever it is.
+    #[test]
+    fn a_rail_beside_a_character_over_nothing_is_still_not_footing() {
+        assert_eq!(footing_under(None, Some((72.10, None)), 71.30), None);
+    }
+
+    /// Ordinary ground: the ring agrees with the centre and is used, tag
+    /// and all -- the common case must not pay for either fix.
+    #[test]
+    fn agreeing_answers_pass_straight_through_with_their_tag() {
+        assert_eq!(
+            footing_under(Some((71.30, Some(3))), Some((71.30, Some(3))), 71.30),
+            Some((71.30, Some(3)))
+        );
+        assert_eq!(footing_under(None, None, 71.30), None);
+    }
+
+    /// A surface a hair above the feet -- float noise, or the fraction a
+    /// body settles by between frames -- is still support, not a climb.
+    #[test]
+    fn float_noise_above_the_feet_is_still_support() {
+        let standing_at = 76.19;
+        let noise = standing_at + FOOTPRINT_SUPPORT_TOLERANCE * 0.5;
+        assert_eq!(
+            footing_under(Some((73.80, None)), Some((noise, None)), standing_at),
+            Some((noise, None))
+        );
+    }
+}
+
+/// Where a jump lands this frame, if it lands at all: `None` to keep
+/// flying, `Some(z)` to put the character down at that height.
+///
+/// **This is the half of "a jump is an absolute trajectory" that replaced
+/// the design every other fix in `foss-wow#158` was working around.** The
+/// arc used to *ride on top of* the ground -- `position.z = ground_base +
+/// jump.height` -- so the ground under the character was added to their
+/// altitude every frame of the flight. Crossing a fence therefore lifted
+/// them by the fence's entire height the instant the floor query found its
+/// rail, on top of whatever the arc had already supplied, and dropped them
+/// again the instant they passed beyond it. Reported live, over four
+/// separate rounds, as "boosts the player over", "you cannot fail the
+/// jump", "no fall, instantly on the ground, 0 travel" -- all one cause.
+/// Four fixes before this one narrowed *what the floor query found* or
+/// *what the wall exemption allowed*, and none of them touched the
+/// addition itself, which is why each came back.
+///
+/// Now the arc is absolute (`jump_takeoff_z + jump.height`) and the ground
+/// decides only *when it ends*. That is this function, and it is a
+/// **crossing** test rather than a comparison against the current height:
+/// the surface must lie between where the arc was at the start of this
+/// frame and where it is now, which is frame-rate independent and cannot
+/// be satisfied by a surface the character was never above. A plain `now <=
+/// surface` would fire on the take-off frame itself (the ground being
+/// stood on is trivially at or above the arc's zero height) and would let
+/// `floor_under_footprint`'s deliberately generous `STEP_HEIGHT` reach --
+/// which searches up to 0.8 units *above* the character -- snap the
+/// character up onto a rail they had not reached, which is the boost all
+/// over again.
+///
+/// **The crossing is the whole test, with no "the arc ran out" fallback
+/// beside it.** There used to be one, because `Jump` clamped its height at
+/// take-off and so could not express going any lower -- an arc that met
+/// nothing simply stopped, and something had to call that a landing. Now
+/// the arc carries on down (see [`::world::motion::Jump::advance`]), so a
+/// body that meets nothing keeps falling, which is what it should have been
+/// doing all along.
+fn jump_landing(before_z: f32, now_z: f32, surface: Option<f32>) -> Option<f32> {
+    let surface = surface?;
+    (now_z <= surface && surface <= before_z).then_some(surface)
+}
+
+#[cfg(test)]
+mod jump_landing_tests {
+    use super::*;
+
+    /// The physics apex a jump's own arc can reach, for building realistic
+    /// test values.
+    const JUMP_APEX: f32 =
+        (::world::motion::JUMP_VELOCITY * ::world::motion::JUMP_VELOCITY)
+            / (2.0 * ::world::motion::GRAVITY);
+
+    /// **The take-off frame must not land.** A plain "is the surface at or
+    /// above me" test does, because the ground being jumped from is exactly
+    /// at the arc's zero height -- which would end every jump on the frame
+    /// it began.
+    #[test]
+    fn taking_off_from_the_ground_is_not_a_landing() {
+        let takeoff_z = 71.62;
+        // First advance: the arc has risen a little above take-off.
+        assert_eq!(
+            jump_landing(takeoff_z, takeoff_z + 0.13, Some(takeoff_z)),
+            None,
+            "the ground just left must not immediately catch the jump again"
+        );
+    }
+
+    /// **The boost, in the one place it can still be expressed.** A fence
+    /// rail found by `floor_under_footprint`'s generous upward reach, while
+    /// the arc is climbing well below it, must not become a landing --
+    /// snapping up to it is exactly the lift that was reported.
+    #[test]
+    fn a_surface_the_arc_has_not_reached_is_not_a_landing() {
+        // Climbing through 72.0, with a rail at 72.6 found overhead.
+        assert_eq!(
+            jump_landing(71.9, 72.0, Some(72.6)),
+            None,
+            "a rail above the arc must not pull the character up onto it"
+        );
+        // And still not once the arc is descending past 72.0 towards it --
+        // it is above, so it was never crossed.
+        assert_eq!(jump_landing(72.1, 72.0, Some(72.6)), None);
+    }
+
+    /// Coming down onto a fence top the arc genuinely cleared *is* a
+    /// landing, caught on the frame the arc crosses it.
+    #[test]
+    fn descending_across_a_cleared_surface_lands_on_it() {
+        // Arc descending from 73.10 to 72.95 with the fence top at 73.00.
+        assert_eq!(jump_landing(73.10, 72.95, Some(73.00)), Some(73.00));
+    }
+
+    /// A fast descent that overshoots the surface within a single frame is
+    /// still caught -- the crossing test is bounded by where the arc *was*,
+    /// not by a fixed tolerance that a frame-rate spike could outrun.
+    #[test]
+    fn a_fast_frame_that_overshoots_the_surface_still_lands_on_it() {
+        // Half a unit of descent in one frame, straight past a 73.00 top.
+        assert_eq!(jump_landing(73.40, 72.90, Some(73.00)), Some(73.00));
+    }
+
+    /// The ordinary "jumped straight up, came back down" landing, and the
+    /// "missed the fence entirely" case a jump has to be able to fail into:
+    /// the arc descends through the ground it left, and that is the
+    /// crossing.
+    #[test]
+    fn an_arc_coming_back_down_lands_on_the_ground_it_left() {
+        let takeoff_z = 71.62;
+        assert_eq!(
+            jump_landing(takeoff_z + 0.1, takeoff_z - 0.02, Some(takeoff_z)),
+            Some(takeoff_z)
+        );
+    }
+
+    /// **With no surface found at all -- an unstreamed tile -- there is no
+    /// landing.** The caller holds the arc still rather than letting it run
+    /// away; see `drive_live_movement`. Inventing a height here is what the
+    /// whole module refuses to do.
+    #[test]
+    fn an_arc_over_nothing_does_not_land() {
+        assert_eq!(jump_landing(71.7, 71.62, None), None);
+    }
+
+    /// **Falling past the height it started from is not a landing.** The
+    /// arc used to stop dead there, which is why a character who walked off
+    /// a ledge could not fall.
+    #[test]
+    fn passing_below_take_off_over_open_air_keeps_falling() {
+        let takeoff_z = 71.62;
+        // Ground is well below: the arc is only part-way down to it.
+        assert_eq!(jump_landing(takeoff_z + 0.02, takeoff_z - 0.3, Some(60.0)), None);
+    }
+
+    /// Nothing here can lift the character above what the arc itself
+    /// reached: every landing height is a surface the arc descended
+    /// through, or the arc's own height.
+    #[test]
+    fn no_landing_is_ever_above_the_arcs_own_reach() {
+        let apex = 71.62 + JUMP_APEX;
+        for surface in [70.0, 71.62, 72.5, apex, apex + 2.0] {
+            if let Some(z) = jump_landing(apex, apex - 0.1, Some(surface)) {
+                assert!(
+                    z <= apex + 1e-4,
+                    "landed at {z}, above the arc's own apex {apex}"
+                );
+            }
+        }
+    }
+}
+
+/// Rejects a single spurious frame in a stream of standing-height answers,
+/// while still accepting a real multi-frame transition.
+///
+/// **The bug this exists for.** `foss-wow#158`: `--log-file` from a live
+/// jump onto a raised platform showed the floor answer sitting around 75.9
+/// for a dozen frames, dropping to ~73.8 -- *below the surrounding terrain*
+/// -- for exactly one frame, then recovering to ~75.9 immediately, and
+/// repeating two or three times over one 750ms jump.
+/// `World::floor_under_footprint` (this ticket's first fix) widened the
+/// query to the body's own radius and removed the large version of this;
+/// this removes what was left, which reads as the same bug at a smaller
+/// scale rather than as a second cause -- a single query still lands on the
+/// wrong triangle for one frame, at a seam the footprint's fixed eight-point
+/// ring did not happen to straddle that frame.
+///
+/// A causal median of the last three raw answers: a lone outlier is
+/// out-voted by its two neighbours the moment it happens, with no need to
+/// see the future. A *real* step -- genuinely landing on something lower or
+/// higher and staying there -- is accepted one frame after it starts, which
+/// two of the three samples agreeing is the earliest anything could tell the
+/// two cases apart. `None` (no floor found at all) passes straight through
+/// and clears the history: walking off the edge of a modelled floor onto
+/// open ground is a real transition, not noise, and delaying it would be a
+/// second bug wearing the fix for the first one.
+#[derive(Default)]
+struct FloorFilter {
+    /// The two most recent raw `Some` answers, oldest first.
+    history: [Option<f32>; 2],
+}
+
+impl FloorFilter {
+    fn filter(&mut self, sample: Option<f32>) -> Option<f32> {
+        let Some(z) = sample else {
+            self.history = [None, None];
+            return None;
+        };
+        let filtered = match self.history {
+            [Some(a), Some(b)] => median3(a, b, z),
+            _ => z,
+        };
+        self.history = [self.history[1], Some(z)];
+        Some(filtered)
+    }
+}
+
+fn median3(a: f32, b: f32, c: f32) -> f32 {
+    let mut v = [a, b, c];
+    v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    v[1]
+}
+
+/// Rejects a single spurious frame in a boolean presence signal -- "is
+/// there a modelled floor under the character", "is the character indoors"
+/// -- the same way [`FloorFilter`] rejects one in the standing height
+/// itself. `FloorFilter` will not do this job: see below.
+///
+/// **Why a boolean needs its own filter, and why one debounced flag is not
+/// reused for the other.** Both `App::modeled_floor` and `App::indoors`
+/// gate more than cosmetics: `modeled_floor` is what the footstep-material
+/// fallback reads, and `indoors` is what `weather_ambience` and
+/// `precipitation_for_frame` read to decide whether rain is heard or seen
+/// at all. A `--log-file` capture of jumping onto a raised platform showed
+/// the underlying query flip for exactly one frame, sandwiched between many
+/// frames agreeing the other way -- and once `indoors` existed, the same
+/// capture showed `weather Some(8533) -> None` and back, thirty-seven times
+/// across one session, each toggle restarting `RainLightLoop.wav` from the
+/// archive. `FloorFilter` cannot be reused for either: it deliberately
+/// passes `None` straight through with **no** smoothing, because losing the
+/// floor for real (walking off a building's edge) must be immediate -- and
+/// a lone `false` sandwiched between two `true`s, or a lone `true`
+/// sandwiched between two `false`s, is exactly the single-frame glitch a
+/// boolean gate needs protecting from in *both* directions, since wrongly
+/// cutting the rain for one frame is exactly as wrong as wrongly letting it
+/// through for one. Each flag gets its own instance rather than sharing one
+/// because they answer different questions and can disagree on the very
+/// frame that matters: a fence rail is `modeled_floor` but never `indoors`.
+///
+/// A majority of the last three raw answers: a lone disagreement is
+/// out-voted by its two neighbours the moment it happens, and a real,
+/// sustained transition is accepted one frame after it starts.
+#[derive(Default)]
+struct FloorPresenceFilter {
+    /// The two most recent raw answers, oldest first. `None` means "not
+    /// observed yet" -- the same bootstrap `FloorFilter` uses, and for the
+    /// same reason: a fresh filter must not bias its first two real answers
+    /// towards `false` just because that is what an empty history defaults
+    /// to.
+    history: [Option<bool>; 2],
+}
+
+impl FloorPresenceFilter {
+    fn filter(&mut self, sample: bool) -> bool {
+        let filtered = match self.history {
+            [Some(a), Some(b)] => [a, b, sample].into_iter().filter(|&v| v).count() >= 2,
+            _ => sample,
+        };
+        self.history = [self.history[1], Some(sample)];
+        filtered
+    }
+}
+
+#[cfg(test)]
+mod floor_presence_filter_tests {
+    use super::*;
+
+    /// The bug itself, in the direction that was actually observed: a lone
+    /// frame losing the floor between two that found it must not cut the
+    /// rain off and on again.
+    #[test]
+    fn a_single_frame_dropout_is_rejected() {
+        let mut filter = FloorPresenceFilter::default();
+        assert!(filter.filter(true));
+        assert!(filter.filter(true));
+        assert!(
+            filter.filter(false),
+            "a lone dropout must not win over two frames that found the floor"
+        );
+        assert!(filter.filter(true));
+    }
+
+    /// The mirror case: a lone spurious detection must not cut the rain off
+    /// for a frame while genuinely out in the open.
+    #[test]
+    fn a_single_frame_false_positive_is_rejected() {
+        let mut filter = FloorPresenceFilter::default();
+        assert!(!filter.filter(false));
+        assert!(!filter.filter(false));
+        assert!(
+            !filter.filter(true),
+            "a lone spurious detection must not win over two open-air frames"
+        );
+    }
+
+    /// A real, sustained transition -- actually walking onto or off a
+    /// modelled floor -- must not be permanently rejected as noise.
+    #[test]
+    fn a_sustained_change_is_accepted_one_frame_in() {
+        let mut filter = FloorPresenceFilter::default();
+        filter.filter(true);
+        filter.filter(true);
+        assert!(
+            filter.filter(false),
+            "one frame in, still indistinguishable from a dropout"
+        );
+        assert!(
+            !filter.filter(false),
+            "two frames in a row off the floor is a real transition"
+        );
+        assert!(!filter.filter(false));
+    }
+}
+
+#[cfg(test)]
+mod floor_filter_tests {
+    use super::*;
+
+    /// The bug itself: a lone frame reading far below two neighbours that
+    /// agree with each other is thrown out, not shown.
+    #[test]
+    fn a_single_frame_spike_is_rejected() {
+        let mut filter = FloorFilter::default();
+        filter.filter(Some(75.9));
+        filter.filter(Some(75.9));
+        assert_eq!(
+            filter.filter(Some(73.8)),
+            Some(75.9),
+            "a lone low frame must not win over two that agree"
+        );
+        assert_eq!(
+            filter.filter(Some(75.9)),
+            Some(75.9),
+            "recovery must be immediate once the spike is outnumbered again"
+        );
+    }
+
+    /// A real step -- the character actually landing on lower ground and
+    /// staying there -- must not be permanently rejected as noise.
+    #[test]
+    fn a_sustained_change_is_accepted_one_frame_in() {
+        let mut filter = FloorFilter::default();
+        filter.filter(Some(75.9));
+        filter.filter(Some(75.9));
+        assert_eq!(
+            filter.filter(Some(70.0)),
+            Some(75.9),
+            "one low frame in, still indistinguishable from the spike"
+        );
+        assert_eq!(
+            filter.filter(Some(70.0)),
+            Some(70.0),
+            "two low frames in a row is a real step, not noise"
+        );
+        assert_eq!(filter.filter(Some(70.0)), Some(70.0));
+    }
+
+    /// Losing the floor entirely must be immediate: smoothing a genuine
+    /// walk off the edge of a building would be a second bug.
+    #[test]
+    fn losing_the_floor_is_immediate_and_resets_history() {
+        let mut filter = FloorFilter::default();
+        filter.filter(Some(75.9));
+        filter.filter(Some(75.9));
+        assert_eq!(filter.filter(None), None);
+        assert_eq!(
+            filter.filter(Some(60.0)),
+            Some(60.0),
+            "the next floor answer is trusted immediately, not fought against \
+             the surface from before the gap"
+        );
+    }
+
+    #[test]
+    fn median3_does_not_care_about_input_order() {
+        assert_eq!(median3(1.0, 5.0, 3.0), 3.0);
+        assert_eq!(median3(5.0, 1.0, 3.0), 3.0);
+        assert_eq!(median3(3.0, 3.0, 3.0), 3.0);
+    }
+}
+
 /// The comparison [`grounded_position`] makes, pulled out so it is checkable
 /// without a `World` -- see there for why the tolerance is chosen rather
 /// than measured.
@@ -4806,12 +5453,16 @@ fn resolve_precipitation(weather: ::world::WeatherChange, seconds: f32) -> Optio
 /// the moment a character steps through a doorway, and `resolve_precipitation`
 /// has no notion of a roof at all: the field is a camera-relative box with no
 /// world geometry in it (see `render::precipitation`), so nothing there would
-/// ever have stopped it. `indoors` is `App::modeled_floor`, the same signal
-/// footsteps already use to fall back from the terrain to a building's own
-/// floor material -- "a building's floor outranks the terrain under it,
-/// which is what makes an interior an interior" (see `drive_live_movement`),
-/// so a rained-on abbey interior is the same class of bug as a footstep that
-/// sounds like grass indoors.
+/// ever have stopped it. `indoors` is `App::indoors` -- **not**
+/// `App::modeled_floor`, which is "something solid was found underfoot" and
+/// is exactly as true of an outdoor fence rail as of an abbey's own floor;
+/// see that field's own doc comment for the live capture that caught the
+/// difference. `modeled_floor` is what footsteps fall back to a building's
+/// floor material with -- "a building's floor outranks the terrain under
+/// it, which is what makes an interior an interior" (see
+/// `drive_live_movement`) -- and a rained-on abbey interior would be the
+/// same class of bug as a footstep that sounds like grass indoors, which is
+/// why this function exists at all; it just needs the narrower signal.
 fn precipitation_for_frame(
     weather: ::world::WeatherChange,
     seconds: f32,
@@ -5631,9 +6282,15 @@ impl App {
             live: None,
             live_move: ::world::motion::Motion::default(),
             jump: None,
+            jump_takeoff_z: 0.0,
+            floor_filter: FloorFilter::default(),
+            floor_presence_filter: FloorPresenceFilter::default(),
+            indoors_filter: FloorPresenceFilter::default(),
             swimming: None,
             floor_material: None,
+            ground_base: None,
             modeled_floor: false,
+            indoors: false,
             wading: false,
             footstep_phase: None,
             autorun: false,
@@ -5855,6 +6512,13 @@ impl App {
             live.realm,
             live.map_name
         );
+        // Seeded from the server's own login altitude, not left `None` --
+        // see `App::ground_base`'s own doc comment. `None` would accept
+        // whatever the *first* ground/floor sample says with no check at
+        // all, which is exactly the "terrain answers before the real floor
+        // has streamed in" window `MAX_GROUND_SNAP`'s refusal exists to
+        // guard against.
+        self.ground_base = Some(live.position.z);
         self.live = Some(live);
         // Last, and only now: this is what switches the client out of the
         // sign-in mode, and every early return above deliberately did not.
@@ -7478,7 +8142,7 @@ impl App {
                 precipitation_for_frame(
                     weather,
                     self.started.elapsed().as_secs_f32(),
-                    self.modeled_floor,
+                    self.indoors,
                 ),
                 &r.material_binds,
                 r.bones.as_ref(),
@@ -7772,6 +8436,19 @@ impl App {
             tracing::info!("landed at {x:.1}, {y:.1}, {z:.1}");
             live.orientation = flight.orientation_before;
             self.flight = None;
+            // **Resynced here, not left stale.** This function's own writes
+            // to `live.position.z` bypass `App::ground_base` entirely --
+            // the whole ground-snap block never runs while `advance_flight`
+            // keeps returning `true`, this frame included, so nothing else
+            // ever touches it during the flight. Without this, the first
+            // frame `drive_live_movement` actually resumes would compare
+            // the just-landed height against whatever `ground_base` was
+            // *before take-off*, refuse the (almost always large) delta,
+            // and snap the character's `z` back to wherever they left the
+            // ground -- the same "stale base" shape as the bug
+            // `ground_base` itself exists to fix, just reached from a
+            // different direction.
+            self.ground_base = Some(z);
         }
         true
     }
@@ -7850,6 +8527,26 @@ impl App {
                 live.position.y + dy * speed * dt,
                 live.position.z,
             );
+            // **Nothing is stepped over mid-air, so the step allowance is
+            // zero while airborne.** `STEP_HEIGHT` is a *walking*
+            // concession -- "how tall a thing may be and still be walked
+            // over" -- and `slide` spends it by ignoring every obstacle
+            // whose top is below the character's feet plus that allowance.
+            // Applied to a body in flight that reads as "anything within
+            // 0.8 above my feet is not there", so a fence was passed
+            // straight through whenever the arc was within a step of its
+            // top rather than actually above it. Reported live: "jumping
+            // still lets me phase through it altogether."
+            //
+            // Zero restores the only rule that is true in the air: an
+            // obstacle is cleared when the body is genuinely above it, and
+            // collides otherwise. The arc is absolute now (see
+            // `jump_landing`), so `from.z` is the character's real height
+            // and that comparison finally means what it says -- which is
+            // also why the ceiling-widening this replaced is gone
+            // entirely: it existed to compensate for a ground-relative arc
+            // that no longer exists.
+            let horizontal_step = if self.jump.is_some() { 0.0 } else { STEP_HEIGHT };
             // **Buildings are solid, and nothing but this client says so.**
             // A character driven through the abbey wall was drawn inside it by
             // a second client watching, so the server neither corrects nor
@@ -7857,7 +8554,7 @@ impl App {
             live.position = match self.renderer.as_ref().and_then(|r| r.scene.as_ref()) {
                 Some(Scene::Streaming(world)) => {
                     let slid =
-                        world.slide(live.position, wanted, BODY_RADIUS, BODY_HEIGHT, STEP_HEIGHT);
+                        world.slide(live.position, wanted, BODY_RADIUS, BODY_HEIGHT, horizontal_step);
                     // **Previously silent.** A full block and a slow climb
                     // look identical in the `stand` log above -- that one
                     // only fires when the standing height *changes*, and a
@@ -7989,8 +8686,46 @@ impl App {
             // most of the world is open ground, and the height field answers
             // for it far more cheaply than a triangle query ever could.
             let ground = world.height_at(live.position.x, live.position.y);
-            let underfoot = world.floor_under_footing(live.position, STEP_HEIGHT);
-            let floor = underfoot.map(|(z, _)| z);
+            // **The body's own footprint, not the single point at its
+            // centre.** A point query at the very edge of a platform can
+            // land on whatever is beside it -- a kerb, a plinth, open ground
+            // -- for exactly the frames the centre happens to sit there,
+            // even while most of the body is still resting on the platform.
+            // Reported live as a stutter that pulled the character down
+            // while jumping onto or over an object: `--log-file` showed one
+            // frame's floor answer *below the surrounding terrain*,
+            // sandwiched between two frames answering the object's own top,
+            // at a spot where only the horizontal position had moved by a
+            // fraction of a unit. See
+            // `collision::World::floor_under_footprint_tagged_with_id`.
+            //
+            // **Not narrowed to zero here while airborne any more -- see
+            // `stand` below, a few lines down, for where the real fix
+            // against a jump climbing a fence's own structure now lives.**
+            // A first attempt narrowed this margin instead and made things
+            // worse: `floor_under_footprint` finding *less* does not stop
+            // whatever it *does* find from being accepted unconditionally,
+            // which is the actual bug. The margin itself is fine to leave
+            // generous; what changed is what happens with its answer.
+            //
+            // **Both queries, because the footprint may support but never
+            // lift** -- see `footing_under`, which is where the fence
+            // stopped being walkable like a ramp.
+            let underfoot = footing_under(
+                world.floor_under_footing(live.position, STEP_HEIGHT),
+                world.floor_under_footprint(live.position, STEP_HEIGHT, BODY_RADIUS),
+                live.position.z,
+            );
+            // **A single frame can still land on the wrong triangle even
+            // within the body's own footprint** -- see `FloorFilter`'s own
+            // doc comment for the live log that caught it. This is the
+            // second half of that fix, applied only to the height used to
+            // stand the character: `floor_material`/`modeled_floor` below
+            // read the raw, unfiltered `underfoot` on purpose, since a
+            // footstep sound flickering for one frame is not the bug being
+            // fixed here and filtering it would delay a real material
+            // change by a frame for nothing.
+            let floor = self.floor_filter.filter(underfoot.map(|(z, _)| z));
             // **The floor outranks the terrain whenever it answered at all --
             // not merely when it happens to be the taller of the two.** This
             // was `ground.max(floor)`, on the reasoning that "a floor laid
@@ -8011,6 +8746,14 @@ impl App {
             // character is standing on; the terrain height field is the
             // fallback for everywhere the collision mesh has nothing to say,
             // indoors or out.
+            //
+            // **Unconditional again, jump or no jump.** A previous fix
+            // filtered this by what the arc could have reached, to stop a
+            // jump climbing a fence's structure. That was the wrong layer:
+            // what the surface *is* does not depend on whether the
+            // character is airborne, and while airborne this is no longer a
+            // standing height at all -- it is only the candidate
+            // `jump_landing` tests the arc against. See `jump_landing`.
             let stand = floor.or(ground);
             // **Read off the same preference**, not asked again. The
             // character is on the collision mesh's floor exactly when
@@ -8019,7 +8762,23 @@ impl App {
             // they disagree on is a footstep that sounds like the ground
             // under the floorboards.
             self.floor_material = underfoot.and_then(|(_, surface)| surface);
-            self.modeled_floor = underfoot.is_some();
+            // **Filtered, unlike `floor_material` above.** A one-frame flip
+            // here does not just mislabel a footstep -- it feeds the
+            // footstep-material fallback below, and an unfiltered flicker
+            // would alternate that fallback every frame near a seam. See
+            // `FloorPresenceFilter`'s own doc comment.
+            self.modeled_floor = self.floor_presence_filter.filter(underfoot.is_some());
+            // **A narrower question than `modeled_floor`, and the one
+            // `weather_ambience`/`precipitation_for_frame` actually need.**
+            // `modeled_floor` is "something solid was found underfoot",
+            // which a fence rail satisfies exactly as well as an abbey's own
+            // floor -- confirmed live: jumping onto the fence cut the rain
+            // sound and restarted it, over and over, because this used to be
+            // `self.modeled_floor` directly. See `App::indoors`'s own doc
+            // comment and `world::World::is_indoors_at`.
+            self.indoors = self
+                .indoors_filter
+                .filter(world.is_indoors_at(live.position));
             // **Logged because the alternative is guessing.** A character
             // that judders going up steps has at least three candidate causes
             // -- two surfaces alternating, a floor and the terrain trading
@@ -8098,7 +8857,20 @@ impl App {
         // Sampling the ground is still unconditional -- the swim test needs it,
         // since what makes water swimmable is how far it stands above the bed.
         // It is only the *assignment* that a swimmer opts out of.
-        if self.swimming.is_none() {
+        //
+        // **A jump opts out of it too, and that is the whole of
+        // `foss-wow#158`.** This block used to run mid-flight as well, and
+        // the jump block below then *added* `jump.height` to whatever it
+        // wrote -- so the ground under the character was folded into their
+        // altitude on every frame of the arc. Crossing a fence lifted them
+        // by the fence's full height the instant its rail was found, and
+        // dropped them again the instant they passed it: the "boost over
+        // the fence", the "cannot fail a jump", and the "no fall, instantly
+        // on the ground" reports were all that one addition. The arc is
+        // absolute now -- see `jump_landing` -- and owns `live.position.z`
+        // by itself until it lands, at which point it writes `ground_base`
+        // and hands control back here.
+        if self.swimming.is_none() && self.jump.is_none() {
             if let Some(z) = stand_at {
                 // **A large vertical relocation is refused.**
                 //
@@ -8122,23 +8894,79 @@ impl App {
                 // so walking across ordinary slopes and stairs remains
                 // unchanged while a terrain fallback cannot relocate a
                 // character onto an unrelated surface.
+                //
+                // **Compared against `self.ground_base`, never against
+                // `live.position.z`.** See that field's own doc comment for
+                // why: `live.position.z` includes the jump arc's own height
+                // whenever one is in progress, and comparing a fresh ground
+                // candidate against a jump-inflated total is exactly what let
+                // a refusal's "leave it alone" become "leave the *already
+                // too-high* total alone, then keep adding more height to it".
                 let streaming = match self.renderer.as_ref().and_then(|r| r.scene.as_ref()) {
                     Some(Scene::Streaming(world)) => world.still_streaming(),
                     _ => false,
                 };
-                let delta = z - live.position.z;
-                if delta.abs() <= MAX_GROUND_SNAP {
-                    live.position.z = z;
-                } else {
+                // **Ground that has dropped away is fallen down, not
+                // snapped down to.** This block is the *only* thing that
+                // ever moved a walking character downwards, and it does it
+                // by assignment -- so walking off a ledge put the character
+                // on the ground below within a single frame, however far
+                // below it was. Reported live: "falling is instant."
+                //
+                // A fall is the same airborne arc a jump uses, without the
+                // upward push (`Jump::stepping_off`), which is why nothing
+                // else here needs to know the difference: the landing, the
+                // `MOVEFLAG_FALLING` on every packet, the fall time the
+                // server reads for damage, and the animation are all
+                // already driven by `App::jump` being `Some`.
+                //
+                // The threshold is what keeps ordinary ground from
+                // triggering it -- see `FALL_THRESHOLD`.
+                if self
+                    .ground_base
+                    .is_some_and(|base| base - z > FALL_THRESHOLD)
+                {
+                    let base = self.ground_base.unwrap_or(z);
                     tracing::debug!(
-                        "ground snap refused: current {:.3}, candidate {:.3}, delta {:.3}, \
-                         tiles streaming {}",
-                        live.position.z,
+                        "stepped off at {:.2},{:.2},{:.2}: ground fell away to {:.3}",
+                        live.position.x,
+                        live.position.y,
+                        base,
                         z,
-                        delta,
-                        streaming,
                     );
+                    self.jump_takeoff_z = base;
+                    self.jump = Some(::world::motion::Jump::stepping_off(
+                        desired.direction(live.orientation),
+                        live_pace(desired).abs(),
+                    ));
+                    // `ground_base` is deliberately left where it was: the
+                    // ledge is what the arc falls *from*, and the airborne
+                    // block picks it up later in this same frame.
+                } else {
+                    let previous = self.ground_base;
+                    self.ground_base = Some(updated_ground_base(previous, z, MAX_GROUND_SNAP));
+                    if let Some(base) = previous {
+                        if self.ground_base != Some(z) {
+                            tracing::debug!(
+                                "ground snap refused: current {:.3}, candidate {:.3}, delta {:.3}, \
+                                 tiles streaming {}",
+                                base,
+                                z,
+                                z - base,
+                                streaming,
+                            );
+                        }
+                    }
                 }
+            }
+            // **Derived, not accumulated.** Whether `ground_base` moved this
+            // frame or held steady on a refusal, `live.position.z` is reset
+            // to it here, fresh -- so a body on the ground is exactly on it
+            // and nothing can compound frame to frame. A fall started just
+            // above leaves `ground_base` at the ledge, which is exactly
+            // where its arc begins; the airborne block then takes over.
+            if let Some(base) = self.ground_base {
+                live.position.z = base;
             }
         }
 
@@ -8180,12 +9008,43 @@ impl App {
             live.position.z = z.clamp(floor, rest.max(floor));
         }
 
-        if let Some(jump) = self.jump.as_mut() {
-            let down = jump.advance(dt);
-            live.position.z += jump.height;
-            if down {
-                landed = Some(jump.elapsed_ms);
-                self.jump = None;
+        // **An absolute trajectory, not a height added to the ground.** See
+        // `jump_landing` for the four rounds of live reports that came from
+        // the `+=` this replaced. `jump.height` is measured from take-off
+        // and depends on nothing but the arc's own physics, so
+        // `jump_takeoff_z + jump.height` is where the character actually is
+        // -- whatever the ground beneath them happens to be doing.
+        //
+        // **Held still where nothing underneath is known.** The arc can pass
+        // below take-off now, so an unstreamed tile is the one case that
+        // could run away with it -- there would be no surface to cross and
+        // nothing to stop the descent. Freezing keeps the same promise the
+        // ground snap makes a few lines up: the server's altitude is stale,
+        // but it is a real place, and a guess is not.
+        if let Some(jump) = self.jump.as_mut().filter(|_| stand_at.is_some()) {
+            let before_z = self.jump_takeoff_z + jump.height;
+            jump.advance(dt);
+            let now_z = self.jump_takeoff_z + jump.height;
+            match jump_landing(before_z, now_z, stand_at) {
+                Some(z) => {
+                    live.position.z = z;
+                    // Set straight rather than through `updated_ground_base`'s
+                    // gate: a landing is the one moment the surface underfoot
+                    // is known to be real and touching, and a jump legitimately
+                    // crosses more height than the gate's per-frame bound.
+                    self.ground_base = Some(z);
+                    tracing::debug!(
+                        "jump landed after {}ms at {:.2},{:.2},{:.2} (took off at {:.2})",
+                        jump.elapsed_ms,
+                        live.position.x,
+                        live.position.y,
+                        z,
+                        self.jump_takeoff_z,
+                    );
+                    landed = Some(jump.elapsed_ms);
+                    self.jump = None;
+                }
+                None => live.position.z = now_z,
             }
         }
 
@@ -9105,7 +9964,17 @@ impl App {
             tracing::warn!("sending jump failed: {e:#}");
             return;
         }
+        tracing::debug!(
+            "jump begin at {:.2},{:.2},{:.2}",
+            live.position.x,
+            live.position.y,
+            live.position.z,
+        );
         self.jump = Some(jump);
+        // The arc's own reference point -- see `App::jump_takeoff_z`'s own
+        // doc comment for why this, and not `live.position.z` alone, is
+        // what the horizontal wall exemption is computed from every frame.
+        self.jump_takeoff_z = live.position.z;
         self.last_heartbeat = Instant::now();
     }
 
@@ -9443,12 +10312,15 @@ impl App {
         let ambience = ambience.filter(|_| self.sound_enabled);
         // A storm is a state of the sky, not of the zone: it can start or
         // stop under an area whose own ambience never changes, and it must
-        // stop the moment the character is under a roof -- `modeled_floor`
-        // is exactly the signal `precipitation_for_frame` already uses for
-        // the same reason, so the drops stop falling and the loop stops
-        // playing on the same frame. See `weather_ambience`.
+        // stop the moment the character is under a roof -- `indoors` is
+        // exactly the signal `precipitation_for_frame` already uses for the
+        // same reason, so the drops stop falling and the loop stops playing
+        // on the same frame. See `weather_ambience`. **Not `modeled_floor`**
+        // -- confirmed live: that used to cut the rain the moment a jump
+        // landed on an outdoor fence rail, which is "solid" and never
+        // "roofed". See `App::indoors`'s own doc comment.
         let weather_sound = weather_ambience(frame_weather(self.live.as_ref(), &self.args).weather)
-            .filter(|_| !self.modeled_floor && self.sound_enabled)
+            .filter(|_| !self.indoors && self.sound_enabled)
             .map(sound::WeatherAmbience::sound_id);
 
         // One roll per call is fine: a channel only consults it when it is
@@ -12028,6 +12900,14 @@ impl App {
                     self.chat.push(Line::Chat(local_notice(
                         "You have been moved.".to_string(),
                     )));
+                    // **Resynced, not left stale.** `answer_teleport` writes
+                    // `live.position` directly, the same way
+                    // `advance_flight` does -- see `App::ground_base`'s own
+                    // doc comment for why leaving the old base in place
+                    // would refuse the very next ground sample and snap `z`
+                    // back towards wherever the character was before being
+                    // moved.
+                    self.ground_base = Some(live.position.z);
                 }
                 match live::answer_worldport(&mut self.chain, live) {
                     Ok(true) => {
@@ -12039,6 +12919,9 @@ impl App {
                             live.position.y,
                             live.position.z
                         );
+                        // Same reason as `answer_teleport` just above: a new
+                        // map means an unrelated old base otherwise.
+                        self.ground_base = Some(live.position.z);
                     }
                     Ok(false) => {}
                     Err(e) => tracing::warn!("world-port acknowledgement failed: {e:#}"),

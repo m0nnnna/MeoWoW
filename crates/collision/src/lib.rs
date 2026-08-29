@@ -267,6 +267,20 @@ impl Triangle {
     }
 }
 
+/// The move `from` -> `to` with everything pushing into a surface of
+/// horizontal unit normal `normal` removed, leaving only what runs along
+/// it.
+///
+/// The vertical component is left exactly as the caller asked: `slide` has
+/// never moved a body vertically, and resolving against a sloped face in
+/// three dimensions would lift a character up it -- the same reason
+/// [`Triangle::push_out_horizontally`] is horizontal-only.
+fn slide_along(from: Vec3, to: Vec3, normal: Vec2) -> Vec3 {
+    let delta = (to - from).truncate();
+    let along = delta - normal * delta.dot(normal);
+    Vec3::new(from.x + along.x, from.y + along.y, to.z)
+}
+
 /// Closest point to `p` on triangle `abc`, in two dimensions.
 fn closest_point_on_triangle_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> Vec2 {
     if point_in_triangle_2d(p, a, b, c) {
@@ -526,6 +540,51 @@ impl World {
         best
     }
 
+    /// [`Self::floor_under_tagged_with_id`], widened to a body's own
+    /// footprint rather than the single point at its centre.
+    ///
+    /// **A raycast is exact; a character has a radius, and standing at the
+    /// very edge of a platform is exactly where that difference shows.** The
+    /// centre point can fall a hair outside the platform's own top triangle
+    /// -- onto a kerb, a plinth, open ground beside it -- while most of the
+    /// body is still resting on the platform, and for that one query the
+    /// plain method answers whatever is under the *next* triangle over.
+    /// Reported live as a stutter while jumping onto or over an object: one
+    /// frame answered a floor height *below the surrounding terrain*,
+    /// sandwiched between two frames answering the object's own top, at a
+    /// spot where nothing but the horizontal position had moved by a
+    /// fraction of a unit. See `a_query_at_the_very_edge_of_a_platform_
+    /// still_finds_it_within_the_footprint`.
+    ///
+    /// Samples the centre plus a ring of points at `radius`, all against the
+    /// same `from_z`/`step`, and keeps the highest -- "any part of the
+    /// footprint that is supported holds you up", the same rule an
+    /// unsplit floor already gives for free. `radius <= 0.0` is exactly
+    /// [`Self::floor_under_tagged_with_id`], so a caller with no body to
+    /// speak of -- a camera ray, an existing test -- pays nothing extra.
+    pub fn floor_under_footprint_tagged_with_id(
+        &self,
+        at: Vec2,
+        from_z: f32,
+        step: f32,
+        radius: f32,
+    ) -> Option<(f32, Option<u8>, Option<u32>)> {
+        let mut best = self.floor_under_tagged_with_id(at, from_z, step);
+        if radius > 0.0 {
+            const RING: usize = 8;
+            for i in 0..RING {
+                let angle = i as f32 * (std::f32::consts::TAU / RING as f32);
+                let sample = at + Vec2::new(angle.cos(), angle.sin()) * radius;
+                if let Some(candidate) = self.floor_under_tagged_with_id(sample, from_z, step) {
+                    if best.is_none_or(|(b, _, _)| candidate.0 > b) {
+                        best = Some(candidate);
+                    }
+                }
+            }
+        }
+        best
+    }
+
     /// How high a wall may be treated as climbable rather than an obstacle,
     /// given where its own foot sits.
     ///
@@ -567,16 +626,27 @@ impl World {
     /// open ground, a standalone fence, a wall whose foot is not standing on
     /// a climbable tread -- this returns exactly `from_z + step`, identical
     /// to every case before this existed.
+    /// **And the wall has to be climbable from that tread, not merely
+    /// standing on one.** This asked only whether a tread existed, and then
+    /// exempted the wall up to its *own top* however tall it was -- so any
+    /// wall with something findable at its foot became passable outright.
+    /// A fence supplies exactly that: its own low rail is a floor at the
+    /// foot of its posts, so every post read as a riser standing on a tread
+    /// and stopped colliding. Reported live as "I can phase through fence
+    /// posts". A stair riser is unaffected, because a riser genuinely *is*
+    /// within one step of the tread it rises from -- which is the whole
+    /// claim the exemption was making, now checked rather than assumed.
     fn wall_exemption(&self, wall_foot: Vec2, wall_top: f32, from_z: f32, step: f32) -> f32 {
         // A hair above the wall's own top, not exactly at it: `push_out`'s
         // own exclusion test is `max().z < low`, and a wall exempted up to
         // precisely its own top would tie that comparison and still be
         // tested, rather than skipped.
         const CLEARANCE: f32 = 0.05;
-        if self.floor_under(wall_foot, from_z, step).is_some() {
-            (wall_top + CLEARANCE).max(from_z + step)
-        } else {
-            from_z + step
+        match self.floor_under(wall_foot, from_z, step) {
+            Some(tread) if wall_top <= tread + step => {
+                (wall_top + CLEARANCE).max(from_z + step)
+            }
+            _ => from_z + step,
         }
     }
 
@@ -612,6 +682,45 @@ impl World {
         if self.triangles.is_empty() {
             return to;
         }
+        if let Some(resolved) = self.attempt(from, to, radius, height, step) {
+            return resolved;
+        }
+        // **Refused whole -- so try it again with the part that pushes into
+        // the obstacle taken out, which is what rubbing along something
+        // is.** Push-out alone slides a body along a face it is *beside*,
+        // but a move refused outright leaves nothing to slide with, and
+        // returning `from` is a dead stop: pinned against the thing rather
+        // than moving past it. Reported live, once fence posts began
+        // colliding at all: "you can get stuck on the fence post instead of
+        // rubbing around it."
+        //
+        // The retry is a single one, against the surface that did the
+        // refusing, and it is checked exactly as the first attempt was --
+        // so nothing here can pass through anything the first attempt would
+        // have caught.
+        if let Some(normal) = self.blocking_normal(from, to, radius, height, step) {
+            let along = slide_along(from, to, normal);
+            if (along.truncate() - from.truncate()).length_squared() > 1e-8 {
+                if let Some(resolved) = self.attempt(from, along, radius, height, step) {
+                    return resolved;
+                }
+            }
+        }
+        from
+    }
+
+    /// One resolution of `from` -> `to`: push out of everything solid, then
+    /// refuse the result if it tunnelled or ended up inside something.
+    /// `None` is a refusal -- see [`World::slide`], which retries along the
+    /// blocking surface before giving up.
+    fn attempt(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        radius: f32,
+        height: f32,
+        step: f32,
+    ) -> Option<Vec3> {
         let mut at = to;
         // Two passes: the first push can leave the character inside a second
         // wall, which is exactly what an inside corner is. More than two buys
@@ -662,14 +771,79 @@ impl World {
         // overlapped nothing. Testing the *path* catches that, where testing
         // the destination cannot. Being left where you started is worse than
         // sliding and far better than being outside the world.
-        if self.crosses_wall(from, at, height, step) || self.blocked(at, radius, height, step) {
-            // Unless the start was already inside something, in which case
-            // refusing would weld the character in place for ever.
-            if !self.blocked(from, radius, height, step) {
-                return from;
+        //
+        // **A path *through* a wall is refused outright, and the escape
+        // hatch below does not cover it.** Both refusals used to share one,
+        // and `blocked` reports true for a character merely *standing
+        // against* something -- it triggers inside `radius`, which is half
+        // a body width, so anyone touching a wall satisfies it. The
+        // guarantee therefore switched itself off in exactly the situation
+        // it exists for, and a single step long enough to carry the
+        // character's centre past a wall's plane was pushed out to the
+        // *far* side and kept. Reported live as phasing through fence
+        // posts, and through a fence altogether while jumping -- a jump
+        // exempts nothing, so `blocked(from)` is true beside anything
+        // solid, which is what made it so much easier to hit in the air.
+        //
+        // Refusing this can never weld anybody in place: crossing a face
+        // means going from one side of it to the other, and a character on
+        // one side has every direction that stays on that side still open.
+        if self.crosses_wall(from, at, height, step) {
+            return None;
+        }
+        // Ending up *inside* something is the case that does need the
+        // hatch: a character who is already overlapping geometry has to be
+        // able to move at all, or they are stuck for good.
+        if self.blocked(at, radius, height, step) && !self.blocked(from, radius, height, step) {
+            return None;
+        }
+        Some(at)
+    }
+
+    /// The horizontal unit normal of whatever refused a move to `to`, for
+    /// [`World::slide`]'s retry to rub along.
+    ///
+    /// The largest pusher wins, matching `attempt`'s own choice of
+    /// correction -- the surface a body is most inside is the one it is
+    /// being stopped by, and so the one worth sliding along. `None` where
+    /// nothing near the destination qualifies, which is the refusal that
+    /// came from the *path* rather than the destination; there is nothing
+    /// local to rub against then, and the caller stops.
+    fn blocking_normal(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        radius: f32,
+        height: f32,
+        step: f32,
+    ) -> Option<Vec2> {
+        let mut best: Option<(f32, Vec2)> = None;
+        for index in self.near(to.truncate(), radius) {
+            let triangle = self.triangles[index as usize];
+            let Some(push) = triangle.push_out_horizontally(to.truncate(), radius) else {
+                continue;
+            };
+            if triangle.under_any_band(from.z, step) {
+                continue;
+            }
+            let foot = triangle.foot_towards(to.truncate());
+            let ceiling = self.wall_exemption(foot, triangle.max().z, from.z, step);
+            if !triangle.overlaps_band(ceiling, ceiling + height) {
+                continue;
+            }
+            let Some(normal) = triangle.normal() else {
+                continue;
+            };
+            let flat = Vec2::new(normal.x, normal.y);
+            if flat.length_squared() < 1e-9 {
+                continue;
+            }
+            let strength = push.length_squared();
+            if best.is_none_or(|(previous, _)| strength > previous) {
+                best = Some((strength, flat.normalize()));
             }
         }
-        at
+        best.map(|(_, normal)| normal)
     }
 
     /// Whether a straight path from `from` to `to` passes through a wall.
@@ -932,6 +1106,127 @@ mod tests {
         assert!(
             (slid - from).length() < 1e-3,
             "a standalone wall taller than a step must still refuse the walk-through: {slid:?}"
+        );
+    }
+
+    /// **A fence post is not a stair riser, and the difference is whether
+    /// the wall is climbable from the tread it stands on.** The exemption
+    /// asked only whether a tread *existed* at a wall's foot, then exempted
+    /// the wall up to its own top however tall it was -- and a fence
+    /// supplies its own tread, because its low rail is a floor sitting at
+    /// the foot of every post. Reported live: "I can phase through fence
+    /// posts."
+    #[test]
+    fn a_post_standing_on_its_own_low_rail_is_not_a_climbable_riser() {
+        let mut world = World::new();
+        let width = 2.0;
+        // The fence's low rail: a horizontal surface at 0.35, the "tread"
+        // that used to make every post look climbable.
+        world.add(Triangle::new(
+            Vec3::new(-0.4, -width, 0.35),
+            Vec3::new(-0.4, width, 0.35),
+            Vec3::new(0.4, -width, 0.35),
+        ));
+        world.add(Triangle::new(
+            Vec3::new(-0.4, width, 0.35),
+            Vec3::new(0.4, width, 0.35),
+            Vec3::new(0.4, -width, 0.35),
+        ));
+        // The post itself: 1.6 tall, far more than one step above that rail.
+        world.add(Triangle::new(
+            Vec3::new(0.0, -width, 0.0),
+            Vec3::new(0.0, width, 0.0),
+            Vec3::new(0.0, -width, 1.6),
+        ));
+        world.add(Triangle::new(
+            Vec3::new(0.0, width, 0.0),
+            Vec3::new(0.0, width, 1.6),
+            Vec3::new(0.0, -width, 1.6),
+        ));
+
+        let (radius, height, step) = (0.55f32, 2.0f32, 0.8f32);
+        // Walking at the post from just outside arm's reach of it, standing
+        // on the rail, to just inside -- close enough that push-out has to
+        // have an opinion.
+        let from = Vec3::new(-0.6, 0.0, 0.35);
+        let wanted = Vec3::new(-0.45, 0.0, 0.35);
+        let slid = world.slide(from, wanted, radius, height, step);
+        assert!(
+            slid.x <= -radius + 1e-3,
+            "a post 1.6 tall must hold the body a radius away, whatever its own \
+             rail sits at -- it is not a riser to be stepped over: {slid:?}"
+        );
+    }
+
+    /// **The guarantee has to hold while touching the wall, which is the
+    /// only time it matters.** `blocked` reports true for a character
+    /// merely standing against something -- it triggers within `radius` --
+    /// and the crossing refusal used to be switched off whenever that was
+    /// so. A step long enough to carry the centre past the wall's plane
+    /// was then pushed out to the *far* side and kept.
+    #[test]
+    fn a_wall_still_blocks_a_long_step_taken_from_against_it() {
+        let mut world = World::new();
+        let width = 2.0;
+        world.add(Triangle::new(
+            Vec3::new(0.0, -width, 0.0),
+            Vec3::new(0.0, width, 0.0),
+            Vec3::new(0.0, -width, 1.5),
+        ));
+        world.add(Triangle::new(
+            Vec3::new(0.0, width, 0.0),
+            Vec3::new(0.0, width, 1.5),
+            Vec3::new(0.0, -width, 1.5),
+        ));
+
+        let (radius, height, step) = (0.55f32, 2.0f32, 0.8f32);
+        // Standing hard against the wall -- well inside `radius`, so
+        // `blocked(from)` is true -- and stepping straight through it.
+        let from = Vec3::new(-0.1, 0.0, 0.0);
+        let wanted = Vec3::new(0.3, 0.0, 0.0);
+        let slid = world.slide(from, wanted, radius, height, step);
+        assert!(
+            slid.x < 0.0,
+            "a step from against a wall must not end up on its far side: {slid:?}"
+        );
+    }
+
+    /// **A refused move is retried along the surface that refused it, not
+    /// dropped.** Reported live once fence posts began colliding at all:
+    /// "you can get stuck on the fence post instead of rubbing around it."
+    /// Walking hard into a post at a slight angle must still make progress
+    /// past it -- push-out alone cannot, because the move it would have
+    /// slid with was refused whole.
+    #[test]
+    fn a_move_refused_head_on_still_rubs_along_the_surface() {
+        let mut world = World::new();
+        let width = 2.0;
+        world.add(Triangle::new(
+            Vec3::new(0.0, -width, 0.0),
+            Vec3::new(0.0, width, 0.0),
+            Vec3::new(0.0, -width, 1.6),
+        ));
+        world.add(Triangle::new(
+            Vec3::new(0.0, width, 0.0),
+            Vec3::new(0.0, width, 1.6),
+            Vec3::new(0.0, -width, 1.6),
+        ));
+
+        let (radius, height, step) = (0.55f32, 2.0f32, 0.8f32);
+        // Pressed against the wall, walking mostly *into* it but with a
+        // real sideways component -- the shape of squeezing past a post.
+        let from = Vec3::new(-0.1, 0.0, 0.0);
+        let wanted = Vec3::new(0.3, 0.25, 0.0);
+
+        let slid = world.slide(from, wanted, radius, height, step);
+        assert!(
+            slid.x < 0.0,
+            "the wall must still hold the body on its own side: {slid:?}"
+        );
+        assert!(
+            slid.y > from.y + 1e-3,
+            "the part of the move running along the wall must survive, or the \
+             body is stuck against it rather than rubbing past: {slid:?}"
         );
     }
 
@@ -1345,6 +1640,74 @@ mod tests {
         assert_eq!(world.floor_under(at, 5.0, 0.5), Some(5.0));
         // Nothing under a point outside the box at all.
         assert_eq!(world.floor_under(Vec2::new(50.0, 50.0), 0.0, 0.5), None);
+    }
+
+    /// **The bug: standing right at the edge of a platform can read the kerb
+    /// beside it for one query instead of the platform under most of the
+    /// body.** Reproduced with the smallest geometry that shows it: a raised
+    /// platform and a low kerb right up against its edge, queried from a
+    /// point that has crossed onto the kerb by a hair while most of a
+    /// body-sized footprint is still over the platform.
+    #[test]
+    fn a_query_at_the_very_edge_of_a_platform_still_finds_it_within_the_footprint() {
+        let mut world = World::new();
+        // The platform: two units square, top at z = 2.0.
+        world.add(Triangle::new(
+            Vec3::new(0.0, 0.0, 2.0),
+            Vec3::new(2.0, 0.0, 2.0),
+            Vec3::new(2.0, 2.0, 2.0),
+        ));
+        world.add(Triangle::new(
+            Vec3::new(0.0, 0.0, 2.0),
+            Vec3::new(2.0, 2.0, 2.0),
+            Vec3::new(0.0, 2.0, 2.0),
+        ));
+        // The kerb beside it: low, flush against the platform's edge at x=2.
+        world.add(Triangle::new(
+            Vec3::new(2.0, 0.0, 0.3),
+            Vec3::new(3.0, 0.0, 0.3),
+            Vec3::new(3.0, 2.0, 0.3),
+        ));
+        world.add(Triangle::new(
+            Vec3::new(2.0, 0.0, 0.3),
+            Vec3::new(3.0, 2.0, 0.3),
+            Vec3::new(2.0, 2.0, 0.3),
+        ));
+
+        // Just past the platform's edge -- where its own top triangle no
+        // longer contains the point.
+        let at = Vec2::new(2.05, 1.0);
+        let from_z = 1.9;
+        let step = 0.8;
+
+        // A bare point lands on the kerb: this is the case being fixed, not
+        // a strawman -- if this assertion fails, the geometry above no
+        // longer reproduces the live bug.
+        assert_eq!(
+            world
+                .floor_under_tagged_with_id(at, from_z, step)
+                .map(|(z, _, _)| z),
+            Some(0.3),
+            "a point a hair past the platform's edge must land on the kerb"
+        );
+
+        // With a body-sized footprint, most of it is still over the
+        // platform, and that is what should hold the character up.
+        const BODY_RADIUS: f32 = 0.55;
+        assert_eq!(
+            world
+                .floor_under_footprint_tagged_with_id(at, from_z, step, BODY_RADIUS)
+                .map(|(z, _, _)| z),
+            Some(2.0),
+            "the platform is still under most of the body and must win"
+        );
+
+        // A zero radius must fall back to exactly the point query: an
+        // existing caller with no body to speak of pays nothing for this.
+        assert_eq!(
+            world.floor_under_footprint_tagged_with_id(at, from_z, step, 0.0),
+            world.floor_under_tagged_with_id(at, from_z, step),
+        );
     }
 
     /// A margin sized to reach a low ceiling finds one; a margin sized only
