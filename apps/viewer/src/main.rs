@@ -12787,6 +12787,9 @@ impl App {
     }
 
     fn pump_live_connection(&mut self) {
+        // Set by the drain below when the stream can no longer be read, and
+        // acted on at the very end of this function -- see `lose_connection`.
+        let mut lost_connection: Option<String> = None;
         // **Loaded here rather than at construction**, because the file is
         // named after the realm and the realm is not known until a connection
         // exists. Guarded by the path being unset rather than by a flag, so
@@ -13653,7 +13656,19 @@ impl App {
                     self.chat.push(Line::Chat(message.clone()));
                 }
             }
-            Err(e) => tracing::warn!("draining the live connection failed: {e:#}"),
+            Err(e) => {
+                tracing::warn!("draining the live connection failed: {e:#}");
+                // **A stream that cannot be read again ends the session.**
+                // Only framing failures qualify -- see
+                // `world::client::Error::is_connection_lost`, which keeps a
+                // body this client could not parse from costing a perfectly
+                // good connection. Acted on after the borrow below rather
+                // than here, because tearing the session down needs all of
+                // `self`.
+                if e.is_connection_lost() {
+                    lost_connection = Some(format!("{e:#}"));
+                }
+            }
         }
 
         for line in party_results {
@@ -14209,6 +14224,78 @@ impl App {
         if worldport_changed {
             self.reload_live_world();
         }
+        // Last, so everything above has finished with the session it is
+        // about to lose.
+        if let Some(why) = lost_connection {
+            self.lose_connection(&why);
+        }
+    }
+
+    /// Ends the session and goes back to the sign-in screen, saying why.
+    ///
+    /// **The alternative was the client carrying on**, which is what it did:
+    /// `drain` failed, one line was logged, and the next frame tried again,
+    /// for as long as the window stayed open. A player saw a world that had
+    /// silently stopped moving and a client that behaved as though nothing
+    /// had happened. That is the worse half of a lost connection -- the
+    /// disconnect itself is not preventable, being told about it is.
+    ///
+    /// Everything the session owned goes with it, and the list is written
+    /// out rather than looped over on purpose: each of these is a *claim
+    /// about a character that no longer exists here*, and one left behind is
+    /// a window or a marker belonging to nobody. The caches are saved first,
+    /// because they are worth keeping and this is the last moment anything
+    /// knows which realm they belong to.
+    fn lose_connection(&mut self, why: &str) {
+        tracing::error!("the connection is gone: {why}");
+        self.save_quest_cache();
+        self.save_giver_cache();
+
+        self.live = None;
+        self.flight = None;
+        self.jump = None;
+        self.ground_base = None;
+        self.swimming = None;
+        self.target = None;
+        self.own_corpse = None;
+        self.questgiver = None;
+        self.trainer = None;
+        self.vendor = None;
+        self.auction = None;
+        self.mailbox = None;
+        self.looting = None;
+        self.area = None;
+
+        // **The realm-keyed caches go with the realm, and the paths with
+        // them.** Both files are named after the realm -- that is the whole
+        // point of them, since a private realm's quest 783 need not be the
+        // original's -- and both are loaded once, guarded by their path
+        // being unset. Kept across a disconnect, a reconnect to a *different*
+        // realm would answer from the old one's data and then write it back
+        // under the old one's name.
+        self.quests = ::world::QuestCache::new();
+        self.givers = ::world::Questgivers::default();
+        self.objectives = maps::Objectives::default();
+        self.quest_cache_path = None;
+        self.giver_cache_path = None;
+
+        // The world goes too. Left in place it would draw behind the sign-in
+        // screen, frozen at the last frame anybody heard about -- a picture
+        // of a place this client is no longer in.
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.scene = None;
+        }
+
+        // **Rebuilt rather than kept aside**, so the screen reloads what it
+        // remembers from `login.toml` -- the account, the server, the realm
+        // and the character, everything but the password. What a player has
+        // to do to come back is type the password and press the button.
+        let mut signin = signin::SignIn::new();
+        if let Some(data) = self.args.data.clone() {
+            signin.screen.settings.data = Some(data);
+        }
+        signin.screen.failed(format!("Connection lost: {why}"));
+        self.signin = Some(signin);
     }
 
     /// Releases the spirit, in response to a click on the release prompt.

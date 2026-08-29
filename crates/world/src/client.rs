@@ -1845,6 +1845,40 @@ impl Connection {
 /// should ever trip it is a connection that has actually gone away.
 const PACKET_COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
 
+impl Error {
+    /// Whether this error means the stream itself can no longer be read, as
+    /// opposed to one packet this client could not make sense of.
+    ///
+    /// **The distinction is whether framing survived.** A body that will not
+    /// parse is a parser problem: `receive` had already read the length,
+    /// consumed exactly that many bytes and left the cursor between packets,
+    /// so the next read is still aligned and the session is worth keeping.
+    /// A framing failure is the opposite -- there is no way back. Once the
+    /// header cipher is out of step every subsequent length is noise, and no
+    /// amount of reading re-synchronises an RC4 stream; the only cure is a
+    /// new connection.
+    ///
+    /// Callers use this to decide whether to end the session rather than to
+    /// carry on warning once a frame at a world they can no longer hear,
+    /// which is what the viewer did for the whole of a live session that
+    /// ended in a crash.
+    pub fn is_connection_lost(&self) -> bool {
+        match self {
+            // A real socket error. A *quiet* one is the ordinary end of a
+            // burst and never reaches a caller as an error at all.
+            Error::Io { source, .. } => !is_quiet_stream(source),
+            Error::Connect { .. } => true,
+            // Both mean a length field decrypted to nonsense, which is the
+            // signature of a desynchronised header cipher. Every other
+            // protocol error is about a body, and leaves framing intact.
+            Error::Protocol(
+                protocol::Error::Oversized { .. } | protocol::Error::Undersized { .. },
+            ) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Whether a read error means "no data yet" rather than a broken connection.
 ///
 /// **`WouldBlock` and `TimedOut` are not the whole set on Windows.** A socket
@@ -2176,6 +2210,53 @@ mod tests {
         // And a genuinely broken connection is still broken.
         assert!(!is_quiet_stream(&IoError::from(ErrorKind::ConnectionReset)));
         assert!(!is_quiet_stream(&IoError::from(ErrorKind::UnexpectedEof)));
+    }
+
+    /// **A body that will not parse must not cost the session; a framing
+    /// failure must.** The difference is whether the next read is still
+    /// aligned: a parse error means `receive` already consumed exactly the
+    /// bytes the length announced, and an `Oversized`/`Undersized` length
+    /// means the header cipher is out of step and never coming back.
+    #[test]
+    fn only_a_framing_failure_counts_as_a_lost_connection() {
+        use std::io::{Error as IoError, ErrorKind};
+
+        // The desync signature, both spellings.
+        assert!(Error::Protocol(protocol::Error::Oversized { got: 6146905 })
+            .is_connection_lost());
+        assert!(Error::Protocol(protocol::Error::Undersized { got: 1 }).is_connection_lost());
+
+        // A dead socket.
+        assert!(Error::Io {
+            what: "a packet body",
+            source: IoError::from(ErrorKind::ConnectionReset),
+        }
+        .is_connection_lost());
+
+        // A quiet one is not a fault at all -- it is how a burst ends.
+        assert!(!Error::Io {
+            what: "a packet header",
+            source: IoError::from(ErrorKind::WouldBlock),
+        }
+        .is_connection_lost());
+
+        // Body-level complaints leave the stream aligned, so the session is
+        // still worth keeping -- including the impossible count that used to
+        // abort the process.
+        assert!(!Error::Protocol(protocol::Error::ImpossibleCount {
+            what: "quest POI sets",
+            count: u32::MAX as usize,
+            left: 4,
+        })
+        .is_connection_lost());
+        assert!(!Error::Protocol(protocol::Error::Trailing {
+            what: "SMSG_GUILD_ROSTER",
+            got: 7,
+        })
+        .is_connection_lost());
+        assert!(!Error::Protocol(protocol::Error::UnknownObjectType { got: 9 })
+            .is_connection_lost());
+        assert!(!Error::NoReply("SMSG_TRAINER_LIST", 12).is_connection_lost());
     }
 
     /// A packet whose header arrives in two pieces is still read whole, even
