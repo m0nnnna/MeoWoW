@@ -13045,6 +13045,14 @@ impl App {
                 .into_iter()
                 .flat_map(|offer| offer.items.iter().map(|item| item.entry)),
         );
+        // A quest's item objective names a "to find" item this character does
+        // not yet carry, so it appears in nothing the bag walk above sees --
+        // it showed as `Item 11119` in the log and the tracker until the
+        // first copy was picked up, which is what made `items_to_ask` ask for
+        // it at all. Asked for as soon as the quest is in the log instead.
+        if let Some(player) = live.state.get(live.guid) {
+            looted.extend(self.quests.item_objective_entries(&player.quest_log_ids()));
+        }
         let own_guid = live.guid;
         let asking = hud::items_to_ask(&mut live.state, own_guid, &looted, ITEMS_PER_FRAME);
         for entry in asking {

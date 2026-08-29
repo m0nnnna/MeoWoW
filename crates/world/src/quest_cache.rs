@@ -181,6 +181,25 @@ impl QuestCache {
         self.pending.iter().copied()
     }
 
+    /// Every item entry a quest's "to find" objective names, for the quests
+    /// in `log` this cache has an answer for.
+    ///
+    /// **What made a quest item show as `Item 11119` until the first copy was
+    /// picked up.** An item objective's entry is not something the character
+    /// carries yet, so it appears in nothing a bag walk sees, and nothing
+    /// asked `CMSG_ITEM_QUERY_SINGLE` for it -- the query was sent only once a
+    /// copy landed in a bag. This is the list a caller adds to that walk, the
+    /// same way an open loot window's rows are.
+    pub fn item_objective_entries(&self, log: &[u32]) -> Vec<u32> {
+        log.iter()
+            .filter_map(|id| match self.answer(*id) {
+                Answer::Known(info) => Some(info),
+                _ => None,
+            })
+            .flat_map(|info| info.item_objectives.iter().map(|item| item.item))
+            .collect()
+    }
+
     /// Whether anything has been learned since the last [`QuestCache::save`].
     pub fn is_dirty(&self) -> bool {
         self.dirty
@@ -305,11 +324,19 @@ mod tests {
     /// The smallest body `parse_quest_query` will accept: a 260-byte head,
     /// five empty strings, the objective block, and four empty strings.
     fn body(id: u32) -> Vec<u8> {
+        body_with_item(id, 0, 0)
+    }
+
+    /// Same shape as `body`, with the first item-objective slot filled in --
+    /// what a quest asking the player to find an item looks like on the wire.
+    fn body_with_item(id: u32, item: u32, count: u32) -> Vec<u8> {
         let mut body = vec![0u8; 260];
         body[..4].copy_from_slice(&id.to_le_bytes());
         body.extend_from_slice(&[0; 5]); // five empty strings
         body.extend_from_slice(&[0u8; 4 * 4 * 4]); // four objectives
-        body.extend_from_slice(&[0u8; 6 * 2 * 4]); // six item objectives
+        body.extend_from_slice(&item.to_le_bytes());
+        body.extend_from_slice(&count.to_le_bytes());
+        body.extend_from_slice(&[0u8; 5 * 2 * 4]); // five more item objectives
         body.extend_from_slice(&[0; 4]); // four empty objective texts
         body
     }
@@ -367,6 +394,27 @@ mod tests {
         let mut cache = QuestCache::new();
         assert_eq!(cache.take_unknown(&[5, 6, 7, 8], 2), vec![5, 6]);
         assert_eq!(cache.answer(7), Answer::Unknown);
+    }
+
+    /// **The bug: a quest's item objective read as `Item 11119` until a copy
+    /// was picked up.** The tracker names an item objective from whatever the
+    /// cache holds, but nothing ever asked the server for it while the log
+    /// only *wanted* the item rather than carrying it -- this is the list a
+    /// caller adds to the ordinary bag walk so the query goes out as soon as
+    /// the quest is known, not once the item is.
+    #[test]
+    fn a_logged_quests_item_objective_is_asked_for_before_its_carried() {
+        let mut cache = QuestCache::new();
+        cache.insert(&body_with_item(333, 11119, 1)).unwrap();
+
+        assert_eq!(cache.item_objective_entries(&[333]), vec![11119]);
+        // A quest still pending, or never asked about, names nothing yet --
+        // there is no answer to read an objective out of.
+        assert!(cache.item_objective_entries(&[16]).is_empty());
+        // A quest with no item objective at all -- the ordinary case --
+        // contributes nothing either.
+        cache.insert(&body(85)).unwrap();
+        assert!(cache.item_objective_entries(&[85]).is_empty());
     }
 
     /// A round trip through a file keeps every answer.
