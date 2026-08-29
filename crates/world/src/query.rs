@@ -361,7 +361,8 @@ pub fn parse_item_query_response(body: &[u8]) -> Result<ItemInfo, Error> {
     // The one variable-length block. Everything below moves if this is
     // wrong, which is what makes `finish` the real test of this parser.
     let stats_count = r.u32()?;
-    let mut stats = Vec::with_capacity(stats_count as usize);
+    let mut stats =
+        Vec::with_capacity(r.records(stats_count, "SMSG_ITEM_QUERY_SINGLE_RESPONSE")?);
     for _ in 0..stats_count {
         let stat_type = r.u32()?;
         let value = r.u32()? as i32;

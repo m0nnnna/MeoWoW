@@ -1014,11 +1014,11 @@ pub fn parse_quest_poi(body: &[u8]) -> Result<Vec<QuestPoiSet>, Error> {
     let mut r = Reader::new(body, "SMSG_QUEST_POI_QUERY_RESPONSE");
 
     let quests = r.u32()?;
-    let mut sets = Vec::with_capacity(quests as usize);
+    let mut sets = Vec::with_capacity(r.records(quests, "quest POI sets")?);
     for _ in 0..quests {
         let quest_id = r.u32()?;
         let marker_count = r.u32()?;
-        let mut markers = Vec::with_capacity(marker_count as usize);
+        let mut markers = Vec::with_capacity(r.records(marker_count, "quest POI markers")?);
         for _ in 0..marker_count {
             let id = r.u32()?;
             // Signed: -1 means "not tied to one objective". See the field.
@@ -1031,7 +1031,7 @@ pub fn parse_quest_poi(body: &[u8]) -> Result<Vec<QuestPoiSet>, Error> {
             let floor_id = r.u32()?;
             let unknown = (r.u32()?, r.u32()?);
             let point_count = r.u32()?;
-            let mut points = Vec::with_capacity(point_count as usize);
+            let mut points = Vec::with_capacity(r.records(point_count, "quest POI points")?);
             for _ in 0..point_count {
                 points.push((r.u32()? as i32, r.u32()? as i32));
             }
@@ -1151,6 +1151,38 @@ mod tests {
     /// `quest_poi_points` tables, which no client is ever sent. Three quests
     /// agreeing at three different offsets cannot happen by accident, and a
     /// reading shifted by one field would still parse.
+    /// **A garbage count must cost the packet, not the process.** This
+    /// packet nests three counted arrays, each a `u32`, and a body read off
+    /// a stream whose header cipher has gone out of step is uniform noise --
+    /// so the count is billions and `Vec::with_capacity` on billions of
+    /// records aborts the process without unwinding. That is not
+    /// hypothetical: it is how a live session ended, with no panic and
+    /// nothing in the log. See `Reader::records`.
+    #[test]
+    fn an_impossible_poi_count_is_refused_rather_than_allocated_for() {
+        // Four bytes saying "four billion quest sets follow", and nothing
+        // after them.
+        let body = u32::MAX.to_le_bytes();
+        assert!(
+            matches!(
+                parse_quest_poi(&body),
+                Err(Error::ImpossibleCount { .. })
+            ),
+            "a count no body could hold must be refused before it is believed"
+        );
+
+        // And the nested counts are guarded too, not just the outer one: one
+        // real set, then a marker count of four billion.
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes()); // one set
+        body.extend_from_slice(&333u32.to_le_bytes()); // its quest id
+        body.extend_from_slice(&u32::MAX.to_le_bytes()); // its markers
+        assert!(matches!(
+            parse_quest_poi(&body),
+            Err(Error::ImpossibleCount { .. })
+        ));
+    }
+
     #[test]
     fn the_markers_agree_with_the_servers_own_poi_tables() {
         let sets = parse_quest_poi(&CAPTURED).unwrap();

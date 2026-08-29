@@ -347,7 +347,14 @@ impl Questgivers {
             let raw = r.u8().map_err(|_| SpawnCacheError::Truncated)?;
             let seen = r.u64().map_err(|_| SpawnCacheError::Truncated)?;
             let offers_count = r.u32().map_err(|_| SpawnCacheError::Truncated)?;
-            let mut offers = Vec::with_capacity(offers_count as usize);
+            // Sized against what is left rather than trusted outright: this
+            // file is written by us but read back from disk, where a
+            // truncated or corrupt write turns a count into four billion and
+            // the allocation into an abort. See `Reader::records`.
+            let mut offers = Vec::with_capacity(
+                r.records(offers_count, "the spawn cache")
+                    .map_err(|_| SpawnCacheError::Truncated)?,
+            );
             for _ in 0..offers_count {
                 offers.push(r.u32().map_err(|_| SpawnCacheError::Truncated)?);
             }

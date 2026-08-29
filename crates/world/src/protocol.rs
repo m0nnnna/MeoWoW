@@ -66,6 +66,15 @@ pub enum Error {
     Oversized { got: usize },
     #[error("packet header claims {got} bytes, too few to hold even an opcode")]
     Undersized { got: usize },
+    #[error(
+        "{what}: {count} records claimed but only {left} bytes remain, and a record \
+         cannot be shorter than a byte -- the count is not where this parser thinks"
+    )]
+    ImpossibleCount {
+        what: &'static str,
+        count: usize,
+        left: usize,
+    },
     #[error("expected {expected}, got {}", crate::opcode::describe(*got))]
     UnexpectedOpcode { expected: &'static str, got: u16 },
     #[error("server refused the session: {0}")]
@@ -345,6 +354,42 @@ impl<'a> Reader<'a> {
 
     pub fn remaining(&self) -> usize {
         self.data.len() - self.at
+    }
+
+    /// Accepts a record count read from the body, refusing one the body could
+    /// not possibly hold.
+    ///
+    /// **A `u32` count is four billion, and `Vec::with_capacity` believes
+    /// it.** Read at the wrong offset -- or off a stream whose header cipher
+    /// has gone out of step, where every byte is noise -- it asks for tens of
+    /// gigabytes, the allocator fails, and Rust answers an allocation failure
+    /// by aborting: no panic, no unwind, no backtrace, nothing in the log.
+    /// That is not a hypothetical. A live session ended exactly that way,
+    /// two `packet claims 6146905 bytes` warnings and then a process that was
+    /// simply gone. The cipher desync behind it is fixed; this is the other
+    /// half, so that the *next* corrupt stream costs the connection instead
+    /// of the client.
+    ///
+    /// The bound is the weakest one that is always true: **every record
+    /// costs at least one byte**, so a count larger than the bytes left
+    /// cannot be right, whatever the record's real shape. That deliberately
+    /// asks nothing about strides -- a parser that knows its own record width
+    /// can and should check harder, as `SMSG_TRAINER_LIST` does -- and it is
+    /// worth being clear about what it therefore does *not* catch: a count
+    /// merely wrong rather than absurd sails through, and is caught a moment
+    /// later when the records themselves run out of input. What it does
+    /// catch is the count that would have killed the process before any of
+    /// that could happen.
+    pub fn records(&self, count: u32, what: &'static str) -> Result<usize, Error> {
+        let count = count as usize;
+        if count > self.remaining() {
+            return Err(Error::ImpossibleCount {
+                what,
+                count,
+                left: self.remaining(),
+            });
+        }
+        Ok(count)
     }
 
     /// How far into the body the cursor has got.
@@ -1448,6 +1493,34 @@ mod tests {
             parse_char_enum(&body),
             Err(Error::Truncated { .. })
         ));
+    }
+
+    /// **A count no body could hold is refused before it is believed.**
+    /// The live failure this exists for was not a wrong list -- it was a
+    /// dead process: a desynchronised header cipher turns every byte into
+    /// noise, a `u32` count read from noise is billions, and
+    /// `Vec::with_capacity` on billions of records aborts without unwinding.
+    /// An abort leaves no panic and no backtrace, which is why the crash it
+    /// caused had nothing in the log at all.
+    #[test]
+    fn a_record_count_larger_than_the_body_is_refused_not_allocated() {
+        let body = [0u8; 16];
+        let r = Reader::new(&body, "a test packet");
+        // What noise looks like: four billion records in sixteen bytes.
+        assert!(matches!(
+            r.records(u32::MAX, "a test packet"),
+            Err(Error::ImpossibleCount { .. })
+        ));
+        // One byte per record is the weakest bound that is always true, so
+        // exactly as many records as bytes left is still allowed through --
+        // the records themselves are what refuse it after that.
+        assert_eq!(r.records(16, "a test packet").unwrap(), 16);
+        assert!(matches!(
+            r.records(17, "a test packet"),
+            Err(Error::ImpossibleCount { .. })
+        ));
+        // And an ordinary count is simply passed back.
+        assert_eq!(r.records(3, "a test packet").unwrap(), 3);
     }
 
     #[test]
