@@ -1754,14 +1754,14 @@ impl Connection {
         }
 
         let header_len = protocol::server_header_len(header[0]);
-        self.read_exact(&mut header[1..header_len], "a packet header")?;
+        self.read_committed(&mut header[1..header_len], "a packet header")?;
         if let Some(crypt) = self.crypt.as_mut() {
             crypt.decrypt(&mut header[1..header_len]);
         }
 
         let parsed = protocol::parse_server_header(&header[..header_len])?;
         let mut body = vec![0u8; parsed.body_len];
-        self.read_exact(&mut body, "a packet body")?;
+        self.read_committed(&mut body, "a packet body")?;
 
         tracing::debug!(
             "received {} ({} bytes)",
@@ -1778,6 +1778,63 @@ impl Connection {
         self.stream
             .read_exact(into)
             .map_err(|source| Error::Io { what, source })
+    }
+
+    /// Fills `into` completely, tolerating a stream that goes quiet part-way
+    /// through, and **never discarding what it has already taken**.
+    ///
+    /// **`read_exact` cannot be used past a packet's first byte.** Its
+    /// contract on failure is that the buffer contents are unspecified and
+    /// *how many bytes were consumed is unspecified too* -- and consumed is
+    /// consumed: those bytes have left the TCP stream for good. Before the
+    /// header cipher existed that was survivable, because a fresh read
+    /// simply resynchronised on the next packet. With RC4 it is permanent:
+    /// every byte taken from the stream but never fed through the cipher
+    /// leaves it one step out for the rest of the connection, and every
+    /// later header decrypts to noise.
+    ///
+    /// [`Connection::receive`] already lengthens the timeout past the first
+    /// byte for exactly this reason, and that narrows the window without
+    /// closing it -- one `WouldBlock`, `TimedOut`, or Windows 997 arriving
+    /// mid-header is enough, and 997 is documented on [`is_quiet_stream`] as
+    /// having killed a live session once already from the *first-byte* path,
+    /// where the damage is far smaller. Seen live as two
+    /// `packet claims 6146905 bytes` warnings and then a process that was
+    /// gone: a desynchronised stream hands garbage lengths to parsers, and a
+    /// parser that sizes an allocation from a garbage count asks for
+    /// gigabytes, which Windows refuses and Rust answers by aborting --
+    /// no panic, no unwind, no backtrace, nothing in the log at all.
+    ///
+    /// So a quiet stream here is waited on rather than reported, bounded by
+    /// [`PACKET_COMPLETION_TIMEOUT`] overall so a connection that has
+    /// genuinely gone away still ends.
+    fn read_committed(&mut self, into: &mut [u8], what: &'static str) -> Result<(), Error> {
+        let deadline = std::time::Instant::now() + PACKET_COMPLETION_TIMEOUT;
+        let mut filled = 0;
+        while filled < into.len() {
+            match self.stream.read(&mut into[filled..]) {
+                // A clean end of stream mid-packet is a dead connection, and
+                // must not spin: there is nothing more coming.
+                Ok(0) => {
+                    return Err(Error::Io {
+                        what,
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "the connection closed part-way through a packet",
+                        ),
+                    })
+                }
+                Ok(read) => filled += read,
+                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(source) if is_quiet_stream(&source) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::Io { what, source });
+                    }
+                }
+                Err(source) => return Err(Error::Io { what, source }),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2206,6 +2263,64 @@ mod tests {
             "the packet after a split header decoded to the wrong opcode,              which is what a desynchronised header cipher looks like"
         );
         assert_eq!(second.body, vec![0xBBu8; 4]);
+        server.join().ok();
+    }
+
+    /// **A read that has already taken bytes must never give them back.**
+    /// `read_exact` does exactly that: on any error its contract leaves both
+    /// the buffer contents *and the number of bytes consumed* unspecified,
+    /// and consumed bytes are gone from the TCP stream for good. Feed it a
+    /// stream that dribbles, with gaps longer than the socket's timeout, and
+    /// it eats part of the buffer and reports failure -- which past a
+    /// packet's first byte means the RC4 header cipher is permanently one
+    /// step out.
+    ///
+    /// Seen live as two `packet claims 6146905 bytes` warnings followed by a
+    /// process that was simply gone, with no panic in the log: garbage
+    /// lengths reach parsers, a parser sizes an allocation from a garbage
+    /// count, and the allocation failure aborts without unwinding.
+    ///
+    /// The timeout here is far shorter than the gaps on purpose, so the old
+    /// code fails and the fixed code waits.
+    #[test]
+    fn a_committed_read_waits_out_a_dribbling_stream_rather_than_losing_bytes() {
+        use std::io::Write;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            // Sixteen bytes, four at a time, with gaps far longer than the
+            // reader's 1ms timeout.
+            for chunk in 0..4u8 {
+                stream.write_all(&[chunk; 4]).expect("chunk");
+                stream.flush().ok();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        let stream = TcpStream::connect(address).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(1)))
+            .expect("timeout");
+        let mut connection = Connection {
+            stream,
+            crypt: None,
+            expansion: 2,
+            started: std::time::Instant::now(),
+            ping_sequence: 0,
+        };
+
+        let mut got = [0u8; 16];
+        connection
+            .read_committed(&mut got, "a dribbled buffer")
+            .expect("a committed read must wait out a quiet stream");
+        assert_eq!(
+            got,
+            [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
+            "every byte must arrive, in order, with none dropped on a timeout"
+        );
         server.join().ok();
     }
 
