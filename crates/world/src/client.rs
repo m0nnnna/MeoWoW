@@ -778,6 +778,29 @@ impl Connection {
         )
     }
 
+    /// Takes an equipped (or carried) item off and lets the server drop it
+    /// into the first free backpack square -- `CMSG_AUTOSTORE_BAG_ITEM`, the
+    /// counterpart of [`Self::equip_item`].
+    ///
+    /// `slot` is an index into the player's own array, so both bag bytes are
+    /// [`crate::inventory::OWN_SLOT_ARRAY`]: source "own array, this slot",
+    /// destination "own array, you pick". This is the opcode `foss-wow#55`
+    /// mistook `CMSG_SWAP_ITEM` for -- confirmed live doing exactly this when
+    /// the source slot was an equipped one.
+    pub fn store_in_backpack(
+        &mut self,
+        slot: crate::inventory::InventorySlot,
+    ) -> Result<(), Error> {
+        self.send(
+            ClientOpcode::AutoStoreBagItem,
+            &[
+                crate::inventory::OWN_SLOT_ARRAY,
+                slot.index() as u8,
+                crate::inventory::OWN_SLOT_ARRAY,
+            ],
+        )
+    }
+
     /// Uses an item where it sits: `(bag, slot)` addressed exactly as
     /// [`Self::equip_item`] and [`Self::swap_item_candidate`] address theirs.
     ///

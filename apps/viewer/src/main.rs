@@ -16471,6 +16471,24 @@ impl App {
             }
         }
 
+        // A right-clicked worn slot comes back off, into the bags. `index` is
+        // the equipment slot itself -- the character panel is indexed by
+        // identity, not by a rebuilt list -- so it maps straight to an
+        // `InventorySlot`. The server picks which backpack square it lands
+        // in; a full backpack is answered with `SMSG_INVENTORY_CHANGE_FAILURE`
+        // and the item simply stays on, the same outcome an incompatible
+        // right-click-equip has.
+        if let Some(index) = hud_response.unequip_item {
+            if let Some(slot) = ::world::inventory::InventorySlot::new(index as u16) {
+                if let Some(live) = self.live.as_mut() {
+                    tracing::info!("unequipping slot {index} back into the bags");
+                    if let Err(e) = live.connection.store_in_backpack(slot) {
+                        tracing::warn!("unequipping slot {index} failed: {e:#}");
+                    }
+                }
+            }
+        }
+
         // **Reported from live play**: a bag item dragged out of the window
         // and dropped over open ground used to just sit there, stuck to the
         // cursor, with no way to let go of it. The confirmation prompt

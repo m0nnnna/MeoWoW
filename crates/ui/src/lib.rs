@@ -335,6 +335,11 @@ pub struct HudResponse {
     /// was offered to the equipment slots, refused, and appeared to do
     /// nothing at all.
     pub activate_item: Option<usize>,
+    /// A worn slot in the character panel was right-clicked -- reported as the
+    /// **equipment slot index** (0..19), which unlike a bag row is a fixed
+    /// identity the caller can act on directly. The caller sends it back to
+    /// the bags; this crate only knows the gesture happened.
+    pub unequip_item: Option<usize>,
     /// The player confirmed destroying a carried item, reported as the same
     /// **row position** [`Self::move_item`] and [`Self::activate_item`] use --
     /// the caller resolves it through the same `bags_where` list.
@@ -1239,6 +1244,9 @@ impl Hud {
                             | Content::TradeOffer(_)
                             | Content::ReleasePrompt(_)
                             | Content::Bags(_)
+                            // Right-click on a worn slot unequips it -- see
+                            // the `Content::Character` arm below.
+                            | Content::Character(_)
                             | Content::Party(..)
                             | Content::PartyInvite(_)
                             // Clicking a tracked quest opens the log at it.
@@ -2021,11 +2029,10 @@ impl Hud {
                         }
                     }
                 }
-                // The character panel has no click behaviour of its own --
-                // see the module comment on why there is nothing here to
-                // combine -- but a worn item wants the same explanation a
-                // bag square gets, so it borrows `bags::hover_tooltip`
-                // rather than duplicating it.
+                // A worn item wants the same explanation a bag square gets,
+                // so it borrows `bags::hover_tooltip` rather than duplicating
+                // it -- and a right-click takes it off, back into the bags,
+                // the mirror of the bag window's right-click-to-equip.
                 (false, Content::Character(slots)) => {
                     if let Some(pointer) = response.hover_pos() {
                         if let Some(row) =
@@ -2033,6 +2040,23 @@ impl Hud {
                         {
                             if let Some(item) = slots.get(row).and_then(|s| s.item.as_ref()) {
                                 frames::bags::hover_tooltip(&response, item);
+                            }
+                        }
+                    }
+                    if response.secondary_clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            if let Some(row) = frames::character::slot_at(
+                                drawn_rect,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                // Only a slot that actually holds something --
+                                // right-clicking an empty slot has nothing to
+                                // send back and the server would decline it.
+                                if slots.get(row).is_some_and(|s| s.item.is_some()) {
+                                    response_out.unequip_item = Some(row);
+                                }
                             }
                         }
                     }

@@ -150,6 +150,21 @@ pub enum ClientOpcode {
     /// filled in.
     AutoEquipItem = 0x010A,
 
+    /// Auto-store an item into a bag, the server choosing which free square --
+    /// the counterpart of [`Self::AutoEquipItem`] for taking gear *off*.
+    ///
+    /// Body is `{src_bag, src_slot, dst_bag}`, three bytes. `255` for a bag
+    /// means the player's own array, as with [`Self::AutoEquipItem`]; with
+    /// `src_bag` `255` and `src_slot` an equipped slot index and `dst_bag`
+    /// `255`, the worn item lands in the first free backpack square.
+    ///
+    /// **Live-confirmed as a side effect of `foss-wow#55`** -- see
+    /// [`Self::SwapItemCandidate`], which this was mistaken for by exactly
+    /// one number. Sent against an equipped source slot the item was watched
+    /// leaving the slot and appearing in the first free backpack square, a
+    /// real state change the server did not decline.
+    AutoStoreBagItem = 0x010B,
+
     /// Moving an item between two named slots, neither of which the server
     /// chooses -- unlike `AutoEquipItem`.
     ///
