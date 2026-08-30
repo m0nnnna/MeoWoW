@@ -46,7 +46,7 @@ pub mod world_map;
 pub mod xp_bar;
 
 pub use auction::{AuctionClick, AuctionRow, AuctionTab, AuctionView};
-pub use bags::{BagItem, BagItemTooltip, BagSlot, WeaponStats};
+pub use bags::{BagItem, BagItemTooltip, BagSlot, ItemCompare, WeaponStats};
 pub use character::EquipSlot;
 pub use guild::{GuildRow, GuildView, OfficerNotes};
 pub use loot::{LootRow, Take};

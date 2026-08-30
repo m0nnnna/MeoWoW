@@ -95,6 +95,12 @@ pub struct BagItem {
     /// unconfirmed) are left visible rather than guessed at, the same rule
     /// every other tooltip in this client already follows.
     pub use_description: String,
+    /// Why the character cannot equip this, already worded -- `None` when
+    /// nothing bars it. See [`BagItemTooltip::restriction`].
+    pub restriction: Option<String>,
+    /// How this stacks up against what is worn in its slot now, or `None`
+    /// when there is nothing to compare against. See [`ItemCompare`].
+    pub compare: Option<ItemCompare>,
 }
 
 /// A weapon's damage and speed, as shown on a tooltip. See [`BagItem::weapon`].
@@ -104,6 +110,26 @@ pub struct WeaponStats {
     pub damage_max: f32,
     /// Milliseconds between swings.
     pub delay_ms: u32,
+}
+
+/// How an item stacks up against the one already worn in the slot it would
+/// go to -- every number a difference, `this minus equipped`, so positive is
+/// a gain.
+///
+/// Resolved entirely by the caller: this crate knows nothing about equipment
+/// slots or what fills them, only how to draw the deltas it is handed.
+/// `None` on a [`BagItem`] means there was nothing to compare against (an
+/// empty slot, or an item that is not equippable).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ItemCompare {
+    /// One delta per entry of [`BagItem::stats`], in the same order. A stat
+    /// the worn item lacks counts as zero, so the delta is the full value.
+    pub stat_deltas: Vec<i32>,
+    /// Armour gained over the worn item.
+    pub armor_delta: i32,
+    /// Damage-per-second gained over the worn weapon. `None` unless both are
+    /// weapons.
+    pub dps_delta: Option<f32>,
 }
 
 /// Everything [`BagItem`] carries beyond the icon, name and count -- a
@@ -120,6 +146,13 @@ pub struct BagItemTooltip {
     pub weapon: Option<WeaponStats>,
     pub stats: Vec<(String, i32)>,
     pub use_description: String,
+    /// Why the character cannot equip this, already worded by the caller --
+    /// `None` when nothing bars it. Drawn as a red line under the name. See
+    /// `world::query::item_restriction`.
+    pub restriction: Option<String>,
+    /// How this compares to what is worn now, or `None` when there is nothing
+    /// worn there to compare against.
+    pub compare: Option<ItemCompare>,
 }
 
 /// How many rows a given number of slots needs.
@@ -361,18 +394,80 @@ pub fn draw_held(painter: &Painter, at: Pos2, item: &BagItem, style: &Style, sca
 /// [`super::action_bar::abbreviate`]), and even an iconned one carries
 /// nothing on its face to tell a rare sword from a common one of the same
 /// shape.
+/// The red a "you cannot use this" line is drawn in, and the green a stat
+/// gain is. Bright enough to read as a warning and a benefit at a glance,
+/// against every theme's tooltip background.
+const CANNOT_USE: Color32 = Color32::from_rgb(255, 64, 64);
+const STAT_GAIN: Color32 = Color32::from_rgb(120, 230, 120);
+
+/// A `(+N)` / `(-N)` suffix comparing this item to the worn one, coloured by
+/// direction. Empty string for no change, so a caller can append it
+/// unconditionally.
+fn delta_suffix(delta: i32) -> (String, Color32) {
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => (format!("  (+{delta})"), STAT_GAIN),
+        std::cmp::Ordering::Less => (format!("  ({delta})"), CANNOT_USE),
+        std::cmp::Ordering::Equal => (String::new(), STAT_GAIN),
+    }
+}
+
 pub fn hover_tooltip(response: &egui::Response, item: &BagItem) {
     egui::Tooltip::for_widget(response).at_pointer().show(|ui| {
         ui.colored_label(quality_color(item.quality), &item.name);
+        // Right under the name, where the original client puts its red class
+        // and level lines -- it is the first thing to know about an item.
+        if let Some(reason) = &item.restriction {
+            ui.colored_label(CANNOT_USE, reason);
+        }
         if let Some(weapon) = item.weapon {
             ui.label(format!("{} - {} Damage", weapon.damage_min, weapon.damage_max));
-            ui.label(format!("Speed {:.2}", weapon.delay_ms as f32 / 1000.0));
+            let speed = weapon.delay_ms as f32 / 1000.0;
+            let dps = if speed > 0.0 {
+                (weapon.damage_min + weapon.damage_max) / 2.0 / speed
+            } else {
+                0.0
+            };
+            ui.label(format!("Speed {speed:.2}  ({dps:.1} damage per second)"));
+            if let Some(d) = item.compare.as_ref().and_then(|c| c.dps_delta) {
+                let (word, colour) = if d >= 0.0 {
+                    ("more", STAT_GAIN)
+                } else {
+                    ("less", CANNOT_USE)
+                };
+                ui.colored_label(colour, format!("{:.1} {word} dps than equipped", d.abs()));
+            }
         }
         if item.armor > 0 {
-            ui.label(format!("{} Armor", item.armor));
+            let suffix = item
+                .compare
+                .as_ref()
+                .filter(|c| c.armor_delta != 0)
+                .map(|c| delta_suffix(c.armor_delta));
+            match suffix {
+                Some((text, colour)) => two_tone(ui, &format!("{} Armor", item.armor), &text, colour),
+                None => {
+                    ui.label(format!("{} Armor", item.armor));
+                }
+            }
         }
-        for (label, value) in &item.stats {
-            ui.label(format!("+{value} {label}"));
+        // The stat block: each line green because it is a benefit, and each
+        // carrying its gain or loss against the worn item when there is one.
+        for (index, (label, value)) in item.stats.iter().enumerate() {
+            let base = format!("+{value} {label}");
+            match item
+                .compare
+                .as_ref()
+                .and_then(|c| c.stat_deltas.get(index).copied())
+                .filter(|d| *d != 0)
+            {
+                Some(delta) => {
+                    let (text, colour) = delta_suffix(delta);
+                    two_tone_colored(ui, &base, STAT_GAIN, &text, colour);
+                }
+                None => {
+                    ui.colored_label(STAT_GAIN, base);
+                }
+            }
         }
         if !item.use_description.is_empty() {
             ui.colored_label(Color32::from_rgb(25, 200, 25), format!("Use: {}", item.use_description));
@@ -386,6 +481,27 @@ pub fn hover_tooltip(response: &egui::Response, item: &BagItem) {
         if !item.description.is_empty() {
             ui.weak(&item.description);
         }
+    });
+}
+
+/// A label whose first part is the theme's ordinary text and whose trailing
+/// part is `colour` -- for an "N Armor  (+12)" line where only the delta is
+/// tinted.
+fn two_tone(ui: &mut egui::Ui, head: &str, tail: &str, colour: Color32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.label(head);
+        ui.colored_label(colour, tail);
+    });
+}
+
+/// [`two_tone`] with the head coloured too -- a green stat name and a
+/// direction-coloured delta beside it.
+fn two_tone_colored(ui: &mut egui::Ui, head: &str, head_colour: Color32, tail: &str, colour: Color32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.colored_label(head_colour, head);
+        ui.colored_label(colour, tail);
     });
 }
 

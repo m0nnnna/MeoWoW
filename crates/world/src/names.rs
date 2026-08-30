@@ -426,6 +426,8 @@ mod tests {
             inventory_type: 21,
             item_level: 3,
             required_level: 1,
+            allowable_class: -1,
+            allowable_race: -1,
             stackable: 1,
             container_slots: 0,
             buy_price: 25,

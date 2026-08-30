@@ -176,6 +176,15 @@ pub struct ItemInfo {
     pub inventory_type: u32,
     pub item_level: u32,
     pub required_level: u32,
+    /// Bitmask of the classes that may use this item, `-1` for "any". Bit
+    /// `n-1` is class `n`. Set only on class-locked items -- relics, tier
+    /// tokens, a few quest items -- and `-1` on ordinary gear, whose class
+    /// limits come from proficiency the server tracks and the client does
+    /// not. See [`item_restriction`].
+    pub allowable_class: i32,
+    /// The same, for races. `-1` for "any"; set on faction- or race-flavoured
+    /// items.
+    pub allowable_race: i32,
     /// How many fit in one square. Negative in the table means "unlimited",
     /// which the wire sends as a negative `i32`.
     pub stackable: i32,
@@ -253,6 +262,104 @@ pub fn item_stat_label(stat_type: u32) -> Option<&'static str> {
     }
 }
 
+/// Why a character cannot equip an item.
+///
+/// **Only the checks the client can make without guessing.** Class and race
+/// masks and the required level are all things the wire states outright and
+/// the player's own object already carries. Weapon and light-armour
+/// proficiency is *not* here: it depends on skill lines this client does not
+/// track and, for mail and plate, on a class's level -- and a tooltip that
+/// says "you cannot use this" when the character will be able to at level 40
+/// is worse than one that stays quiet and lets the server decline the equip.
+/// The one armour rule that is safe -- a caster and plate, a rogue and mail --
+/// is the permanent kind, kept in [`class_armor_ceiling`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemRestriction {
+    /// The item's class mask excludes this character's class.
+    WrongClass,
+    /// The item's race mask excludes this character's race.
+    WrongRace,
+    /// Armour heavier than this class ever wears, at any level.
+    TooHeavy,
+    /// The character is below the item's required level.
+    LevelTooLow(u32),
+}
+
+impl std::fmt::Display for ItemRestriction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ItemRestriction::WrongClass | ItemRestriction::TooHeavy => {
+                write!(f, "Your class cannot use this")
+            }
+            ItemRestriction::WrongRace => write!(f, "Your race cannot use this"),
+            ItemRestriction::LevelTooLow(level) => write!(f, "Requires level {level}"),
+        }
+    }
+}
+
+/// The heaviest armour subclass a class ever wears: `1` cloth, `2` leather,
+/// `3` mail, `4` plate.
+///
+/// **Permanent, not "right now".** A hunter is `3` here even at level 10,
+/// before mail is trained -- the question is "does this class ever wear it",
+/// so the answer never produces a false "cannot use". The level-gated cases
+/// are left to the server. Cloaks, necks, rings, trinkets and relics are
+/// subclass `0` or `6+` and are not weight-checked at all.
+///
+/// Well-known 3.3.5 facts, held to the same bar as [`item_stat_label`]: a
+/// wrong entry here would be spotted by anyone who has worn a chestpiece.
+fn class_armor_ceiling(class: u8) -> u32 {
+    match class {
+        1 | 2 | 6 => 4, // Warrior, Paladin, Death Knight
+        3 | 7 => 3,     // Hunter, Shaman
+        4 | 11 => 2,    // Rogue, Druid
+        5 | 8 | 9 => 1, // Priest, Mage, Warlock
+        // An unrecognised class assumes the least restriction rather than
+        // warn wrongly -- the same direction every other doubt here leans.
+        _ => 4,
+    }
+}
+
+/// Whether `class`/`race`/`level` bar this character from equipping `info`,
+/// and if so, the first reason that applies. `None` means "nothing here says
+/// they cannot" -- not a promise the server will accept it, since proficiency
+/// is deliberately unchecked (see [`ItemRestriction`]).
+pub fn item_restriction(
+    class: u8,
+    race: u8,
+    level: u32,
+    info: &ItemInfo,
+) -> Option<ItemRestriction> {
+    // `-1` (0xFFFFFFFF) is the "no restriction" sentinel; otherwise bit
+    // `n - 1` stands for class or race `n`.
+    if info.allowable_class != -1
+        && (1..=32).contains(&class)
+        && info.allowable_class as u32 & (1 << (class - 1)) == 0
+    {
+        return Some(ItemRestriction::WrongClass);
+    }
+    if info.allowable_race != -1
+        && (1..=32).contains(&race)
+        && info.allowable_race as u32 & (1 << (race - 1)) == 0
+    {
+        return Some(ItemRestriction::WrongRace);
+    }
+    // `ITEM_CLASS_ARMOR` is `4`; subclasses `1..=4` are cloth/leather/mail/
+    // plate. Subclass `0` (misc: cloaks, necks, rings, trinkets), `6` (shield)
+    // and `7..=10` (relics) are not weight-restricted here.
+    const ARMOR: u32 = 4;
+    if info.item_class == ARMOR
+        && (1..=4).contains(&info.sub_class)
+        && info.sub_class > class_armor_ceiling(class)
+    {
+        return Some(ItemRestriction::TooHeavy);
+    }
+    if level < info.required_level {
+        return Some(ItemRestriction::LevelTooLow(info.required_level));
+    }
+    None
+}
+
 /// `ITEM_SPELLTRIGGER_ON_USE`: the trigger a "use this" click acts on.
 ///
 /// **Only this one is named**, and the rest are deliberately left as raw
@@ -313,6 +420,8 @@ pub fn parse_item_query_response(body: &[u8]) -> Result<ItemInfo, Error> {
             inventory_type: 0,
             item_level: 0,
             required_level: 0,
+            allowable_class: -1,
+            allowable_race: -1,
             stackable: 0,
             container_slots: 0,
             buy_price: 0,
@@ -343,8 +452,8 @@ pub fn parse_item_query_response(body: &[u8]) -> Result<ItemInfo, Error> {
     let buy_price = r.u32()? as i32;
     let sell_price = r.u32()?;
     let inventory_type = r.u32()?;
-    let _allowable_class = r.u32()? as i32;
-    let _allowable_race = r.u32()? as i32;
+    let allowable_class = r.u32()? as i32;
+    let allowable_race = r.u32()? as i32;
     let item_level = r.u32()?;
     let required_level = r.u32()?;
     let _required_skill = r.u32()?;
@@ -449,6 +558,8 @@ pub fn parse_item_query_response(body: &[u8]) -> Result<ItemInfo, Error> {
         inventory_type,
         item_level,
         required_level,
+        allowable_class,
+        allowable_race,
         stackable,
         container_slots,
         buy_price,
@@ -1121,6 +1232,56 @@ mod tests {
         assert_eq!(parsed.damage_max, 3.5);
     }
 
+
+    fn armor_item(sub_class: u32, allowable_class: i32, required_level: u32) -> ItemInfo {
+        let mut info = parse_item_query_response(&item_response(2224, "A Chestpiece", 0)).unwrap();
+        info.item_class = 4; // armour
+        info.sub_class = sub_class;
+        info.allowable_class = allowable_class;
+        info.required_level = required_level;
+        info
+    }
+
+    #[test]
+    fn a_caster_cannot_wear_plate_but_a_warrior_can() {
+        // Warrior (1), human (1), level 80.
+        let plate = armor_item(4, -1, 1);
+        assert_eq!(item_restriction(8, 1, 80, &plate), Some(ItemRestriction::TooHeavy)); // mage
+        assert_eq!(item_restriction(1, 1, 80, &plate), None); // warrior
+        // Cloth is fine for everyone.
+        let cloth = armor_item(1, -1, 1);
+        assert_eq!(item_restriction(8, 1, 80, &cloth), None);
+    }
+
+    #[test]
+    fn a_hunter_is_never_told_they_cannot_wear_mail() {
+        // Even at level 10, before mail is trained: the check is "does this
+        // class ever wear it", so it must not fire.
+        let mail = armor_item(3, -1, 1);
+        assert_eq!(item_restriction(3, 1, 10, &mail), None);
+    }
+
+    #[test]
+    fn a_class_locked_relic_is_refused_by_the_wrong_class() {
+        // A paladin libram: allowable-class mask with only the paladin bit
+        // (class 2 -> bit 1 -> value 2).
+        let libram = armor_item(7, 0b10, 1);
+        assert_eq!(item_restriction(3, 1, 80, &libram), Some(ItemRestriction::WrongClass)); // hunter
+        assert_eq!(item_restriction(2, 1, 80, &libram), None); // paladin
+    }
+
+    #[test]
+    fn the_level_gate_is_the_last_word() {
+        let gear = armor_item(1, -1, 40);
+        assert_eq!(
+            item_restriction(8, 1, 39, &gear),
+            Some(ItemRestriction::LevelTooLow(40))
+        );
+        assert_eq!(item_restriction(8, 1, 40, &gear), None);
+        // A class restriction outranks the level one.
+        let plate = armor_item(4, -1, 40);
+        assert_eq!(item_restriction(8, 1, 39, &plate), Some(ItemRestriction::TooHeavy));
+    }
 
     /// **The test that separates a real parse from a lucky one.** The stats
     /// block is the packet's only variable-length section, and a parser that

@@ -2493,6 +2493,29 @@ mod tests {
         out
     }
 
+    /// The same, carrying each run's colour -- from the galley's first
+    /// section, which is the whole of it for every `colored_label` here.
+    fn painted_colored(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let colour = text
+                        .override_text_color
+                        .or_else(|| text.galley.job.sections.first().map(|s| s.format.color))
+                        .unwrap_or(egui::Color32::PLACEHOLDER);
+                    out.push((text.galley.text().to_string(), colour));
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
     fn player() -> UnitView {
         UnitView::placeholder("Testwolf")
     }
@@ -3030,6 +3053,8 @@ mod tests {
                 }),
                 stats: vec![("Agility".to_string(), 3)],
                 use_description: "Poisons the blade for 30 sec.".into(),
+                restriction: None,
+                compare: None,
             }),
         };
         let data = HudData {
@@ -3062,16 +3087,16 @@ mod tests {
             "A wicked blade.",
         ] {
             assert!(
-                filled.iter().any(|text| text == wanted),
+                filled.iter().any(|text| text.contains(wanted)),
                 "hovering the square never painted {wanted:?}; got {filled:?}"
             );
         }
     }
 
-    /// The character panel senses only hover, never click -- see its module
-    /// comment. That makes it the one place a `Sense` mismatch would show up
-    /// as "the tooltip silently never appears" rather than as a failed click
-    /// test, so it gets its own check rather than trusting the bag window's.
+    /// The character panel is the one frame whose primary gesture is hover,
+    /// not click, so a `Sense` mismatch shows up here as "the tooltip
+    /// silently never appears" rather than as a failed click test -- it gets
+    /// its own check rather than trusting the bag window's.
     #[test]
     fn a_hovered_worn_item_explains_itself_too() {
         let mut slots = frames::character::placeholder();
@@ -3088,6 +3113,8 @@ mod tests {
             weapon: None,
             stats: vec![("Stamina".to_string(), 5)],
             use_description: String::new(),
+            restriction: None,
+            compare: None,
         });
         let data = HudData {
             character: Some(&slots),
@@ -3114,6 +3141,129 @@ mod tests {
                 "hovering the worn item never painted {wanted:?}; got {filled:?}"
             );
         }
+    }
+
+    /// A hovered item that the character cannot equip gets a red warning line,
+    /// its stat bonuses are drawn green, and when something is worn in its
+    /// slot the tooltip shows the gain or loss against it.
+    #[test]
+    fn a_tooltip_warns_compares_and_greens_the_stats() {
+        let mut slots = vec![frames::BagSlot::default(); 16];
+        slots[0] = frames::BagSlot {
+            item: Some(frames::BagItem {
+                entry: 5,
+                name: "Plate Helm of Testing".into(),
+                count: 1,
+                icon: None,
+                quality: 3,
+                item_level: 40,
+                required_level: 35,
+                description: String::new(),
+                armor: 400,
+                weapon: None,
+                stats: vec![("Stamina".to_string(), 20), ("Strength".to_string(), 12)],
+                use_description: String::new(),
+                restriction: Some("Your class cannot use this".into()),
+                compare: Some(frames::ItemCompare {
+                    // +20 Sta beats a worn +14 -> +6; +12 Str against a worn
+                    // +18 -> -6.
+                    stat_deltas: vec![6, -6],
+                    armor_delta: 150,
+                    dps_delta: None,
+                }),
+            }),
+        };
+        let data = HudData {
+            bags: Some(&slots),
+            ..Default::default()
+        };
+
+        let profile = Profile::default();
+        let element = profile.get(ElementId::Bags);
+        let rect = element.rect(
+            screen(),
+            frames::bags::size(slots.len(), &profile.style, element.scale),
+        );
+        let centre = frames::bags::slot_rects(rect, slots.len(), &profile.style, element.scale)
+            .next()
+            .unwrap()
+            .center();
+
+        let mut hud = Hud::default();
+        let painted = painted_colored(&shapes(&mut hud, &data, Some(centre)));
+        let find = |needle: &str| {
+            painted
+                .iter()
+                .find(|(text, _)| text.contains(needle))
+                .unwrap_or_else(|| panic!("nothing painted contained {needle:?}; got {painted:?}"))
+                .1
+        };
+
+        // The warning is red.
+        let red = find("cannot use this");
+        assert!(red.r() > 200 && red.g() < 120 && red.b() < 120, "warning colour {red:?}");
+
+        // Stat bonuses are green.
+        let sta = find("+20 Stamina");
+        assert!(sta.g() > 180 && sta.r() < 180, "stat colour {sta:?}");
+
+        // The comparison shows both directions.
+        let gain = find("(+6)");
+        assert!(gain.g() > 180 && gain.r() < 180, "gain colour {gain:?}");
+        let loss = find("(-6)");
+        assert!(loss.r() > 200 && loss.g() < 120, "loss colour {loss:?}");
+
+        // And the armour delta.
+        assert!(painted.iter().any(|(t, _)| t.contains("(+150)")), "{painted:?}");
+    }
+
+    /// **Reported from play: right-clicking a worn item did nothing** -- the
+    /// character panel was left out of the `Sense::click()` list, so the arm
+    /// that would report it was dead code. A right-click on a filled slot
+    /// reports its equipment slot index (the caller stores it back in the
+    /// bags); a right-click on an empty slot reports nothing.
+    #[test]
+    fn right_clicking_a_worn_item_asks_to_unequip_it() {
+        let mut slots = frames::character::placeholder();
+        for slot in slots.iter_mut() {
+            slot.item = None;
+        }
+        slots[3].item = Some(frames::BagItem {
+            entry: 100,
+            name: "Worn Shortsword".into(),
+            count: 1,
+            ..Default::default()
+        });
+        let data = HudData {
+            character: Some(&slots),
+            ..Default::default()
+        };
+
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::Character);
+        let rect = element.rect(
+            screen(),
+            frames::character::size(&hud.profile.style, element.scale),
+        );
+        let slot_centres: Vec<egui::Pos2> =
+            frames::character::slot_rects(rect, &hud.profile.style, element.scale)
+                .map(|r| r.center())
+                .collect();
+
+        let filled = drive(
+            &mut hud,
+            &data,
+            &click_script(slot_centres[3], egui::PointerButton::Secondary),
+        );
+        assert_eq!(filled.unequip_item, Some(3));
+
+        let empty = drive(
+            &mut hud,
+            &data,
+            &click_script(slot_centres[5], egui::PointerButton::Secondary),
+        );
+        assert_eq!(empty.unequip_item, None);
     }
 
     /// Drives the interface through real egui passes, one batch of events per

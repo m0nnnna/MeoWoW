@@ -4693,6 +4693,38 @@ enum Looting {
 /// See `world::inventory::InventorySlot::label`.
 const MAIN_HAND_SLOT: usize = 15;
 
+/// The equipment slot an item's `inventory_type` would fill, as an index into
+/// `world::inventory::InventorySlot` -- the destination a tooltip compares
+/// against.
+///
+/// The paired slots (rings, trinkets, one-hand weapons) resolve to their
+/// *first* index: comparing against both and showing two deltas is what the
+/// original client does with a modifier held, and this does not go that far.
+/// `None` for a type with no fixed worn slot -- ammunition, a bag, a
+/// quest item.
+fn equip_slot_for_invtype(inventory_type: u32) -> Option<u16> {
+    Some(match inventory_type {
+        1 => 0,             // head
+        2 => 1,             // neck
+        3 => 2,             // shoulder
+        4 => 3,             // shirt
+        5 | 20 => 4,        // chest, robe
+        6 => 5,             // waist
+        7 => 6,             // legs
+        8 => 7,             // feet
+        9 => 8,             // wrists
+        10 => 9,            // hands
+        11 => 10,           // finger (first)
+        12 => 12,           // trinket (first)
+        16 => 14,           // back
+        13 | 17 | 21 => 15, // one-hand, two-hand, main hand
+        14 | 22 | 23 => 16, // shield, off-hand weapon, held in off-hand
+        15 | 25 | 26 => 17, // ranged, thrown, ranged-right
+        19 => 18,           // tabard
+        _ => return None,
+    })
+}
+
 /// How far the pointer may travel between press and release and still count as
 /// a click rather than as a look.
 const CLICK_SLOP: f64 = 4.0;
@@ -10767,21 +10799,18 @@ impl App {
             .unwrap_or_else(|| items.name(entry))
     }
 
-    /// Everything a bag or character square's tooltip draws beyond the name.
-    /// Every field answers its "not yet known" default until the same
-    /// `SMSG_ITEM_QUERY_SINGLE_RESPONSE` `item_name` reads from has arrived --
-    /// see that function's own doc comment for why the fallback is honest
-    /// rather than invented.
+    /// The tooltip fields that come straight off
+    /// `SMSG_ITEM_QUERY_SINGLE_RESPONSE` -- everything except
+    /// `use_description`, which needs the spellbook and archive chain to
+    /// resolve. Split from [`Self::item_tooltip`] so a caller that has only
+    /// `&self` (the questgiver window builder) can still show a reward's
+    /// stats, its "you cannot use this" line and its comparison to worn gear.
     ///
-    /// Takes the spellbook, archive chain and atlas to resolve an on-use
-    /// item's effect line -- see `spells::Spellbook::resolve_extra` -- as
-    /// three more disjoint borrows alongside `live`, for the same reason
-    /// `item_name` above takes its pieces separately rather than `&self`.
-    fn item_tooltip(
+    /// Every field answers its "not yet known" default until the query has
+    /// arrived -- see [`Self::item_name`] for why the fallback is honest
+    /// rather than invented.
+    fn item_static_fields(
         live: Option<&live::LiveWorld>,
-        spells: &mut spells::Spellbook,
-        chain: &mut Chain,
-        maps: &maps::Maps,
         entry: u32,
     ) -> ui::frames::BagItemTooltip {
         let Some(info) = live.and_then(|live| live.state.names.item(entry)).flatten() else {
@@ -10796,24 +10825,133 @@ impl App {
             damage_max: info.damage_max,
             delay_ms: info.weapon_delay,
         });
-        let stats = info
-            .stats
+        let stat_label = |stat_type: u32| {
+            ::world::query::item_stat_label(stat_type)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Stat {stat_type}"))
+        };
+        let named_stats: Vec<&::world::query::ItemStat> =
+            info.stats.iter().filter(|stat| stat.value != 0).collect();
+        let stats = named_stats
             .iter()
-            .filter(|stat| stat.value != 0)
-            .map(|stat| {
-                let label = ::world::query::item_stat_label(stat.stat_type)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("Stat {}", stat.stat_type));
-                (label, stat.value)
-            })
+            .map(|stat| (stat_label(stat.stat_type), stat.value))
             .collect();
+
+        // Whether the character can equip it at all -- class, race, level and
+        // the one armour rule that never guesses. Only when there is a live
+        // character to ask about.
+        let restriction = live.and_then(|live| {
+            let me = live.state.get(live.guid)?;
+            ::world::query::item_restriction(
+                me.class()?,
+                me.race()?,
+                me.level().unwrap_or(0),
+                &info,
+            )
+            .map(|reason| reason.to_string())
+        });
+
+        // How it stacks up against whatever is worn in the slot it would go
+        // to. `None` when the slot is empty, when the item is not equippable,
+        // or when it *is* the worn item (a character-panel hover).
+        let compare = live.and_then(|live| {
+            let slot = equip_slot_for_invtype(info.inventory_type)?;
+            let worn_entry = ::world::inventory::equipped(&live.state, live.guid)
+                .get(slot as usize)
+                .copied()
+                .flatten()
+                .and_then(|held| held.entry)?;
+            if worn_entry == entry {
+                return None;
+            }
+            let worn = live.state.names.item(worn_entry).flatten()?;
+            let stat_deltas = named_stats
+                .iter()
+                .map(|stat| {
+                    let theirs = worn
+                        .stats
+                        .iter()
+                        .find(|s| s.stat_type == stat.stat_type)
+                        .map(|s| s.value)
+                        .unwrap_or(0);
+                    stat.value - theirs
+                })
+                .collect();
+            let dps = |item: &::world::query::ItemInfo| {
+                (item.damage_min + item.damage_max) / 2.0
+                    / (item.weapon_delay as f32 / 1000.0)
+            };
+            let dps_delta =
+                (info.weapon_delay > 0 && worn.weapon_delay > 0).then(|| dps(&info) - dps(&worn));
+            Some(ui::frames::ItemCompare {
+                stat_deltas,
+                armor_delta: info.armor as i32 - worn.armor as i32,
+                dps_delta,
+            })
+        });
+
+        ui::frames::BagItemTooltip {
+            quality: info.quality,
+            item_level: info.item_level,
+            required_level: info.required_level,
+            description: info.description.clone(),
+            armor: info.armor,
+            weapon,
+            stats,
+            use_description: String::new(),
+            restriction,
+            compare,
+        }
+    }
+
+    /// A quest reward as a [`ui::frames::BagItem`], so the questgiver window
+    /// can draw it by name and raise the same hover tooltip a bag square
+    /// gets. `use_description` is left empty -- resolving an on-use effect
+    /// needs mutable borrows this call site does not have, and a quest reward
+    /// is almost never a consumable.
+    fn item_reward(
+        live: Option<&live::LiveWorld>,
+        items: &items::Items,
+        entry: u32,
+        count: u32,
+    ) -> ui::frames::BagItem {
+        let fields = Self::item_static_fields(live, entry);
+        ui::frames::BagItem {
+            entry,
+            name: Self::item_name(live, items, entry),
+            count,
+            icon: None,
+            quality: fields.quality,
+            item_level: fields.item_level,
+            required_level: fields.required_level,
+            description: fields.description,
+            armor: fields.armor,
+            weapon: fields.weapon,
+            stats: fields.stats,
+            use_description: fields.use_description,
+            restriction: fields.restriction,
+            compare: fields.compare,
+        }
+    }
+
+    fn item_tooltip(
+        live: Option<&live::LiveWorld>,
+        spells: &mut spells::Spellbook,
+        chain: &mut Chain,
+        maps: &maps::Maps,
+        entry: u32,
+    ) -> ui::frames::BagItemTooltip {
+        let mut tip = Self::item_static_fields(live, entry);
+        let Some(info) = live.and_then(|live| live.state.names.item(entry)).flatten() else {
+            return tip;
+        };
         // Resolved on demand rather than at login, because which items exist
         // is not known until well after it -- see `resolve_extra`'s own doc
         // comment. Whatever the spell's own description could not resolve
         // (most often food's `$o1`, a periodic total this project's
         // `dbc::spelltext` deliberately leaves unconfirmed) stays visible as
         // a token rather than becoming a guessed number.
-        let use_description = info
+        tip.use_description = info
             .use_spell()
             .map(|spell| {
                 spells.resolve_extra(chain, spell);
@@ -10835,16 +10973,7 @@ impl App {
                 }
             })
             .unwrap_or_default();
-        ui::frames::BagItemTooltip {
-            quality: info.quality,
-            item_level: info.item_level,
-            required_level: info.required_level,
-            description: info.description.clone(),
-            armor: info.armor,
-            weapon,
-            stats,
-            use_description,
-        }
+        tip
     }
 
     fn quest_progress(&self, quest: &::world::quest::QuestInfo) -> Vec<String> {
@@ -15710,6 +15839,8 @@ impl App {
                             weapon: tooltip.weapon,
                             stats: tooltip.stats,
                             use_description: tooltip.use_description,
+                            restriction: tooltip.restriction,
+                            compare: tooltip.compare,
                         }),
                     };
                     bags_where[index] = Some(carried.at);
@@ -15787,6 +15918,8 @@ impl App {
                             weapon: tooltip.weapon,
                             stats: tooltip.stats,
                             use_description: tooltip.use_description,
+                            restriction: tooltip.restriction,
+                            compare: tooltip.compare,
                         }
                     });
                     ui::frames::EquipSlot {
