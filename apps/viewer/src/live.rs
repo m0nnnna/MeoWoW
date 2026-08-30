@@ -172,13 +172,23 @@ pub struct LiveWorld {
     /// once. The first body per opcode is the one that teaches; the rest are
     /// noise, and a busy zone would produce plenty.
     reported_failures: std::collections::HashSet<u16>,
-    /// How this character is dressed, resolved once at login.
+    /// The five appearance numbers, kept so [`refresh_own_look`] can rebuild
+    /// `look` without going back to the character list. These genuinely
+    /// cannot change without a barber -- unlike the equipment folded into
+    /// `look` beside them.
+    pub appearance: crate::character::Appearance,
+    /// How this character is dressed: appearance plus current equipment.
     ///
-    /// Resolved here rather than per frame because it cannot change without a
-    /// barber, and reading three DBCs every frame to learn the same answer
-    /// would be the login burst's thirty-seven seconds all over again.
+    /// Seeded at login from the character list. The **appearance** part cannot
+    /// change without a barber, but the **equipment** part changes every time
+    /// the player puts on or takes off a piece -- and the own body is drawn
+    /// from this snapshot rather than resolved per frame off the fields the
+    /// way other players are (that would be the login burst's DBC reads every
+    /// frame). [`refresh_own_look`] rebuilds it from replicated visible-item
+    /// state whenever that state implies a different [`look_key`].
     pub look: std::rc::Rc<crate::character::Look>,
-    /// Distinguishes this look in the renderer's model cache.
+    /// Distinguishes this look in the renderer's model cache. Changes with
+    /// equipment, which is what makes a swapped cape actually redraw.
     pub look_key: u64,
     /// Kept alive rather than dropped at the end of [`connect`]: the viewer
     /// walks the character over this same connection, and RC4 header state
@@ -376,6 +386,7 @@ pub fn enter(
         position: Vec3::new(landed.x, landed.y, landed.z),
         orientation: landed.orientation,
         state,
+        appearance,
         look: std::rc::Rc::new(look),
         look_key: crate::character::look_key(&appearance, &equipment),
         fold_failures: 0,
@@ -526,6 +537,46 @@ pub fn answer_teleport(live: &mut LiveWorld) -> bool {
     let at = teleport.info.position;
     live.position = Vec3::new(at.x, at.y, at.z);
     live.orientation = at.orientation;
+    true
+}
+
+/// Rebuilds [`LiveWorld::look`] when replicated equipment has changed.
+///
+/// The own body is drawn from this snapshot, not resolved per frame off the
+/// update fields the way another player's is -- so a piece of gear put on or
+/// taken off changes nothing on screen until this runs. A cape is the loudest
+/// case (a whole mesh appearing or vanishing), but every painted layer and
+/// every held model is folded into the same [`look_key`].
+///
+/// The appearance behind the look never changes, so `live.appearance` is
+/// reused; only the equipment is re-read, from `PLAYER_VISIBLE_ITEM_*` on our
+/// own object, mapped through `Item.dbc` to `(display id, inventory type)`
+/// exactly as `player_look` in the viewer does it for other players. Cheap to
+/// call every pump: the key is a hash of nineteen small integers and a match
+/// means no work. Returns whether it rebuilt.
+pub fn refresh_own_look(
+    live: &mut LiveWorld,
+    chain: &mut Chain,
+    items: &crate::items::Items,
+) -> bool {
+    let Some(entity) = live.state.get(live.guid) else {
+        return false;
+    };
+    let equipment: Vec<(u32, u8)> = entity
+        .visible_item_entries()
+        .iter()
+        .filter_map(|entry| (*entry != 0).then(|| items.display(*entry)).flatten())
+        .collect();
+    let key = crate::character::look_key(&live.appearance, &equipment);
+    if key == live.look_key {
+        return false;
+    }
+    live.look = std::rc::Rc::new(crate::character::resolve_wearing(
+        chain,
+        live.appearance,
+        &equipment,
+    ));
+    live.look_key = key;
     true
 }
 

@@ -13157,6 +13157,15 @@ impl App {
             Ok(packets) => {
                 let report = live::replicate(&mut live.state, &packets);
                 live.note_failures(&report);
+                // **Our own body is dressed from a login snapshot**, so a
+                // piece of gear equipped or removed in play -- a cape most
+                // visibly -- changes nothing on screen until the snapshot is
+                // rebuilt from the replicated visible-item fields. Other
+                // players already redraw because they are resolved off those
+                // fields every frame; this is the own body catching up.
+                if live::refresh_own_look(live, &mut self.chain, &self.items) {
+                    tracing::info!("own appearance rebuilt after an equipment change");
+                }
                 // Fifth category, and the one that punishes being dropped
                 // hardest: an unacknowledged teleport makes the server discard
                 // every movement packet this client sends, so the character
