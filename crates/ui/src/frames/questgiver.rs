@@ -20,6 +20,8 @@ use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec
 
 use crate::style::Style;
 
+pub use super::bags::BagItem;
+
 /// One plain speech line in a gossip menu -- "I'd like to browse your
 /// goods.", or a custom NPC's own scripted choices. Not a quest: choosing one
 /// answers `CMSG_GOSSIP_SELECT_OPTION` and, on a scripted NPC, very often
@@ -95,14 +97,21 @@ pub enum QuestgiverView {
         /// One line per objective, already rendered by the caller -- this
         /// crate knows nothing about creature ids or item entries.
         objectives: Vec<String>,
-        /// Rewards the quest gives unconditionally.
-        rewards: Vec<String>,
+        /// Rewards the quest gives unconditionally. A [`BagItem`] each, the
+        /// same payload a bag square carries, so the hover tooltip is the one
+        /// [`super::bags::hover_tooltip`] already draws -- name coloured by
+        /// quality, stats, flavour text. The name is `Item {entry}` until the
+        /// caller's `CMSG_ITEM_QUERY_SINGLE` is answered, exactly as a bag
+        /// square is.
+        rewards: Vec<BagItem>,
+        /// Money the quest pays, in copper. `0` draws nothing.
+        reward_money: u32,
         /// Optional rewards, of which exactly one is taken -- empty for a
         /// quest offering none. Choosing among these is what
         /// `foss-wow#141`'s predecessor ticket asked for: this window used
         /// to hand over `reward_choices[0]` unconditionally, silently
         /// wrong for any quest with more than one.
-        reward_choices: Vec<String>,
+        reward_choices: Vec<BagItem>,
         /// Which of `reward_choices` is currently picked. Meaningless when
         /// `reward_choices` is empty; the caller is responsible for keeping
         /// it a valid index otherwise (see [`QuestgiverClick::chosen_reward`]).
@@ -181,26 +190,48 @@ fn wrap(text: &str, style: &Style, scale: f32) -> Vec<String> {
     lines
 }
 
+/// Where the hoverable reward rows sit inside [`body_lines`] -- a
+/// `(first line index, count)` pair per section, or `None` when that section
+/// is absent. The money line is deliberately not covered: it is not an item
+/// and has no tooltip.
+#[derive(Default, Clone, Copy)]
+struct RewardRows {
+    /// The unconditional "You will receive:" item rows.
+    rewards: Option<(usize, usize)>,
+    /// The "Choose one:" pick-one rows.
+    choices: Option<(usize, usize)>,
+}
+
+/// One reward's text: `Name`, or `Name x3` for a stack.
+fn reward_name(item: &BagItem) -> String {
+    if item.count > 1 {
+        format!("{} x{}", item.name, item.count)
+    } else {
+        item.name.clone()
+    }
+}
+
 /// Every line the window will draw, in order, so the size and the painter
 /// cannot disagree about how many there are.
 fn body_lines(view: &QuestgiverView, style: &Style, scale: f32) -> Vec<String> {
     body_lines_and_choice_range(view, style, scale).0
 }
 
-/// [`body_lines`], plus where the reward-choice rows sit within it -- a
-/// `(start, count)` pair, or `None` when there is nothing to choose.
+/// [`body_lines`], plus where the reward rows sit within it -- see
+/// [`RewardRows`].
 ///
 /// **One function for both**, rather than two that have to agree on where
-/// wrapped body text and a variable-length objective list push the choice
-/// section down. `click_at` reads the range; `body_lines` (and so `size` and
-/// `draw`, which both call it) reads the lines -- the same reasoning
-/// [`row_rects`] and [`button_rects`] already apply to fixed geometry,
-/// extended to a section whose offset depends on how much text precedes it.
+/// wrapped body text and a variable-length objective list push the reward
+/// sections down. `click_at` and `reward_at` read the ranges; `body_lines`
+/// (and so `size` and `draw`, which both call it) reads the lines -- the same
+/// reasoning [`row_rects`] and [`button_rects`] already apply to fixed
+/// geometry, extended to sections whose offset depends on how much text
+/// precedes them.
 fn body_lines_and_choice_range(
     view: &QuestgiverView,
     style: &Style,
     scale: f32,
-) -> (Vec<String>, Option<(usize, usize)>) {
+) -> (Vec<String>, RewardRows) {
     match view {
         QuestgiverView::List { options, quests, .. } => (
             options
@@ -215,12 +246,13 @@ fn body_lines_and_choice_range(
                     }
                 }))
                 .collect(),
-            None,
+            RewardRows::default(),
         ),
         QuestgiverView::Quest {
             body,
             objectives,
             rewards,
+            reward_money,
             reward_choices,
             selected_reward,
             action,
@@ -234,18 +266,26 @@ fn body_lines_and_choice_range(
                     lines.extend(wrap(&format!("- {objective}"), style, scale));
                 }
             }
-            if !rewards.is_empty() {
+            // **One line per reward, never wrapped.** An item name never
+            // approaches the wrap width, and a hoverable row has to stay
+            // exactly one line so its rectangle -- from `row_rects`, the same
+            // function `List` uses -- lands on the row it names rather than on
+            // half of it.
+            let reward_range = if rewards.is_empty() && *reward_money == 0 {
+                None
+            } else {
                 lines.push(String::new());
                 lines.push("You will receive:".into());
+                let start = lines.len();
                 for reward in rewards {
-                    lines.extend(wrap(&format!("- {reward}"), style, scale));
+                    lines.push(format!("- {}", reward_name(reward)));
                 }
-            }
-            // **One line per choice, never wrapped.** An id-only string
-            // ("item 1234 x1") never approaches the wrap width, and a
-            // clickable row needs to stay exactly one line so its
-            // rectangle -- from `row_rects`, the same function `List` uses
-            // -- lands on the row it names rather than on half of it.
+                let range = (!rewards.is_empty()).then_some((start, rewards.len()));
+                if *reward_money > 0 {
+                    lines.push(format!("- {}", super::trainer::money(*reward_money)));
+                }
+                range
+            };
             let choice_range = if reward_choices.is_empty() {
                 None
             } else {
@@ -254,7 +294,7 @@ fn body_lines_and_choice_range(
                 let start = lines.len();
                 for (index, choice) in reward_choices.iter().enumerate() {
                     let marker = if index == *selected_reward { ">" } else { " " };
-                    lines.push(format!("{marker} {choice}"));
+                    lines.push(format!("{marker} {}", reward_name(choice)));
                 }
                 Some((start, reward_choices.len()))
             };
@@ -268,7 +308,13 @@ fn body_lines_and_choice_range(
                 lines.push(String::new());
                 lines.push("You are not finished yet.".into());
             }
-            (lines, choice_range)
+            (
+                lines,
+                RewardRows {
+                    rewards: reward_range,
+                    choices: choice_range,
+                },
+            )
         }
     }
 }
@@ -382,7 +428,9 @@ pub fn click_at(
             // the buttons at the bottom, and the two never overlap, but a
             // reward still has to be pickable before the window has decided
             // whether `Complete` even has a label yet.
-            if let (_, Some((start, count))) = body_lines_and_choice_range(view, style, scale) {
+            if let (_, RewardRows { choices: Some((start, count)), .. }) =
+                body_lines_and_choice_range(view, style, scale)
+            {
                 if let Some(row) = row_rects(rect, start + count, style, scale)
                     .get(start..)
                     .and_then(|rows| rows.iter().position(|row| row.contains(point)))
@@ -406,6 +454,36 @@ pub fn click_at(
         }
     }
     click
+}
+
+/// Which reward item the pointer is over, if any -- an unconditional reward
+/// or a pick-one choice. The caller feeds the result to
+/// [`super::bags::hover_tooltip`], which is why this hands back a [`BagItem`]
+/// rather than an index: the tooltip is the one bag squares already use.
+pub fn reward_at<'v>(
+    rect: Rect,
+    view: &'v QuestgiverView,
+    style: &Style,
+    scale: f32,
+    point: Pos2,
+) -> Option<&'v BagItem> {
+    let QuestgiverView::Quest {
+        rewards,
+        reward_choices,
+        ..
+    } = view
+    else {
+        return None;
+    };
+    let (lines, ranges) = body_lines_and_choice_range(view, style, scale);
+    let rects = row_rects(rect, lines.len(), style, scale);
+    let hit = |range: Option<(usize, usize)>, items: &'v [BagItem]| {
+        let (start, count) = range?;
+        (0..count)
+            .find(|&i| rects.get(start + i).is_some_and(|r| r.contains(point)))
+            .and_then(|i| items.get(i))
+    };
+    hit(ranges.rewards, rewards).or_else(|| hit(ranges.choices, reward_choices))
 }
 
 /// Paints the window.
@@ -441,13 +519,29 @@ pub fn draw(painter: &Painter, rect: Rect, view: &QuestgiverView, style: &Style,
     let painter = painter.with_clip_rect(rect);
     let line = line_height(style, scale);
     let mut y = rect.min.y + pad + line;
-    for body in body_lines(view, style, scale) {
+    let (lines, ranges) = body_lines_and_choice_range(view, style, scale);
+    // A reward row is drawn in its item's quality colour, so a rare drop
+    // reads as one at a glance; everything else stays in the dim body shade.
+    let quality_at = |index: usize| -> Option<Color32> {
+        let QuestgiverView::Quest { rewards, reward_choices, .. } = view else {
+            return None;
+        };
+        let pick = |range: Option<(usize, usize)>, items: &[BagItem]| {
+            let (start, count) = range?;
+            (index >= start && index < start + count)
+                .then(|| items.get(index - start))
+                .flatten()
+                .map(|item| super::bags::quality_color(item.quality))
+        };
+        pick(ranges.rewards, rewards).or_else(|| pick(ranges.choices, reward_choices))
+    };
+    for (index, body) in lines.iter().enumerate() {
         painter.text(
             Pos2::new(rect.min.x + pad, y + line * 0.5),
             Align2::LEFT_CENTER,
             body,
             font.clone(),
-            dim,
+            quality_at(index).unwrap_or(dim),
         );
         y += line;
     }
@@ -489,6 +583,7 @@ pub fn placeholder() -> QuestgiverView {
             .into(),
         objectives: vec!["Speak with Marshal McBride.".into()],
         rewards: Vec::new(),
+        reward_money: 0,
         reward_choices: Vec::new(),
         selected_reward: 0,
         action: QuestgiverAction::Accept,
@@ -499,6 +594,14 @@ pub fn placeholder() -> QuestgiverView {
 mod tests {
     use super::*;
 
+    fn bag_item(name: &str, count: u32) -> BagItem {
+        BagItem {
+            name: name.into(),
+            count,
+            ..Default::default()
+        }
+    }
+
     fn quest(action: QuestgiverAction) -> QuestgiverView {
         QuestgiverView::Quest {
             id: 783,
@@ -506,6 +609,7 @@ mod tests {
             body: "Some text.".into(),
             objectives: vec!["Speak with Marshal McBride.".into()],
             rewards: Vec::new(),
+            reward_money: 0,
             reward_choices: Vec::new(),
             selected_reward: 0,
             action,
@@ -559,6 +663,7 @@ mod tests {
             body: String::new(),
             objectives: Vec::new(),
             rewards: Vec::new(),
+            reward_money: 0,
             reward_choices: Vec::new(),
             selected_reward: 0,
             action: QuestgiverAction::Waiting,
@@ -722,6 +827,7 @@ mod tests {
             body,
             objectives,
             rewards,
+            reward_money,
             action,
             ..
         } = quest(QuestgiverAction::Complete)
@@ -734,7 +840,8 @@ mod tests {
             body,
             objectives,
             rewards,
-            reward_choices: choices.iter().map(|s| s.to_string()).collect(),
+            reward_money,
+            reward_choices: choices.iter().map(|name| bag_item(name, 1)).collect(),
             selected_reward,
             action,
         }
@@ -749,9 +856,11 @@ mod tests {
     #[test]
     fn picking_a_reward_choice_reports_its_row_position() {
         let style = Style::default();
-        let view = quest_with_choices(&["item 159 x1", "item 2589 x1"], 0);
+        let view = quest_with_choices(&["Elwynn Longsword", "Ironforge Breastplate"], 0);
         let rect = Rect::from_min_size(Pos2::ZERO, size(&view, &style, 1.0));
-        let Some((start, count)) = body_lines_and_choice_range(&view, &style, 1.0).1 else {
+        let RewardRows { choices: Some((start, count)), .. } =
+            body_lines_and_choice_range(&view, &style, 1.0).1
+        else {
             panic!("expected a choice range");
         };
         assert_eq!(count, 2);
@@ -779,7 +888,7 @@ mod tests {
     fn no_choices_means_no_picker() {
         let style = Style::default();
         let view = quest_with_choices(&[], 0);
-        assert_eq!(body_lines_and_choice_range(&view, &style, 1.0).1, None);
+        assert!(body_lines_and_choice_range(&view, &style, 1.0).1.choices.is_none());
         let lines = body_lines(&view, &style, 1.0).join(" ");
         assert!(!lines.contains("Choose one"), "{lines}");
     }
@@ -789,10 +898,64 @@ mod tests {
     #[test]
     fn only_the_selected_reward_is_marked() {
         let style = Style::default();
-        let view = quest_with_choices(&["item 159 x1", "item 2589 x1"], 1);
+        let view = quest_with_choices(&["Elwynn Longsword", "Ironforge Breastplate"], 1);
         let lines = body_lines(&view, &style, 1.0);
         let marked: Vec<_> = lines.iter().filter(|line| line.starts_with('>')).collect();
         assert_eq!(marked.len(), 1, "{lines:?}");
-        assert!(marked[0].contains("item 2589 x1"), "{marked:?}");
+        assert!(marked[0].contains("Ironforge Breastplate"), "{marked:?}");
+    }
+
+    /// **The bug this milestone is about**: a reward drew as `item 2224` with
+    /// nothing on hover. The line now carries the resolved name, and
+    /// `reward_at` maps the row back to its `BagItem` so the caller can raise
+    /// the same tooltip a bag square gets -- for an unconditional reward and
+    /// for a pick-one choice alike.
+    #[test]
+    fn a_reward_row_shows_its_name_and_is_hoverable() {
+        let style = Style::default();
+        let QuestgiverView::Quest {
+            id, title, body, objectives, action, ..
+        } = quest(QuestgiverAction::Complete) else {
+            unreachable!()
+        };
+        let view = QuestgiverView::Quest {
+            id,
+            title,
+            body,
+            objectives,
+            rewards: vec![bag_item("Worn Shortsword", 1), bag_item("Minor Healing Potion", 5)],
+            reward_money: 12_345,
+            reward_choices: vec![bag_item("Recruit's Shirt", 1)],
+            selected_reward: 0,
+            action,
+        };
+        let rect = Rect::from_min_size(Pos2::ZERO, size(&view, &style, 1.0));
+
+        let joined = body_lines(&view, &style, 1.0).join("\n");
+        assert!(joined.contains("- Worn Shortsword"), "{joined}");
+        assert!(joined.contains("- Minor Healing Potion x5"), "{joined}");
+        // Money reads in coins, not a raw copper count.
+        assert!(joined.contains("1g 23s 45c"), "{joined}");
+
+        let (_, ranges) = body_lines_and_choice_range(&view, &style, 1.0);
+        let (rstart, rcount) = ranges.rewards.expect("reward rows");
+        assert_eq!(rcount, 2, "the money line is not a hoverable reward row");
+        let rows = row_rects(rect, body_lines(&view, &style, 1.0).len(), &style, 1.0);
+        assert_eq!(
+            reward_at(rect, &view, &style, 1.0, rows[rstart].center()).map(|i| i.name.as_str()),
+            Some("Worn Shortsword")
+        );
+        assert_eq!(
+            reward_at(rect, &view, &style, 1.0, rows[rstart + 1].center()).map(|i| i.name.as_str()),
+            Some("Minor Healing Potion")
+        );
+        // The money line sits right after the two item rows and is not one.
+        assert_eq!(reward_at(rect, &view, &style, 1.0, rows[rstart + 2].center()), None);
+
+        let (cstart, _) = ranges.choices.expect("choice rows");
+        assert_eq!(
+            reward_at(rect, &view, &style, 1.0, rows[cstart].center()).map(|i| i.name.as_str()),
+            Some("Recruit's Shirt")
+        );
     }
 }

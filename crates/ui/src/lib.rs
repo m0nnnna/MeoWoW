@@ -1778,6 +1778,21 @@ impl Hud {
                             );
                         }
                     }
+                    // Hovering a reward row explains what it is -- the same
+                    // gesture and the same tooltip a bag square gets, because
+                    // `reward_at` hands back the very `BagItem` the bag frame
+                    // draws.
+                    if let Some(pointer) = response.hover_pos() {
+                        if let Some(item) = frames::questgiver::reward_at(
+                            drawn_rect,
+                            view,
+                            &style,
+                            element.scale,
+                            pointer,
+                        ) {
+                            frames::bags::hover_tooltip(&response, item);
+                        }
+                    }
                 }
                 (false, Content::Tracker(view)) => {
                     if response.clicked() {
@@ -4778,7 +4793,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
             objectives: vec!["Speak with Marshal McBride.".into()],
-            rewards: vec!["item 2224 x1".into()],
+            rewards: vec![frames::questgiver::BagItem {
+                name: "Recruit's Shirt".into(),
+                count: 1,
+                ..Default::default()
+            }],
+            reward_money: 0,
             reward_choices: Vec::new(),
             selected_reward: 0,
             action: frames::QuestgiverAction::Accept,
@@ -4843,7 +4863,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
             objectives: vec!["Speak with Marshal McBride.".into()],
-            rewards: vec!["item 2224 x1".into()],
+            rewards: vec![frames::questgiver::BagItem {
+                name: "Recruit's Shirt".into(),
+                count: 1,
+                ..Default::default()
+            }],
+            reward_money: 0,
             reward_choices: Vec::new(),
             selected_reward: 0,
             action: frames::QuestgiverAction::Accept,
@@ -4974,6 +4999,7 @@ mod tests {
             body: "Speak with Marshal McBride.".into(),
             objectives: Vec::new(),
             rewards: Vec::new(),
+            reward_money: 0,
             reward_choices: Vec::new(),
             selected_reward: 0,
             action: frames::QuestgiverAction::Accept,
@@ -5022,6 +5048,7 @@ mod tests {
             body: "Speak with Marshal McBride.".into(),
             objectives: Vec::new(),
             rewards: Vec::new(),
+            reward_money: 0,
             reward_choices: Vec::new(),
             selected_reward: 0,
             action: frames::QuestgiverAction::Accept,

@@ -6025,9 +6025,16 @@ impl Questgiver {
         // line to click and a quest to take is not "nothing else to choose
         // between", and jumping straight to the quest would hide the lines
         // the player never got to read.
+        //
+        // Only a *change* of quest resets the reward pick -- a repeated
+        // identical greeting (the server re-sends one on any interaction)
+        // must not wipe a choice the player has already made.
         if self.options.is_empty() && self.offered.len() == 1 {
-            self.showing = self.offered.first().copied();
-            self.selected_reward = 0;
+            let only = self.offered.first().copied();
+            if self.showing != only {
+                self.showing = only;
+                self.selected_reward = 0;
+            }
         }
     }
 
@@ -6039,12 +6046,61 @@ impl Questgiver {
     }
 
     /// The server put one quest's scroll on screen without being asked.
+    ///
+    /// **Reached repeatedly for the same quest.** `SMSG_QUESTGIVER_OFFER_
+    /// REWARD` and `SMSG_QUESTGIVER_REQUEST_ITEMS` arrive again on every
+    /// re-query of the scroll while the window is open -- so the reward pick
+    /// is reset only when the quest actually *changes*, or clicking a second
+    /// reward snapped back to the first every frame.
     fn note_quest_offered(&mut self, quest: u32) {
         if !self.offered.contains(&quest) {
             self.offered.push(quest);
         }
-        self.showing = Some(quest);
-        self.selected_reward = 0;
+        if self.showing != Some(quest) {
+            self.showing = Some(quest);
+            self.selected_reward = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod questgiver_reward_tests {
+    use super::*;
+
+    fn giver() -> Questgiver {
+        Questgiver {
+            npc: 0x42,
+            name: "Test".into(),
+            offered: Vec::new(),
+            options: Vec::new(),
+            menu_id: 0,
+            showing: None,
+            selected_reward: 0,
+        }
+    }
+
+    /// **The reported bug: picking a second reward snapped back to the
+    /// first.** `SMSG_QUESTGIVER_OFFER_REWARD` arrives again on every
+    /// re-query of the scroll, so `note_quest_offered` ran every frame -- and
+    /// it used to reset `selected_reward` unconditionally.
+    #[test]
+    fn a_repeated_offer_of_the_same_quest_keeps_the_reward_pick() {
+        let mut g = giver();
+        g.note_quest_offered(333);
+        assert_eq!(g.showing, Some(333));
+
+        // The player clicks the third reward.
+        g.selected_reward = 2;
+
+        // The server volunteers the same reward screen twice more.
+        g.note_quest_offered(333);
+        g.note_quest_offered(333);
+        assert_eq!(g.selected_reward, 2, "the pick was wiped by a repeat offer");
+
+        // A *different* quest does reset it -- a stale pick is not a choice.
+        g.note_quest_offered(78);
+        assert_eq!(g.showing, Some(78));
+        assert_eq!(g.selected_reward, 0);
     }
 }
 
@@ -11492,6 +11548,7 @@ impl App {
                 body: String::new(),
                 objectives: Vec::new(),
                 rewards: Vec::new(),
+                reward_money: 0,
                 reward_choices: Vec::new(),
                 selected_reward: 0,
                 action: ui::QuestgiverAction::Waiting,
@@ -11523,24 +11580,26 @@ impl App {
             } else {
                 vec![quest.objectives_text.clone()]
             },
-            // **Ids, not names.** Item names need `CMSG_ITEM_QUERY_SINGLE`,
-            // which this client does not send yet (`foss-wow#56`), and a made
-            // up name would be a fabricated string on a reward screen. An id
-            // is checkable; a guess is not.
+            // Names resolved through the item cache -- the same
+            // `SMSG_ITEM_QUERY_SINGLE_RESPONSE` the bags read from, asked for
+            // in `pump_live_connection` as soon as a reward is on screen. A
+            // reward whose query has not answered yet still says `Item {id}`
+            // rather than an invented name, exactly as a fresh bag square
+            // does.
             rewards: quest
                 .reward_items
                 .iter()
-                .map(|reward| format!("item {} x{}", reward.item, reward.count))
-                .chain(
-                    (quest.money > 0).then(|| format!("{} copper", quest.money)),
-                )
+                .map(|reward| {
+                    Self::item_reward(self.live.as_ref(), &self.items, reward.item, reward.count)
+                })
                 .collect(),
-            // Same reasoning as `rewards`: ids, not names, until `foss-wow#56`
-            // sends `CMSG_ITEM_QUERY_SINGLE`.
+            reward_money: quest.money,
             reward_choices: quest
                 .reward_choices
                 .iter()
-                .map(|reward| format!("item {} x{}", reward.item, reward.count))
+                .map(|reward| {
+                    Self::item_reward(self.live.as_ref(), &self.items, reward.item, reward.count)
+                })
                 .collect(),
             // Clamped rather than trusted: `showing` resets this to `0`
             // whenever the quest changes, but a quest cache entry that
@@ -14062,7 +14121,6 @@ impl App {
             }
         }
 
-        let had_offer = !offered.is_empty();
         if let Some(questgiver) = self.questgiver.as_mut() {
             for gossip in &greetings {
                 questgiver.note_gossip(gossip);
@@ -14071,30 +14129,37 @@ impl App {
                 questgiver.note_quest_offered(quest);
             }
         }
-        // **Whatever a greeting or an unrequested offer just put on screen
-        // needs the same two requests a clicked list row gets.** `note_gossip`
-        // shows a menu of exactly one straight away, and `note_quest_offered`
-        // is the server volunteering a quest with nobody having asked -- both
-        // can set `showing` with no `CMSG_QUEST_QUERY` ever sent for it, which
-        // otherwise leaves the window saying "Asking the server..." forever:
-        // the only other place that sends it is the click handler for a
-        // multi-quest list. Gated on this frame actually having produced a
-        // greeting or an offer, so an open window does not resend the scroll
-        // request every frame while it waits.
-        if !greetings.is_empty() || had_offer {
-            if let Some(quest) = self.questgiver.as_ref().and_then(|g| g.showing) {
-                if let Some(npc) = self.questgiver.as_ref().map(|g| g.npc) {
-                    if let Err(e) = live.connection.query_quest(npc, quest) {
-                        tracing::warn!("asking for quest {quest}'s scroll failed: {e:#}");
-                    }
+        // **A fresh greeting is the one thing that needs the scroll request
+        // sent to the NPC.** `note_gossip` can show a single-quest menu
+        // straight away with no `CMSG_QUESTGIVER_QUERY_QUEST` ever sent, which
+        // otherwise leaves the window blank -- the only other place that
+        // sends it is the click handler for a multi-quest list.
+        //
+        // **It must NOT be re-sent in response to the offer it produced.**
+        // The reply to that query, for a completable quest, is another
+        // `SMSG_QUESTGIVER_OFFER_REWARD`, so a gate that also fired on "an
+        // offer arrived this frame" looped forever -- a query every frame,
+        // and `note_quest_offered` wiping the player's reward pick with it.
+        if !greetings.is_empty() {
+            if let (Some(quest), Some(npc)) = (
+                self.questgiver.as_ref().and_then(|g| g.showing),
+                self.questgiver.as_ref().map(|g| g.npc),
+            ) {
+                if let Err(e) = live.connection.query_quest(npc, quest) {
+                    tracing::warn!("asking for quest {quest}'s scroll failed: {e:#}");
                 }
-                for quest in self.quests.take_unknown(&[quest], 1) {
-                    if let Err(e) = live.connection.query_quest_info(quest) {
-                        tracing::warn!("asking what quest {quest} is failed: {e:#}");
-                        self.quests.give_up(quest);
-                    } else {
-                        self.quest_asked_at.insert(quest, Instant::now());
-                    }
+            }
+        }
+        // The quest's own text and rewards come from the cache, whichever way
+        // it got on screen. `take_unknown` asks once and remembers, so this
+        // is safe to run every frame the window is open.
+        if let Some(quest) = self.questgiver.as_ref().and_then(|g| g.showing) {
+            for quest in self.quests.take_unknown(&[quest], 1) {
+                if let Err(e) = live.connection.query_quest_info(quest) {
+                    tracing::warn!("asking what quest {quest} is failed: {e:#}");
+                    self.quests.give_up(quest);
+                } else {
+                    self.quest_asked_at.insert(quest, Instant::now());
                 }
             }
         }
@@ -14158,6 +14223,17 @@ impl App {
         // it at all. Asked for as soon as the quest is in the log instead.
         if let Some(player) = live.state.get(live.guid) {
             looted.extend(self.quests.item_objective_entries(&player.quest_log_ids()));
+        }
+        // A quest reward on the open questgiver window is the same case: it
+        // names an item this character does not carry, so nothing the bag
+        // walk sees knows what it is called -- and it drew as `Item {id}`
+        // until this asked. Only the quest currently on screen, and only
+        // while a window is open.
+        if let Some(quest) = self.questgiver.as_ref().and_then(|giver| giver.showing) {
+            if let ::world::Answer::Known(info) = self.quests.answer(quest) {
+                looted.extend(info.reward_items.iter().map(|reward| reward.item));
+                looted.extend(info.reward_choices.iter().map(|reward| reward.item));
+            }
         }
         let own_guid = live.guid;
         let asking = hud::items_to_ask(&mut live.state, own_guid, &looted, ITEMS_PER_FRAME);
@@ -15526,9 +15602,10 @@ impl App {
             orientation: live.orientation,
         });
         // **The title comes from the cache or the marker says a number.**
-        // A reward already reads `item 2224 x1` on this principle: a made
-        // -up name cannot be checked and would be believed, where an id
-        // is checkable and visibly unfinished.
+        // A quest reward follows the same principle: it reads `Item 2224`
+        // until `SMSG_ITEM_QUERY_SINGLE_RESPONSE` answers, never an invented
+        // name -- a made-up name cannot be checked and would be believed,
+        // where an id is checkable and visibly unfinished.
         let log: Vec<u32> = self
             .live
             .as_ref()
