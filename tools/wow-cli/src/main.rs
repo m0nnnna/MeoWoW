@@ -9254,7 +9254,9 @@ fn pick_realm<'a>(realms: &'a [auth::Realm], wanted: Option<&str>) -> Result<&'a
 fn adt_cmd(chain: &mut Chain, cmd: AdtCommand) -> Result<()> {
     match cmd {
         AdtCommand::Map { map } => adt_map(chain, &map),
-        AdtCommand::Tile { map, x, y, limit } => adt_tile(chain, &map, x, y, limit),
+        AdtCommand::Tile { map, x, y, limit, near } => {
+            adt_tile(chain, &map, x, y, limit, near.as_deref())
+        }
         AdtCommand::Survey { map, limit } => adt_survey(chain, map.as_deref(), limit),
         AdtCommand::Height { map, x, y } => adt_height(chain, &map, x, y),
         AdtCommand::Liquid { map, limit } => adt_liquid(chain, map.as_deref(), limit),
@@ -9349,7 +9351,14 @@ fn adt_map(chain: &mut Chain, map: &str) -> Result<()> {
     Ok(())
 }
 
-fn adt_tile(chain: &mut Chain, map: &str, x: usize, y: usize, limit: usize) -> Result<()> {
+fn adt_tile(
+    chain: &mut Chain,
+    map: &str,
+    x: usize,
+    y: usize,
+    limit: usize,
+    near: Option<&str>,
+) -> Result<()> {
     let wdt = load_wdt(chain, map)?;
     let path = adt::tile_path(map, x, y);
     let bytes = chain.read(&path).with_context(|| format!("reading {path}"))?;
@@ -9408,6 +9417,26 @@ fn adt_tile(chain: &mut Chain, map: &str, x: usize, y: usize, limit: usize) -> R
                 "    {} at [{:.0} {:.0} {:.0}] set {}",
                 o.path, o.position[0], o.position[1], o.position[2], o.doodad_set
             );
+        }
+    }
+
+    println!("\n  doodad models ({}):", tile.doodad_models.len());
+    for m in &tile.doodad_models {
+        println!("    {m}");
+    }
+
+    if let Some(near) = near {
+        let want: Vec<f32> = near.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let [wx, wy, wz] = want[..] else {
+            anyhow::bail!("--near wants three comma-separated numbers, `x,y,z`");
+        };
+        println!("\n  doodad placements within 60u of [{wx} {wy} {wz}]:");
+        for d in &tile.doodads {
+            let [px, py, pz] = d.position;
+            let dist = ((px - wx).powi(2) + (py - wy).powi(2) + (pz - wz).powi(2)).sqrt();
+            if dist <= 60.0 {
+                println!("    {dist:.0}u  {} at [{px:.0} {py:.0} {pz:.0}]", d.path);
+            }
         }
     }
     Ok(())

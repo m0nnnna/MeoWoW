@@ -327,6 +327,12 @@ struct Args {
     #[arg(long)]
     pitch: Option<f32>,
 
+    /// Place the streaming fly camera at this world position, `x,y,z`, instead
+    /// of the tile's spawn point. For aiming a headless screenshot at one
+    /// doodad without a live session.
+    #[arg(long)]
+    eye: Option<String>,
+
     /// Orbit the scene instead of flying through it. Worlds default to flying.
     #[arg(long)]
     orbit: bool,
@@ -1732,8 +1738,15 @@ fn face_focus_from(eye: glam::Vec3, focus: glam::Vec3) -> (f32, f32) {
 /// Places the camera over a streaming world's starting tile.
 fn streaming_camera(world: &world::World, chain: &mut Chain, args: &Args) -> Result<Camera> {
     let tile = parse_tile(&args.tile)?;
+    let eye = args.eye.as_deref().and_then(|s| {
+        let n: Vec<f32> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        match n[..] {
+            [x, y, z] => Some(glam::Vec3::new(x, y, z)),
+            _ => None,
+        }
+    });
     let mut fly = Fly {
-        position: world.spawn_above(chain, (tile.0 as i32, tile.1 as i32)),
+        position: eye.unwrap_or_else(|| world.spawn_above(chain, (tile.0 as i32, tile.1 as i32))),
         pitch: -0.45,
         speed: 120.0,
         ..Default::default()
@@ -2426,36 +2439,46 @@ fn draw_scene(
                 pass.set_vertex_buffer(1, instances.buffer.slice(..));
             }
 
-            for (item, binds) in items.iter().zip(world_binds) {
-                if let Some(item_bones) = item
-                    .animation
-                    .as_ref()
-                    .map(|animation| &animation.buffer)
-                    .or(bones)
-                {
-                    pass.set_bind_group(2, &item_bones.bind_group, &[]);
-                }
-                pass.set_vertex_buffer(0, item.mesh.vertices.slice(..));
-                pass.set_index_buffer(item.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                let instances =
-                    item.instance_start..item.instance_start + item.instance_count;
-                for (draw_index, draw) in item.draws.iter().enumerate() {
-                    let (Some(pipeline), Some(bind)) =
-                        (meshes.get(draw.state), binds.get(draw.texture))
-                    else {
-                        continue;
-                    };
-                    let Some(texture_bind) = item.texture_animation.bind(draw_index) else {
-                        continue;
-                    };
-                    pass.set_pipeline(pipeline);
-                    pass.set_bind_group(1, bind, &[]);
-                    pass.set_bind_group(3, texture_bind, &[]);
-                    pass.draw_indexed(
-                        draw.first_index..draw.first_index + draw.index_count,
-                        0,
-                        instances.clone(),
-                    );
+            // Opaque and alpha-tested first, then everything that blends --
+            // across items, not just within one. A blended submesh (a
+            // fountain's water curtain, a torch glow) drawn mid-list is painted
+            // over by any opaque geometry from a later item; the same split the
+            // streaming path makes. `pass` = draw, `!pass` = collect for later.
+            for pass_transparent in [false, true] {
+                for (item, binds) in items.iter().zip(world_binds) {
+                    if let Some(item_bones) = item
+                        .animation
+                        .as_ref()
+                        .map(|animation| &animation.buffer)
+                        .or(bones)
+                    {
+                        pass.set_bind_group(2, &item_bones.bind_group, &[]);
+                    }
+                    pass.set_vertex_buffer(0, item.mesh.vertices.slice(..));
+                    pass.set_index_buffer(item.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    let instances =
+                        item.instance_start..item.instance_start + item.instance_count;
+                    for (draw_index, draw) in item.draws.iter().enumerate() {
+                        if draw.state.blend.is_transparent() != pass_transparent {
+                            continue;
+                        }
+                        let (Some(pipeline), Some(bind)) =
+                            (meshes.get(draw.state), binds.get(draw.texture))
+                        else {
+                            continue;
+                        };
+                        let Some(texture_bind) = item.texture_animation.bind(draw_index) else {
+                            continue;
+                        };
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(1, bind, &[]);
+                        pass.set_bind_group(3, texture_bind, &[]);
+                        pass.draw_indexed(
+                            draw.first_index..draw.first_index + draw.index_count,
+                            0,
+                            instances.clone(),
+                        );
+                    }
                 }
             }
 
@@ -2787,6 +2810,45 @@ fn draw_liquid<'a>(
     }
 }
 
+/// Issues one draw for a world group's submesh. Shared by the opaque pass and
+/// the deferred transparent pass so the two cannot drift; the caller has
+/// already bound this group's bones, vertex and index buffers.
+fn draw_world_geometry(
+    pass: &mut wgpu::RenderPass<'_>,
+    meshes: &MeshRenderer,
+    group: &crate::world::Group,
+    draw_index: usize,
+    draw: &crate::model::Draw,
+    profile: &mut FrameProfile,
+) {
+    // **The group's override, not the material's own state**, and only where
+    // one was asked for. A tint with alpha under one is invisible through an
+    // opaque pipeline -- the blend has to be switched on for the number to
+    // mean anything -- so the two travel together. See `world::Group::translucent`.
+    let state = if group.translucent {
+        crate::world::translucent(draw.state)
+    } else {
+        draw.state
+    };
+    let (Some(pipeline), Some(bind), Some(texture_bind)) = (
+        meshes.get(state),
+        group.model.binds.get(draw.texture),
+        group.model.texture_animation.bind(draw_index),
+    ) else {
+        return;
+    };
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(1, bind, &[]);
+    pass.set_bind_group(3, texture_bind, &[]);
+    profile.model_draws += 1;
+    profile.triangles += (draw.index_count / 3) * group.count;
+    pass.draw_indexed(
+        draw.first_index..draw.first_index + draw.index_count,
+        0,
+        0..group.count,
+    );
+}
+
 /// Draws a streaming world: terrain first, then the instanced objects on it.
 #[allow(clippy::too_many_arguments)]
 fn draw_streaming(
@@ -3075,6 +3137,15 @@ fn draw_streaming(
     // differs. Tile M2s and replicated entities can each carry an animated
     // bone buffer, so bind group 2 is chosen fresh per group instead of once
     // for the whole pass.
+    // **Opaque first, then everything that blends -- across groups, not just
+    // within one.** A model's own draws are already ordered opaque-before-
+    // transparent, but the groups themselves are only path-sorted, so a
+    // transparent submesh in one doodad (a fountain's water curtain, a torch's
+    // glow) would be painted over by any opaque geometry drawn from a
+    // later-sorted group -- the abbey wall behind the Northshire fountain ate
+    // its stream this way. Transparent draws are collected here and issued
+    // after the loop, still before the liquid.
+    let mut deferred: Vec<(&crate::world::Group, usize)> = Vec::new();
     for group in world.tiles().flat_map(|t| t.groups.iter()).chain(world.entities()) {
         {
             profile.groups += 1;
@@ -3119,36 +3190,41 @@ fn draw_streaming(
                     profile.culled_draws += 1;
                     continue;
                 }
-                // **The group's override, not the material's own state**, and
-                // only where one was asked for. A tint with alpha under one is
-                // invisible through an opaque pipeline -- the blend has to be
-                // switched on for the number to mean anything -- so the two
-                // travel together. See `world::Group::translucent`.
-                let state = if group.translucent {
-                    crate::world::translucent(draw.state)
-                } else {
-                    draw.state
-                };
-                let (Some(pipeline), Some(bind), Some(texture_bind)) = (
-                    meshes.get(state),
-                    group.model.binds.get(draw.texture),
-                    group.model.texture_animation.bind(draw_index),
-                )
-                else {
+                if draw.state.blend.is_transparent() {
+                    deferred.push((group, draw_index));
                     continue;
-                };
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(1, bind, &[]);
-                pass.set_bind_group(3, texture_bind, &[]);
-                profile.model_draws += 1;
-                profile.triangles += (draw.index_count / 3) * group.count;
-                pass.draw_indexed(
-                    draw.first_index..draw.first_index + draw.index_count,
-                    0,
-                    0..group.count,
+                }
+                draw_world_geometry(
+                    &mut pass, meshes, group, draw_index, draw, profile,
                 );
             }
         }
+    }
+    for &(group, draw_index) in &deferred {
+        let group_bones = group
+            .animation
+            .and_then(|key| world.entity_bone_buffer(key))
+            .or_else(|| {
+                group
+                    .map_animation
+                    .as_deref()
+                    .and_then(|key| world.map_bone_buffer(key))
+            })
+            .or(bones);
+        if let Some(group_bones) = group_bones {
+            pass.set_bind_group(2, &group_bones.bind_group, &[]);
+        }
+        pass.set_vertex_buffer(0, group.model.mesh.vertices.slice(..));
+        pass.set_vertex_buffer(1, group.instances.buffer.slice(..));
+        pass.set_index_buffer(group.model.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        draw_world_geometry(
+            &mut pass,
+            meshes,
+            group,
+            draw_index,
+            &group.model.draws[draw_index],
+            profile,
+        );
     }
 
     // **After everything opaque and before the weather.** Liquid blends, so
