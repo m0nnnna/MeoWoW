@@ -4519,6 +4519,18 @@ struct App {
     /// true. A guid that is in it now and was not before has just noticed
     /// somebody.
     attackers: std::collections::HashSet<u64>,
+    /// When each unit last let out a *repeating* combat vocalisation -- a
+    /// wound grunt or an attack effort.
+    ///
+    /// Melee resolves faster than a grunt clip is long, and a fight against
+    /// two or three creatures pushed one of these per landed blow: the same
+    /// half-second grunt started five times in a second, overlapping itself
+    /// into a wall of noise. The original throttles a creature's own voice
+    /// hard, so this holds each unit to one repeating cry per
+    /// [`COMBAT_VOICE_COOLDOWN`]. One-shot cries -- a death yelp, a
+    /// just-noticed-you snarl -- are not gated: they happen once and want to
+    /// be heard.
+    last_combat_voice: std::collections::HashMap<u64, Instant>,
     sound_enabled: bool,
     music_enabled: bool,
     audio: Option<rodio::OutputStream>,
@@ -4680,9 +4692,33 @@ struct App {
 enum Looting {
     /// Sent, and no answer yet. Releasing now would close a corpse that was
     /// never opened, which is what the first version of this did every frame.
-    Asked(u64),
+    ///
+    /// `since` bounds the wait. A corpse the server finds empty answers with a
+    /// release, but a **game object** that opens onto nothing -- an
+    /// already-emptied gather node, a lock this character cannot pick that the
+    /// server declines without a `SMSG_CAST_FAILED` -- answers with no packet
+    /// at all, and without a deadline this would wait for that answer for the
+    /// rest of the session. `object` records which of the two this was: a
+    /// corpse needs no notice when the wait ends, a game object does, because
+    /// nothing else on screen told the player the click did anything.
+    ///
+    /// **`cast_ms` is why the deadline is not a constant.** Opening a game
+    /// object is a real cast whose length the server sets and sends in
+    /// `SMSG_SPELL_START` -- a second for a simple chest, several for a slow
+    /// gather -- and the loot only arrives once that cast finishes. A fixed
+    /// client timeout short enough to catch a dead request is also short
+    /// enough to abort a legitimate slow open, so the wait is the server's own
+    /// cast time plus a round-trip grace, and never runs while a cast for this
+    /// character is still in flight. `0` until a `SMSG_SPELL_START` for the
+    /// open has been seen (an instant cast, or a realm that sends none).
+    Asked {
+        guid: u64,
+        since: Instant,
+        object: bool,
+        cast_ms: u32,
+    },
     /// The server answered with something, so a window is showing. When it
-    /// stops showing, this is the corpse to release.
+    /// stops showing, this is the guid to release.
     Open(u64),
 }
 
@@ -5269,6 +5305,29 @@ mod jump_landing_tests {
                     "landed at {z}, above the arc's own apex {apex}"
                 );
             }
+        }
+    }
+}
+
+/// Whether `guid` may let out a *repeating* combat cry now -- a wound grunt
+/// or an attack effort -- updating its timer when it may. See
+/// [`App::last_combat_voice`] for the machine-gun-grunt this bounds.
+///
+/// A free function rather than a method so it takes the one field it touches:
+/// the swing loop holds `self.live` borrowed, and a `&mut self` method could
+/// not be called from inside it.
+fn combat_voice_ok(seen: &mut std::collections::HashMap<u64, Instant>, guid: u64) -> bool {
+    /// One repeating combat vocalisation per unit per this long. Roughly a
+    /// melee swing timer -- long enough that a grunt clip finishes before the
+    /// same creature is allowed another, short enough that a drawn-out fight
+    /// still has the odd cry in it.
+    const COMBAT_VOICE_COOLDOWN: Duration = Duration::from_millis(1800);
+    let now = Instant::now();
+    match seen.get(&guid) {
+        Some(last) if now.duration_since(*last) < COMBAT_VOICE_COOLDOWN => false,
+        _ => {
+            seen.insert(guid, now);
+            true
         }
     }
 }
@@ -6342,21 +6401,25 @@ impl App {
             // answer to one of its questions, and making somebody retype what
             // they just passed on the command line would be absurd.
             if let Some(host) = &args.realm_host {
-                signin.screen.settings.server = if args.realm_port == auth::client::DEFAULT_PORT {
-                    host.clone()
-                } else {
-                    format!("{host}:{}", args.realm_port)
-                };
+                signin.screen.settings.account_mut().server =
+                    if args.realm_port == auth::client::DEFAULT_PORT {
+                        host.clone()
+                    } else {
+                        format!("{host}:{}", args.realm_port)
+                    };
             }
             if let Some(user) = &args.user {
-                signin.screen.settings.account = user.clone();
+                signin.screen.settings.account_mut().name = user.clone();
             }
             if let Some(realm) = &args.realm {
-                signin.screen.settings.realm = Some(realm.clone());
+                signin.screen.settings.account_mut().realm = Some(realm.clone());
             }
             if let Some(character) = &args.character {
-                signin.screen.settings.character = Some(character.clone());
+                signin.screen.settings.account_mut().character = Some(character.clone());
             }
+            // The overrides above may have named a different account than the
+            // one `SignIn::new` prefilled a saved password for.
+            signin.reload_saved_password();
             if chain.archives().next().is_none() {
                 if let Some(data) = signin.screen.settings.data.clone() {
                     match open_data(&data, &signin.screen.settings.locale) {
@@ -6510,6 +6573,7 @@ impl App {
             pending_sounds: Vec::new(),
             impact_delay_ms,
             attackers: std::collections::HashSet::new(),
+            last_combat_voice: std::collections::HashMap::new(),
             sound_enabled: true,
             music_enabled: true,
             // Opened once, here, rather than on the first sound: enumerating
@@ -11476,6 +11540,21 @@ impl App {
             return;
         }
         tracing::info!("opening game object {guid:#018x}");
+        // **The cast is the request; the loot window is its answer, and it
+        // arrives unsolicited.** A chest is opened by `Spell::EffectOpenLock ->
+        // Spell::SendLoot`, which pushes `SMSG_LOOT_RESPONSE` with no
+        // `CMSG_LOOT` behind it -- so without a pending state here the
+        // `Asked -> Open -> release` machine never engages for a game object,
+        // the window that draws has no owner, and `CMSG_LOOT_RELEASE` is never
+        // sent. Every object opened that way then stays locked to this client
+        // on the server. `object: true` also lets the wait end with a visible
+        // "nothing there" when the open produced no loot and no failure packet.
+        self.looting = Some(Looting::Asked {
+            guid,
+            since: Instant::now(),
+            object: true,
+            cast_ms: 0,
+        });
     }
 
     /// What the questgiver window should be showing, or `None` when no
@@ -12473,7 +12552,12 @@ impl App {
             tracing::warn!("could not open loot: {e:#}");
             return;
         }
-        self.looting = Some(Looting::Asked(guid));
+        self.looting = Some(Looting::Asked {
+            guid,
+            since: Instant::now(),
+            object: false,
+            cast_ms: 0,
+        });
         tracing::debug!("asked to loot {guid:#x}");
     }
 
@@ -13192,6 +13276,20 @@ impl App {
                     // back towards wherever the character was before being
                     // moved.
                     self.ground_base = Some(live.position.z);
+                    // **Every local motion state dies with the teleport**, the
+                    // same reset a flight takeoff does and for the same
+                    // reason: the jump/fall arc *owns* `live.position.z` while
+                    // it runs, so a fall still in progress overwrites the
+                    // destination Z with its own the very next frame and the
+                    // client relays a position under the world. If the tiles
+                    // there have not streamed in, that fall never finds ground
+                    // to land on, so it never clears -- and the server answers
+                    // every heartbeat with another teleport. Seen live as a
+                    // ghost "falling out of the world": `MSG_MOVE_TELEPORT_ACK`
+                    // ten times a second, terrain gone, the character stuck.
+                    self.jump = None;
+                    self.swimming = None;
+                    self.flight = None;
                 }
                 match live::answer_worldport(&mut self.chain, live) {
                     Ok(true) => {
@@ -13204,8 +13302,13 @@ impl App {
                             live.position.z
                         );
                         // Same reason as `answer_teleport` just above: a new
-                        // map means an unrelated old base otherwise.
+                        // map means an unrelated old base otherwise, and a
+                        // fall or swim arc carried across a map change fights
+                        // the destination for the altitude just the same.
                         self.ground_base = Some(live.position.z);
+                        self.jump = None;
+                        self.swimming = None;
+                        self.flight = None;
                     }
                     Ok(false) => {}
                     Err(e) => tracing::warn!("world-port acknowledgement failed: {e:#}"),
@@ -13315,6 +13418,56 @@ impl App {
                     );
                     tracing::debug!("cast refused -- {text}");
                     self.chat.push(Line::Chat(local_notice(text)));
+
+                    // A refused kneeling-open is the whole answer to a pending
+                    // game-object loot: this line is the feedback, so drop the
+                    // wait rather than let it run on and time out into a
+                    // second, vaguer "nothing to loot there".
+                    if failure.spell_id == ::world::spell::OPEN_LOCK_KNEELING
+                        && matches!(self.looting, Some(Looting::Asked { object: true, .. }))
+                    {
+                        self.looting = None;
+                    }
+                }
+
+                // **A game object's loot is taken on the spot, not shown in a
+                // window.** Picking grapes or opening a chest is one gesture,
+                // and the server can answer the loot and then close it -- the
+                // object despawns, or the last item is auto-removed -- inside
+                // this same drain, so `state.loot` is already back to `None`
+                // and the window would never have rendered. `report.loot_
+                // responses` carries the contents regardless, and every slot
+                // plus the money is claimed here. A corpse still gets its
+                // window: `object` is false for one, and looting a body is a
+                // thing a player picks through.
+                if matches!(self.looting, Some(Looting::Asked { object: true, .. })) {
+                    for loot in &report.loot_responses {
+                        for item in &loot.items {
+                            if let Err(e) = live.connection.loot_item(item.slot) {
+                                tracing::warn!("auto-loot slot {} failed: {e:#}", item.slot);
+                            }
+                        }
+                        if loot.money > 0 {
+                            if let Err(e) = live.connection.loot_money() {
+                                tracing::warn!("auto-loot money failed: {e:#}");
+                            }
+                        }
+                        tracing::info!(
+                            "auto-looted game object {:#018x}: {} item(s), {} money",
+                            loot.guid,
+                            loot.items.len(),
+                            loot.money
+                        );
+                        self.chat.push(Line::Chat(local_notice("Picked it up.".into())));
+                    }
+                    if !report.loot_responses.is_empty() {
+                        self.looting = None;
+                        // The window is never wanted for this: clear the state
+                        // now so the `(None, true)` arm in `build_ui` does not
+                        // flash it open for the frame between the response and
+                        // the `SMSG_LOOT_REMOVED`s that answer these requests.
+                        live.state.loot = None;
+                    }
                 }
                 // A cast's own sound, keyed by spell id rather than by
                 // caster or weapon the way combat sounds are -- most spells
@@ -13324,6 +13477,18 @@ impl App {
                 for start in &report.cast_starts {
                     if let Some(id) = self.sounds.spell_cast(start.spell_id) {
                         self.pending_sounds.push((id, false));
+                    }
+                    // The server has now said how long this open takes. Carry
+                    // it onto the pending loot so the wait for the window is
+                    // that length plus a grace, not a client guess -- a slow
+                    // gather is several seconds and a fixed timeout would
+                    // abort it. `since` stays put: the loot lands a round trip
+                    // after the cast *ends*, so the whole span is measured
+                    // from the request.
+                    if start.spell_id == ::world::spell::OPEN_LOCK_KNEELING {
+                        if let Some(Looting::Asked { cast_ms, .. }) = &mut self.looting {
+                            *cast_ms = start.cast_time_ms;
+                        }
                     }
                 }
                 for go in &report.cast_landings {
@@ -13501,7 +13666,12 @@ impl App {
                             {
                                 // A creature's swing is a vocal effort, not an
                                 // impact -- it happens as the blow starts.
-                                self.pending_sounds.push((id, false));
+                                // Held to one cry per swing timer so a fight
+                                // with two or three of them is not a wall of
+                                // overlapping grunts.
+                                if combat_voice_ok(&mut self.last_combat_voice, swing.attacker) {
+                                    self.pending_sounds.push((id, false));
+                                }
                             }
                         }
                     }
@@ -13522,10 +13692,17 @@ impl App {
                             };
                             // The victim's cry is a reaction to being hit,
                             // so it belongs at the moment of contact too.
-                            if let Some(id) = voice.get(which) {
+                            //
+                            // A death yelp always plays -- it happens once and
+                            // is the point of the whole exchange. A wound grunt
+                            // is the repeating one, so it waits its turn: a
+                            // creature struck four times in three seconds cries
+                            // once, not four times over itself.
+                            let gated = which == sound::Voice::Wound
+                                && !combat_voice_ok(&mut self.last_combat_voice, swing.victim);
+                            if let Some(id) = voice.get(which).filter(|_| !gated) {
                                 self.pending_sounds.push((id, true));
                             }
- 
                         }
                     }
                     self.chat.push(Line::Swing(swing.clone()));
@@ -16580,13 +16757,67 @@ impl App {
         // `Open` can be released. A client that never releases leaves the body
         // locked to it for everyone else on the realm, which is why this is
         // not simply left to the server.
-        let open = self
+        //
+        // **`(None, true)` is adopted, not ignored.** Loot can appear without
+        // this client having sent the request it answers -- a chest opened by
+        // the kneeling cast is looted server-side and the response is
+        // unsolicited, and a slow one can land after the wait below has timed
+        // out. Whatever put it there, the window still has to be released when
+        // it closes, so an untracked loot is taken over as `Open` keyed by the
+        // guid the response itself carries.
+        //
+        // **A wait that is never answered ends on its own.** An already-emptied
+        // node or a silently declined lock sends no window and no failure
+        // packet; without this the `Asked` sits forever and the next real loot
+        // request cannot tell it apart from its own pending state.
+        //
+        // The deadline is the server's own cast time for the open (`cast_ms`,
+        // from `SMSG_SPELL_START`) plus a round-trip grace, and it is
+        // suspended entirely while a cast for this character is still in
+        // flight. A flat constant here is wrong twice over: too long and a
+        // dead request hangs, too short and a legitimate slow gather is cut
+        // off mid-cast. `cast_ms` is `0` for a corpse and for an instant open,
+        // where the grace alone is the whole budget.
+        const LOOT_ANSWER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+        let loot_guid = self
             .live
             .as_ref()
-            .is_some_and(|live| live.state.loot.is_some());
+            .and_then(|live| live.state.loot.as_ref())
+            .map(|loot| loot.guid);
+        let open = loot_guid.is_some();
+        let still_casting = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.active_cast(live.guid, now))
+            .is_some();
         match (self.looting, open) {
-            (Some(Looting::Asked(guid)), true) => self.looting = Some(Looting::Open(guid)),
+            (Some(Looting::Asked { guid, .. }), true) => {
+                self.looting = Some(Looting::Open(guid))
+            }
+            (None, true) => {
+                if let Some(guid) = loot_guid {
+                    self.looting = Some(Looting::Open(guid));
+                }
+            }
             (Some(Looting::Open(_)), false) => self.release_loot(),
+            (Some(Looting::Asked { guid, since, object, cast_ms }), false)
+                if !still_casting
+                    && now.saturating_duration_since(since)
+                        >= std::time::Duration::from_millis(cast_ms as u64) + LOOT_ANSWER_GRACE =>
+            {
+                // A corpse the server found empty released itself and needs no
+                // line; a game object that opened nothing has to say so,
+                // because the kneel was the only thing the player saw.
+                tracing::info!(
+                    "loot wait for {guid:#018x} gave up after {:?} (cast {cast_ms}ms, object {object})",
+                    now.saturating_duration_since(since),
+                );
+                if object {
+                    self.chat
+                        .push(Line::Chat(local_notice("Nothing to loot there.".into())));
+                }
+                self.looting = None;
+            }
             _ => {}
         }
 

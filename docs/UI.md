@@ -553,14 +553,27 @@ correctly today. The panel says so, in as many words, under the character list.
 
 ### The password
 
-Never written to disk. Not as a setting, not obfuscated, not behind a "remember
-me": `login::Settings` has no field for it, and a test asserts on the
-*serialised text* rather than on the struct, because the struct not having the
-field is what a reviewer sees and the bytes are what a person's disk gets.
+Never written to `login.toml`. Not as a setting, not obfuscated: `login::
+Settings` has no field for it, and a test asserts on the *serialised text*
+rather than on the struct, because the struct not having the field is what a
+reviewer sees and the bytes are what a person's disk gets.
+
+**"Save password" is opt-in and does not change that.** When it is ticked the
+viewer -- not `crates/ui`, which reaches no keychain -- hands the secret to the
+operating system's credential store (Windows Credential Manager), keyed by the
+account and its server, and writes it only once the logon server has accepted
+it. Unticking it forgets what is stored. `crates/ui` carries the flag and the
+`Account::secret_key` the viewer keys on; `apps/viewer/src/signin.rs::secret`
+is the half that stores anything, and every call there is best-effort -- a
+machine with no usable keychain simply does not remember.
 
 Everything else is remembered in `%APPDATA%\open-wow\login.toml` -- a separate
 file from `ui.toml`, so swapping layouts with somebody does not swap which
-account you sign in as.
+account you sign in as. It holds a **list** of account+server profiles,
+most-recently-used first; the credentials panel picks between them with a
+dropdown on the account field, and "+ Add account" starts a blank one. A file
+written before the switcher -- one account as scalar keys -- is migrated in
+place on load, not rejected.
 
 ## Themes
 

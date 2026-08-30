@@ -1044,6 +1044,14 @@ enum Command {
         /// transcribed columns and has to be found by trying one live.
         #[arg(long, value_parser = parse_hex_guid)]
         cast_at_object: Option<u64>,
+        /// Cast `--cast`'s spell at the nearest replicated game object with
+        /// this `gameobject_template` entry, resolving the guid in the same
+        /// session it is used. On a live realm a guid printed by an earlier
+        /// `--objects` run has often been recycled by the time a second
+        /// session casts at it, which reads as `SPELL_FAILED_OUT_OF_RANGE`
+        /// from a character standing on top of the object.
+        #[arg(long)]
+        cast_at_nearest: Option<u32>,
         /// Whisper `--say` to this character instead of speaking aloud.
         ///
         /// The only chat with no range at all, which makes it the one that
@@ -1093,6 +1101,10 @@ enum AdtCommand {
         y: usize,
         #[arg(long, default_value_t = 8)]
         limit: usize,
+        /// List doodad placements within 60 units of this world position,
+        /// `x,y,z` -- for finding which model sits at a given spot.
+        #[arg(long)]
+        near: Option<String>,
     },
     /// Parse every tile of a map, checking that chunks meet at their edges.
     Survey {
@@ -1708,6 +1720,7 @@ fn main() -> Result<()> {
             cast_self,
             cancel_aura,
             cast_at_object,
+            cast_at_nearest,
             port,
             timeout,
         } => {
@@ -1810,6 +1823,7 @@ fn main() -> Result<()> {
                 cast_self: *cast_self,
                 cancel_aura: *cancel_aura,
                 cast_at_object: *cast_at_object,
+                cast_at_nearest: *cast_at_nearest,
                 host,
                 port: *port,
                 user,
@@ -2039,6 +2053,7 @@ struct WorldRequest<'a> {
     cast_self: bool,
     cancel_aura: Option<u32>,
     cast_at_object: Option<u64>,
+    cast_at_nearest: Option<u32>,
     locale: &'a str,
     timeout: u64,
     /// Only touched by `--visible-items`, which is a game-file question
@@ -2195,6 +2210,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         cast_self,
         cancel_aura,
         cast_at_object,
+        cast_at_nearest,
         locale,
         data,
         timeout,
@@ -2851,7 +2867,7 @@ nothing replicated matches {wanted:?}"),
             cancel_own_aura(&mut connection, &mut state, character.guid, spell_id)?;
         }
 
-        if let (Some(spell_id), None) = (cast, cast_at_object) {
+        if let (Some(spell_id), None, None) = (cast, cast_at_object, cast_at_nearest) {
             let target = if cast_self {
                 None
             } else {
@@ -2968,11 +2984,52 @@ cast {spell_id} at {} (attempt {attempt})",
         // server's own answer -- `SMSG_CAST_FAILED` naming a reason, or
         // silence plus a lootable state, which is what success looks like
         // for a spell nothing acknowledges directly.
-        if let (Some(spell_id), Some(guid)) = (cast, cast_at_object) {
+        // Resolve `--cast-at-nearest <entry>` to a live guid in this session,
+        // so the object is one the character is actually standing near rather
+        // than a guid a prior session printed and the realm has since reused.
+        let cast_target = cast_at_object.or_else(|| {
+            let entry = cast_at_nearest?;
+            let me = state.get(character.guid)?.position?;
+            let (guid, dist) = state
+                .game_objects()
+                .filter(|go| go.entry() == Some(entry))
+                .filter_map(|go| {
+                    let p = go.position?;
+                    Some((go.guid, (p.x - me.x).hypot(p.y - me.y)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))?;
+            println!("nearest game object of entry {entry}: {guid:#018x} at {dist:.1} units");
+            Some(guid)
+        });
+        if let (Some(spell_id), Some(guid)) = (cast, cast_target) {
             connection.set_selection(guid)?;
             connection.cast_spell_at_gameobject(spell_id, guid)?;
             println!("\ncast {spell_id} at game object {guid:#018x}");
             let batch = connection.drain(std::time::Duration::from_millis(900), 128)?;
+            if let Some(capture) = capture.as_mut() {
+                capture.record(&batch)?;
+            }
+            // The loot the open produced, in full -- an empty short form and a
+            // populated one are the whole question here, and `state.loot` is
+            // cleared again by the release that follows in the same batch.
+            for packet in &batch {
+                match packet.opcode {
+                    o if o == world::opcode::server::LOOT_RESPONSE => {
+                        println!("  SMSG_LOOT_RESPONSE ({} bytes): {}", packet.body.len(), hex_preview(&packet.body, 256));
+                        match world::loot::parse_loot_response(&packet.body) {
+                            Ok(loot) => println!(
+                                "    parsed: guid {:#018x}, loot_type {}, money {}, {} item(s), error {:?}",
+                                loot.guid, loot.loot_type, loot.money, loot.items.len(), loot.error
+                            ),
+                            Err(e) => println!("    parse failed: {e}"),
+                        }
+                    }
+                    o if o == world::opcode::server::LOOT_RELEASE_RESPONSE => {
+                        println!("  SMSG_LOOT_RELEASE_RESPONSE ({} bytes): {}", packet.body.len(), hex_preview(&packet.body, 256));
+                    }
+                    _ => {}
+                }
+            }
             let report = state.replicate(&batch, None);
             for start in &report.cast_starts {
                 println!(

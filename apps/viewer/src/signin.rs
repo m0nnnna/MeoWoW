@@ -21,6 +21,64 @@ use mpq::Chain;
 
 use crate::live;
 
+/// The operating system's credential store, used only for the "Save password"
+/// option on the sign-in screen.
+///
+/// **`ui::login` deliberately cannot reach this** -- that crate touches no
+/// files but its own settings, and a system keychain is further still. So the
+/// panel carries a `save_password` flag and the account+server it keys on, and
+/// this module is the half that actually stores the secret.
+///
+/// Every call is best-effort. A machine with no usable keychain -- a CI
+/// runner, a stripped container, a platform this build has no backend for --
+/// simply does not remember, which is the same outcome as leaving the box
+/// unticked. A failure is logged, never surfaced to the panel: "your password
+/// was not saved" is not something to interrupt a login for.
+mod secret {
+    /// The service name every entry is filed under in the store. The account
+    /// and server go in the *user* half of the key -- see `ui::Account::
+    /// secret_key`.
+    const SERVICE: &str = "open-wow";
+
+    fn entry(key: &str) -> Option<keyring::Entry> {
+        match keyring::Entry::new(SERVICE, key) {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                tracing::warn!("credential store unavailable: {e}");
+                None
+            }
+        }
+    }
+
+    /// The saved password for this account+server key, or `None` if there is
+    /// none or the store cannot be read.
+    pub fn load(key: &str) -> Option<String> {
+        match entry(key)?.get_password() {
+            Ok(password) => Some(password),
+            Err(keyring::Error::NoEntry) => None,
+            Err(e) => {
+                tracing::warn!("could not read a saved password: {e}");
+                None
+            }
+        }
+    }
+
+    pub fn store(key: &str, password: &str) {
+        let Some(entry) = entry(key) else { return };
+        if let Err(e) = entry.set_password(password) {
+            tracing::warn!("could not save the password: {e}");
+        }
+    }
+
+    pub fn forget(key: &str) {
+        let Some(entry) = entry(key) else { return };
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => tracing::warn!("could not clear a saved password: {e}"),
+        }
+    }
+}
+
 /// The account name and password on their way to a worker thread.
 ///
 /// Named so the password is passed as a field of something with a comment on
@@ -173,7 +231,7 @@ pub struct SignIn {
 
 impl SignIn {
     pub fn new() -> Self {
-        Self {
+        let mut this = Self {
             screen: ui::SignIn::new(),
             names: Names::default(),
             pending: None,
@@ -181,6 +239,25 @@ impl SignIn {
             realm: None,
             connection: None,
             characters: None,
+        };
+        this.reload_saved_password();
+        this
+    }
+
+    /// Fills the password field from the credential store, if the account the
+    /// form is showing has "Save password" set and something is stored for it.
+    /// A no-op otherwise -- including when nothing is stored, which leaves the
+    /// field empty rather than clearing what a caller may have just put there.
+    pub fn reload_saved_password(&mut self) {
+        let account = self.screen.settings.account();
+        if !account.save_password
+            || account.name.trim().is_empty()
+            || account.server.trim().is_empty()
+        {
+            return;
+        }
+        if let Some(password) = secret::load(&account.secret_key()) {
+            self.screen.password = password;
         }
     }
 
@@ -214,6 +291,16 @@ impl SignIn {
                 Outcome::Continue
             }
             ui::login::Action::Choose(index) => self.choose(index),
+            ui::login::Action::AccountChanged => {
+                // The panel has already cleared the password. Refill it from
+                // the store if this account kept one.
+                self.reload_saved_password();
+                Outcome::Continue
+            }
+            ui::login::Action::ForgetPassword => {
+                secret::forget(&self.screen.settings.account().secret_key());
+                Outcome::Continue
+            }
         }
     }
 
@@ -238,7 +325,7 @@ impl SignIn {
         let credentials = Credentials {
             host,
             port,
-            user: self.screen.settings.account.trim().to_string(),
+            user: self.screen.settings.account().name.trim().to_string(),
             password: std::mem::take(&mut self.screen.password),
             locale: self.screen.settings.locale.trim().to_string(),
         };
@@ -295,10 +382,10 @@ impl SignIn {
     fn open_realm(&mut self, realm: auth::Realm) {
         let Some(session) = &self.session else { return };
         let key = session.session_key;
-        let user = self.screen.settings.account.trim().to_string();
+        let user = self.screen.settings.account().name.trim().to_string();
         self.screen
             .working(format!("entering {}\u{2026}", realm.name));
-        self.screen.settings.realm = Some(realm.name.clone());
+        self.screen.settings.account_mut().realm = Some(realm.name.clone());
         self.screen.save();
         self.realm = Some(realm.clone());
 
@@ -333,7 +420,7 @@ impl SignIn {
             self.screen.failed("the realm connection was lost; sign in again");
             return Outcome::Continue;
         };
-        self.screen.settings.character = Some(character.name.clone());
+        self.screen.settings.account_mut().character = Some(character.name.clone());
         self.screen.save();
         self.screen
             .working(format!("entering the world as {}\u{2026}", character.name));
@@ -364,6 +451,20 @@ impl SignIn {
         self.pending = None;
         match done {
             Done::Authenticated(Ok(session)) => {
+                // The logon server has accepted the credentials, so this is
+                // the moment the account is worth remembering and -- if the
+                // box is ticked -- the password is worth writing. Ticking it
+                // over a typo does not reach here.
+                self.screen.remember_active();
+                let key = self.screen.settings.account().secret_key();
+                if self.screen.settings.account().save_password {
+                    if !self.screen.password.is_empty() {
+                        secret::store(&key, &self.screen.password);
+                    }
+                } else {
+                    secret::forget(&key);
+                }
+
                 let realms = session.realms.clone();
                 self.session = Some(session);
                 match realms.len() {

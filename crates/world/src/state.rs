@@ -1254,6 +1254,17 @@ pub struct Replication {
     /// [`Self::casts_landed`]: a stop for a fight this client never saw begin
     /// clears nothing and is not counted.
     pub attacks_stopped: usize,
+    /// Non-empty `SMSG_LOOT_RESPONSE`s that arrived this batch.
+    ///
+    /// Returned as an event *as well as* folded into [`WorldState::loot`],
+    /// because a game object opened by a spell can have its loot answered and
+    /// then closed -- `SMSG_LOOT_RELEASE_RESPONSE`, or the last item removed --
+    /// inside the same drain, which leaves `WorldState::loot` back at `None`
+    /// before any caller looks at it. A caller that only ever reads the state
+    /// then sees a chest that gave nothing; this is how it learns an item was
+    /// on the wire so it can take it. Empty responses are not listed -- there
+    /// is nothing to act on.
+    pub loot_responses: Vec<crate::loot::Loot>,
     /// Packets that would not decode, with their payload for offline analysis.
     pub failures: Vec<(u16, crate::protocol::Error, Result<Vec<u8>, crate::protocol::Error>)>,
 }
@@ -2611,6 +2622,7 @@ impl WorldState {
                             if loot.is_empty() {
                                 self.loot = None;
                             } else {
+                                report.loot_responses.push(loot.clone());
                                 self.loot = Some(loot);
                             }
                         }

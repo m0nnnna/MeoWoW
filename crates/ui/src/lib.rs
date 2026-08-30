@@ -58,7 +58,7 @@ pub use frames::{
     VendorRow, VendorView, XpBarView,
 };
 pub use layout::{default_path, CharacterBars, ElementId, Profile};
-pub use login::{CharacterRow, RealmRow, SignIn, Stage as SignInStage, Tone};
+pub use login::{Account, CharacterRow, RealmRow, SignIn, Stage as SignInStage, Tone};
 pub use style::{Color, PowerType, Style};
 pub use theme::Theme;
 

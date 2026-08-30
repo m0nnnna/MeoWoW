@@ -46,4 +46,5 @@ auth = { path = "../../crates/auth" }
 world = { path = "../../crates/world" }
 ui = { path = "../../crates/ui" }
 rfd.workspace = true
+keyring.workspace = true
 rodio = { version = "0.21.1", default-features = false, features = ["mp3", "playback", "symphonia-mp3", "symphonia-wav", "wav"] }

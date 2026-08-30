@@ -23,11 +23,15 @@
 //! and every one of those refusals is a *string* nobody here has verified.
 //! The original client does it correctly today. This one signs in.
 //!
-//! The password is **never written to disk**. Not as a setting, not
-//! obfuscated, not behind a "remember me" -- see [`Settings`], which has no
-//! field for it. Everything else about a sign-in is remembered, because
-//! retyping a server address every launch is the thing that makes a login
-//! screen worse than a command line.
+//! The password is **never written to `login.toml`**. When "Save password" is
+//! ticked the viewer hands the secret to the operating system's credential
+//! store -- Windows Credential Manager -- keyed by the account and its server;
+//! [`Settings`] and the file it serialises to still have no password field,
+//! obfuscated or otherwise, and the test `the_file_cannot_hold_a_password`
+//! keeps it that way. Everything else about a sign-in is remembered here,
+//! because retyping a server address every launch is the thing that makes a
+//! login screen worse than a command line -- and more than one account can be
+//! remembered now, as a list the credentials panel picks from.
 
 use std::path::PathBuf;
 
@@ -42,12 +46,80 @@ use crate::Error;
 /// suggest a port would be asking every user to know one.
 pub const DEFAULT_PORT: u16 = 3724;
 
+/// One remembered account: its name, the server it signs in to, and the last
+/// realm and character chosen on it. The switcher on the credentials panel is
+/// a list of these, and [`Settings::account`] holds the one the form is
+/// showing.
+///
+/// **`save_password` is a flag, not a password.** When it is set the viewer
+/// keeps the secret in the operating system's credential store, keyed by
+/// [`Self::secret_key`]. Nothing here is the password; see the module comment.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Account {
+    /// The account name. An empty one is the blank row a fresh install starts
+    /// with, and the row "Add account" creates.
+    pub name: String,
+    /// Host, or `host:port`. One field rather than two because that is how
+    /// people are given a realm -- and a port that is nearly always 3724 does
+    /// not deserve a permanent box on the screen.
+    pub server: String,
+    /// The realm last entered on this account, so a list of many preselects
+    /// the right one.
+    pub realm: Option<String>,
+    /// The character last played on it, likewise.
+    pub character: Option<String>,
+    /// Whether the viewer keeps this account's password in the OS credential
+    /// store between launches.
+    pub save_password: bool,
+}
+
+impl Default for Account {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            server: String::new(),
+            realm: None,
+            character: None,
+            save_password: false,
+        }
+    }
+}
+
+impl Account {
+    /// The name the OS credential store files this account's password under.
+    ///
+    /// Account **and** server, because the same account name against two
+    /// realms is two different logins with two different passwords.
+    pub fn secret_key(&self) -> String {
+        format!("{}@{}", self.name.trim(), self.server.trim())
+    }
+
+    /// Splits [`Self::server`] into a host and a port.
+    ///
+    /// A trailing `:` or a port that is not a number falls back to
+    /// [`DEFAULT_PORT`] rather than refusing: the overwhelmingly common input
+    /// is a bare hostname, and someone halfway through typing `:80` should not
+    /// see an error where the address is still being written.
+    pub fn address(&self) -> (String, u16) {
+        let server = self.server.trim();
+        match server.rsplit_once(':') {
+            Some((host, port)) => (
+                host.trim().to_string(),
+                port.trim().parse().unwrap_or(DEFAULT_PORT),
+            ),
+            None => (server.to_string(), DEFAULT_PORT),
+        }
+    }
+}
+
 /// What is remembered between launches.
 ///
-/// **No password field, and that is the design.** A client that stores one
-/// stores it in plain text on a machine other people may use, and "obfuscated"
-/// is plain text with an extra step. The account name is remembered, which is
-/// the half that is tedious and not a secret.
+/// **No password field, and that is the design.** A client that writes one to
+/// this file writes it in plain text on a machine other people may use, and
+/// "obfuscated" is plain text with an extra step. A saved password lives in
+/// the OS credential store instead; what is here is the account *names*, which
+/// are the half that is tedious and not a secret.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
@@ -56,18 +128,43 @@ pub struct Settings {
     /// settings panel opens itself.
     pub data: Option<PathBuf>,
     pub locale: String,
-    /// Host, or `host:port`. One field rather than two because that is how
-    /// people are given a realm -- and a port that is nearly always 3724 does
-    /// not deserve a permanent box on the screen.
-    pub server: String,
-    pub account: String,
-    /// The realm last entered, so a list of many preselects the right one.
-    pub realm: Option<String>,
-    /// The character last played, likewise.
-    pub character: Option<String>,
+    /// The remembered accounts, most-recently-used first. **Always at least
+    /// one** -- a fresh install has a single blank entry, which is the form as
+    /// it has always looked. Serialised as `[[account]]` tables.
+    #[serde(rename = "account")]
+    pub accounts: Vec<Account>,
+    /// Which entry of [`Self::accounts`] the form is showing. Clamped on load,
+    /// so a hand-edited file naming row nine of a three-row list still opens.
+    pub active: usize,
 }
 
 impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            data: None,
+            locale: "enUS".into(),
+            accounts: vec![Account::default()],
+            active: 0,
+        }
+    }
+}
+
+/// The pre-switcher shape of the file: one account, its server and its last
+/// realm and character as scalar keys. Read only when the current parser
+/// rejects a file, so an existing `login.toml` is migrated rather than
+/// reported as malformed.
+#[derive(serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LegacySettings {
+    data: Option<PathBuf>,
+    locale: String,
+    server: String,
+    account: String,
+    realm: Option<String>,
+    character: Option<String>,
+}
+
+impl Default for LegacySettings {
     fn default() -> Self {
         Self {
             data: None,
@@ -77,6 +174,45 @@ impl Default for Settings {
             realm: None,
             character: None,
         }
+    }
+}
+
+impl From<LegacySettings> for Settings {
+    fn from(old: LegacySettings) -> Self {
+        Settings {
+            data: old.data,
+            locale: old.locale,
+            accounts: vec![Account {
+                name: old.account,
+                server: old.server,
+                realm: old.realm,
+                character: old.character,
+                save_password: false,
+            }],
+            active: 0,
+        }
+    }
+}
+
+/// Parses a settings file's text, migrating the pre-switcher shape.
+///
+/// The current parser is tried first; only if it rejects the text is the old
+/// shape tried, and a file that is neither reports the *current* parser's
+/// error -- a genuinely malformed file should say what the format is now.
+fn parse_settings(text: &str) -> Result<Settings, Error> {
+    match toml::from_str::<Settings>(text) {
+        Ok(mut settings) => {
+            settings.normalize();
+            Ok(settings)
+        }
+        Err(current) => match toml::from_str::<LegacySettings>(text) {
+            Ok(legacy) => {
+                let mut settings = Settings::from(legacy);
+                settings.normalize();
+                Ok(settings)
+            }
+            Err(_) => Err(current.into()),
+        },
     }
 }
 
@@ -101,7 +237,7 @@ impl Settings {
     /// when it is not.
     pub fn load_from(path: &std::path::Path) -> Result<Settings, Error> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Ok(toml::from_str(&text)?),
+            Ok(text) => parse_settings(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
             Err(e) => Err(e.into()),
         }
@@ -115,21 +251,35 @@ impl Settings {
         Ok(())
     }
 
-    /// Splits [`Self::server`] into a host and a port.
-    ///
-    /// A trailing `:` or a port that is not a number falls back to
-    /// [`DEFAULT_PORT`] rather than refusing: the overwhelmingly common input
-    /// is a bare hostname, and someone halfway through typing `:80` should not
-    /// see an error where the address is still being written.
-    pub fn address(&self) -> (String, u16) {
-        let server = self.server.trim();
-        match server.rsplit_once(':') {
-            Some((host, port)) => (
-                host.trim().to_string(),
-                port.trim().parse().unwrap_or(DEFAULT_PORT),
-            ),
-            None => (server.to_string(), DEFAULT_PORT),
+    /// Guarantees the one invariant every accessor here relies on: at least
+    /// one account, and [`Self::active`] in range.
+    fn normalize(&mut self) {
+        if self.accounts.is_empty() {
+            self.accounts.push(Account::default());
         }
+        if self.active >= self.accounts.len() {
+            self.active = 0;
+        }
+    }
+
+    /// The account the form is showing.
+    pub fn account(&self) -> &Account {
+        let i = self.active.min(self.accounts.len().saturating_sub(1));
+        &self.accounts[i]
+    }
+
+    /// The account the form is showing, for editing. Also pins [`Self::active`]
+    /// back in range, so a caller that mutates through this cannot then read a
+    /// different row through [`Self::account`].
+    pub fn account_mut(&mut self) -> &mut Account {
+        self.normalize();
+        let i = self.active;
+        &mut self.accounts[i]
+    }
+
+    /// The address of the account the form is showing.
+    pub fn address(&self) -> (String, u16) {
+        self.account().address()
     }
 }
 
@@ -215,6 +365,13 @@ pub enum Action {
     /// reopened. Reported rather than done here for the ordinary reason: this
     /// crate has never heard of an archive.
     DataChanged,
+    /// The active account changed -- a different one was picked from the
+    /// switcher, or a blank one was added. The viewer refills the password
+    /// field from the credential store, or clears it.
+    AccountChanged,
+    /// "Save password" was just switched off. The viewer forgets whatever
+    /// secret it has stored for the account the form is showing.
+    ForgetPassword,
 }
 
 /// Which box has the keyboard.
@@ -238,6 +395,9 @@ pub struct SignIn {
     pub status: Option<(String, Tone)>,
     /// Whether the settings panel is showing instead of the sign-in one.
     pub settings_open: bool,
+    /// Whether the account switcher's dropdown is showing under the account
+    /// field.
+    account_menu_open: bool,
     /// Which row of a list is picked out. Kept across a stage change so the
     /// remembered character can be preselected -- see [`SignIn::show_list`].
     pub selected: usize,
@@ -275,12 +435,13 @@ impl SignIn {
         };
         let fresh = settings.data.is_none();
         Self {
-            focus: if settings.account.is_empty() {
+            focus: if settings.account().name.is_empty() {
                 Field::Account
             } else {
                 Field::Password
             },
             settings_open: fresh,
+            account_menu_open: false,
             status: status.or(fresh.then(|| {
                 (
                     "point this at your WoW 3.3.5a Data folder to begin".into(),
@@ -325,10 +486,28 @@ impl SignIn {
         self.status = Some((what.into(), Tone::Plain));
     }
 
+    /// Moves the account just signed in to the front of the switcher, dropping
+    /// any earlier duplicate of it. Called by the viewer once the logon server
+    /// has accepted the credentials, so the list is ordered by recency.
+    pub fn remember_active(&mut self) {
+        let current = self.settings.account().clone();
+        if current.name.trim().is_empty() {
+            return;
+        }
+        self.settings.accounts.retain(|a| {
+            !(a.name.trim().eq_ignore_ascii_case(current.name.trim())
+                && a.server.trim() == current.server.trim())
+        });
+        self.settings.accounts.insert(0, current);
+        self.settings.active = 0;
+        self.save();
+    }
+
     /// Shows a realm list, preselecting the one last entered.
     pub fn show_realms(&mut self, realms: Vec<RealmRow>) {
         self.selected = self
             .settings
+            .account()
             .realm
             .as_deref()
             .and_then(|wanted| {
@@ -344,6 +523,7 @@ impl SignIn {
     pub fn show_characters(&mut self, characters: Vec<CharacterRow>) {
         self.selected = self
             .settings
+            .account()
             .character
             .as_deref()
             .and_then(|wanted| {
@@ -361,17 +541,28 @@ impl SignIn {
     /// of this check: a button that looks alive and silently does nothing is
     /// the failure this project has paid for in three other frames.
     pub fn ready(&self) -> bool {
+        let account = self.settings.account();
         self.settings.data.is_some()
-            && !self.settings.server.trim().is_empty()
-            && !self.settings.account.trim().is_empty()
+            && !account.server.trim().is_empty()
+            && !account.name.trim().is_empty()
             && !self.password.is_empty()
+    }
+
+    /// The accounts worth offering in the switcher: the ones with a name on
+    /// them. An unnamed row is the blank being typed, not something to pick.
+    fn named_accounts(&self) -> impl Iterator<Item = (usize, &Account)> {
+        self.settings
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| !a.name.trim().is_empty())
     }
 
     fn field_mut(&mut self, field: Field) -> &mut String {
         match field {
-            Field::Account => &mut self.settings.account,
+            Field::Account => &mut self.settings.account_mut().name,
             Field::Password => &mut self.password,
-            Field::Server => &mut self.settings.server,
+            Field::Server => &mut self.settings.account_mut().server,
             Field::Locale => &mut self.settings.locale,
             // The data directory is a path everywhere else and a string only
             // while it is being typed, so it is edited through a scratch
@@ -382,9 +573,9 @@ impl SignIn {
 
     fn field_text(&self, field: Field) -> String {
         match field {
-            Field::Account => self.settings.account.clone(),
+            Field::Account => self.settings.account().name.clone(),
             Field::Password => self.password.clone(),
-            Field::Server => self.settings.server.clone(),
+            Field::Server => self.settings.account().server.clone(),
             Field::Locale => self.settings.locale.clone(),
             Field::Data => self
                 .settings
@@ -446,6 +637,24 @@ enum Item {
         detail: String,
         enabled: bool,
     },
+    /// One row of the account switcher's dropdown. Separate from [`Item::Row`]
+    /// because a `Row` is a list-stage choice that emits [`Target::Choose`],
+    /// and this emits its own target -- a specific account, or "add".
+    Menu {
+        rect: Rect,
+        target: Target,
+        name: String,
+        detail: String,
+        /// The account currently in the form. Drawn picked out.
+        current: bool,
+    },
+    /// A labelled checkbox. Just "Save password" so far.
+    Check {
+        rect: Rect,
+        target: Target,
+        text: String,
+        checked: bool,
+    },
     /// Small print. Drawn dim, never clickable, and load-bearing exactly
     /// once: it is where the panel says character creation lives elsewhere.
     Note { rect: Rect, text: String },
@@ -463,6 +672,14 @@ enum Target {
     Choose,
     Back,
     Quit,
+    /// Show or hide the account switcher's dropdown.
+    ToggleAccountMenu,
+    /// Make this entry of [`Settings::accounts`] the one in the form.
+    PickAccount(usize),
+    /// Add a blank account and switch the form to it.
+    AddAccount,
+    /// Flip "Save password" for the account in the form.
+    ToggleSavePassword,
 }
 
 impl Item {
@@ -472,6 +689,8 @@ impl Item {
             | Item::Field { rect, .. }
             | Item::Button { rect, .. }
             | Item::Row { rect, .. }
+            | Item::Menu { rect, .. }
+            | Item::Check { rect, .. }
             | Item::Note { rect, .. } => *rect,
         }
     }
@@ -488,6 +707,7 @@ impl Item {
             Item::Field { field, .. } => Some(Target::Focus(*field)),
             Item::Button { target, enabled, .. } => enabled.then_some(*target),
             Item::Row { enabled, .. } => enabled.then_some(Target::Choose),
+            Item::Menu { target, .. } | Item::Check { target, .. } => Some(*target),
             Item::Label { .. } | Item::Note { .. } => None,
         }
     }
@@ -558,6 +778,55 @@ impl Build {
             text,
             secret,
             hint,
+        });
+    }
+
+    /// A field with a dropdown caret carved off its right end -- the account
+    /// box when there is more than one account to pick from. The caret is a
+    /// separate button so the hit test stays one-rectangle-per-item.
+    fn field_with_caret(&mut self, field: Field, text: String, hint: &'static str) {
+        let rect = self.take(self.row);
+        let caret = rect.height();
+        self.items.push(Item::Field {
+            rect: Rect::from_min_size(
+                rect.min,
+                Vec2::new(rect.width() - caret - self.gap, rect.height()),
+            ),
+            field,
+            text,
+            secret: false,
+            hint,
+        });
+        self.items.push(Item::Button {
+            rect: Rect::from_min_size(
+                Pos2::new(rect.right() - caret, rect.top()),
+                Vec2::splat(caret),
+            ),
+            target: Target::ToggleAccountMenu,
+            text: "\u{25be}".into(),
+            primary: false,
+            enabled: true,
+        });
+    }
+
+    fn menu_row(&mut self, target: Target, name: String, detail: String, current: bool) {
+        let rect = self.take(self.row);
+        self.items.push(Item::Menu {
+            rect,
+            target,
+            name,
+            detail,
+            current,
+        });
+    }
+
+    fn check(&mut self, target: Target, text: impl Into<String>, checked: bool) {
+        let rect = self.take(self.row * 0.8);
+        self.items.push(Item::Check {
+            rect,
+            target,
+            text: text.into(),
+            checked,
         });
     }
 
@@ -708,13 +977,42 @@ impl SignIn {
 
     fn build_credentials(&self, b: &mut Build) {
         b.label("Account", true);
-        b.field(Field::Account, self.settings.account.clone(), false, "");
+        // The caret, and the dropdown it opens, appear only once there is a
+        // saved account to switch to. Until the first sign-in the panel looks
+        // exactly as it always has.
+        let switchable = self.named_accounts().count() >= 1;
+        if switchable {
+            b.field_with_caret(Field::Account, self.field_text(Field::Account), "");
+        } else {
+            b.field(Field::Account, self.field_text(Field::Account), false, "");
+        }
+        if self.account_menu_open {
+            for (i, account) in self.settings.accounts.iter().enumerate() {
+                let name = if account.name.trim().is_empty() {
+                    "(new account)".to_string()
+                } else {
+                    account.name.clone()
+                };
+                b.menu_row(
+                    Target::PickAccount(i),
+                    name,
+                    account.server.clone(),
+                    i == self.settings.active,
+                );
+            }
+            b.menu_row(Target::AddAccount, "+ Add account".into(), String::new(), false);
+        }
         b.label("Password", true);
         b.field(Field::Password, self.password.clone(), true, "");
+        b.check(
+            Target::ToggleSavePassword,
+            "Save password",
+            self.settings.account().save_password,
+        );
         b.label("Realm server", true);
         b.field(
             Field::Server,
-            self.settings.server.clone(),
+            self.field_text(Field::Server),
             false,
             "host or host:port",
         );
@@ -850,7 +1148,7 @@ impl SignIn {
             }
             Target::CloseSettings => {
                 self.settings_open = false;
-                self.focus = if self.settings.account.is_empty() {
+                self.focus = if self.settings.account().name.is_empty() {
                     Field::Account
                 } else {
                     Field::Password
@@ -863,6 +1161,43 @@ impl SignIn {
             Target::Choose => Action::Choose(self.selected),
             Target::Back => Action::Back,
             Target::Quit => Action::Quit,
+            Target::ToggleAccountMenu => {
+                self.account_menu_open = !self.account_menu_open;
+                Action::None
+            }
+            Target::PickAccount(index) => {
+                self.account_menu_open = false;
+                self.settings.active = index.min(self.settings.accounts.len().saturating_sub(1));
+                // The password belongs to whoever was in the form a moment
+                // ago, not to this account. Cleared, and the viewer refills it
+                // from the credential store if this account saved one.
+                self.password.clear();
+                self.focus = Field::Password;
+                self.save();
+                Action::AccountChanged
+            }
+            Target::AddAccount => {
+                self.account_menu_open = false;
+                self.settings.accounts.push(Account::default());
+                self.settings.active = self.settings.accounts.len() - 1;
+                self.password.clear();
+                self.focus = Field::Account;
+                self.save();
+                Action::AccountChanged
+            }
+            Target::ToggleSavePassword => {
+                let now = !self.settings.account().save_password;
+                self.settings.account_mut().save_password = now;
+                self.save();
+                // Turning it on stores nothing yet -- the viewer writes the
+                // secret only once the logon server has accepted it. Turning
+                // it off forgets whatever is already stored, now.
+                if now {
+                    Action::None
+                } else {
+                    Action::ForgetPassword
+                }
+            }
         }
     }
 
@@ -915,7 +1250,12 @@ impl SignIn {
                 None
             }
             egui::Key::Enter => Some(self.submit()),
-            egui::Key::Escape => Some(if self.settings_open {
+            egui::Key::Escape => Some(if self.account_menu_open {
+                // The dropdown is the first thing Escape closes -- it is a
+                // transient overlay, not a panel to back out of.
+                self.account_menu_open = false;
+                Action::None
+            } else if self.settings_open {
                 self.settings_open = false;
                 self.save();
                 Action::DataChanged
@@ -1220,6 +1560,98 @@ impl SignIn {
                         style.quest_dim.into(),
                     );
                 }
+                Item::Menu {
+                    name,
+                    detail,
+                    current,
+                    ..
+                } => {
+                    painter.rect_filled(
+                        at,
+                        corner_radius(style.corner),
+                        if *current {
+                            style.spellbook_selected
+                        } else {
+                            style.login_field
+                        },
+                    );
+                    painter.rect_stroke(
+                        at,
+                        corner_radius(style.corner),
+                        Stroke::new(
+                            style.border_width.max(1.0),
+                            if *current {
+                                Color32::from(style.login_accent)
+                            } else {
+                                Color32::from(style.border)
+                            },
+                        ),
+                        StrokeKind::Inside,
+                    );
+                    let inner = at.shrink2(Vec2::new(style.padding, 0.0));
+                    let clipped = painter.with_clip_rect(inner);
+                    clipped.text(
+                        inner.left_center(),
+                        Align2::LEFT_CENTER,
+                        name,
+                        font.clone(),
+                        style.text.into(),
+                    );
+                    if !detail.is_empty() {
+                        clipped.text(
+                            inner.right_center(),
+                            Align2::RIGHT_CENTER,
+                            detail,
+                            small.clone(),
+                            style.quest_dim.into(),
+                        );
+                    }
+                }
+                Item::Check { text, checked, .. } => {
+                    let box_side = at.height().min(style.font_size + 4.0);
+                    let box_rect = Rect::from_min_size(
+                        Pos2::new(at.left(), at.center().y - box_side / 2.0),
+                        Vec2::splat(box_side),
+                    );
+                    painter.rect_filled(
+                        box_rect,
+                        corner_radius(style.corner * 0.5),
+                        if *checked {
+                            Color32::from(style.login_accent)
+                        } else {
+                            style.login_field.into()
+                        },
+                    );
+                    painter.rect_stroke(
+                        box_rect,
+                        corner_radius(style.corner * 0.5),
+                        Stroke::new(
+                            style.border_width.max(1.0),
+                            Color32::from(if *checked {
+                                style.login_accent
+                            } else {
+                                style.border
+                            }),
+                        ),
+                        StrokeKind::Inside,
+                    );
+                    if *checked {
+                        painter.text(
+                            box_rect.center(),
+                            Align2::CENTER_CENTER,
+                            "\u{2713}",
+                            small.clone(),
+                            contrasting(style.login_accent),
+                        );
+                    }
+                    painter.text(
+                        Pos2::new(box_rect.right() + style.gap, at.center().y),
+                        Align2::LEFT_CENTER,
+                        text,
+                        small.clone(),
+                        style.text.into(),
+                    );
+                }
             }
         }
     }
@@ -1299,20 +1731,29 @@ fn corner_radius(radius: f32) -> egui::CornerRadius {
 mod tests {
     use super::*;
 
+    fn account(name: &str, server: &str) -> Account {
+        Account {
+            name: name.into(),
+            server: server.into(),
+            realm: None,
+            character: None,
+            save_password: false,
+        }
+    }
+
     fn screen() -> SignIn {
         SignIn {
             settings: Settings {
                 data: Some(PathBuf::from("D:/Games/WoW/Data")),
                 locale: "enUS".into(),
-                server: "127.0.0.1".into(),
-                account: "OWC33".into(),
-                realm: None,
-                character: None,
+                accounts: vec![account("OWC33", "127.0.0.1")],
+                active: 0,
             },
             password: "hunter2".into(),
             stage: Stage::Credentials,
             status: None,
             settings_open: false,
+            account_menu_open: false,
             selected: 0,
             focus: Field::Password,
             // No file, so nothing a test does can reach the real settings.
@@ -1323,16 +1764,110 @@ mod tests {
     #[test]
     fn a_bare_host_gets_the_default_port() {
         let mut settings = Settings::default();
-        settings.server = "wow1.nekos.farm".into();
+        settings.account_mut().server = "wow1.nekos.farm".into();
         assert_eq!(
             settings.address(),
             ("wow1.nekos.farm".into(), DEFAULT_PORT)
         );
-        settings.server = "127.0.0.1:3725".into();
+        settings.account_mut().server = "127.0.0.1:3725".into();
         assert_eq!(settings.address(), ("127.0.0.1".into(), 3725));
         // Half-typed, and it must not error: the box is still being written.
-        settings.server = "127.0.0.1:".into();
+        settings.account_mut().server = "127.0.0.1:".into();
         assert_eq!(settings.address(), ("127.0.0.1".into(), DEFAULT_PORT));
+    }
+
+    /// A `login.toml` written before the account switcher is migrated in
+    /// place, not rejected -- reverting a remembered server every launch is
+    /// exactly the tedium this screen removes.
+    #[test]
+    fn an_old_login_file_migrates() {
+        let old = "\
+            locale = \"enGB\"\n\
+            server = \"wow1.nekos.farm:8080\"\n\
+            account = \"TESTER\"\n\
+            realm = \"NekoCore\"\n\
+            character = \"Testwolf\"\n";
+        let settings = parse_settings(old).expect("the old shape parses");
+        assert_eq!(settings.locale, "enGB");
+        assert_eq!(settings.accounts.len(), 1);
+        let account = settings.account();
+        assert_eq!(account.name, "TESTER");
+        assert_eq!(account.server, "wow1.nekos.farm:8080");
+        assert_eq!(account.realm.as_deref(), Some("NekoCore"));
+        assert_eq!(account.character.as_deref(), Some("Testwolf"));
+        assert!(!account.save_password);
+        // And it round-trips through the new shape unchanged.
+        let text = toml::to_string_pretty(&settings).expect("serialise");
+        assert_eq!(parse_settings(&text).expect("re-parse"), settings);
+        // A file that is neither shape is still an error, reported by the
+        // current parser.
+        assert!(parse_settings("account = 3\nnonsense = true\n").is_err());
+    }
+
+    /// Picking an account from the switcher fills the form with its fields and
+    /// tells the viewer to refill the password.
+    #[test]
+    fn picking_an_account_fills_the_form() {
+        let mut screen = screen();
+        screen.settings.accounts.push(Account {
+            character: Some("Watcher".into()),
+            ..account("OWC34", "otherhost:9000")
+        });
+        assert_eq!(screen.act(Target::PickAccount(1)), Action::AccountChanged);
+        assert_eq!(screen.settings.active, 1);
+        assert_eq!(screen.field_text(Field::Account), "OWC34");
+        assert_eq!(screen.field_text(Field::Server), "otherhost:9000");
+        assert_eq!(screen.settings.account().character.as_deref(), Some("Watcher"));
+        assert!(screen.password.is_empty(), "the old account's password was kept");
+        assert!(!screen.account_menu_open);
+    }
+
+    /// "Add account" appends a blank entry and switches the form to it.
+    #[test]
+    fn adding_an_account_blanks_the_form() {
+        let mut screen = screen();
+        assert_eq!(screen.act(Target::AddAccount), Action::AccountChanged);
+        assert_eq!(screen.settings.accounts.len(), 2);
+        assert_eq!(screen.settings.active, 1);
+        assert_eq!(screen.field_text(Field::Account), "");
+        assert!(screen.password.is_empty());
+    }
+
+    /// Unticking "Save password" asks the viewer to forget the stored secret;
+    /// ticking it just records the intent.
+    #[test]
+    fn save_password_toggles_and_asks_to_forget() {
+        let mut screen = screen();
+        assert!(!screen.settings.account().save_password);
+        assert_eq!(screen.act(Target::ToggleSavePassword), Action::None);
+        assert!(screen.settings.account().save_password);
+        assert_eq!(screen.act(Target::ToggleSavePassword), Action::ForgetPassword);
+        assert!(!screen.settings.account().save_password);
+    }
+
+    /// The account just signed in moves to the front, and signing in as one
+    /// already on the list re-orders rather than duplicates it.
+    #[test]
+    fn remember_active_is_most_recently_used_first() {
+        let mut screen = screen();
+        screen.settings.accounts.push(account("OWC34", "127.0.0.1"));
+        let names = |s: &SignIn| -> Vec<String> {
+            s.settings.accounts.iter().map(|a| a.name.clone()).collect()
+        };
+
+        screen.settings.active = 1; // OWC34
+        screen.remember_active();
+        assert_eq!(screen.settings.active, 0);
+        assert_eq!(names(&screen), ["OWC34", "OWC33"]);
+
+        screen.settings.active = 1; // OWC33
+        screen.remember_active();
+        assert_eq!(names(&screen), ["OWC33", "OWC34"], "no duplicate OWC33");
+    }
+
+    #[test]
+    fn a_secret_key_is_account_and_server() {
+        assert_eq!(account("OWC33", "127.0.0.1").secret_key(), "OWC33@127.0.0.1");
     }
 
     /// The settings file is the one thing this screen writes, and everything
@@ -1351,10 +1886,20 @@ mod tests {
     /// reviewer sees and the serialised bytes are what a person's disk gets.
     #[test]
     fn the_file_cannot_hold_a_password() {
-        let screen = screen();
+        let mut screen = screen();
+        // Even with "Save password" on -- the secret still goes to the OS
+        // credential store, never here.
+        screen.settings.account_mut().save_password = true;
         let text = toml::to_string_pretty(&screen.settings).expect("serialise");
-        assert!(!text.contains("hunter2"), "{text}");
-        assert!(!text.to_lowercase().contains("password"), "{text}");
+        assert!(!text.contains("hunter2"), "the password is in the file:\n{text}");
+        // No key is a password value. `save_password` is a flag and is fine;
+        // a bare `password` / `password_obf` key is not.
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.trim_start().starts_with("password")),
+            "a password key is in the file:\n{text}"
+        );
     }
 
     #[test]
@@ -1367,7 +1912,7 @@ mod tests {
         screen.settings.data = None;
         assert!(!screen.ready());
         screen.settings.data = Some(PathBuf::from("D:/"));
-        screen.settings.server = "  ".into();
+        screen.settings.account_mut().server = "  ".into();
         assert!(!screen.ready());
     }
 
@@ -1410,9 +1955,9 @@ mod tests {
     fn control_characters_never_reach_a_field() {
         let mut screen = screen();
         screen.focus = Field::Account;
-        screen.settings.account.clear();
+        screen.settings.account_mut().name.clear();
         screen.type_into("a\r\n\u{1b}b");
-        assert_eq!(screen.settings.account, "ab");
+        assert_eq!(screen.settings.account().name, "ab");
     }
 
     /// Tab cycles the panel that is showing, and *only* that panel: a tab in
@@ -1493,7 +2038,7 @@ mod tests {
     #[test]
     fn the_remembered_character_is_preselected() {
         let mut screen = screen();
-        screen.settings.character = Some("watcher".into());
+        screen.settings.account_mut().character = Some("watcher".into());
         screen.show_characters(vec![
             CharacterRow { name: "Testwolf".into(), detail: String::new(), blocked: false },
             CharacterRow { name: "Watcher".into(), detail: String::new(), blocked: false },
@@ -1501,7 +2046,7 @@ mod tests {
         assert_eq!(screen.selected, 1);
         // And a character that is gone falls back to the first rather than to
         // an index past the end.
-        screen.settings.character = Some("Deleted".into());
+        screen.settings.account_mut().character = Some("Deleted".into());
         screen.show_characters(vec![CharacterRow {
             name: "Testwolf".into(),
             detail: String::new(),
@@ -1592,6 +2137,12 @@ mod tests {
         screen.settings_open = true;
         panels.push(screen.panel(&style));
         screen.settings_open = false;
+        // The credentials panel with the account dropdown open and more than
+        // one account in it -- the tallest that panel gets.
+        screen.settings.accounts.push(account("OWC34", "otherhost"));
+        screen.account_menu_open = true;
+        panels.push(screen.panel(&style));
+        screen.account_menu_open = false;
         screen.working("signing in");
         panels.push(screen.panel(&style));
         screen.show_realms(vec![RealmRow {
@@ -1739,6 +2290,19 @@ mod tests {
         );
     }
 
+    /// The open account dropdown paints every saved account and the way to add
+    /// one, and "Save password" is on the panel whether ticked or not.
+    #[test]
+    fn the_account_dropdown_paints_its_entries() {
+        let mut screen = screen();
+        screen.settings.accounts.push(account("OWC34", "otherhost"));
+        screen.account_menu_open = true;
+        let (text, _) = run(&mut screen, Vec::new(), 2);
+        for wanted in ["OWC33", "OWC34", "+ Add account", "Save password"] {
+            assert!(text.iter().any(|t| t == wanted), "{wanted:?} in {text:?}");
+        }
+    }
+
     /// A character list has to reach the screen with its detail lines on it,
     /// and with the note saying where new characters come from -- which is the
     /// one sentence on this screen that answers a question the client cannot.
@@ -1808,6 +2372,20 @@ mod tests {
                 Target::OpenSettings => assert!(screen.settings_open, "clicking the cat"),
                 Target::SignIn => assert_eq!(action, Action::SignIn),
                 Target::Quit => assert_eq!(action, Action::Quit),
+                // The harness replays the press across passes, so a plain
+                // toggle lands an even number of times and reads unchanged.
+                // Both of these assert on the last action instead: clicking
+                // the caret opens the dropdown, whose first row then gets
+                // clicked and switches account; the save-password box ends a
+                // run of toggles switched off, asking the viewer to forget.
+                Target::ToggleAccountMenu => assert_eq!(
+                    action,
+                    Action::AccountChanged,
+                    "clicking the account caret did not open a usable dropdown"
+                ),
+                Target::ToggleSavePassword => {
+                    assert_eq!(action, Action::ForgetPassword, "clicking save-password")
+                }
                 other => panic!("unexpected control on the sign-in panel: {other:?}"),
             }
         }
@@ -1824,12 +2402,12 @@ mod tests {
     fn keystrokes_reach_the_focused_field() {
         let mut screen = screen();
         screen.focus = Field::Account;
-        screen.settings.account.clear();
+        screen.settings.account_mut().name.clear();
         let (_, action) = run(&mut screen, vec![egui::Event::Text("Testwolf".into())], 2);
         assert_eq!(action, Action::None);
         // The harness delivers the same input twice, so the text arrives
         // twice: this asserts about the harness as much as about `show`, and
         // an assertion of `"Testwolf"` would be the one that was wrong.
-        assert_eq!(screen.settings.account, "TestwolfTestwolf");
+        assert_eq!(screen.settings.account().name, "TestwolfTestwolf");
     }
 }

@@ -4,6 +4,9 @@
 .vscode/
 .idea/
 
+# Local realm credentials, kept out of the tree on purpose. Never commit.
+/lin.txt
+
 # Never commit game assets -- the client requires the user's own installation.
 *.MPQ
 *.mpq

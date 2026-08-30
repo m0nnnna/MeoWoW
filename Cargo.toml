@@ -46,6 +46,17 @@ toml = "0.9"
 # `xdg-portal` back on -- said here rather than discovered, because the feature
 # it disables is not one this platform can notice missing.
 rfd = { version = "0.15", default-features = false }
+# The operating system's own credential store, for the "Save password" option
+# on the sign-in screen. It only ever holds that one secret, keyed by account
+# and server; a build with no backend for its platform, or a machine with no
+# usable keychain, simply does not remember -- see `apps/viewer/src/signin.rs`.
+# `default-features = false` with only `windows-native`: this client's platform
+# is Windows (Credential Manager), and the default feature set drags in the
+# Linux Secret Service stack and a crypto backend this does not need. A Linux
+# build has to turn a `*-native` backend back on, the same shape of note the
+# `rfd` line above carries. Passes the reuse test -- a system credential vault
+# has nothing to do with WoW.
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
 
 [profile.dev]
 # Format parsing on multi-GB archives is unusable in a fully unoptimized build,
