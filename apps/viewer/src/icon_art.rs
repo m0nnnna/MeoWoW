@@ -1,113 +1,105 @@
-// The client's icon, drawn rather than shipped.
+// The client's icon.
 //
-// **This file is compiled twice**: once as a module of the viewer, which
-// turns it into the window's icon at runtime, and once by `build.rs` through
-// an `include!`, which turns it into the `.ico` Windows shows in Explorer and
-// on the taskbar. That is the whole reason it uses nothing but `std` and
-// knows about neither `winit` nor the ICO format -- a build script cannot
-// depend on the crate it is building, and two hand-drawn cats that drifted
-// apart would be worse than one.
+// **This file is compiled twice**: once as a module of the viewer, which turns
+// it into the window's icon at runtime, and once by `build.rs` through an
+// `include!`, which turns it into the `.ico` Windows shows in Explorer and on
+// the taskbar. A build script cannot depend on the crate it is building, so
+// everything here leans only on `std` and on `png` -- which is a
+// `[build-dependencies]` entry as well as a normal one for exactly this
+// reason. Two icons that drifted apart would be worse than one.
 //
-// Procedural for the same reason every frame in `crates/ui` is painted from
-// explicit geometry: there is no art file to lose, it renders at whatever
-// size is asked for, and the colours are the ones the interface already uses.
+// The art itself lives in `app-icon.png`, a 256x256 straight-RGBA master
+// exported once from the source drawing and committed as the one deliberate
+// exception to the tree's blanket `*.png` ignore -- it is this project's own
+// mark, not anyone else's asset. Everything below is just resampling it down
+// to whatever size a title bar, a taskbar or an `.ico` entry asks for.
 
-/// The cat's fur, which is the neko theme's accent (`#ff9ec4`).
-const FUR: [u8; 3] = [255, 158, 196];
-/// The inside of an ear, an eye and the nose: the neko panel's own dark.
-const DARK: [u8; 3] = [34, 19, 32];
+/// The 256x256 RGBA master, PNG-encoded. Decoded on demand rather than kept
+/// unpacked: it is read a handful of times per launch (one window icon, four
+/// `.ico` entries) and never in a hot path.
+const MASTER_PNG: &[u8] = include_bytes!("app-icon.png");
 
-/// How many samples per axis each pixel is evaluated at.
+/// The master, decoded to straight (non-premultiplied) RGBA, with its side
+/// length.
 ///
-/// **Three, not one.** At sixteen pixels a hard-edged circle with a triangle
-/// on it is a stack of jagged steps, and the icon is drawn at sixteen more
-/// often than at any other size -- that is what a taskbar and a title bar ask
-/// for.
-const SAMPLES: u32 = 3;
+/// Panics rather than degrades: unlike the window icon as a whole -- which is
+/// allowed to fall back to the platform default -- a master PNG that will not
+/// decode is a broken build, and a silent all-transparent icon would be
+/// indistinguishable from the feature being switched off.
+fn master() -> (Vec<u8>, u32) {
+    let mut reader = png::Decoder::new(MASTER_PNG)
+        .read_info()
+        .expect("app-icon.png is a valid PNG");
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("app-icon.png decodes");
+    assert_eq!(
+        info.color_type,
+        png::ColorType::Rgba,
+        "app-icon.png must be straight RGBA"
+    );
+    assert_eq!(info.bit_depth, png::BitDepth::Eight);
+    assert_eq!(info.width, info.height, "app-icon.png must be square");
+    buf.truncate(info.buffer_size());
+    (buf, info.width)
+}
 
 /// Draws the icon at `size` by `size`, as straight (non-premultiplied) RGBA.
 ///
-/// Transparent outside the cat. An icon with its own opaque background is a
-/// coloured square in a taskbar whatever the taskbar's colour is.
+/// Transparent outside the cat, because an icon with its own opaque background
+/// is a coloured square in a taskbar whatever the taskbar's colour is -- the
+/// master already has the transparency and this preserves it.
+///
+/// A box (area-average) downsample: every destination pixel is the mean of the
+/// source pixels it covers, so a 16-pixel icon is a real reduction of the art
+/// rather than a stack of jagged nearest-neighbour steps. The averaging is
+/// done in premultiplied colour and then un-premultiplied, or a soft edge
+/// where opaque ink meets transparent black would darken as it faded.
 pub fn draw(size: u32) -> Vec<u8> {
-    let mut pixels = vec![0u8; (size * size * 4) as usize];
-    let step = 1.0 / (size as f32 * SAMPLES as f32);
-    for y in 0..size {
-        for x in 0..size {
-            // Coverage and colour are accumulated together, so an edge where
-            // fur meets an eye blends the two rather than blending fur with
-            // nothing and painting the eye over it.
-            let (mut cover, mut rgb) = (0.0f32, [0.0f32; 3]);
-            for sy in 0..SAMPLES {
-                for sx in 0..SAMPLES {
-                    let u = (x as f32 * SAMPLES as f32 + sx as f32 + 0.5) * step;
-                    let v = (y as f32 * SAMPLES as f32 + sy as f32 + 0.5) * step;
-                    if let Some(colour) = sample(u, v) {
-                        cover += 1.0;
-                        for c in 0..3 {
-                            rgb[c] += colour[c] as f32;
-                        }
-                    }
+    let (src, src_size) = master();
+    if size == 0 {
+        return Vec::new();
+    }
+    if size == src_size {
+        return src;
+    }
+    let mut out = vec![0u8; (size * size * 4) as usize];
+    let scale = src_size as f64 / size as f64;
+    // Guaranteed below by the `size == src_size` short-circuit above and by
+    // there being no icon size larger than the 256 master: every destination
+    // pixel covers at least one whole source pixel on each axis.
+    for dy in 0..size {
+        let yi0 = (dy as f64 * scale).floor() as u32;
+        let yi1 = (((dy + 1) as f64 * scale).ceil() as u32).min(src_size);
+        for dx in 0..size {
+            let xi0 = (dx as f64 * scale).floor() as u32;
+            let xi1 = (((dx + 1) as f64 * scale).ceil() as u32).min(src_size);
+
+            let (mut r, mut g, mut b, mut a) = (0.0f64, 0.0, 0.0, 0.0);
+            let mut n = 0.0f64;
+            for sy in yi0..yi1 {
+                for sx in xi0..xi1 {
+                    n += 1.0;
+                    let i = ((sy * src_size + sx) * 4) as usize;
+                    let alpha = src[i + 3] as f64;
+                    r += src[i] as f64 * alpha;
+                    g += src[i + 1] as f64 * alpha;
+                    b += src[i + 2] as f64 * alpha;
+                    a += alpha;
                 }
             }
-            let taken = (SAMPLES * SAMPLES) as f32;
-            let at = ((y * size + x) * 4) as usize;
-            if cover > 0.0 {
-                for c in 0..3 {
-                    pixels[at + c] = (rgb[c] / cover).round().clamp(0.0, 255.0) as u8;
-                }
-                pixels[at + 3] = (cover / taken * 255.0).round() as u8;
+
+            let at = ((dy * size + dx) * 4) as usize;
+            if a > 0.0 {
+                out[at] = (r / a).round().clamp(0.0, 255.0) as u8;
+                out[at + 1] = (g / a).round().clamp(0.0, 255.0) as u8;
+                out[at + 2] = (b / a).round().clamp(0.0, 255.0) as u8;
+            }
+            if n > 0.0 {
+                out[at + 3] = (a / n).round().clamp(0.0, 255.0) as u8;
             }
         }
     }
-    pixels
-}
-
-/// What is at one point of the unit square, or `None` for nothing.
-fn sample(x: f32, y: f32) -> Option<[u8; 3]> {
-    // Eyes and nose first: they sit on the head, so they win where they
-    // overlap it. Testing them first is the same thing as painting them last
-    // and costs no second pass.
-    if in_circle(x, y, 0.385, 0.575, 0.062) || in_circle(x, y, 0.615, 0.575, 0.062) {
-        return Some(DARK);
-    }
-    // The nose, a small triangle pointing down.
-    if in_triangle(x, y, (0.455, 0.655), (0.545, 0.655), (0.5, 0.715)) {
-        return Some(DARK);
-    }
-    // The inside of each ear.
-    if in_triangle(x, y, (0.245, 0.365), (0.315, 0.135), (0.395, 0.335))
-        || in_triangle(x, y, (0.755, 0.365), (0.685, 0.135), (0.605, 0.335))
-    {
-        return Some(DARK);
-    }
-    // Each ear, drawn under its own lining.
-    if in_triangle(x, y, (0.195, 0.44), (0.295, 0.06), (0.44, 0.34))
-        || in_triangle(x, y, (0.805, 0.44), (0.705, 0.06), (0.56, 0.34))
-    {
-        return Some(FUR);
-    }
-    // The head.
-    if in_circle(x, y, 0.5, 0.58, 0.335) {
-        return Some(FUR);
-    }
-    None
-}
-
-fn in_circle(x: f32, y: f32, cx: f32, cy: f32, r: f32) -> bool {
-    let (dx, dy) = (x - cx, y - cy);
-    dx * dx + dy * dy <= r * r
-}
-
-/// Whether a point is inside a triangle, by the sign of three cross products.
-///
-/// Winding-independent -- it accepts a triangle given either way round --
-/// because the two ears here are mirror images of each other and one of them
-/// would otherwise have to be written backwards to be drawn at all.
-fn in_triangle(x: f32, y: f32, a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
-    let side = |p: (f32, f32), q: (f32, f32)| (q.0 - p.0) * (y - p.1) - (q.1 - p.1) * (x - p.0);
-    let (u, v, w) = (side(a, b), side(b, c), side(c, a));
-    (u >= 0.0 && v >= 0.0 && w >= 0.0) || (u <= 0.0 && v <= 0.0 && w <= 0.0)
+    out
 }
 
 /// Packs one or more sizes into a Windows `.ico`.

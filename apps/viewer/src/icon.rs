@@ -2,8 +2,8 @@
 //!
 //! The executable's icon comes from the resource table and is attached by
 //! `build.rs`; this is the one winit hands the compositor for the title bar
-//! and, on the platforms that use it, the taskbar. Both draw the same cat from
-//! [`crate::icon_art`].
+//! and, on the platforms that use it, the taskbar. Both come from the same
+//! `app-icon.png` master, resampled by [`crate::icon_art`].
 
 use crate::icon_art;
 
@@ -32,51 +32,66 @@ pub fn window_icon() -> Option<winit::window::Icon> {
 mod tests {
     use super::*;
 
-    /// The icon has to *be* something. A drawing bug that produced an empty
-    /// bitmap would show up as the default window icon, which is exactly what
-    /// this feature looks like when it is switched off -- an absent capability
-    /// and an absent thing producing the same picture, again.
+    /// The icon has to *be* something. A decode or resample bug that produced
+    /// an empty bitmap would show up as the default window icon, which is
+    /// exactly what this feature looks like when it is switched off -- an
+    /// absent capability and an absent thing producing the same picture, again.
     #[test]
     fn the_icon_is_not_blank() {
         let pixels = icon_art::draw(SIZE);
         assert_eq!(pixels.len(), (SIZE * SIZE * 4) as usize);
-        let opaque = pixels.chunks_exact(4).filter(|p| p[3] > 200).count();
+        let drawn = pixels.chunks_exact(4).filter(|p| p[3] > 16).count();
         let total = (SIZE * SIZE) as usize;
-        // A cat's head on a transparent square: somewhere between a fifth and
-        // three quarters of it is fur. Loose bounds on purpose -- this asserts
-        // that something was drawn, not that it is pretty.
+        // The cat's head fills a good part of the square but leaves the
+        // corners and margins clear. Loose bounds on purpose -- this asserts
+        // that something was drawn and that it is not a solid block, not that
+        // it is pretty.
         assert!(
-            opaque > total / 5 && opaque < total * 3 / 4,
-            "{opaque} of {total} pixels are opaque"
+            drawn > total / 4 && drawn < total * 9 / 10,
+            "{drawn} of {total} pixels have ink"
         );
     }
 
-    /// Two eyes and a nose in the middle, distinct from the fur around them.
-    /// Without this the shape test passes on a plain pink circle.
+    /// The art is high-contrast -- white brushwork and red splatter over a
+    /// black face -- so among its opaque pixels there must be both very dark
+    /// and very light ones. Without this the shape test passes on a flat blob.
     #[test]
     fn the_cat_has_a_face() {
         let pixels = icon_art::draw(SIZE);
-        let at = |x: u32, y: u32| {
-            let i = ((y * SIZE + x) * 4) as usize;
-            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
-        };
-        let eye = at((SIZE as f32 * 0.385) as u32, (SIZE as f32 * 0.575) as u32);
-        let cheek = at((SIZE as f32 * 0.5) as u32, (SIZE as f32 * 0.5) as u32);
-        assert!(eye[3] > 200 && cheek[3] > 200, "both should be inside the head");
+        let opaque: Vec<u32> = pixels
+            .chunks_exact(4)
+            .filter(|p| p[3] > 220)
+            .map(|p| p[0] as u32 + p[1] as u32 + p[2] as u32)
+            .collect();
+        assert!(!opaque.is_empty(), "nothing opaque was drawn");
+        let dark = opaque.iter().filter(|&&sum| sum < 120).count();
+        let light = opaque.iter().filter(|&&sum| sum > 600).count();
         assert!(
-            (eye[0] as i32 - cheek[0] as i32).abs() > 100,
-            "an eye must not be the same colour as the fur: {eye:?} against {cheek:?}"
+            dark > 20 && light > 20,
+            "expected both dark and light ink; {dark} dark, {light} light of {}",
+            opaque.len()
         );
     }
 
-    /// The corners are transparent, or the taskbar gets a pink square.
+    /// The corners are transparent, or the taskbar gets a black square. A few
+    /// units of alpha are allowed for the downsample rounding the master's
+    /// near-zero edge pixels into.
     #[test]
     fn the_icon_has_no_background() {
         let pixels = icon_art::draw(SIZE);
         for (x, y) in [(0, 0), (SIZE - 1, 0), (0, SIZE - 1), (SIZE - 1, SIZE - 1)] {
             let i = ((y * SIZE + x) * 4) as usize;
-            assert_eq!(pixels[i + 3], 0, "corner {x},{y} is not transparent");
+            assert!(pixels[i + 3] <= 4, "corner {x},{y} alpha is {}", pixels[i + 3]);
         }
+    }
+
+    /// Asking for the master's own size returns it untouched, and asking for
+    /// zero returns nothing rather than panicking.
+    #[test]
+    fn the_edge_sizes_behave() {
+        assert!(icon_art::draw(0).is_empty());
+        let native = icon_art::draw(256);
+        assert_eq!(native.len(), 256 * 256 * 4);
     }
 
     /// The `.ico` container has to say how many images it holds and where each

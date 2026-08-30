@@ -27,6 +27,11 @@
 *.jpg
 *.jpeg
 
+# The one deliberate exception: the client's *own* icon, drawn for this
+# project and no one else's asset. `build.rs` bakes it into the executable
+# and the window, so it has to be in the tree -- see `apps/viewer/src/icon_art.rs`.
+!/apps/viewer/src/app-icon.png
+
 # Machine-local build config (target-dir redirect); see docs/BUILDING.md
 /.cargo/config.toml
 

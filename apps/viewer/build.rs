@@ -16,6 +16,7 @@ include!("src/icon_art.rs");
 
 fn main() {
     println!("cargo:rerun-if-changed=src/icon_art.rs");
+    println!("cargo:rerun-if-changed=src/app-icon.png");
     println!("cargo:rerun-if-changed=build.rs");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

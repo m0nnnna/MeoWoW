@@ -13,6 +13,10 @@ repository.workspace = true
 # and `build.rs` treats a missing one as a warning. Passes the reuse test: it
 # is the operating system's own packaging, nothing to do with WoW.
 embed-resource = "3"
+# `build.rs` `include!`s `src/icon_art.rs`, which decodes `src/app-icon.png`
+# into the sizes the `.ico` needs -- so the decoder has to be a build-dep as
+# well as a normal one.
+png.workspace = true
 
 [dependencies]
 mpq = { path = "../../crates/mpq" }
