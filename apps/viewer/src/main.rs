@@ -3158,7 +3158,10 @@ fn draw_streaming(
     draw_liquid(
         gpu,
         &mut pass,
-        world.tiles().filter_map(|t| t.terrain.liquid.as_ref()),
+        world
+            .tiles()
+            .filter_map(|t| t.terrain.liquid.as_ref())
+            .chain(world.wmo_liquids()),
         liquid_renderer,
         world.liquid_types(),
         &lit,

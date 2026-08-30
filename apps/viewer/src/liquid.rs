@@ -228,8 +228,6 @@ pub fn build(
     types: &mut LiquidTypes,
     tile: &adt::Adt,
 ) -> Option<LoadedLiquid> {
-    use wgpu::util::DeviceExt;
-
     if tile.liquid.is_empty() {
         return None;
     }
@@ -297,14 +295,68 @@ pub fn build(
         }
     }
 
-    // One buffer for the tile, with each type's indices laid end to end, so a
-    // draw is a range rather than a rebind of the vertex buffer.
+    finish(gpu, by_type)
+}
+
+/// Builds the liquid surfaces a placed `.wmo` declares -- fountain basins,
+/// interior pools, canal and harbour water. `MH2O` on the terrain never
+/// reaches under a `.wmo`, so without this every one of them is a dry hole.
+///
+/// `surfaces` are `(LiquidType.dbc row, wet-cell quads)` with the placement
+/// transform already applied, so this only has to skin them the same way
+/// [`build`] skins a terrain sheet. Each quad is `[bottom-left, bottom-right,
+/// top-left, top-right]`.
+pub fn build_wmo(
+    gpu: &Gpu,
+    renderer: &LiquidRenderer,
+    chain: &mut Chain,
+    types: &mut LiquidTypes,
+    surfaces: &[(u16, Vec<[Vec3; 4]>)],
+) -> Option<LoadedLiquid> {
+    let mut by_type: HashMap<u16, (Vec<LiquidVertex>, Vec<u32>)> = HashMap::new();
+    for (liquid_type, cells) in surfaces {
+        if cells.is_empty() {
+            continue;
+        }
+        types.ensure(gpu, renderer, chain, *liquid_type);
+        let look = types.look(*liquid_type);
+        let entry = by_type.entry(*liquid_type).or_default();
+        for quad in cells {
+            let base = entry.0.len() as u32;
+            for corner in quad {
+                // Keyed off world position so neighbouring cells tile
+                // continuously rather than each restarting the pattern -- the
+                // same reason `build` offsets its UVs by the cell's place in
+                // the chunk. `MLIQ` carries no depth, so a pool is drawn at
+                // full opacity throughout.
+                let uv = [corner.x * 0.06, corner.y * 0.06];
+                entry.0.push(LiquidVertex {
+                    position: (*corner).into(),
+                    uv_motion: [uv[0], uv[1], look.scroll, 0.0],
+                    tint: [look.tint[0], look.tint[1], look.tint[2], look.alpha],
+                    mode: [look.emissive, if look.alpha_keyed { 1.0 } else { 0.0 }],
+                });
+            }
+            entry.1.extend_from_slice(&[base, base + 1, base + 3, base, base + 3, base + 2]);
+        }
+    }
+    finish(gpu, by_type)
+}
+
+/// Packs one or more typed vertex/index runs into a single buffer pair, one
+/// [`LiquidDraw`] per type. Shared by [`build`] and [`build_wmo`].
+fn finish(
+    gpu: &Gpu,
+    by_type: HashMap<u16, (Vec<LiquidVertex>, Vec<u32>)>,
+) -> Option<LoadedLiquid> {
+    use wgpu::util::DeviceExt;
+
     let mut vertices: Vec<LiquidVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     let mut draws = Vec::new();
     let mut ordered: Vec<(u16, (Vec<LiquidVertex>, Vec<u32>))> = by_type.into_iter().collect();
-    // Sorted so a tile's draw order does not depend on hash iteration, which
-    // would make two runs of `--screenshot` differ where the sheets overlap.
+    // Sorted so draw order does not depend on hash iteration, which would make
+    // two runs of `--screenshot` differ where sheets overlap.
     ordered.sort_by_key(|(id, _)| *id);
     for (liquid_type, (part_vertices, part_indices)) in ordered {
         if part_indices.is_empty() {

@@ -127,6 +127,10 @@ pub struct CachedModel {
     /// Parallel to `group_bounds`. Empty for an M2, which has no groups to
     /// speak of. See `world_object::LoadedWmo::group_interior`.
     pub group_interior: Vec<bool>,
+    /// The liquid surfaces a WMO's groups declare via `MLIQ`, in model space.
+    /// Empty for an M2 and for a WMO with no interior water. See
+    /// `world_object::WmoLiquid`.
+    pub liquids: Vec<crate::world_object::WmoLiquid>,
 }
 
 /// One model and the transforms it takes on a single tile.
@@ -528,6 +532,10 @@ pub struct Tile {
     /// reading a vertex buffer back per frame to find out how high the ground
     /// is under one character would be absurd.
     heights: TileHeights,
+    /// The `MLIQ` water from every `.wmo` placed on this tile, merged into one
+    /// buffer. `None` when no building here holds any. Drawn by the same pass
+    /// as the terrain's liquid -- see [`World::wmo_liquids`].
+    wmo_liquid: Option<crate::liquid::LoadedLiquid>,
 }
 
 /// One tile's height field, in a form that answers "how high is the ground
@@ -1305,6 +1313,10 @@ impl World {
         // Grown as triangles are added, so it costs one comparison per vertex
         // rather than a second pass over the whole set.
         let mut solid_bounds: Option<(Vec3, Vec3)> = None;
+        // WMO `MLIQ` surfaces -- fountain basins, interior pools, canal and
+        // harbour water -- placed into world space here for the same reason
+        // collision is: the grid only indexes what has a world position.
+        let mut wmo_liquid_surfaces: Vec<(u16, Vec<[Vec3; 4]>)> = Vec::new();
         for (path, transforms) in groups {
             let Some(model) = self.model(gpu, meshes, chain, &path) else {
                 continue;
@@ -1348,6 +1360,19 @@ impl World {
                     );
                 }
             }
+            for wmo_liquid in &model.liquids {
+                for transform in &transforms {
+                    wmo_liquid_surfaces.push((
+                        wmo_liquid.liquid_type,
+                        wmo_liquid
+                            .cells
+                            .iter()
+                            .map(|quad| quad.map(|corner| transform.transform_point3(corner)))
+                            .collect(),
+                    ));
+                }
+            }
+
             meshes.prepare(gpu, model.draws.iter().map(|d| d.state));
             let map_animation = self.ensure_map_animation(gpu, meshes, &path, &model);
             let raw: Vec<Instance> = transforms
@@ -1379,6 +1404,21 @@ impl World {
             tile.1,
             solid.triangle_count()
         );
+        let wmo_liquid = crate::liquid::build_wmo(
+            gpu,
+            liquid_renderer,
+            chain,
+            &mut self.liquid_types,
+            &wmo_liquid_surfaces,
+        );
+        if wmo_liquid.is_some() {
+            tracing::debug!(
+                "tile {},{} carries {} WMO liquid cell(s)",
+                tile.0,
+                tile.1,
+                wmo_liquid_surfaces.iter().map(|(_, c)| c.len()).sum::<usize>()
+            );
+        }
         Ok(Tile {
             terrain,
             groups: built,
@@ -1386,6 +1426,7 @@ impl World {
             heights: TileHeights::new(&parsed.chunks, &parsed.liquid),
             solid_bounds,
             solid,
+            wmo_liquid,
         })
     }
 
@@ -1855,6 +1896,7 @@ impl World {
             group_interior: Vec<bool>,
             render_bounds: Option<(Vec3, Vec3)>,
             doodads: Vec<Vec<crate::world_object::Doodad>>,
+            liquids: Vec<crate::world_object::WmoLiquid>,
             texture_animation: crate::model::TextureAnimation,
         }
 
@@ -1890,6 +1932,7 @@ impl World {
                         group_interior: w.group_interior,
                         render_bounds: Some((w.min, w.max)),
                         doodads: w.doodads,
+                        liquids: w.liquids,
                     }
                 })
                 .ok()
@@ -1931,6 +1974,7 @@ impl World {
                         group_interior: Vec::new(),
                         render_bounds: Some((m.min, m.max)),
                         doodads: Vec::new(),
+                        liquids: Vec::new(),
                     }
                 })
                 .ok()
@@ -1964,6 +2008,7 @@ impl World {
                 group_surface_ids: b.group_surface_ids,
                 group_interior: b.group_interior,
                 render_bounds: b.render_bounds,
+                liquids: b.liquids,
             })
         })
     }
@@ -2007,6 +2052,13 @@ impl World {
 
     pub fn tiles(&self) -> impl Iterator<Item = &Tile> {
         self.tiles.values()
+    }
+
+    /// The `MLIQ` water from buildings on every streamed tile -- fountain
+    /// basins, interior pools, the Stormwind canals. Chained into the same
+    /// draw as the terrain's liquid.
+    pub fn wmo_liquids(&self) -> impl Iterator<Item = &crate::liquid::LoadedLiquid> {
+        self.tiles.values().filter_map(|tile| tile.wmo_liquid.as_ref())
     }
 
     /// Objects placed by the server, drawn alongside the map's own geometry.
@@ -3032,6 +3084,7 @@ impl World {
                     group_surface_ids: Vec::new(),
                     group_interior: Vec::new(),
                     render_bounds: Some((loaded.min, loaded.max)),
+                    liquids: Vec::new(),
                 })
             })
             // Timed on this side too: a load that *fails* still reads the

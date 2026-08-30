@@ -17,7 +17,7 @@
 
 pub mod group;
 
-pub use group::Group;
+pub use group::{Group, Liquid};
 
 /// The version a 3.3.5a client ships.
 pub const VERSION_WOTLK: u32 = 17;
@@ -429,5 +429,126 @@ mod tests {
         assert_eq!(string_at(block, 0), "first");
         assert_eq!(string_at(block, 6), "second");
         assert_eq!(string_at(block, 999), "");
+    }
+
+    /// A group's `MLIQ` surface, off a known-good synthetic body shaped like
+    /// the Stormwind fountain's: a small grid, all cells wet, one flat height.
+    #[test]
+    fn a_group_liquid_grid_parses() {
+        let mut header = vec![0u8; 68];
+        header[0..4].copy_from_slice(&(-1i32).to_le_bytes()); // no name
+        header[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        header[52..56].copy_from_slice(&0u32.to_le_bytes()); // groupLiquid: water
+
+        // MOVT so the group has geometry and `validate` has something to check.
+        let mut movt = Vec::new();
+        for v in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            for c in v {
+                movt.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+
+        // MLIQ: 3x3 verts, 2x2 tiles, corner (10,20,5), every height 5.0,
+        // every tile 0x40 (wet).
+        let mut mliq = Vec::new();
+        mliq.extend_from_slice(&3u32.to_le_bytes());
+        mliq.extend_from_slice(&3u32.to_le_bytes());
+        mliq.extend_from_slice(&2u32.to_le_bytes());
+        mliq.extend_from_slice(&2u32.to_le_bytes());
+        for c in [10.0f32, 20.0, 5.0] {
+            mliq.extend_from_slice(&c.to_le_bytes());
+        }
+        mliq.extend_from_slice(&0u16.to_le_bytes()); // material
+        for _ in 0..9 {
+            mliq.extend_from_slice(&[0, 0, 0, 0]); // flow/light, unread
+            mliq.extend_from_slice(&5.0f32.to_le_bytes()); // height
+        }
+        mliq.extend_from_slice(&[0x40, 0x40, 0x40, 0x0F]); // last tile dry
+
+        let mut mogp = header;
+        for (magic, payload) in [(b"MOVT", movt), (b"MLIQ", mliq)] {
+            mogp.extend_from_slice(&[magic[3], magic[2], magic[1], magic[0]]);
+            mogp.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            mogp.extend_from_slice(&payload);
+        }
+
+        let file = chunked(&[
+            (b"MVER", 17u32.to_le_bytes().to_vec()),
+            (b"MOGP", mogp),
+        ]);
+        let group = group::Group::parse(&file, &[]).unwrap();
+
+        assert_eq!(group.group_liquid, 0);
+        assert!(group.has_liquid());
+        let liquid = group.liquid.as_ref().unwrap();
+        assert_eq!((liquid.verts_x, liquid.verts_y), (3, 3));
+        assert_eq!((liquid.tiles_x, liquid.tiles_y), (2, 2));
+        assert_eq!(liquid.corner, [10.0, 20.0, 5.0]);
+        assert_eq!(liquid.height(2, 2), 5.0);
+        assert!(liquid.cell_wet(0, 0));
+        assert!(liquid.cell_wet(1, 0));
+        assert!(!liquid.cell_wet(1, 1), "0x0F is the dry sentinel");
+        assert!(!liquid.cell_wet(9, 9), "out of range is dry, not a panic");
+
+        // `groupLiquid` 0 -> take the type off the first wet tile's low
+        // nibble (`0x40 & 0xF == 0`), `+1`, convert -> `LiquidType.dbc` 13,
+        // "WMO Water".
+        assert_eq!(group.liquid_type(), Some(13));
+
+        // A body one byte short of its announced grid is dropped, not read as
+        // zeroes.
+        let short = &file[..file.len() - 1];
+        assert!(group::Group::parse(short, &[])
+            .map(|g| g.liquid.is_none())
+            .unwrap_or(true));
+    }
+
+    /// The legacy `groupLiquid` conversion, the same one every reference map
+    /// extractor runs. Not a DBC id: `15` is "no liquid", everything else is
+    /// `+1`'d and mapped by its low bits.
+    #[test]
+    fn a_legacy_group_liquid_index_converts_to_a_dbc_row() {
+        // Header only, no chunks -- `liquid_type` reads `MLIQ` from `liquid`,
+        // so build one directly.
+        let with = |group_liquid: u32, flags: u32, tiles: Vec<u8>| group::Group {
+            flags,
+            bounding_box: ([0.0; 3], [0.0; 3]),
+            name: String::new(),
+            descriptive_name: String::new(),
+            group_id: 0,
+            portal_start: 0,
+            portal_count: 0,
+            batch_counts: Default::default(),
+            vertices: Vec::new(),
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            indices: Vec::new(),
+            triangle_materials: Vec::new(),
+            batches: Vec::new(),
+            vertex_colors: Vec::new(),
+            doodad_refs: Vec::new(),
+            group_liquid,
+            liquid: Some(group::Liquid {
+                verts_x: 2,
+                verts_y: 2,
+                tiles_x: 1,
+                tiles_y: 1,
+                corner: [0.0; 3],
+                heights: vec![0.0; 4],
+                tiles,
+            }),
+        };
+
+        // Stormwind's canals: `5` -> `+1` -> `6` -> `(6-1)&3 == 1` -> row 14,
+        // "WMO Ocean".
+        assert_eq!(with(5, 0, vec![0x40]).liquid_type(), Some(14));
+        // Northshire's fountain: header says `15` (no liquid), so the type
+        // comes off the tile -- low nibble `4`, `+1` -> `5`, `(5-1)&3 == 0`
+        // -> row 13, "WMO Water".
+        assert_eq!(with(15, 0, vec![0x44]).liquid_type(), Some(13));
+        // The `0x80000` group flag turns that fresh water into "WMO Ocean".
+        assert_eq!(with(15, 0x0008_0000, vec![0x44]).liquid_type(), Some(14));
+        // `15` with every tile dry is genuinely no liquid.
+        assert_eq!(with(15, 0, vec![0x0F]).liquid_type(), None);
     }
 }

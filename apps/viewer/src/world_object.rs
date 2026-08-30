@@ -60,12 +60,32 @@ pub struct LoadedWmo {
     pub doodads: Vec<Vec<Doodad>>,
     pub doodad_sets: Vec<String>,
     pub missing_textures: Vec<String>,
+    /// The liquid surfaces the groups declare via `MLIQ` -- fountain basins,
+    /// interior pools, canal and harbour water. In model space, so a placed
+    /// copy transforms them the same way it transforms its walls. `MH2O` on
+    /// the terrain never reaches under a `.wmo`, so without this every one of
+    /// them is a dry hole.
+    pub liquids: Vec<WmoLiquid>,
 }
 
 #[derive(Clone)]
 pub struct Doodad {
     pub path: String,
     pub transform: Mat4,
+}
+
+/// One group's liquid surface, reduced to the wet cells' corners in model
+/// space so the placement path only has to transform points.
+#[derive(Clone)]
+pub struct WmoLiquid {
+    /// `LiquidType.dbc` row, taken straight from the group header's
+    /// `groupLiquid` (which is a DBC id), or `13` "WMO Water" when that is
+    /// `0`. `LiquidTypes` resolves it to a look and loads its art, falling
+    /// back to plain blue water for a type it does not recognise.
+    pub liquid_type: u16,
+    /// One `[bottom-left, bottom-right, top-left, top-right]` quad per wet
+    /// cell, the corner order [`crate::liquid::build`] winds.
+    pub cells: Vec<[Vec3; 4]>,
 }
 
 /// The `TerrainType` row a WMO material names when it declines to say what
@@ -250,6 +270,7 @@ pub fn load_with_areas(
     let mut collision: Vec<[[f32; 3]; 3]> = Vec::new();
     let mut collision_footing: Vec<u8> = Vec::new();
     let mut collision_area: Vec<u32> = Vec::new();
+    let mut liquids: Vec<WmoLiquid> = Vec::new();
     let group_bounds = root
         .groups
         .iter()
@@ -276,6 +297,49 @@ pub fn load_with_areas(
             continue;
         }
         group_count += 1;
+
+        // The group's liquid, reduced to the corners of its wet cells in
+        // model space. `4.1666` per tile is `adt::UNIT_SIZE` -- WMO liquid
+        // tiles and terrain `MH2O` cells are the same size.
+        if let (Some(surface), Some(liquid_type)) = (&group.liquid, group.liquid_type()) {
+            const TILE: f32 = 1600.0 / 3.0 / 16.0 / 8.0;
+            let corner = Vec3::from(surface.corner);
+            // The `MLIQ` vertex height is an absolute local `z`; only `x`/`y`
+            // step from the corner.
+            let vertex = |i: u32, j: u32| {
+                Vec3::new(
+                    corner.x + i as f32 * TILE,
+                    corner.y + j as f32 * TILE,
+                    surface.height(i, j),
+                )
+            };
+            let mut cells = Vec::new();
+            for j in 0..surface.tiles_y {
+                for i in 0..surface.tiles_x {
+                    if !surface.cell_wet(i, j) {
+                        continue;
+                    }
+                    cells.push([
+                        vertex(i, j),
+                        vertex(i + 1, j),
+                        vertex(i, j + 1),
+                        vertex(i + 1, j + 1),
+                    ]);
+                }
+            }
+            if !cells.is_empty() {
+                tracing::debug!(
+                    "{path} group {gi}: MLIQ {}x{} verts, groupLiquid {} -> LiquidType {}, {} wet cell(s), corner {corner:?}",
+                    surface.verts_x,
+                    surface.verts_y,
+                    group.group_liquid,
+                    liquid_type,
+                    cells.len(),
+                );
+                liquids.push(WmoLiquid { liquid_type, cells });
+            }
+        }
+
         let surface_id = areas
             .and_then(|areas| areas.get(root.header.wmo_id, group.group_id))
             .map(|area| area.row_id)
@@ -415,6 +479,7 @@ pub fn load_with_areas(
             .map(|s| format!("{} ({})", s.name, s.count))
             .collect(),
         missing_textures,
+        liquids,
     })
 }
 

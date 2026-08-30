@@ -11143,6 +11143,31 @@ fn wmo_info(chain: &mut Chain, path: &str, limit: usize) -> Result<()> {
                 if group.is_interior() { "interior " } else { "exterior " },
                 if group.has_vertex_colors() { "vcolors " } else { "" },
             );
+            if let Some(surface) = &group.liquid {
+                println!(
+                    "         liquid: {}x{} verts, groupLiquid {} -> LiquidType {:?}, corner [{:.1} {:.1} {:.1}]",
+                    surface.verts_x,
+                    surface.verts_y,
+                    group.group_liquid,
+                    group.liquid_type(),
+                    surface.corner[0],
+                    surface.corner[1],
+                    surface.corner[2],
+                );
+            }
+            for (b, batch) in group.batches.iter().enumerate() {
+                let mat = root.materials.get(batch.material_id as usize);
+                let (blend, flags, tex) = match mat {
+                    Some(m) => (m.blend_mode, m.flags, root.texture(m.texture1).to_string()),
+                    None => (u32::MAX, 0, String::from("<no material>")),
+                };
+                println!(
+                    "         batch {b:>2}: mat {:>2} blend {blend} matflags {flags:#06x} bflags {:#04x} {:>4} tris  {tex}",
+                    batch.material_id,
+                    batch.flags,
+                    batch.triangle_count(),
+                );
+            }
         }
         if let Err(e) = group.validate() {
             println!("         INVALID: {e}");

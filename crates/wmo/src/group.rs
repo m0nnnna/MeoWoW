@@ -85,6 +85,60 @@ pub struct Group {
     pub vertex_colors: Vec<[u8; 4]>,
     /// Indices into the root's doodad list.
     pub doodad_refs: Vec<u16>,
+    /// The group header's `groupLiquid` -- the raw legacy liquid family, used
+    /// with `& 3` to pick water / ocean / magma / slime. `0` for a group with
+    /// no liquid.
+    pub group_liquid: u32,
+    /// The `MLIQ` surface, when the group has one.
+    pub liquid: Option<Liquid>,
+}
+
+/// A group's `MLIQ` chunk: a rectangular grid of liquid surface heights and a
+/// per-cell mask saying which cells actually hold liquid.
+///
+/// This is how a fountain basin, an interior pool, a canal or harbour water
+/// inside a building gets its surface -- `MH2O` on the terrain is a separate
+/// thing and never covers what sits under a `.wmo`.
+///
+/// The grid is `verts_x` by `verts_y` vertices (one more each way than the
+/// tile counts). Vertex `(i, j)` sits at `corner + (i * TILE, j * TILE, h)` in
+/// the group's own space, where `TILE` is `4.1666` -- the same
+/// `adt::UNIT_SIZE` the terrain liquid uses -- and `h` is [`Liquid::heights`]
+/// at `j * verts_x + i`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Liquid {
+    pub verts_x: u32,
+    pub verts_y: u32,
+    pub tiles_x: u32,
+    pub tiles_y: u32,
+    /// The grid's minimum corner, in group-local space.
+    pub corner: [f32; 3],
+    /// One surface height per vertex, row-major with `x` fastest.
+    pub heights: Vec<f32>,
+    /// One byte per tile, row-major with `x` fastest. A tile is dry when the
+    /// low nibble is `0xF` -- the "no liquid" sentinel; other bits carry the
+    /// liquid type and flags this client does not read.
+    pub tiles: Vec<u8>,
+}
+
+impl Liquid {
+    /// Whether the tile at `(i, j)` holds liquid. Out-of-range is dry.
+    pub fn cell_wet(&self, i: u32, j: u32) -> bool {
+        if i >= self.tiles_x || j >= self.tiles_y {
+            return false;
+        }
+        self.tiles
+            .get((j * self.tiles_x + i) as usize)
+            .is_some_and(|flag| flag & 0x0F != 0x0F)
+    }
+
+    /// The surface height at vertex `(i, j)`.
+    pub fn height(&self, i: u32, j: u32) -> f32 {
+        self.heights
+            .get((j * self.verts_x + i) as usize)
+            .copied()
+            .unwrap_or(0.0)
+    }
 }
 
 /// Batches are grouped by how they are lit and blended, and the counts say
@@ -178,6 +232,34 @@ impl Group {
             .map(|v| u16::from_le_bytes([v[0], v[1]]))
             .collect();
 
+        // `MLIQ`: a 30-byte header, then `verts_x * verts_y` eight-byte vertex
+        // records whose trailing `f32` is the surface height, then
+        // `tiles_x * tiles_y` mask bytes. A body too short for the counts it
+        // announces is dropped rather than read as a grid of zeroes.
+        let liquid = {
+            let mliq = find(b"MLIQ");
+            let header_ok = mliq.len() >= 30;
+            let (vx, vy, tx, ty) = if header_ok {
+                (u32_at(mliq, 0), u32_at(mliq, 4), u32_at(mliq, 8), u32_at(mliq, 12))
+            } else {
+                (0, 0, 0, 0)
+            };
+            let verts = (vx as usize).saturating_mul(vy as usize);
+            let tiles_n = (tx as usize).saturating_mul(ty as usize);
+            let need = 30usize
+                .saturating_add(verts.saturating_mul(8))
+                .saturating_add(tiles_n);
+            (header_ok && verts > 0 && mliq.len() >= need).then(|| Liquid {
+                verts_x: vx,
+                verts_y: vy,
+                tiles_x: tx,
+                tiles_y: ty,
+                corner: vec3_at(mliq, 16),
+                heights: (0..verts).map(|k| f32_at(mliq, 30 + k * 8 + 4)).collect(),
+                tiles: mliq[30 + verts * 8..30 + verts * 8 + tiles_n].to_vec(),
+            })
+        };
+
         Ok(Self {
             flags: u32_at(mogp, 8),
             bounding_box: (vec3_at(mogp, 12), vec3_at(mogp, 24)),
@@ -199,6 +281,8 @@ impl Group {
             batches,
             vertex_colors,
             doodad_refs,
+            group_liquid: u32_at(mogp, 52),
+            liquid,
         })
     }
 
@@ -211,8 +295,57 @@ impl Group {
     pub fn has_vertex_colors(&self) -> bool {
         self.flags & 0x04 != 0
     }
+    /// Whether the group carries a liquid surface.
+    ///
+    /// Reads the parsed `MLIQ`, not the `0x1000` header flag: across the
+    /// Stormwind city object, every group with an `MLIQ` chunk -- the
+    /// fountains, the canals, the harbour -- has that flag *clear*, so trusting
+    /// it drew no interior water anywhere.
     pub fn has_liquid(&self) -> bool {
-        self.flags & 0x1000 != 0
+        self.liquid.is_some()
+    }
+
+    /// The `LiquidType.dbc` row this group's surface should be drawn as, or
+    /// `None` when it has no surface or none that renders.
+    ///
+    /// **`groupLiquid` is not a DBC id in a pre-Cata `.wmo`.** It is a legacy
+    /// family index that has to be converted -- `15` means "no liquid", and
+    /// any other value is `+1`'d and then mapped by its low two bits to one
+    /// of the four "WMO Water/Ocean/Magma/Slime" rows. When the header says
+    /// nothing (`0` or `15`), the type comes off the first wet tile's own low
+    /// nibble the same way. This is the conversion every reference map
+    /// extractor runs; taking `groupLiquid` at face value drew the Northshire
+    /// fountain as green lava (raw `15` == `LiquidType.dbc` "Green Lava").
+    pub fn liquid_type(&self) -> Option<u16> {
+        let surface = self.liquid.as_ref()?;
+        let convert = |id: u32| -> u32 {
+            if id != 0 && id < 21 {
+                match id.wrapping_sub(1) & 3 {
+                    // The `0x0008_0000` bit picks "WMO Ocean" over "WMO Water"
+                    // for an otherwise-fresh-water group, matching the
+                    // extractor exactly.
+                    0 => u32::from(self.flags & 0x0008_0000 != 0) + 13,
+                    1 => 14,
+                    2 => 19,
+                    _ => 20,
+                }
+            } else {
+                id
+            }
+        };
+        let mut resolved = match self.group_liquid {
+            0 | 15 => 0,
+            other => convert(other + 1),
+        };
+        if resolved == 0 {
+            for &tile in &surface.tiles {
+                if tile & 0x0F != 0x0F {
+                    resolved = convert(u32::from(tile & 0x0F) + 1);
+                    break;
+                }
+            }
+        }
+        (resolved != 0).then_some(resolved as u16)
     }
 
     pub fn triangle_count(&self) -> usize {
