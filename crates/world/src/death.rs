@@ -113,6 +113,19 @@ pub fn parse_reclaim_delay(body: &[u8]) -> Result<u32, Error> {
     Ok(delay)
 }
 
+/// Reads `SMSG_SPIRIT_HEALER_CONFIRM`: the spirit healer's guid, **unpacked**
+/// -- eight plain bytes.
+///
+/// The server sends this once a graveyard spirit healer's gossip line has been
+/// chosen. It is an offer, not an effect: the character is still a ghost until
+/// the client answers with `CMSG_SPIRIT_HEALER_ACTIVATE` naming the same guid.
+pub fn parse_spirit_healer_confirm(body: &[u8]) -> Result<u64, Error> {
+    let mut r = Reader::new(body, "SMSG_SPIRIT_HEALER_CONFIRM");
+    let healer = r.u64()?;
+    r.finish()?;
+    Ok(healer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +180,18 @@ mod tests {
     #[test]
     fn no_corpse_is_a_one_byte_answer_rather_than_a_failure() {
         assert_eq!(parse_corpse_query(&[0]).unwrap(), None);
+    }
+
+    #[test]
+    fn a_spirit_healer_confirm_is_an_unpacked_guid() {
+        let guid = 0xf130_0000_0000_1963u64;
+        assert_eq!(
+            parse_spirit_healer_confirm(&guid.to_le_bytes()).unwrap(),
+            guid
+        );
+        // One byte short and one byte long are both errors.
+        assert!(parse_spirit_healer_confirm(&[0; 7]).is_err());
+        assert!(parse_spirit_healer_confirm(&[0; 9]).is_err());
     }
 
     #[test]

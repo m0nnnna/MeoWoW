@@ -1612,6 +1612,22 @@ impl Connection {
         self.send(ClientOpcode::ReclaimCorpse, &corpse.to_le_bytes())
     }
 
+    /// Accepts a spirit healer's offer to resurrect at the graveyard, the way
+    /// back to life that needs no corpse run.
+    ///
+    /// The guid is the spirit healer's, **unpacked**, and must match the one
+    /// [`SMSG_SPIRIT_HEALER_CONFIRM`](crate::opcode::server::SPIRIT_HEALER_CONFIRM)
+    /// just carried -- the server re-resolves it and refuses in silence if it
+    /// is not a spirit healer within interaction range. Sending it unprompted
+    /// does nothing: the confirm is what makes the character eligible.
+    ///
+    /// Nothing acknowledges it directly. What confirms it is the ghost flag
+    /// clearing and health returning, both replicated -- and, usually, a
+    /// same-map teleport to the graveyard nearest the body.
+    pub fn spirit_healer_activate(&mut self, healer: u64) -> Result<(), Error> {
+        self.send(ClientOpcode::SpiritHealerActivate, &healer.to_le_bytes())
+    }
+
     /// Milliseconds since the connection opened, as the movement clock.
     pub fn tick(&self) -> u32 {
         self.started.elapsed().as_millis() as u32

@@ -261,6 +261,17 @@ pub enum ClientOpcode {
     /// elapsed. Five ways to get nothing back, none of which says which.
     ReclaimCorpse = 0x01D2,
 
+    /// Accept a spirit healer's resurrection: come back to life *here*, at the
+    /// graveyard, with resurrection sickness, instead of running back to the
+    /// body. Carries the spirit healer's guid, **unpacked** -- eight plain
+    /// bytes, the same encoding [`Self::ReclaimCorpse`] uses.
+    ///
+    /// Sent only in answer to [`server::SPIRIT_HEALER_CONFIRM`], which the
+    /// server volunteers after the `GOSSIP_OPTION_SPIRITHEALER` menu line is
+    /// chosen. Nothing acknowledges it directly -- what confirms it is the
+    /// ghost flag clearing and health coming back, replicated.
+    SpiritHealerActivate = 0x021C,
+
     // Movement. These are `MSG_` rather than `CMSG_`: the same opcode travels
     // in both directions, the client reporting its own movement and the server
     // relaying someone else's. Only the framing differs -- inbound packets are
@@ -1489,6 +1500,16 @@ pub mod server {
     /// Sent on death: how long before the corpse can be reclaimed, in
     /// milliseconds. Observed carrying exactly 30000.
     pub const CORPSE_RECLAIM_DELAY: u16 = 0x0269;
+
+    /// The spirit healer offering to bring this character back to life at the
+    /// graveyard. Eight bytes, the healer's guid, unpacked.
+    ///
+    /// Arrives after the graveyard spirit healer's gossip line is chosen --
+    /// the server casts spell 17251 on the healer, whose only effect is to
+    /// send this. The client answers with
+    /// [`crate::ClientOpcode::SpiritHealerActivate`] to accept. See
+    /// [`crate::death::parse_spirit_healer_confirm`].
+    pub const SPIRIT_HEALER_CONFIRM: u16 = 0x0222;
     /// A unit's threat list dropping someone: `{packed guid, packed guid}`,
     /// the list's owner then whoever left it. Arrives twice on death, once per
     /// creature that had us.
@@ -1629,6 +1650,7 @@ pub fn describe(opcode: u16) -> String {
         server::CORPSE_QUERY => "MSG_CORPSE_QUERY",
         server::DEATH_RELEASE_LOC => "SMSG_DEATH_RELEASE_LOC",
         server::CORPSE_RECLAIM_DELAY => "SMSG_CORPSE_RECLAIM_DELAY",
+        server::SPIRIT_HEALER_CONFIRM => "SMSG_SPIRIT_HEALER_CONFIRM",
         server::THREAT_REMOVE => "SMSG_THREAT_REMOVE",
         server::CANCEL_COMBAT => "SMSG_CANCEL_COMBAT",
         server::DURABILITY_DAMAGE_DEATH => "SMSG_DURABILITY_DAMAGE_DEATH",

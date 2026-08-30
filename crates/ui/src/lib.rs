@@ -5076,6 +5076,7 @@ mod tests {
     fn clicking_the_release_prompt_reports_it() {
         let view = frames::ReleasePromptView {
             text: "You have died.".into(),
+            body_bearing: None,
         };
         let data = HudData {
             release_prompt: Some(&view),
@@ -5104,6 +5105,7 @@ mod tests {
 
         let view = frames::ReleasePromptView {
             text: "You have died.".into(),
+            body_bearing: None,
         };
         let mut open = Hud::default();
         hide_bars(&mut open);

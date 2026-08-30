@@ -7,6 +7,7 @@
 //! here needs `loot`'s row geometry.
 
 use egui::{Align2, Color32, FontId, Painter, Rect, Stroke, StrokeKind, Vec2};
+use egui::emath::Rot2;
 
 use crate::style::Style;
 
@@ -18,6 +19,15 @@ pub struct ReleasePromptView {
     /// wording it wants ("You have died." versus a delay-specific message)
     /// and this crate has no business duplicating that judgement.
     pub text: String,
+    /// Which way the character's body lies, as a screen-space angle in
+    /// radians: `0` points right, `+` turns clockwise (egui's y grows
+    /// downward). `None` while alive, before the corpse query is answered, or
+    /// while not a ghost -- there is nothing to point at.
+    ///
+    /// Resolved by the caller from the camera and the body's world position,
+    /// the same division of labour the world-anchored markers use: this crate
+    /// draws the arrow it is handed and knows nothing about where a corpse is.
+    pub body_bearing: Option<f32>,
 }
 
 impl ReleasePromptView {
@@ -27,6 +37,7 @@ impl ReleasePromptView {
     pub fn placeholder() -> Self {
         Self {
             text: "You have died. Click to release your spirit.".into(),
+            body_bearing: Some(-std::f32::consts::FRAC_PI_2),
         }
     }
 }
@@ -52,6 +63,34 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ReleasePromptView, style: &Sty
     );
 
     let inner = rect.shrink(style.padding * scale);
+
+    // The body arrow sits at the left end of the prompt, clear of the
+    // centred text. A ghost that has released has one thing left to do --
+    // reach the body -- and until now the only hint of which way that was
+    // lay on the minimap. Drawn before the text's clip rect is set so it is
+    // not clipped away.
+    if let Some(bearing) = view.body_bearing {
+        let disc = (style.bar_height * scale * 0.75).max(7.0);
+        let centre = egui::pos2(inner.left() + disc, rect.center().y);
+        painter.circle_filled(centre, disc, style.background);
+        painter.circle_stroke(
+            centre,
+            disc,
+            Stroke::new(style.border_width.max(1.0) * scale, stroke_color),
+        );
+        let rot = Rot2::from_angle(bearing);
+        let tip = centre + rot * egui::vec2(disc * 0.72, 0.0);
+        let back = disc * 0.5;
+        let wing = disc * 0.5;
+        let left = centre + rot * egui::vec2(-back, -wing);
+        let right = centre + rot * egui::vec2(-back, wing);
+        painter.add(egui::Shape::convex_polygon(
+            vec![tip, left, right],
+            stroke_color,
+            Stroke::NONE,
+        ));
+    }
+
     let painter = painter.with_clip_rect(inner);
     let font = FontId::proportional(style.font_size * scale);
     painter.text(

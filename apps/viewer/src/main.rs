@@ -13142,6 +13142,11 @@ impl App {
         // `self.chat`, and `live` is borrowed for the whole drain.
         let mut party_results: Vec<String> = Vec::new();
         let mut worldport_changed = false;
+        // A spirit healer offering to resurrect this ghost at the graveyard.
+        // Collected here and answered below the `live` borrow, the same shape
+        // every other reply in this drain uses. Last write wins: a second
+        // confirm can only be the same offer resent.
+        let mut spirit_healer_confirm: Option<u64> = None;
         match live.connection.drain(Duration::from_millis(1), 64) {
             // Every batch has to go through all the kinds of change replicate
             // handles -- object updates, relayed movement, monster moves,
@@ -13875,6 +13880,24 @@ impl App {
                                 }
                             }
                         }
+                        // A spirit healer offering to bring this ghost back to
+                        // life where it stands. The server sends it once the
+                        // spirit-healer gossip line has been chosen; the way
+                        // to accept is to answer with the same guid, which is
+                        // done below so `self` is free to take a chat line.
+                        ::world::opcode::server::SPIRIT_HEALER_CONFIRM => {
+                            match ::world::death::parse_spirit_healer_confirm(&packet.body) {
+                                Ok(healer) => {
+                                    tracing::info!(
+                                        "spirit healer {healer:#018x} offers resurrection"
+                                    );
+                                    spirit_healer_confirm = Some(healer);
+                                }
+                                Err(error) => tracing::warn!(
+                                    "a spirit healer confirm would not parse: {error}"
+                                ),
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -14104,6 +14127,34 @@ impl App {
                 if let Err(e) = live.connection.trainer_list(npc) {
                     tracing::warn!("re-asking the trainer failed: {e:#}");
                 }
+            }
+        }
+
+        // **The spirit healer's offer is accepted straight away.** The player
+        // has already said what they want by choosing the resurrect line in
+        // the gossip menu; the real client's second confirm dialog only
+        // exists to warn about the weakness that follows, which the chat line
+        // below says instead. Answering with the healer's own guid is what
+        // brings the ghost back to life -- weakened, but with no corpse run.
+        // The gossip window that produced the offer has done its job, so it
+        // is closed.
+        if let Some(healer) = spirit_healer_confirm {
+            let is_ghost = live.state.get(live.guid).is_some_and(|e| e.is_ghost());
+            if is_ghost {
+                if let Err(e) = live.connection.spirit_healer_activate(healer) {
+                    tracing::warn!("accepting the spirit healer failed: {e:#}");
+                } else {
+                    tracing::info!("accepted spirit healer {healer:#018x}");
+                    self.questgiver = None;
+                    self.chat.push(Line::Chat(local_notice(
+                        "The spirit healer returns you to life. You feel weakened."
+                            .to_string(),
+                    )));
+                }
+            } else {
+                tracing::debug!(
+                    "a spirit healer confirm arrived while not a ghost, ignored"
+                );
             }
         }
 
@@ -14921,6 +14972,75 @@ impl App {
             )
         });
 
+        // The character's own current corpse: which object it is, and where.
+        //
+        // Resolved once and kept, because three things need it and they must
+        // not disagree -- the bracket drawn around the body, the request that
+        // asks for it back, and the direction arrow on the dead screen.
+        // Available from the moment the server answers `MSG_CORPSE_QUERY` --
+        // see `own_corpse_query_sent`. The guid has to come from a replicated
+        // object nearest that answer, exactly as `report_reclaim` in `wow-cli`
+        // does it: corpse-shaped objects include the bones of bodies already
+        // reclaimed, and bones carry the same owner guid as the current body,
+        // so owner alone picks a stale one.
+        //
+        // **Gated on still being dead.** `corpse_location` is only cleared on
+        // a worldport, so after resurrecting on the same map it lingers -- and
+        // the server leaves a bones object at the death site carrying this
+        // character's owner guid, which `own_corpses` matched. The result was
+        // a corpse bracket stuck on the bones for the rest of the session.
+        // Once alive there is nothing to run back to.
+        let dead_or_ghost = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.get(live.guid))
+            .is_some_and(|entity| entity.is_dead_or_ghost());
+        self.own_corpse = dead_or_ghost
+            .then(|| {
+                self.live.as_ref().and_then(|live| {
+                    let body_at = live.state.corpse_location?;
+                    let (guid, position) = live
+                        .state
+                        .own_corpses(live.guid)
+                        .filter_map(|c| c.position.map(|p| (c.guid, p)))
+                        .min_by(|a, b| {
+                            let d = |p: &::world::update::Position| {
+                                (p.x - body_at.x).powi(2) + (p.y - body_at.y).powi(2)
+                            };
+                            d(&a.1).total_cmp(&d(&b.1))
+                        })?;
+                    Some((guid, glam::Vec3::new(position.x, position.y, position.z)))
+                })
+            })
+            .flatten();
+        let corpse_marker = self
+            .own_corpse
+            .and_then(|(_, at)| hud::corpse_marker_rect(&self.camera, viewport, at));
+
+        // Where the body lies in the world, whatever the distance. The nearest
+        // replicated corpse object is the precise answer; `MSG_CORPSE_QUERY`'s
+        // coordinates are the fallback for a body too far off to be streamed
+        // at all -- which is the usual case for a fresh ghost at a graveyard.
+        // Only while dead, for the same reason `own_corpse` is.
+        let body_position = self.own_corpse.map(|(_, at)| at).or_else(|| {
+            dead_or_ghost
+                .then(|| self.live.as_ref().and_then(|live| live.state.corpse_location))
+                .flatten()
+                .map(|at| glam::Vec3::new(at.x, at.y, at.z))
+        });
+        // That world position turned into a screen-space bearing from the
+        // camera, so the dead screen can draw an arrow at it. Built off the
+        // camera's own right/up axes rather than the world orientation
+        // convention, so it needs no assumption about which way `+X` faces --
+        // the same reason picking unprojects the scene matrix instead of
+        // rebuilding it from yaw.
+        let body_bearing = body_position.and_then(|at| {
+            let to = at - self.camera.eye();
+            let (right, up) = self.camera.billboard_basis();
+            let (x, y) = (to.dot(right), to.dot(up));
+            (x.abs() > 1e-4 || y.abs() > 1e-4).then(|| (-y).atan2(x))
+        });
+
         // Present exactly while the character is dead: first as the release
         // prompt, then as the way back. Absent while alive, the same
         // "existence is the flag" shape the loot window uses. See
@@ -14938,58 +15058,32 @@ impl App {
             if !entity.is_ghost() {
                 return Some(ui::frames::ReleasePromptView {
                     text: "You have died.\nClick to release your spirit.".to_string(),
+                    body_bearing: None,
                 });
             }
-            // A ghost. What it can do depends on how far it has walked back.
-            Some(ui::frames::ReleasePromptView {
-                text: match self.own_corpse {
-                    Some((_, at)) => {
-                        let away = at.truncate().distance(live.position.truncate());
-                        if away <= CORPSE_RECLAIM_RADIUS {
-                            "You are a ghost.\nClick to return to your body.".to_string()
-                        } else {
-                            // The distance rather than a bare instruction: a
-                            // prompt that says "go back" without saying how
-                            // far is no better than the marker already on
-                            // screen.
-                            format!("You are a ghost.\nYour body is {away:.0} yards away.")
-                        }
+            // A ghost. What it can do depends on how far it has walked back --
+            // and the arrow points at the body the whole time.
+            let text = match body_position {
+                Some(at) => {
+                    let away = at.truncate().distance(live.position.truncate());
+                    if self.own_corpse.is_some() && away <= CORPSE_RECLAIM_RADIUS {
+                        "You are a ghost.\nClick to return to your body.".to_string()
+                    } else {
+                        // The distance rather than a bare instruction: a
+                        // prompt that says "go back" without saying how far
+                        // is no better than the marker already on screen.
+                        format!("You are a ghost.\nYour body is {away:.0} yards away.")
                     }
-                    // The query has been sent and not yet answered, or the
-                    // body is too far off to be a replicated object. Saying
-                    // so beats an instruction that cannot be followed.
-                    None => "You are a ghost.\nLooking for your body...".to_string(),
-                },
+                }
+                // The query has been sent and not yet answered. Saying so
+                // beats an instruction that cannot be followed.
+                None => "You are a ghost.\nLooking for your body...".to_string(),
+            };
+            Some(ui::frames::ReleasePromptView {
+                text,
+                body_bearing,
             })
         });
-
-        // The character's own current corpse: which object it is, and where.
-        //
-        // Resolved once and kept, because two things need it and they must not
-        // disagree -- the bracket drawn around the body, and the request that
-        // asks for it back. Available from the moment the server answers
-        // `MSG_CORPSE_QUERY` -- see `own_corpse_query_sent`. The guid has to
-        // come from a replicated object nearest that answer, exactly as
-        // `report_reclaim` in `wow-cli` does it: corpse-shaped objects include
-        // the bones of bodies already reclaimed, and bones carry the same
-        // owner guid as the current body, so owner alone picks a stale one.
-        self.own_corpse = self.live.as_ref().and_then(|live| {
-            let body_at = live.state.corpse_location?;
-            let (guid, position) = live
-                .state
-                .own_corpses(live.guid)
-                .filter_map(|c| c.position.map(|p| (c.guid, p)))
-                .min_by(|a, b| {
-                    let d = |p: &::world::update::Position| {
-                        (p.x - body_at.x).powi(2) + (p.y - body_at.y).powi(2)
-                    };
-                    d(&a.1).total_cmp(&d(&b.1))
-                })?;
-            Some((guid, glam::Vec3::new(position.x, position.y, position.z)))
-        });
-        let corpse_marker = self
-            .own_corpse
-            .and_then(|(_, at)| hud::corpse_marker_rect(&self.camera, viewport, at));
 
         // Every number still rising, oldest first. Pruned here rather than in
         // `pump_live_connection`, which runs on the network's schedule, not
