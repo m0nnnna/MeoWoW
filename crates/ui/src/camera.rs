@@ -31,6 +31,23 @@ pub struct Camera {
 
     /// How far back the camera starts, before the wheel moves it.
     pub distance: f32,
+
+    /// How far the world is drawn, in world units.
+    ///
+    /// **A preference and not a constant, because it is the largest single
+    /// lever on the frame and its right value is a judgement.** Measured at
+    /// Goldshire: 12,000 units against 397 is 3,713 draws against 2,035 and
+    /// 81 frames a second against 110, for under 1% of the pixels at eye
+    /// level -- but 13.8% from a rise, where the difference is a horizon.
+    /// The reference 3.3.5a client ships `farclip` at **397** and its own
+    /// slider stops at 777.
+    ///
+    /// Here rather than as a bare flag default for the reason the module
+    /// exists: a setting the player changes is one they expect to still be
+    /// there tomorrow. `--view-distance` still outranks it, because a flag
+    /// typed on purpose has to beat a setting typed once -- that is what
+    /// keeps a probe reproducible.
+    pub view_distance: f32,
 }
 
 impl Default for Camera {
@@ -41,6 +58,7 @@ impl Default for Camera {
             turn_per_window: 180.0,
             invert_pitch: false,
             distance: 9.0,
+            view_distance: DEFAULT_VIEW_DISTANCE,
         }
     }
 }
@@ -54,6 +72,21 @@ pub const MIN_TURN_PER_WINDOW: f32 = 45.0;
 /// The widest. Two full turns is already past the point where the view is hard
 /// to aim, and it is comfortably beyond the old accidental value.
 pub const MAX_TURN_PER_WINDOW: f32 = 720.0;
+
+/// What the world is drawn to unless told otherwise: the reference client's
+/// own `farclip`, read off the 3.3.5a install with the `MeoBench` addon.
+pub const DEFAULT_VIEW_DISTANCE: f32 = 397.0;
+
+/// The range the slider offers.
+///
+/// The near end is the reference client's own minimum rather than a number
+/// chosen here; the far end is past its maximum of 777, because this client
+/// keeps nine tiles resident and there is no reason to forbid seeing them.
+/// **Neither end is zero**: a view distance of nothing draws nothing, and a
+/// value read from a file a person can type into has to be clamped rather
+/// than trusted -- the same reason `radians_per_pixel` clamps.
+pub const MIN_VIEW_DISTANCE: f32 = 177.0;
+pub const MAX_VIEW_DISTANCE: f32 = 1600.0;
 
 /// The closest and furthest the camera may sit from its subject.
 ///
@@ -85,6 +118,17 @@ impl Camera {
     /// The starting distance, clamped to what the wheel may reach.
     pub fn start_distance(&self) -> f32 {
         self.distance.clamp(MIN_DISTANCE, MAX_DISTANCE)
+    }
+
+    /// How far to draw, clamped to what the slider offers.
+    ///
+    /// Named apart from the field so the unclamped value can still be
+    /// serialised: `ui.toml` records what the player chose, and this is what
+    /// the camera is given. Same split as `distance` and
+    /// [`Self::start_distance`].
+    pub fn far_plane(&self) -> f32 {
+        self.view_distance
+            .clamp(MIN_VIEW_DISTANCE, MAX_VIEW_DISTANCE)
     }
 
     /// The sign to apply to a vertical drag.
@@ -155,6 +199,25 @@ mod tests {
             let start = camera.start_distance();
             assert!((MIN_DISTANCE..=MAX_DISTANCE).contains(&start), "{distance} gave {start}");
         }
+    }
+
+    /// **A view distance of zero draws nothing**, and this value is read from
+    /// a file a person can type into -- so it is clamped rather than trusted,
+    /// exactly like the turn rate. The default is asserted alongside because
+    /// it is the number that decides what a double-click looks like.
+    #[test]
+    fn the_view_distance_is_clamped_and_defaults_to_the_reference() {
+        assert_eq!(Camera::default().far_plane(), DEFAULT_VIEW_DISTANCE);
+        for view_distance in [-1.0, 0.0, 1.0, 397.0, 900.0, 99_000.0] {
+            let far = Camera { view_distance, ..Default::default() }.far_plane();
+            assert!(
+                (MIN_VIEW_DISTANCE..=MAX_VIEW_DISTANCE).contains(&far),
+                "{view_distance} gave {far}"
+            );
+        }
+        // ...and a value inside the range is passed through untouched, or the
+        // clamp would be indistinguishable from ignoring the setting.
+        assert_eq!(Camera { view_distance: 600.0, ..Default::default() }.far_plane(), 600.0);
     }
 
     /// Inverting flips the sign and nothing else.

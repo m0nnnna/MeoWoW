@@ -181,6 +181,81 @@ impl Attention {
     }
 }
 
+/// How close a thing has to be to be worth simulating, independent of whether
+/// it is on screen.
+///
+/// **Separate from [`Attention`] because it answers a different question, and
+/// the two are wanted in different combinations.** `Attention` asks "is this
+/// worth working on", which is the frustum widened by a radius so a plume
+/// behind you keeps its history. That is the right rule for a skeleton and the
+/// wrong one for a candle: the frustum reaches the far plane, twelve thousand
+/// units by default, so turning to face down a village street admits every
+/// torch, lantern and candelabra in every building out to the horizon.
+/// Measured live at the Goldshire inn, turning on the spot: **110 emitters and
+/// 3,110 sprites facing the back wall, 1,614 and 21,330 facing the door**, for
+/// 98 fps against 54.
+///
+/// **What this trades away is history at the boundary.** An emitter coming
+/// back into range restarts with no plume, which is the very thing
+/// `Attention`'s radius exists to prevent -- so the bound has to be far
+/// enough out that the restart is sub-pixel. At 400 units a torch flame two
+/// units across subtends about five pixels at 720p, and the four-camera
+/// screenshot A/B against no bound at all is 0 differing pixels of 921,600,
+/// with a negative control (every emitter against none, inside the inn) of
+/// 238. Tightening it is not free the way widening it is.
+///
+/// The offline path is why this is not simply a second radius on `Attention`.
+/// `--screenshot` uses [`Attention::everything`] on purpose -- one frame has no
+/// history and the warm-up exists to build some -- so a rule folded into
+/// `wants` would be switched off in exactly the instrument that has to
+/// photograph it. A range is passed alongside instead, and the headless render
+/// applies the same one the window does, which is what makes a two-run pixel
+/// diff the control for this.
+#[derive(Clone, Copy)]
+pub struct Range {
+    centre: Vec3,
+    radius: f32,
+}
+
+impl Range {
+    /// Everything within `radius` of `centre`. A non-positive radius is
+    /// [`Self::unbounded`] -- **a range of zero is not a small world, it is a
+    /// world with no fires in it**, the same trap the streaming radius had.
+    pub fn around(centre: Vec3, radius: f32) -> Self {
+        Self {
+            centre,
+            radius: if radius > 0.0 { radius } else { f32::INFINITY },
+        }
+    }
+
+    /// No bound at all: what this client did before the range existed, and
+    /// what `--emitter-distance 0` restores.
+    pub fn unbounded() -> Self {
+        Self {
+            centre: Vec3::ZERO,
+            radius: f32::INFINITY,
+        }
+    }
+
+    /// **`None` means yes**, for the same reason [`Attention::wants`] says so:
+    /// a held torch's bounds are `None` by design -- it follows its wielder
+    /// rather than being judged on a box nobody keeps -- and a thing whose
+    /// extent this client cannot state is not evidence that it is far away.
+    pub fn holds(&self, bounds: Option<(Vec3, Vec3)>) -> bool {
+        if !self.radius.is_finite() {
+            return true;
+        }
+        let Some((min, max)) = bounds else {
+            return true;
+        };
+        // The box's own distance, not its origin's -- a building is not far
+        // away because the corner its transform names happens to be. Same
+        // clamp as `Attention::wants`, deliberately.
+        let nearest = self.centre.clamp(min, max);
+        nearest.distance_squared(self.centre) <= self.radius * self.radius
+    }
+}
+
 /// The world-space box a model-space box occupies once transformed.
 ///
 /// All eight corners, not the two transformed endpoints. Transforming `min`
@@ -343,6 +418,38 @@ mod tests {
         // check above is not passing for some other reason.
         let away = (Vec3::new(-1000.0, -10.0, -10.0), Vec3::new(-25.0, 10.0, 10.0));
         assert!(!at.wants(Some(away)));
+    }
+
+    #[test]
+    fn a_range_holds_what_is_near_and_refuses_what_is_far() {
+        let near = Range::around(Vec3::ZERO, 100.0);
+        assert!(near.holds(Some(unit_box(Vec3::new(50.0, 0.0, 0.0)))));
+        assert!(!near.holds(Some(unit_box(Vec3::new(500.0, 0.0, 0.0)))));
+        // Judged on the box, not its origin: a building whose far corner is
+        // over the hill still has a near face at arm's length.
+        let long = (Vec3::new(-5.0, -5.0, -5.0), Vec3::new(5000.0, 5.0, 5.0));
+        assert!(near.holds(Some(long)));
+    }
+
+    /// **A range of zero is a world with no fires in it**, so it is read as no
+    /// bound rather than as the tightest possible one -- the same call
+    /// `MIN_STREAM_RADIUS` makes, for the same reason: the value that looks
+    /// like "off" and the value that looks like "everything" are the same
+    /// keystroke, and only one of them is ever meant.
+    #[test]
+    fn a_zero_or_negative_range_is_no_bound() {
+        for radius in [0.0, -1.0] {
+            let r = Range::around(Vec3::ZERO, radius);
+            assert!(r.holds(Some(unit_box(Vec3::splat(1e9)))), "radius {radius}");
+        }
+        assert!(Range::unbounded().holds(Some(unit_box(Vec3::splat(1e9)))));
+    }
+
+    /// Bounds this client cannot state are not evidence of distance. A held
+    /// torch has none by design and must keep burning.
+    #[test]
+    fn a_range_keeps_what_has_no_bounds() {
+        assert!(Range::around(Vec3::ZERO, 1.0).holds(None));
     }
 
     #[test]

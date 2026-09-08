@@ -246,6 +246,83 @@ struct Args {
     #[arg(long)]
     present_mode: Option<String>,
 
+    /// Stop drawing the inside of a building the camera is not in, once that
+    /// building is this many units away. `0` skips every one of them.
+    ///
+    /// **The measurement `FrameProfile::unentered_draws` exists to justify,
+    /// made switchable so the win could be benched rather than argued.** 4.34
+    /// talked terrain batching up twice on reasoning and then settled it in one
+    /// run by disabling the work; this is that move for something much larger.
+    /// Standing in Goldshire, 1,571 of 1,819 building draws paint rooms inside
+    /// Stormwind, which is over the hill, and skipping all of them takes the
+    /// frame's CPU cost down by 36%.
+    ///
+    /// **The distance is the whole design, and `0` shows why it is needed.**
+    /// Skipping every unentered interior is not free: a doorway stops being a
+    /// dark room and becomes a hole you can see the grass through, which the
+    /// A/B catches as 7,514 differing pixels at Goldshire's blacksmith. That
+    /// artifact needs the *entrance* to be on screen, and an entrance far
+    /// enough away is a few pixels of shadow. So the rule is not "do not draw
+    /// interiors", it is "do not draw interiors nobody could resolve", and the
+    /// number is where those two part company -- found by rendering it, not by
+    /// choosing it.
+    ///
+    /// **150, and the sweep is why.** With the distance measured to the room
+    /// rather than to the building, 50, 100 and 200 give byte-identical frames
+    /// at Goldshire -- everything unentered there is either the blacksmith in
+    /// front of you at under 50 units or a city at over 200, with nothing in
+    /// between. 150 sits in that gap with margin on both sides, and a larger
+    /// number is the safer direction because it draws *more*.
+    #[arg(long, default_value_t = 150.0)]
+    interior_cull: f32,
+
+    /// How far this client draws, in world units. Fog is pulled in to match.
+    ///
+    /// **The reference client runs at 397.** That is what `GetCVar("farclip")`
+    /// returns on the 3.3.5a install this project is measured against, read
+    /// with the `MeoBench` addon; WoW's own slider tops out at 777. This client
+    /// has drawn to 12,000 since the fly camera was written, which with a
+    /// nine-tile residency means the far plane clips nothing at all and every
+    /// resident chunk in front of the camera is submitted.
+    ///
+    /// What that costs, measured at Goldshire: **1,506 draws against 610, and
+    /// 2.18 ms of CPU encode+submit against 0.67** -- and from a rise looking
+    /// over open forest, 1,962 against 956.
+    ///
+    /// **It is not free, and where it is not free is the interesting part.** At
+    /// eye level the cut is invisible (200 pixels differ past delta 2, against a
+    /// 100-pixel noise floor) because trees occlude everything beyond it. From a
+    /// high vantage over open ground the same cut changed **127,540 pixels**,
+    /// which is a landscape disappearing. Fog is what makes the difference, and
+    /// tying the two together is why this is one number and not two -- see
+    /// `fogged_to`.
+    ///
+    /// **An override, not the setting.** Unset, the saved
+    /// `ui::camera::Camera::view_distance` decides -- a slider in the `F1`
+    /// panel, written to `ui.toml` like every other preference, defaulting to
+    /// the reference client's own 397. Given, it wins, for the reason `--data`
+    /// wins over the remembered directory: a flag typed on purpose has to beat
+    /// a setting typed once, or no probe in `docs/ROADMAP.md` is reproducible
+    /// on a machine whose owner has moved the slider. Pass
+    /// `--view-distance 12000` for the horizon this client drew before the
+    /// setting existed.
+    #[arg(long)]
+    view_distance: Option<f32>,
+
+    /// Draw the inside of every building, however far away and whoever is in
+    /// it.
+    ///
+    /// **The A/B for `--interior-cull`, and the reason its zero is worth
+    /// anything.** The same argument as `--no-cull`: a rule that removes
+    /// geometry is only correct if it changes the frame time and nothing else,
+    /// and "nothing else" is not something an eye can certify -- a missing room
+    /// inside a building on the far side of a hill looks exactly like a hill.
+    /// Two `--screenshot` runs differing by this flag alone are 0 differing
+    /// pixels at Goldshire, and the negative control that makes that mean
+    /// something is `--interior-cull 0`, which reports 7,514.
+    #[arg(long)]
+    no_interior_cull: bool,
+
     /// Submit every draw, culling nothing against the frustum.
     ///
     /// **The instrument the culling is checked with, and the reason it can be
@@ -266,6 +343,25 @@ struct Args {
     /// behind you. One cascade, so it is one or the other.
     #[arg(long, default_value_t = 110.0)]
     shadow_radius: f32,
+
+    /// How far away an emitter stops being simulated, in world units.
+    /// `0` simulates every one of them, however far.
+    ///
+    /// **Not the same question as how far this client draws.** A room's
+    /// geometry over the hill is a few triangles; its candles are a
+    /// particle system each, and the frustum that admits them reaches
+    /// `--view-distance`. Measured live at the Goldshire inn by turning on
+    /// the spot: facing the back wall **110 emitters and 3,110 sprites at
+    /// 98 fps**, facing the door **1,614 and 21,330 at 54**, with the draw
+    /// count merely doubling. The emitter phase alone went 0.5 to 3.6 ms.
+    ///
+    /// Separate from `--view-distance` on purpose: shortening that changes
+    /// how far you can see and is a judgement, while a flame whose sprites
+    /// are smaller than a pixel is not a picture anybody is looking at.
+    /// `--screenshot` applies this too, which is what makes a two-run pixel
+    /// diff the control -- see `render::cull::Range`.
+    #[arg(long, default_value_t = 400.0)]
+    emitter_distance: f32,
 
     /// How many texels across the shadow map is.
     #[arg(long, default_value_t = 2048)]
@@ -915,6 +1011,13 @@ const LIVE_HEARTBEAT_EVERY: Duration = Duration::from_millis(100);
 /// 7.0 is the *run* speed -- 3.3.5a walks at 2.5, and walking is a toggle
 /// nothing here sends -- which is why the character's own body draws with the
 /// run cycle. See `crate::world::Motion`.
+///
+/// **Confirmed against the original client**, which held exactly 7.00 yd/s for
+/// 4,703 frames of a play session sampled with the `MeoBench` addon. A
+/// *histogram* rather than a maximum is what says so: a maximum is one frame
+/// and could be a spike, while a speed held for four thousand frames is the
+/// setting. Read from `GetUnitSpeed`, which is the client answering a question
+/// about itself.
 const LIVE_RUN_SPEED: f32 = 7.0;
 
 /// Units per second retreating. 3.3.5a backpedals at 4.5, deliberately slower
@@ -925,6 +1028,12 @@ const LIVE_RUN_SPEED: f32 = 7.0;
 /// which carries nine speeds and which this client does not parse yet. Until it
 /// does, a character with a speed buff moves at the default here. Reading them
 /// off the wire is the right fix and is not this one.
+///
+/// **Confirmed against the original client at 4.50 yd/s**, a clearly separate
+/// peak from the run at 7.00 in the same session's histogram. Two peaks and
+/// nothing between them is what makes it a constant rather than a deceleration
+/// caught mid-stride -- the same reason the emitter census counts placements
+/// rather than timing them.
 const LIVE_BACK_SPEED: f32 = 4.5;
 
 /// How fast the character is travelling for the keys currently held,
@@ -1146,9 +1255,17 @@ const DIVE_PITCH_DEADZONE: f32 = 0.15;
 /// pushing the character down.
 const BUOYANCY_TAU: f32 = 0.45;
 
-/// Radians per second turned by the A/D keys. Not verified against a
-/// reference client -- see the facing note in `docs/RENDERING.md` -- but close
-/// enough that the character does not spin wildly or crawl.
+/// Radians per second turned by the A/D keys.
+///
+/// **Confirmed against the original client, which reports
+/// `cameraYawMoveSpeed = 180` degrees per second.** That is exactly `PI`
+/// radians, so the value chosen here by feel turns out to be the right one --
+/// read with the `MeoBench` addon, which asks the reference client its own
+/// settings rather than anybody reading its code.
+///
+/// Worth keeping as a note about method rather than about the number: this
+/// stood for several milestones saying it was unverified and close enough, and
+/// verifying it cost one slash command once there was something to ask.
 const LIVE_TURN_RATE: f32 = std::f32::consts::PI;
 
 /// Which movement keys are currently held.
@@ -1235,6 +1352,32 @@ fn parse_tile(spec: &str) -> Result<(usize, usize)> {
 /// Worlds fly by default and single assets orbit: orbiting a nine-tile block
 /// means circling something two kilometres wide, which is useless for looking
 /// at anything in it.
+/// How far a camera looking at the *streamed world* draws.
+///
+/// **One place, because three constructors build such a camera and a flag two
+/// of them honour is worse than a flag none of them does.** `--view-distance`
+/// was read only by `streaming_camera` -- the offline `--map` path every
+/// headless bench in `docs/ROADMAP.md` uses -- so `live_camera` quietly kept
+/// `Fly::default()`'s 12,000. Every measurement of the far plane was therefore
+/// made in the one mode where the flag worked, and the run at the window that
+/// was meant to confirm it came back *"better"* with its terrain draw count
+/// unmoved. Exactly the shape `interior_cull` documents, in the opposite
+/// direction: there the screenshot was the instrument and might have lied,
+/// here it was the only thing telling the truth.
+///
+/// A model or texture scene is **not** a world view and does not consult this:
+/// `Orbit::frame` fits the far plane to the bounding sphere of the thing being
+/// looked at, which is a fact about the model rather than a preference.
+///
+/// `saved` is `None` wherever there is no interface to have saved anything --
+/// `--screenshot` above all, which must not depend on what somebody dragged a
+/// slider to last Tuesday.
+fn world_view_distance(args: &Args, saved: Option<&ui::camera::Camera>) -> f32 {
+    args.view_distance
+        .or_else(|| saved.map(ui::camera::Camera::far_plane))
+        .unwrap_or(ui::camera::DEFAULT_VIEW_DISTANCE)
+}
+
 fn initial_camera(scene: &Scene, args: &Args) -> Camera {
     let mut orbit = match scene.bounds() {
         Some((min, max)) => Orbit::frame(min, max),
@@ -1252,7 +1395,9 @@ fn initial_camera(scene: &Scene, args: &Args) -> Camera {
     }
 
     if matches!(scene, Scene::World(_)) && !args.orbit {
-        Camera::Fly(Fly::from_orbit(&orbit))
+        let mut fly = Fly::from_orbit(&orbit);
+        fly.far = world_view_distance(args, None);
+        Camera::Fly(fly)
     } else {
         Camera::Orbit(orbit)
     }
@@ -1273,6 +1418,13 @@ fn live_camera(live: &live::LiveWorld, args: &Args) -> Camera {
     // Walking pace rather than the flying speed a survey wants: the point here
     // is to stand somewhere, not to cross a continent.
     fly.speed = 30.0;
+    // **This line was missing for as long as `--view-distance` has existed**,
+    // so the flag worked in every headless probe and did nothing in the window.
+    // `None` because the constructors cannot reach the interface: in a window
+    // `redraw` overwrites this from the saved setting before the first frame
+    // is drawn, which is also what lets the slider move it live. See
+    // `world_view_distance`.
+    fly.far = world_view_distance(args, None);
     Camera::Fly(fly)
 }
 
@@ -1757,6 +1909,7 @@ fn streaming_camera(world: &world::World, chain: &mut Chain, args: &Args) -> Res
     if let Some(pitch) = args.pitch {
         fly.pitch = pitch.to_radians();
     }
+    fly.far = world_view_distance(args, None);
     Ok(Camera::Fly(fly))
 }
 
@@ -1933,6 +2086,91 @@ struct FrameProfile {
     terrain_draws: u32,
     /// Building, doodad and creature draws in the visible pass.
     model_draws: u32,
+    /// The `.wmo` share of `model_draws`.
+    ///
+    /// **Split out because a report named buildings and this number could not
+    /// answer.** "Walking into Goldshire drops the frame rate" is a claim
+    /// about one kind of geometry, and `model_draws` covers buildings, the
+    /// doodads inside them, the tile's trees and every replicated creature at
+    /// once -- so a village of eight houses and a forest of four hundred trees
+    /// are one number, and whichever is guessed at first is what gets fixed.
+    /// Same move as splitting `sound` into area/steps/play: the bucket, not
+    /// the suspect.
+    building_draws: u32,
+    /// The replicated-creature share of `model_draws`, held items included.
+    ///
+    /// Zero in every headless render, which is what makes the headless and
+    /// live numbers comparable at all: `--screenshot` has no session, so any
+    /// gap between the two that is *not* this is a gap in the map's own
+    /// geometry.
+    entity_draws: u32,
+    /// Draws of a building's *interior* rooms while the camera stands outside
+    /// that building altogether.
+    ///
+    /// **A bound, not a fix**, and the reason it is measured before anything is
+    /// built: 4.34 talked terrain batching up twice on reasoning and then
+    /// bounded it at 0.3-0.6 ms by deleting the work and benching. This is the
+    /// same move. It is exactly the set of draws the cheapest approximation of
+    /// portal culling -- "do not draw the inside of a building you are not
+    /// standing in" -- would delete, so it says what that approximation is
+    /// worth before a line of it exists.
+    ///
+    /// It is a *lower* bound on what real portal culling would take, because
+    /// portals also cut the rooms of a building you *are* inside, and it is not
+    /// free of consequence: what it would stop drawing includes the room you
+    /// can see through an open door from outside. That trade is a decision, not
+    /// a measurement, which is another reason this counts rather than acts.
+    unentered_draws: u32,
+    /// The share of `model_draws` issued from the deferred transparent pass.
+    ///
+    /// **These cost more than an opaque draw and the count is the only thing
+    /// that says how many there are.** The opaque loop binds a group's bones,
+    /// vertices and indices once and then issues every draw of it; the
+    /// deferred loop has lost that grouping by the time it runs and rebinds
+    /// all four per draw. A canopy of alpha-blended leaves is therefore not
+    /// the same cost as a stone wall with the same draw count, and until this
+    /// was counted there was no way to know which Goldshire was made of.
+    blended_draws: u32,
+    /// Turning the recorded pass into a command buffer -- `encoder.finish()`.
+    ///
+    /// **The largest single phase in the frame, and it spent two milestones
+    /// hidden inside `submit_ms`.** `submit([encoder.finish()])` times both as
+    /// one, and the name on the total was the wrong one of the two: 4.34 read
+    /// it as the CPU talking to the GPU and concluded it could not move.
+    ///
+    /// It is not that. It is `wgpu` translating what this client recorded into
+    /// a backend command buffer, entirely on our side of the driver, and it is
+    /// proportional to how many commands there are -- which is a number this
+    /// client chooses. Headless at Goldshire: 1,506 draws costs 1.61 ms here
+    /// against 0.16 ms of real submit; 610 draws costs 0.75.
+    finish_ms: f32,
+    /// Calls actually issued on the world's visible pass that are not draws:
+    /// pipelines, bind groups, vertex and index buffers.
+    ///
+    /// **Counted rather than timed, because this is the thing a fix moves.** A
+    /// draw call in this renderer is never one call -- it is a pipeline, three
+    /// bind groups, two vertex buffers, an index buffer and the draw -- so
+    /// "3,781 draws" understated what the CPU hands the driver by a factor
+    /// nobody had measured until this counter existed. `submit` being the
+    /// largest phase in the frame is a fact about *this* number, not about the
+    /// draw count, and a millisecond cannot tell the two apart.
+    state_calls: u32,
+    /// Calls [`Bound`] skipped because the pass already had that state.
+    ///
+    /// **Printed beside `state_calls`, always, including when it is zero** --
+    /// the same rule as `culled_draws`. A dedup that has quietly stopped
+    /// deduping draws an identical picture and takes an identical frame; only
+    /// the ratio of these two says otherwise, which is why the regression test
+    /// asserts a count and not a time.
+    skipped_state: u32,
+    /// The `set_pipeline` share of `skipped_state`.
+    ///
+    /// Kept apart from the rest because a pipeline change is the most
+    /// expensive thing a pass can be told to do, and because it is the one
+    /// that says whether sorting the draw list by material is still worth
+    /// doing: what is left here after the dedup is what a sort could *not*
+    /// have deleted anyway.
+    redundant_pipelines: u32,
     /// Groups walked to produce those draws, whether or not they drew
     /// anything. A group is one model and every placement of it on one tile.
     groups: u32,
@@ -1945,6 +2183,21 @@ struct FrameProfile {
     /// the original client draws this same city at 160fps, so a triangle
     /// count that looks ordinary points squarely at the other half.
     triangles: u32,
+    /// The share of `entities_ms` spent working out what the creatures are
+    /// standing on, before a single instance buffer is rebuilt.
+    ///
+    /// **Split because `entities` was one number covering two unrelated
+    /// jobs**: asking the collision grids where 122 creatures' feet are, and
+    /// rebuilding every entity group's GPU buffers. They have opposite fixes
+    /// and only one of them was sitting next to 103,948 candidate triangles.
+    entities_ground_ms: f32,
+    /// Ground answers worked out afresh this frame, and served from memory.
+    ///
+    /// **Both, always.** See `world::World::ground_hits`: a cache that has
+    /// stopped caching is invisible in the picture and nearly invisible in the
+    /// frame, and only the ratio says so.
+    ground_fresh: usize,
+    ground_remembered: usize,
     /// Draws the frustum test skipped, across both passes.
     ///
     /// **Printed beside what was drawn, always, including when it is zero.**
@@ -2035,6 +2288,9 @@ struct FrameProfile {
     entities_ms: f32,
     /// Posing skeletons.
     animations_ms: f32,
+    /// ...split, because the total did not move with the skeleton count it
+    /// was named after. See `world::AnimProbe`.
+    anim: world::AnimProbe,
     /// Stepping particle and ribbon emitters.
     emitters_ms: f32,
     /// Waiting for a surface texture. **Its own number on purpose**: this is
@@ -2172,6 +2428,7 @@ impl FrameProfile {
             + self.acquire_ms
             + self.log_ms
             + self.encode_ms
+            + self.finish_ms
             + self.submit_ms
             + self.present_ms
     }
@@ -2190,6 +2447,9 @@ impl FrameProfile {
         format!(
             "{draws} draws/frame = {} terrain + {} models + {} shadow, \
              {} culled | {} groups, {} instances, {} ktris\n\
+             models = {} buildings + {} doodads + {} creatures, {} of them \
+             blended, {} inside buildings nobody is in | {} state calls, \
+             {} skipped ({} redundant pipelines)\n\
              redraw {:.1}: ui {:.1} = snapshot {:.1} (target {:.1}, markers {:.1}, \
              bars {:.1}, panels {:.1}, map {:.1}, windows {:.1}) + egui {:.1} \
              (hud {:.1}, stats {:.1}) \
@@ -2197,13 +2457,16 @@ impl FrameProfile {
              move {:.1} | camera {:.1} | \
              net {:.1} | \
              sound {:.1} (area {:.1}, steps {:.1}, play {:.1}) | stream {:.1} | \
-             entities {:.1} | anim {:.1} | \
+             entities {:.1} (ground {:.1}) | \
+             anim {:.1} (scan {:.1} of {} groups, map {:.1} for {}, \
+             pose {:.1} for {} buckets ({} bones, {} blending), \
+             snapshot {:.1}, held {:.1} for {}) | \
              emitters {:.1} | acquire {:.1} | encode {:.1} (interface {:.1}) | \
-             submit {:.1} | \
+             finish {:.1} | submit {:.1} | \
              present {:.1} | \
              rest {:.1} ms; outside redraw {:.1} = {} events in {:.1} + \
              {:.1} idle + {:.1} log ms\n\
-             collision: {} queries, {} candidates ({} per query) | \
+             collision: {} queries, {} candidates of {} walked ({} per query),              ground {} fresh / {} remembered | \
              clips {} played from {} reads, tracks {} started from {} reads | \
              instance buffers {} reused, {} created | \
              {} buffer writes staging {} KiB\
@@ -2216,6 +2479,20 @@ impl FrameProfile {
             self.groups,
             self.instances,
             self.triangles / 1000,
+            self.building_draws,
+            // Derived rather than counted: a doodad is what is left once the
+            // two kinds that can name themselves have been taken out, so the
+            // three shares sum to `model_draws` by construction and cannot
+            // drift apart the way three independent counters would.
+            self.model_draws
+                .saturating_sub(self.building_draws)
+                .saturating_sub(self.entity_draws),
+            self.entity_draws,
+            self.blended_draws,
+            self.unentered_draws,
+            self.state_calls,
+            self.skipped_state,
+            self.redundant_pipelines,
             self.redraw_ms,
             self.ui_ms,
             self.ui_snapshot_ms,
@@ -2238,11 +2515,24 @@ impl FrameProfile {
             self.sound_play_ms,
             self.stream_ms,
             self.entities_ms,
+            self.entities_ground_ms,
             self.animations_ms,
+            self.anim.scan_ms,
+            self.anim.scanned,
+            self.anim.map_ms,
+            self.anim.map_posed,
+            self.anim.entity_ms,
+            self.anim.buckets,
+            self.anim.bones,
+            self.anim.blended,
+            self.anim.snapshot_ms,
+            self.anim.held_ms,
+            self.anim.held,
             self.emitters_ms,
             self.acquire_ms,
             self.encode_ms,
             self.interface_ms,
+            self.finish_ms,
             self.submit_ms,
             self.present_ms,
             unaccounted,
@@ -2258,7 +2548,16 @@ impl FrameProfile {
             self.log_ms,
             self.collision.queries,
             self.collision.candidates,
+            // **Beside what was tested, always.** `walked` is what the grid
+            // narrowed to and `candidates` is what survived the vertical
+            // slab test -- see `collision::Slot`. With the two equal the
+            // filter has quietly stopped filtering, which answers the same
+            // heights, draws the same picture and costs a hundred times as
+            // much in a building.
+            self.collision.walked,
             self.collision.candidates / self.collision.queries.max(1),
+            self.ground_fresh,
+            self.ground_remembered,
             self.clip_plays,
             self.clip_reads,
             self.track_starts,
@@ -2333,8 +2632,7 @@ fn draw_scene(
     // why the counts are taken at the `draw_indexed` rather than off what is
     // resident.
     profile: &mut FrameProfile,
-    // `false` submits everything -- see `Args::no_cull`.
-    cull: bool,
+    cull: Culling,
 ) {
     // Terrain has its own pipeline, so both the tile and world scenes route
     // their landscape through here.
@@ -2810,9 +3108,278 @@ fn draw_liquid<'a>(
     }
 }
 
+/// Draws and groups submitted per model path, while somebody is counting.
+///
+/// **A side channel rather than a [`FrameProfile`] field, and off by default.**
+/// The profile is `Copy` and is assigned around every frame; a `HashMap` in it
+/// would be cloned sixty times a second to answer a question nobody is asking
+/// on most runs. Threading an `Option<&mut _>` down instead would put a
+/// twenty-sixth parameter on `draw_scene`, which this file has already decided
+/// against once -- "a parameter that can be passed wrong is worse than no
+/// parameter".
+///
+/// Switched on by `--screenshot`, which is the right instrument for it: what
+/// the census answers is which of the *map's* models the draw calls go to, and
+/// the map is the same whether or not a session is attached. Single-threaded
+/// because the renderer is.
+///
+/// It exists because `building_draws` named the kind and stopped there.
+/// Goldshire's own buildings are two to twelve groups each, so 1,819 building
+/// draws had to be coming from somewhere else, and no amount of reasoning about
+/// the number was going to say where.
+pub mod census {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static TALLY: RefCell<Option<HashMap<String, (u32, u32)>>> = const { RefCell::new(None) };
+        /// The same tally for emitter *placements*, kept apart because they are
+        /// a different currency. A model contributing two draws and one
+        /// contributing two thousand particle sources are not comparable, and
+        /// summing them into one table would let the cheap one hide the
+        /// expensive one -- which is how "1,805 emitters alight" went unnoticed
+        /// behind a draw count that had only doubled.
+        static LIT: RefCell<Option<HashMap<String, (u32, u32)>>> = const { RefCell::new(None) };
+    }
+
+    /// Starts counting. Anything already gathered is discarded.
+    pub fn start() {
+        TALLY.with(|t| *t.borrow_mut() = Some(HashMap::new()));
+        LIT.with(|t| *t.borrow_mut() = Some(HashMap::new()));
+    }
+
+    /// Adds one group's emitter placements.
+    pub fn record_emitters(path: Option<&std::rc::Rc<str>>, placements: u32) {
+        if placements == 0 {
+            return;
+        }
+        LIT.with(|t| {
+            if let Some(tally) = t.borrow_mut().as_mut() {
+                let key = path.map_or("<creatures and what they carry>", |p| &**p);
+                let entry = tally.entry(key.to_owned()).or_insert((0, 0));
+                entry.0 += placements;
+                entry.1 += 1;
+            }
+        });
+    }
+
+    /// The emitter tally so far, heaviest first, and stops counting.
+    pub fn finish_emitters() -> Vec<(String, (u32, u32))> {
+        let mut rows: Vec<_> = LIT
+            .with(|t| t.borrow_mut().take())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        rows.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+        rows
+    }
+
+    /// Adds one group's contribution. Cheap and inlined to nothing when the
+    /// census is off, which is every frame the window draws.
+    pub fn record(path: Option<&std::rc::Rc<str>>, draws: u32) {
+        if draws == 0 {
+            return;
+        }
+        TALLY.with(|t| {
+            if let Some(tally) = t.borrow_mut().as_mut() {
+                // One bucket for everything rebuilt per frame -- see
+                // `world::Group::path`, which explains why those carry no name.
+                let key = path.map_or("<creatures and what they carry>", |p| &**p);
+                let entry = tally.entry(key.to_owned()).or_insert((0, 0));
+                entry.0 += draws;
+                entry.1 += 1;
+            }
+        });
+    }
+
+    /// The tally so far, heaviest first, and stops counting.
+    pub fn finish() -> Vec<(String, (u32, u32))> {
+        let mut rows: Vec<_> = TALLY
+            .with(|t| t.borrow_mut().take())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        rows.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+        rows
+    }
+}
+
+/// What the world's visible pass currently has bound, so a call that would set
+/// state the pass already has can be skipped.
+///
+/// **Because the draw loop set all of it unconditionally, every draw.** At
+/// Goldshire that was 11,107 pass calls behind 3,781 draws, and 2,399 of the
+/// pipeline sets named the pipeline already bound -- a building's batches run
+/// in material order, so long runs of them want the same one. The frame there
+/// is CPU-bound and not by a little: `--bench` has the GPU finishing half a
+/// millisecond after the CPU stops encoding, so *every* call skipped here is
+/// off the critical path.
+///
+/// **Identity, not equality, and by address.** Two bind groups holding the same
+/// resources are still two objects to `wgpu`, so this can only skip a call
+/// naming the very same object; it under-counts rather than over-counts, which
+/// is the safe direction. Addresses are compared and never dereferenced, and
+/// they are stable for as long as it matters: everything bound in this pass is
+/// reachable from the `&world` borrowed for the whole of it, so nothing can be
+/// dropped and have its address reused mid-frame.
+///
+/// Zero means nothing is bound. No object lives at address zero, so it cannot
+/// collide with a real one, and a pass that starts here therefore issues its
+/// first set of every kind.
+#[derive(Default)]
+struct Bound {
+    /// The pipeline is keyed by the `RenderState` that selects it rather than
+    /// by address: the state is a small `Copy` value, the mapping to a
+    /// pipeline is a pure function, and comparing it needs no lookup.
+    pipeline: Option<render::mesh::RenderState>,
+    texture: usize,
+    bones: usize,
+    texture_transform: usize,
+    vertices: usize,
+    instances: usize,
+    indices: usize,
+}
+
+/// What the world pass is allowed to skip.
+///
+/// **A struct rather than two `bool` parameters**, which is a trap this file has
+/// already named: adjacent booleans of the same type can be passed in the wrong
+/// order and the compiler will not say so, and the failure -- a frame that
+/// culls the frustum when it meant to cull interiors -- draws a plausible
+/// picture either way.
+#[derive(Clone, Copy)]
+struct Culling {
+    /// `false` submits everything -- see `Args::no_cull`.
+    frustum: bool,
+    /// How far a building must be before its unentered interior stops being
+    /// drawn, or `None` to always draw it -- see `Args::interior_cull`.
+    interiors: Option<f32>,
+}
+
+/// Whether this draw paints the inside of a building the camera is not in.
+///
+/// **Every clause narrows it towards "certainly not visible", because this
+/// number's whole job is to be a floor.** A `.wmo` only, since an M2 has no
+/// rooms; a group flagged interior by the building itself, not guessed at; and
+/// the camera outside the *whole* placement's box rather than outside the room,
+/// so a corridor two doors along in the building you are standing in is not
+/// counted. `submesh_id` is the group index for a WMO -- that is what makes
+/// `part_bounds` work at all -- and `group_interior` is indexed the same way.
+///
+/// Answers `false` wherever anything is unknown. A model with no interior
+/// table, a draw whose id is past the end, a group with no bounds: none of
+/// those is evidence that a room cannot be seen, and a bound that quietly
+/// counts unknowns is not a bound.
+/// Returns how far outside the building the camera is, or `None` where this
+/// draw is not an unentered interior at all. Zero means standing in the box.
+fn unentered(
+    group: &crate::world::Group,
+    draw: &crate::model::Draw,
+    eye: glam::Vec3,
+) -> Option<f32> {
+    if !group.building {
+        return None;
+    }
+    if !group
+        .model
+        .group_interior
+        .get(draw.submesh_id as usize)
+        .copied()
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    // **The room's own box, and the whole building's only as a fallback.**
+    // Measured the other way first and the sweep refused to separate anything:
+    // Stormwind's model box is 1,058 units across and reaches to within 150
+    // units of Goldshire, so a threshold that spared the blacksmith in front of
+    // you also spared a city over the hill, and 150 and 300 gave byte-identical
+    // frames. The distance that means something is to the *room*, which is what
+    // `part_bounds` holds and what the frustum test above already uses.
+    //
+    // `part_bounds` is `None` for a model placed more than once -- its boxes are
+    // world space and two placements have two sets -- and the fallback is the
+    // union box, which is larger and therefore reads as *nearer*. That errs
+    // towards drawing, which is the safe direction for a thing that removes
+    // geometry.
+    let room = group
+        .part_bounds
+        .as_ref()
+        .and_then(|parts| parts.get(draw.submesh_id as usize).copied());
+    room_distance(eye, group.bounds?, room)
+}
+
+/// The interior-cull distance in force, or `None` where every interior draws.
+///
+/// One place, because three call sites read it and a flag honoured by two of
+/// them is a bug that draws correctly in the window and wrongly in the
+/// screenshot -- or the other way round, which is worse, because the screenshot
+/// is the instrument.
+fn interior_cull(args: &Args) -> Option<f32> {
+    (!args.no_interior_cull).then_some(args.interior_cull)
+}
+
+/// How far outside a building's room the eye is, or `None` while it is inside
+/// the building at all.
+///
+/// **Split out from [`unentered`] because it is the half that can be tested.**
+/// Everything above it needs a `Group`, which needs a loaded model, which needs
+/// a GPU; this needs three boxes and a point, and it is where every decision
+/// actually happens. The rule this file keeps relearning is that a check
+/// written into a draw loop is a check nothing ever runs again.
+fn room_distance(
+    eye: glam::Vec3,
+    building: (glam::Vec3, glam::Vec3),
+    room: Option<(glam::Vec3, glam::Vec3)>,
+) -> Option<f32> {
+    let (min, max) = building;
+    // Inside the building: every room of it is fair game, near or far. Asked of
+    // the *building* and not the room, because standing in the hall of an inn
+    // must not cull the bedroom upstairs -- the eye is outside that room's box
+    // and can see straight into it.
+    if eye.cmpge(min).all() && eye.cmple(max).all() {
+        return None;
+    }
+    let (near, far) = room.unwrap_or(building);
+    // Distance to the box, not to its centre: a centre distance would call the
+    // gatehouse you are standing under far away.
+    let outside = (near - eye).max(eye - far).max(glam::Vec3::ZERO).length();
+    (outside > 0.0).then_some(outside)
+}
+
+/// A reference's address, for identity comparison only. Never dereferenced.
+fn address<T: ?Sized>(value: &T) -> usize {
+    std::ptr::from_ref(value) as *const u8 as usize
+}
+
+impl Bound {
+    /// Records that `slot` is about to be set to `next`, and answers whether
+    /// the call is worth making. Counts either way.
+    fn changed(slot: &mut usize, next: usize, profile: &mut FrameProfile) -> bool {
+        if *slot == next {
+            profile.skipped_state += 1;
+            return false;
+        }
+        *slot = next;
+        profile.state_calls += 1;
+        true
+    }
+}
+
 /// Issues one draw for a world group's submesh. Shared by the opaque pass and
 /// the deferred transparent pass so the two cannot drift; the caller has
 /// already bound this group's bones, vertex and index buffers.
+///
+/// **Returns whether it actually drew.** Three lookups here can each come back
+/// empty, and a caller counting its own category by calling this and then
+/// incrementing would count the draws that never happened -- which is how a
+/// draw-call number stops matching the one the pass really submitted. The
+/// caller adds to `building_draws`, `entity_draws` and `blended_draws` only on
+/// `true`, so those shares always sum to at most `model_draws`.
+///
+/// `bound` is the pipeline state this pass last set, carried across both loops
+/// so [`FrameProfile::redundant_pipelines`] counts what a material sort could
+/// actually delete.
 fn draw_world_geometry(
     pass: &mut wgpu::RenderPass<'_>,
     meshes: &MeshRenderer,
@@ -2820,7 +3387,8 @@ fn draw_world_geometry(
     draw_index: usize,
     draw: &crate::model::Draw,
     profile: &mut FrameProfile,
-) {
+    bound: &mut Bound,
+) -> bool {
     // **The group's override, not the material's own state**, and only where
     // one was asked for. A tint with alpha under one is invisible through an
     // opaque pipeline -- the blend has to be switched on for the number to
@@ -2835,11 +3403,22 @@ fn draw_world_geometry(
         group.model.binds.get(draw.texture),
         group.model.texture_animation.bind(draw_index),
     ) else {
-        return;
+        return false;
     };
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(1, bind, &[]);
-    pass.set_bind_group(3, texture_bind, &[]);
+    if bound.pipeline == Some(state) {
+        profile.skipped_state += 1;
+        profile.redundant_pipelines += 1;
+    } else {
+        bound.pipeline = Some(state);
+        profile.state_calls += 1;
+        pass.set_pipeline(pipeline);
+    }
+    if Bound::changed(&mut bound.texture, address(bind), profile) {
+        pass.set_bind_group(1, bind, &[]);
+    }
+    if Bound::changed(&mut bound.texture_transform, address(texture_bind), profile) {
+        pass.set_bind_group(3, texture_bind, &[]);
+    }
     profile.model_draws += 1;
     profile.triangles += (draw.index_count / 3) * group.count;
     pass.draw_indexed(
@@ -2847,6 +3426,7 @@ fn draw_world_geometry(
         0,
         0..group.count,
     );
+    true
 }
 
 /// Draws a streaming world: terrain first, then the instanced objects on it.
@@ -2878,7 +3458,7 @@ fn draw_streaming(
     seconds: f32,
     atmosphere: Option<&Atmosphere<'_>>,
     profile: &mut FrameProfile,
-    cull: bool,
+    cull: Culling,
 ) {
     let aspect = size.0 as f32 / size.1.max(1) as f32;
     // **The one uniform, kept.** The liquid pass has its own bind group and
@@ -2918,11 +3498,14 @@ fn draw_streaming(
     // `Frustum::everything` rather than an `Option` threaded through every
     // test below: a frustum that admits everything is a real frustum, and one
     // branch at the top beats six `if let`s in the hot loops.
-    let frustum = if cull {
+    let frustum = if cull.frustum {
         render::cull::Frustum::from_view_proj(view_proj)
     } else {
         render::cull::Frustum::everything()
     };
+    // Read once for the whole pass: `unentered` asks it per draw and the
+    // camera cannot move mid-frame.
+    let eye = camera.eye();
 
     let lit = lit_uniform(
         camera,
@@ -2949,7 +3532,7 @@ fn draw_streaming(
         // costs to draw. And it is the change the shadow milestone itself
         // named as the first thing to measure: 110 units of box was being
         // handed the whole resident world, nine tiles of it, every frame.
-        let shadow_frustum = if cull {
+        let shadow_frustum = if cull.frustum {
             render::cull::Frustum::from_view_proj(matrix)
         } else {
             render::cull::Frustum::everything()
@@ -3145,8 +3728,16 @@ fn draw_streaming(
     // later-sorted group -- the abbey wall behind the Northshire fountain ate
     // its stream this way. Transparent draws are collected here and issued
     // after the loop, still before the liquid.
-    let mut deferred: Vec<(&crate::world::Group, usize)> = Vec::new();
-    for group in world.tiles().flat_map(|t| t.groups.iter()).chain(world.entities()) {
+    //
+    // **Tagged with where the group came from**, because the two halves of
+    // this chain are the two halves of the question a frame-rate report asks:
+    // a tile's groups are the map -- buildings and scenery, the same every
+    // frame -- and the entities are the session's creatures. See
+    // `FrameProfile::entity_draws`.
+    let mut deferred: Vec<(bool, &crate::world::Group, usize)> = Vec::new();
+    let mut bound = Bound::default();
+    let map_groups = world.tiles().flat_map(|t| t.groups.iter()).map(|g| (false, g));
+    for (entity, group) in map_groups.chain(world.entities().iter().map(|g| (true, g))) {
         {
             profile.groups += 1;
             profile.instances += group.count;
@@ -3168,14 +3759,42 @@ fn draw_streaming(
                 })
                 .or(bones);
             if let Some(group_bones) = group_bones {
-                pass.set_bind_group(2, &group_bones.bind_group, &[]);
+                if Bound::changed(&mut bound.bones, address(&group_bones.bind_group), profile) {
+                    pass.set_bind_group(2, &group_bones.bind_group, &[]);
+                }
             }
-            pass.set_vertex_buffer(0, group.model.mesh.vertices.slice(..));
-            pass.set_vertex_buffer(1, group.instances.buffer.slice(..));
-            pass.set_index_buffer(
-                group.model.mesh.indices.slice(..),
-                wgpu::IndexFormat::Uint32,
-            );
+            // **The vertices and indices dedup and the instances rarely do.**
+            // A tile's groups are sorted by path, so consecutive groups are
+            // often placements of one model -- the mesh is the same object and
+            // the instance buffer never is.
+            if Bound::changed(
+                &mut bound.vertices,
+                address(&group.model.mesh.vertices),
+                profile,
+            ) {
+                pass.set_vertex_buffer(0, group.model.mesh.vertices.slice(..));
+            }
+            if Bound::changed(
+                &mut bound.instances,
+                address(&group.instances.buffer),
+                profile,
+            ) {
+                pass.set_vertex_buffer(1, group.instances.buffer.slice(..));
+            }
+            if Bound::changed(
+                &mut bound.indices,
+                address(&group.model.mesh.indices),
+                profile,
+            ) {
+                pass.set_index_buffer(
+                    group.model.mesh.indices.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+            }
+            // Snapshotted so the census can be charged what this group
+            // actually submitted rather than what its batch list promised --
+            // three lookups inside `draw_world_geometry` can each decline.
+            let before = profile.model_draws;
             for (draw_index, draw) in group.model.draws.iter().enumerate() {
                 // A building's rooms, one at a time. This is the test that
                 // matters in a city: Ironforge is one placement of one model
@@ -3190,17 +3809,33 @@ fn draw_streaming(
                     profile.culled_draws += 1;
                     continue;
                 }
+                // **Before the transparent split, not after it.** A room's
+                // window glass is a blended batch of the same interior group,
+                // and skipping only the opaque half would leave a building's
+                // panes hanging in the air over the hill.
+                let hidden = unentered(group, draw, eye);
+                if let (Some(distance), Some(beyond)) = (hidden, cull.interiors) {
+                    if distance >= beyond {
+                        profile.culled_draws += 1;
+                        continue;
+                    }
+                }
                 if draw.state.blend.is_transparent() {
-                    deferred.push((group, draw_index));
+                    deferred.push((entity, group, draw_index));
                     continue;
                 }
-                draw_world_geometry(
-                    &mut pass, meshes, group, draw_index, draw, profile,
-                );
+                if draw_world_geometry(
+                    &mut pass, meshes, group, draw_index, draw, profile, &mut bound,
+                ) {
+                    profile.building_draws += u32::from(group.building);
+                    profile.entity_draws += u32::from(entity);
+                    profile.unentered_draws += u32::from(hidden.is_some());
+                }
             }
+            census::record(group.path.as_ref(), profile.model_draws - before);
         }
     }
-    for &(group, draw_index) in &deferred {
+    for &(entity, group, draw_index) in &deferred {
         let group_bones = group
             .animation
             .and_then(|key| world.entity_bone_buffer(key))
@@ -3211,20 +3846,54 @@ fn draw_streaming(
                     .and_then(|key| world.map_bone_buffer(key))
             })
             .or(bones);
+        // **Per draw here, against per *group* above.** The deferred list is
+        // flat, so a group with eight blended batches would rebind its
+        // vertices, indices and bones eight times -- except that the entries
+        // of one group are adjacent in this list, so the dedup takes all but
+        // the first of them. That is most of why it is here and not only on
+        // the pipeline: see `FrameProfile::blended_draws`.
         if let Some(group_bones) = group_bones {
-            pass.set_bind_group(2, &group_bones.bind_group, &[]);
+            if Bound::changed(&mut bound.bones, address(&group_bones.bind_group), profile) {
+                pass.set_bind_group(2, &group_bones.bind_group, &[]);
+            }
         }
-        pass.set_vertex_buffer(0, group.model.mesh.vertices.slice(..));
-        pass.set_vertex_buffer(1, group.instances.buffer.slice(..));
-        pass.set_index_buffer(group.model.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-        draw_world_geometry(
+        if Bound::changed(
+            &mut bound.vertices,
+            address(&group.model.mesh.vertices),
+            profile,
+        ) {
+            pass.set_vertex_buffer(0, group.model.mesh.vertices.slice(..));
+        }
+        if Bound::changed(
+            &mut bound.instances,
+            address(&group.instances.buffer),
+            profile,
+        ) {
+            pass.set_vertex_buffer(1, group.instances.buffer.slice(..));
+        }
+        if Bound::changed(
+            &mut bound.indices,
+            address(&group.model.mesh.indices),
+            profile,
+        ) {
+            pass.set_index_buffer(group.model.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        }
+        if draw_world_geometry(
             &mut pass,
             meshes,
             group,
             draw_index,
             &group.model.draws[draw_index],
             profile,
-        );
+            &mut bound,
+        ) {
+            profile.building_draws += u32::from(group.building);
+            profile.entity_draws += u32::from(entity);
+            profile.blended_draws += 1;
+            profile.unentered_draws +=
+                u32::from(unentered(group, &group.model.draws[draw_index], eye).is_some());
+            census::record(group.path.as_ref(), 1);
+        }
     }
 
     // **After everything opaque and before the weather.** Liquid blends, so
@@ -3524,6 +4193,27 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let target = Offscreen::new(&gpu, args.width, args.height, format);
+    // **What this render was told to draw, said once.** The same line the
+    // window prints, and for the same reason: a frame breakdown or a pixel
+    // count is only comparable to another run that agreed on these, and
+    // until `--view-distance` was found doing nothing in the window there
+    // was no way to tell a setting that was ignored from one never given.
+    // `None` for the saved profile on purpose -- a probe must not depend on
+    // where somebody left a slider.
+    tracing::info!(
+        "drawing to {:.0} units, emitters to {}, interiors {}, shadows within {:.0}",
+        world_view_distance(args, None),
+        if args.emitter_distance > 0.0 {
+            format!("{:.0}", args.emitter_distance)
+        } else {
+            "no limit".to_string()
+        },
+        match interior_cull(args) {
+            Some(beyond) => format!("culled past {beyond:.0}"),
+            None => "all drawn".to_string(),
+        },
+        args.shadow_radius,
+    );
     let depth = DepthBuffer::new(&gpu, args.width, args.height);
     let blitter = Blitter::new(&gpu, format);
     let mut meshes = MeshRenderer::new(&gpu, format);
@@ -3655,8 +4345,46 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
             // `warm_emitters` already documents.
             let all = render::cull::Attention::everything();
             world.update_animations(&gpu, &meshes, &all);
-            for _ in 0..60 {
-                world.update_emitters(&gpu, &mut particles, &mut emitters, 1.0 / 60.0, &all);
+            // **The counts, offline.** The times here are a cold first call
+            // and mean little; the two *counts* are the whole point, because
+            // the scan's subject is the resident tile set and the pose's is
+            // the animation buckets, and those are different numbers that
+            // one total cannot tell apart. See `world::AnimProbe`.
+            let anim = world.anim_probe();
+            tracing::info!(
+                "anim: scan {} groups in {:.2} ms, {} map cycle(s) posed in \
+                 {:.2} ms, {} bucket(s) in {:.2} ms, {} bone matrices",
+                anim.scanned,
+                anim.scan_ms,
+                anim.map_posed,
+                anim.map_ms,
+                anim.buckets,
+                anim.entity_ms,
+                anim.bones,
+            );
+            const WARMUP: usize = 60;
+            for step in 0..WARMUP {
+                // **Started before the last step, not after the loop.** The
+                // census is a one-frame measurement like the draw census below,
+                // and counting all sixty would report sixty times the
+                // placements -- a number that looks like a finding and is an
+                // artefact of the warm-up.
+                if step == WARMUP - 1 {
+                    census::start();
+                }
+                world.update_emitters(
+                    &gpu,
+                    &mut particles,
+                    &mut emitters,
+                    1.0 / 60.0,
+                    &all,
+                    // **The range applies offline and the frustum does not.**
+                    // `all` is deliberate -- one frame has no history and this
+                    // loop exists to build some -- but a distance bound folded
+                    // into it would be switched off in the one instrument that
+                    // can photograph what it removes.
+                    render::cull::Range::around(camera.eye(), args.emitter_distance),
+                );
             }
         }
         Scene::Model(m) => warm_emitters(
@@ -3681,6 +4409,8 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
             label: Some("screenshot"),
         });
     let mut headless = FrameProfile::default();
+    // Not started again here: the emitter warm-up above already did, and the
+    // two tallies are filled by different phases of the same frame.
     draw_scene(
         &gpu,
         &mut encoder,
@@ -3720,7 +4450,7 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
             strength: SHADOW_STRENGTH,
         }),
         &mut headless,
-        !args.no_cull,
+        Culling { frustum: !args.no_cull, interiors: interior_cull(args) },
     );
     // **The headless path's whole reason for carrying one.** `--screenshot`
     // draws no HUD, so the debug window's copy of this cannot be captured
@@ -3730,6 +4460,40 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     // exactly as the windowed one does. The times are not comparable (one
     // frame, cold caches, no present); the counts are.
     tracing::info!("headless frame: {}", headless.describe());
+    // **The tail matters as much as the head.** A census that printed only the
+    // top twenty would answer "which model is worst" and hide the answer that
+    // turned out to be true here -- that no single model is, and the draws are
+    // a long tail of small ones. So the total and the count of everything below
+    // the cut are printed too, and they are what the reader should compare.
+    let census = census::finish();
+    let counted: u32 = census.iter().map(|(_, (draws, _))| draws).sum();
+    let mut listed = 0;
+    for (path, (draws, groups)) in census.iter().take(20) {
+        listed += draws;
+        tracing::info!(
+            "  census {draws:>5} draws over {groups:>3} group(s)  {}",
+            path
+        );
+    }
+    tracing::info!(
+        "  census total {counted} draws over {} models; the {} not listed are {} draws",
+        census.len(),
+        census.len().saturating_sub(20),
+        counted.saturating_sub(listed),
+    );
+    // **Emitters counted separately from draws, and printed even when the
+    // draw census is uninteresting.** A model can be three draws and two
+    // thousand particle sources; the frame that made this necessary had its
+    // draw count merely double while its live emitters went up 27-fold.
+    let lit = census::finish_emitters();
+    let placements: u32 = lit.iter().map(|(_, (n, _))| n).sum();
+    for (path, (n, groups)) in lit.iter().take(10) {
+        tracing::info!("  emitters {n:>5} placement(s) over {groups:>3} group(s)  {}", path);
+    }
+    tracing::info!(
+        "  emitters total {placements} placement(s) over {} models",
+        lit.len(),
+    );
     // **How long the GPU actually takes, measured rather than inferred.**
     // Every phase in the profile above is CPU time; none of them can say
     // whether the card is the limit. `submit` and the gap between frames are
@@ -3753,7 +4517,15 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
     );
 
     if let Some(rounds) = args.bench.filter(|n| *n > 0) {
+        // **Four buckets, because `submit` was the largest phase in the live
+        // frame and nothing had ever split it.** `wgpu` does not do the same
+        // work at each of these steps and the names do not say which: recording
+        // a pass, turning the recording into a command buffer, and handing that
+        // buffer to the driver are three different costs, and the live profile
+        // was charging all of the second and third to one number.
         let mut encode = Vec::with_capacity(rounds as usize);
+        let mut finish = Vec::with_capacity(rounds as usize);
+        let mut submit = Vec::with_capacity(rounds as usize);
         let mut total = Vec::with_capacity(rounds as usize);
         for _ in 0..rounds {
             let round = Instant::now();
@@ -3778,12 +4550,21 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
                     strength: SHADOW_STRENGTH,
                 }),
                 &mut counts,
-                !args.no_cull,
+                Culling { frustum: !args.no_cull, interiors: interior_cull(args) },
             );
-            gpu.queue.submit([encoder.finish()]);
-            // **Before the poll**, so this is what the CPU spent rather than
-            // what it waited for. The two are the whole question.
-            encode.push(round.elapsed().as_secs_f32() * 1000.0);
+            let recorded = round.elapsed().as_secs_f32() * 1000.0;
+            let at_finish = Instant::now();
+            let buffer = encoder.finish();
+            let finished = at_finish.elapsed().as_secs_f32() * 1000.0;
+            let at_submit = Instant::now();
+            gpu.queue.submit([buffer]);
+            let submitted = at_submit.elapsed().as_secs_f32() * 1000.0;
+            encode.push(recorded);
+            finish.push(finished);
+            submit.push(submitted);
+            // **Everything above is before the poll**, so it is what the CPU
+            // spent rather than what it waited for. The two are the whole
+            // question.
             gpu.device
                 .poll(wgpu::PollType::wait_indefinitely())
                 .expect("the device should finish the frame");
@@ -3794,6 +4575,8 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
             (v[0], v[v.len() / 2], v[v.len() - 1])
         };
         let (e_min, e_mid, e_max) = stat(&mut encode);
+        let (f_min, f_mid, _f_max) = stat(&mut finish);
+        let (s_min, s_mid, _s_max) = stat(&mut submit);
         let (t_min, t_mid, t_max) = stat(&mut total);
         // **The minimum, not the mean.** Every sample is the true cost plus
         // whatever else the machine was doing, so the smallest is the closest
@@ -3802,6 +4585,11 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
             "bench {rounds} frames at {}x{}: cpu encode+submit min {e_min:.2} median              {e_mid:.2} max {e_max:.2} ms | gpu complete min {t_min:.2} median              {t_mid:.2} max {t_max:.2} ms",
             target.width,
             target.height,
+        );
+        // Separately, because the sum of the three is the number above and the
+        // interesting thing is the proportions.
+        tracing::info!(
+            "  of which: record {e_min:.2}/{e_mid:.2} | finish {f_min:.2}/{f_mid:.2} |              submit {s_min:.2}/{s_mid:.2} ms (min/median)",
         );
     }
 
@@ -4967,6 +5755,7 @@ const ENTITY_STAND_TOLERANCE: f32 = 2.5;
 /// fight with a second, harder correction layered on top of it.
 fn grounded_position(
     world: &crate::world::World,
+    guid: u64,
     position: glam::Vec3,
     airborne: bool,
     swimming: bool,
@@ -4974,7 +5763,11 @@ fn grounded_position(
     if airborne || swimming {
         return position;
     }
-    match world.stand_height(position, STEP_HEIGHT) {
+    // **Remembered per guid.** This runs for every replicated creature every
+    // frame, and almost none of them have moved since the last one -- 183
+    // queries and 103,948 candidate triangles in one Goldshire frame, for 122
+    // creatures standing still. See `World::stand_height_remembered`.
+    match world.stand_height_remembered(guid, position, STEP_HEIGHT) {
         Some(ground) if entity_is_standing_on(position.z, ground) => {
             glam::Vec3::new(position.x, position.y, ground)
         }
@@ -5718,6 +6511,86 @@ struct ShadowTerms {
     strength: f32,
 }
 
+/// How much of the view distance the fade occupies, when fog has to be pulled
+/// in to hide the far plane.
+///
+/// **A judgement, and named as one.** Nothing in `Light.dbc` describes this: the
+/// tables describe a zone's real atmosphere, and this is the width of a band
+/// invented to hide a clip. The only hard requirement is that fog reach full
+/// strength *at* the far plane; everything before that is a choice between a
+/// clear world with an abrupt fade and a hazy one with a gentle one.
+///
+/// Chosen by rendering it. Preserving Elwynn's own 12.5% start ratio was tried
+/// first and is wrong for a reason worth keeping: 2,125..17,000 describes a
+/// gentle haze two kilometres out, and scaling that whole shape down to a
+/// 397-unit view puts fog fifty units from the camera and drowns the world in
+/// yellow. The ratio is a fact about a distance, not about a proportion.
+const FOG_FADE_FRACTION: f32 = 0.75;
+
+/// Pulls a zone's fog in so it is fully opaque by the far plane.
+///
+/// **Returns the zone's own numbers untouched when they already fit.** Pulling
+/// fog *in* is what makes a shortened view distance invisible; pushing it out
+/// would be inventing atmosphere the tables do not describe.
+fn fogged_to(start: f32, end: f32, far: f32) -> (f32, f32) {
+    if end <= 0.0 || far <= 0.0 || end <= far {
+        return (start, end);
+    }
+    // The zone's own start, if it is already inside the fade band -- a zone
+    // that genuinely fogs early keeps doing so. Otherwise the band above.
+    (start.min(far * FOG_FADE_FRACTION), far)
+}
+
+#[cfg(test)]
+mod fog_range_tests {
+    use super::*;
+
+    /// Elwynn at a shortened view distance: fog must finish exactly at the far
+    /// plane, because that is the distance at which geometry stops existing.
+    #[test]
+    fn fog_ends_where_the_geometry_does() {
+        let (start, end) = fogged_to(2125.0, 17000.0, 397.0);
+        assert!((end - 397.0).abs() < 1e-3, "fog must end at the far plane: {end}");
+        assert!(start < end, "start must stay in front of end: {start} .. {end}");
+    }
+
+    /// **The fade is a thin band at the edge, not the zone's shape shrunk.**
+    /// This is the test that would have caught the first attempt: scaling
+    /// Elwynn's 2,125..17,000 by its own ratio puts fog fifty units out, and
+    /// the render came back a wall of yellow haze.
+    #[test]
+    fn the_world_stays_clear_up_close() {
+        let (start, _) = fogged_to(2125.0, 17000.0, 397.0);
+        assert!(
+            start > 250.0,
+            "fog must not begin near the camera merely because the zone's own              end is far away: began at {start}"
+        );
+    }
+
+    /// A zone that genuinely fogs early keeps its own start -- the clamp only
+    /// ever pulls fog in, never pushes it out.
+    #[test]
+    fn a_genuinely_foggy_zone_keeps_its_own_start() {
+        let (start, end) = fogged_to(20.0, 900.0, 400.0);
+        assert_eq!(start, 20.0, "an early start is real atmosphere, not a clip");
+        assert_eq!(end, 400.0);
+    }
+
+    /// **Never pushed outwards.** A zone that already fogs inside the far plane
+    /// is describing real atmosphere and must be left exactly as measured.
+    #[test]
+    fn fog_that_already_fits_is_untouched() {
+        assert_eq!(fogged_to(50.0, 300.0, 1000.0), (50.0, 300.0));
+    }
+
+    /// Degenerate inputs answer with the input rather than a division by zero:
+    /// a zone with no fog is a real state and must not become one with fog.
+    #[test]
+    fn no_fog_stays_no_fog() {
+        assert_eq!(fogged_to(0.0, 0.0, 397.0), (0.0, 0.0));
+    }
+}
+
 /// The camera uniform with real lighting folded in, or the placeholder when
 /// there is none.
 fn lit_uniform(
@@ -5763,7 +6636,28 @@ fn lit_uniform(
     // would look like the two disagreeing about the horizon.
     let fog = sky.encode(sample.fog());
     uniform.fog = [fog[0], fog[1], fog[2], 0.0];
-    uniform.fog_range = [sample.fog_start, sample.fog_end, 0.0, 0.0];
+    // **Fog is pulled in to the far plane, never pushed past it.**
+    //
+    // The two are one decision and were being made separately. `Light.dbc` puts
+    // Elwynn's fog at 2,125..17,000 while the resident world is about 1,100
+    // units across, so within everything this client can draw the fog term is
+    // clamped to zero -- there is effectively no distance falloff at all. That
+    // is fine while the far plane is 12,000 and nothing is ever clipped, and it
+    // is exactly wrong the moment the far plane is brought in: geometry would
+    // stop at a hard circle with full-strength colour right up to the edge.
+    //
+    // `fogged()` reaches the fog colour at `fog_end`, and the fog colour is the
+    // horizon the sky is already drawn to meet (see the comment above). So fog
+    // ending at the far plane means the last thing drawn is exactly the colour
+    // of the sky behind it, and clipping there removes nothing a viewer can
+    // see. That is the property, and it is a fact about this renderer rather
+    // than a number copied from somewhere.
+    //
+    // **Both ends scale by the same factor**, preserving the ratio `Light.dbc`
+    // states for the zone rather than substituting an invented start distance.
+    // A zone whose fog already ends inside the far plane is left alone.
+    let (fog_start, fog_end) = fogged_to(sample.fog_start, sample.fog_end, camera.far());
+    uniform.fog_range = [fog_start, fog_end, 0.0, 0.0];
     if let Some(shadow) = shadow {
         uniform.light_view_proj = shadow.matrix.to_cols_array_2d();
         uniform.shadow = [
@@ -6981,6 +7875,27 @@ impl ApplicationHandler for App {
             caps.present_modes,
             config.desired_maximum_frame_latency,
         );
+        // **What this session was told to draw, said once, in the log.**
+        // `--view-distance` was ignored by the live camera for its whole
+        // existence and nothing said so: the log tees every frame's cost and
+        // never stated the settings those costs were paid under, so "the flag
+        // did nothing" and "the flag was not passed" read identically from
+        // here. The frame breakdowns are only comparable between runs that
+        // agree on these.
+        tracing::info!(
+            "drawing to {:.0} units, emitters to {}, interiors {}, shadows within {:.0}",
+            world_view_distance(&self.args, Some(&self.hud.profile.camera)),
+            if self.args.emitter_distance > 0.0 {
+                format!("{:.0}", self.args.emitter_distance)
+            } else {
+                "no limit".to_string()
+            },
+            match interior_cull(&self.args) {
+                Some(beyond) => format!("culled past {beyond:.0}"),
+                None => "all drawn".to_string(),
+            },
+            self.args.shadow_radius,
+        );
 
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
@@ -7972,6 +8887,16 @@ impl App {
         profile.ui_panels_ms = self.ui_panels_ms;
         profile.ui_map_ms = self.ui_map_ms;
         profile.ui_windows_ms = self.ui_windows_ms;
+        // **Every frame, unconditionally, and after `build_ui`.** After,
+        // because the slider that sets it lives in the panel that pass draws,
+        // and a value read before it would lag a frame behind the drag.
+        // Unconditionally, because the alternative is setting it in each of
+        // the three camera constructors, and a flag honoured by two of three
+        // constructors is exactly the bug this replaced -- `--view-distance`
+        // reached `streaming_camera` and not `live_camera`, so it worked in
+        // every headless probe and did nothing in the window.
+        self.camera
+            .set_far(world_view_distance(&self.args, Some(&self.hud.profile.camera)));
         let camera = self.camera;
 
         // Movement integrates real elapsed time, so travel speed does not
@@ -8057,6 +8982,11 @@ impl App {
                 eye,
             );
             profile.stream_ms = phase.elapsed().as_secs_f32() * 1000.0;
+            // **After streaming, before anything is placed.** Streaming is what
+            // bumps the collision epoch, so retiring last frame's ground
+            // answers here means the frame that follows asks against the
+            // triangles it will actually draw. See `World::begin_ground_frame`.
+            world.begin_ground_frame();
             // Also every frame, despite rebuilding every instance buffer.
             // This was originally throttled (see git history for
             // `LIVE_ENTITY_REBUILD_EVERY`) on the reasoning that rebuilding
@@ -8149,6 +9079,7 @@ impl App {
                                     } else {
                                         grounded_position(
                                             world,
+                                            entity.guid,
                                             entity.position,
                                             entity.airborne,
                                             entity.swimming,
@@ -8181,6 +9112,8 @@ impl App {
                                 }
                             })
                             .collect();
+                    profile.entities_ground_ms =
+                        phase.elapsed().as_secs_f32() * 1000.0;
                     let undrawable =
                         world.set_entities(&r.gpu, &mut r.meshes, &mut self.chain, &placements);
                     // Warn on change, not on every rebuild: this now runs
@@ -8244,6 +9177,7 @@ impl App {
             );
             world.update_animations(&r.gpu, &r.meshes, &attention);
             profile.animations_ms = phase.elapsed().as_secs_f32() * 1000.0;
+            profile.anim = world.anim_probe();
             let phase = Instant::now();
             // ...and everything alight, after the poses it hangs off. A flame
             // on a hand is placed by the very matrix the hand was drawn with,
@@ -8261,6 +9195,7 @@ impl App {
                 &mut r.emitters,
                 self.frame_ms / 1000.0,
                 &attention,
+                render::cull::Range::around(camera.eye(), self.args.emitter_distance),
             );
             profile.emitters_ms = phase.elapsed().as_secs_f32() * 1000.0;
         }
@@ -8389,7 +9324,10 @@ impl App {
                     strength: SHADOW_STRENGTH,
                 }),
                 &mut profile,
-                !self.args.no_cull,
+                Culling {
+                    frustum: !self.args.no_cull,
+                    interiors: interior_cull(&self.args),
+                },
             );
         }
 
@@ -8444,8 +9382,24 @@ impl App {
         profile.interface_ms = interface_started.elapsed().as_secs_f32() * 1000.0;
 
         profile.encode_ms = phase.elapsed().as_secs_f32() * 1000.0;
+        // **`finish` is timed on its own, and it is the largest thing in the
+        // frame.** It used to be written `submit([encoder.finish()])`, which
+        // evaluates the finish *inside* the expression being timed as submit --
+        // so for two milestones "submit" meant finish-plus-submit, and 4.34
+        // concluded from it that the phase could not move because it *was* the
+        // CPU talking to the GPU. It is not. Turning a recorded pass into a
+        // command buffer is `wgpu` work on our side of the driver, proportional
+        // to the commands we hand it, and therefore ours to reduce. Measured
+        // headless at Goldshire: 1,506 draws costs 1.61 ms of finish against
+        // 0.16 ms of submit; 610 draws costs 0.75.
+        //
+        // Same family as the phantom gap in 4.34 -- an instrument that quietly
+        // folds two costs together sends every reader after the wrong one.
         let phase = Instant::now();
-        r.gpu.queue.submit([encoder.finish()]);
+        let commands = encoder.finish();
+        profile.finish_ms = phase.elapsed().as_secs_f32() * 1000.0;
+        let phase = Instant::now();
+        r.gpu.queue.submit([commands]);
         profile.submit_ms = phase.elapsed().as_secs_f32() * 1000.0;
         let phase = Instant::now();
         r.gpu.queue.present(frame);
@@ -8461,6 +9415,7 @@ impl App {
         // the pass would attribute their work to the next one.
         if let Some(Scene::Streaming(world)) = r.scene.as_ref() {
             profile.collision = world.collision_probe();
+            (profile.ground_fresh, profile.ground_remembered) = world.ground_cache_counts();
             (profile.buffers_reused, profile.buffers_created) =
                 world.instance_pool_counts();
             (profile.skeletons, profile.entity_groups) = world.entity_load();
@@ -13231,7 +14186,12 @@ impl App {
         // every other reply in this drain uses. Last write wins: a second
         // confirm can only be the same offer resent.
         let mut spirit_healer_confirm: Option<u64> = None;
-        match live.connection.drain(Duration::from_millis(1), 64) {
+        // **No wait at all -- see `Connection::drain_ready`.** This asked
+        // the socket to wait a millisecond for a packet that usually was not
+        // coming, every frame, and on Windows a one-millisecond socket
+        // timeout is honoured against a system timer whose default period is
+        // 15.6 ms.
+        match live.connection.drain_ready(64) {
             // Every batch has to go through all the kinds of change replicate
             // handles -- object updates, relayed movement, monster moves,
             // destroys, names, chat -- or the world ends up quietly frozen
@@ -15073,6 +16033,7 @@ impl App {
                     // and its model must never be allowed.
                     let at = grounded_position(
                         world,
+                        entity.guid,
                         glam::Vec3::new(at.x, at.y, at.z),
                         false,
                         entity.swimming(),
@@ -15110,6 +16071,7 @@ impl App {
                         .unwrap_or(1.0);
                     let at = grounded_position(
                         world,
+                        entity.guid,
                         glam::Vec3::new(at.x, at.y, at.z),
                         false,
                         entity.swimming(),
@@ -15145,6 +16107,7 @@ impl App {
                 .unwrap_or(1.0);
             let at = grounded_position(
                 world,
+                entity.guid,
                 glam::Vec3::new(at.x, at.y, at.z),
                 false,
                 entity.swimming(),
@@ -17994,6 +18957,81 @@ mod swim_tests {
 }
 
 #[cfg(test)]
+mod view_distance_tests {
+    use super::*;
+
+    fn args(argv: &[&str]) -> Args {
+        let mut full = vec!["wow-viewer"];
+        full.extend_from_slice(argv);
+        Args::parse_from(full)
+    }
+
+    /// **The bug this exists to prevent shipped and was measured around.**
+    /// `--view-distance` reached `streaming_camera` and not `live_camera`, so
+    /// every headless bench honoured it, every window session ignored it, and
+    /// the run meant to confirm the flag came back reporting an improvement
+    /// with its terrain draw count unmoved.
+    ///
+    /// Asserting the *default* alongside the flag is the half that matters:
+    /// a `world_view_distance` that returned `Fly::default().far` would pass
+    /// any test that only checked the unflagged case, and that is precisely
+    /// the value the broken path was using.
+    #[test]
+    fn the_world_far_plane_comes_from_the_flag() {
+        assert_eq!(world_view_distance(&args(&["--view-distance", "397"]), None), 397.0);
+        // Unflagged and with nothing saved: the reference client's own number.
+        assert_eq!(
+            world_view_distance(&args(&[]), None),
+            ui::camera::DEFAULT_VIEW_DISTANCE
+        );
+    }
+
+    /// **The three-way precedence, asserted as three, because each pair alone
+    /// passes with the third rule broken.** A flag typed on purpose beats a
+    /// setting typed once -- the rule `--data` already follows -- or no probe
+    /// in `docs/ROADMAP.md` is reproducible on a machine whose owner has moved
+    /// the slider. And a probe consults no saved setting at all.
+    #[test]
+    fn a_typed_flag_outranks_a_saved_setting() {
+        let saved = ui::camera::Camera { view_distance: 800.0, ..Default::default() };
+
+        // Nothing typed: the setting decides.
+        assert_eq!(world_view_distance(&args(&[]), Some(&saved)), 800.0);
+        // Typed: it wins, even though the setting says otherwise.
+        assert_eq!(
+            world_view_distance(&args(&["--view-distance", "12000"]), Some(&saved)),
+            12_000.0
+        );
+        // No interface to have saved anything -- `--screenshot`.
+        assert_eq!(
+            world_view_distance(&args(&[]), None),
+            ui::camera::DEFAULT_VIEW_DISTANCE
+        );
+    }
+
+    /// A saved value out of range is clamped rather than trusted: `ui.toml` is
+    /// a file a person edits, and a zero there would draw nothing at all.
+    #[test]
+    fn a_saved_setting_is_clamped_on_the_way_through() {
+        let broken = ui::camera::Camera { view_distance: 0.0, ..Default::default() };
+        let far = world_view_distance(&args(&[]), Some(&broken));
+        assert!(far >= ui::camera::MIN_VIEW_DISTANCE, "got {far}");
+    }
+
+    /// A follow camera is a world view and draws to the same plane. Built from
+    /// the same helper `live_camera` uses, since what `live_camera` adds on top
+    /// is a position and a walking speed.
+    #[test]
+    fn a_follow_camera_draws_to_the_world_far_plane() {
+        let mut fly = orbit_around(glam::Vec3::ZERO, 0.0, -0.2, 12.0);
+        // Default until told: this is the state the live path was stuck in.
+        assert_eq!(fly.far, 12_000.0);
+        fly.far = world_view_distance(&args(&["--view-distance", "397"]), None);
+        assert_eq!(fly.far, 397.0);
+    }
+}
+
+#[cfg(test)]
 mod sign_in_tests {
     use super::*;
 
@@ -18244,5 +19282,101 @@ mod live_aware_position_tests {
         let state = ::world::WorldState::new();
         let walked = glam::Vec3::new(10.0, 20.0, 30.0);
         assert!(live_aware_position(&state, 42, walked, 1.5, 99, Instant::now()).is_none());
+    }
+}
+
+/// The interior cull's geometry decision, which is the half of it that can run
+/// without a GPU.
+///
+/// **Counts and cases, never milliseconds.** 4.34's rule, and this is exactly
+/// the shape it was written for: a cull that has quietly stopped culling draws
+/// the same picture and takes a frame that only a benchmark with a +/-40%
+/// spread could tell apart.
+#[cfg(test)]
+mod interior_cull_tests {
+    use super::*;
+    use glam::Vec3;
+
+    /// A small building, and a room inside the far end of it.
+    fn fixture() -> ((Vec3, Vec3), (Vec3, Vec3)) {
+        let building = (Vec3::new(0.0, 0.0, 0.0), Vec3::new(20.0, 20.0, 10.0));
+        let room = (Vec3::new(14.0, 14.0, 0.0), Vec3::new(20.0, 20.0, 10.0));
+        (building, room)
+    }
+
+    /// The case that decides whether this is safe to have on by default: a
+    /// player who has walked through the door must keep every room, including
+    /// the ones they are not standing in. Anything else empties a building from
+    /// the inside.
+    #[test]
+    fn standing_inside_the_building_keeps_every_room() {
+        let (building, room) = fixture();
+        let hall = Vec3::new(2.0, 2.0, 1.0);
+        assert_eq!(
+            room_distance(hall, building, Some(room)),
+            None,
+            "a room in the building the eye is standing in must never be culled, \
+             however far across that building it is"
+        );
+    }
+
+    /// The room's box and not the building's, which is the whole finding: with
+    /// the building's box the sweep could not separate a blacksmith at 20 units
+    /// from a city at 1,400, because the city's box reached to within 150.
+    #[test]
+    fn distance_is_measured_to_the_room_not_the_building() {
+        let (building, room) = fixture();
+        // Just outside the near wall, so the *building* is a fraction of a unit
+        // away while the room at the far end is more than ten.
+        let outside = Vec3::new(-1.0, 2.0, 1.0);
+        let to_building = room_distance(outside, building, None).expect("outside the building");
+        let to_room = room_distance(outside, building, Some(room)).expect("outside the room");
+        assert!(
+            to_building < 2.0,
+            "the building's own box starts one unit away: {to_building}"
+        );
+        assert!(
+            to_room > 13.0,
+            "the room is at the far end and must read as far: {to_room}"
+        );
+        // The bug this replaced: one threshold cannot serve both readings.
+        assert!(
+            to_building < 150.0 && to_room < 150.0,
+            "sanity -- the fixture is small; the point is the ratio, not the cut"
+        );
+    }
+
+    /// Missing per-part boxes must read as *near*, so the draw survives. A
+    /// model placed more than once has no world-space part boxes at all, and a
+    /// cull that treated "I do not know" as "it is far away" would delete every
+    /// farmhouse in Elwynn.
+    #[test]
+    fn an_unknown_room_falls_back_to_the_whole_building() {
+        let (building, _) = fixture();
+        let outside = Vec3::new(-1.0, 2.0, 1.0);
+        let known = room_distance(outside, building, Some(building));
+        let unknown = room_distance(outside, building, None);
+        assert_eq!(
+            known, unknown,
+            "with no room box the building's own must be used, which is larger \
+             and therefore nearer -- the direction that keeps drawing"
+        );
+    }
+
+    /// The negative control, in the form a test can carry: the same point with
+    /// the eye moved outside must produce a distance where the eye inside
+    /// produced none. Without this, a `room_distance` that returned `None`
+    /// unconditionally would pass every other test here.
+    #[test]
+    fn stepping_outside_turns_the_answer_on() {
+        let (building, room) = fixture();
+        let inside = Vec3::new(2.0, 2.0, 1.0);
+        let outside = Vec3::new(-400.0, 2.0, 1.0);
+        assert_eq!(room_distance(inside, building, Some(room)), None);
+        let far = room_distance(outside, building, Some(room)).expect("outside");
+        assert!(
+            far > 400.0,
+            "four hundred units from the wall should read as at least that: {far}"
+        );
     }
 }

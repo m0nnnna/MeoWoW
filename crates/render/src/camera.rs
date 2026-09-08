@@ -395,6 +395,28 @@ impl Camera {
         }
     }
 
+    /// How far this camera draws. Read by the fog, which has to be opaque by
+    /// the time geometry stops being submitted -- see `lit_uniform`.
+    pub fn far(&self) -> f32 {
+        match self {
+            Self::Orbit(c) => c.far,
+            Self::Fly(c) => c.far,
+        }
+    }
+
+    /// Sets how far this camera draws.
+    ///
+    /// **The world's far plane only.** An `Orbit` framing a single model has
+    /// its far plane fitted to that model's bounding sphere by `Orbit::frame`,
+    /// which is a fact about the thing being looked at rather than a
+    /// preference, so this leaves it alone: a viewer showing one `.m2` must
+    /// not have it clipped away by a world setting.
+    pub fn set_far(&mut self, far: f32) {
+        if let Self::Fly(c) = self {
+            c.far = far;
+        }
+    }
+
     /// Where the camera is looking, as a unit vector.
     ///
     /// Used to aim the shadow box ahead of the viewer rather than around

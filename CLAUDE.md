@@ -1009,6 +1009,63 @@ These are what replaced guessing.
   culling, no LOD. Those are features with milestones, not optimisations, and
   saying so is more useful than grinding another tenth of a millisecond.
 
+- **A spatial index narrows in the dimensions it indexes, and a building is
+  the one it does not.** The collision grid is 8x8 units in x and y with *no
+  vertical split*, so a cell inside the Lion's Pride Inn is a **column** --
+  the floor underfoot, the storey above it, the roof, every wall between them
+  and the collision of everything standing on any of them: **3,440 entries
+  against a world median of 19**. The follow camera marches the ground twelve
+  times per sampled yaw and was testing **264,000 triangles a frame for 4.7ms
+  of a 21ms frame**, against 4,800 and 0.1ms ten yards outside the door. Fixed
+  by carrying each entry's z span in the cell and filing flat surfaces apart
+  from the rest -- `floor_hit` and `push_out_horizontally` refuse each other's
+  candidates by the *identical* threshold, and had been handed one list for
+  four milestones. 152,476 tests to 16,633, and the picture is byte-identical.
+- **The instrument that finds it is the one that counts the index, not the
+  query.** `Probe` had counted lookups and candidates since 4.34 and could not
+  see this: the query count was 85 indoors and 85 outdoors, and only the
+  *candidates per query* moved, 25 to 3,100. What named the cause was a new
+  number about the grid itself -- `cell_load`, printed with every tile's
+  triangle total, worst cell and median. A triangle count says how much
+  geometry arrived and nothing at all about what one query will scan.
+- **An index change is a claim about which candidates cannot matter, and that
+  claim fails silently.** A height still comes back and a camera still stops
+  somewhere; what is missing is a surface that should have been considered.
+  So it gets a differential test against a full scan written from the
+  definition -- 8,000 floor queries, 1,200 rays and 576 body checks over a
+  deliberately jumbled building, every answer equal. Verified by breaking it:
+  a slab bound tightened by 0.3 units fails both oracles, and the two count
+  tests fail on the old code at 5,760 of 5,760 tested.
+- **A live-only report may already have its own A/B on disk.** The complaint
+  was "40fps in the inn"; the ordinary double-click launch tees to
+  `%APPDATA%\open-wow\viewer.log`, so ninety-two per-frame breakdowns of
+  that very session were already written down, area id and all -- the
+  character had walked in and out of the door three times. Median redraw 15.9ms
+  outside against 21.1ms inside, and **every phase but one within 0.4ms**.
+  Read the log before asking for a run.
+- **A millisecond of waiting on purpose is not a millisecond.** The frame
+  drained the world socket with `drain(Duration::from_millis(1), 64)`, and a
+  quiet stream is how that call learns to stop -- so it paid the wait every
+  frame. `SO_RCVTIMEO` is honoured against the Windows system interrupt timer,
+  whose default period is **15.6ms**: measured here, a 1ms read timeout on a
+  quiet socket costs a mean of **15.57ms** and the same read on a non-blocking
+  socket costs **0.0014ms**. It did not always cost fifteen, which is what let
+  it survive -- something else in the process usually holds the timer at 1ms,
+  and the live logs show `net` clustered at 1.1ms accordingly. **That is a
+  millisecond of every frame held there by another program's setting**, and
+  4.34's unexplained "43-48ms spike, 2-3 per run, flat across crowd sizes" is
+  three of these. Ask what a timeout costs on the platform before treating it
+  as the number written down.
+- **The reference client is a *conditions* instrument and it answered again.**
+  MeoBench cannot report a draw call, a batch or a phase -- no WoW Lua API
+  exposes any of it, in any version. What it can say is what the thing being
+  compared against is *set to*, and the answer both times was the same one:
+  `farclip 397` against our 12,000, with `particleDensity`, `shadowLevel` and
+  `environmentDetail` all at their defaults. Measured in our own frame at the
+  inn, 397 is **2,260 draws to 786** and `record+finish+submit` 5.25ms to
+  1.92ms. It is not a bug and it is not free -- it changes how far you can
+  see -- which is why it is a flag and a decision rather than a fix.
+
 ### Writing the code around it
 
 - **A trap documented at one call site does not protect the next one.** That

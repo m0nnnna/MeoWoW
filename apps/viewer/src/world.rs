@@ -14,7 +14,7 @@
 //! enough to be visible as a stall, so only a couple are admitted per frame and
 //! the rest wait.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::Instant;
@@ -204,6 +204,38 @@ pub struct Group {
     /// one building have two different sets of them, which is a per-instance
     /// draw loop rather than a per-group one.
     pub part_bounds: Option<Vec<(Vec3, Vec3)>>,
+    /// The archive path of this group's model, for the draw census.
+    ///
+    /// **Carried for the census and nothing else.** Everything the draw loop
+    /// needs is already in `model`; what a *report* needs is a name, and "1,819
+    /// building draws" cannot be acted on until it says which buildings.
+    ///
+    /// **`None` for everything rebuilt per frame** -- creatures, the items they
+    /// hold, the doodads a game object carries -- and that is the point rather
+    /// than an omission. Tile groups are built once when a tile loads, so an
+    /// `Rc<str>` there is free; entity groups are rebuilt sixty times a second
+    /// and a name on those would be a string allocation per creature per frame,
+    /// which is the exact shape of cost 4.34 spent a rung removing. The census
+    /// buckets them together and
+    /// [`crate::FrameProfile::entity_draws`] already reports their total, so
+    /// nothing is lost but a name nobody was going to act on.
+    pub path: Option<std::rc::Rc<str>>,
+    /// Whether this group's model is a `.wmo` -- a building -- rather than an
+    /// `.m2`.
+    ///
+    /// **Carried only so the frame profile can split its own draw count.**
+    /// Nothing about the draw depends on it: a building and a tree are both a
+    /// mesh with transforms, which is why one loop draws both. But
+    /// `model_draws` is a single number covering buildings, the doodads a
+    /// building carries inside it, the tile's own scenery and every replicated
+    /// creature, and a report that "buildings cause the frame loss" cannot be
+    /// checked against a number that cannot tell them apart. See
+    /// `FrameProfile::building_draws`.
+    ///
+    /// A WMO's *interior* doodads are `.m2` and count as doodads here, which is
+    /// the honest split: they are drawn by the same instanced path as a tree
+    /// and would be fixed by whatever fixes a tree.
+    pub building: bool,
     /// A stable identity per entry in [`Group::emitting`].
     ///
     /// Entity groups are rebuilt **every frame** and their order changes
@@ -213,6 +245,76 @@ pub struct Group {
     /// Doodads use a hash of their tile, path and placement index, which is
     /// equally stable and survives the tile being drawn again.
     pub emitting_ids: Vec<u64>,
+}
+
+/// Keeps only the placements an [`render::cull::Attention`] wants, with their
+/// identities.
+///
+/// **Per placement, not per group -- the same rule, at the granularity it was
+/// always meant for.**
+///
+/// A [`Group`] is one model and *every* placement of it on a tile, so the
+/// group-level test admits or refuses seventy torches as one decision on a
+/// union box spanning the whole tile. Measured live at Goldshire from a single
+/// spot: facing one way, 66 emitters alight and the frame holds 93fps; turning
+/// around, **1,805 emitters and 21,755 particles** at 54fps, while the draw
+/// count merely doubled. Three groups hold 211 torches between them, and the
+/// census names them all as indoor lights -- the candles of rooms the interior
+/// cull had already stopped drawing.
+///
+/// Nothing new is decided here. `Attention` already says which emitters are
+/// worth stepping and already carries the radius that keeps a plume's history
+/// alive behind you; this only stops one torch in view speaking for every torch
+/// on the tile.
+///
+/// **The ids travel in lockstep or not at all.** They key a particle system's
+/// history, and a placement kept under a neighbour's id restarts every plume
+/// that moved -- the exact failure [`Group::emitting_ids`] exists to prevent,
+/// and the one thing here a picture would show only as flames stuttering.
+///
+/// Refuses nothing when the model states no extent: a held item's bounds are
+/// `None` by design, and so is its fate. Borrows rather than allocates whenever
+/// every placement survives, which is the common frame.
+fn retain_lit<'a>(
+    placements: std::borrow::Cow<'a, [Mat4]>,
+    ids: &'a [u64],
+    extent: Option<(Vec3, Vec3)>,
+    wants: impl Fn(Mat4, (Vec3, Vec3)) -> bool,
+) -> (std::borrow::Cow<'a, [Mat4]>, std::borrow::Cow<'a, [u64]>) {
+    let Some(extent) = extent else {
+        return (placements, std::borrow::Cow::Borrowed(ids));
+    };
+    let kept = placements.iter().filter(|t| wants(**t, extent)).count();
+    if kept == placements.len() {
+        return (placements, std::borrow::Cow::Borrowed(ids));
+    }
+    let mut transforms = Vec::with_capacity(kept);
+    let mut lit = Vec::with_capacity(kept);
+    for (index, transform) in placements.iter().enumerate() {
+        if wants(*transform, extent) {
+            transforms.push(*transform);
+            // Empty for a model with no emitters, and parallel where it is not.
+            if let Some(id) = ids.get(index) {
+                lit.push(*id);
+            }
+        }
+    }
+    (
+        std::borrow::Cow::Owned(transforms),
+        std::borrow::Cow::Owned(lit),
+    )
+}
+
+/// What a remembered ground answer depends on.
+///
+/// Every field is part of the question: *who* asked (two creatures can stand at
+/// one point), *where* (bit-exact -- see [`World::stand_height_remembered`]),
+/// and *against which triangles* (`epoch`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct GroundKey {
+    asker: u64,
+    at: [u32; 3],
+    epoch: u64,
 }
 
 /// A group that hangs off another group's skeleton.
@@ -478,6 +580,56 @@ pub struct FramePose {
     pub bones: Vec<Mat4>,
     pub sequence: usize,
     pub time_ms: u32,
+}
+
+/// What [`World::update_animations`] spent, split three ways, with the count
+/// of what each half worked on beside its time.
+///
+/// **The phase read as a flat ~1.9 ms that did not scale with the skeletons it
+/// poses** -- fitted against the reported skeleton count at R2 = 0.01, which
+/// is no relationship at all. A total that does not move with its named
+/// subject is a total containing something else, and there is no way to say
+/// what without taking it apart: exactly 4.34's rule about splitting the
+/// bucket rather than naming a suspect.
+///
+/// Note that the two halves have entirely different subjects. Posing entities
+/// scales with animation *buckets* -- one pose per distinct display and
+/// motion, however many creatures share it. The map half scales with the
+/// **resident tile set**, because finding which doodad cycles are worth
+/// running walks every group of every resident tile whether or not any of
+/// them animates. Counted separately for that reason.
+#[derive(Clone, Copy, Default)]
+pub struct AnimProbe {
+    /// Walking the resident groups to find the doodad cycles worth running.
+    pub scan_ms: f32,
+    /// Posing those cycles and uploading them.
+    pub map_ms: f32,
+    /// Posing the replicated entities' animation buckets.
+    pub entity_ms: f32,
+    /// Copying those poses into [`World::frame_poses`] for the emitters --
+    /// every bucket's whole matrix vector, cloned, every frame.
+    pub snapshot_ms: f32,
+    /// Placing held items, which rewrites an instance buffer per wielder
+    /// group whether or not the wielder moved.
+    pub held_ms: f32,
+    /// Groups walked by the scan: every group of every resident tile, plus
+    /// the entity groups.
+    pub scanned: usize,
+    /// Distinct doodad paths that came back from it and were posed.
+    pub map_posed: usize,
+    /// Animation buckets posed...
+    pub buckets: usize,
+    /// ...and how many of those cost a *second* pose because they are
+    /// mid-transition and blending from an outgoing cycle.
+    pub blended: usize,
+    /// **Bone matrices produced, which is the subject a pose cost actually
+    /// has.** Buckets are not comparable to each other: a torch has four
+    /// bones and a human has over a hundred, so a bucket count can hold
+    /// still while the work behind it doubles -- and a fit against the
+    /// bucket count would report no relationship and be believed.
+    pub bones: usize,
+    /// Entity groups whose held item was replaced this frame.
+    pub held: usize,
 }
 
 struct MapAnimation {
@@ -914,6 +1066,9 @@ pub struct World {
     instance_pool: InstancePool,
     map_animations: HashMap<String, MapAnimation>,
     map_frame_poses: RefCell<HashMap<String, FramePose>>,
+    /// What the last [`World::update_animations`] cost, split. See
+    /// [`AnimProbe`].
+    anim_probe: Cell<AnimProbe>,
     /// Animated bone buffers for replicated-entity groups, keyed by
     /// `Group::animation` and reused across rebuilds rather than reallocated:
     /// `update_bones` rewrites a buffer's contents in place, so the GPU
@@ -985,6 +1140,35 @@ pub struct World {
     pending: VecDeque<(i32, i32)>,
     queued: HashSet<(i32, i32)>,
     failed: HashSet<(i32, i32)>,
+    /// Bumped whenever a tile is loaded or evicted.
+    ///
+    /// **The only thing that can make a remembered ground answer wrong.** A
+    /// creature standing still stands on ground that does not move -- unless
+    /// the triangles under it arrive or leave, which happens exactly here. See
+    /// [`World::stand_height_remembered`].
+    collision_epoch: u64,
+    /// Ground heights already worked out this frame and last, keyed by whoever
+    /// asked and where they stood.
+    ///
+    /// **Two maps and a swap, rather than one map and a pruning rule.** The
+    /// alternative is a cache that grows for every creature that ever stood
+    /// anywhere -- guids of temporary summons come off a counter -- and a
+    /// heuristic for when to forget. Reading the previous frame and writing the
+    /// current one bounds it to exactly what was asked for, with no policy to
+    /// get wrong.
+    ///
+    /// `RefCell` because the draw path holds `&World`: this is memoisation, not
+    /// state, and every entry is a value the uncached call would have returned.
+    grounded: RefCell<(HashMap<GroundKey, Option<f32>>, HashMap<GroundKey, Option<f32>>)>,
+    /// Answers served from memory and worked out afresh, this frame.
+    ///
+    /// **Two numbers, because one cannot say the cache is working.** A cache
+    /// that has quietly stopped caching places every creature identically and
+    /// takes a frame only a benchmark could tell apart; the ratio is the only
+    /// thing that speaks. Same rule as the instance pool's and the sound
+    /// caches' counters.
+    ground_hits: std::cell::Cell<usize>,
+    ground_misses: std::cell::Cell<usize>,
     pub stats: Stats,
 }
 
@@ -1067,6 +1251,7 @@ impl World {
             entities: Vec::new(),
             map_animations: HashMap::new(),
             map_frame_poses: RefCell::new(HashMap::new()),
+            anim_probe: Cell::new(AnimProbe::default()),
             entity_bones: HashMap::new(),
             active_motion_buckets: RefCell::new(std::collections::HashSet::new()),
             blending: RefCell::new(HashMap::new()),
@@ -1078,6 +1263,10 @@ impl World {
             pending: VecDeque::new(),
             queued: HashSet::new(),
             failed: HashSet::new(),
+            collision_epoch: 0,
+            grounded: RefCell::new((HashMap::new(), HashMap::new())),
+            ground_hits: std::cell::Cell::new(0),
+            ground_misses: std::cell::Cell::new(0),
             stats: Stats::default(),
         })
     }
@@ -1134,11 +1323,18 @@ impl World {
         // Keeping it costs one tile's buffers while a player is inside a
         // building bigger than a tile, which is precisely when they are wanted.
         let limit = self.radius + EVICT_MARGIN;
+        let before = self.tiles.len();
         self.tiles.retain(|tile, loaded| {
             let near =
                 (tile.0 - centre.0).abs() <= limit && (tile.1 - centre.1).abs() <= limit;
             near || solid_reaches(loaded.solid_bounds, camera, camera)
         });
+        // Every remembered ground answer was computed against the triangles
+        // that were resident; losing a tile can move the floor under a
+        // creature standing on its edge.
+        if self.tiles.len() != before {
+            self.collision_epoch += 1;
+        }
         self.pending.retain(|tile| {
             (tile.0 - centre.0).abs() <= self.radius
                 && (tile.1 - centre.1).abs() <= self.radius
@@ -1173,6 +1369,7 @@ impl World {
             match self.load_tile(gpu, meshes, terrain_renderer, liquid_renderer, chain, tile) {
                 Ok(loaded) => {
                     self.tiles.insert(tile, loaded);
+                    self.collision_epoch += 1;
                 }
                 Err(e) => {
                     tracing::warn!("tile {},{} failed: {e}", tile.0, tile.1);
@@ -1384,6 +1581,12 @@ impl World {
             built.push(Group {
                 bounds,
                 part_bounds,
+                // The path, because it is the only thing here that knows: the
+                // buildings and the doodads were merged into one map keyed by
+                // path well above this, precisely so that both draw through
+                // one loop.
+                building: path.to_ascii_lowercase().ends_with(".wmo"),
+                path: Some(std::rc::Rc::from(path.as_str())),
                 emitting: emitting_placements(&model, &transforms),
                 emitting_ids: doodad_ids(&model, tile, &path, transforms.len()),
                 model,
@@ -1398,11 +1601,25 @@ impl World {
             });
         }
 
+        // **The cell load beside the triangle count, always.** A tile's
+        // triangle total says how much geometry arrived; it says nothing at
+        // all about what one query will have to scan, and those are the two
+        // numbers a collision cost is made of. See `collision::World::
+        // cell_load` -- this line is what named the Lion's Pride Inn.
+        let load = solid.cell_load();
         tracing::debug!(
-            "tile {},{} is solid in {} triangles",
+            "tile {},{} is solid in {} triangles over {} cells, {} entries, worst cell {} at {:.0},{:.0} spanning z {:.1}..{:.1}, median {}",
             tile.0,
             tile.1,
-            solid.triangle_count()
+            solid.triangle_count(),
+            load.cells,
+            load.entries,
+            load.worst,
+            load.worst_at.0,
+            load.worst_at.1,
+            load.worst_z.0,
+            load.worst_z.1,
+            load.median,
         );
         let wmo_liquid = crate::liquid::build_wmo(
             gpu,
@@ -1762,6 +1979,70 @@ impl World {
             .or_else(|| self.height_at(at.x, at.y))
     }
 
+    /// [`Self::stand_height`], answered from memory when the same asker last
+    /// stood in the same place against the same triangles.
+    ///
+    /// **Because a standing NPC was paying for a fresh answer sixty times a
+    /// second.** Measured live in Goldshire: 183 ground queries and **103,948
+    /// candidate triangles in one frame**, to place 122 replicated creatures
+    /// almost all of which had not moved. The answer cannot change unless the
+    /// creature moves or the triangles do, and both are in the key.
+    ///
+    /// This is memoisation and not state: every hit returns the value the
+    /// uncached call would have returned, which is why it can sit behind
+    /// `&self`. The one thing that would make it a lie is the floor changing
+    /// under a stationary creature, and that is what `collision_epoch`
+    /// counts.
+    ///
+    /// The position is keyed by its bits rather than as a float. Two frames
+    /// reporting the identical position are the case this exists for, and
+    /// identical bits is exactly that question -- no tolerance to choose, and
+    /// a creature that moved by any amount at all simply misses.
+    pub fn stand_height_remembered(&self, asker: u64, at: Vec3, step: f32) -> Option<f32> {
+        let key = GroundKey {
+            asker,
+            at: [at.x.to_bits(), at.y.to_bits(), at.z.to_bits()],
+            epoch: self.collision_epoch,
+        };
+        {
+            let mut both = self.grounded.borrow_mut();
+            let (previous, current) = &mut *both;
+            if let Some(hit) = current.get(&key).or_else(|| previous.get(&key)) {
+                let hit = *hit;
+                current.insert(key, hit);
+                self.ground_hits.set(self.ground_hits.get() + 1);
+                return hit;
+            }
+        }
+        // **Computed with the borrow released.** `stand_height` walks the
+        // collision grids and this client has already been bitten once by a
+        // cache held across the work it was caching.
+        let answer = self.stand_height(at, step);
+        self.grounded.borrow_mut().1.insert(key, answer);
+        self.ground_misses.set(self.ground_misses.get() + 1);
+        answer
+    }
+
+    /// Retires last frame's ground answers and starts a new frame's.
+    ///
+    /// Called once per frame by the caller that is about to place entities. The
+    /// swap is what bounds the cache: anything not asked for again is dropped,
+    /// so a creature that died or walked out of range takes its entry with it.
+    pub fn begin_ground_frame(&self) {
+        let mut both = self.grounded.borrow_mut();
+        let (previous, current) = &mut *both;
+        std::mem::swap(previous, current);
+        current.clear();
+        self.ground_hits.set(0);
+        self.ground_misses.set(0);
+    }
+
+    /// Ground answers worked out afresh and served from memory this frame.
+    /// **Both numbers, always** -- see [`Self::ground_hits`].
+    pub fn ground_cache_counts(&self) -> (usize, usize) {
+        (self.ground_misses.get(), self.ground_hits.get())
+    }
+
     pub fn floor_under_surface(
         &self,
         at: Vec3,
@@ -2034,6 +2315,12 @@ impl World {
         (self.entity_bones.len(), self.entities.len())
     }
 
+    /// What the last [`Self::update_animations`] spent, split. See
+    /// [`AnimProbe`].
+    pub fn anim_probe(&self) -> AnimProbe {
+        self.anim_probe.get()
+    }
+
     /// Instance buffers reused against created since the session began.
     /// See [`InstancePool`].
     pub fn instance_pool_counts(&self) -> (u64, u64) {
@@ -2043,9 +2330,10 @@ impl World {
     pub fn collision_probe(&self) -> collision::Probe {
         let mut total = collision::Probe::default();
         for tile in self.tiles() {
-            let probe = tile.solid.take_probe();
-            total.queries += probe.queries;
-            total.candidates += probe.candidates;
+            // Whole-struct, not field by field: this loop used to name the
+            // two fields it knew about and quietly dropped the third the day
+            // it was added. See `collision::Probe`'s `AddAssign`.
+            total += tile.solid.take_probe();
         }
         total
     }
@@ -2419,6 +2707,8 @@ impl World {
                     // A torch in a hand is the case this exists for, and its
                     // placements are rewritten every frame by
                     // `update_animations` along with the item's own transform.
+                    building: false,
+                    path: None,
                     emitting: emitting_placements(&held_model, &bind_pose_transforms),
                     // The wielder's guid, mixed so a torch in a hand and the
                     // hand's owner do not collide on one key. A held item is
@@ -2474,6 +2764,8 @@ impl World {
                 built.push(Group {
                     bounds,
                     part_bounds,
+                    building: false,
+                    path: None,
                     emitting: emitting_placements(&doodad_model, &doodad_transforms),
                     emitting_ids: entity_doodad_ids(
                         &doodad_model,
@@ -2497,6 +2789,8 @@ impl World {
             built.push(Group {
                 bounds,
                 part_bounds,
+                building: false,
+                path: None,
                 emitting: emitting_placements(&model, &transforms),
                 emitting_ids: if model.particles.is_empty() && model.ribbons.is_empty() {
                     Vec::new()
@@ -2577,14 +2871,19 @@ impl World {
         // pose computed per distinct *path* across the whole resident set,
         // whether or not any of its placements can be seen. See
         // `render::cull::Attention`.
+        let mut probe = AnimProbe::default();
+        let at_scan = Instant::now();
         let active_map_animations: HashSet<&str> = self
             .tiles
             .values()
             .flat_map(|tile| tile.groups.iter())
             .chain(self.entities.iter())
+            .inspect(|_| probe.scanned += 1)
             .filter(|group| attention.wants(group.bounds))
             .filter_map(|group| group.map_animation.as_deref())
             .collect();
+        probe.scan_ms = at_scan.elapsed().as_secs_f32() * 1000.0;
+        let at_map = Instant::now();
         let mut map_poses = HashMap::new();
         for path in active_map_animations {
             let Some(animation) = self.map_animations.get(path) else {
@@ -2600,6 +2899,7 @@ impl World {
             );
             let upload: Vec<[[f32; 4]; 4]> =
                 pose.iter().map(|matrix| matrix.to_cols_array_2d()).collect();
+            probe.bones += upload.len();
             meshes.update_bones(gpu, &animation.bones, &upload);
             animation.model.texture_animation.update(
                 gpu,
@@ -2616,7 +2916,9 @@ impl World {
                 },
             );
         }
+        probe.map_posed = map_poses.len();
         *self.map_frame_poses.borrow_mut() = map_poses;
+        probe.map_ms = at_map.elapsed().as_secs_f32() * 1000.0;
 
         // Poses a single motion at its own clock -- exactly what this
         // function always computed, pulled out so a transition's outgoing
@@ -2735,7 +3037,9 @@ impl World {
                 // before the parent chain is composed. Blending completed
                 // model-space matrices moves every child independently and
                 // changes limb lengths during the transition.
-                Some((old_sequence, old_time_ms, elapsed)) => blend_poses_with_global_loops(
+                Some((old_sequence, old_time_ms, elapsed)) => {
+                    probe.blended += 1;
+                    blend_poses_with_global_loops(
                     &group.model.bones,
                     old_sequence,
                     old_time_ms,
@@ -2743,15 +3047,20 @@ impl World {
                     time_ms,
                     elapsed as f32 / TRANSITION_BLEND_MS as f32,
                     group.model.texture_animation.global_sequences(),
-                ),
+                    )
+                }
                 None => posed,
             };
 
             let pose: Vec<[[f32; 4]; 4]> =
                 final_pose.iter().map(|m| m.to_cols_array_2d()).collect();
+            probe.bones += pose.len();
             meshes.update_bones(gpu, bones, &pose);
+            probe.buckets += 1;
             poses.insert((display_id, motion), (final_pose, sequence, time_ms));
         }
+        probe.entity_ms = now.elapsed().as_secs_f32() * 1000.0;
+        let at_snapshot = Instant::now();
         // Replaced wholesale, not merged: a bucket that stopped animating this
         // frame must stop having a pose, or an emitter would keep hanging off
         // the skeleton of a creature that has despawned.
@@ -2774,6 +3083,8 @@ impl World {
         // stop counting as active, or its *next* reappearance would be
         // missed as a transition.
         *self.active_motion_buckets.borrow_mut() = next_active;
+        probe.snapshot_ms = at_snapshot.elapsed().as_secs_f32() * 1000.0;
+        let at_held = Instant::now();
 
         // Then everything hanging off those poses. A held item's transform is
         // the wielder's own instance transform times the hand's animated
@@ -2782,6 +3093,7 @@ impl World {
         // arm holding it.
         for group in &self.entities {
             let Some(held) = &group.held else { continue };
+            probe.held += 1;
             // No pose means the wielder had no cycle to play. Its bones are
             // identity, so the hand is at its bind-pose position and the item
             // belongs there -- still, but in the right place.
@@ -2810,6 +3122,8 @@ impl World {
             }
             group.instances.write(gpu, &instances);
         }
+        probe.held_ms = at_held.elapsed().as_secs_f32() * 1000.0;
+        self.anim_probe.set(probe);
     }
 
     /// Steps everything alight in the world and builds this frame's geometry.
@@ -2826,6 +3140,7 @@ impl World {
         emitters: &mut crate::emitters::Emitters,
         dt: f32,
         attention: &render::cull::Attention,
+        range: render::cull::Range,
     ) {
         let poses = self.frame_poses.borrow();
         let map_poses = self.map_frame_poses.borrow();
@@ -2899,11 +3214,50 @@ impl World {
                 ),
             };
 
+            // **Per placement, not per group -- the same rule, at the
+            // granularity it was always meant for.**
+            //
+            // A `Group` is one model and *every* placement of it on a tile, so
+            // the coarse test above admits or refuses seventy torches as one
+            // decision on a union box spanning the whole tile. Measured live at
+            // Goldshire from a single spot: facing one way, 66 emitters alight
+            // and the frame holds 93fps; turning around, **1,805 emitters and
+            // 21,755 particles** at 54fps, while the draw count merely doubled.
+            // Three groups hold 211 torches between them.
+            //
+            // Nothing new is being decided here. `Attention` already says which
+            // emitters are worth stepping and already carries the radius that
+            // keeps a plume's history alive behind you; this only stops one
+            // torch in view from speaking for every torch in the tile.
+            //
+            // Refuses nothing when the model has no extent -- a held item's
+            // bounds are `None` by design, and so is its fate.
+            let (placements, ids) = retain_lit(
+                placements,
+                &group.emitting_ids,
+                group.model.render_bounds,
+                |transform, (lo, hi)| {
+                    let box_ = render::cull::transformed_bounds(transform, lo, hi);
+                    // **Both, and they are not the same question.** `Attention`
+                    // says whether this placement is worth working on at all;
+                    // the range says whether a flame this far away is worth
+                    // simulating. The frustum reaches the far plane, so without
+                    // the second one a torch twelve thousand units down the road
+                    // burns at full rate to produce sub-pixel sprites. See
+                    // `render::cull::Range`.
+                    attention.wants(Some(box_)) && range.holds(Some(box_))
+                },
+            );
+            // Nothing of this group is worth stepping.
+            if placements.is_empty() {
+                continue;
+            }
+            crate::census::record_emitters(group.path.as_ref(), placements.len() as u32);
             sources.push(crate::emitters::Source {
                 particles: &group.model.particles,
                 ribbons: &group.model.ribbons,
                 textures: &group.model.textures,
-                ids: std::borrow::Cow::Borrowed(&group.emitting_ids),
+                ids,
                 placements,
                 pose: pose.map(|f| f.bones.as_slice()),
                 sequence,
@@ -5961,5 +6315,212 @@ mod tests {
         remember_display_bounds(&mut bounds, 197, None);
 
         assert_eq!(bounds.get(&197), Some(&known));
+    }
+}
+
+/// The per-placement emitter gate, which is the half of it that needs no GPU.
+#[cfg(test)]
+mod retain_lit_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    /// Four torches along a line, and an extent of one unit around each.
+    fn torches() -> (Vec<Mat4>, Vec<u64>) {
+        let at = |x: f32| Mat4::from_translation(Vec3::new(x, 0.0, 0.0));
+        (
+            vec![at(0.0), at(10.0), at(20.0), at(30.0)],
+            vec![100, 200, 300, 400],
+        )
+    }
+
+    const EXTENT: (Vec3, Vec3) = (Vec3::splat(-1.0), Vec3::splat(1.0));
+
+    /// **The bug this function exists to make impossible.** The ids key a
+    /// particle system's history; a placement kept under its neighbour's id
+    /// restarts the plume, which is visible only as flames stuttering and
+    /// which no draw count would show.
+    #[test]
+    fn surviving_placements_keep_their_own_identities() {
+        let (placements, ids) = torches();
+        // Keep the second and fourth, so any off-by-one misaligns visibly.
+        let (kept, kept_ids) = retain_lit(
+            Cow::Borrowed(&placements),
+            &ids,
+            Some(EXTENT),
+            |t, _| {
+                let x = t.w_axis.x;
+                (9.0..11.0).contains(&x) || (29.0..31.0).contains(&x)
+            },
+        );
+        assert_eq!(kept.len(), 2);
+        assert_eq!(
+            kept_ids.as_ref(),
+            &[200, 400],
+            "the second and fourth torch must keep the second and fourth ids"
+        );
+        assert_eq!(kept[0].w_axis.x, 10.0);
+        assert_eq!(kept[1].w_axis.x, 30.0);
+    }
+
+    /// The common frame: everything is wanted, so nothing is allocated and the
+    /// borrow is handed straight back. 4.34 spent a rung removing per-frame
+    /// allocations; this must not add one back for the usual case.
+    #[test]
+    fn keeping_everything_borrows_rather_than_copies() {
+        let (placements, ids) = torches();
+        let (kept, kept_ids) =
+            retain_lit(Cow::Borrowed(&placements), &ids, Some(EXTENT), |_, _| true);
+        assert!(matches!(kept, Cow::Borrowed(_)), "all wanted must not copy");
+        assert!(matches!(kept_ids, Cow::Borrowed(_)));
+        assert_eq!(kept.len(), 4);
+    }
+
+    /// A model with no stated extent is never refused -- a held item's bounds
+    /// are `None` by design, and a torch in a hand must follow its wielder
+    /// rather than be judged on a box nobody keeps.
+    #[test]
+    fn no_extent_means_every_placement_survives() {
+        let (placements, ids) = torches();
+        let (kept, kept_ids) = retain_lit(
+            Cow::Borrowed(&placements),
+            &ids,
+            None,
+            // Would refuse everything if it were ever consulted.
+            |_, _| false,
+        );
+        assert_eq!(kept.len(), 4, "no extent must not be read as 'nowhere'");
+        assert_eq!(kept_ids.len(), 4);
+    }
+
+    /// The negative control: the same call refusing everything must come back
+    /// empty. Without it, a `retain_lit` that ignored `wants` entirely would
+    /// pass every other test here.
+    #[test]
+    fn refusing_everything_empties_the_group() {
+        let (placements, ids) = torches();
+        let (kept, kept_ids) =
+            retain_lit(Cow::Borrowed(&placements), &ids, Some(EXTENT), |_, _| false);
+        assert!(kept.is_empty(), "the caller skips the group on this");
+        assert!(kept_ids.is_empty());
+    }
+
+    /// **The range and the frustum are `&&`-ed, and each half has to be shown
+    /// to bite on its own.** One placement in view and near, one in view and
+    /// far, one out of view and near: only the first survives, and a version
+    /// that dropped either test would keep two.
+    ///
+    /// This is the check the picture cannot make. A candle twelve thousand
+    /// units down the road contributes no pixels either way, so a screenshot
+    /// A/B of the distance bound at Goldshire is byte-identical *whether or
+    /// not the bound works* -- the negative control there (every emitter
+    /// against none) moves 13 pixels, which is the noise floor. See
+    /// `render::cull::Range`.
+    #[test]
+    fn a_range_and_a_frustum_each_refuse_on_their_own() {
+        let at = |x: f32| Mat4::from_translation(Vec3::new(x, 0.0, 0.0));
+        // In view and near; in view and far down the road; near but behind.
+        let placements = vec![at(0.0), at(5000.0), at(-20.0)];
+        let ids = vec![100, 200, 300];
+        let near = render::cull::Range::around(Vec3::ZERO, 100.0);
+        // Stands in for the frustum: everything ahead is in view, however far.
+        let in_view = |t: &Mat4| t.w_axis.x >= 0.0;
+        let (kept, kept_ids) = retain_lit(
+            Cow::Borrowed(&placements),
+            &ids,
+            Some(EXTENT),
+            |t, (lo, hi)| {
+                in_view(&t) && near.holds(Some(render::cull::transformed_bounds(t, lo, hi)))
+            },
+        );
+        assert_eq!(kept.len(), 1, "only the near one in view survives");
+        assert_eq!(kept_ids.as_ref(), &[100]);
+
+        // Without the range, the far one comes back -- which is what this
+        // client did before it existed, and what 1,614 live emitters looked
+        // like from inside the Goldshire inn facing the door.
+        let (unbounded, _) =
+            retain_lit(Cow::Borrowed(&placements), &ids, Some(EXTENT), |t, _| in_view(&t));
+        assert_eq!(unbounded.len(), 2);
+    }
+
+    /// Ids may be shorter than placements -- `emitting_ids` is empty for a
+    /// model carrying no emitters -- and that must not panic or misalign.
+    #[test]
+    fn an_empty_id_list_is_tolerated() {
+        let (placements, _) = torches();
+        let (kept, kept_ids) = retain_lit(
+            Cow::Borrowed(&placements),
+            &[],
+            Some(EXTENT),
+            |t, _| t.w_axis.x < 15.0,
+        );
+        assert_eq!(kept.len(), 2);
+        assert!(kept_ids.is_empty());
+    }
+}
+
+/// The ground cache's key, which is where a stale floor would come from.
+#[cfg(test)]
+mod ground_key_tests {
+    use super::*;
+
+    fn key(asker: u64, at: Vec3, epoch: u64) -> GroundKey {
+        GroundKey {
+            asker,
+            at: [at.x.to_bits(), at.y.to_bits(), at.z.to_bits()],
+            epoch,
+        }
+    }
+
+    /// The case the cache exists for: a creature that has not moved asks the
+    /// same question and must be recognised as having asked it.
+    #[test]
+    fn standing_still_asks_the_same_question() {
+        let at = Vec3::new(-9459.8, 64.2, 55.9);
+        assert_eq!(key(7, at, 3), key(7, at, 3));
+    }
+
+    /// **The stale-floor case, and the reason `collision_epoch` is in the
+    /// key.** A tile arriving or leaving can move the floor under a creature
+    /// that has not itself moved by a millimetre; without the epoch that
+    /// creature keeps the answer computed against triangles that are gone.
+    #[test]
+    fn a_streamed_tile_invalidates_a_creature_that_never_moved() {
+        let at = Vec3::new(-9459.8, 64.2, 55.9);
+        assert_ne!(
+            key(7, at, 3),
+            key(7, at, 4),
+            "the same creature in the same place must re-ask once the resident \
+             triangles have changed"
+        );
+    }
+
+    /// Two creatures standing on one point are still two questions -- and more
+    /// to the point, one creature's answer must never be handed to another,
+    /// which is what an asker-less key would do.
+    #[test]
+    fn two_creatures_on_one_spot_do_not_share_an_answer() {
+        let at = Vec3::new(-9459.8, 64.2, 55.9);
+        assert_ne!(key(7, at, 3), key(8, at, 3));
+    }
+
+    /// A creature that moved at all must miss. Bit equality is the whole rule:
+    /// there is no tolerance to pick, and the smallest representable step is
+    /// still a step.
+    #[test]
+    fn any_movement_at_all_is_a_miss() {
+        let at = Vec3::new(-9459.8, 64.2, 55.9);
+        let nudged = Vec3::new(f32::from_bits(at.x.to_bits() + 1), at.y, at.z);
+        assert_ne!(key(7, at, 3), key(7, nudged, 3));
+    }
+
+    /// Height is part of where a creature is standing, not a derived answer --
+    /// `stand_height` takes `at.z` and searches from it, so two creatures at
+    /// one ground position on different floors of an inn get different floors.
+    #[test]
+    fn height_is_part_of_the_question() {
+        let lower = Vec3::new(-9459.8, 64.2, 55.9);
+        let upper = Vec3::new(-9459.8, 64.2, 61.9);
+        assert_ne!(key(7, lower, 3), key(7, upper, 3));
     }
 }

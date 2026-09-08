@@ -169,6 +169,18 @@ pub(crate) fn window(
                 .text("distance"),
             );
             ui.checkbox(&mut camera.invert_pitch, "invert vertical");
+            // **The largest single lever on the frame rate, so the slider says
+            // so.** Nothing else in this window changes what the client costs
+            // to draw; a person dragging it is trading a horizon for frames
+            // and has no way to know that from a number alone.
+            ui.add(
+                egui::Slider::new(
+                    &mut camera.view_distance,
+                    crate::camera::MIN_VIEW_DISTANCE..=crate::camera::MAX_VIEW_DISTANCE,
+                )
+                .text("view distance (nearer is faster)")
+                .logarithmic(true),
+            );
 
             ui.separator();
             ui.horizontal(|ui| {
