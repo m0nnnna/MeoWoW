@@ -1703,6 +1703,105 @@ impl Connection {
         outcome.map(|()| collected)
     }
 
+    /// [`Connection::drain`] with no waiting at all: whatever has already
+    /// arrived, and nothing else.
+    ///
+    /// **The right call from anything with a frame to render, and the reason
+    /// is a Windows fact rather than a protocol one.** `drain` asks the socket
+    /// to wait `quiet_for` for a packet that, in the common case, is not
+    /// coming -- and a quiet stream is how it learns to stop, so it pays that
+    /// wait *every* time. `SO_RCVTIMEO` is honoured against the system
+    /// interrupt timer, whose default period is **15.6 ms**: measured on this
+    /// machine, a 1 ms read timeout on a quiet socket costs a mean of
+    /// **15.57 ms**, and the same read on a non-blocking socket costs
+    /// **0.0014 ms**. The viewer drained with a 1 ms timeout every frame.
+    ///
+    /// It did not always cost 15 ms, which is what made it survive: something
+    /// in the process -- the audio stack, the compositor, the GPU driver --
+    /// usually has the timer raised to 1 ms, and the live logs show `net`
+    /// clustered at 1.1 ms accordingly. That is still a millisecond of every
+    /// frame spent waiting on purpose, and it is a millisecond held there by
+    /// *another program's* setting: nothing this client does keeps that timer
+    /// raised, and when it drops, every frame gains fifteen milliseconds at
+    /// once. `4.34` recorded "a 43-48 ms spike, 2-3 per run, flat across crowd
+    /// sizes, never investigated"; three of these is 46.5 ms.
+    ///
+    /// A packet that arrives a moment after this returns is read by the next
+    /// frame, which is at most one frame later -- against a wait that bought
+    /// nothing whenever the stream was already quiet.
+    pub fn drain_ready(&mut self, limit: usize) -> Result<Vec<Packet>, Error> {
+        let mut collected = Vec::new();
+        while collected.len() < limit {
+            match self.receive_ready()? {
+                Some(packet) => {
+                    self.housekeep(&packet)?;
+                    collected.push(packet);
+                }
+                None => break,
+            }
+        }
+        Ok(collected)
+    }
+
+    /// [`Connection::receive`] without waiting: `Ok(None)` when nothing has
+    /// arrived yet.
+    ///
+    /// **Only the first byte is asked for without waiting, and that is the
+    /// same licence `receive` already takes with its timeout** -- nothing has
+    /// been consumed and no cipher has advanced, so giving up costs nothing.
+    /// Past that byte the packet must be finished or the connection is dead,
+    /// so the socket is put *back into blocking mode before anything is
+    /// committed*: `read_committed` tolerates `WouldBlock` and would otherwise
+    /// spin against its deadline instead of waiting on the socket, turning a
+    /// straddled header into a busy-wait.
+    pub fn receive_ready(&mut self) -> Result<Option<Packet>, Error> {
+        let mut header = [0u8; protocol::SERVER_HEADER_LEN_LARGE];
+        let restore = self.stream.read_timeout().ok().flatten();
+        self.stream
+            .set_nonblocking(true)
+            .map_err(|source| Error::Io {
+                what: "making the stream non-blocking",
+                source,
+            })?;
+        let first = std::io::Read::read(&mut self.stream, &mut header[..1]);
+        // **Unconditionally, and before the match.** A stream left
+        // non-blocking is not a slow client, it is a client whose every
+        // subsequent blocking read fails instantly with `WouldBlock` -- which
+        // `is_quiet_stream` reads as "the server has gone quiet", so the
+        // connection would look idle rather than broken. See
+        // `a_ready_drain_leaves_the_stream_blocking`.
+        let restored = self.stream.set_nonblocking(false);
+        let _ = self.stream.set_read_timeout(restore);
+        restored.map_err(|source| Error::Io {
+            what: "restoring the stream to blocking",
+            source,
+        })?;
+        match first {
+            // A clean end of stream is a closed connection, not quiet.
+            Ok(0) => {
+                return Err(Error::Io {
+                    what: "a packet header",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the connection closed",
+                    ),
+                })
+            }
+            Ok(_) => {}
+            Err(source) if is_quiet_stream(&source) => return Ok(None),
+            Err(source) => {
+                return Err(Error::Io {
+                    what: "a packet header",
+                    source,
+                })
+            }
+        }
+        let _ = self.stream.set_read_timeout(Some(PACKET_COMPLETION_TIMEOUT));
+        let finished = self.receive_after_first_byte(&mut header);
+        let _ = self.stream.set_read_timeout(restore);
+        finished.map(Some)
+    }
+
     /// Sends a keepalive without waiting for the echo.
     ///
     /// The right call from anything with a frame to render. [`Connection::ping`]
@@ -2296,6 +2395,96 @@ mod tests {
         assert!(!Error::Protocol(protocol::Error::UnknownObjectType { got: 9 })
             .is_connection_lost());
         assert!(!Error::NoReply("SMSG_TRAINER_LIST", 12).is_connection_lost());
+    }
+
+    /// **A ready drain reads what has arrived, answers nothing when the
+    /// stream is quiet, and leaves the socket blocking either way.**
+    ///
+    /// The last clause is the one worth a test. `receive_ready` puts the
+    /// stream into non-blocking mode to ask for its first byte, and a stream
+    /// left that way does not fail loudly: every later blocking read returns
+    /// `WouldBlock` immediately, which [`is_quiet_stream`] reads as *"the
+    /// server has gone quiet"*. The connection would look idle -- no error, no
+    /// dropped socket, the world simply stops changing -- which is precisely
+    /// the failure mode this crate has been bitten by before, in the header
+    /// cipher desynchronising into a client "rendering a world it can no
+    /// longer hear".
+    ///
+    /// **Not a timing assertion.** That the wait is gone is measured
+    /// elsewhere and is a fact about Windows' timer, not about this code; what
+    /// this pins is the state the socket is left in, which is what would break
+    /// silently.
+    #[test]
+    fn a_ready_drain_leaves_the_stream_blocking() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut crypt = ServerCrypt::new(&KEY);
+            write_server_packet(&mut stream, Some(&mut crypt), 0x1234, &[0xAA; 6]);
+            write_server_packet(&mut stream, Some(&mut crypt), 0x5678, &[0xBB; 4]);
+            std::thread::sleep(Duration::from_millis(400));
+        });
+
+        let stream = TcpStream::connect(address).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("timeout");
+        let mut connection = Connection {
+            stream,
+            crypt: Some(HeaderCrypt::new(&KEY)),
+            expansion: 2,
+            started: std::time::Instant::now(),
+            ping_sequence: 0,
+        };
+
+        // Both packets, however many rounds it takes for them to arrive -- a
+        // ready drain does not wait, so an empty first call is correct and
+        // expected rather than a failure.
+        let mut seen: Vec<u16> = Vec::new();
+        for _ in 0..200 {
+            seen.extend(
+                connection
+                    .drain_ready(64)
+                    .expect("a ready drain")
+                    .iter()
+                    .map(|packet| packet.opcode),
+            );
+            if seen.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(seen, vec![0x1234, 0x5678], "both packets, in order");
+
+        // Quiet now, and quiet is `Ok(empty)` rather than an error -- the
+        // caller is a frame, and "nothing arrived" is the ordinary case.
+        assert!(
+            connection.drain_ready(64).expect("quiet is not a fault").is_empty(),
+            "a quiet stream hands back nothing"
+        );
+
+        // **The state the socket is left in.** A blocking read against a
+        // 50 ms timeout on a quiet stream must take roughly that long and
+        // report a timeout; on a stream left non-blocking it returns
+        // instantly, and `is_quiet_stream` cannot tell the two apart.
+        let waited = std::time::Instant::now();
+        let outcome = connection.receive();
+        let elapsed = waited.elapsed();
+        assert!(
+            matches!(&outcome, Err(Error::Io { source, .. }) if is_quiet_stream(source)),
+            "a quiet blocking read reports quiet, got {}",
+            match &outcome {
+                Ok(packet) => format!("a packet, opcode {:#06x}", packet.opcode),
+                Err(error) => error.to_string(),
+            }
+        );
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "the stream was left non-blocking: a 50 ms blocking read returned in {elapsed:?}"
+        );
+
+        server.join().ok();
     }
 
     /// A packet whose header arrives in two pieces is still read whole, even
