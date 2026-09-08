@@ -8344,10 +8344,27 @@ profile.
 
 ### Still not done
 
-* **No portal culling.** Frustum culling only, so indoors this draws every room
-  inside the frustum where the original draws the room you are in plus what is
-  visible through the doorways. In Ironforge the city *is* the frustum, which
-  is why it remains the worst case.
+* **Portal culling: built, and this bullet is now history.** Frustum culling
+  alone drew every room inside the frustum where the original draws the room
+  you are in plus what is visible through the doorways; in Ironforge the city
+  *is* the frustum, which is why it was the worst case. `render::portal` walks
+  the doorways now -- start in the room holding the eye, step through openings,
+  narrowing what may be seen by each opening's screen rectangle. Measured
+  across six indoor cameras in the two cities:
+
+      Ironforge  1,655 draws / 731 building  ->  1,052 / 128
+      Ironforge  2,032 draws / 825 building  ->  1,348 / 141
+      Stormwind  2,776 draws / 1,502 building -> 1,563 / 289
+      Stormwind  1,697 draws / 817 building  ->    923 /  43
+
+  **81-95% of a city's own room draws, with the picture byte-identical on five
+  of six cameras** and 11 pixels of 921,600 on the sixth. Benched inside
+  Ironforge: CPU `record+finish+submit` 2.10 -> 1.23 ms and GPU complete
+  2.65 -> 1.61 ms, and the GPU mattering at all is what makes a city different
+  from everywhere else this client has looked. Outdoors nothing changes at all
+  -- Goldshire's draw counts are *identical* with the walk on and off, because
+  the eye is in no room, the walk says so, and saying so means "draw
+  everything".
 
   **Correction, and it is the kind this file exists to catch.** This bullet
   used to say "the parser already reads the portal chunks -- Ironforge has 134

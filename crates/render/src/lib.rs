@@ -12,6 +12,7 @@ pub mod cull;
 pub mod liquid;
 pub mod mesh;
 pub mod particles;
+pub mod portal;
 pub mod precipitation;
 pub mod shading;
 pub mod shadow;

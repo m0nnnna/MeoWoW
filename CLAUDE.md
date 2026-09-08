@@ -100,7 +100,7 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation, timed events, particles/ribbons), WMO, ADT/WDT, MH2O — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming, liquids, M2 emitters, sun shadows — done. **`--screenshot` renders one frame headless and draws NO HUD** (see the instrument rule below). Model files, skeletons and the creature tables are cached **per file** as well as per display id, so a zone of humanoids loads one `HumanMale.m2` rather than one per NPC; every load prints its own cost breakdown |
-| Frame time | **Frustum culling on terrain chunks, model groups and each WMO *room*, in the visible pass and the sun's.** Ironforge went 11,506 draws/frame to 2,322 and 13fps to a frame that holds 77fps with 400 bodies and 17,000 particles on screen. Drawing the world costs **2ms of GPU**; everything else in the frame is CPU. **No portal culling and no level of detail** — the two systems the original has and this does not, and why Ironforge is still the worst case. See 4.34 |
+| Frame time | **Frustum culling on terrain chunks, model groups and each WMO *room*, in the visible pass and the sun's.** Ironforge went 11,506 draws/frame to 2,322 and 13fps to a frame that holds 77fps with 400 bodies and 17,000 particles on screen. Drawing the world costs **2ms of GPU**; everything else in the frame is CPU. **Portal culling walks a building's doorways**, so standing in a city draws the room you are in and what the openings show: Ironforge 731 building draws to 128, Stormwind 1,502 to 289, byte-identical on five of six cameras. `--no-portal-cull` is the A/B and `--portal-depth 0` the negative control. **There is no level of detail and there is none to be had** -- 3.3.5a's `.skin` files are not LODs and WMOs have none at all; see the rule below. See 4.34 |
 | Protocol | 3.1–3.5 done against a live realm, two clients at once. Replicated creatures interpolate, turn and animate; **other players do not** — see the defect below |
 | World | Day/night from `Light.dbc`, a real sky gradient, sun and moon, weather that falls, game objects drawn. **A star dome, a cloud band and the zone skybox `LightSkybox` names** — which on Azeroth and Kalimdor is none, measured. No moon texture, one cloud layer |
 | Shadows | **A directional shadow map from the sun**, cast by terrain, models and alpha-keyed foliage, received by everything but liquid. One cascade around the camera; `--no-shadows` and `--shadow-dump` are the instruments |
@@ -849,6 +849,19 @@ the full account is in `docs/ROADMAP.md`.
   feet planted in antiphase, which is what a walk is. **Before reading a
   measurement, ask what it would look like if the probe were aimed at
   nothing.**
+- **A pixel diff's noise floor is a property of the camera, not of the
+  project.** 4.34 recorded `--screenshot` as reproducible to "about 76 pixels
+  at delta <= 2" and that number was carried around as *the* threshold. Ten
+  cameras were A/B'd for portal culling and nine came back at 0 to 11 pixels;
+  the tenth came back at **2,731**, which read exactly like a room being
+  wrongly culled and sent me looking at highlighted diff images. The control
+  was one command away and settles it completely: **the same configuration
+  rendered twice at that camera differs by 2,159**, and the A/B's 2,152 is
+  *less than the scene's own noise*. There was a brazier in frame, and
+  `update_emitters` reads a wall clock. So a sweep of cameras carries a
+  self-noise column per row, not one figure at the top -- and the cheapest
+  possible refutation of "my change broke this" is running the *unchanged*
+  thing twice.
 - **An odd-looking render is often the camera.** Render canonical angles before
   doubting the parser.
 - **Some rules can only be found by looking.** Geoset selection took four

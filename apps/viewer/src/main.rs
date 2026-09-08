@@ -323,6 +323,37 @@ struct Args {
     #[arg(long)]
     no_interior_cull: bool,
 
+    /// Draw every room of a building, instead of only those the eye can reach
+    /// through its doorways.
+    ///
+    /// **The A/B for portal culling, and the reason its numbers mean
+    /// anything.** The same argument as `--no-cull` and `--no-interior-cull`:
+    /// a rule that removes geometry is correct only if it changes the frame
+    /// time and nothing else, and "nothing else" is not something an eye can
+    /// certify -- a room that was never reached looks like a wall, which is
+    /// what a room is supposed to look like from outside.
+    ///
+    /// Two `--screenshot` runs differing by this flag alone must produce the
+    /// same pixels *and* different draw counts. Either number on its own is
+    /// worthless: identical pixels with identical draws means the walk never
+    /// ran, and fewer draws with different pixels means it ate a room somebody
+    /// could see.
+    #[arg(long)]
+    no_portal_cull: bool,
+
+    /// Stop the doorway walk after this many openings. Omit for no limit.
+    ///
+    /// **The negative control that makes `--no-portal-cull`'s zero mean
+    /// something.** "Culling removed 603 draws and changed no pixels" is two
+    /// claims, and the second is worthless alone: a walk that reached every
+    /// room would change no pixels either, and so would one that never ran. A
+    /// deliberately too-short walk through the same camera has to change a
+    /// great many, and `--portal-depth 0` -- the room the eye stands in and
+    /// nothing else -- is the shortest there is. Same move as pushing the
+    /// frustum planes 12 units inward to prove `--no-cull` measures anything.
+    #[arg(long)]
+    portal_depth: Option<u32>,
+
     /// Submit every draw, culling nothing against the frustum.
     ///
     /// **The instrument the culling is checked with, and the reason it can be
@@ -2121,6 +2152,21 @@ struct FrameProfile {
     /// can see through an open door from outside. That trade is a decision, not
     /// a measurement, which is another reason this counts rather than acts.
     unentered_draws: u32,
+    /// Draws skipped because the doorway walk never reached their room.
+    ///
+    /// **Printed beside the two building counters, always**, and it is the
+    /// only number that separates the two ways this can be useless: a walk
+    /// that reaches everything (no saving) and a walk that never runs (no
+    /// saving either) draw the identical picture and take the identical
+    /// frame. `buildings_walked` and `buildings_entered` say which.
+    portal_culled_draws: u32,
+    /// Buildings offered to the doorway walk this frame -- one placement, with
+    /// rooms and openings both present.
+    buildings_walked: u32,
+    /// ...and how many of those the eye was actually inside, which is the only
+    /// case that can cull anything. The gap between the two is every farmhouse
+    /// on the tile, and it is expected to be nearly all of them.
+    buildings_entered: u32,
     /// The share of `model_draws` issued from the deferred transparent pass.
     ///
     /// **These cost more than an opaque draw and the count is the only thing
@@ -2450,6 +2496,8 @@ impl FrameProfile {
              models = {} buildings + {} doodads + {} creatures, {} of them \
              blended, {} inside buildings nobody is in | {} state calls, \
              {} skipped ({} redundant pipelines)\n\
+             portals: {} draw(s) in rooms no doorway reached, over {} building(s) \
+             walked of which {} had the eye inside\n\
              redraw {:.1}: ui {:.1} = snapshot {:.1} (target {:.1}, markers {:.1}, \
              bars {:.1}, panels {:.1}, map {:.1}, windows {:.1}) + egui {:.1} \
              (hud {:.1}, stats {:.1}) \
@@ -2493,6 +2541,9 @@ impl FrameProfile {
             self.state_calls,
             self.skipped_state,
             self.redundant_pipelines,
+            self.portal_culled_draws,
+            self.buildings_walked,
+            self.buildings_entered,
             self.redraw_ms,
             self.ui_ms,
             self.ui_snapshot_ms,
@@ -3254,6 +3305,18 @@ struct Culling {
     /// How far a building must be before its unentered interior stops being
     /// drawn, or `None` to always draw it -- see `Args::interior_cull`.
     interiors: Option<f32>,
+    /// Whether to walk a building's doorways and draw only the rooms the eye
+    /// can reach -- see `Args::no_portal_cull` and `render::portal`.
+    ///
+    /// **Answers the case `interiors` structurally cannot.** That one asks how
+    /// far away a room is, and indoors the answer is zero: sweeping the far
+    /// plane from 397 to 12,000 units inside Ironforge left its building draw
+    /// count unchanged at every step, because the eye is inside the box and
+    /// distance was never what bounded a room.
+    portals: bool,
+    /// How many doorways deep the walk may go -- `u32::MAX` unless
+    /// `--portal-depth` says otherwise. See `Args::portal_depth`.
+    depth: u32,
 }
 
 /// Whether this draw paints the inside of a building the camera is not in.
@@ -3736,6 +3799,11 @@ fn draw_streaming(
     // `FrameProfile::entity_draws`.
     let mut deferred: Vec<(bool, &crate::world::Group, usize)> = Vec::new();
     let mut bound = Bound::default();
+    // **One buffer, reused across every building in the frame.** `visible_rooms`
+    // rewrites it in full each time, which is the property that makes reuse
+    // safe -- a stale `true` left over from the previous building would draw a
+    // room nothing had reached, and a stale `false` would hide one.
+    let mut rooms: Vec<bool> = Vec::new();
     let map_groups = world.tiles().flat_map(|t| t.groups.iter()).map(|g| (false, g));
     for (entity, group) in map_groups.chain(world.entities().iter().map(|g| (true, g))) {
         {
@@ -3748,6 +3816,39 @@ fn draw_streaming(
                 profile.culled_draws += group.model.draws.len() as u32;
                 continue;
             }
+            // **Once per building, not once per draw.** The walk is a graph
+            // traversal over the whole building and its answer is the same for
+            // every draw in it; asking per draw would repeat it 731 times in
+            // Ironforge to get 731 identical answers.
+            //
+            // Both halves have to be present or the answer is meaningless:
+            // `part_bounds` is where the rooms are and `doorways` is how they
+            // join, and they are `Some` under the identical condition for
+            // exactly that reason -- see `world::placement_doorways`.
+            let walked = match (cull.portals, &group.part_bounds, &group.doorways) {
+                (true, Some(part_bounds), Some(doorways)) => {
+                    let verdict = render::portal::visible_rooms_to_depth(
+                        eye,
+                        &view_proj,
+                        part_bounds,
+                        doorways,
+                        &group.model.unwalkable_rooms,
+                        cull.depth,
+                        &mut rooms,
+                    );
+                    profile.buildings_walked += 1;
+                    if verdict == render::portal::Rooms::Decided {
+                        profile.buildings_entered += 1;
+                    }
+                    // **`Undecided` fills the buffer with `true`.** The eye is
+                    // outside this building, which is the ordinary case for
+                    // every farmhouse on the tile, and the honest answer there
+                    // is "draw it" -- `interiors` is the rule that handles
+                    // being outside.
+                    true
+                }
+                _ => false,
+            };
             let group_bones = group
                 .animation
                 .and_then(|key| world.entity_bone_buffer(key))
@@ -3807,6 +3908,20 @@ fn draw_streaming(
                     .is_some_and(|(min, max)| !frustum.intersects(*min, *max))
                 {
                     profile.culled_draws += 1;
+                    continue;
+                }
+                // **The room this batch belongs to, if the walk reached it.**
+                // `submesh_id` is the group index for a WMO -- the same
+                // indexing `part_bounds` and `group_interior` use -- so the
+                // walk's answer lines up with it directly.
+                //
+                // A batch whose id is past the end of the walk is drawn: an id
+                // this pass cannot place is not evidence that its room is
+                // unreachable, and a cull that treats "I do not know" as "no"
+                // deletes geometry for the one reason it must never delete it.
+                if walked && !rooms.get(draw.submesh_id as usize).copied().unwrap_or(true) {
+                    profile.culled_draws += 1;
+                    profile.portal_culled_draws += 1;
                     continue;
                 }
                 // **Before the transparent split, not after it.** A room's
@@ -4450,7 +4565,12 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
             strength: SHADOW_STRENGTH,
         }),
         &mut headless,
-        Culling { frustum: !args.no_cull, interiors: interior_cull(args) },
+        Culling {
+            frustum: !args.no_cull,
+            interiors: interior_cull(args),
+            portals: !args.no_portal_cull,
+            depth: args.portal_depth.unwrap_or(u32::MAX),
+        },
     );
     // **The headless path's whole reason for carrying one.** `--screenshot`
     // draws no HUD, so the debug window's copy of this cannot be captured
@@ -4550,7 +4670,12 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
                     strength: SHADOW_STRENGTH,
                 }),
                 &mut counts,
-                Culling { frustum: !args.no_cull, interiors: interior_cull(args) },
+                Culling {
+            frustum: !args.no_cull,
+            interiors: interior_cull(args),
+            portals: !args.no_portal_cull,
+            depth: args.portal_depth.unwrap_or(u32::MAX),
+        },
             );
             let recorded = round.elapsed().as_secs_f32() * 1000.0;
             let at_finish = Instant::now();
@@ -9327,6 +9452,8 @@ impl App {
                 Culling {
                     frustum: !self.args.no_cull,
                     interiors: interior_cull(&self.args),
+                    portals: !self.args.no_portal_cull,
+                    depth: self.args.portal_depth.unwrap_or(u32::MAX),
                 },
             );
         }

@@ -33,6 +33,13 @@ pub struct LoadedWmo {
     /// abbey interior from a garden fence the character has jumped onto.
     /// Reported live as rain cutting out while jumping a fence outdoors.
     pub group_interior: Vec<bool>,
+    /// The openings between this building's rooms, in model space, each
+    /// naming the pair of groups it joins. Empty for a building of one room,
+    /// which is 1,269 of the game's 1,985. See `render::portal`.
+    pub doorways: Vec<crate::world::ModelDoorway>,
+    /// Rooms named by an opening the file describes from only one side, and so
+    /// never culled. See [`LoadedWmo::doorways`].
+    pub unwalkable_rooms: Vec<u32>,
     pub vertex_count: usize,
     pub triangle_count: usize,
     pub group_count: usize,
@@ -280,6 +287,46 @@ pub fn load_with_areas(
     // the same source `group_bounds` above already reads, so this costs
     // nothing extra to open.
     let group_interior = root.groups.iter().map(|group| group.is_interior()).collect();
+    // **The doorways, reduced to the pair of rooms each joins.** A `.wmo`
+    // stores every portal twice, once from each side, and which entry belongs
+    // to which room is decided by a per-group index range in the *group file*
+    // header. Taking the two groups a portal is referenced by says the same
+    // thing without opening anything, and cannot be wrong about which entry
+    // was whose -- see `render::portal::Doorway`, which steps to whichever of
+    // the pair is not where the eye is.
+    //
+    // **69 of the game's 7,548 portals are referenced once rather than twice**
+    // (11 of them in Stormwind), so a portal with fewer than two ends is an
+    // ordinary thing this loop must drop rather than a file worth refusing.
+    let mut portal_ends: Vec<Vec<u32>> = vec![Vec::new(); root.portals.len()];
+    for reference in &root.portal_refs {
+        if let Some(ends) = portal_ends.get_mut(usize::from(reference.portal)) {
+            ends.push(u32::from(reference.group));
+        }
+    }
+    let doorways: Vec<crate::world::ModelDoorway> = root
+        .portals
+        .iter()
+        .zip(&portal_ends)
+        .filter_map(|(portal, ends)| {
+            let [a, b] = ends[..] else { return None };
+            (a != b).then(|| crate::world::ModelDoorway {
+                vertices: portal.vertices.iter().copied().map(Vec3::from).collect(),
+                rooms: (a, b),
+            })
+        })
+        .collect();
+    // **The rooms behind an opening the file only half-describes.** A portal
+    // referenced from one side names a room and nothing beyond it, so it
+    // cannot be walked through -- and a room reachable only that way would
+    // never be reached at all. There is no far side to name, so the near room
+    // is marked and left at that; see `render::portal::visible_rooms`, and
+    // 4.35's account of the twelve-pixel sliver in Stormwind that found it.
+    let unwalkable_rooms: Vec<u32> = portal_ends
+        .iter()
+        .filter(|ends| ends.len() != 2)
+        .flat_map(|ends| ends.iter().copied())
+        .collect();
     let mut group_surface_ids = vec![0; root.header.group_count as usize];
 
     for gi in 0..root.header.group_count as usize {
@@ -452,6 +499,8 @@ pub fn load_with_areas(
         group_bounds,
         group_surface_ids,
         group_interior,
+        doorways,
+        unwalkable_rooms,
         vertex_count: vertices.len(),
         triangle_count,
         group_count,

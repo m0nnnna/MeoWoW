@@ -127,10 +127,30 @@ pub struct CachedModel {
     /// Parallel to `group_bounds`. Empty for an M2, which has no groups to
     /// speak of. See `world_object::LoadedWmo::group_interior`.
     pub group_interior: Vec<bool>,
+    /// The openings between this building's rooms, in model space. Empty for
+    /// an M2 and for a building of one room. See [`ModelDoorway`].
+    pub doorways: Vec<ModelDoorway>,
+    /// Rooms an opening names from one side only, which cannot be walked
+    /// through and so are never culled. See
+    /// `world_object::LoadedWmo::unwalkable_rooms`.
+    pub unwalkable_rooms: Vec<u32>,
     /// The liquid surfaces a WMO's groups declare via `MLIQ`, in model space.
     /// Empty for an M2 and for a WMO with no interior water. See
     /// `world_object::WmoLiquid`.
     pub liquids: Vec<crate::world_object::WmoLiquid>,
+}
+
+/// An opening between two of a building's rooms, in the building's own space.
+///
+/// Kept in model space beside `group_bounds` and transformed per placement,
+/// exactly as those are -- see [`placement_bounds`]. The alternative, storing
+/// them already placed, would mean one copy per placement of a model that has
+/// only one set of rooms.
+#[derive(Clone, Debug)]
+pub struct ModelDoorway {
+    pub vertices: Vec<Vec3>,
+    /// The two groups it joins, as indices into `group_bounds`.
+    pub rooms: (u32, u32),
 }
 
 /// One model and the transforms it takes on a single tile.
@@ -204,6 +224,11 @@ pub struct Group {
     /// one building have two different sets of them, which is a per-instance
     /// draw loop rather than a per-group one.
     pub part_bounds: Option<Vec<(Vec3, Vec3)>>,
+    /// This placement's doorways, in world space, `Some` under exactly the
+    /// same condition as [`Self::part_bounds`]: one placement of a building
+    /// that has rooms. Portal culling needs the rooms and the openings between
+    /// them to be in the same space, and `part_bounds` is where the rooms are.
+    pub doorways: Option<Vec<render::portal::Doorway>>,
     /// The archive path of this group's model, for the draw census.
     ///
     /// **Carried for the census and nothing else.** Everything the draw loop
@@ -408,6 +433,35 @@ fn placement_bounds(
         },
         transforms,
         margin,
+    )
+}
+
+/// This placement's doorways in world space, under exactly the condition
+/// [`placement_bounds`] offers per-part boxes: **one placement of a building
+/// that has rooms.**
+///
+/// The two must agree, because portal culling matches an opening against the
+/// rooms it joins and a doorway placed by one transform against a room placed
+/// by another is a doorway in the wrong building. Tied to the same
+/// `[transform]` pattern rather than to a separate condition, so they cannot
+/// come apart.
+fn placement_doorways(
+    model: &CachedModel,
+    transforms: &[Mat4],
+) -> Option<Vec<render::portal::Doorway>> {
+    let [transform] = transforms else { return None };
+    if model.doorways.is_empty() {
+        return None;
+    }
+    Some(
+        model
+            .doorways
+            .iter()
+            .map(|d| render::portal::Doorway {
+                vertices: d.vertices.iter().map(|v| transform.transform_point3(*v)).collect(),
+                rooms: d.rooms,
+            })
+            .collect(),
     )
 }
 
@@ -1578,9 +1632,11 @@ impl World {
                 .collect();
             // Scenery does not move after this, so no margin.
             let (bounds, part_bounds) = placement_bounds(&model, &transforms, false);
+            let doorways = placement_doorways(&model, &transforms);
             built.push(Group {
                 bounds,
                 part_bounds,
+                doorways,
                 // The path, because it is the only thing here that knows: the
                 // buildings and the doodads were merged into one map keyed by
                 // path well above this, precisely so that both draw through
@@ -2175,6 +2231,8 @@ impl World {
             group_bounds: Vec<(Vec3, Vec3)>,
             group_surface_ids: Vec<u32>,
             group_interior: Vec<bool>,
+            doorways: Vec<ModelDoorway>,
+            unwalkable_rooms: Vec<u32>,
             render_bounds: Option<(Vec3, Vec3)>,
             doodads: Vec<Vec<crate::world_object::Doodad>>,
             liquids: Vec<crate::world_object::WmoLiquid>,
@@ -2211,6 +2269,8 @@ impl World {
                         group_bounds: w.group_bounds,
                         group_surface_ids: w.group_surface_ids,
                         group_interior: w.group_interior,
+                        doorways: w.doorways,
+                        unwalkable_rooms: w.unwalkable_rooms,
                         render_bounds: Some((w.min, w.max)),
                         doodads: w.doodads,
                         liquids: w.liquids,
@@ -2253,6 +2313,8 @@ impl World {
                         group_bounds: Vec::new(),
                         group_surface_ids: Vec::new(),
                         group_interior: Vec::new(),
+                        doorways: Vec::new(),
+                        unwalkable_rooms: Vec::new(),
                         render_bounds: Some((m.min, m.max)),
                         doodads: Vec::new(),
                         liquids: Vec::new(),
@@ -2288,6 +2350,8 @@ impl World {
                 group_bounds: b.group_bounds,
                 group_surface_ids: b.group_surface_ids,
                 group_interior: b.group_interior,
+                doorways: b.doorways,
+                unwalkable_rooms: b.unwalkable_rooms,
                 render_bounds: b.render_bounds,
                 liquids: b.liquids,
             })
@@ -2704,6 +2768,7 @@ impl World {
                     // is a rounding error against the city behind it.
                     bounds: None,
                     part_bounds: None,
+                    doorways: None,
                     // A torch in a hand is the case this exists for, and its
                     // placements are rewritten every frame by
                     // `update_animations` along with the item's own transform.
@@ -2764,6 +2829,7 @@ impl World {
                 built.push(Group {
                     bounds,
                     part_bounds,
+                    doorways: None,
                     building: false,
                     path: None,
                     emitting: emitting_placements(&doodad_model, &doodad_transforms),
@@ -2789,6 +2855,7 @@ impl World {
             built.push(Group {
                 bounds,
                 part_bounds,
+                doorways: None,
                 building: false,
                 path: None,
                 emitting: emitting_placements(&model, &transforms),
@@ -3416,6 +3483,9 @@ impl World {
                     binds,
                     texture_animation: loaded.texture_animation,
                     doodads: Vec::new(),
+                    // A creature is an M2: one piece, no rooms, no doorways.
+                    doorways: Vec::new(),
+                    unwalkable_rooms: Vec::new(),
                     bones: loaded.bones,
                     sequences: loaded.sequences,
                     attachments: loaded.attachments,
