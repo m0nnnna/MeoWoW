@@ -1008,6 +1008,22 @@ These are what replaced guessing.
   rescans are gone, what is left is what this client does not have: no portal
   culling, no LOD. Those are features with milestones, not optimisations, and
   saying so is more useful than grinding another tenth of a millisecond.
+- **…and a feature you do not have is not necessarily one you could have.** A
+  backlog entry is a claim, and "no level of detail, anywhere — this is most of
+  how the original draws a city cheaply" stood for two rungs before anybody
+  asked whether the data existed. **It does not.** 3.3.5a's `.skin` files are
+  named for levels of detail and are not any: **21,560 of 22,779 models ship
+  exactly one**, and across every model that has more, **not one has a higher
+  skin with fewer draw calls** — the triangles are identical and the batches go
+  *up*, 34.7% by level 3. WMO level of detail did not exist until Legion, and a
+  WMO is where the cost is: 731 of 1,088 model draws in Ironforge are the city
+  itself. So the lever named in the backlog was never there, and the two things
+  still worth doing under that name — decimating terrain, dropping small
+  doodads with distance — are different features that have to be bounded on
+  their own. **Check the data exists before scheduling the thing that would
+  consume it**, and be most suspicious when the format's own name for something
+  agrees with the plan: `.skin` LOD indices, like a column that is named
+  correctly and still does not mean what its name says here.
 
 - **A spatial index narrows in the dimensions it indexes, and a building is
   the one it does not.** The collision grid is 8x8 units in x and y with *no

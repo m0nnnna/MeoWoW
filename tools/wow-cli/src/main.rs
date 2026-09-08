@@ -1354,6 +1354,36 @@ enum WmoCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Dump the doorways between a building's rooms: `MOPV`, `MOPT`, `MOPR`.
+    ///
+    /// **The dump command that has to exist before any of this reaches the
+    /// renderer**, and the checks in it are the point rather than the listing.
+    /// A portal is four points and a plane, and every field of that is a small
+    /// number that would look perfectly plausible read at the wrong offset --
+    /// so what is printed is the set of properties the data *must* have if the
+    /// stride is right:
+    ///
+    /// * the portal count agrees with the one `MOHD` declares,
+    /// * every plane normal is a **unit vector**,
+    /// * every portal vertex lies **on that portal's own plane**, which is the
+    ///   strongest of the three because it is the only one that ties `MOPV`,
+    ///   `MOPT`'s vertex run and the plane together -- a wrong stride in any
+    ///   one of them moves the points off the plane,
+    /// * every reference names a group that exists, and
+    /// * every portal is referenced **exactly twice, from opposite sides**,
+    ///   because a doorway joins two rooms and a portal graph that does not
+    ///   pair up cannot be walked.
+    ///
+    /// A failure here is printed as a count, never as a refusal: the shape has
+    /// to survive being wrong, or the next reader learns only that something
+    /// was declined.
+    Portals {
+        /// Archive path of the root `.wmo`.
+        path: String,
+        /// How many portals to list individually.
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1373,6 +1403,33 @@ enum M2Command {
     },
     /// Parse every model and its skins, validating the index tables.
     Survey {
+        filter: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Ask whether this game's `.skin` files are levels of detail at all.
+    ///
+    /// **The question is what a lower skin would buy, and it has to be asked
+    /// of the population rather than of a model somebody picked.** The name
+    /// says "level of detail" and `docs/ROADMAP.md` records "no level of
+    /// detail, anywhere" as a thing this client is missing, which presumes the
+    /// data is there to use. Whether it is, is a fact about 3.3.5a's archives
+    /// and nothing else.
+    ///
+    /// Two numbers per level, because they answer different questions and only
+    /// one of them matters to this renderer. **Triangles** are what a level of
+    /// detail is supposed to reduce, and they are what the *GPU* pays.
+    /// **Batches** become draw calls, which is what the CPU pays -- and this
+    /// client's frame is CPU-bound in submission, with `finish` proportional to
+    /// the commands handed to it. A skin with the same triangles and more
+    /// batches is not a cheaper model; it is a more expensive one.
+    ///
+    /// Absent is counted apart from present, because "the file is not there"
+    /// and "it is there and identical" are different findings and a survey that
+    /// merged them could report either as the other. Reading is the test, never
+    /// listing: an MPQ resolves by hash, so a path missing from `(listfile)`
+    /// still reads, and a path present in it may not.
+    Lods {
         filter: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
@@ -10945,6 +11002,7 @@ fn wmo_cmd(chain: &mut Chain, cmd: WmoCommand) -> Result<()> {
         WmoCommand::Info { path, limit } => wmo_info(chain, &path, limit),
         WmoCommand::Survey { filter, limit } => wmo_survey(chain, filter.as_deref(), limit),
         WmoCommand::Footing { filter, limit } => wmo_footing(chain, filter.as_deref(), limit),
+        WmoCommand::Portals { path, limit } => wmo_portals(chain, &path, limit),
     }
 }
 
@@ -10963,6 +11021,153 @@ fn wmo_cmd(chain: &mut Chain, cmd: WmoCommand) -> Result<()> {
 /// reason to say anything. A column that is zero nearly everywhere and
 /// meaningful on floors is the right shape; one that is uniformly zero says
 /// this cannot be done at all.
+/// Dumps a building's portals and checks the properties that say the stride is
+/// right. See [`WmoCommand::Portals`].
+fn wmo_portals(chain: &mut Chain, path: &str, limit: usize) -> Result<()> {
+    let bytes = chain.read(path)?;
+    let root = wmo::Root::parse(&bytes)?;
+    println!("{path}");
+    println!(
+        "  {} groups, {} portals declared, {} parsed, {} references",
+        root.header.group_count,
+        root.header.portal_count,
+        root.portals.len(),
+        root.portal_refs.len(),
+    );
+    if root.portals.is_empty() {
+        println!("  no portals: a building of one room, or an outdoor shell");
+        return Ok(());
+    }
+    // **The declared count against the parsed one.** These come from different
+    // chunks and a stride error moves only the second.
+    if root.portals.len() as u32 != root.header.portal_count {
+        println!(
+            "  MISMATCH: MOHD says {} portals, MOPT holds {}",
+            root.header.portal_count,
+            root.portals.len()
+        );
+    }
+
+    // Both numbers, always: "none were off the plane" and "there were no
+    // vertices" are different answers.
+    let (mut unit, mut off_unit) = (0usize, 0usize);
+    let (mut on_plane, mut off_plane) = (0usize, 0usize);
+    let mut worst_normal = 0.0f32;
+    let mut worst_plane = 0.0f32;
+    for portal in &root.portals {
+        let length = portal.normal_length();
+        if (length - 1.0).abs() <= 1e-3 {
+            unit += 1;
+        } else {
+            off_unit += 1;
+        }
+        worst_normal = worst_normal.max((length - 1.0).abs());
+        for v in &portal.vertices {
+            // dot(n, v) + d, which is zero for a point on the plane. Measured
+            // in world units, so the tolerance is a distance and not a ratio.
+            let d = portal.normal[0] * v[0]
+                + portal.normal[1] * v[1]
+                + portal.normal[2] * v[2]
+                + portal.distance;
+            if d.abs() <= 0.05 {
+                on_plane += 1;
+            } else {
+                off_plane += 1;
+            }
+            worst_plane = worst_plane.max(d.abs());
+        }
+    }
+    println!(
+        "  plane normals: {unit} unit-length, {off_unit} not (worst error {worst_normal:.2e})"
+    );
+    println!(
+        "  portal vertices: {on_plane} on their own plane, {off_plane} off it \
+         (worst distance {worst_plane:.4} units)"
+    );
+
+    // Every reference must name a group that exists and a portal that exists.
+    let groups = root.header.group_count;
+    let bad_group = root
+        .portal_refs
+        .iter()
+        .filter(|r| u32::from(r.group) >= groups)
+        .count();
+    let bad_portal = root
+        .portal_refs
+        .iter()
+        .filter(|r| usize::from(r.portal) >= root.portals.len())
+        .count();
+    println!(
+        "  references: {} resolve to a real group, {bad_group} do not; \
+         {} to a real portal, {bad_portal} do not",
+        root.portal_refs.len() - bad_group,
+        root.portal_refs.len() - bad_portal,
+    );
+
+    // **A doorway joins two rooms, so each portal must be referenced twice,
+    // once from each side.** This is the property that says the graph can be
+    // walked at all -- and it is the one a plausible-looking wrong stride is
+    // least likely to satisfy by accident.
+    let mut times_seen = vec![0usize; root.portals.len()];
+    let mut side_sum = vec![0i32; root.portals.len()];
+    for r in &root.portal_refs {
+        if let Some(slot) = times_seen.get_mut(usize::from(r.portal)) {
+            *slot += 1;
+            side_sum[usize::from(r.portal)] += i32::from(r.side);
+        }
+    }
+    let paired = times_seen.iter().filter(|n| **n == 2).count();
+    let opposed = times_seen
+        .iter()
+        .zip(&side_sum)
+        .filter(|(n, s)| **n == 2 && **s == 0)
+        .count();
+    let mut sides: std::collections::BTreeMap<i16, usize> = std::collections::BTreeMap::new();
+    for r in &root.portal_refs {
+        *sides.entry(r.side).or_insert(0) += 1;
+    }
+    println!(
+        "  pairing: {paired} of {} portals referenced exactly twice, {opposed} of those \
+         from opposite sides",
+        root.portals.len()
+    );
+    println!(
+        "  side values seen: {}",
+        sides
+            .iter()
+            .map(|(s, n)| format!("{s}x{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    println!("\n  portals (first {limit}):");
+    for (i, portal) in root.portals.iter().enumerate().take(limit) {
+        let joins: Vec<String> = root
+            .portal_refs
+            .iter()
+            .filter(|r| usize::from(r.portal) == i)
+            .map(|r| {
+                let name = root
+                    .groups
+                    .get(usize::from(r.group))
+                    .map(|g| g.name.as_str())
+                    .unwrap_or("?");
+                format!("{} ({name}) side {}", r.group, r.side)
+            })
+            .collect();
+        println!(
+            "    {i:>3}: {} verts, normal [{:.3} {:.3} {:.3}] d {:.2}  <-> {}",
+            portal.vertices.len(),
+            portal.normal[0],
+            portal.normal[1],
+            portal.normal[2],
+            portal.distance,
+            joins.join("  |  "),
+        );
+    }
+    Ok(())
+}
+
 fn wmo_footing(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> Result<()> {
     use std::collections::BTreeMap;
 
@@ -11291,6 +11496,18 @@ fn wmo_survey(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> 
     let mut failures: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let (mut ok, mut groups, mut verts, mut tris) = (0usize, 0usize, 0u64, 0u64);
     let (mut doodads, mut unresolved, mut biggest) = (0u64, 0usize, 0usize);
+    // **Portals, checked against the properties a right stride implies.** A
+    // systematic offset error shows up here as one large bucket rather than as
+    // scattered noise, which is the whole reason this command exists. Every
+    // counter is a pair: `on_plane`/`off_plane` and so on, because "none were
+    // wrong" and "there were none" are different answers.
+    let (mut portals, mut portal_refs, mut buildings_with_portals) = (0u64, 0u64, 0usize);
+    let (mut unit_normals, mut bad_normals) = (0u64, 0u64);
+    let (mut on_plane, mut off_plane) = (0u64, 0u64);
+    let (mut paired, mut unpaired) = (0u64, 0u64);
+    let (mut refs_resolve, mut refs_dangling) = (0u64, 0u64);
+    let mut declared_mismatch = 0usize;
+    let mut worst_plane = 0.0f32;
 
     for (i, name) in roots.iter().enumerate() {
         let Ok(bytes) = chain.read(name) else {
@@ -11308,6 +11525,54 @@ fn wmo_survey(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> 
         };
         ok += 1;
         doodads += root.doodads.len() as u64;
+
+        if !root.portals.is_empty() {
+            buildings_with_portals += 1;
+        }
+        portals += root.portals.len() as u64;
+        portal_refs += root.portal_refs.len() as u64;
+        if root.portals.len() as u32 != root.header.portal_count {
+            declared_mismatch += 1;
+        }
+        for portal in &root.portals {
+            if (portal.normal_length() - 1.0).abs() <= 1e-3 {
+                unit_normals += 1;
+            } else {
+                bad_normals += 1;
+            }
+            for v in &portal.vertices {
+                let d = portal.normal[0] * v[0]
+                    + portal.normal[1] * v[1]
+                    + portal.normal[2] * v[2]
+                    + portal.distance;
+                if d.abs() <= 0.05 {
+                    on_plane += 1;
+                } else {
+                    off_plane += 1;
+                }
+                worst_plane = worst_plane.max(d.abs());
+            }
+        }
+        let mut seen = vec![0usize; root.portals.len()];
+        for r in &root.portal_refs {
+            if usize::from(r.portal) < root.portals.len()
+                && u32::from(r.group) < root.header.group_count
+            {
+                refs_resolve += 1;
+            } else {
+                refs_dangling += 1;
+            }
+            if let Some(slot) = seen.get_mut(usize::from(r.portal)) {
+                *slot += 1;
+            }
+        }
+        for n in seen {
+            if n == 2 {
+                paired += 1;
+            } else {
+                unpaired += 1;
+            }
+        }
         let names = wmo::Chunks::find(&bytes, b"MOGN").unwrap_or(&[]).to_vec();
 
         for gi in 0..root.header.group_count as usize {
@@ -11345,6 +11610,18 @@ fn wmo_survey(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> 
     println!("  {verts} vertices, {tris} triangles, {doodads} doodad placements");
     println!("  largest group: {biggest} vertices");
     println!("  {unresolved} listed roots did not resolve (tombstoned or stale)");
+    println!(
+        "\n  portals: {portals} across {buildings_with_portals} building(s), \
+         {portal_refs} references, {declared_mismatch} disagreeing with MOHD"
+    );
+    println!(
+        "    plane normals {unit_normals} unit-length / {bad_normals} not | \
+         vertices {on_plane} on their plane / {off_plane} off (worst {worst_plane:.3} units)"
+    );
+    println!(
+        "    references {refs_resolve} resolve / {refs_dangling} dangling | \
+         portals {paired} referenced twice / {unpaired} not"
+    );
     if failures.is_empty() {
         println!("\nno failures");
     } else {
@@ -11360,6 +11637,7 @@ fn m2_cmd(chain: &mut Chain, cmd: M2Command) -> Result<()> {
     match cmd {
         M2Command::Info { path, lod, limit } => m2_info(chain, &path, lod, limit),
         M2Command::Survey { filter, limit } => m2_survey(chain, filter.as_deref(), limit),
+        M2Command::Lods { filter, limit } => m2_lods(chain, filter.as_deref(), limit),
         M2Command::Creature { display_id } => m2_creature(chain, display_id),
         M2Command::Anims { path, limit } => m2_anims(chain, &path, limit),
         M2Command::AttachTrace {
@@ -14193,6 +14471,158 @@ fn m2_info(chain: &mut Chain, path: &str, lod: u32, limit: usize) -> Result<()> 
             }
         }
         Err(e) => println!("\n  {skin_path}: {e}"),
+    }
+    Ok(())
+}
+
+/// What one model's skins came to, at each level.
+#[derive(Clone, Copy, Default)]
+struct LodRow {
+    /// `None` where the file is not in the archives at all.
+    triangles: Option<u32>,
+    batches: Option<u32>,
+}
+
+/// Surveys whether higher `.skin` indices are cheaper than skin 0.
+///
+/// See [`M2Command::Lods`] for why the question is asked this way. The
+/// comparison is made only over models where **both** levels read, because a
+/// total over "every model that has a level 2" and a total over "every model
+/// that has a level 0" are sums over different populations and their ratio
+/// means nothing.
+fn m2_lods(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let needle = filter.map(str::to_lowercase);
+    let names: Vec<String> = chain
+        .list()?
+        .into_iter()
+        .filter(|n| {
+            let l = n.to_lowercase();
+            l.ends_with(".m2") && needle.as_ref().is_none_or(|f| l.contains(f.as_str()))
+        })
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+
+    const LEVELS: usize = 4;
+    let mut models = 0usize;
+    let mut declared: BTreeMap<u32, usize> = BTreeMap::new();
+    // Per level, over the models where this level *and* level 0 both read.
+    let mut present = [0usize; LEVELS];
+    let mut absent = [0usize; LEVELS];
+    let mut tris_here = [0u64; LEVELS];
+    let mut tris_at_zero = [0u64; LEVELS];
+    let mut batches_here = [0u64; LEVELS];
+    let mut batches_at_zero = [0u64; LEVELS];
+    let mut fewer_tris = [0usize; LEVELS];
+    let mut same_tris = [0usize; LEVELS];
+    let mut fewer_batches = [0usize; LEVELS];
+    let mut more_batches = [0usize; LEVELS];
+    // The single best case there is, so a flat result cannot hide one model
+    // that would have been worth using.
+    let mut best_saving: Option<(f32, String, u32, u32)> = None;
+
+    for (i, name) in names.iter().enumerate() {
+        let Ok(bytes) = chain.read(name) else { continue };
+        let Ok(model) = m2::Model::parse(&bytes) else {
+            continue;
+        };
+        models += 1;
+        *declared.entry(model.skin_count()).or_insert(0) += 1;
+
+        let mut rows = [LodRow::default(); LEVELS];
+        for (lod, row) in rows.iter_mut().enumerate() {
+            let path = m2::skin_path(name, lod as u32);
+            // **Read, never list.** An MPQ resolves by hash; a `(listfile)`
+            // entry is neither necessary nor sufficient for a file to be here.
+            let Ok(sb) = chain.read(&path) else { continue };
+            let Ok(skin) = m2::Skin::parse(&sb) else { continue };
+            *row = LodRow {
+                triangles: Some((skin.triangles().len() / 3) as u32),
+                batches: Some(skin.batches().len() as u32),
+            };
+        }
+
+        let (Some(base_tris), Some(base_batches)) = (rows[0].triangles, rows[0].batches) else {
+            continue;
+        };
+        for lod in 1..LEVELS {
+            let (Some(t), Some(b)) = (rows[lod].triangles, rows[lod].batches) else {
+                absent[lod] += 1;
+                continue;
+            };
+            present[lod] += 1;
+            tris_here[lod] += u64::from(t);
+            tris_at_zero[lod] += u64::from(base_tris);
+            batches_here[lod] += u64::from(b);
+            batches_at_zero[lod] += u64::from(base_batches);
+            match t.cmp(&base_tris) {
+                std::cmp::Ordering::Less => fewer_tris[lod] += 1,
+                std::cmp::Ordering::Equal => same_tris[lod] += 1,
+                std::cmp::Ordering::Greater => {}
+            }
+            if b < base_batches {
+                fewer_batches[lod] += 1;
+            } else if b > base_batches {
+                more_batches[lod] += 1;
+            }
+            if t < base_tris {
+                let saved = 1.0 - t as f32 / base_tris.max(1) as f32;
+                if best_saving.as_ref().is_none_or(|(s, ..)| saved > *s) {
+                    best_saving = Some((saved, name.clone(), base_tris, t));
+                }
+            }
+        }
+        if i % 2000 == 1999 {
+            tracing::info!("{}/{} models", i + 1, names.len());
+        }
+    }
+
+    println!("\n{models} models parsed of {} listed", names.len());
+    println!("\n  skin profiles declared by the header:");
+    for (count, models) in &declared {
+        println!("    {count}: {models:>6} model(s)");
+    }
+
+    println!(
+        "\n  against level 0, over models where both levels read:\n\
+         \x20   lvl   models    absent    triangles           batches"
+    );
+    for lod in 1..LEVELS {
+        if present[lod] == 0 {
+            println!(
+                "    {lod:>3} {:>8} {:>9}    (no model has this level)",
+                0, absent[lod]
+            );
+            continue;
+        }
+        println!(
+            "    {lod:>3} {:>8} {:>9}  {:>9} -> {:<9} {:>8} -> {}",
+            present[lod],
+            absent[lod],
+            tris_at_zero[lod],
+            tris_here[lod],
+            batches_at_zero[lod],
+            batches_here[lod],
+        );
+        // **Both directions printed, always.** "None were smaller" and "there
+        // were none to compare" are different answers, and a table showing
+        // only the reductions could not tell them apart.
+        println!(
+            "        {:>6} fewer triangles, {:>6} identical, {:>6} fewer batches, {:>6} more batches",
+            fewer_tris[lod], same_tris[lod], fewer_batches[lod], more_batches[lod]
+        );
+    }
+
+    match &best_saving {
+        Some((saved, name, from, to)) => println!(
+            "\n  the largest triangle reduction found anywhere: {:.1}% ({from} -> {to})\n    {name}",
+            saved * 100.0
+        ),
+        None => println!(
+            "\n  no model, at any level, has fewer triangles than its level 0.\n\
+             \x20   these are not levels of detail."
+        ),
     }
     Ok(())
 }

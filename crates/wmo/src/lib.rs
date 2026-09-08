@@ -26,6 +26,13 @@ const MATERIAL_SIZE: usize = 64;
 const GROUP_INFO_SIZE: usize = 32;
 const DOODAD_SET_SIZE: usize = 32;
 const DOODAD_DEF_SIZE: usize = 40;
+/// `MOPT`: two `u16` naming a run of `MOPV`, then a plane as normal plus
+/// distance. Confirmed against the count in `MOHD` -- Ironforge declares 134
+/// portals and its `MOPT` is 2,680 bytes -- and against the normals arriving
+/// unit-length, which no neighbouring stride produces.
+const PORTAL_SIZE: usize = 20;
+/// `MOPR`: portal, group, side, and a padding word.
+const PORTAL_REF_SIZE: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -46,7 +53,7 @@ pub enum Error {
 // The chunked container itself is shared with ADT; see `crates/chunk`. These
 // re-exports keep `wmo::Chunks` working for callers.
 pub use chunk::{Chunks, Magic};
-pub(crate) use chunk::{f32_at, string_at, u32_at, vec3_at};
+pub(crate) use chunk::{f32_at, string_at, u16_at, u32_at, vec3_at};
 
 /// Confirms a file is a WMO of the expected version.
 pub(crate) fn check_version(data: &[u8]) -> Result<(), Error> {
@@ -152,6 +159,61 @@ impl GroupInfo {
     }
 }
 
+/// A doorway between two groups: the convex polygon you can see through, and
+/// the plane it lies in.
+///
+/// **The vertices are resolved here rather than left as indices into `MOPV`.**
+/// A portal is a handful of points and there are 134 of them in the largest
+/// building in the game, so nothing is saved by making every caller carry the
+/// vertex pool and index into it correctly -- and an index nobody has resolved
+/// is an index nobody has range-checked.
+///
+/// The plane is stored as it is in the file, `normal` and `distance` with the
+/// convention `dot(normal, point) + distance = 0`. It is **not** normalised
+/// here: whether it arrives unit-length is the property that says the stride
+/// is right, and a parser that normalises destroys its own evidence. See
+/// [`Portal::normal_length`].
+#[derive(Clone, Debug)]
+pub struct Portal {
+    pub vertices: Vec<[f32; 3]>,
+    pub normal: [f32; 3],
+    pub distance: f32,
+}
+
+impl Portal {
+    /// Length of the stored plane normal.
+    ///
+    /// **This is the check that a wrong offset cannot survive.** A plane
+    /// normal is a unit vector; four bytes out in either direction reads a
+    /// coordinate or a distance as one of its components and the length stops
+    /// being one. Same move as the M2 normals and the SRP6 rotation keys --
+    /// check a property the data *must* have, not merely that it decoded.
+    pub fn normal_length(&self) -> f32 {
+        let [x, y, z] = self.normal;
+        (x * x + y * y + z * z).sqrt()
+    }
+}
+
+/// One end of one portal: a group saying "through this doorway lies that
+/// group, and I am on this side of its plane".
+///
+/// A group's `portal_start`/`portal_count` (on the *group file's* header, see
+/// [`group::Group`]) name a run of these, so the references are stored in
+/// group order and are not meaningful out of it.
+#[derive(Clone, Copy, Debug)]
+pub struct PortalRef {
+    /// Index into [`Root::portals`].
+    pub portal: u16,
+    /// The group on the far side of it.
+    pub group: u16,
+    /// Which side of the portal's plane the *referencing* group lies on,
+    /// `+1` or `-1`. Kept as the raw number: it decides which way the
+    /// frustum is narrowed when stepping through, and naming one sign
+    /// "front" before anything has been drawn through it would be a guess
+    /// with nothing to check it against.
+    pub side: i16,
+}
+
 /// A named selection of doodads. Only one set is active at a time, which is
 /// how one building ships furnished and empty variants.
 #[derive(Clone, Debug)]
@@ -180,6 +242,12 @@ pub struct Root {
     pub groups: Vec<GroupInfo>,
     pub doodad_sets: Vec<DoodadSet>,
     pub doodads: Vec<DoodadDef>,
+    /// The building's doorways, in the order `MOPR` references them.
+    pub portals: Vec<Portal>,
+    /// Which group lies through which doorway. Indexed by a group's own
+    /// `portal_start`/`portal_count`, so this is one flat array shared by
+    /// every group rather than a list per group.
+    pub portal_refs: Vec<PortalRef>,
     texture_names: Vec<u8>,
 }
 
@@ -274,12 +342,55 @@ impl Root {
             })
             .collect();
 
+        // **The doorways.** `MOPV` is a flat pool of vertices, `MOPT` says
+        // which run of it each portal uses plus the plane it lies in, and
+        // `MOPR` says which groups a portal joins. Only the counts of these
+        // have ever been read here -- `MOHD`'s `portal_count` and each group's
+        // `portal_start`/`portal_count` -- which is why `docs/ROADMAP.md` said
+        // the portal chunks were already parsed when no byte of them was.
+        let portal_vertices: Vec<[f32; 3]> = Chunks::find(data, b"MOPV")
+            .unwrap_or(&[])
+            .chunks_exact(12)
+            .map(|v| vec3_at(v, 0))
+            .collect();
+        let portals = Chunks::find(data, b"MOPT")
+            .unwrap_or(&[])
+            .chunks_exact(PORTAL_SIZE)
+            .map(|p| {
+                let start = u16_at(p, 0) as usize;
+                let count = u16_at(p, 2) as usize;
+                Portal {
+                    // Clamped rather than trusted: a run running off the end
+                    // of the pool is a malformed file, and the caller that
+                    // wants to know gets the count back as a short polygon
+                    // instead of a panic.
+                    vertices: portal_vertices
+                        .get(start..(start + count).min(portal_vertices.len()))
+                        .unwrap_or_default()
+                        .to_vec(),
+                    normal: vec3_at(p, 4),
+                    distance: f32_at(p, 16),
+                }
+            })
+            .collect();
+        let portal_refs = Chunks::find(data, b"MOPR")
+            .unwrap_or(&[])
+            .chunks_exact(PORTAL_REF_SIZE)
+            .map(|r| PortalRef {
+                portal: u16_at(r, 0),
+                group: u16_at(r, 2),
+                side: u16_at(r, 4) as i16,
+            })
+            .collect();
+
         Ok(Self {
             header,
             materials,
             groups,
             doodad_sets,
             doodads,
+            portals,
+            portal_refs,
             texture_names,
         })
     }
@@ -421,6 +532,160 @@ mod tests {
         // A name that merely ends in digits is not a group.
         assert!(!is_group_path("Building01.wmo"));
         assert!(!is_group_path("Foo_00.wmo"));
+    }
+
+    /// Two portals sharing one vertex pool, so an off-by-one in the run
+    /// misaligns visibly rather than reading the same answer twice.
+    ///
+    /// **Every field here is chosen to be wrong-looking if read at the wrong
+    /// offset.** The second portal's plane is a diagonal rather than an axis,
+    /// so a normal read four bytes out stops being unit-length; the runs are
+    /// different lengths, so a fixed stride cannot fake them; and the sides
+    /// are `-1`/`+1`, which is the one value that separates a signed read from
+    /// an unsigned one -- `65535` is what this field looks like read as `u16`.
+    #[test]
+    fn portal_geometry_planes_and_references_parse() {
+        // Eight vertices: a 3-point run then a 5-point run, so the second
+        // portal's first vertex is only right if the first run's length was.
+        // The second run lies on the diagonal plane `x + y = 5`, not on a
+        // slab of constant x -- a quad that happened to be axis-aligned would
+        // sit on several wrong planes as happily as on the right one.
+        let vertices: Vec<[f32; 3]> = vec![
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [5.0, 0.0, 1.0],
+            [4.0, 1.0, 1.0],
+            [4.0, 1.0, 0.0],
+            [4.5, 0.5, 0.5],
+        ];
+        let mut mopv = Vec::new();
+        for v in &vertices {
+            for c in v {
+                mopv.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+
+        let mut mopt = Vec::new();
+        // Portal 0: vertices 0..3, plane x = 1 -> normal (1,0,0), d = -1.
+        mopt.extend_from_slice(&0u16.to_le_bytes());
+        mopt.extend_from_slice(&3u16.to_le_bytes());
+        for c in [1.0f32, 0.0, 0.0, -1.0] {
+            mopt.extend_from_slice(&c.to_le_bytes());
+        }
+        // Portal 1: vertices 3..8, a diagonal plane so the normal is not axial.
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        mopt.extend_from_slice(&3u16.to_le_bytes());
+        mopt.extend_from_slice(&5u16.to_le_bytes());
+        for c in [s, s, 0.0, -5.0 * s] {
+            mopt.extend_from_slice(&c.to_le_bytes());
+        }
+
+        let mut mopr = Vec::new();
+        for (portal, group, side) in [(0u16, 2u16, 1i16), (0, 7, -1), (1, 7, 1), (1, 9, -1)] {
+            mopr.extend_from_slice(&portal.to_le_bytes());
+            mopr.extend_from_slice(&group.to_le_bytes());
+            mopr.extend_from_slice(&side.to_le_bytes());
+            mopr.extend_from_slice(&0u16.to_le_bytes()); // padding
+        }
+
+        let mut mohd = vec![0u8; 64];
+        mohd[4..8].copy_from_slice(&10u32.to_le_bytes()); // group_count
+        mohd[8..12].copy_from_slice(&2u32.to_le_bytes()); // portal_count
+
+        let data = chunked(&[
+            (b"MVER", VERSION_WOTLK.to_le_bytes().to_vec()),
+            (b"MOHD", mohd),
+            (b"MOPV", mopv),
+            (b"MOPT", mopt),
+            (b"MOPR", mopr),
+        ]);
+        let root = Root::parse(&data).expect("a root with portals");
+
+        assert_eq!(root.portals.len(), 2, "MOPT stride is 20 bytes");
+        assert_eq!(root.header.portal_count, 2, "and MOHD agrees");
+
+        // The runs, which is what proves MOPT's two leading u16 were read.
+        assert_eq!(root.portals[0].vertices.len(), 3);
+        assert_eq!(root.portals[1].vertices.len(), 5);
+        assert_eq!(root.portals[0].vertices[0], [1.0, 0.0, 0.0]);
+        assert_eq!(
+            root.portals[1].vertices[0],
+            [5.0, 0.0, 0.0],
+            "the second run starts where the first ended"
+        );
+
+        // The planes, and the property the live check is built on.
+        assert_eq!(root.portals[0].normal, [1.0, 0.0, 0.0]);
+        assert_eq!(root.portals[0].distance, -1.0);
+        for portal in &root.portals {
+            assert!(
+                (portal.normal_length() - 1.0).abs() < 1e-6,
+                "a plane normal is a unit vector: {}",
+                portal.normal_length()
+            );
+            // ...and every vertex lies on the plane it names. This is the
+            // cross-check that ties MOPV, the run and the plane together, and
+            // the one the dump command reports for real files.
+            for v in &portal.vertices {
+                let d = portal.normal[0] * v[0]
+                    + portal.normal[1] * v[1]
+                    + portal.normal[2] * v[2]
+                    + portal.distance;
+                assert!(d.abs() < 1e-5, "vertex {v:?} is {d} off its own plane");
+            }
+        }
+
+        // The references, including the signed side.
+        assert_eq!(root.portal_refs.len(), 4, "MOPR stride is 8 bytes");
+        assert_eq!(root.portal_refs[1].portal, 0);
+        assert_eq!(root.portal_refs[1].group, 7);
+        assert_eq!(
+            root.portal_refs[1].side, -1,
+            "side is signed; read unsigned this is 65535"
+        );
+        assert_eq!(root.portal_refs[2].side, 1);
+    }
+
+    /// A building of one room has no portals, and that is an ordinary file
+    /// rather than a failure -- most of the game's buildings are this.
+    #[test]
+    fn a_building_with_no_portal_chunks_still_parses() {
+        let mut mohd = vec![0u8; 64];
+        mohd[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let data = chunked(&[
+            (b"MVER", VERSION_WOTLK.to_le_bytes().to_vec()),
+            (b"MOHD", mohd),
+        ]);
+        let root = Root::parse(&data).expect("a root with no portals");
+        assert!(root.portals.is_empty());
+        assert!(root.portal_refs.is_empty());
+    }
+
+    /// A portal whose run runs off the end of the pool is a malformed file and
+    /// must come back short rather than panic -- the same call every other
+    /// index in this crate makes.
+    #[test]
+    fn a_portal_run_past_the_vertex_pool_is_clamped() {
+        let mut mopv = Vec::new();
+        for c in [0.0f32, 0.0, 0.0] {
+            mopv.extend_from_slice(&c.to_le_bytes());
+        }
+        let mut mopt = Vec::new();
+        mopt.extend_from_slice(&0u16.to_le_bytes());
+        mopt.extend_from_slice(&400u16.to_le_bytes()); // far past one vertex
+        for c in [1.0f32, 0.0, 0.0, 0.0] {
+            mopt.extend_from_slice(&c.to_le_bytes());
+        }
+        let data = chunked(&[
+            (b"MVER", VERSION_WOTLK.to_le_bytes().to_vec()),
+            (b"MOHD", vec![0u8; 64]),
+            (b"MOPV", mopv),
+            (b"MOPT", mopt),
+        ]);
+        let root = Root::parse(&data).expect("a malformed run must not panic");
+        assert_eq!(root.portals[0].vertices.len(), 1);
     }
 
     #[test]

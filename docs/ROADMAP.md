@@ -8347,10 +8347,77 @@ profile.
 * **No portal culling.** Frustum culling only, so indoors this draws every room
   inside the frustum where the original draws the room you are in plus what is
   visible through the doorways. In Ironforge the city *is* the frustum, which
-  is why it remains the worst case. The parser already reads the portal chunks
-  -- Ironforge has 134 portals -- and nothing uses them.
-* **No level of detail, anywhere.** M2s always load LOD 0 and terrain has one
-  resolution. This is most of how the original draws a city cheaply.
+  is why it remains the worst case.
+
+  **Correction, and it is the kind this file exists to catch.** This bullet
+  used to say "the parser already reads the portal chunks -- Ironforge has 134
+  portals -- and nothing uses them". It read the *counts*: `MOHD`'s
+  `portal_count` and each group's `portal_start`/`portal_count`. `MOPV`,
+  `MOPT` and `MOPR` -- the vertices, the planes and the references, which is
+  all of the actual data -- appeared nowhere in the tree. A sentence saying the
+  hard part is done is a claim with the same weight as a comment, and this one
+  would have sent its next reader looking for a table that was not there.
+  They are parsed now, with `wow-cli wmo portals` as the dump command and the
+  checks folded into `wmo survey`: **7,548 portals across 716 of 1,985
+  buildings, 0 disagreeing with `MOHD`, 15,023 of 15,023 references resolving,
+  7,547 of 7,548 plane normals unit-length, and 30,438 of 30,443 portal
+  vertices lying on the plane their own portal names.** That last one is the
+  check worth keeping: it is the only property that ties `MOPV`, `MOPT`'s
+  vertex run and the plane together, so a wrong stride in any one of the three
+  moves the points off the plane. **69 portals of 7,548 are not referenced
+  twice** -- 11 of them in Stormwind -- so a traversal that assumes every
+  doorway has two ends is wrong about 0.9% of them, silently.
+* **Level of detail: measured, and there is none to use.** This bullet used to
+  say "M2s always load LOD 0 and terrain has one resolution. This is most of
+  how the original draws a city cheaply." The first clause is true and the
+  second does not follow, because **3.3.5a's `.skin` files are not levels of
+  detail.** `wow-cli m2 lods` across every model in the archives:
+
+      22,779 models parsed
+      21,560 of them (94.6%) declare exactly ONE skin profile
+      level 1: 1,230 models -- 1,220 identical triangles, 2 fewer
+                              batches 12,692 -> 14,081   (0 fewer, 752 more)
+      level 2:   403 models --   395 identical triangles, 3 fewer
+                              batches  6,469 ->  7,338   (0 fewer, 275 more)
+      level 3:   239 models --   233 identical triangles, 1 fewer
+                              batches  3,816 ->  5,140   (0 fewer, 221 more)
+      largest triangle reduction found anywhere: 5.5%, on ChickenMount
+
+  **Not one model in 22,779 has a higher skin with fewer draw calls, and
+  higher skins carry the same geometry split into more batches** -- 34.7% more
+  at level 3. This client's frame is CPU-bound in submission with `finish`
+  proportional to the commands handed to it, so switching to a higher skin
+  would make it measurably *worse*. The declared counts and the archive agree
+  to within 11 files, which is what says the survey is reading what it thinks:
+  21,549 absent level-1 files against 21,560 models declaring one profile.
+
+  Nor is there anything else to reach for. **WMO level of detail does not
+  exist in this game version** -- it arrived in Legion; the 8 `.wmo` paths in
+  the archives matching "lod" are all Hunters *Lodge*. And a WMO is where the
+  cost is: standing in Ironforge, 731 of 1,088 model draws are `IRONFORGE.WMO`
+  itself. What is left under the name is a *different* feature -- generated
+  terrain decimation, or dropping small doodads with distance the way the
+  reference client's `environmentDetail` does -- and it should be bounded on
+  its own terms rather than inherited from this sentence. Terrain is 53 draws
+  of 1,655 there, and terrain batching was already bounded at 0.3-0.6 ms and
+  deferred.
+
+  **The worst case, re-measured, because the far plane moved underneath it.**
+  4.34's Ironforge numbers were taken at a 12,000-unit far plane, which no
+  longer exists. Standing inside the city at noon, drawing to 397:
+
+      1,655 draws = 53 terrain + 1,088 models + 514 shadow, 9,883 culled
+      models = 731 buildings + 357 doodads
+      record 0.67 | finish 1.79 | submit 0.21 ms   GPU complete 3.14 ms
+
+  So the ceiling on portal culling here is the 731 building draws plus most of
+  the 514 shadow draws -- and unlike everywhere else this client has looked,
+  **the GPU is now the slower half**, so cutting rooms would buy on both sides.
+  Note also what the far plane did *not* do: sweeping it from 397 to 12,000
+  left `models = 144 buildings` unchanged at every step from one camera, because
+  the eye is inside the building's box and the frustum, not the distance, is
+  what bounds a room. That is exactly why `--interior-cull` cannot help in a
+  city and portal culling is the only thing that can.
 * **A fixed-cost spike of 43 to 48 ms**, two or three per run, present at every
   crowd size and therefore not a load problem. Almost certainly tile streaming
   or a first-time model load. It is the only thing in the profile that does not
