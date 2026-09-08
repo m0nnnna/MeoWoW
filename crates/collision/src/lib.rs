@@ -349,6 +349,70 @@ pub struct Probe {
     /// Triangles those lookups handed back to be tested one at a time. This
     /// is the number a better index would move.
     pub candidates: u64,
+    /// The [`World::near`] share of the two counters above -- a *square* of
+    /// cells rather than the one cell a point falls in.
+    ///
+    /// **Split out because the total could not say which shape was costing.**
+    /// Standing in the Lion's Pride Inn the frame reported 85 queries and
+    /// 263,700 candidates, and those same 85 queries outdoors ten yards away
+    /// reported 4,800 -- a hundredfold jump in candidates with the query count
+    /// *unchanged*. That is either one cell that got dense or a handful of
+    /// range queries whose square got dense, and the two want opposite fixes:
+    /// the first wants a finer index, the second wants a smaller radius or
+    /// fewer callers. Same rule as splitting `entities` into ground and
+    /// buffers, and as counting lookups *and* candidates in the first place.
+    pub range_queries: u64,
+    pub range_candidates: u64,
+    /// Index entries looked at to produce those candidates.
+    ///
+    /// **The number that says whether the index is doing anything.** A cell
+    /// is a column through a building -- see [`Slot`] -- so `walked` is what
+    /// the grid narrowed *to* and `candidates` is what survived the vertical
+    /// test and got a real geometric one. Both, always: with the two equal
+    /// the height filter has quietly stopped filtering, which draws the same
+    /// picture, answers the same heights and takes a hundredfold longer in a
+    /// building. A cache that has stopped caching, again.
+    pub walked: u64,
+}
+
+/// **Summing is here, beside the fields, because the caller that needs it was
+/// adding them by hand and dropped the new one silently.**
+///
+/// The viewer holds one grid per streamed tile and totals nine probes a
+/// frame. Written out at the call site, that total is a list of
+/// `total.x += probe.x` lines that has to be revisited every time this struct
+/// grows -- and when `walked` was added and the list was not, the frame
+/// profile reported `67,573 candidates of 0 walked`. A counter reading zero
+/// is the one failure this whole instrument exists to make visible, and it
+/// was the instrument itself. Adding a field here now reaches every caller.
+impl std::ops::AddAssign for Probe {
+    fn add_assign(&mut self, other: Self) {
+        let Self {
+            queries,
+            candidates,
+            range_queries,
+            range_candidates,
+            walked,
+        } = other;
+        self.queries += queries;
+        self.candidates += candidates;
+        self.range_queries += range_queries;
+        self.range_candidates += range_candidates;
+        self.walked += walked;
+    }
+}
+
+/// What [`World::cell_load`] found in the index.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+pub struct CellLoad {
+    pub cells: usize,
+    pub entries: usize,
+    pub worst: usize,
+    pub median: usize,
+    /// The south-west corner of the fullest cell, in world units, and the
+    /// vertical span of what is filed in it.
+    pub worst_at: (f32, f32),
+    pub worst_z: (f32, f32),
 }
 
 #[derive(Default)]
@@ -376,7 +440,104 @@ pub struct World {
     /// Cell coordinate to the triangles overlapping it. A triangle spanning
     /// several cells appears in each, which is what makes a lookup a lookup
     /// rather than a search.
-    cells: std::collections::HashMap<(i32, i32), Vec<u32>>,
+    cells: std::collections::HashMap<(i32, i32), Cell>,
+}
+
+/// One cell's contents, with the flat surfaces kept apart from the rest.
+///
+/// **Every query here wants one half or the other, and only the camera's ray
+/// wants both.** `floor_hit` refuses a triangle whose normal leans past
+/// [`FLOOR_NORMAL_Z`] and `push_out_horizontally` refuses one that does *not*
+/// -- the identical threshold, from opposite sides -- so "what am I standing
+/// on" and "what is stopping me walking" have never had anything to say to
+/// each other's candidates. They were nevertheless handed the same list, and
+/// in a building that list is a column: see [`Slot`].
+///
+/// Splitting it costs nothing. A triangle is in exactly one of the two, so
+/// this is the same number of entries in the same number of allocations, and
+/// the classification happens once when the tile is built rather than once
+/// per query per frame -- `is_floor` is a cross product and a normalise,
+/// which is most of what `floor_hit` was being called for in order to be
+/// told no.
+#[derive(Default)]
+struct Cell {
+    floors: Vec<Slot>,
+    walls: Vec<Slot>,
+}
+
+/// Which half of a [`Cell`] a query can possibly be answered by.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Want {
+    /// Anything a body can be pushed sideways by, which is everything that is
+    /// not flat -- see [`Triangle::push_out_horizontally`].
+    Walls,
+    /// Everything, which is only ever the camera's ray: it is stopped by a
+    /// floor above it and a ceiling below it exactly as it is by a wall.
+    Either,
+}
+
+impl Cell {
+    fn len(&self) -> usize {
+        self.floors.len() + self.walls.len()
+    }
+
+    /// The slots a query of this shape has to look at, in one iterator.
+    fn wanted(&self, want: Want) -> impl Iterator<Item = &Slot> {
+        let floors: &[Slot] = match want {
+            Want::Either => self.floors.as_slice(),
+            Want::Walls => &[],
+        };
+        floors.iter().chain(self.walls.iter())
+    }
+}
+
+/// One triangle's membership of one cell: which triangle, and how high it
+/// reaches.
+///
+/// **The heights are here rather than looked up, and that is the whole point
+/// of the type.** This index is two-dimensional, so a cell is a *column*: in
+/// a building it holds the floor, the floor above it, the roof, every wall
+/// passing between them and the collision of everything standing on any of
+/// them. Measured at Goldshire, the fullest cell of the tile holds **3,440
+/// entries spanning 26 units of height against a world median of 19** -- and
+/// a query about the floor under somebody's feet was testing all 3,440.
+///
+/// A triangle's `floor_hit` lies between its own lowest and highest vertex,
+/// and a segment cannot meet a triangle it never reaches the height of, so a
+/// query that knows its own vertical extent can refuse most of that column
+/// for the price of two float comparisons -- against a `floor_hit`, which is
+/// a cross product, a normalise, a plane solve and three edge tests, on a
+/// triangle fetched from somewhere else in memory.
+///
+/// Twelve bytes rather than four, paid per *entry*: Stormwind's tile has 1.47
+/// million of them, so this is about 12 MB where it was 6. That is the
+/// trade -- the index costs memory proportional to the geometry, and the
+/// queries stop costing time proportional to it.
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    index: u32,
+    min_z: f32,
+    max_z: f32,
+}
+
+impl Slot {
+    /// Whether this entry can matter to a query spanning `lo..=hi` in z.
+    ///
+    /// **Widened by a hair, deliberately.** `hit_at` accepts a barycentric
+    /// coordinate a whisker outside the triangle so that a point exactly on a
+    /// seam lands on one of the two triangles sharing it rather than on
+    /// neither -- which means the point it reports can sit a fraction outside
+    /// the triangle's own corner heights. A slab test with no margin could
+    /// therefore reject, once in a very long while, a surface the scan it
+    /// replaces would have found: a camera through a wall, or a floor that is
+    /// not there, at one grazing angle and no other. The margin is far below
+    /// anything geometric here and far above that tolerance, and being
+    /// generous costs only a candidate that then fails the real test anyway.
+    #[inline]
+    fn reaches(&self, lo: f32, hi: f32) -> bool {
+        const MARGIN: f32 = 1e-3;
+        self.max_z >= lo - MARGIN && self.min_z <= hi + MARGIN
+    }
 }
 
 impl World {
@@ -411,9 +572,22 @@ impl World {
         }
         let index = self.triangles.len() as u32;
         let (min, max) = (triangle.min(), triangle.max());
+        let slot = Slot {
+            index,
+            min_z: min.z,
+            max_z: max.z,
+        };
+        // Classified once, here, rather than rediscovered per query -- see
+        // `Cell`.
+        let flat = triangle.is_floor();
         for x in cell_of(min.x)..=cell_of(max.x) {
             for y in cell_of(min.y)..=cell_of(max.y) {
-                self.cells.entry((x, y)).or_default().push(index);
+                let cell = self.cells.entry((x, y)).or_default();
+                if flat {
+                    cell.floors.push(slot);
+                } else {
+                    cell.walls.push(slot);
+                }
             }
         }
         self.triangles.push(triangle);
@@ -437,20 +611,43 @@ impl World {
     /// `slide` iterates a candidate list and calls `wall_exemption` -- and so
     /// this -- from inside that loop, so a single shared scratch would be
     /// corrupted by its own re-entry. An immutable borrow cannot be.
-    fn cell_at(&self, centre: Vec2) -> &[u32] {
+    fn cell_at(&self, centre: Vec2) -> &[Slot] {
         self.cells
             .get(&(cell_of(centre.x), cell_of(centre.y)))
-            .map(Vec::as_slice)
+            // **The flat half only.** `floor_hit` answers `None` for every
+            // triangle in the other one, by the same threshold that put it
+            // there -- see `Cell`. A wall was costing a cross product and a
+            // normalise in order to be told it is a wall, and a building is
+            // mostly walls.
+            .map(|cell| cell.floors.as_slice())
             .unwrap_or_default()
     }
 
-    /// Every triangle whose cell touches the given square, without repeats.
-    fn near(&self, centre: Vec2, radius: f32) -> Vec<u32> {
+    /// Every triangle whose cell touches the given square and whose own
+    /// height reaches into `lo..=hi`, without repeats.
+    ///
+    /// **The vertical bound is not an optimisation the caller may skip.** See
+    /// [`Slot`]: a cell is a column through a whole building, and every one of
+    /// these callers is asking about a segment or a body that occupies a few
+    /// units of it. Filtering here rather than in each caller's own loop is
+    /// what keeps the *sort and dedup below* off the rejects too, which at ten
+    /// thousand candidates is the larger half.
+    ///
+    /// A caller that genuinely means "any height" passes
+    /// `(f32::NEG_INFINITY, f32::INFINITY)` and gets exactly the old
+    /// behaviour.
+    fn near(&self, centre: Vec2, radius: f32, want: Want, lo: f32, hi: f32) -> Vec<u32> {
         let mut found: Vec<u32> = Vec::new();
+        let mut walked = 0u64;
         for x in cell_of(centre.x - radius)..=cell_of(centre.x + radius) {
             for y in cell_of(centre.y - radius)..=cell_of(centre.y + radius) {
                 if let Some(cell) = self.cells.get(&(x, y)) {
-                    found.extend_from_slice(cell);
+                    walked += cell.len() as u64;
+                    found.extend(
+                        cell.wanted(want)
+                            .filter(|slot| slot.reaches(lo, hi))
+                            .map(|slot| slot.index),
+                    );
                 }
             }
         }
@@ -459,8 +656,57 @@ impl World {
         let mut probe = self.probe.get();
         probe.queries += 1;
         probe.candidates += found.len() as u64;
+        probe.range_queries += 1;
+        probe.range_candidates += found.len() as u64;
+        probe.walked += walked;
         self.probe.set(probe);
         found
+    }
+
+    /// How the index itself is packed: cells occupied, the fullest one, and
+    /// the median.
+    ///
+    /// **A property of the grid, asked once when a tile is built, not a
+    /// per-frame counter.** [`Probe`] says what the queries cost; this says
+    /// whether the index they narrow through is any good. A single cell
+    /// holding thousands of triangles makes every point query in it a
+    /// thousand-triangle scan, and nothing in the frame profile can tell that
+    /// from a caller asking too often -- see the note on
+    /// [`Probe::range_queries`].
+    ///
+    /// Entries, not triangles: a triangle spanning several cells is counted
+    /// in each, which is exactly what a query walks.
+    pub fn cell_load(&self) -> CellLoad {
+        let mut sizes: Vec<usize> = self.cells.values().map(Cell::len).collect();
+        sizes.sort_unstable();
+        let worst_at = self
+            .cells
+            .iter()
+            .max_by_key(|(_, v)| v.len())
+            .map(|(k, _)| *k)
+            .unwrap_or_default();
+        // The z span of the fullest cell, which is what says whether it is
+        // dense *geometry* or a whole building stacked into one column: this
+        // index is two-dimensional, so a floor, the floor above it, the roof
+        // and every wall between them share one cell.
+        let column = self
+            .cells
+            .get(&worst_at)
+            .map(|cell| {
+                cell.wanted(Want::Either)
+                    .fold((f32::MAX, f32::MIN), |(lo, hi), slot| {
+                        (lo.min(slot.min_z), hi.max(slot.max_z))
+                    })
+            })
+            .unwrap_or((0.0, 0.0));
+        CellLoad {
+            cells: sizes.len(),
+            entries: sizes.iter().sum(),
+            worst: sizes.last().copied().unwrap_or(0),
+            median: sizes.get(sizes.len() / 2).copied().unwrap_or(0),
+            worst_at: (worst_at.0 as f32 * CELL, worst_at.1 as f32 * CELL),
+            worst_z: column,
+        }
     }
 
     /// Reads the work counters and zeroes them, so a caller reading once a
@@ -511,11 +757,32 @@ impl World {
         let mut best: Option<(f32, Option<u8>, Option<u32>)> = None;
         // The counters still see this: one narrowing, whatever it hands back.
         let candidates = self.cell_at(at);
-        let mut probe = self.probe.get();
-        probe.queries += 1;
-        probe.candidates += candidates.len() as u64;
-        self.probe.set(probe);
-        for &index in candidates {
+        let mut tested = 0u64;
+        for slot in candidates {
+            // **Two comparisons in place of a `floor_hit`, and this is where
+            // the frame went.** A cell in a building is a column -- see
+            // [`Slot`] -- so most of what shares it with the floor underfoot
+            // is the storey above, the roof, and the walls between: geometry
+            // that cannot be what is holding anybody up, and that
+            // `floor_hit` was refusing one cross product and one normalise
+            // at a time. Standing in the Lion's Pride Inn the follow camera
+            // was testing 264,000 triangles a frame for 4.7 ms of a 21 ms
+            // frame, against 4,800 ten yards outside the door.
+            //
+            // `floor_hit` interpolates the triangle's own plane inside its
+            // own footprint, so its answer is never below `min_z` nor above
+            // `max_z`: anything starting above the ceiling cannot come back
+            // under it, and anything topping out below the best height found
+            // so far cannot beat it. The second test is why `best` is read
+            // here rather than after -- it tightens as the scan goes.
+            if slot.min_z > ceiling {
+                continue;
+            }
+            if best.is_some_and(|(b, _, _)| slot.max_z <= b) {
+                continue;
+            }
+            tested += 1;
+            let index = slot.index;
             let triangle = self.triangles[index as usize];
             let Some(z) = triangle.floor_hit(at) else {
                 continue;
@@ -537,6 +804,11 @@ impl World {
                 best = Some((z, tag, surface_id));
             }
         }
+        let mut probe = self.probe.get();
+        probe.queries += 1;
+        probe.candidates += tested;
+        probe.walked += candidates.len() as u64;
+        self.probe.set(probe);
         best
     }
 
@@ -727,7 +999,17 @@ impl World {
         // very little and costs a lookup each.
         for _ in 0..2 {
             let mut correction = Vec2::ZERO;
-            for index in self.near(at.truncate(), radius) {
+            // **The band this loop can possibly accept, handed to the
+            // index instead of being rediscovered per triangle.**
+            // `under_any_band` already refuses anything topping out below
+            // `from.z + step`, and `wall_exemption` only ever *raises* the
+            // band's floor -- an exempted wall is one whose own top is under
+            // the raised band, so it never passes `overlaps_band` either.
+            // Everything that can survive both therefore lies inside this
+            // slab, and the column above and below it need never be looked
+            // at. See `Slot`.
+            let (lo, hi) = (from.z + step, from.z + step + height);
+            for index in self.near(at.truncate(), radius, Want::Walls, lo, hi) {
                 let triangle = self.triangles[index as usize];
                 // **The two rejections that cost nothing, first.** Everything
                 // below `wall_exemption` is a grid lookup per candidate, and
@@ -818,7 +1100,10 @@ impl World {
         step: f32,
     ) -> Option<Vec2> {
         let mut best: Option<(f32, Vec2)> = None;
-        for index in self.near(to.truncate(), radius) {
+        // The same slab `attempt` narrows to, for the same reason: this
+        // walks the identical candidate list and makes the identical tests.
+        let (lo, hi) = (from.z + step, from.z + step + height);
+        for index in self.near(to.truncate(), radius, Want::Walls, lo, hi) {
             let triangle = self.triangles[index as usize];
             let Some(push) = triangle.push_out_horizontally(to.truncate(), radius) else {
                 continue;
@@ -858,11 +1143,26 @@ impl World {
         }
         let span = (to.truncate() - from.truncate()).length();
         let middle = (from.truncate() + to.truncate()) * 0.5;
-        let candidates = self.near(middle, span * 0.5 + CELL);
         // Sampled from the step height upward, for the same reason the
         // push-out band starts there: a sample at the ankles would find every
         // stair riser and refuse the move that the band above it just allowed.
-        for offset in [step + 0.05, (step + height) * 0.5, height * 0.9] {
+        let offsets = [step + 0.05, (step + height) * 0.5, height * 0.9];
+        // The three sampled segments together span exactly this much height,
+        // and `hit_at` only ever answers for a point *on* the segment -- so a
+        // triangle outside the slab cannot be crossed by any of them. See
+        // `Slot`.
+        let low = offsets.iter().copied().fold(f32::INFINITY, f32::min);
+        let high = offsets.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        // Walls only: this loop's first act was `if triangle.is_floor()
+        // { continue; }`, which is the classification the index now carries.
+        let candidates = self.near(
+            middle,
+            span * 0.5 + CELL,
+            Want::Walls,
+            from.z.min(to.z) + low,
+            from.z.max(to.z) + high,
+        );
+        for offset in offsets {
             let lift = Vec3::new(0.0, 0.0, offset);
             for &index in &candidates {
                 let triangle = self.triangles[index as usize];
@@ -897,9 +1197,17 @@ impl World {
         }
         let span = (to.truncate() - from.truncate()).length();
         let middle = (from.truncate() + to.truncate()) * 0.5;
-        self.near(middle, span * 0.5 + CELL)
-            .into_iter()
-            .filter_map(|index| self.triangles[index as usize].hit_at(from, to))
+        // `hit_at` answers only for a point on the segment, so nothing
+        // outside the segment's own height can be the answer. See `Slot`.
+        self.near(
+            middle,
+            span * 0.5 + CELL,
+            Want::Either,
+            from.z.min(to.z),
+            from.z.max(to.z),
+        )
+        .into_iter()
+        .filter_map(|index| self.triangles[index as usize].hit_at(from, to))
             .fold(None, |nearest: Option<f32>, t| {
                 Some(nearest.map_or(t, |best| best.min(t)))
             })
@@ -925,7 +1233,13 @@ impl World {
         }
         let span = (to.truncate() - from.truncate()).length();
         let middle = (from.truncate() + to.truncate()) * 0.5;
-        self.near(middle, span * 0.5 + CELL)
+        self.near(
+            middle,
+            span * 0.5 + CELL,
+            Want::Either,
+            from.z.min(to.z),
+            from.z.max(to.z),
+        )
             .into_iter()
             .filter_map(|index| {
                 self.triangles[index as usize]
@@ -950,7 +1264,13 @@ impl World {
         // See `wall_exemption` and `slide`, which this must agree with: a
         // move `slide`'s push-out phase considers fine must not be vetoed
         // here by a stricter idea of which walls are exempt.
-        self.near(at.truncate(), radius).into_iter().any(|index| {
+        // The same slab `attempt` uses -- see there. This must agree with it
+        // about which walls are exempt, so it must agree about which walls it
+        // is even shown.
+        let (lo, hi) = (at.z + step, at.z + step + height);
+        self.near(at.truncate(), radius, Want::Walls, lo, hi)
+            .into_iter()
+            .any(|index| {
             let triangle = self.triangles[index as usize];
             // The same order as `slide`, and it has to stay the same order:
             // this and `slide`'s push-out phase must agree about which walls
@@ -1432,7 +1752,7 @@ mod tests {
             let fast = world.floor_under_tagged_with_id(at, 1.0, 0.5);
             // The general path, reached through the same grid.
             let slow = world
-                .near(at, 0.0)
+                .near(at, 0.0, Want::Either, f32::NEG_INFINITY, f32::INFINITY)
                 .into_iter()
                 .filter_map(|i| world.triangles[i as usize].floor_hit(at))
                 .filter(|z| *z <= 1.5)
@@ -1457,6 +1777,238 @@ mod tests {
             Probe::default(),
             "reading has to zero it, or a per-frame figure is a session total"
         );
+    }
+
+    /// A floor repeated up a column, which is what a building is to a
+    /// two-dimensional index.
+    ///
+    /// Storeys eight units apart, so each lands in its own slab and none of
+    /// them share a band with the query.
+    fn a_building_of(storeys: usize) -> Vec<Triangle> {
+        let mut out = Vec::new();
+        for storey in 0..storeys {
+            let lift = storey as f32 * 8.0;
+            out.extend(
+                a_crowded_floor(24)
+                    .into_iter()
+                    .map(|t| Triangle::new(t.a + Vec3::Z * lift, t.b + Vec3::Z * lift, t.c + Vec3::Z * lift)),
+            );
+        }
+        out
+    }
+
+    /// **Standing on the ground floor must not cost a triangle test per
+    /// triangle in the whole building above it.**
+    ///
+    /// This index is two-dimensional, so one cell is a column: the floor
+    /// underfoot, the storey above, the roof, and every wall between them.
+    /// Measured live in the Lion's Pride Inn, where the fullest cell of the
+    /// Goldshire tile holds **3,440 entries against a world median of 19**,
+    /// and the follow camera -- which marches the ground twelve times per
+    /// sampled yaw, several yaws a frame -- tested 264,000 triangles a frame
+    /// for **4.7 ms of a 21 ms frame**, against 4,800 and 0.1 ms ten yards
+    /// outside the door. The picture, the height answered and the frame's
+    /// draw count were all identical; only the candidate count said anything.
+    ///
+    /// **Two counts, not a duration.** `walked` is what the grid narrowed to
+    /// and `candidates` is what survived the vertical test and got a real
+    /// geometric one. A timing assertion would pass on a fast machine with
+    /// the filter fully broken, and could not tell "there was nothing to
+    /// reject" from "nothing was rejected" -- which is the failure this is
+    /// here to catch, because a filter that has quietly stopped filtering
+    /// answers exactly the same heights.
+    #[test]
+    fn a_floor_query_does_not_test_the_storeys_above_it() {
+        let world = world_with(a_building_of(5));
+        world.take_probe();
+        // On the ground floor, looking down, as a character or a camera ray
+        // marching the ground does.
+        let floor = world.floor_under(Vec2::new(2.0, 2.0), 0.1, 0.5);
+        let probe = world.take_probe();
+        assert_eq!(floor, Some(0.0), "the ground floor is what holds you up");
+        assert!(
+            probe.walked > 2000,
+            "the sample has to be a real column or it proves nothing: {} entries",
+            probe.walked
+        );
+        assert!(
+            probe.candidates * 4 < probe.walked,
+            "four storeys of the five are above the query and cannot be the              floor under it -- tested {} of {} entries",
+            probe.candidates,
+            probe.walked
+        );
+    }
+
+    /// The same bound for the camera's other question, which goes through
+    /// [`World::near`] rather than the single-cell path -- and so also pays a
+    /// sort and a dedup over whatever it fails to reject.
+    #[test]
+    fn a_camera_ray_does_not_sort_the_storeys_it_never_reaches() {
+        let world = world_with(a_building_of(5));
+        world.take_probe();
+        let hit = world.first_hit(Vec3::new(2.0, 2.0, 1.0), Vec3::new(4.0, 4.0, 1.5));
+        let probe = world.take_probe();
+        assert_eq!(hit, None, "open air between two points on one storey");
+        assert!(
+            probe.walked > 2000,
+            "the sample has to be a real column: {} entries",
+            probe.walked
+        );
+        assert!(
+            probe.candidates * 4 < probe.walked,
+            "a ray half a unit tall cannot meet a storey eight units up --              kept {} of {} entries",
+            probe.candidates,
+            probe.walked
+        );
+    }
+
+    /// A jumbled two-storey building: floors, ramps, walls at every angle,
+    /// and a roof, all sharing cells.
+    ///
+    /// Deliberately not axis-aligned and deliberately not tidy -- the whole
+    /// risk in the index is a surface that sits *near* a threshold, and a box
+    /// made of six flat faces has none.
+    fn a_jumbled_building() -> Vec<Triangle> {
+        let mut out = Vec::new();
+        // A cheap deterministic scatter; no dependency, and reproducible.
+        let mut seed = 0x2545_F491u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 8) as f32 / 16_777_216.0
+        };
+        for _ in 0..600 {
+            let base = Vec3::new(next() * 24.0, next() * 24.0, next() * 18.0);
+            // Spans from nearly flat to nearly vertical, so triangles land on
+            // both sides of `FLOOR_NORMAL_Z` and some straddle it.
+            let lean = next() * 3.0;
+            let a = base;
+            let b = base + Vec3::new(next() * 3.0 + 0.2, next() * 3.0, next() * lean);
+            let c = base + Vec3::new(next() * 3.0, next() * 3.0 + 0.2, next() * lean);
+            out.push(Triangle::new(a, b, c));
+        }
+        out
+    }
+
+    /// **The index may make a query cheaper. It may not make it answer
+    /// differently.**
+    ///
+    /// The oracle is a scan over every triangle in the world, written from
+    /// the definition rather than from the index -- the same move the SRP6
+    /// tests make with a server written from the protocol. A vertical slab
+    /// test and a floors/walls split are both claims about which candidates
+    /// *cannot* matter, and a claim like that fails silently: the height
+    /// still comes back, the camera still stops somewhere, and only a
+    /// surface that should have been considered and was not says otherwise.
+    ///
+    /// Sampled across a jumbled building rather than at one point, because
+    /// the cases at risk are the ones near a threshold -- a triangle whose
+    /// top is a hair above the query ceiling, a ray that grazes a storey.
+    #[test]
+    fn the_index_answers_exactly_what_a_full_scan_does() {
+        let triangles = a_jumbled_building();
+        let world = world_with(triangles.clone());
+        let mut floors_checked = 0;
+        let mut hits_checked = 0;
+        for i in 0..40 {
+            for j in 0..40 {
+                let at = Vec2::new(i as f32 * 0.6, j as f32 * 0.6);
+                for from_z in [0.0, 4.5, 9.0, 13.5, 18.0] {
+                    let step = 0.5;
+                    let ceiling = from_z + step;
+                    // The definition: the highest floor hit at or below the
+                    // ceiling, over every triangle there is.
+                    let want = triangles
+                        .iter()
+                        .filter_map(|t| t.floor_hit(at))
+                        .filter(|z| *z <= ceiling)
+                        .fold(None, |b: Option<f32>, z| Some(b.map_or(z, |b| b.max(z))));
+                    let got = world.floor_under(at, from_z, step);
+                    assert_eq!(got, want, "floor at {at:?} from {from_z}");
+                    floors_checked += 1;
+                }
+            }
+        }
+        for i in 0..20 {
+            for j in 0..20 {
+                let from = Vec3::new(i as f32 * 1.2, j as f32 * 1.2, 3.0 + (i % 5) as f32 * 3.0);
+                for to in [
+                    from + Vec3::new(6.0, 2.0, 1.0),
+                    from + Vec3::new(-4.0, 5.0, -2.5),
+                    from + Vec3::new(0.5, -0.5, 9.0),
+                ] {
+                    let want = triangles
+                        .iter()
+                        .filter_map(|t| t.hit_at(from, to))
+                        .fold(None, |b: Option<f32>, t| Some(b.map_or(t, |b| b.min(t))));
+                    let got = world.first_hit(from, to);
+                    assert_eq!(got, want, "ray {from:?} -> {to:?}");
+                    hits_checked += 1;
+                }
+            }
+        }
+        // **Both counts printed, because a loop that sampled nothing passes.**
+        assert!(
+            floors_checked == 8_000 && hits_checked == 1_200,
+            "the sample has to be the size it claims: {floors_checked} floors, {hits_checked} rays"
+        );
+    }
+
+    /// The same oracle for the two questions a *walking* body asks, which go
+    /// through the other half of the index.
+    ///
+    /// `blocked` is the one worth its own assertion: it is what vetoes a
+    /// move, so an index that hides a wall from it does not slow anything
+    /// down -- it lets a character walk through the wall.
+    #[test]
+    fn the_index_blocks_and_crosses_exactly_what_a_full_scan_does() {
+        let triangles = a_jumbled_building();
+        let world = world_with(triangles.clone());
+        let bare = {
+            // One cell wide enough to hold the whole sample, so `near` cannot
+            // narrow anything away and the answer is the definition.
+            let mut w = World::new();
+            for t in triangles.iter() {
+                w.add(*t);
+            }
+            w
+        };
+        let (radius, height, step) = (0.55f32, 2.0f32, 0.5f32);
+        let mut checked = 0;
+        for i in 0..24 {
+            for j in 0..24 {
+                let at = Vec3::new(i as f32 * 1.0, j as f32 * 1.0, 2.0 + (j % 4) as f32 * 4.0);
+                // `blocked` against a scan written from `blocked`'s own rule.
+                let want = triangles.iter().any(|t| {
+                    if t.push_out_horizontally(at.truncate(), radius).is_none()
+                        || t.under_any_band(at.z, step)
+                    {
+                        return false;
+                    }
+                    let foot = t.foot_towards(at.truncate());
+                    let ceiling = bare.wall_exemption(foot, t.max().z, at.z, step);
+                    t.overlaps_band(ceiling, ceiling + height)
+                });
+                assert_eq!(world.blocked(at, radius, height, step), want, "blocked at {at:?}");
+                let to = at + Vec3::new(1.7, -1.1, 0.0);
+                let want_cross = [step + 0.05, (step + height) * 0.5, height * 0.9]
+                    .into_iter()
+                    .any(|offset| {
+                        let lift = Vec3::new(0.0, 0.0, offset);
+                        triangles
+                            .iter()
+                            .any(|t| !t.is_floor() && t.crossed_by(at + lift, to + lift))
+                    });
+                assert_eq!(
+                    world.crosses_wall(at, to, height, step),
+                    want_cross,
+                    "crossing {at:?} -> {to:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 576, "the sample has to be the size it claims");
     }
 
     fn world_with(triangles: Vec<Triangle>) -> World {
