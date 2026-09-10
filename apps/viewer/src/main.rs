@@ -456,6 +456,35 @@ struct Args {
     #[arg(long)]
     shadow_dump: Option<PathBuf>,
 
+    /// Sample the standing surface on a grid around `--eye` and write every
+    /// sample to this CSV, then exit without rendering.
+    ///
+    /// **The instrument for `foss-wow#172` and `#111`**: falling through the
+    /// world is a disagreement between the terrain height field and the
+    /// collision mesh about what is underfoot, and walking into it live finds
+    /// one spot per fall. This asks the question at every point of a grid,
+    /// from the terrain's own height the way a character standing on the
+    /// ground would, and reports where the mesh answered *below* the
+    /// terrain by more than `FALL_THRESHOLD` -- which is the shape of a
+    /// mine under a hill or a rock sunk into a riverbed -- and what each
+    /// ranking rule would have done there. The summary prints two counts
+    /// for each rule, always: how many samples it would have dropped
+    /// through the ground, and how many it would have left standing.
+    /// `--map --stream --eye` are required -- the collision world exists
+    /// only in the streaming scene, and without `--stream` this would have
+    /// quietly written nothing and reported a render; `--survey-radius`
+    /// sets the reach.
+    #[arg(long, requires = "map", requires = "stream", requires = "eye")]
+    floor_survey: Option<PathBuf>,
+
+    /// Half-width of the `--floor-survey` grid, in world units.
+    #[arg(long, default_value_t = 150.0)]
+    survey_radius: f32,
+
+    /// Spacing of the `--floor-survey` grid, in world units.
+    #[arg(long, default_value_t = 2.0)]
+    survey_spacing: f32,
+
     /// Write the logged-in character's composed skin to this PNG.
     ///
     /// The skin is ten regions of one 512x512 atlas -- face, arms, hands,
@@ -720,7 +749,10 @@ fn main() -> Result<()> {
         None => Chain::new(),
     };
 
-    if let Some(path) = args.screenshot.clone() {
+    // A floor survey rides the headless path -- it needs the streaming world
+    // built exactly the way the window builds it, collision and all -- and
+    // exits before the frame is drawn.
+    if let Some(path) = args.screenshot.clone().or_else(|| args.floor_survey.clone()) {
         // **A screenshot with no archives is refused rather than rendered.**
         // It would produce a perfectly plausible empty picture -- the one
         // failure mode this project has paid for repeatedly -- and there is no
@@ -4517,6 +4549,175 @@ fn describe(scene: &Scene) -> String {
 
 // ---------------------------------------------------------------- headless
 
+/// `--floor-survey`: the standing rule asked at every point of a grid, and
+/// written down.
+///
+/// Each sample starts **on the terrain**, `(x, y, height_at)`, and asks the
+/// mesh the same two questions `drive_live_movement` asks -- the centre
+/// point and the footprint ring, combined by `footing_under` -- so what is
+/// measured is what a character walking across that spot would have been
+/// told. Three columns then say what each rule makes of it: the rule that
+/// shipped before the cave fix (`ground.max(floor)`), the cave fix itself
+/// (`floor.or(ground)`), and `support_under`. A sample is a *fall* under a
+/// rule when the rule's answer sits more than `FALL_THRESHOLD` below the
+/// terrain the sample stood on -- the exact test that starts a fall arc
+/// live -- and a *lift* when it sits more than `STEP_HEIGHT` above it.
+///
+/// **Two counts per rule, always.** The number of falls alone cannot tell
+/// "none were wrong" from "there was nothing to ask": the number of holes
+/// (no terrain to stand on, so no sample) and the number of samples that
+/// stood are printed beside it.
+fn floor_survey(
+    world: &world::World,
+    eye: glam::Vec3,
+    args: &Args,
+    out: &std::path::Path,
+) -> Result<()> {
+    use std::io::Write;
+    let radius = args.survey_radius.max(0.0);
+    let spacing = args.survey_spacing.max(0.1);
+    let steps = (radius / spacing).floor() as i32;
+    let mut file = std::io::BufWriter::new(std::fs::File::create(out)?);
+    writeln!(
+        file,
+        "x,y,terrain,liquid,mesh,mesh_minus_terrain,max_rule,or_rule,support_rule"
+    )?;
+    let (mut holes, mut stood, mut mesh_answered) = (0usize, 0usize, 0usize);
+    let (mut wet, mut wet_or_fell) = (0usize, 0usize);
+    // **The cave, asked from underneath.** Every sample whose mesh floor
+    // lies more than a step below the terrain is also a place a character
+    // can be *standing in* -- a tunnel under a hill -- so the rule is asked
+    // a second time from that floor. This is the Northshire "teleport" the
+    // `or` rule was written to fix: `ground.max(floor)` must lift these and
+    // the rule that replaces it must not, or the fix for `#172` has simply
+    // moved the bug back where it was.
+    let (mut underneath, mut max_lifted_underneath, mut support_lifted_underneath) =
+        (0usize, 0usize, 0usize);
+    // Per rule: samples dropped through the ground, samples lifted off it.
+    let (mut max_fell, mut max_lifted) = (0usize, 0usize);
+    let (mut or_fell, mut or_lifted) = (0usize, 0usize);
+    let (mut support_fell, mut support_lifted) = (0usize, 0usize);
+    // The worst drops the shipped rule would have made, so the CSV does not
+    // have to be opened to know where to walk.
+    let mut worst: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for iy in -steps..=steps {
+        for ix in -steps..=steps {
+            let x = eye.x + ix as f32 * spacing;
+            let y = eye.y + iy as f32 * spacing;
+            let Some(terrain) = world.height_at(x, y) else {
+                holes += 1;
+                continue;
+            };
+            stood += 1;
+            let at = glam::Vec3::new(x, y, terrain);
+            let underfoot = footing_under(
+                world.floor_under_footing(at, STEP_HEIGHT),
+                world.floor_under_footprint(at, STEP_HEIGHT, BODY_RADIUS),
+                terrain,
+            );
+            let mesh = underfoot.map(|(z, _)| z);
+            if mesh.is_some() {
+                mesh_answered += 1;
+            }
+            let max_rule = mesh.map_or(terrain, |m| m.max(terrain));
+            let or_rule = mesh.unwrap_or(terrain);
+            let support_rule = support_under(Some(terrain), mesh, terrain, STEP_HEIGHT)
+                .map(Support::z)
+                .unwrap_or(terrain);
+            let tally = |z: f32, fell: &mut usize, lifted: &mut usize| {
+                if terrain - z > FALL_THRESHOLD {
+                    *fell += 1;
+                } else if z - terrain > STEP_HEIGHT {
+                    *lifted += 1;
+                }
+            };
+            tally(max_rule, &mut max_fell, &mut max_lifted);
+            tally(or_rule, &mut or_fell, &mut or_lifted);
+            tally(support_rule, &mut support_fell, &mut support_lifted);
+            // Under water is the riverbed half of `foss-wow#172`; the
+            // surface height is what separates it from dry ground in the
+            // CSV, and the count says whether the population could answer.
+            let liquid = world.liquid_at(x, y).map(|l| l.surface);
+            if liquid.is_some_and(|surface| surface > terrain) {
+                wet += 1;
+                if terrain - or_rule > FALL_THRESHOLD {
+                    wet_or_fell += 1;
+                }
+            }
+            if terrain - or_rule > FALL_THRESHOLD {
+                worst.push((terrain - or_rule, x, y, terrain));
+            }
+            if let Some(below) = mesh.filter(|m| terrain - m > STEP_HEIGHT) {
+                underneath += 1;
+                if below.max(terrain) - below > STEP_HEIGHT {
+                    max_lifted_underneath += 1;
+                }
+                let from_below = support_under(Some(terrain), Some(below), below, STEP_HEIGHT)
+                    .map(Support::z)
+                    .unwrap_or(below);
+                if from_below - below > STEP_HEIGHT {
+                    support_lifted_underneath += 1;
+                }
+            }
+            writeln!(
+                file,
+                "{x:.2},{y:.2},{terrain:.3},{},{},{},{max_rule:.3},{or_rule:.3},{support_rule:.3}",
+                liquid.map_or(String::new(), |l| format!("{l:.3}")),
+                mesh.map_or(String::new(), |m| format!("{m:.3}")),
+                mesh.map_or(String::new(), |m| format!("{:.3}", m - terrain)),
+            )?;
+        }
+    }
+    file.flush()?;
+    worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+    tracing::info!(
+        "floor survey: {} samples on a {:.0}-unit grid around {:.1},{:.1}: {} stood on terrain, {} holes, mesh answered at {}",
+        stood + holes,
+        spacing,
+        eye.x,
+        eye.y,
+        stood,
+        holes,
+        mesh_answered,
+    );
+    tracing::info!(
+        "  under water: {} samples, of which floor.or(ground) drops {} through the bed",
+        wet,
+        wet_or_fell,
+    );
+    tracing::info!(
+        "  ground.max(floor): {} fell through, {} lifted, {} stood",
+        max_fell,
+        max_lifted,
+        stood - max_fell - max_lifted,
+    );
+    tracing::info!(
+        "  floor.or(ground):  {} fell through, {} lifted, {} stood",
+        or_fell,
+        or_lifted,
+        stood - or_fell - or_lifted,
+    );
+    tracing::info!(
+        "  support_under:     {} fell through, {} lifted, {} stood",
+        support_fell,
+        support_lifted,
+        stood - support_fell - support_lifted,
+    );
+    tracing::info!(
+        "  asked again from the {} mesh floors under the terrain: ground.max(floor) lifts {} out, support_under lifts {}",
+        underneath,
+        max_lifted_underneath,
+        support_lifted_underneath,
+    );
+    for (drop, x, y, terrain) in worst.iter().take(10) {
+        tracing::info!(
+            "  floor.or(ground) drops {drop:.1} at {x:.1},{y:.1} (terrain {terrain:.1})"
+        );
+    }
+    tracing::info!("wrote {}", out.display());
+    Ok(())
+}
+
 fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<()> {
     let gpu = Gpu::block(None)?;
     tracing::info!("adapter: {}", gpu.describe());
@@ -4598,6 +4799,9 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
             if world.stats.tiles_pending == 0 {
                 break;
             }
+        }
+        if let Some(path) = &args.floor_survey {
+            return floor_survey(world, eye, args, path);
         }
     }
     // Any scene with geometry needs its pipelines built and a bone palette
@@ -6295,6 +6499,208 @@ mod footing_under_tests {
         assert_eq!(
             footing_under(Some((73.80, None)), Some((noise, None)), standing_at),
             Some((noise, None))
+        );
+    }
+}
+
+/// What is holding the character up this frame, and which of the two
+/// sources said so.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Support {
+    /// The terrain height field.
+    Terrain(f32),
+    /// A collision-mesh floor -- a building, a cave, a bridge, a rock.
+    Mesh(f32),
+}
+
+impl Support {
+    fn z(self) -> f32 {
+        match self {
+            Support::Terrain(z) | Support::Mesh(z) => z,
+        }
+    }
+
+    fn is_mesh(self) -> bool {
+        matches!(self, Support::Mesh(_))
+    }
+}
+
+/// The surface the character stands on, chosen from the terrain height
+/// field and the collision mesh by **one rule for both: the highest
+/// surface at or below a step above the feet, whichever kind it is.**
+///
+/// **The bug this replaced, `foss-wow#172`.** The mesh used to outrank the
+/// terrain *whenever it answered at all* -- `floor.or(ground)` -- which was
+/// itself the fix for a cave: a cave's walkable floor sits *below* the
+/// hillside overhead, so "take the higher of the two" carried anybody who
+/// walked underground straight back up to daylight. The `or` fixed the cave
+/// and broke its mirror image. Standing on the hillside *above* a mine, the
+/// mesh query searches downward from the feet and finds the tunnel floor
+/// tens of units below -- a genuine floor, and the only one the mesh has
+/// there, because **terrain is never added to the collision world** (see
+/// `world::World::load_tile`, whose only `add_tagged_with_id` is the
+/// WMO/M2 loop). The `or` then threw away the ground the character was
+/// actually standing on, the drop exceeded `FALL_THRESHOLD`, and they fell
+/// through the hill into the mine. Reported live, above a mine and "in
+/// rivers and what not" -- any doodad whose collision reaches below the
+/// terrain it is sunk into produces the same shape, and `--floor-survey`
+/// is what finds them offline.
+///
+/// The cave fix said the right thing and put it in the wrong place: the
+/// mesh query is bounded to `feet + step` so that a roof overhead is never
+/// stood on, and the *terrain* is a roof overhead in exactly the same sense
+/// when the character is under it. So the terrain gets the identical bound,
+/// and after that neither source needs to outrank the other -- a hillside
+/// over a tunnel is higher than the tunnel and wins; a tunnel under a
+/// hillside excludes the hillside and wins; a bridge deck over a riverbed
+/// is higher and wins. The original client indexes terrain and buildings in
+/// one structure and stands on the highest of them, and this is that rule
+/// with the height field left in its cheap separate form.
+///
+/// A tie goes to the mesh, so a floor laid flush on the ground still sounds
+/// like the floor underfoot.
+///
+/// **What it does not do.** A jump whose arc pierces the terrain over a
+/// low cave will land on top of that terrain on the way down, where the
+/// old rule kept the cave floor. That is the geometry saying what it says
+/// -- this client has no ceiling for a jump to hit -- and it needs a tunnel
+/// whose roof is within one jump height of its floor with no hole cut in
+/// the terrain above, which is not a thing a level designer leaves.
+fn support_under(
+    ground: Option<f32>,
+    floor: Option<f32>,
+    feet_z: f32,
+    step: f32,
+) -> Option<Support> {
+    let terrain = ground.filter(|g| *g <= feet_z + step).map(Support::Terrain);
+    let mesh = floor.map(Support::Mesh);
+    match (mesh, terrain) {
+        (Some(m), Some(t)) => Some(if t.z() > m.z() { t } else { m }),
+        (m, t) => m.or(t),
+    }
+}
+
+#[cfg(test)]
+mod support_under_tests {
+    use super::*;
+
+    /// **`foss-wow#172` itself.** On the hillside above a mine the mesh
+    /// finds the tunnel floor far below; the ground underfoot must win.
+    #[test]
+    fn a_hillside_above_a_tunnel_stands_on_the_hillside() {
+        let feet = 60.0;
+        assert_eq!(
+            support_under(Some(60.0), Some(31.5), feet, STEP_HEIGHT),
+            Some(Support::Terrain(60.0)),
+            "the tunnel under the hill is not what the character is standing on"
+        );
+    }
+
+    /// **The Northshire cave "teleport", which the old rule fixed and this
+    /// one must keep fixed.** Underground, the hillside overhead is above
+    /// the feet by far more than a step and is not a candidate at all.
+    #[test]
+    fn a_tunnel_under_a_hillside_stands_on_the_tunnel() {
+        let feet = 31.5;
+        assert_eq!(
+            support_under(Some(60.0), Some(31.5), feet, STEP_HEIGHT),
+            Some(Support::Mesh(31.5)),
+            "the hill overhead must not lift a character out of the cave"
+        );
+    }
+
+    /// Walking deeper: the cave floor drops by a fraction per frame and the
+    /// terrain overhead stays excluded, so nothing carries the character up.
+    #[test]
+    fn descending_a_cave_keeps_following_its_floor() {
+        let mut feet = 31.5;
+        for _ in 0..200 {
+            let floor = feet - 0.05;
+            let support = support_under(Some(60.0), Some(floor), feet, STEP_HEIGHT);
+            assert_eq!(support, Some(Support::Mesh(floor)));
+            feet = floor;
+        }
+    }
+
+    /// A building's floor sits above the ground it is built on, and a
+    /// bridge deck above the riverbed under it: the mesh is higher and wins,
+    /// exactly as it did before.
+    #[test]
+    fn a_floor_above_the_ground_is_stood_on() {
+        assert_eq!(
+            support_under(Some(70.0), Some(72.0), 72.0, STEP_HEIGHT),
+            Some(Support::Mesh(72.0))
+        );
+    }
+
+    /// **The riverbed shape.** A rock sunk into the bed has collision below
+    /// the terrain; a character wading over it stands on the bed, not
+    /// inside the rock.
+    #[test]
+    fn a_doodad_sunk_below_the_terrain_does_not_swallow_the_character() {
+        assert_eq!(
+            support_under(Some(48.2), Some(46.9), 48.2, STEP_HEIGHT),
+            Some(Support::Terrain(48.2))
+        );
+    }
+
+    /// The common case, open ground with nothing modelled, and its mirror
+    /// in a building whose tile has no terrain answer at all.
+    #[test]
+    fn a_single_source_answers_alone() {
+        assert_eq!(
+            support_under(Some(55.0), None, 55.0, STEP_HEIGHT),
+            Some(Support::Terrain(55.0))
+        );
+        assert_eq!(
+            support_under(None, Some(55.0), 55.0, STEP_HEIGHT),
+            Some(Support::Mesh(55.0))
+        );
+        assert_eq!(support_under(None, None, 55.0, STEP_HEIGHT), None);
+    }
+
+    /// Terrain within a step above the feet is climbed, the way a mesh
+    /// stair is -- a bank rising ahead is not a roof.
+    #[test]
+    fn terrain_within_a_step_above_is_still_ground() {
+        assert_eq!(
+            support_under(Some(55.5), None, 55.0, STEP_HEIGHT),
+            Some(Support::Terrain(55.5))
+        );
+        assert_eq!(
+            support_under(Some(56.0), None, 55.0, STEP_HEIGHT),
+            None,
+            "terrain more than a step overhead is a roof, not ground"
+        );
+    }
+
+    /// **The airborne case must not lose the ground.** The query is made
+    /// from where the arc was at the start of the frame, and any terrain
+    /// below that is a candidate however fast the fall -- `jump_landing`'s
+    /// crossing test needs the surface at or below `before_z`, which this
+    /// bound is strictly looser than.
+    #[test]
+    fn falling_fast_still_offers_the_ground_below() {
+        let before_z = 80.0;
+        assert_eq!(
+            support_under(Some(41.0), None, before_z, STEP_HEIGHT),
+            Some(Support::Terrain(41.0))
+        );
+        assert_eq!(
+            jump_landing(before_z, before_z - 6.0, Some(41.0)),
+            None,
+            "not yet reached, but offered -- the crossing test decides when"
+        );
+        assert_eq!(jump_landing(43.0, 40.5, Some(41.0)), Some(41.0));
+    }
+
+    /// A floor flush with the ground is a tie, and the tie is the mesh's so
+    /// footsteps sound like what was laid there.
+    #[test]
+    fn a_tie_goes_to_the_mesh() {
+        assert_eq!(
+            support_under(Some(55.0), Some(55.0), 55.0, STEP_HEIGHT),
+            Some(Support::Mesh(55.0))
         );
     }
 }
@@ -10284,48 +10690,47 @@ impl App {
             // fixed here and filtering it would delay a real material
             // change by a frame for nothing.
             let floor = self.floor_filter.filter(underfoot.map(|(z, _)| z));
-            // **The floor outranks the terrain whenever it answered at all --
-            // not merely when it happens to be the taller of the two.** This
-            // was `ground.max(floor)`, on the reasoning that "a floor laid
-            // over ground holds the character up", which is true of a
-            // building -- its floor sits *above* the ground it is built on --
-            // and false of a cave: a cave's walkable floor sits *below* the
-            // surface directly overhead, so `max` picked the surface every
-            // time, and a character walking deeper underground was carried
-            // back up to daylight the moment the real cave floor read lower
-            // than the terrain above it. Reported from live play as a
-            // "teleport" out of the Northshire cave.
+            // **The highest surface at or below a step above the feet,
+            // terrain and mesh alike** -- see `support_under`, which holds
+            // the history. Short form: this was `ground.max(floor)`, which
+            // lifted anybody in the Northshire cave back up to the hillside
+            // overhead; then `floor.or(ground)`, which fixed the cave and
+            // dropped anybody standing on the hillside *above* a mine into
+            // its tunnel, because the mesh query looks downward and the
+            // tunnel floor is a real floor (`foss-wow#172`). Both were the
+            // same mistake: one source outranking the other, where the
+            // right answer is to bound the terrain the way the mesh query
+            // already bounds itself and then simply take the higher.
             //
-            // `floor_under_footing` has already done the one check that
-            // matters -- whether the collision mesh answers for this spot at
-            // all, bounded to a step above where the character already is,
-            // so a roof or an upper floor is never returned as `floor` in
-            // the first place. Once it has answered, that answer is what the
-            // character is standing on; the terrain height field is the
-            // fallback for everywhere the collision mesh has nothing to say,
-            // indoors or out.
-            //
-            // **Unconditional again, jump or no jump.** A previous fix
-            // filtered this by what the arc could have reached, to stop a
-            // jump climbing a fence's structure. That was the wrong layer:
-            // what the surface *is* does not depend on whether the
-            // character is airborne, and while airborne this is no longer a
-            // standing height at all -- it is only the candidate
-            // `jump_landing` tests the arc against. See `jump_landing`.
-            let stand = floor.or(ground);
+            // **Unconditional, jump or no jump.** A previous fix filtered
+            // this by what the arc could have reached, to stop a jump
+            // climbing a fence's structure. That was the wrong layer: what
+            // the surface *is* does not depend on whether the character is
+            // airborne, and while airborne this is no longer a standing
+            // height at all -- it is only the candidate `jump_landing`
+            // tests the arc against. See `jump_landing`.
+            let support = support_under(ground, floor, live.position.z, STEP_HEIGHT);
+            let stand = support.map(Support::z);
+            let on_mesh = support.is_some_and(Support::is_mesh);
             // **Read off the same preference**, not asked again. The
-            // character is on the collision mesh's floor exactly when
-            // `underfoot` answered, so deriving the surface from a second
+            // character is on the collision mesh's floor exactly when the
+            // rule above chose it, so deriving the surface from a second
             // test would be two answers to one question -- and the frame
             // they disagree on is a footstep that sounds like the ground
-            // under the floorboards.
-            self.floor_material = underfoot.and_then(|(_, surface)| surface);
+            // under the floorboards. Or, now, like the mine under the hill:
+            // a mesh the rule *rejected* is not underfoot and must not name
+            // the footstep either.
+            self.floor_material = if on_mesh {
+                underfoot.and_then(|(_, surface)| surface)
+            } else {
+                None
+            };
             // **Filtered, unlike `floor_material` above.** A one-frame flip
             // here does not just mislabel a footstep -- it feeds the
             // footstep-material fallback below, and an unfiltered flicker
             // would alternate that fallback every frame near a seam. See
             // `FloorPresenceFilter`'s own doc comment.
-            self.modeled_floor = self.floor_presence_filter.filter(underfoot.is_some());
+            self.modeled_floor = self.floor_presence_filter.filter(on_mesh);
             // **A narrower question than `modeled_floor`, and the one
             // `weather_ambience`/`precipitation_for_frame` actually need.**
             // `modeled_floor` is "something solid was found underfoot",

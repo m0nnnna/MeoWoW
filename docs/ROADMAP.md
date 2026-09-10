@@ -8749,3 +8749,108 @@ could have broken -- a creature drawn a frame late, or one that never arrives
 falling through the world above a mine and in riverbeds. Nothing to do with
 this rung -- replicated entity models carry no collision -- it is floor
 coverage in the open world, a sibling of the Stormwind fountain case.)
+
+## Falling through the world above a mine, and in rivers (`foss-wow#172`)
+
+Reported in the same session that confirmed the off-thread model loader:
+*"i did fall through the world above a mine and there's been more issues of
+falling through the world in rivers and what not."* Two named places, and the
+rule below the ROADMAP's own advice about that -- **do not merge two cases
+until one probe shows they share a cause** -- was followed and paid off in one
+run.
+
+### The cause, read before it was measured
+
+The standing height came from two sources: the terrain height field
+(`world.height_at`) and the collision mesh (`floor_under_footing`, searched
+*downward* from a step above the feet, keeping the highest floor it finds).
+They were combined by `floor.or(ground)`: **the mesh outranked the terrain
+whenever it answered at all.** That line was itself a fix. It had been
+`ground.max(floor)`, and a cave's walkable floor sits *below* the hillside
+overhead, so the `max` carried anybody in the Northshire cave straight back up
+to daylight -- the "teleport" report. The `or` fixed the cave.
+
+What the `or` could not know is that **terrain is never added to the collision
+world.** `World::load_tile`'s only `add_tagged_with_id` is the WMO/M2 loop; the
+height field is consulted separately because it is cheap. So on the hillside
+*above* a mine, the mesh query looks down through the hill -- there is no
+terrain triangle to stop it -- finds the tunnel floor tens of units below, and
+reports it as the floor. It is a real floor. The `or` then discards the
+hillside, the drop exceeds `FALL_THRESHOLD`, and a fall arc starts into the
+mine. Silent-wrong in the usual shape: every answer along the way is true, and
+the cave fix's predicted cost was exactly this -- walking *over* a cave is the
+same geometry with the character on the other side of it.
+
+### The rule that replaced it
+
+The cave fix said the right thing in the wrong place. The mesh query is bounded
+to `feet + STEP_HEIGHT` precisely so that a roof overhead is never stood on;
+the terrain is a roof overhead in exactly the same sense when the character is
+under it. So `support_under` gives the terrain the identical bound and then
+takes the higher of whatever survives, with no source outranking the other:
+
+* hillside over a tunnel: the hillside is higher and wins;
+* tunnel under a hillside: the hillside is more than a step overhead, is
+  excluded, and the tunnel wins;
+* a building's floor, a bridge deck: higher than the ground under it and wins,
+  as before;
+* a rock or a reed sunk into a riverbed: the bed is higher and wins.
+
+That is the original client's rule -- it indexes terrain and buildings in one
+structure and stands on the highest surface within reach -- with the height
+field left in its separate, cheap form. The result carries *which* source
+answered (`Support::Terrain`/`Support::Mesh`), and the footstep material and
+the `modeled_floor` presence now read off that decision rather than off "did
+the mesh answer": a mesh the rule rejected is not underfoot and must not name
+the footstep either.
+
+### The instrument, and what it measured
+
+**`--floor-survey <csv> --map Azeroth --stream --eye x,y,z`** builds the
+streaming world exactly as the window does, collision and all, and asks the
+standing question at every point of a grid (`--survey-radius`,
+`--survey-spacing`), *from the terrain height* the way a character walking
+there would. For each sample it records what all three rules -- `max`, `or`,
+`support_under` -- would have done, and counts, per rule, samples dropped more
+than `FALL_THRESHOLD` below the terrain and samples lifted more than a step
+above it. Then it asks the question a second time **from every mesh floor it
+found under the terrain**, as a character standing in that tunnel: this is the
+Northshire teleport re-run offline, and it is what stops the fix for `#172`
+from simply moving the bug back where it was.
+
+Two hundred and fifty units around Fargodeep Mine (`-9833,194`), 62,925
+samples on a 2-unit grid:
+
+| rule | fell through | lifted | asked again from 2,516 tunnel floors: lifted out |
+|---|---|---|---|
+| `ground.max(floor)` (pre-cave-fix) | 0 | 0 | **2,516** |
+| `floor.or(ground)` (shipped) | **2,830** | 0 | 0 |
+| `support_under` | 0 | 0 | 0 |
+
+The worst drop at Fargodeep is 49.5 units; at Jasperlode (`-8646,-131`) it is
+**173.6**, from a hillside at z 261 into the tunnel beneath. Northshire, whose
+own mine is what the `or` was written for, reads 710 / 0 / 0 on the same three
+rows.
+
+**The riverbed case shares the cause, and the survey is what showed it.** A
+`liquid` column separates wet samples; around Goldshire, **58 of 3,312
+underwater samples** fall under the shipped rule and 25 of 2,791 at Northshire.
+At `-9280,-144`, in the river east of Goldshire, the mesh 2.5 units under the
+bed is `SWAMPPLANT04.M2` -- reeds, placed with their collision sunk into the
+riverbed. The drops are 2-3.6 units where a mine's are tens, which is why the
+river reports read as "and what not" rather than as a named place: shallow
+enough to look like a stumble, deep enough to start a fall arc.
+
+### What it does not do
+
+* **A jump whose arc pierces the terrain over a low tunnel lands on top of it**
+  on the way down. The old rule kept the tunnel floor; this one has no ceiling
+  for a jump to hit and the geometry is what it is. It needs a tunnel whose
+  roof is within one jump height of its floor with no hole cut in the terrain
+  above, which is not a thing a level designer leaves.
+* **The stuck-forever half of `#111` is separate and still open.** A floor
+  search only ever looks at or below where it starts, so a character who has
+  already gone under the world never finds anything again. This rung removes
+  the way in that was measured; it does not add a way out.
+* **Not yet confirmed at the window.** The survey is the offline half; the
+  hillside above Fargodeep and the reeds at `-9280,-144` are where to walk.

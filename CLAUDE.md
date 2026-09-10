@@ -115,7 +115,7 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | Sound | Zone music and ambience by area and hour, creature voices, weapon impacts, **footsteps that know what they are standing on** — terrain and building floors both. No attenuation, no spell sounds |
 | NPCs | Gossip, vendors (buy only -- no sell window), quests, questgiver `!`/`?` marks, trainers, auctioneers |
 | City services | **All six done and confirmed at the window: trainers, flight paths, trade, mail, guilds and the auction house.** Browsing, paging, bidding and cancelling; no sell window, no search box, no sort control |
-| Collision | Walls stop you, floors and stairs hold you up, M2 collision meshes are obstacles. Tiles are selected by the **bounds of what they hold**, not by where the character is — Stormwind is one placement covering nine tiles. Transitions cut rather than blend; a stair stutter is instrumented, not solved |
+| Collision | Walls stop you, floors and stairs hold you up, M2 collision meshes are obstacles. Tiles are selected by the **bounds of what they hold**, not by where the character is — Stormwind is one placement covering nine tiles. **The standing surface is the highest of terrain and mesh at or below a step above the feet** (`support_under`) -- neither source outranks the other, which is what stopped the hillside above a mine dropping the character into its tunnel and a riverbed's sunk reeds swallowing them (`foss-wow#172`; offline, `--floor-survey`). Transitions cut rather than blend; a stair stutter is instrumented, not solved; a character already under the world has no way back up (`#111`) |
 
 ### At the window
 
@@ -197,6 +197,12 @@ guess was wrong; see 4.34, where eight of them were.
   hash rather than stacked, so a crowd is reproducible on a realm with four
   characters on it. Copies at one point share a tile, a cell and an animation
   bucket, which is the *cheap* case.
+* **`--floor-survey <csv> --map Azeroth --stream --eye x,y,z`** asks the
+  standing rule at every point of a grid, from the terrain the way a walking
+  character would, and again from every mesh floor found *under* the terrain
+  the way somebody in the tunnel would. Reports per rule how many samples
+  fell through and how many were lifted, and the wet ones separately. Falling
+  through the world is one spot per fall live and 2,830 spots in one run here.
 
 **Known defect: replicated *players* do not interpolate.** A creature moves by
 `SMSG_MONSTER_MOVE`, which carries a start, an end and a duration; a player
@@ -1231,6 +1237,15 @@ These are what replaced guessing.
   survived four milestones because `EVICT_MARGIN` retains a 3x3, so walking
   back the way you came looked fine. It is a **floor** in the constructor now
   rather than a default.
+- **A fix that makes one source outrank another has a mirror image, and the
+  mirror is where it fails.** The cave floor sits below the hillside overhead,
+  so "mesh beats terrain whenever it answers" fixed the Northshire teleport --
+  and dropped anybody standing on the hillside *above* a mine into its
+  tunnel, because the mesh query looks down through terrain that is not in
+  the collision world at all. The right rule bounded both sources the same
+  way and took the higher; the survey that proved it asks from **both
+  sides**, since a fix measured only from the side that was reported has
+  merely moved the bug back where it came from.
 - **A thing's *owner* and a thing's *extent* are different.** A world object is
   filed under the tile containing its **origin**, correctly, so it is neither
   drawn twice nor left behind. Collision then chose tiles by where the
