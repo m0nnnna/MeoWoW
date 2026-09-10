@@ -300,6 +300,21 @@ enum Command {
         /// `SMSG_INVENTORY_CHANGE_FAILURE` in full if the server declines.
         #[arg(long)]
         swap: Option<String>,
+        /// Destroy what is in one of the player's own slots and report what
+        /// happened -- `--destroy 23` is the first backpack square.
+        ///
+        /// **The instrument that confirms `CMSG_DESTROYITEM` (`0x0111`),**
+        /// which the bag window's drop-on-the-ground prompt sends and which
+        /// nothing in this client had ever sent before it (`foss-wow#130`).
+        /// Diffs the slot array the way `--swap` does, prints every
+        /// `SMSG_INVENTORY_CHANGE_FAILURE` in full, and runs the drain after
+        /// the send through the ordinary parser -- so a body of the wrong
+        /// length surfaces as the *next* packet failing to parse, which is
+        /// the failure a wrong length actually produces. Aim it at an empty
+        /// slot as the control: the server has to read bag and slot to say
+        /// `ITEM_NOT_FOUND`, so that refusal is proof the body parsed.
+        #[arg(long)]
+        destroy: Option<u16>,
         /// Open the loot on the nearest dead unit and print every byte that
         /// comes back.
         ///
@@ -1722,6 +1737,7 @@ fn main() -> Result<()> {
             items,
             equip,
             swap,
+            destroy,
             loot,
             gossip,
             gossip_select,
@@ -1824,6 +1840,7 @@ fn main() -> Result<()> {
                 items: *items,
                 equip,
                 swap: swap.as_deref(),
+                destroy: *destroy,
                 loot: *loot,
                 gossip: *gossip,
                 gossip_select: *gossip_select,
@@ -2055,6 +2072,7 @@ struct WorldRequest<'a> {
     items: bool,
     equip: &'a [u16],
     swap: Option<&'a str>,
+    destroy: Option<u16>,
     loot: bool,
     gossip: Option<u32>,
     gossip_select: Option<u32>,
@@ -2212,6 +2230,7 @@ fn world_login(request: WorldRequest<'_>) -> Result<()> {
         items,
         equip,
         swap,
+        destroy,
         loot,
         gossip,
         gossip_select,
@@ -3225,6 +3244,10 @@ cast {spell_id} at {} (attempt {attempt})",
 
         if let Some(pair) = swap {
             swap_and_report(&mut connection, &mut state, character.guid, pair)?;
+        }
+
+        if let Some(slot) = destroy {
+            destroy_and_report(&mut connection, &mut state, character.guid, slot)?;
         }
 
         if loot {
@@ -7951,6 +7974,85 @@ fn swap_and_report(
         }
     );
 
+    Ok(())
+}
+
+fn destroy_and_report(
+    connection: &mut world::Connection,
+    state: &mut world::WorldState,
+    own_guid: u64,
+    slot: u16,
+) -> Result<()> {
+    use world::inventory::{self, InventorySlot};
+
+    let Some(target) = InventorySlot::new(slot) else {
+        anyhow::bail!("slot past the end of the array ({} slots)", inventory::SLOT_COUNT);
+    };
+
+    let before: std::collections::BTreeMap<u16, u64> = inventory::held(state, own_guid)
+        .into_iter()
+        .map(|item| (item.slot.index(), item.guid))
+        .collect();
+    println!(
+        "
+destroying slot {slot} ({})",
+        match before.get(&slot) {
+            Some(guid) => format!("{guid:#018x}"),
+            // Sent anyway: the refusal is the control.
+            None => "empty -- expecting ITEM_NOT_FOUND back".into(),
+        }
+    );
+
+    // Count zero means the whole stack, the same as the bag window sends.
+    connection.destroy_item(inventory::OWN_SLOT_ARRAY, target.index() as u8, 0)?;
+    let batch = connection.drain(std::time::Duration::from_millis(1200), 128)?;
+    println!("  {} packet(s) in the 1.2s after the send", batch.len());
+    let report = state.replicate(&batch, None);
+
+    for failure in &report.inventory_failures {
+        println!(
+            "  refused: {} (items {:#018x}, {:#018x})",
+            world::inventory::describe_inventory_failure(failure.code),
+            failure.item_a,
+            failure.item_b
+        );
+    }
+
+    let after: std::collections::BTreeMap<u16, u64> = inventory::held(state, own_guid)
+        .into_iter()
+        .map(|item| (item.slot.index(), item.guid))
+        .collect();
+    let mut moved = Vec::new();
+    for index in 0..inventory::SLOT_COUNT {
+        let (was, now) = (before.get(&index), after.get(&index));
+        if was != now {
+            moved.push((index, was.copied(), now.copied()));
+        }
+    }
+    if moved.is_empty() {
+        println!("
+nothing changed in the slot array.");
+        return Ok(());
+    }
+    println!("
+{} slot(s) changed:", moved.len());
+    for (index, was, now) in &moved {
+        let describe = |guid: &Option<u64>| match guid {
+            Some(guid) => format!("{guid:#018x}"),
+            None => "empty".into(),
+        };
+        println!("  slot {index:>2}: {} -> {}", describe(was), describe(now));
+    }
+    let gone = moved.len() == 1 && moved[0].0 == slot && moved[0].2.is_none();
+    println!(
+        "
+{}",
+        if gone {
+            "-- the slot emptied and nothing else moved: the item was destroyed."
+        } else {
+            "-- something changed, but not that one slot going empty."
+        }
+    );
     Ok(())
 }
 

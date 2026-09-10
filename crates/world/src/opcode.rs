@@ -200,28 +200,32 @@ pub enum ClientOpcode {
     /// Destroys a carried item outright -- what a bag drag that ends nowhere
     /// (not a slot, not a vendor, not any other window) means.
     ///
-    /// **From public documentation, not yet confirmed against a live
-    /// realm** -- unlike every neighbouring opcode in this block, which was
-    /// checked by watching a specific guid move. `0x0111` sits exactly where
-    /// the table says it should, one below `SwapItemCandidate` and one above
-    /// `INVENTORY_CHANGE_FAILURE` (`0x0112`, already confirmed and parsed in
-    /// this crate as the generic refusal every inventory write shares), and
-    /// the body is silent on success the same way `BuyItem` and `SellItem`
-    /// are; a refusal answers on the shared `INVENTORY_CHANGE_FAILURE`
-    /// opcode instead of a reply of its own.
+    /// **Confirmed live** (`wow-cli world --destroy`, `foss-wow#130`), both
+    /// ways round. Against a stack of linen cloth in backpack slot 26 the slot
+    /// emptied in the next object update, nothing else in the array moved,
+    /// no `INVENTORY_CHANGE_FAILURE` came back, and the 105 packets that
+    /// followed in the next 1.2 seconds parsed cleanly -- which is the check
+    /// that matters for a body whose *length* was the open question, since a
+    /// wrong length fails as the next packet, not this one. Against an
+    /// **empty** slot the answer was `INVENTORY_CHANGE_FAILURE` code 23,
+    /// `ITEM_NOT_FOUND`, with both guids zero: the server had to read the
+    /// bag and slot bytes to say that, so the refusal is proof the body
+    /// parsed, and it is the cheaper of the two probes because it needs no
+    /// item to spend.
     ///
-    /// `{bag, slot, count}` plus three trailing zero bytes the documented
-    /// handler reads and never uses -- six in total. Sent whole rather than
-    /// as three, deliberately: packets are length-framed, so extra trailing
-    /// bytes a handler does not read are merely unread within this one
-    /// packet, where three bytes *short* risks the read running past this
-    /// packet's own bound if the six-byte body is the real one -- the safer
-    /// side to be wrong on between the two candidate lengths.
+    /// `0x0111` sits one below `SwapItemCandidate` and one above
+    /// `INVENTORY_CHANGE_FAILURE` (`0x0112`, the generic refusal every
+    /// inventory write shares); silent on success the same way `BuyItem` and
+    /// `SellItem` are.
     ///
-    /// What would confirm it the way `SwapItemCandidate` was confirmed: sending it
-    /// against a known slot and watching the item actually leave
-    /// `PLAYER_FIELD_PACK_SLOT_n` in the next object update, with no
-    /// `INVENTORY_CHANGE_FAILURE` in between.
+    /// `{bag, slot, count}` plus three trailing bytes the handler reads and
+    /// never uses -- six in total, which the server's own reader confirms
+    /// (six `u8` reads, nothing conditional). Count zero destroys the whole
+    /// stack; non-zero destroys that many of it. Before the live run this
+    /// was sent at six rather than three on the reasoning that packets are
+    /// length-framed, so bytes a handler does not read are harmless where a
+    /// body three short would run the read past its bound; the reasoning
+    /// held and is now beside the point.
     DestroyItem = 0x0111,
 
     /// Take one slot off the corpse currently open, letting the server choose
