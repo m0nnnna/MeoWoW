@@ -175,7 +175,12 @@ pub struct LoadedModel {
     pub texture_animation: TextureAnimation,
     /// Skeleton with animation tracks, kept so poses can be evaluated per
     /// frame rather than baked at load.
-    pub bones: std::rc::Rc<Vec<m2::AnimatedBone>>,
+    ///
+    /// `Arc`, not `Rc`: the background loader decodes this on its own thread
+    /// (once per file, shared across every costume) and hands it back. The
+    /// tracks are read-only after decode, so the share costs a refcount and
+    /// never a copy.
+    pub bones: std::sync::Arc<Vec<m2::AnimatedBone>>,
     pub sequences: Vec<m2::Sequence>,
     /// Points other models hang from. Cheap to carry -- a character model has
     /// thirty-nine and a tree none -- and the only way to hang a weapon on a
@@ -195,7 +200,7 @@ pub struct LoadedModel {
     /// carries the measurement that identified them. Empty for everything with
     /// no legs, which is most models, and empty *per sequence* for the cycles
     /// a creature does not walk in.
-    pub footfalls: std::rc::Rc<Vec<Vec<u32>>>,
+    pub footfalls: std::sync::Arc<Vec<Vec<u32>>>,
     /// Human-readable name per sequence, from `AnimationData.dbc`.
     pub sequence_names: Vec<String>,
     pub min: Vec3,
@@ -279,8 +284,8 @@ fn is_particle_mesh(
 /// costume that model wears.
 #[derive(Clone)]
 struct Skeleton {
-    bones: std::rc::Rc<Vec<m2::AnimatedBone>>,
-    footfalls: std::rc::Rc<Vec<Vec<u32>>>,
+    bones: std::sync::Arc<Vec<m2::AnimatedBone>>,
+    footfalls: std::sync::Arc<Vec<Vec<u32>>>,
     /// How many external files went into it, kept only so the load line can
     /// still report the number on a cache hit -- where none were read.
     files: usize,
@@ -519,6 +524,10 @@ pub fn load_dressed(
 /// else -- the LOD fallback, the batch walk, the bone palette -- is identical,
 /// and two copies of that would drift. See [`crate::character`] for why a
 /// player needs it at all.
+///
+/// This is [`prepare_dressed_with`] followed by [`finalize_dressed`]: the
+/// synchronous callers want one call, and the seam only matters to the
+/// background loader that runs the first half off the render thread.
 pub fn load_dressed_with(
     gpu: &Gpu,
     meshes: &render::mesh::MeshRenderer,
@@ -529,6 +538,71 @@ pub fn load_dressed_with(
     lod: u32,
     look: Option<&crate::character::Look>,
 ) -> Result<LoadedModel> {
+    finalize_dressed(
+        gpu,
+        meshes,
+        prepare_dressed_with(chain, sources, path, variations, lod, look)?,
+    )
+}
+
+/// One texture slot, resolved and decoded but not yet on the GPU.
+///
+/// The split point between [`prepare_dressed_with`] and [`finalize_dressed`]:
+/// resolving which file a slot wants and decoding a BLP is archive work and CPU
+/// work, and belongs off the render thread; `wgpu` resource creation stays on
+/// it. `Composed` carries a character body skin blended in memory upstream;
+/// `File` a parsed BLP; `Missing` a slot that resolved to nothing, drawn as the
+/// grey placeholder so the model is shaded geometry rather than absent.
+pub enum PreparedTexture {
+    Composed { width: u32, height: u32, rgba: Vec<u8> },
+    File { blp: blp::Blp, label: String },
+    Missing,
+}
+
+/// Everything [`finalize_dressed`] needs to turn one model into a
+/// [`LoadedModel`], with no archive access and no GPU.
+///
+/// **Every field is `Send`.** The background model loader reads and parses on
+/// its own thread and hands one of these back over a channel; the render thread
+/// then does only the `wgpu` uploads. `bones` and `footfalls` are `Arc` -- the
+/// same read-only tracks the skeleton cache holds, shared for a refcount rather
+/// than copied. `model` is kept whole because [`TextureAnimation::new`] reads
+/// the texture-transform tracks straight off it.
+pub struct PreparedModel {
+    pub model: m2::Model,
+    pub vertices: Vec<MeshVertex>,
+    pub indices: Vec<u32>,
+    pub draws: Vec<Draw>,
+    pub textures: Vec<PreparedTexture>,
+    pub missing_textures: Vec<String>,
+    pub bones: std::sync::Arc<Vec<m2::AnimatedBone>>,
+    pub footfalls: std::sync::Arc<Vec<Vec<u32>>>,
+    pub sequences: Vec<m2::Sequence>,
+    pub sequence_names: Vec<String>,
+    pub attachments: Vec<m2::Attachment>,
+    pub particles: Vec<m2::ParticleEmitter>,
+    pub ribbons: Vec<m2::RibbonEmitter>,
+    pub collision: Vec<[[f32; 3]; 3]>,
+    pub min: Vec3,
+    pub max: Vec3,
+    pub path: String,
+    pub vertex_count: usize,
+    pub triangle_count: usize,
+    pub timings: LoadTimings,
+}
+
+/// The archive-and-CPU half of [`load_dressed_with`]: reads the `.m2`, `.skin`
+/// and `.anim` files, decodes geometry and textures, and resolves the
+/// skeleton. Touches neither the GPU nor a [`MeshRenderer`], so the background
+/// loader can run it off the render thread. See [`finalize_dressed`].
+pub fn prepare_dressed_with(
+    chain: &mut Chain,
+    sources: &mut Sources,
+    path: &str,
+    variations: &Variations,
+    lod: u32,
+    look: Option<&crate::character::Look>,
+) -> Result<PreparedModel> {
     let began = Instant::now();
     let mut timings = LoadTimings::default();
 
@@ -617,29 +691,26 @@ pub fn load_dressed_with(
         };
 
         // A character's body texture is composed in memory from several
-        // layers and has no file behind it, so it is uploaded from pixels
-        // before any path is considered.
+        // layers and has no file behind it, so it is taken from pixels before
+        // any path is considered. Resolved and decoded here; uploaded in
+        // `finalize_dressed`.
         let composed = look
             .filter(|_| def.kind == 1)
             .and_then(|look| look.skin.as_ref())
-            .map(|skin| {
-                render::texture::upload_rgba(
-                    gpu,
-                    skin.width,
-                    skin.height,
-                    &skin.rgba,
-                    "character skin",
-                )
+            .map(|skin| PreparedTexture::Composed {
+                width: skin.width,
+                height: skin.height,
+                rgba: skin.rgba.clone(),
             });
-        let uploaded = composed.or_else(|| {
+        let resolved = composed.or_else(|| {
             file.as_ref().and_then(|f| {
                 let bytes = chain.read(f).ok()?;
-                let parsed = blp::Blp::parse(&bytes).ok()?;
-                Some(upload_blp(gpu, &parsed, f))
+                let blp = blp::Blp::parse(&bytes).ok()?;
+                Some(PreparedTexture::File { blp, label: f.clone() })
             })
         });
 
-        match uploaded {
+        match resolved {
             Some(t) => {
                 textures.push(t);
             }
@@ -647,12 +718,12 @@ pub fn load_dressed_with(
                 missing_textures.push(
                     file.unwrap_or_else(|| format!("<runtime slot type {}>", def.kind)),
                 );
-                textures.push(placeholder(gpu));
+                textures.push(PreparedTexture::Missing);
             }
         }
     }
     if textures.is_empty() {
-        textures.push(placeholder(gpu));
+        textures.push(PreparedTexture::Missing);
     }
     timings.textures = phase.elapsed();
 
@@ -787,9 +858,8 @@ pub fn load_dressed_with(
     };
 
     let triangle_count = indices.len() / 3;
+    let vertex_count = vertices.len();
     timings.geometry += phase.elapsed();
-
-    let texture_animation = TextureAnimation::new(gpu, meshes, &model, &draws);
 
     let sequences = model.sequences();
     // The whole skeleton -- the `.anim` reads, the bone tracks and the timed
@@ -807,11 +877,11 @@ pub fn load_dressed_with(
             // after `sequences` has moved into it, and the outer index of a
             // footfall list *is* a sequence index.
             let skeleton = Skeleton {
-                footfalls: std::rc::Rc::new(m2::event::footfalls(
+                footfalls: std::sync::Arc::new(m2::event::footfalls(
                     &model.events_with(&external),
                     sequences.len(),
                 )),
-                bones: std::rc::Rc::new(model.animated_bones_with(&external)),
+                bones: std::sync::Arc::new(model.animated_bones_with(&external)),
                 files: external.len(),
             };
             sources.skeletons.insert(path.clone(), skeleton.clone());
@@ -819,7 +889,11 @@ pub fn load_dressed_with(
         }
     };
     timings.external_anim_files = skeleton.files;
-    let (bones, footfalls) = (skeleton.bones, skeleton.footfalls);
+    // Shared out of the skeleton cache, not copied: `Arc` so the result can
+    // cross the loader thread, and the tracks are read-only after decode. The
+    // per-*path* cache in `Sources` is untouched.
+    let bones = skeleton.bones.clone();
+    let footfalls = skeleton.footfalls.clone();
     // Net of the reads already attributed above, so the two do not double-count
     // on a miss and `skeleton` reads as ~0 on a hit.
     timings.skeleton = phase.elapsed().saturating_sub(timings.external_anims);
@@ -827,11 +901,88 @@ pub fn load_dressed_with(
     let sequence_names = sequence_names(sources, chain, &sequences);
     timings.sequence_names = phase.elapsed();
 
-    // Hoisted out of the struct literal below purely so it can be timed: a
-    // buffer upload is the one part of this that touches the GPU, and telling
-    // it apart from the archive reads is the difference between "load this off
-    // the render thread" and "there is nothing to move".
+    // Hoisted for the same reason the upload is timed in `finalize_dressed`.
+    // `collision_triangles` walks a second mesh nothing draws, and an emitter
+    // list is parsed per model -- both invisible in a breakdown that stopped at
+    // the struct literal.
     let phase = Instant::now();
+    let attachments = model.attachments();
+    let particles = model.particle_emitters();
+    let ribbons = model.ribbon_emitters();
+    let collision = model.collision_triangles();
+    timings.extras = phase.elapsed();
+    timings.total = began.elapsed();
+
+    Ok(PreparedModel {
+        model,
+        vertices,
+        indices,
+        draws,
+        textures,
+        missing_textures,
+        bones,
+        footfalls,
+        sequences,
+        sequence_names,
+        attachments,
+        particles,
+        ribbons,
+        collision,
+        min,
+        max,
+        path,
+        vertex_count,
+        triangle_count,
+        timings,
+    })
+}
+
+/// The GPU half of [`load_dressed_with`]: uploads the geometry and textures a
+/// [`prepare_dressed_with`] decoded, and builds the texture-animation buffer.
+/// Cheap and bounded -- one mesh upload and a handful of small texture uploads
+/// -- and the only part of a model load that has to run on the render thread.
+pub fn finalize_dressed(
+    gpu: &Gpu,
+    meshes: &render::mesh::MeshRenderer,
+    prepared: PreparedModel,
+) -> Result<LoadedModel> {
+    let PreparedModel {
+        model,
+        vertices,
+        indices,
+        draws,
+        textures,
+        missing_textures,
+        bones,
+        footfalls,
+        sequences,
+        sequence_names,
+        attachments,
+        particles,
+        ribbons,
+        collision,
+        min,
+        max,
+        path,
+        vertex_count,
+        triangle_count,
+        mut timings,
+    } = prepared;
+
+    let phase = Instant::now();
+    let textures: Vec<UploadedTexture> = textures
+        .into_iter()
+        .map(|t| match t {
+            PreparedTexture::Composed { width, height, rgba } => {
+                render::texture::upload_rgba(gpu, width, height, &rgba, "character skin")
+            }
+            PreparedTexture::File { blp, label } => upload_blp(gpu, &blp, &label),
+            PreparedTexture::Missing => placeholder(gpu),
+        })
+        .collect();
+
+    let texture_animation = TextureAnimation::new(gpu, meshes, &model, &draws);
+
     let mesh = if vertices.is_empty() || indices.is_empty() {
         // A zero-length GPU buffer is not something wgpu will make, and an
         // emitter-only model has exactly that. One degenerate vertex costs
@@ -851,18 +1002,9 @@ pub fn load_dressed_with(
     } else {
         GpuMesh::upload(gpu, &vertices, &indices)
     };
-    timings.upload = phase.elapsed();
-
-    // Hoisted for the same reason the upload was. `collision_triangles` walks
-    // a second mesh nothing draws, and an emitter list is parsed per model --
-    // both invisible in a breakdown that stopped at the struct literal.
-    let phase = Instant::now();
-    let attachments = model.attachments();
-    let particles = model.particle_emitters();
-    let ribbons = model.ribbon_emitters();
-    let collision = model.collision_triangles();
-    timings.extras = phase.elapsed();
-    timings.total = began.elapsed();
+    let elapsed = phase.elapsed();
+    timings.upload = elapsed;
+    timings.total += elapsed;
 
     Ok(LoadedModel {
         mesh,
@@ -880,7 +1022,7 @@ pub fn load_dressed_with(
         min,
         max,
         path,
-        vertex_count: vertices.len(),
+        vertex_count,
         triangle_count,
         missing_textures,
         timings,
@@ -1090,5 +1232,47 @@ mod tests {
             after.0 > before.0,
             "the second costume should have hit the cache and did not"
         );
+    }
+
+    /// The CPU/GPU split does not lose anything on the way through.
+    ///
+    /// `prepare_dressed_with` runs on the background loader's thread and must
+    /// hand back everything `finalize_dressed` needs without a second trip to
+    /// the archives: real geometry, a decoded skeleton, and one resolved
+    /// texture slot per model definition. Skipped without `WOW_DATA`.
+    #[test]
+    fn preparing_a_model_leaves_nothing_for_finalize_to_fetch() {
+        let Some(data) = std::env::var_os("WOW_DATA") else {
+            eprintln!("skipping: WOW_DATA not set");
+            return;
+        };
+        let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
+        let mut sources = Sources::default();
+
+        let (path, variations) =
+            creature(&mut sources, &mut chain, 1859).expect("Marshal McBride");
+        let prepared = prepare_dressed_with(&mut chain, &mut sources, &path, &variations, 0, None)
+            .expect("preparing HumanMale");
+
+        assert!(prepared.vertex_count > 0, "a humanoid has vertices");
+        assert_eq!(prepared.vertices.len(), prepared.vertex_count);
+        assert!(!prepared.draws.is_empty(), "and draw calls");
+        assert!(!prepared.bones.is_empty(), "and an animated skeleton");
+        assert_eq!(
+            prepared.triangle_count,
+            prepared.indices.len() / 3,
+            "the triangle count is the index count it came from",
+        );
+        assert_eq!(
+            prepared.textures.len(),
+            prepared.model.textures().len().max(1),
+            "one prepared slot per texture definition (or a lone placeholder)",
+        );
+        // Nothing in the texture list is still a bare path: a `File` slot
+        // carries a parsed BLP, ready to upload.
+        assert!(prepared.textures.iter().any(|t| matches!(
+            t,
+            PreparedTexture::File { .. } | PreparedTexture::Composed { .. }
+        )));
     }
 }

@@ -72,7 +72,7 @@ pub struct CachedModel {
     /// though only replicated entities currently animate. Doodads and
     /// buildings are always drawn in the bind pose regardless, so carrying
     /// this costs them nothing and keeps one loader path instead of two.
-    pub bones: std::rc::Rc<Vec<m2::AnimatedBone>>,
+    pub bones: std::sync::Arc<Vec<m2::AnimatedBone>>,
     pub sequences: Vec<m2::Sequence>,
     /// Where things this model carries hang from. Empty for everything that
     /// carries nothing, which is nearly everything.
@@ -89,7 +89,7 @@ pub struct CachedModel {
     /// carries the measurement that identified them. Empty for everything with
     /// no legs, which is most models, and empty *per sequence* for the cycles
     /// a creature does not walk in.
-    pub footfalls: std::rc::Rc<Vec<Vec<u32>>>,
+    pub footfalls: std::sync::Arc<Vec<Vec<u32>>>,
     /// The model's own extent, in its local space. Carried so a replicated
     /// entity can be clicked on: a click needs a volume to test a ray against,
     /// and the model already knows how big it is. `None` for a WMO, which is
@@ -867,6 +867,46 @@ pub struct AnimProbe {
     pub held: usize,
 }
 
+/// What [`World::set_entities`] spent *loading*, as against rebuilding.
+///
+/// **Split off because `entities_ms` was one number covering two jobs whose
+/// costs differ by twenty times and whose fixes have nothing in common**:
+/// rebuilding every entity group's instance buffer, which happens every frame
+/// by design and costs 2-3 ms, and loading a model the first time a look comes
+/// into view, which happens rarely and costs 20-50.
+///
+/// The second is the whole of the outdoor stutter, and the unsplit line hid it
+/// twice over. `entities 41.6 (ground 0.2)` reads as 41.4 ms of instance
+/// rebuild -- a per-frame job apparently gone pathological -- when the true
+/// reading is 2.5 ms of rebuild behind a 39 ms cold load of three creatures
+/// that had just walked into view. Every reader of that line is sent after the
+/// half that was innocent. Same shape as the `finish`-inside-`submit` mistake
+/// in 4.34: a bucket containing two things names neither.
+///
+/// It also explains why the spike looked crowd-independent under `--stress`,
+/// which duplicates creatures already loaded and therefore adds no looks at
+/// all. The subject here is the **arrival rate of unseen looks**, not the
+/// number of bodies on screen.
+///
+/// **With a [`ModelLoader`](crate::model_loader::ModelLoader) attached this
+/// measures only what is left on the render thread** -- the GPU upload of a
+/// model the worker already read and parsed, which is a millisecond or two.
+/// The read that used to dominate this figure now happens off-frame. A number
+/// still climbing here after the loader is attached is the finalize cost, or a
+/// zone where looks are arriving faster than one worker can feed them.
+#[derive(Clone, Copy, Default)]
+pub struct LoadProbe {
+    /// Wall time inside a cache *miss* this rebuild. Synchronously that is the
+    /// whole load -- archive reads, parsing, skin composition, upload; with the
+    /// background loader it is the upload alone.
+    pub load_ms: f32,
+    /// Misses that produced it. **Beside the time, always**: one 40 ms load and
+    /// twenty 2 ms ones want different fixes, and a total cannot tell them
+    /// apart. Zero with a non-zero time would mean the accounting has come
+    /// adrift, which is the failure this pair exists to make visible.
+    pub loaded: usize,
+}
+
 struct MapAnimation {
     model: Rc<CachedModel>,
     bones: BoneBuffer,
@@ -1306,6 +1346,21 @@ pub struct World {
     /// What the last [`World::update_animations`] cost, split. See
     /// [`AnimProbe`].
     anim_probe: Cell<AnimProbe>,
+    /// What the last [`World::set_entities`] spent on cache misses. See
+    /// [`LoadProbe`].
+    ///
+    /// A `Cell` rather than a return value because the misses happen several
+    /// call layers down, in two different methods, and threading an out
+    /// parameter through both would put the accounting where a later caller
+    /// can forget it -- the trap this project already documented as "a
+    /// parameter that can be passed wrong is worse than no parameter".
+    load_probe: Cell<LoadProbe>,
+    /// Reads and parses first-time entity models on a background thread, when
+    /// attached. `None` for a headless render, a `wow-cli` probe or a test --
+    /// anything that draws one frame and exits, where an asynchronous load
+    /// would simply never arrive. See [`crate::model_loader`] and
+    /// [`World::attach_loader`].
+    model_loader: Option<crate::model_loader::ModelLoader>,
     /// Animated bone buffers for replicated-entity groups, keyed by
     /// `Group::animation` and reused across rebuilds rather than reallocated:
     /// `update_bones` rewrites a buffer's contents in place, so the GPU
@@ -1490,6 +1545,8 @@ impl World {
             map_animations: HashMap::new(),
             map_frame_poses: RefCell::new(HashMap::new()),
             anim_probe: Cell::new(AnimProbe::default()),
+            load_probe: Cell::new(LoadProbe::default()),
+            model_loader: None,
             entity_bones: HashMap::new(),
             active_motion_buckets: RefCell::new(std::collections::HashSet::new()),
             blending: RefCell::new(HashMap::new()),
@@ -2447,12 +2504,12 @@ impl World {
             mesh: render::mesh::GpuMesh,
             draws: Vec<Draw>,
             textures: Vec<UploadedTexture>,
-            bones: std::rc::Rc<Vec<m2::AnimatedBone>>,
+            bones: std::sync::Arc<Vec<m2::AnimatedBone>>,
             sequences: Vec<m2::Sequence>,
             attachments: Vec<m2::Attachment>,
             particles: Vec<m2::ParticleEmitter>,
             ribbons: Vec<m2::RibbonEmitter>,
-            footfalls: std::rc::Rc<Vec<Vec<u32>>>,
+            footfalls: std::sync::Arc<Vec<Vec<u32>>>,
             bounds: Option<(Vec3, Vec3)>,
             collision: Vec<[[f32; 3]; 3]>,
             collision_footing: Vec<u8>,
@@ -2615,6 +2672,37 @@ impl World {
         self.anim_probe.get()
     }
 
+    /// What the last [`Self::set_entities`] spent on cache misses. See
+    /// [`LoadProbe`].
+    pub fn load_probe(&self) -> LoadProbe {
+        self.load_probe.get()
+    }
+
+    /// Hands entity model loading to a background thread.
+    ///
+    /// Called once, on the live streaming path only. After this, a first-time
+    /// creature load no longer runs inside `set_entities` -- the creature is
+    /// undrawable for the frame or two until the worker's result arrives, at
+    /// which point only the GPU upload runs on the render thread.
+    pub fn attach_loader(&mut self, loader: crate::model_loader::ModelLoader) {
+        self.model_loader = Some(loader);
+    }
+
+    /// Books one cache miss against this rebuild.
+    ///
+    /// Called on every path that can read the archives, including the ones
+    /// that *fail*: a load that ends in an error has already paid for the
+    /// reads, so an undrawable creature stalls the frame exactly like a drawn
+    /// one. Leaving those out would make the accounted time fall short of the
+    /// bucket precisely when something is wrong, which is the worst moment for
+    /// an instrument to go quiet.
+    fn note_load(&self, began: Instant) {
+        let mut probe = self.load_probe.get();
+        probe.load_ms += began.elapsed().as_secs_f32() * 1000.0;
+        probe.loaded += 1;
+        self.load_probe.set(probe);
+    }
+
     /// Instance buffers reused against created since the session began.
     /// See [`InstancePool`].
     pub fn instance_pool_counts(&self) -> (u64, u64) {
@@ -2701,6 +2789,44 @@ impl World {
         // in a dozen places and a field borrow alongside them is a fight with
         // no prize. Put back at the end.
         let mut pool = std::mem::take(&mut self.instance_pool);
+        // Zeroed per rebuild, not accumulated: the question the frame line
+        // asks is what *this* frame paid, and a running total answers a
+        // different one. See [`LoadProbe`].
+        self.load_probe.set(LoadProbe::default());
+        // Take in the models the background loader finished since last frame.
+        // The archive read and the parse happened on its thread; what is left
+        // here is the GPU upload, which `note_load` books like any other -- so
+        // with a loader attached the frame line's `load` figure is the small
+        // finalize cost, not the 40 ms read it replaced.
+        let done = self
+            .model_loader
+            .as_mut()
+            .map(|loader| loader.drain())
+            .unwrap_or_default();
+        for resp in done {
+            let entry = resp.prepared.and_then(|prepared| {
+                let began = Instant::now();
+                let loaded = crate::model::finalize_dressed(gpu, meshes, prepared)
+                    .map_err(|e| {
+                        tracing::debug!("finalising display {}: {e:#}", resp.key.0)
+                    })
+                    .ok()?;
+                tracing::info!(
+                    "display {} loaded off-thread ({})",
+                    resp.key.0,
+                    loaded.timings.summary(),
+                );
+                let model = cache_creature_model(gpu, meshes, resp.key.0, loaded);
+                self.note_load(began);
+                Some(model)
+            });
+            remember_display_bounds(
+                &mut self.entity_display_bounds,
+                resp.key.0,
+                entry.as_ref().and_then(|model| model.bounds),
+            );
+            self.entity_cache.insert(resp.key, entry);
+        }
         let mut grouped: HashMap<(u32, Motion, u64, bool), Vec<Mat4>> = HashMap::new();
         // Parallel to `grouped` and pushed in lockstep with it, so entry `i`
         // of a bucket's transforms and entry `i` of its guids are the same
@@ -2829,11 +2955,18 @@ impl World {
                 .unwrap_or_default();
             let look = looks.get(&look_key).cloned().flatten();
             let kind = kinds.get(&look_key).copied().unwrap_or(::world::ObjectType::Unit);
-            let Some(model) =
-                self.entity_model(gpu, meshes, chain, display_id, look_key, look.as_deref(), kind)
-            else {
-                undrawable += transforms.len();
-                continue;
+            let model = match self.entity_model(
+                gpu, meshes, chain, display_id, look_key, look.as_deref(), kind,
+            ) {
+                EntityModel::Ready(model) => model,
+                // Handed to the background loader and not back yet. Not counted
+                // as undrawable: it is transient, and `set_entities`'s return
+                // value drives a warning that fires on change.
+                EntityModel::Pending => continue,
+                EntityModel::Missing => {
+                    undrawable += transforms.len();
+                    continue;
+                }
             };
             // Both the materials' own states and, for a stealthed bucket, the
             // blended overrides the draw loop will actually ask for. A
@@ -3601,13 +3734,23 @@ impl World {
         if let Some(cached) = self.held_cache.get(&key) {
             return cached.clone();
         }
+        let began = Instant::now();
         let variations = crate::model::Variations(vec![item.texture.clone()]);
         let entry = self.build(gpu, meshes, chain, &item.model, &variations);
+        self.note_load(began);
         self.held_cache.insert(key, entry.clone());
         entry
     }
 
     /// Loads a creature model by display id, with the skins that id selects.
+    ///
+    /// With a [`ModelLoader`](crate::model_loader::ModelLoader) attached, a
+    /// first-time creature miss is handed to the background thread and comes
+    /// back as [`EntityModel::Pending`]; the read, the parse and the skeleton
+    /// decode -- the whole of the outdoor stutter -- happen off the render
+    /// thread, and `set_entities` finishes the model when the result lands.
+    /// Without one, the load is synchronous, exactly as before: that is the
+    /// path a headless render, a `wow-cli` probe and every test take.
     fn entity_model(
         &mut self,
         gpu: &Gpu,
@@ -3617,9 +3760,12 @@ impl World {
         look_key: u64,
         look: Option<&crate::character::Look>,
         kind: ::world::ObjectType,
-    ) -> Option<Rc<CachedModel>> {
+    ) -> EntityModel {
         if let Some(cached) = self.entity_cache.get(&(display_id, look_key)) {
-            return cached.clone();
+            return match cached {
+                Some(model) => EntityModel::Ready(model.clone()),
+                None => EntityModel::Missing,
+            };
         }
 
         // A game object resolves to a *path*, which the tile loader's cache
@@ -3627,11 +3773,39 @@ impl World {
         // which matters because a mailbox is a model and a ship is a building.
         // So game objects reuse it wholesale rather than growing a second
         // model cache that would load the abbey's benches once per bench.
+        // Booked as a load like any other. It usually is not one -- the tile
+        // loader's cache has most of these already -- but a mailbox nobody has
+        // walked past yet reads the archives here exactly as a creature does,
+        // and the accounting has to cover the path rather than the common case.
+        //
+        // Left synchronous: game objects are rarer than creatures, mostly
+        // already warm in the tile cache, and a mailbox appearing a frame late
+        // reads worse than a wolf doing so.
         if kind == ::world::ObjectType::GameObject {
-            let path = self.game_object_path(chain, display_id)?;
-            return self.model(gpu, meshes, chain, &path);
+            let began = Instant::now();
+            let path = self.game_object_path(chain, display_id);
+            let model = path.and_then(|path| self.model(gpu, meshes, chain, &path));
+            self.note_load(began);
+            return match model {
+                Some(model) => EntityModel::Ready(model),
+                None => EntityModel::Missing,
+            };
         }
 
+        // Creature, NPC or player body. Off the render thread when a loader is
+        // attached: `set_entities` will draw nothing for this bucket until the
+        // worker answers, and finish the model then.
+        //
+        // The NPC body-texture lookup (`CreatureDisplayInfoExtra`) goes to the
+        // worker too -- it reads several megabytes, and doing it here would
+        // leave a read on the frame that the rest of this was moved to remove.
+        if let Some(loader) = self.model_loader.as_mut() {
+            loader.request((display_id, look_key), display_id, look.cloned(), 0);
+            return EntityModel::Pending;
+        }
+
+        // No loader: the synchronous path.
+        //
         // A humanoid NPC's body texture lives in `CreatureDisplayInfoExtra` and
         // nowhere else -- see `character::NpcAppearances::look`. Only consulted
         // when the caller supplied no look of its own, which is every case but
@@ -3642,10 +3816,6 @@ impl World {
         // function of the display id, so `(display_id, 0)` already
         // distinguishes it from every other. A key that included it would
         // reload one model per creature *instance*.
-        //
-        // Everything from here down is a *miss*, and a miss is synchronous on
-        // the render thread the first time each new display comes into view.
-        // That is the whole of the stutter this instrument exists to price.
         let began = Instant::now();
         let npc_look = look.is_none().then(|| self.npc_look(chain, display_id)).flatten();
         let looked_up = began.elapsed();
@@ -3655,9 +3825,9 @@ impl World {
         // mutably, and the model path is owned by the time the second runs.
         let resolved = crate::model::creature(&mut self.sources, chain, display_id);
         let loaded = resolved.and_then(|(path, variations)| {
-                crate::model::load_dressed_with(
-                    gpu,
-                    meshes,
+            crate::model::load_dressed_with(
+                gpu,
+                meshes,
                 chain,
                 &mut self.sources,
                 &path,
@@ -3673,82 +3843,28 @@ impl World {
 
         let entry = loaded
             .map(|loaded| {
-                // A texture that failed to load is a *white* creature, not a
-                // missing one, and white is the one failure that looks
-                // deliberate. `load_dressed` has always collected these and
-                // every caller has always dropped them, so the whole
-                // white-humanoid problem was invisible in the logs -- the same
-                // shape as the packet body this project once refused and threw
-                // away. Named, at warning level, with the display id that
-                // produced it: that is enough to reproduce it offline with
-                // `wow-viewer --creature <id> --screenshot`.
-                if !loaded.missing_textures.is_empty() {
-                    tracing::warn!(
-                        "display {display_id} drew with {} placeholder texture(s): {}",
-                        loaded.missing_textures.len(),
-                        loaded.missing_textures.join(", ")
-                    );
-                }
                 // One line per first-time load, naming the display id and
                 // where the milliseconds went.
                 //
                 // **This is a measurement, not a symptom.** The placeholder
-                // warning above coincides with every stutter, which is exactly
-                // why it was mistaken for a cause twice: it is a marker that a
-                // load just *finished*. A cost that nobody has timed is how
-                // this project once spent an afternoon blaming a `Spell.dbc`
-                // read that takes 185ms for a thirty-seven-second login. Kept
-                // at info, and kept per-load rather than aggregated, because
-                // the question a frozen frame asks is "which creature", and an
-                // average cannot answer it.
-                // Both cache numbers on every line, deliberately. A hit count
+                // warning `cache_creature_model` prints coincides with every
+                // stutter, which is exactly why it was mistaken for a cause
+                // twice: it is a marker that a load just *finished*. A cost
+                // that nobody has timed is how this project once spent an
+                // afternoon blaming a `Spell.dbc` read that takes 185ms for a
+                // thirty-seven-second login. Kept at info, and kept per-load
+                // rather than aggregated, because the question a frozen frame
+                // asks is "which creature", and an average cannot answer it.
+                // Both cache numbers on every line, deliberately: a hit count
                 // alone cannot separate "the shared cache is working" from
-                // "nothing has been loaded twice yet", and the second is what
-                // a regression here would look like.
+                // "nothing has been loaded twice yet".
                 tracing::info!(
                     "display {display_id} loaded in {:?} \
                      (look {looked_up:?}, {}) [source cache {hits} hit / {misses} miss]",
                     began.elapsed(),
                     loaded.timings.summary(),
                 );
-                let binds = loaded
-                    .textures
-                    .iter()
-                    .map(|t| meshes.material_bind_group(gpu, &t.view))
-                    .collect();
-                Rc::new(CachedModel {
-                    mesh: loaded.mesh,
-                    draws: loaded.draws,
-                    binds,
-                    texture_animation: loaded.texture_animation,
-                    doodads: Vec::new(),
-                    // A creature is an M2: one piece, no rooms, no doorways.
-                    doorways: Vec::new(),
-                    unwalkable_rooms: Vec::new(),
-                    bones: loaded.bones,
-                    sequences: loaded.sequences,
-                    attachments: loaded.attachments,
-                    particles: loaded.particles,
-                    ribbons: loaded.ribbons,
-                    footfalls: loaded.footfalls,
-                    // This is the cache click-to-target reads from, so this is
-                    // the one that has to carry the model's extent.
-                    bounds: Some((loaded.min, loaded.max)),
-                    textures: loaded.textures,
-                    // A replicated entity's own body is not scenery: creatures
-                    // and players are moved by the server, and colliding with
-                    // them is a different feature from colliding with the
-                    // world. Left empty rather than filled in unused.
-                    collision: Vec::new(),
-                    collision_footing: Vec::new(),
-                    collision_area: Vec::new(),
-                    wmo_id: None,
-                    group_bounds: Vec::new(),
-                    group_surface_ids: Vec::new(),
-                    group_interior: Vec::new(),
-                    render_bounds: Some((loaded.min, loaded.max)),
-                    liquids: Vec::new(),
-                })
+                cache_creature_model(gpu, meshes, display_id, loaded)
             })
             // Timed on this side too: a load that *fails* still reads the
             // archives, so an undrawable creature costs a frame exactly like a
@@ -3756,6 +3872,9 @@ impl World {
             // against it.
             .map_err(|e| tracing::debug!("display id {display_id}: {e} (after {:?})", began.elapsed()))
             .ok();
+        // Booked whether or not a model came back, for the reason `note_load`
+        // gives: the reads happened either way.
+        self.note_load(began);
 
         remember_display_bounds(
             &mut self.entity_display_bounds,
@@ -3764,7 +3883,10 @@ impl World {
         );
 
         self.entity_cache.insert((display_id, look_key), entry.clone());
-        entry
+        match entry {
+            Some(model) => EntityModel::Ready(model),
+            None => EntityModel::Missing,
+        }
     }
 
     /// Which model a game object wears, loading the table on first use.
@@ -3817,6 +3939,85 @@ impl World {
         }
         self.npc_looks.as_ref()?.look(display_id)
     }
+}
+
+/// The three answers [`World::entity_model`] can give.
+///
+/// Kept apart so `set_entities` can tell a creature still loading from one that
+/// will never load: `Pending` must not count towards the undrawable total,
+/// which drives a warning that fires on change.
+enum EntityModel {
+    Ready(Rc<CachedModel>),
+    /// Handed to the background loader; nothing to draw for this bucket yet.
+    Pending,
+    /// Tried and failed, or -- on the synchronous path -- resolved to nothing.
+    Missing,
+}
+
+/// Turns a [`LoadedModel`](crate::model::LoadedModel) into the `CachedModel`
+/// the entity cache holds: build the material bind groups, and warn about any
+/// texture slot that fell back to the grey placeholder.
+///
+/// Shared by the synchronous load path in [`World::entity_model`] and the
+/// background loader's finish step in [`World::set_entities`], so the two
+/// cannot drift.
+fn cache_creature_model(
+    gpu: &Gpu,
+    meshes: &MeshRenderer,
+    display_id: u32,
+    loaded: crate::model::LoadedModel,
+) -> Rc<CachedModel> {
+    // A texture that failed to load is a *white* creature, not a missing one,
+    // and white is the one failure that looks deliberate. `load_dressed` has
+    // always collected these and every caller used to drop them, so the whole
+    // white-humanoid problem was invisible in the logs. Named, at warning
+    // level, with the display id: enough to reproduce it offline with
+    // `wow-viewer --creature <id> --screenshot`.
+    if !loaded.missing_textures.is_empty() {
+        tracing::warn!(
+            "display {display_id} drew with {} placeholder texture(s): {}",
+            loaded.missing_textures.len(),
+            loaded.missing_textures.join(", ")
+        );
+    }
+    let binds = loaded
+        .textures
+        .iter()
+        .map(|t| meshes.material_bind_group(gpu, &t.view))
+        .collect();
+    Rc::new(CachedModel {
+        mesh: loaded.mesh,
+        draws: loaded.draws,
+        binds,
+        texture_animation: loaded.texture_animation,
+        doodads: Vec::new(),
+        // A creature is an M2: one piece, no rooms, no doorways.
+        doorways: Vec::new(),
+        unwalkable_rooms: Vec::new(),
+        bones: loaded.bones,
+        sequences: loaded.sequences,
+        attachments: loaded.attachments,
+        particles: loaded.particles,
+        ribbons: loaded.ribbons,
+        footfalls: loaded.footfalls,
+        // This is the cache click-to-target reads from, so this is the one
+        // that has to carry the model's extent.
+        bounds: Some((loaded.min, loaded.max)),
+        textures: loaded.textures,
+        // A replicated entity's own body is not scenery: creatures and players
+        // are moved by the server, and colliding with them is a different
+        // feature from colliding with the world. Left empty rather than filled
+        // in unused.
+        collision: Vec::new(),
+        collision_footing: Vec::new(),
+        collision_area: Vec::new(),
+        wmo_id: None,
+        group_bounds: Vec::new(),
+        group_surface_ids: Vec::new(),
+        group_interior: Vec::new(),
+        render_bounds: Some((loaded.min, loaded.max)),
+        liquids: Vec::new(),
+    })
 }
 
 /// Keeps game objects out of creatures' half of the display-id space.

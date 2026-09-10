@@ -31,7 +31,7 @@ pub struct Placed {
 
 pub struct PlacedAnimation {
     pub buffer: BoneBuffer,
-    bones: std::rc::Rc<Vec<m2::AnimatedBone>>,
+    bones: std::sync::Arc<Vec<m2::AnimatedBone>>,
     global_sequences: Vec<u32>,
     sequence: usize,
     duration_ms: u32,
@@ -47,7 +47,7 @@ impl PlacedAnimation {
         }
         Some(Self {
             buffer: meshes.create_bones(gpu, model.bones.len()),
-            bones: std::rc::Rc::clone(&model.bones),
+            bones: std::sync::Arc::clone(&model.bones),
             global_sequences: model.texture_animation.global_sequences().to_vec(),
             sequence,
             duration_ms: definition.duration_ms,

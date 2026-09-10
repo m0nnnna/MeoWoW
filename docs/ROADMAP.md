@@ -8678,3 +8678,74 @@ the unlearnable ones greyed out on purpose.
 * **`fps avg` reported 128 straight through the freeze.** An average cannot
   see a stall, and the worst-frame line is the only reason this was found at
   all.
+
+## Entity model loading, off the render thread
+
+The portal rung's own confirmation pass ended with a finding it did not act on:
+**the city is no longer where the frame collapses -- outdoor Elwynn is**, at a
+p90 worst-frame of 50.1 ms against Ironforge's 23.2, and 4.34's open "43-48 ms
+spike, 2-3 per run, flat across crowd sizes" was still unexplained. The
+suspects it named were tile streaming or a first-time model load.
+
+### The instrument first
+
+`entities_ms` was one number over two jobs whose costs differ by twenty times:
+the per-frame instance-buffer rebuild (2-3 ms, steady) and the first-time load
+of a creature's model, which reads its `.m2`, forty-odd `.anim` files and its
+textures out of the archives *inside `set_entities`, on the render thread*.
+`LoadProbe` splits them -- wall time and a count, the pair every counter in
+this project reports -- and the split settled it in the logs the double-click
+launch already writes: `entities 41.6 (ground 0.2)` is **2.5 ms of rebuild
+behind a 39 ms cold load of three creatures that had just walked into view**.
+Every reader of the unsplit line was sent after the half that was innocent --
+the same shape as 4.34's `finish`-inside-`submit`.
+
+It also explains the crowd independence. `--stress` duplicates creatures
+*already loaded*, so it adds bodies and no new looks; the subject here is the
+**arrival rate of unseen looks**, which a synthetic crowd does not touch.
+
+### What moved
+
+`model::load_dressed_with` split along the seam its own comments already
+marked: **`prepare_dressed_with`** does every archive read, every parse, the
+BLP decode and the skeleton resolve and returns a `PreparedModel` -- all `Send`,
+no GPU; **`finalize_dressed`** does the mesh upload, the texture uploads and
+the texture-animation buffer. The synchronous callers still get one function,
+`load_dressed_with` being the two composed.
+
+`model_loader::ModelLoader` runs `prepare_dressed_with` on a background thread
+with **its own `Chain`** -- `Chain::read` takes `&mut self`, so a shared one is
+a lock on every archive read on both sides, tile streaming included; reopening
+pays for the archive headers once, off the frame. `set_entities` drains
+finished models at the top of each frame and does only the upload. A creature
+appears a frame or two late outdoors instead of freezing the frame for
+everyone -- the failure mode chosen deliberately over a placeholder capsule.
+
+Scope is the creature/NPC/player-body path only. Held weapons and game objects
+stay synchronous: smaller, rarer, and mostly already warm in the tile cache.
+The NPC body-texture lookup (`CreatureDisplayInfoExtra`, several megabytes)
+moved to the worker too, for the same reason as the rest.
+
+### What it does not do
+
+* **One worker.** Outdoors, new looks arrive seconds apart; a pool is a loop
+  away if a zone is found that needs it.
+* **The live path only.** A headless render, a `wow-cli` probe and every test
+  keep the synchronous load -- an asynchronous one would never arrive in a
+  single frame, and the reproducible probes must stay reproducible.
+* **`Rc` became `Arc`** for the skeleton (`bones`, `footfalls`) on
+  `LoadedModel` and `CachedModel` -- the tracks are read-only after decode, so
+  the cross-thread share costs a refcount and never a copy.
+
+### Confirmed at the window
+
+Goldshire out into Elwynn, where creatures stream in and out of view: *"never
+saw it dip below 100fps"*, no hitch on a new NPC appearing. The pop-in the
+design trades for is not visible enough to report. The one thing this rung
+could have broken -- a creature drawn a frame late, or one that never arrives
+-- did neither.
+
+(The same session turned up a **separate, older** class of bug: the player
+falling through the world above a mine and in riverbeds. Nothing to do with
+this rung -- replicated entity models carry no collision -- it is floor
+coverage in the open world, a sibling of the Stormwind fountain case.)

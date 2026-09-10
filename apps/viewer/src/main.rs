@@ -19,6 +19,7 @@ mod live;
 mod maps;
 mod minimap;
 mod model;
+mod model_loader;
 mod scene;
 mod sky;
 mod signin;
@@ -830,6 +831,35 @@ fn build_live_scene(
 /// same world** -- a second copy of this would be the place a feature added
 /// for one path quietly failed to reach the other, which is how
 /// `--screenshot` ended up not posing a single creature.
+/// Gives a freshly built streaming world its background model loader.
+///
+/// A first-time creature load otherwise runs inside `set_entities` on the
+/// render thread -- 20-50 ms when a look walks into view outdoors. The worker
+/// takes the archive read, the parse and the skeleton decode; the render
+/// thread keeps only the GPU upload. A failure here is not fatal: the world
+/// falls back to loading synchronously, which is the old behaviour.
+///
+/// Live path only. A headless render, a `wow-cli` probe and every test draw
+/// one frame, where an asynchronous load would never arrive.
+fn attach_model_loader(source: Option<&(std::path::PathBuf, String)>, scene: &mut Scene) {
+    let Scene::Streaming(world) = scene else {
+        return;
+    };
+    let Some((data, locale)) = source else {
+        tracing::warn!(
+            "no data directory recorded; entity models will load on the render thread"
+        );
+        return;
+    };
+    match model_loader::ModelLoader::spawn(data.clone(), locale.clone()) {
+        Ok(loader) => world.attach_loader(loader),
+        Err(e) => tracing::warn!(
+            "background model loader unavailable ({e:#}); \
+             entity models will load on the render thread"
+        ),
+    }
+}
+
 fn world_for_live(
     gpu: &Gpu,
     meshes: &mut MeshRenderer,
@@ -2367,7 +2397,19 @@ struct FrameProfile {
     stream_ms: f32,
     /// Rebuilding every replicated entity's instance buffer, which happens
     /// every frame by design -- see the note at the call site.
+    ///
+    /// **Contains [`Self::load`], which is not per-frame work at all.** Read
+    /// the two together or not at all: the rebuild is 2-3 ms and steady, and
+    /// any figure above that is a first-time model being finished this frame.
+    /// With the background loader attached (the live path) that finish is a
+    /// GPU upload of a few milliseconds; without it -- a headless render, a
+    /// probe -- it is the whole synchronous load, 20-50 ms, read off the disk
+    /// inside the frame.
     entities_ms: f32,
+    /// ...of which this was spent finishing first-time models: the whole load
+    /// synchronously, or just the GPU upload behind the background loader. See
+    /// `world::LoadProbe`.
+    load: world::LoadProbe,
     /// Posing skeletons.
     animations_ms: f32,
     /// ...split, because the total did not move with the skeleton count it
@@ -2542,7 +2584,7 @@ impl FrameProfile {
              move {:.1} | camera {:.1} | \
              net {:.1} | \
              sound {:.1} (area {:.1}, steps {:.1}, play {:.1}) | stream {:.1} | \
-             entities {:.1} (ground {:.1}) | \
+             entities {:.1} (ground {:.1}, {} load(s) {:.1}) | \
              anim {:.1} (scan {:.1} of {} groups, map {:.1} for {}, \
              pose {:.1} for {} buckets ({} bones, {} blending), \
              snapshot {:.1}, held {:.1} for {}) | \
@@ -2606,6 +2648,8 @@ impl FrameProfile {
             self.stream_ms,
             self.entities_ms,
             self.entities_ground_ms,
+            self.load.loaded,
+            self.load.load_ms,
             self.animations_ms,
             self.anim.scan_ms,
             self.anim.scanned,
@@ -5053,6 +5097,11 @@ impl ChatChannel {
 struct App {
     args: Args,
     chain: Chain,
+    /// The `Data` directory and locale the live `chain` was opened from, so
+    /// the background model loader ([`model_loader`]) can open its own handles
+    /// on the same archives. `None` until a directory is chosen -- on the CLI
+    /// path from `--data`, otherwise from the sign-in screen's folder picker.
+    archive_source: Option<(std::path::PathBuf, String)>,
     /// The sign-in screen, present until a character has been entered as.
     ///
     /// **Its presence is the mode**, so nothing can be both signing in and in
@@ -7650,6 +7699,10 @@ impl App {
             camera_distance: hud.profile.camera.start_distance(),
             minimap_range: hud.profile.style.minimap_range,
             hud,
+            archive_source: args
+                .data
+                .clone()
+                .map(|data| (data, args.locale.clone())),
             args,
             chain,
             window: None,
@@ -7823,6 +7876,9 @@ impl App {
         match opened {
             Ok(chain) => {
                 self.chain = chain;
+                self.archive_source = data
+                    .clone()
+                    .map(|data| (data, locale.clone()));
                 self.reload_tables();
                 if let Some(signin) = self.signin.as_mut() {
                     signin.screen.note(format!(
@@ -7833,6 +7889,7 @@ impl App {
             }
             Err(message) => {
                 self.chain = Chain::new();
+                self.archive_source = None;
                 self.reload_tables();
                 if let Some(signin) = self.signin.as_mut() {
                     signin.screen.failed(message);
@@ -7905,17 +7962,18 @@ impl App {
             tracing::error!("entered the world with no renderer; nothing will be drawn");
             return;
         };
-        let scene = match world_for_live(&r.gpu, &mut r.meshes, &mut self.chain, &self.args, &live)
-        {
-            Ok(scene) => scene,
-            Err(e) => {
-                tracing::error!("building the world failed: {e:#}");
-                if let Some(signin) = self.signin.as_mut() {
-                    signin.screen.failed(format!("{e:#}"));
+        let mut scene =
+            match world_for_live(&r.gpu, &mut r.meshes, &mut self.chain, &self.args, &live) {
+                Ok(scene) => scene,
+                Err(e) => {
+                    tracing::error!("building the world failed: {e:#}");
+                    if let Some(signin) = self.signin.as_mut() {
+                        signin.screen.failed(format!("{e:#}"));
+                    }
+                    return;
                 }
-                return;
-            }
-        };
+            };
+        attach_model_loader(self.archive_source.as_ref(), &mut scene);
         r.meshes.prepare(&r.gpu, scene_states(&scene));
         // Sized for the largest skeleton rather than for this character's,
         // exactly as `resumed` does -- see BIND_POSE_BONES. Written to the
@@ -7956,14 +8014,16 @@ impl App {
             tracing::error!("reloaded the world with no renderer; nothing will be drawn");
             return;
         };
-        let scene = match world_for_live(&r.gpu, &mut r.meshes, &mut self.chain, &self.args, live) {
-            Ok(scene) => scene,
-            Err(e) => {
-                tracing::error!("building the transferred world failed: {e:#}");
-                r.scene = None;
-                return;
-            }
-        };
+        let mut scene =
+            match world_for_live(&r.gpu, &mut r.meshes, &mut self.chain, &self.args, live) {
+                Ok(scene) => scene,
+                Err(e) => {
+                    tracing::error!("building the transferred world failed: {e:#}");
+                    r.scene = None;
+                    return;
+                }
+            };
+        attach_model_loader(self.archive_source.as_ref(), &mut scene);
         r.meshes.prepare(&r.gpu, scene_states(&scene));
         let bones = r.meshes.create_bones(&r.gpu, BIND_POSE_BONES);
         r.meshes
@@ -8255,7 +8315,13 @@ impl ApplicationHandler for App {
                 &mut self.chain,
                 &self.args,
             ) {
-                Ok((scene, live)) => {
+                Ok((mut scene, live)) => {
+                    // The self-contained `--realm-host` path enters here rather
+                    // than through `enter_world`; a live world wants its
+                    // background loader either way.
+                    if live.is_some() {
+                        attach_model_loader(self.archive_source.as_ref(), &mut scene);
+                    }
                     self.offline_map =
                         offline_map_id(&mut self.chain, self.args.map.as_deref());
                     if live.is_some() || (self.offline_map.is_some() && self.args.hour.is_some())
@@ -9414,6 +9480,11 @@ impl App {
                         phase.elapsed().as_secs_f32() * 1000.0;
                     let undrawable =
                         world.set_entities(&r.gpu, &mut r.meshes, &mut self.chain, &placements);
+                    // Read immediately after the rebuild that filled it: the
+                    // probe is zeroed per call, so anything between the two
+                    // that touched the world would report somebody else's
+                    // loads against this frame.
+                    profile.load = world.load_probe();
                     // Warn on change, not on every rebuild: this now runs
                     // every frame, and a zone with one unloadable model would
                     // otherwise log about it forever.
