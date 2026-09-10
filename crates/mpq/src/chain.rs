@@ -13,12 +13,22 @@ use crate::{Archive, Entry, Error};
 pub struct Chain {
     /// Ordered lowest priority first, matching the client's load order.
     archives: Vec<Archive>,
+    /// How many times [`Self::read`] has gone to an archive, ever.
+    ///
+    /// **A count, not a timer.** A caller that has quietly started re-reading
+    /// a table it used to read once draws an identical picture and, on a fast
+    /// enough machine, takes an acceptable frame -- only a ratio says
+    /// otherwise. Reading `Spell.dbc` once per trainer row instead of once per
+    /// trainer cost 17.3 seconds in a single frame and nothing anywhere
+    /// errored; the regression test for it asserts this number.
+    reads: u64,
 }
 
 impl Chain {
     pub fn new() -> Self {
         Self {
             archives: Vec::new(),
+            reads: 0,
         }
     }
 
@@ -106,9 +116,19 @@ impl Chain {
 
     /// Reads a file, resolving it against the load order.
     pub fn read(&mut self, name: &str) -> Result<Vec<u8>, Error> {
+        self.reads += 1;
         self.owner(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?
             .read(name)
+    }
+
+    /// How many reads this chain has served. See [`Self::reads`].
+    ///
+    /// Counted whether the read succeeded or not: a caller looping over a path
+    /// that resolves to nothing is doing the same amount of work as one
+    /// looping over a path that resolves, and both are the mistake.
+    pub fn reads(&self) -> u64 {
+        self.reads
     }
 
     /// Reports which archive would win for `name`.

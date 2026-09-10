@@ -16842,6 +16842,28 @@ impl App {
             None => None,
         };
 
+        // **Trainer spells were never in `Spellbook::load`'s `wanted` set** --
+        // that set is built from what the character already knows, and the
+        // whole point of a trainer is offering spells it does not. Without
+        // this, `name` below falls through to its "no game data" answer for
+        // every single row, which is not an absence: it looked exactly like
+        // the trainer had sent numbers instead of names.
+        //
+        // **The whole list in one call, and that is the entire point.** This
+        // was a `resolve_extra` per row inside the loop below, which read and
+        // parsed `Spell.dbc` once per offered spell: Bengus Deepforge offers
+        // 86, and greeting him froze the client for **17.3 seconds** in a
+        // single frame -- the whole of it inside this `panels` timer, which is
+        // how it was found. See `Spellbook::resolve_extra_all`.
+        let trainer_spell_ids: Vec<u32> = self
+            .trainer
+            .as_ref()
+            .and_then(|session| session.list.as_ref())
+            .map(|list| list.spells.iter().map(|spell| spell.spell).collect())
+            .unwrap_or_default();
+        if !trainer_spell_ids.is_empty() {
+            self.spells.resolve_extra_all(&mut self.chain, &trainer_spell_ids);
+        }
         let trainer: Option<ui::TrainerView> = self.trainer.as_ref().map(|session| {
             let rows = session
                 .list
@@ -16850,17 +16872,6 @@ impl App {
                     list.spells
                         .iter()
                         .map(|spell| {
-                            // **Trainer spells were never in `Spellbook::load`'s
-                            // `wanted` set** -- that set is built from what the
-                            // character already knows, and the whole point of a
-                            // trainer is offering spells it does not. Without
-                            // this, `name` below falls through to its "no game
-                            // data" answer for every single row, which is not
-                            // an absence: it looked exactly like the trainer had
-                            // sent numbers instead of names. Same call
-                            // `item_tooltip` makes for an on-use item's effect
-                            // spell, and free after the first ask per id.
-                            self.spells.resolve_extra(&mut self.chain, spell.spell);
                             let icon = self.spells.icon(
                                 &r.gpu,
                                 &mut r.egui_renderer,

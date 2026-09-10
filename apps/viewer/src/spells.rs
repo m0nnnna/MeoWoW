@@ -458,51 +458,61 @@ impl Spellbook {
 
     /// Reads name, rank, description, icon and effect values for one spell
     /// [`Self::load`] was never asked for -- an item's on-use effect, most
-    /// often, since which items exist is not known until well after login;
-    /// or a trainer's whole offered list, which by definition is spells the
-    /// character does not have yet and so was never in `wanted` either.
+    /// often, since which items exist is not known until well after login.
     ///
-    /// A full `Spell.dbc` scan per call rather than another batch load: an
-    /// item's on-use spell is discovered one at a time, as a bag or worn
-    /// slot is first hovered, and there are only ever a handful of them in
-    /// one session (food, drink, potions, bandages). Re-running `load`'s
-    /// batch for every single one would rescan the whole fifty-thousand-row
-    /// table on every new item instead of once at login. [`Self::resolved_extra`]
-    /// makes repeat calls for the same id -- which a held-open tooltip makes
-    /// every frame -- free after the first.
+    /// One id at a time, which is genuinely how an item's on-use spell is
+    /// discovered: as a bag or worn slot is first hovered. Anything that
+    /// learns about *several* ids at once must call [`Self::resolve_extra_all`]
+    /// instead -- see that function for what a caller looping over this one
+    /// cost.
     pub fn resolve_extra(&mut self, chain: &mut Chain, spell: u32) {
-        if spell == 0 || self.known.contains_key(&spell) || self.resolved_extra.contains(&spell) {
+        self.resolve_extra_all(chain, std::slice::from_ref(&spell));
+    }
+
+    /// The same, for a whole list of ids in **one** pass over the tables.
+    ///
+    /// **This exists because a trainer froze the client for 17.3 seconds.**
+    /// `resolve_extra` used to read and parse four DBCs per call, and the
+    /// trainer window resolved one row at a time: Bengus Deepforge offers 86
+    /// spells, so opening him read `Spell.dbc` -- 49,871 records of 936 bytes
+    /// plus 12.8 MB of strings -- eighty-six times. The arithmetic settles
+    /// that this was the whole cost rather than merely part of it: the same
+    /// four tables are read once at login and that is logged at 231 ms, and
+    /// 86 x 231 ms is 19.9 s against a measured 17.3.
+    ///
+    /// The old doc comment justified the per-call read with "there are only
+    /// ever a handful of them in one session", which is true of an on-use
+    /// item and false of a trainer -- and the same comment named the trainer
+    /// case two lines above. **A premise written for one caller does not
+    /// survive the caller that makes its rare case the common one.**
+    ///
+    /// Batching rather than caching the parsed tables on `self` is deliberate:
+    /// `Spell.dbc` is ~60 MB parsed, and holding it resident for the life of
+    /// the session to save a hover would trade a hitch nobody sees for memory
+    /// everybody pays. [`Self::resolved_extra`] still makes repeat calls for
+    /// the same id -- which a held-open tooltip makes every frame -- free.
+    pub fn resolve_extra_all(&mut self, chain: &mut Chain, spells: &[u32]) {
+        use dbc::schema::{Spell, SpellDuration, SpellIcon, SpellRadius};
+
+        // **Marked as asked before anything is read**, exactly as the one-id
+        // version did: an id `Spell.dbc` genuinely has no row for must not be
+        // retried on the next frame, and the loop below cannot tell "no row"
+        // from "not looked at yet" once the table is dropped.
+        let mut wanted: HashSet<u32> = HashSet::new();
+        for &spell in spells {
+            if spell == 0 || self.known.contains_key(&spell) || !self.resolved_extra.insert(spell) {
+                continue;
+            }
+            wanted.insert(spell);
+        }
+        if wanted.is_empty() {
             return;
         }
-        self.resolved_extra.insert(spell);
 
-        use dbc::schema::{Spell, SpellDuration, SpellIcon, SpellRadius};
         let Some(table) = chain.read(Spell::PATH).ok().and_then(|bytes| Spell::parse(&bytes).ok())
         else {
             return;
         };
-        let Some(row) = table.iter().find(|row| row.id() == spell) else {
-            return;
-        };
-
-        // Same lookup `load` does for every spell in `wanted`, just for one
-        // id: without it a trainer's or an on-use item's icon square would
-        // stay blank forever, the same silent gap `name` had before this
-        // function existed at all.
-        let icon_path = chain
-            .read(SpellIcon::PATH)
-            .ok()
-            .and_then(|bytes| SpellIcon::parse(&bytes).ok())
-            .and_then(|icons| {
-                let wanted_icon = row.spell_icon_id();
-                // The table stores the path without an extension, same as
-                // `load`. Mapped to an owned string inside this closure,
-                // before `icons` itself goes out of scope.
-                icons
-                    .iter()
-                    .find(|icon| icon.id() == wanted_icon)
-                    .map(|icon| format!("{}.blp", icon.texture()))
-            });
 
         // Same two small index tables `load` reads, for the same tokens --
         // `$d` and `$a1` need them to resolve at all.
@@ -524,17 +534,54 @@ impl Spellbook {
             .map(|table| table.iter().map(|row| (row.id(), row.radius())).collect())
             .unwrap_or_default();
 
-        self.values.insert(spell, values_of(&row, &durations, &radii));
-        self.known.insert(
-            spell,
-            SpellInfo {
-                name: row.name().to_string(),
-                rank: row.rank().to_string(),
-                description: row.description().to_string(),
-                icon_path,
-                passive: row.attributes() & ATTR_PASSIVE != 0,
-            },
-        );
+        // One walk over the table for the whole list, the shape `load` uses,
+        // rather than a `find` per id.
+        let mut icon_ids: HashMap<u32, u32> = HashMap::new();
+        for row in table.iter() {
+            let id = row.id();
+            if !wanted.contains(&id) {
+                continue;
+            }
+            icon_ids.insert(id, row.spell_icon_id());
+            self.values.insert(id, values_of(&row, &durations, &radii));
+            self.known.insert(
+                id,
+                SpellInfo {
+                    name: row.name().to_string(),
+                    rank: row.rank().to_string(),
+                    description: row.description().to_string(),
+                    icon_path: None,
+                    passive: row.attributes() & ATTR_PASSIVE != 0,
+                },
+            );
+        }
+
+        // Same lookup `load` does for every spell in its own `wanted`, and
+        // read only if something matched: without it a trainer's or an on-use
+        // item's icon square would stay blank forever, the same silent gap
+        // `name` had before this function existed at all.
+        if icon_ids.is_empty() {
+            return;
+        }
+        let Some(icons) = chain
+            .read(SpellIcon::PATH)
+            .ok()
+            .and_then(|bytes| SpellIcon::parse(&bytes).ok())
+        else {
+            return;
+        };
+        let mut paths: HashMap<u32, String> = HashMap::new();
+        for row in icons.iter() {
+            paths.insert(row.id(), row.texture().to_string());
+        }
+        for (spell, icon) in icon_ids {
+            if let Some(path) = paths.get(&icon) {
+                if let Some(info) = self.known.get_mut(&spell) {
+                    // The table stores the path without an extension.
+                    info.icon_path = Some(format!("{path}.blp"));
+                }
+            }
+        }
     }
 
     /// What to call a spell on a bar.
@@ -706,6 +753,69 @@ mod tests {
     fn chain() -> Option<Chain> {
         let data = std::env::var_os("WOW_DATA")?;
         Some(Chain::open_wow_data(data, "enUS").expect("opening archives"))
+    }
+
+    /// Eight of Bengus Deepforge's eighty-six offered spells cost the same
+    /// number of archive reads as one of them.
+    ///
+    /// **The regression test for a 17.3-second frame.** `resolve_extra` read
+    /// and parsed four DBCs per call, and the trainer window called it once
+    /// per offered row, so greeting an Ironforge blacksmithing trainer read
+    /// `Spell.dbc` -- 49,871 records of 936 bytes -- eighty-six times.
+    ///
+    /// **A count, not a duration**, for the reason `Chain::reads` exists: a
+    /// timing assertion passes on a fast machine with the bug present, is
+    /// flaky when it does fail, and says nothing about why. This one fails on
+    /// the old code at 32 reads against 4 and cannot be made to pass by a
+    /// faster disk.
+    ///
+    /// It asserts the *names* too, because a `resolve_extra_all` that did
+    /// nothing at all would also read nothing at all -- the two are
+    /// indistinguishable from the read count alone.
+    #[test]
+    fn a_trainers_whole_list_costs_one_pass_over_the_tables() {
+        let mut chain = match chain() {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping: WOW_DATA not set");
+                return;
+            }
+        };
+
+        // Real ids: the first eight rows of trainer template 201004, which is
+        // what creature 4258 (Bengus Deepforge) refers to.
+        const OFFERED: [u32; 8] = [2020, 2021, 2661, 2662, 2664, 2665, 2666, 2668];
+
+        let mut one = Spellbook::default();
+        let before = chain.reads();
+        one.resolve_extra_all(&mut chain, &OFFERED[..1]);
+        let for_one = chain.reads() - before;
+
+        let mut many = Spellbook::default();
+        let before = chain.reads();
+        many.resolve_extra_all(&mut chain, &OFFERED);
+        let for_many = chain.reads() - before;
+
+        assert_eq!(
+            for_many, for_one,
+            "resolving {} spells took {for_many} archive reads against {for_one} for one",
+            OFFERED.len()
+        );
+        assert!(for_one <= 4, "one pass should touch four tables, not {for_one}");
+
+        // The half that catches a no-op: every id has to have been answered.
+        for id in OFFERED {
+            assert!(
+                many.known_name(id).is_some(),
+                "spell {id} was not resolved by the batch"
+            );
+        }
+
+        // And a repeat ask is free, which is what keeps a held-open window
+        // from paying this every frame -- see `Spellbook::resolved_extra`.
+        let before = chain.reads();
+        many.resolve_extra_all(&mut chain, &OFFERED);
+        assert_eq!(chain.reads() - before, 0, "a second ask re-read the tables");
     }
 
     /// The whole path, against the real archives: columns to values, values
