@@ -8468,6 +8468,130 @@ profile.
   `environmentDetail`-style rule that spared the big trees would address less
   than that. Not a milestone on its own; a cheap addition if a room-based
   doodad cull is built anyway.
+
+  **Built, and this is what it took.** The doodads inherit the walk now.
+  Ironforge at the same camera:
+
+      buildings 128 -> 128     doodads 357 -> 74 draws
+      3,058 of 3,113 interior doodad placements in rooms no doorway reached
+
+  `--no-room-doodads` is the A/B, and it exists rather than reusing
+  `--no-portal-cull` because that one switches off *both* rules and would
+  credit the barrels with the rooms' saving. Benched at that camera, three
+  interleaved pairs, `--bench 300`, min of 300:
+
+      room-culled  record 0.35-0.52 | finish 0.72-1.00 | submit 0.10-0.13 ms
+      not culled   record 0.64-0.68 | finish 1.54-1.81 | submit 0.15-0.21 ms
+      whole frame (CPU+GPU): 1.79-2.63 ms against 3.06-3.49 ms
+
+  **~1.0 ms of CPU and ~1.3 ms off the frame**, at a median-of-three. The
+  earlier bound said ~0.6 CPU / ~0.8 GPU for all 357; measured against the
+  A/B rather than against a different session, it is larger.
+
+  ### `MODR` is a global index, and three controls say so
+
+  `wow-cli wmo doodad-rooms` is the dump command. The question was what a
+  group's `u16` doodad references index -- the whole `MODD` array, or the
+  doodad *set* the placement chose -- and on almost every building those are
+  the same number, because almost every building has one set starting at zero.
+  So the check is geometric: **is the doodad inside the box of the room that
+  names it.** Over the archives, 255,550 references across 990 buildings:
+
+      as an index into MODD    97.6% inside the room's box (0 dangling)
+      shifted by one           90.7%
+      read as set-relative     34.3%   (over 189 separating buildings)
+      half the array away      25.9%   -- the floor
+
+  **The floor is the control that matters.** The off-by-one scores 90.7%
+  because `MODD` is written room by room, so a doodad's neighbour is usually
+  in the same room -- in Ironforge that control reads 96.6% against the right
+  answer's 99.7%, which is nearly no separation at all. Half an array away is
+  decorrelated from the ordering, and at 0.4% in Ironforge it says what "no
+  relationship" looks like on this test. Set-relative is refuted: 34.3%
+  against a 25.9% floor.
+
+  `MODR` also **partitions the whole array** -- 246,565 doodads named by
+  exactly one room, 3,735 by several, and **not one by none.** The several is
+  why a span carries a list of rooms and the test is "any of them": a barrel
+  in a doorway belongs to both sides of it.
+
+  ### Two conditions that a picture found, not an argument
+
+  `MODR` says which room *owns* a doodad. It does not say where the doodad is,
+  and the walk decides reachability from the room's **geometry** box. Both
+  ways those come apart were found by rendering:
+
+  * **The room has to be flagged interior.** A `.wmo` files its outdoor
+    scatter under exterior groups -- Stormwind claims **584 of its 6,212**
+    references that way -- and those trees stand across a district, nowhere
+    near the shell owning them. Inheriting an exterior group's visibility
+    culled a canopy in plain sight: 12,700 pixels of 921,600 at a camera whose
+    own noise is 72.
+  * **The doodad has to be inside the box that claims it.** 9 of Ironforge's
+    3,335 references are outside theirs and 62 of Stormwind's 6,212, by as
+    much as 113 units. A doodad outside the box has had no claim tested about
+    it. Both conditions together leave 99.7% of Ironforge's references
+    cullable and 89.7% of Stormwind's; the rest simply keep drawing.
+
+  Refused at the tag rather than at the draw, so a doodad no room may claim
+  ends with an empty room list -- and an empty room list already means "draw
+  it". There is no second rule to keep in step.
+
+  ### The trap: a camera that cannot test this
+
+  Two of six cameras in the first sweep came back with real differences --
+  8,975 and 59,694 **stable** pixels, not particle noise. Both looked exactly
+  like wrongly culled geometry. Both were **cameras aimed at nothing**: the
+  eye embedded in a wall, two thirds of the frame grey void, seeing *through*
+  geometry rather than through doorways. The previous rung documented this
+  trap and I walked into it anyway by picking coordinates by hand.
+
+  What settles it is a **baseline column**: at those cameras the building
+  walk, untouched by this rung, is *already* wrong -- 32,178 stable pixels at
+  the worse one with only `--no-portal-cull` varied. **A camera where portal
+  culling is already wrong cannot test a rule that inherits from it**, so the
+  criterion for a usable camera is that its baseline is zero, and that is
+  checkable before anything else is measured. The sweep:
+
+      cam   self-noise   baseline   this rung   depth 0
+      ifA          0          0           0      12,061
+      swA          0          0           0       1,373
+      swB          0          0           0       1,779
+      swD          0          0           0      25,651
+      k5         321        148         219       1,585
+      k7           0          0           0          21
+      k9           0          0           0           0
+
+  Six of seven byte-identical; k5's difference is below its own noise. **k9's
+  negative control does not bite at all** (0 pixels at depth 0), so that row
+  proves nothing and is left in saying so. Outdoors at Goldshire the draw
+  counts are *identical* -- 163 buildings + 348 doodads either way -- because
+  the eye is in no room, the walk says `Undecided`, and Undecided draws
+  everything.
+
+  **And a second instrument, for the cameras with a fire in them.** A brazier
+  re-rolls its particles every run because `update_emitters` reads a wall
+  clock, so a plain A/B at such a camera measures the fire: 103,705 pixels at
+  one, against a self-noise of 5,757. Comparing only the pixels *both*
+  configurations paint identically twice removes the clock from the question
+  and leaves what the change actually did. That is what said the two bad
+  cameras were bad rather than noisy.
+
+  ### What it does not do
+
+  * **The shadow pass is untouched**, as it is for the rooms themselves: a
+    barrel you cannot see can still cast into a room you can.
+  * **A culled doodad still emits particles.** They are occluded by the same
+    walls that occlude the barrel -- which the zero-pixel A/B is the evidence
+    for -- so this is waste and not a picture bug. The next lever under this
+    one, and it is the emitter list rather than the draw list.
+  * **Culling instances can raise the draw count.** A batch that was one
+    instanced call becomes one call per surviving run, so where a room's
+    doodads survive in scattered pieces the calls go up while the instances go
+    down. Measured: Ironforge 357 -> 74 and Stormwind k7 411 -> 354, both
+    down; the two cameras where it went *up* were the two aimed at nothing.
+    `world::arrange` sorts each group's placements by room so a room is one
+    range, which is what keeps this bounded; adjacent survivors merge.
 * **A fixed-cost spike of 43 to 48 ms**, two or three per run, present at every
   crowd size and therefore not a load problem. Almost certainly tile streaming
   or a first-time model load. It is the only thing in the profile that does not

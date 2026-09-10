@@ -100,7 +100,7 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 |---|---|
 | Data formats | MPQ, DBC, BLP, M2 (+animation, timed events, particles/ribbons), WMO, ADT/WDT, MH2O — all done |
 | Renderer | Textures, skinned models, buildings, blended terrain, streaming, liquids, M2 emitters, sun shadows — done. **`--screenshot` renders one frame headless and draws NO HUD** (see the instrument rule below). Model files, skeletons and the creature tables are cached **per file** as well as per display id, so a zone of humanoids loads one `HumanMale.m2` rather than one per NPC; every load prints its own cost breakdown |
-| Frame time | **Frustum culling on terrain chunks, model groups and each WMO *room*, in the visible pass and the sun's.** Ironforge went 11,506 draws/frame to 2,322 and 13fps to a frame that holds 77fps with 400 bodies and 17,000 particles on screen. Drawing the world costs **2ms of GPU**; everything else in the frame is CPU. **Portal culling walks a building's doorways**, so standing in a city draws the room you are in and what the openings show: Ironforge 731 building draws to 128, Stormwind 1,502 to 289, byte-identical on five of six cameras. `--no-portal-cull` is the A/B and `--portal-depth 0` the negative control. **There is no level of detail and there is none to be had** -- 3.3.5a's `.skin` files are not LODs and WMOs have none at all; see the rule below. See 4.34 |
+| Frame time | **Frustum culling on terrain chunks, model groups and each WMO *room*, in the visible pass and the sun's.** Ironforge went 11,506 draws/frame to 2,322 and 13fps to a frame that holds 77fps with 400 bodies and 17,000 particles on screen. Drawing the world costs **2ms of GPU**; everything else in the frame is CPU. **Portal culling walks a building's doorways**, so standing in a city draws the room you are in and what the openings show: Ironforge 731 building draws to 128, Stormwind 1,502 to 289, byte-identical on five of six cameras. `--no-portal-cull` is the A/B and `--portal-depth 0` the negative control. **The walk reaches a building's interior doodads too** -- `MODR` says which room each belongs to, and Ironforge's 357 doodad draws fall to 74 with 3,058 of 3,113 placements in rooms no doorway reached, for ~1.0ms of CPU and ~1.3ms off the frame. `--no-room-doodads` is that rung's own A/B, separate because `--no-portal-cull` switches off both rules. **There is no level of detail and there is none to be had** -- 3.3.5a's `.skin` files are not LODs and WMOs have none at all; see the rule below. See 4.34 |
 | Protocol | 3.1–3.5 done against a live realm, two clients at once. Replicated creatures interpolate, turn and animate; **other players do not** — see the defect below |
 | World | Day/night from `Light.dbc`, a real sky gradient, sun and moon, weather that falls, game objects drawn. **A star dome, a cloud band and the zone skybox `LightSkybox` names** — which on Azeroth and Kalimdor is none, measured. No moon texture, one cloud layer |
 | Shadows | **A directional shadow map from the sun**, cast by terrain, models and alpha-keyed foliage, received by everything but liquid. One cascade around the camera; `--no-shadows` and `--shadow-dump` are the instruments |
@@ -188,6 +188,11 @@ guess was wrong; see 4.34, where eight of them were.
   (`caps.present_modes[0]`, which is `Fifo` here) and lets it be changed. It
   exists to tell "the client is slow" from "the client is waiting for the
   monitor".
+* **`--no-room-doodads`** draws a building's interior doodads whatever the
+  doorway walk said, while still culling its rooms. It exists because
+  `--no-portal-cull` switches off both rules at once and would credit one
+  with the other's saving; the two are separate claims and were measured
+  separately.
 * **`--stress N`** duplicates every replicated creature N times, spread by a
   hash rather than stacked, so a crowd is reproducible on a realm with four
   characters on it. Copies at one point share a tile, a cell and an animation
@@ -392,6 +397,22 @@ the full account is in `docs/ROADMAP.md`.
   same double-encode applied to sky, fog and diffuse light; fixing only the
   certain half left the world bright under a dusk sky, and the report that came
   back complained about the half that was *correct*.
+- **A control that scores nearly as well as the answer is a control that
+  cannot separate anything.** `MODR`'s doodad indices were tested by asking
+  whether each doodad lands inside the box of the room naming it -- 97.6%
+  across the archives. The obvious control, the same list shifted by one,
+  scores **90.7%**, because `MODD` is written room by room and a doodad's
+  neighbour is usually its roommate; in Ironforge that reads 96.6% against
+  99.7%. What made the test mean anything was a control decorrelated from the
+  ordering -- a doodad half the array away, **25.9%** -- and against that floor
+  the set-relative reading's 34.3% is refuted. Pick the control by asking what
+  it shares with the answer, not by perturbing the answer slightly.
+- **A field that says who *owns* a thing does not say where the thing is.**
+  `MODR` files every doodad under a room, and the portal walk decides
+  reachability from that room's *geometry* box -- so a `.wmo` filing its
+  outdoor trees under an exterior shell (Stormwind, 584 of 6,212) had those
+  trees culled in plain sight. Before inheriting one record's answer onto
+  another, ask what the answer was actually computed from.
 - **A name is the one thing in a binary format that cannot be a coincidence.**
   The M2 event stride fit 4,265 of 4,265 models by byte accounting and every
   neighbouring stride fit 1,343; the identifier being four printable ASCII
@@ -849,6 +870,24 @@ the full account is in `docs/ROADMAP.md`.
   feet planted in antiphase, which is what a walk is. **Before reading a
   measurement, ask what it would look like if the probe were aimed at
   nothing.**
+- **A camera where the thing you inherit from is already wrong cannot test
+  what you built on it.** Room-culling a building's doodads came back with
+  8,975 and 59,694 *stable* pixels different at two cameras of six -- not
+  particle noise, and exactly the shape of a wrongly culled room. Both were
+  **aimed at nothing**: the eye embedded in a wall, seeing *through* geometry
+  rather than through doorways, which is the trap the rung below had already
+  documented and which was walked into anyway by picking coordinates by hand.
+  What named it was a **baseline column** -- at those cameras the *building*
+  walk, untouched by the new rule, already differed by 32,178 pixels with
+  `--no-portal-cull` alone. So a sweep of cameras carries a baseline beside
+  its self-noise, and a camera qualifies before it measures.
+- **A pixel diff whose subject has a clock in it needs the clock taken out.**
+  `update_emitters` re-rolls a brazier's particles every run, so an A/B at a
+  camera with a fire in it measured the fire: **103,705 pixels against a
+  self-noise of 5,757.** Comparing only the pixels *both* configurations paint
+  identically twice -- two renders per side, not one -- leaves what the change
+  did. Cheaper than choosing cameras without fires, and it works on the
+  cameras you actually care about.
 - **A pixel diff's noise floor is a property of the camera, not of the
   project.** 4.34 recorded `--screenshot` as reproducible to "about 76 pixels
   at delta <= 2" and that number was carried around as *the* threshold. Ten

@@ -354,6 +354,25 @@ struct Args {
     #[arg(long)]
     portal_depth: Option<u32>,
 
+    /// Draw a building's interior doodads whatever the doorway walk said,
+    /// while still culling the building's own rooms.
+    ///
+    /// **The A/B that separates this rung from the one under it.** Portal
+    /// culling and the doodads it carries are two rules sharing one walk, and
+    /// `--no-portal-cull` switches off both -- so a bench that used it would
+    /// credit the barrels with the rooms' saving and the other way round.
+    /// Ironforge's buildings fall 731 draws to 128 and its doodads 357 to 75,
+    /// and those are separate claims that had to be measured separately.
+    ///
+    /// The pixel test is the same one and just as necessary: two
+    /// `--screenshot` runs differing by this flag alone must be the same
+    /// picture with different draw counts. `--portal-depth 0` remains the
+    /// negative control for both, and it bites on the doodads too -- 75 at
+    /// full depth, 58 at depth 0, where before this existed the count did not
+    /// move with depth at all.
+    #[arg(long)]
+    no_room_doodads: bool,
+
     /// Submit every draw, culling nothing against the frustum.
     ///
     /// **The instrument the culling is checked with, and the reason it can be
@@ -2160,6 +2179,23 @@ struct FrameProfile {
     /// saving either) draw the identical picture and take the identical
     /// frame. `buildings_walked` and `buildings_entered` say which.
     portal_culled_draws: u32,
+    /// Interior doodad *placements* the walk never reached -- the barrels,
+    /// braziers and chairs of a room that is not being drawn.
+    ///
+    /// **Counted in instances and not in draws, because that is the unit the
+    /// saving arrives in.** A doodad group is one model and every copy of it on
+    /// the tile, so removing a room's forty torches removes forty instances
+    /// from a draw that is still issued for the torches elsewhere. Reporting it
+    /// as draws would say "zero" for exactly the case this exists to measure.
+    ///
+    /// Its companion is `portal_culled_draws`: a group *entirely* inside culled
+    /// rooms loses its batches too, and those are counted there, as draws, with
+    /// the building geometry.
+    portal_culled_doodads: u32,
+    /// Interior doodad placements this frame drew, so the number above has
+    /// something to be a share of. "None were culled" and "there were none" are
+    /// the same sentence otherwise.
+    room_doodads: u32,
     /// Buildings offered to the doorway walk this frame -- one placement, with
     /// rooms and openings both present.
     buildings_walked: u32,
@@ -2496,7 +2532,8 @@ impl FrameProfile {
              models = {} buildings + {} doodads + {} creatures, {} of them \
              blended, {} inside buildings nobody is in | {} state calls, \
              {} skipped ({} redundant pipelines)\n\
-             portals: {} draw(s) in rooms no doorway reached, over {} building(s) \
+             portals: {} draw(s) in rooms no doorway reached, {} of {} interior \
+             doodad(s) likewise, over {} building(s) \
              walked of which {} had the eye inside\n\
              redraw {:.1}: ui {:.1} = snapshot {:.1} (target {:.1}, markers {:.1}, \
              bars {:.1}, panels {:.1}, map {:.1}, windows {:.1}) + egui {:.1} \
@@ -2542,6 +2579,8 @@ impl FrameProfile {
             self.skipped_state,
             self.redundant_pipelines,
             self.portal_culled_draws,
+            self.portal_culled_doodads,
+            self.portal_culled_doodads + self.room_doodads,
             self.buildings_walked,
             self.buildings_entered,
             self.redraw_ms,
@@ -3317,6 +3356,10 @@ struct Culling {
     /// How many doorways deep the walk may go -- `u32::MAX` unless
     /// `--portal-depth` says otherwise. See `Args::portal_depth`.
     depth: u32,
+    /// Whether the walk's answer reaches a building's interior doodads as well
+    /// as its own rooms -- see `Args::no_room_doodads`, which is the A/B that
+    /// keeps the two savings apart.
+    room_doodads: bool,
 }
 
 /// Whether this draw paints the inside of a building the camera is not in.
@@ -3410,6 +3453,48 @@ fn room_distance(
     (outside > 0.0).then_some(outside)
 }
 
+/// The rooms one placed building's doorway walk reached this frame, or `None`
+/// if it was not walked at all -- portal culling off, the eye outside it, or a
+/// building placed twice on its tile and so having no single set of rooms.
+///
+/// **`None` is "draw everything", and the linear scan is the point.** A frame
+/// walks the building the camera is standing in and, at a threshold or in a
+/// doorway, perhaps a second: this list holds nought, one or two entries, and a
+/// map keyed on an id would cost a hash per doodad run to search a list that
+/// short. Its shape is the same fact `render::portal::Rooms::Undecided` states.
+fn walked_rooms(
+    walks: &[(crate::world::PlacementId, Vec<bool>)],
+    id: crate::world::PlacementId,
+) -> Option<&[bool]> {
+    walks
+        .iter()
+        .find(|(walked, _)| *walked == id)
+        .map(|(_, rooms)| rooms.as_slice())
+}
+
+/// Whether a run of a building's interior doodads stands in any room this
+/// frame's walk reached.
+///
+/// **Any, not all.** 3,735 of the game's interior doodads are claimed by more
+/// than one room, and a barrel in a doorway is visible from either side of it;
+/// requiring every claiming room to be reachable would delete it from both.
+///
+/// A room index past the end of the walk answers `true`, for the reason the
+/// building's own batches do: an index this pass cannot place is not evidence
+/// that a room is unreachable, and a cull that reads "I do not know" as "no"
+/// deletes geometry for the one reason it must never delete it.
+fn span_visible(
+    walks: &[(crate::world::PlacementId, Vec<bool>)],
+    span: &crate::world::RoomSpan,
+) -> bool {
+    let Some(rooms) = walked_rooms(walks, span.building) else {
+        return true;
+    };
+    span.rooms
+        .iter()
+        .any(|room| rooms.get(*room as usize).copied().unwrap_or(true))
+}
+
 /// A reference's address, for identity comparison only. Never dereferenced.
 fn address<T: ?Sized>(value: &T) -> usize {
     std::ptr::from_ref(value) as *const u8 as usize
@@ -3433,12 +3518,18 @@ impl Bound {
 /// the deferred transparent pass so the two cannot drift; the caller has
 /// already bound this group's bones, vertex and index buffers.
 ///
-/// **Returns whether it actually drew.** Three lookups here can each come back
-/// empty, and a caller counting its own category by calling this and then
-/// incrementing would count the draws that never happened -- which is how a
-/// draw-call number stops matching the one the pass really submitted. The
-/// caller adds to `building_draws`, `entity_draws` and `blended_draws` only on
-/// `true`, so those shares always sum to at most `model_draws`.
+/// **Returns how many draws it actually issued.** Three lookups here can each
+/// come back empty, and a caller counting its own category by calling this and
+/// then incrementing would count the draws that never happened -- which is how
+/// a draw-call number stops matching the one the pass really submitted. The
+/// caller adds this number to `building_draws`, `entity_draws` and
+/// `blended_draws`, so those shares always sum to at most `model_draws`.
+///
+/// **It is a number rather than a `bool` because one batch can be several
+/// draws.** `runs` is the set of instance ranges that survived this frame's
+/// room walk -- one range covering everything for all but a building's own
+/// interior doodads -- and each range is its own `draw_indexed`. See
+/// `world::visible_runs`.
 ///
 /// `bound` is the pipeline state this pass last set, carried across both loops
 /// so [`FrameProfile::redundant_pipelines`] counts what a material sort could
@@ -3449,9 +3540,10 @@ fn draw_world_geometry(
     group: &crate::world::Group,
     draw_index: usize,
     draw: &crate::model::Draw,
+    runs: &[std::ops::Range<u32>],
     profile: &mut FrameProfile,
     bound: &mut Bound,
-) -> bool {
+) -> u32 {
     // **The group's override, not the material's own state**, and only where
     // one was asked for. A tint with alpha under one is invisible through an
     // opaque pipeline -- the blend has to be switched on for the number to
@@ -3466,8 +3558,11 @@ fn draw_world_geometry(
         group.model.binds.get(draw.texture),
         group.model.texture_animation.bind(draw_index),
     ) else {
-        return false;
+        return 0;
     };
+    if runs.is_empty() {
+        return 0;
+    }
     if bound.pipeline == Some(state) {
         profile.skipped_state += 1;
         profile.redundant_pipelines += 1;
@@ -3482,14 +3577,19 @@ fn draw_world_geometry(
     if Bound::changed(&mut bound.texture_transform, address(texture_bind), profile) {
         pass.set_bind_group(3, texture_bind, &[]);
     }
-    profile.model_draws += 1;
-    profile.triangles += (draw.index_count / 3) * group.count;
-    pass.draw_indexed(
-        draw.first_index..draw.first_index + draw.index_count,
-        0,
-        0..group.count,
-    );
-    true
+    // One `draw_indexed` per surviving run. All but a building's interior
+    // doodads have exactly one, covering every instance, which is the call
+    // this pass has always made.
+    for run in runs {
+        profile.model_draws += 1;
+        profile.triangles += (draw.index_count / 3) * (run.end - run.start);
+        pass.draw_indexed(
+            draw.first_index..draw.first_index + draw.index_count,
+            0,
+            run.clone(),
+        );
+    }
+    runs.len() as u32
 }
 
 /// Draws a streaming world: terrain first, then the instanced objects on it.
@@ -3799,11 +3899,61 @@ fn draw_streaming(
     // `FrameProfile::entity_draws`.
     let mut deferred: Vec<(bool, &crate::world::Group, usize)> = Vec::new();
     let mut bound = Bound::default();
-    // **One buffer, reused across every building in the frame.** `visible_rooms`
-    // rewrites it in full each time, which is the property that makes reuse
-    // safe -- a stale `true` left over from the previous building would draw a
-    // room nothing had reached, and a stale `false` would hide one.
-    let mut rooms: Vec<bool> = Vec::new();
+    // **Every walk, done before anything is drawn.** It used to happen inline,
+    // once per building group as the loop reached it, which was enough while
+    // the only thing a walk decided was that same group's own batches. It is
+    // not enough now: a room's *doodads* are merged by path across every
+    // building on the tile and are drawn from a group of their own, which the
+    // path sort may reach long before -- or long after -- the building they
+    // stand in. The answer has to exist before the loop starts.
+    //
+    // **Only a building the eye is standing in is walked at all**, which is the
+    // same set the inline version could decide anything about:
+    // `render::portal::visible_rooms` seeds from the rooms whose boxes hold the
+    // eye and returns `Undecided` -- draw everything -- when there are none. So
+    // this asks that question directly rather than walking a farmhouse to be
+    // told to draw all of it, and the pre-pass costs a box test per building on
+    // the ordinary outdoor tile.
+    let mut walks: Vec<(crate::world::PlacementId, Vec<bool>)> = Vec::new();
+    if cull.portals {
+        for group in world.tiles().flat_map(|t| t.groups.iter()) {
+            // All three under the same condition -- one placement of a building
+            // that has rooms and openings between them. See
+            // `world::placement_doorways`.
+            let (Some(id), Some(part_bounds), Some(doorways)) =
+                (group.placement, &group.part_bounds, &group.doorways)
+            else {
+                continue;
+            };
+            if !part_bounds
+                .iter()
+                .any(|(min, max)| eye.cmpge(*min).all() && eye.cmple(*max).all())
+            {
+                continue;
+            }
+            profile.buildings_walked += 1;
+            let mut rooms = Vec::new();
+            let verdict = render::portal::visible_rooms_to_depth(
+                eye,
+                &view_proj,
+                part_bounds,
+                doorways,
+                &group.model.unwalkable_rooms,
+                cull.depth,
+                &mut rooms,
+            );
+            // **An `Undecided` walk is not recorded**, and the lookup's `None`
+            // is what draws everything. Storing its all-`true` buffer would be
+            // the same answer through a second path, and two ways of saying
+            // "draw it" is one more than a rule this delicate should have.
+            if verdict == render::portal::Rooms::Decided {
+                profile.buildings_entered += 1;
+                walks.push((id, rooms));
+            }
+        }
+    }
+    // Reused across every group in the frame; `visible_runs` clears it.
+    let mut runs: Vec<std::ops::Range<u32>> = Vec::new();
     let map_groups = world.tiles().flat_map(|t| t.groups.iter()).map(|g| (false, g));
     for (entity, group) in map_groups.chain(world.entities().iter().map(|g| (true, g))) {
         {
@@ -3816,39 +3966,42 @@ fn draw_streaming(
                 profile.culled_draws += group.model.draws.len() as u32;
                 continue;
             }
-            // **Once per building, not once per draw.** The walk is a graph
-            // traversal over the whole building and its answer is the same for
-            // every draw in it; asking per draw would repeat it 731 times in
-            // Ironforge to get 731 identical answers.
-            //
-            // Both halves have to be present or the answer is meaningless:
-            // `part_bounds` is where the rooms are and `doorways` is how they
-            // join, and they are `Some` under the identical condition for
-            // exactly that reason -- see `world::placement_doorways`.
-            let walked = match (cull.portals, &group.part_bounds, &group.doorways) {
-                (true, Some(part_bounds), Some(doorways)) => {
-                    let verdict = render::portal::visible_rooms_to_depth(
-                        eye,
-                        &view_proj,
-                        part_bounds,
-                        doorways,
-                        &group.model.unwalkable_rooms,
-                        cull.depth,
-                        &mut rooms,
-                    );
-                    profile.buildings_walked += 1;
-                    if verdict == render::portal::Rooms::Decided {
-                        profile.buildings_entered += 1;
-                    }
-                    // **`Undecided` fills the buffer with `true`.** The eye is
-                    // outside this building, which is the ordinary case for
-                    // every farmhouse on the tile, and the honest answer there
-                    // is "draw it" -- `interiors` is the rule that handles
-                    // being outside.
-                    true
-                }
-                _ => false,
+            // **This building's own rooms**, if the eye is standing in it and
+            // the pre-pass above walked it. `None` is every farmhouse on the
+            // tile and means "draw all of it" -- `interiors` is the rule that
+            // handles being outside a building.
+            let walked = group.placement.and_then(|id| walked_rooms(&walks, id));
+            // **The instances of this group that survive**, which is one range
+            // covering everything for all but a building's interior doodads.
+            // Computed once per group rather than per batch: every batch of a
+            // model draws the same instances.
+            // An empty span list is what the A/B switches to, and it takes the
+            // same path a tree takes: one range, every instance.
+            let spans = if cull.room_doodads {
+                group.room_spans.as_slice()
+            } else {
+                &[]
             };
+            crate::world::visible_runs(
+                spans,
+                group.count,
+                |span| span_visible(&walks, span),
+                &mut runs,
+            );
+            if runs.is_empty() {
+                // Every instance of this group is in a room nothing reached, so
+                // none of its batches will be issued. Counted here as draws,
+                // beside the building geometry, because that is what they are.
+                profile.culled_draws += group.model.draws.len() as u32;
+                profile.portal_culled_draws += group.model.draws.len() as u32;
+                profile.portal_culled_doodads += group.count;
+                continue;
+            }
+            if !spans.is_empty() {
+                let drawn: u32 = runs.iter().map(|r| r.end - r.start).sum();
+                profile.room_doodads += drawn;
+                profile.portal_culled_doodads += group.count.saturating_sub(drawn);
+            }
             let group_bones = group
                 .animation
                 .and_then(|key| world.entity_bone_buffer(key))
@@ -3919,7 +4072,9 @@ fn draw_streaming(
                 // this pass cannot place is not evidence that its room is
                 // unreachable, and a cull that treats "I do not know" as "no"
                 // deletes geometry for the one reason it must never delete it.
-                if walked && !rooms.get(draw.submesh_id as usize).copied().unwrap_or(true) {
+                if walked
+                    .is_some_and(|rooms| !rooms.get(draw.submesh_id as usize).copied().unwrap_or(true))
+                {
                     profile.culled_draws += 1;
                     profile.portal_culled_draws += 1;
                     continue;
@@ -3939,13 +4094,12 @@ fn draw_streaming(
                     deferred.push((entity, group, draw_index));
                     continue;
                 }
-                if draw_world_geometry(
-                    &mut pass, meshes, group, draw_index, draw, profile, &mut bound,
-                ) {
-                    profile.building_draws += u32::from(group.building);
-                    profile.entity_draws += u32::from(entity);
-                    profile.unentered_draws += u32::from(hidden.is_some());
-                }
+                let issued = draw_world_geometry(
+                    &mut pass, meshes, group, draw_index, draw, &runs, profile, &mut bound,
+                );
+                profile.building_draws += issued * u32::from(group.building);
+                profile.entity_draws += issued * u32::from(entity);
+                profile.unentered_draws += issued * u32::from(hidden.is_some());
             }
             census::record(group.path.as_ref(), profile.model_draws - before);
         }
@@ -3993,21 +4147,38 @@ fn draw_streaming(
         ) {
             pass.set_index_buffer(group.model.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
         }
-        if draw_world_geometry(
+        // **Recomputed here rather than carried on the deferred entry.** The
+        // opaque loop's answer is a per-group fact and this list is flat, so
+        // storing it would mean a `Vec` per blended batch; recomputing walks a
+        // span list that is empty for everything but a building's own interior
+        // doodads, which is where the glass of a lantern lives.
+        crate::world::visible_runs(
+            if cull.room_doodads {
+                group.room_spans.as_slice()
+            } else {
+                &[]
+            },
+            group.count,
+            |span| span_visible(&walks, span),
+            &mut runs,
+        );
+        let issued = draw_world_geometry(
             &mut pass,
             meshes,
             group,
             draw_index,
             &group.model.draws[draw_index],
+            &runs,
             profile,
             &mut bound,
-        ) {
-            profile.building_draws += u32::from(group.building);
-            profile.entity_draws += u32::from(entity);
-            profile.blended_draws += 1;
+        );
+        if issued > 0 {
+            profile.building_draws += issued * u32::from(group.building);
+            profile.entity_draws += issued * u32::from(entity);
+            profile.blended_draws += issued;
             profile.unentered_draws +=
-                u32::from(unentered(group, &group.model.draws[draw_index], eye).is_some());
-            census::record(group.path.as_ref(), 1);
+                issued * u32::from(unentered(group, &group.model.draws[draw_index], eye).is_some());
+            census::record(group.path.as_ref(), issued);
         }
     }
 
@@ -4570,6 +4741,7 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
             interiors: interior_cull(args),
             portals: !args.no_portal_cull,
             depth: args.portal_depth.unwrap_or(u32::MAX),
+            room_doodads: !args.no_room_doodads,
         },
     );
     // **The headless path's whole reason for carrying one.** `--screenshot`
@@ -4675,6 +4847,7 @@ fn screenshot(args: &Args, chain: &mut Chain, out: &std::path::Path) -> Result<(
             interiors: interior_cull(args),
             portals: !args.no_portal_cull,
             depth: args.portal_depth.unwrap_or(u32::MAX),
+            room_doodads: !args.no_room_doodads,
         },
             );
             let recorded = round.elapsed().as_secs_f32() * 1000.0;
@@ -9454,6 +9627,7 @@ impl App {
                     interiors: interior_cull(&self.args),
                     portals: !self.args.no_portal_cull,
                     depth: self.args.portal_depth.unwrap_or(u32::MAX),
+                    room_doodads: !self.args.no_room_doodads,
                 },
             );
         }

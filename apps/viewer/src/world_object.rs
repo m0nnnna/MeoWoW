@@ -79,6 +79,23 @@ pub struct LoadedWmo {
 pub struct Doodad {
     pub path: String,
     pub transform: Mat4,
+    /// The rooms that claim this doodad, as group indices -- `MODR`, inverted.
+    ///
+    /// **Empty means "nothing said", and nothing said is drawn.** A group file
+    /// that would not parse, a model loaded one group at a time for a dump,
+    /// a doodad no room lists: none of those is evidence that a barrel cannot
+    /// be seen, and the rule [`crate::world::Group::room_spans`] is built on
+    /// is that an absent answer is unknown rather than "no".
+    ///
+    /// Usually exactly one entry -- 246,565 of the game's 250,300 interior
+    /// doodads are named by a single room -- but 3,735 are named by several,
+    /// which is why this is a list and the test is "any of them". Measured by
+    /// `wow-cli wmo doodad-rooms`, which is also where the reading itself is
+    /// established: `MODR` indexes the whole `MODD` array and not the doodad
+    /// set the placement chose, 97.6% of references landing inside the box of
+    /// the room that names them against 25.9% for an unrelated doodad and
+    /// 34.3% for the set-relative reading.
+    pub rooms: Vec<u16>,
 }
 
 /// One group's liquid surface, reduced to the wet cells' corners in model
@@ -207,6 +224,52 @@ fn render_state(material: &wmo::Material) -> RenderState {
     }
 }
 
+/// Whether room `gi` may lend its visibility to the doodad at `index`.
+///
+/// **`MODR` says which room *owns* a doodad, which is not the same as saying
+/// where it is**, and this is the gap between the two. Both conditions were
+/// found by a picture rather than reasoned out, and each answers a different
+/// way the file's ownership and the walk's geometry come apart:
+///
+/// * **The room has to be an interior one.** A `.wmo` files its outdoor
+///   scatter under exterior groups -- Stormwind claims 584 of its 6,212
+///   references that way -- and those trees stand across a whole district,
+///   nowhere near the shell that owns them. Inheriting an exterior group's
+///   visibility onto them culled a canopy in plain sight: **12,700 pixels of
+///   921,600 against a camera whose own noise is 72.**
+/// * **The doodad has to be inside the box that claims it.** A group's
+///   bounding box bounds its *geometry*, and the portal walk decides
+///   reachability from exactly that box -- so a doodad outside it has had no
+///   claim tested about it at all. 9 of Ironforge's 3,335 references and 62 of
+///   Stormwind's 6,212 are outside, by as much as 113 units.
+///
+/// The box is the **root's** per-group box and not the group file's, because
+/// that is the one `world::placement_bounds` turns into `part_bounds` and the
+/// walk answers about. Two boxes that agree today are two boxes that can stop
+/// agreeing.
+///
+/// Refusing here rather than at the draw is deliberate: a doodad no room may
+/// claim ends with an empty [`Doodad::rooms`], and an empty list already means
+/// "draw it". There is no second rule to keep in step.
+///
+/// `wow-cli wmo doodad-rooms` counts both conditions over the archives.
+fn claimable(root: &wmo::Root, gi: usize, doodad: usize) -> bool {
+    let Some(group) = root.groups.get(gi) else {
+        return false;
+    };
+    if !group.is_interior() {
+        return false;
+    }
+    let Some(doodad) = root.doodads.get(doodad) else {
+        return false;
+    };
+    let (min, max) = group.bounding_box;
+    // A unit of slack, which is what the survey's "inside or within a unit"
+    // column measures: a lamp bracketed to a wall sits in the wall's plane and
+    // rounds to just outside the room it lights.
+    (0..3).all(|k| doodad.position[k] >= min[k] - 1.0 && doodad.position[k] <= max[k] + 1.0)
+}
+
 fn doodad_transform(doodad: &wmo::DoodadDef) -> Mat4 {
     Mat4::from_scale_rotation_translation(
         Vec3::splat(doodad.scale),
@@ -328,6 +391,21 @@ pub fn load_with_areas(
         .flat_map(|ends| ends.iter().copied())
         .collect();
     let mut group_surface_ids = vec![0; root.header.group_count as usize];
+    // **`MODR`, inverted: which rooms claim each doodad.** The file states it
+    // the other way round -- a list of doodad indices per group -- and the
+    // renderer needs it per doodad, because a doodad group's instances are
+    // merged across buildings and have to be filtered one at a time.
+    //
+    // Left entirely empty when `only_group` is set. A model loaded one group
+    // at a time knows about one room's references and nothing about the rest,
+    // and half a partition is worse than none: the groups that were never
+    // opened would read as "no room claims this" and draw, while the one that
+    // was would cull. See [`Doodad::rooms`].
+    let mut doodad_rooms: Vec<Vec<u16>> = if only_group.is_some() {
+        Vec::new()
+    } else {
+        vec![Vec::new(); root.doodads.len()]
+    };
 
     for gi in 0..root.header.group_count as usize {
         if only_group.is_some_and(|want| want != gi) {
@@ -340,6 +418,20 @@ pub fn load_with_areas(
         let Ok(group) = wmo::Group::parse(&gbytes, &group_names) else {
             continue;
         };
+        // **Before the guards below, not after them.** A group whose geometry
+        // this client declines to draw is still a room the portal walk knows
+        // about -- the boxes and the doorways come off the *root* -- so its
+        // doodads must still be filed under it or they would draw with the
+        // room culled around them.
+        for reference in &group.doodad_refs {
+            let index = usize::from(*reference);
+            if !claimable(&root, gi, index) {
+                continue;
+            }
+            if let Some(rooms) = doodad_rooms.get_mut(index) {
+                rooms.push(gi as u16);
+            }
+        }
         if group.validate().is_err() || group.vertices.is_empty() {
             continue;
         }
@@ -512,12 +604,20 @@ pub fn load_with_areas(
             .doodad_sets
             .iter()
             .map(|set| {
+                // **The index into `MODD`, carried down past the filter.**
+                // `MODR` names doodads by their position in the whole array,
+                // and the nameless ones dropped a line below would shift every
+                // set-local index after them -- so the global one is taken
+                // first, exactly as `doodads_in_set` clamps it.
+                let base = (set.start as usize).min(root.doodads.len());
                 root.doodads_in_set(set)
                     .iter()
-                    .filter(|doodad| !doodad.path.is_empty())
-                    .map(|doodad| Doodad {
+                    .enumerate()
+                    .filter(|(_, doodad)| !doodad.path.is_empty())
+                    .map(|(offset, doodad)| Doodad {
                         path: doodad.path.clone(),
                         transform: doodad_transform(doodad),
+                        rooms: doodad_rooms.get(base + offset).cloned().unwrap_or_default(),
                     })
                     .collect()
             })

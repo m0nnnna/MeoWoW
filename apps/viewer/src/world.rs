@@ -153,6 +153,163 @@ pub struct ModelDoorway {
     pub rooms: (u32, u32),
 }
 
+/// One placed building, told apart from every other placed building.
+///
+/// **A counter and not a hash of anything.** The thing being identified is a
+/// copy of a model at a position, and every candidate made of its own contents
+/// -- path, transform, tile plus index -- collides for the case that matters:
+/// the same building placed twice on one tile is exactly what
+/// [`Group::part_bounds`] already refuses to reason about, and two placements
+/// sharing an id would silently hand one's room visibility to the other. A
+/// counter cannot do that, and it costs a `u64` per tile load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacementId(u64);
+
+/// A run of one [`Group`]'s instances, and the rooms of one building that
+/// claim it.
+///
+/// **The rooms are a list because a doodad can be claimed by several.** 3,735
+/// of the game's 250,300 interior doodads are named by more than one group --
+/// a chandelier over a stairwell, a barrel in a doorway -- and the answer for
+/// those is "visible if *any* of them is", which is the direction that draws.
+/// An empty list would mean nothing claims it, and such a doodad never reaches
+/// a span at all; see [`Group::room_spans`].
+#[derive(Clone, Debug)]
+pub struct RoomSpan {
+    /// The building whose walk decides this run.
+    pub building: PlacementId,
+    /// Group indices into that building's `part_bounds`.
+    pub rooms: Vec<u16>,
+    /// First instance of the run, and how many.
+    pub start: u32,
+    pub count: u32,
+}
+
+/// One placement on its way into a [`Group`], still knowing where it came from.
+///
+/// Exists only between reading a tile's `.adt` and uploading its instance
+/// buffers. Everything after that point sees a flat array of transforms, which
+/// is the whole reason the room has to be attached here.
+struct Placed {
+    transform: Mat4,
+    /// The building placement that claims it and the rooms of that building
+    /// naming it, or `None` for anything standing on the terrain in its own
+    /// right -- a tile's trees and rocks, and the buildings themselves.
+    room: Option<(PlacementId, Vec<u16>)>,
+}
+
+impl Placed {
+    /// A placement no room claims.
+    fn loose(transform: Mat4) -> Self {
+        Self {
+            transform,
+            room: None,
+        }
+    }
+}
+
+/// Orders a group's placements so each room is one contiguous run, and says
+/// where those runs are.
+///
+/// **The sort is what makes a range a draw.** A draw call takes an instance
+/// range, so scattered instances of one room would need one call each; sorted,
+/// a room is a range and Ironforge's hundred rooms cost at most a hundred
+/// draws instead of three thousand. Stable, so two placements of one room keep
+/// the order the `.adt` and the `.wmo` listed them in -- which is what keeps
+/// `--screenshot` reproducible, for the reason the path sort above it exists.
+///
+/// Untagged placements sort first and are given no span at all: an instance no
+/// span covers is drawn unconditionally, which is what makes a tile's own
+/// scatter -- merged into these same groups by path -- immune to a rule about
+/// rooms it was never part of.
+fn arrange(mut placed: Vec<Placed>) -> (Vec<Mat4>, Vec<RoomSpan>) {
+    placed.sort_by(|a, b| match (&a.room, &b.room) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some((a_id, a_rooms)), Some((b_id, b_rooms))) => {
+            a_id.0.cmp(&b_id.0).then_with(|| a_rooms.cmp(b_rooms))
+        }
+    });
+    let mut spans: Vec<RoomSpan> = Vec::new();
+    for (index, entry) in placed.iter().enumerate() {
+        let Some((building, rooms)) = &entry.room else {
+            continue;
+        };
+        match spans.last_mut() {
+            Some(last)
+                if last.building == *building
+                    && last.rooms == *rooms
+                    && last.start + last.count == index as u32 =>
+            {
+                last.count += 1;
+            }
+            _ => spans.push(RoomSpan {
+                building: *building,
+                rooms: rooms.clone(),
+                start: index as u32,
+                count: 1,
+            }),
+        }
+    }
+    (placed.into_iter().map(|p| p.transform).collect(), spans)
+}
+
+/// The instance ranges of a group that survive this frame's room walks.
+///
+/// `lit` answers whether a span's building reached any of its rooms; a span
+/// whose building was never walked -- the eye is outside it, or portal culling
+/// is off -- must answer `true`, because [`render::portal::Rooms::Undecided`]
+/// means "draw it" and this is where that promise is kept.
+///
+/// **A group with no spans yields exactly one range**, which is the whole
+/// instance count and the same single draw the pass has always issued. Runs are
+/// merged as they are pushed, so a building whose rooms are all visible also
+/// collapses back to one -- the cost of this feature on a frame that culls
+/// nothing is a comparison per span, not a draw call per room.
+pub fn visible_runs(
+    spans: &[RoomSpan],
+    count: u32,
+    mut lit: impl FnMut(&RoomSpan) -> bool,
+    out: &mut Vec<std::ops::Range<u32>>,
+) {
+    out.clear();
+    fn push(out: &mut Vec<std::ops::Range<u32>>, from: u32, to: u32) {
+        if from >= to {
+            return;
+        }
+        match out.last_mut() {
+            Some(last) if last.end == from => last.end = to,
+            _ => out.push(from..to),
+        }
+    }
+    if spans.is_empty() {
+        push(out, 0, count);
+        return;
+    }
+    // Walked in order, and the gaps between spans are drawn. The spans are
+    // built as a sorted, non-overlapping list by [`arrange`]; the clamping and
+    // the `max` below mean a malformed one draws too much rather than reading
+    // past the end of a buffer.
+    let mut cursor = 0u32;
+    for span in spans {
+        // **Never behind the cursor.** [`arrange`] builds these disjoint and in
+        // order, and this is what makes a list that somehow is not still
+        // produce ranges that are ascending and do not overlap -- an instance
+        // range handed to `draw_indexed` twice draws a barrel twice, which
+        // through a blended material is a barrel that looks different from its
+        // neighbours for no reason anybody would connect to culling.
+        let start = span.start.max(cursor).min(count);
+        let end = span.start.saturating_add(span.count).max(start).min(count);
+        push(out, cursor, start);
+        if lit(span) {
+            push(out, start, end);
+        }
+        cursor = cursor.max(end);
+    }
+    push(out, cursor, count);
+}
+
 /// One model and the transforms it takes on a single tile.
 pub struct Group {
     pub model: Rc<CachedModel>,
@@ -229,6 +386,30 @@ pub struct Group {
     /// that has rooms. Portal culling needs the rooms and the openings between
     /// them to be in the same space, and `part_bounds` is where the rooms are.
     pub doorways: Option<Vec<render::portal::Doorway>>,
+    /// A stable identity for the one building placement this group *is*, under
+    /// the same condition as [`Self::part_bounds`] and [`Self::doorways`].
+    ///
+    /// It exists so a doodad can name the building it stands inside. Nothing
+    /// else in a [`Group`] can: the path is shared by every copy of a model,
+    /// the transforms are a vector, and a doodad group is merged across every
+    /// building on its tile. See [`Self::room_spans`].
+    pub placement: Option<PlacementId>,
+    /// Which of a building's rooms each run of this group's instances belongs
+    /// to -- `MODR`, carried through to the draw loop.
+    ///
+    /// **Empty is the ordinary case and means "draw every instance".** A tile's
+    /// scatter, a creature, a game object and every building itself have no
+    /// room to belong to, and neither does a doodad whose `.wmo` said nothing
+    /// about it. The draw loop's fallback is therefore the whole instance
+    /// range, byte for byte what it submitted before any of this existed.
+    ///
+    /// **Runs rather than a flag per instance**, because the instance buffer is
+    /// uploaded once when the tile loads and a draw takes a *range*. Sorting
+    /// the placements by the room that owns them makes each room one range, so
+    /// a frame that culls nothing issues exactly one draw per batch as before,
+    /// and a frame standing in one room of Ironforge issues one per surviving
+    /// run. See [`InstanceRuns`].
+    pub room_spans: Vec<RoomSpan>,
     /// The archive path of this group's model, for the draw census.
     ///
     /// **Carried for the census and nothing else.** Everything the draw loop
@@ -1054,6 +1235,8 @@ pub struct World {
     wdt: adt::Wdt,
     radius: i32,
     max_doodads: usize,
+    /// Handed out one per placed building, never reused -- see [`PlacementId`].
+    next_placement: u64,
     wmo_areas: crate::world_object::WmoAreas,
     /// `None` marks a model that failed to load, so it is not retried on every
     /// tile that places it.
@@ -1291,6 +1474,7 @@ impl World {
             wdt,
             radius: radius.max(MIN_STREAM_RADIUS),
             max_doodads,
+            next_placement: 0,
             wmo_areas,
             cache: HashMap::new(),
             entity_cache: HashMap::new(),
@@ -1497,7 +1681,7 @@ impl World {
         // Own only the placements whose position falls on this tile, so a
         // border-straddling object belongs to exactly one owner and is neither
         // drawn twice nor left behind when a neighbour is evicted.
-        let mut groups: HashMap<String, Vec<Mat4>> = HashMap::new();
+        let mut groups: HashMap<String, Vec<Placed>> = HashMap::new();
         let mut wmo_placements = Vec::new();
         let mut budget = self.max_doodads;
         for placement in &parsed.objects {
@@ -1512,8 +1696,10 @@ impl World {
                 object_rotation(placement.rotation),
                 position,
             );
-            groups.entry(path.clone()).or_default().push(transform);
-            wmo_placements.push((path, placement.doodad_set as usize, transform));
+            groups.entry(path.clone()).or_default().push(Placed::loose(transform));
+            let id = PlacementId(self.next_placement);
+            self.next_placement += 1;
+            wmo_placements.push((path, placement.doodad_set as usize, transform, id));
         }
         for placement in &parsed.doodads {
             if budget == 0 {
@@ -1527,11 +1713,11 @@ impl World {
             groups
                 .entry(placement.path.to_string())
                 .or_default()
-                .push(Mat4::from_scale_rotation_translation(
+                .push(Placed::loose(Mat4::from_scale_rotation_translation(
                     Vec3::splat(placement.scale),
                     placement_rotation(placement.rotation),
                     position,
-                ));
+                )));
         }
 
         // `--max-doodads 0` means *no doodads at all*, which has to include a
@@ -1539,17 +1725,39 @@ impl World {
         // draw is (Ironforge, 299 of 357), so an instrument that dropped only
         // the tile scatter would bound the wrong thing. The buildings
         // themselves are already in `groups` from the loop above.
+        //
+        // **Each one carries the room that claims it from here on.** This is
+        // the only point at which a doodad still knows which building it came
+        // out of: below, they are merged by path with every other copy on the
+        // tile and with the tile's own scatter, which is exactly what makes the
+        // draw loop cheap and what made room culling impossible before the tag
+        // existed. See [`Group::room_spans`].
+        let mut buildings: HashMap<&str, Vec<PlacementId>> = HashMap::new();
         if self.max_doodads > 0 {
-            for (path, set, parent) in wmo_placements {
-                let Some(model) = self.model(gpu, meshes, chain, &path) else {
+            for (path, set, parent, id) in &wmo_placements {
+                buildings.entry(path.as_str()).or_default().push(*id);
+                let Some(model) = self.model(gpu, meshes, chain, path) else {
                     continue;
                 };
-                let Some(doodads) = model.doodads.get(set) else {
+                let Some(doodads) = model.doodads.get(*set) else {
                     continue;
                 };
                 for doodad in doodads {
-                    groups.entry(doodad.path.clone()).or_default().push(parent * doodad.transform);
+                    groups
+                        .entry(doodad.path.clone())
+                        .or_default()
+                        .push(Placed {
+                            transform: *parent * doodad.transform,
+                            // A doodad no room claims is a doodad this pass
+                            // must keep drawing -- see [`Doodad::rooms`].
+                            room: (!doodad.rooms.is_empty())
+                                .then(|| (*id, doodad.rooms.clone())),
+                        });
                 }
+            }
+        } else {
+            for (path, _, _, id) in &wmo_placements {
+                buildings.entry(path.as_str()).or_default().push(*id);
             }
         }
 
@@ -1562,7 +1770,7 @@ impl World {
         // that "two screenshots of the same weather are the same picture";
         // this is what makes that true. The particle systems were already
         // seeded from their placement ids for the same reason.
-        let mut groups: Vec<(String, Vec<Mat4>)> = groups.into_iter().collect();
+        let mut groups: Vec<(String, Vec<Placed>)> = groups.into_iter().collect();
         groups.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut built = Vec::new();
@@ -1575,10 +1783,16 @@ impl World {
         // harbour water -- placed into world space here for the same reason
         // collision is: the grid only indexes what has a world position.
         let mut wmo_liquid_surfaces: Vec<(u16, Vec<[Vec3; 4]>)> = Vec::new();
-        for (path, transforms) in groups {
+        for (path, placed) in groups {
             let Some(model) = self.model(gpu, meshes, chain, &path) else {
                 continue;
             };
+            // **Reordered here and nowhere later.** Everything below reads
+            // `transforms` -- collision, liquid, the instance buffer, the
+            // emitter list and its ids -- so the sort has to happen before the
+            // first of them or two of those views of one group would disagree
+            // about which placement is which. See [`arrange`].
+            let (transforms, room_spans) = arrange(placed);
             if model.wmo_id.is_some() {
                 wmos.extend(transforms.iter().map(|transform| WmoInstance {
                     path: path.clone(),
@@ -1644,6 +1858,15 @@ impl World {
                 bounds,
                 part_bounds,
                 doorways,
+                // **The same condition `part_bounds` is `Some` under**, and it
+                // has to be: this id is what a doodad names to find the walk
+                // whose answer applies to it, and a group holding two copies of
+                // a building has two sets of rooms and no single walk at all.
+                placement: buildings
+                    .get(path.as_str())
+                    .filter(|ids| ids.len() == 1)
+                    .map(|ids| ids[0]),
+                room_spans,
                 // The path, because it is the only thing here that knows: the
                 // buildings and the doodads were merged into one map keyed by
                 // path well above this, precisely so that both draw through
@@ -2776,6 +2999,8 @@ impl World {
                     bounds: None,
                     part_bounds: None,
                     doorways: None,
+                    placement: None,
+                    room_spans: Vec::new(),
                     // A torch in a hand is the case this exists for, and its
                     // placements are rewritten every frame by
                     // `update_animations` along with the item's own transform.
@@ -2837,6 +3062,11 @@ impl World {
                     bounds,
                     part_bounds,
                     doorways: None,
+                    // An entity is never a room and never inside one that this
+                    // pass could walk: rooms belong to a placed building, and a
+                    // creature's group is rebuilt every frame from a guid list.
+                    placement: None,
+                    room_spans: Vec::new(),
                     building: false,
                     path: None,
                     emitting: emitting_placements(&doodad_model, &doodad_transforms),
@@ -2863,6 +3093,8 @@ impl World {
                 bounds,
                 part_bounds,
                 doorways: None,
+                placement: None,
+                room_spans: Vec::new(),
                 building: false,
                 path: None,
                 emitting: emitting_placements(&model, &transforms),
@@ -6392,6 +6624,307 @@ mod tests {
         remember_display_bounds(&mut bounds, 197, None);
 
         assert_eq!(bounds.get(&197), Some(&known));
+    }
+
+    // ---- Room-culled interior doodads -------------------------------------
+    //
+    // **A culling bug does not look like a bug**, which is the rule
+    // `render::portal` is written around and applies twice as hard here: a
+    // wrongly *kept* doodad is invisible waste, and a wrongly *dropped* one is
+    // a barrel that is not there, in a room the camera may not enter for
+    // another ten minutes. Neither errors. So the whole apparatus is tested
+    // against an oracle written from the definition rather than from the
+    // implementation -- one instance at a time, no runs, no sorting -- and the
+    // oracle is checked by breaking the thing it measures.
+
+    /// A tag: the building that claims a placement and the rooms naming it.
+    fn tag(building: u64, rooms: &[u16]) -> Option<(PlacementId, Vec<u16>)> {
+        Some((PlacementId(building), rooms.to_vec()))
+    }
+
+    /// A placement whose transform records where it started, so the sort can be
+    /// followed: `arrange` returns bare matrices and the test has to be able to
+    /// say which original each one is.
+    fn placed(index: usize, room: Option<(PlacementId, Vec<u16>)>) -> Placed {
+        Placed {
+            transform: Mat4::from_translation(Vec3::new(index as f32, 0.0, 0.0)),
+            room,
+        }
+    }
+
+    fn original(transform: &Mat4) -> usize {
+        transform.w_axis.x as usize
+    }
+
+    /// Expands the run list into the set of instances it draws.
+    fn drawn(runs: &[std::ops::Range<u32>]) -> Vec<u32> {
+        runs.iter().flat_map(|r| r.clone()).collect()
+    }
+
+    /// **The oracle: the same rule, one instance at a time.** No sorting, no
+    /// runs, no merging -- for each placement in the arranged order, is it
+    /// claimed at all, was its building walked, and does the walk reach any
+    /// room that names it.
+    fn oracle(
+        order: &[Mat4],
+        tags: &[Option<(PlacementId, Vec<u16>)>],
+        walks: &[(PlacementId, Vec<bool>)],
+    ) -> Vec<u32> {
+        order
+            .iter()
+            .enumerate()
+            .filter(|(_, transform)| {
+                let Some((building, rooms)) = &tags[original(transform)] else {
+                    return true;
+                };
+                match walks.iter().find(|(id, _)| id == building) {
+                    None => true,
+                    Some((_, reached)) => rooms
+                        .iter()
+                        .any(|r| reached.get(*r as usize).copied().unwrap_or(true)),
+                }
+            })
+            .map(|(index, _)| index as u32)
+            .collect()
+    }
+
+    fn runs_of(
+        spans: &[RoomSpan],
+        count: u32,
+        walks: &[(PlacementId, Vec<bool>)],
+    ) -> Vec<std::ops::Range<u32>> {
+        let mut out = Vec::new();
+        visible_runs(
+            spans,
+            count,
+            |span| match walks.iter().find(|(id, _)| *id == span.building) {
+                None => true,
+                Some((_, reached)) => span
+                    .rooms
+                    .iter()
+                    .any(|r| reached.get(*r as usize).copied().unwrap_or(true)),
+            },
+            &mut out,
+        );
+        out
+    }
+
+    /// A deliberately jumbled tile: two buildings, rooms interleaved, and a
+    /// scatter of untagged placements mixed through the middle -- which is what
+    /// a real doodad group is, since the tile's own trees and every building's
+    /// interior set are merged under one path.
+    fn jumbled() -> Vec<Option<(PlacementId, Vec<u16>)>> {
+        let mut tags = Vec::new();
+        for i in 0..60u16 {
+            tags.push(match i % 6 {
+                0 => None,
+                1 => tag(1, &[i % 7]),
+                2 => tag(2, &[i % 5]),
+                3 => tag(1, &[(i % 7), (i % 3) + 7]),
+                4 => tag(2, &[3]),
+                _ => tag(1, &[0]),
+            });
+        }
+        tags
+    }
+
+    /// **The differential test.** Every combination of walks over a jumbled
+    /// group must draw exactly the instances the per-instance oracle draws.
+    #[test]
+    fn runs_draw_exactly_what_a_per_instance_filter_draws() {
+        let tags = jumbled();
+        let (order, spans) =
+            arrange(tags.iter().cloned().enumerate().map(|(i, t)| placed(i, t)).collect());
+        // Every room mask that matters: nothing walked, one building walked at
+        // several depths, both walked, and a walk that reached nothing.
+        let masks: Vec<Vec<(PlacementId, Vec<bool>)>> = vec![
+            vec![],
+            vec![(PlacementId(1), vec![true; 10])],
+            vec![(PlacementId(1), vec![false; 10])],
+            vec![(PlacementId(1), vec![true, false, false, true, false, false, false, true, false, false])],
+            vec![(PlacementId(2), vec![false, true, false, false, true])],
+            vec![
+                (PlacementId(1), vec![false, true, true, false, false, false, false, false, true, false]),
+                (PlacementId(2), vec![true, false, false, false, false]),
+            ],
+            // A building nothing on this tile belongs to: every span must draw.
+            vec![(PlacementId(99), vec![false; 10])],
+        ];
+        for walks in &masks {
+            assert_eq!(
+                drawn(&runs_of(&spans, order.len() as u32, walks)),
+                oracle(&order, &tags, walks),
+                "walks {walks:?}"
+            );
+        }
+    }
+
+    /// **The oracle checked by breaking what it measures.** A differential test
+    /// against a second implementation is worth nothing until it is shown to
+    /// fail: two functions that agree because neither does anything pass every
+    /// case above. Widening one span by a single instance must be caught.
+    #[test]
+    fn the_differential_test_catches_a_span_off_by_one() {
+        let tags = jumbled();
+        let (order, spans) =
+            arrange(tags.iter().cloned().enumerate().map(|(i, t)| placed(i, t)).collect());
+        let count = order.len() as u32;
+        // **One building culled and the other fully reachable**, so a span that
+        // is a little too big or a little too small changes the answer whichever
+        // way it errs. Both culled and the widened case eats an instance that
+        // was hidden anyway -- which is how the first version of this test
+        // passed while measuring nothing.
+        let walks = vec![
+            (PlacementId(1), vec![false; 10]),
+            (PlacementId(2), vec![true; 5]),
+        ];
+        assert_eq!(
+            drawn(&runs_of(&spans, count, &walks)),
+            oracle(&order, &tags, &walks),
+            "the unbroken case has to pass first"
+        );
+
+        // One instance too few: it falls into the gap between spans, and a gap
+        // is drawn unconditionally. A barrel appears in a room nobody is in.
+        let mut narrowed = spans.clone();
+        let shrink = narrowed
+            .iter()
+            .position(|s| s.building == PlacementId(1) && s.count > 1)
+            .expect("a culled span holding more than one placement");
+        narrowed[shrink].count -= 1;
+        assert_ne!(
+            drawn(&runs_of(&narrowed, count, &walks)),
+            oracle(&order, &tags, &walks),
+            "a span one instance short must be caught"
+        );
+
+        // One instance too many: the last culled span swallows the first
+        // placement of a room that *is* reachable, and a barrel goes missing.
+        let mut widened = spans.clone();
+        let grow = widened
+            .iter()
+            .rposition(|s| s.building == PlacementId(1))
+            .expect("a culled span");
+        widened[grow].count += 1;
+        assert_ne!(
+            drawn(&runs_of(&widened, count, &walks)),
+            oracle(&order, &tags, &walks),
+            "a span one instance long must be caught"
+        );
+    }
+
+    /// **The safety property.** Whatever the walks say, room culling only ever
+    /// removes instances -- it can never draw one that drawing everything would
+    /// not have drawn, and with no walks at all it removes none.
+    #[test]
+    fn culling_only_ever_removes_and_never_adds() {
+        let tags = jumbled();
+        let (order, spans) =
+            arrange(tags.iter().cloned().enumerate().map(|(i, t)| placed(i, t)).collect());
+        let all: Vec<u32> = (0..order.len() as u32).collect();
+        assert_eq!(
+            drawn(&runs_of(&spans, order.len() as u32, &[])),
+            all,
+            "nothing walked must draw every instance"
+        );
+        let walks = vec![
+            (PlacementId(1), vec![false, true, false, false, false, false, false, false, false, false]),
+            (PlacementId(2), vec![false; 5]),
+        ];
+        let kept = drawn(&runs_of(&spans, order.len() as u32, &walks));
+        assert!(kept.len() < all.len(), "this mask has to cull something");
+        assert!(kept.iter().all(|i| all.contains(i)));
+        assert!(kept.windows(2).all(|w| w[0] < w[1]), "runs stay in order");
+    }
+
+    /// A group nothing claims -- a tile's trees, a creature, a building itself
+    /// -- yields the single whole-range draw the pass has always issued, and it
+    /// does so with the walks non-empty, which is the case that could regress.
+    #[test]
+    fn a_group_with_no_rooms_is_one_draw_of_everything() {
+        let walks = vec![(PlacementId(1), vec![false; 10])];
+        assert_eq!(runs_of(&[], 12, &walks), vec![0..12]);
+        assert_eq!(runs_of(&[], 0, &walks), Vec::new());
+    }
+
+    /// Adjacent survivors merge, so a building whose rooms are all reachable
+    /// costs one draw and not one per room. The count of draws is the entire
+    /// point of the sort in [`arrange`], and it is asserted rather than assumed.
+    #[test]
+    fn adjacent_visible_runs_collapse_into_one_draw() {
+        let spans = vec![
+            RoomSpan { building: PlacementId(1), rooms: vec![0], start: 0, count: 3 },
+            RoomSpan { building: PlacementId(1), rooms: vec![1], start: 3, count: 3 },
+            RoomSpan { building: PlacementId(1), rooms: vec![2], start: 6, count: 3 },
+        ];
+        let all_visible = vec![(PlacementId(1), vec![true; 3])];
+        assert_eq!(runs_of(&spans, 9, &all_visible), vec![0..9]);
+        let middle_gone = vec![(PlacementId(1), vec![true, false, true])];
+        assert_eq!(runs_of(&spans, 9, &middle_gone), vec![0..3, 6..9]);
+        let none = vec![(PlacementId(1), vec![false; 3])];
+        assert!(runs_of(&spans, 9, &none).is_empty());
+    }
+
+    /// A doodad several rooms claim is drawn if *any* of them is reachable --
+    /// a barrel in a doorway belongs to the rooms on both sides of it.
+    #[test]
+    fn a_doodad_two_rooms_claim_survives_either_of_them() {
+        let spans = vec![RoomSpan {
+            building: PlacementId(1),
+            rooms: vec![4, 9],
+            start: 0,
+            count: 1,
+        }];
+        assert_eq!(
+            runs_of(&spans, 1, &[(PlacementId(1), vec![false; 10])]).len(),
+            0
+        );
+        for reachable in [4usize, 9] {
+            let mut rooms = vec![false; 10];
+            rooms[reachable] = true;
+            assert_eq!(runs_of(&spans, 1, &[(PlacementId(1), rooms)]), vec![0..1]);
+        }
+    }
+
+    /// The sort is what turns a room into a range. Untagged placements come
+    /// first and get no span, and each distinct room becomes exactly one run
+    /// however scattered its placements were in the file.
+    #[test]
+    fn arrange_gathers_each_room_into_one_run() {
+        let tags = vec![
+            tag(1, &[2]),
+            None,
+            tag(1, &[0]),
+            tag(2, &[0]),
+            tag(1, &[2]),
+            None,
+            tag(1, &[0]),
+        ];
+        let (order, spans) =
+            arrange(tags.iter().cloned().enumerate().map(|(i, t)| placed(i, t)).collect());
+        assert_eq!(
+            order.iter().map(original).collect::<Vec<_>>(),
+            vec![1, 5, 2, 6, 0, 4, 3],
+            "untagged first, then by building and room, stable within each"
+        );
+        assert_eq!(spans.len(), 3, "one run per distinct room: {spans:?}");
+        assert_eq!((spans[0].start, spans[0].count), (2, 2));
+        assert_eq!((spans[1].start, spans[1].count), (4, 2));
+        assert_eq!((spans[2].start, spans[2].count), (6, 1));
+        assert_eq!(spans[2].building, PlacementId(2));
+    }
+
+    /// Every instance of a group with no tags at all is left alone -- no spans,
+    /// and the transforms in the order they arrived. This is the ordinary tile
+    /// of trees, and reordering it would move every particle seed for nothing.
+    #[test]
+    fn a_tile_of_scatter_is_not_reordered() {
+        let (order, spans) = arrange((0..8).map(|i| placed(i, None)).collect());
+        assert!(spans.is_empty());
+        assert_eq!(
+            order.iter().map(original).collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
     }
 }
 

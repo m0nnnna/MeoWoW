@@ -1384,6 +1384,32 @@ enum WmoCommand {
         #[arg(long, default_value_t = 8)]
         limit: usize,
     },
+    /// Ask which room each interior doodad belongs to: `MODR`, read against
+    /// the group boxes it claims to fill.
+    ///
+    /// **The question is what `MODR`'s `u16` indexes**, and every candidate
+    /// parses. A group's doodad refs could name the whole `MODD` array, or the
+    /// doodad *set* the placement chose, and on the overwhelming majority of
+    /// buildings -- one set, starting at zero -- those are the same number.
+    /// A reading that is wrong by a set start therefore looks perfect on
+    /// almost every sample and puts the wrong barrels in the wrong rooms in a
+    /// city, which is precisely where it matters.
+    ///
+    /// So the check is geometric rather than arithmetic: a doodad a room
+    /// claims should be **inside that room's bounding box**. Printed against
+    /// two deliberately wrong readings -- the same list shifted by one, and
+    /// the same list read as set-relative -- because a containment rate with
+    /// nothing beside it is not evidence. The population that can separate the
+    /// last pair is counted separately for the same reason: a tie reported by
+    /// samples incapable of answering is not a tie.
+    DoodadRooms {
+        filter: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// How many buildings to list individually.
+        #[arg(long, default_value_t = 6)]
+        show: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -11003,6 +11029,11 @@ fn wmo_cmd(chain: &mut Chain, cmd: WmoCommand) -> Result<()> {
         WmoCommand::Survey { filter, limit } => wmo_survey(chain, filter.as_deref(), limit),
         WmoCommand::Footing { filter, limit } => wmo_footing(chain, filter.as_deref(), limit),
         WmoCommand::Portals { path, limit } => wmo_portals(chain, &path, limit),
+        WmoCommand::DoodadRooms {
+            filter,
+            limit,
+            show,
+        } => wmo_doodad_rooms(chain, filter.as_deref(), limit, show),
     }
 }
 
@@ -11630,6 +11661,217 @@ fn wmo_survey(chain: &mut Chain, filter: Option<&str>, limit: Option<usize>) -> 
             println!("  {count:>7}  {kind}\n           e.g. {example}");
         }
     }
+    Ok(())
+}
+
+/// Which room owns which interior doodad, and whether `MODR` says so.
+/// See [`WmoCommand::DoodadRooms`].
+fn wmo_doodad_rooms(
+    chain: &mut Chain,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    show: usize,
+) -> Result<()> {
+    let needle = filter.map(str::to_lowercase);
+    let roots: Vec<String> = chain
+        .list()?
+        .into_iter()
+        .filter(|n| {
+            let l = n.to_lowercase();
+            l.ends_with(".wmo")
+                && !wmo::is_group_path(&l)
+                && needle.as_ref().is_none_or(|f| l.contains(f.as_str()))
+        })
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+
+    /// Whether `point` is inside `bounds` grown by `slack` on every side.
+    fn within(bounds: ([f32; 3], [f32; 3]), point: [f32; 3], slack: f32) -> bool {
+        (0..3).all(|k| point[k] >= bounds.0[k] - slack && point[k] <= bounds.1[k] + slack)
+    }
+
+    // The reading under test, and two deliberately wrong ones. A containment
+    // rate on its own says only that doodads are somewhere in the building.
+    let (mut exact, mut near, mut outside) = (0u64, 0u64, 0u64);
+    let (mut shift_in, mut shift_out) = (0u64, 0u64);
+    let (mut rel_in, mut rel_out) = (0u64, 0u64);
+    // The floor. `MODD` is written room by room, so the neighbour of a doodad
+    // is usually in the same room and an off-by-one lands in the right box
+    // anyway -- 96.6% of the time in Ironforge, which makes that control
+    // nearly useless on its own. Half an array away is decorrelated from the
+    // ordering and still deterministic, so it says what "no relationship at
+    // all" scores on this same test.
+    let (mut far_in, mut far_out) = (0u64, 0u64);
+    // How many buildings could tell the global reading from the set-relative
+    // one at all: a set starting at zero makes the two the same number.
+    let (mut separating, mut with_refs) = (0usize, 0usize);
+    let (mut dangling, mut refs_total) = (0u64, 0u64);
+    // A doodad may be named by several rooms, or by none at all -- the
+    // exterior scatter a building carries outside its own walls.
+    let (mut once, mut shared, mut orphan) = (0u64, 0u64, 0u64);
+    let mut worst_gap = 0.0f32;
+    let mut listed = 0usize;
+    // **The two conditions a doodad has to meet before a room's visibility may
+    // be inherited onto it**, counted here because the second one is what a
+    // Stormwind courtyard camera found by drawing 12,700 pixels of missing
+    // tree. A group's bounding box bounds its *geometry*; nothing says a
+    // doodad it claims is inside it, and an exterior group claims the trees
+    // scattered over half a district.
+    let (mut interior_refs, mut exterior_refs) = (0u64, 0u64);
+    let (mut cullable, mut not_cullable) = (0u64, 0u64);
+
+    for (i, name) in roots.iter().enumerate() {
+        let Ok(bytes) = chain.read(name) else { continue };
+        let Ok(root) = wmo::Root::parse(&bytes) else {
+            continue;
+        };
+        if root.doodads.is_empty() || root.header.group_count == 0 {
+            continue;
+        }
+        let names = wmo::Chunks::find(&bytes, b"MOGN").unwrap_or(&[]).to_vec();
+        // Set starts above zero are what makes the set-relative reading a
+        // different claim from the global one.
+        let starts: Vec<u32> = root
+            .doodad_sets
+            .iter()
+            .map(|s| s.start)
+            .filter(|s| *s > 0)
+            .collect();
+        let mut times_named = vec![0usize; root.doodads.len()];
+        let (mut root_exact, mut root_refs) = (0u64, 0u64);
+
+        for gi in 0..root.header.group_count as usize {
+            let Ok(gbytes) = chain.read(&wmo::group_path(name, gi)) else {
+                continue;
+            };
+            let Ok(group) = wmo::Group::parse(&gbytes, &names) else {
+                continue;
+            };
+            let box_ = group.bounding_box;
+            for r in &group.doodad_refs {
+                refs_total += 1;
+                root_refs += 1;
+                let index = usize::from(*r);
+                let Some(doodad) = root.doodads.get(index) else {
+                    dangling += 1;
+                    continue;
+                };
+                if let Some(slot) = times_named.get_mut(index) {
+                    *slot += 1;
+                }
+                let p = doodad.position;
+                let inside = within(box_, p, 1.0);
+                let interior = root
+                    .groups
+                    .get(gi)
+                    .is_some_and(wmo::GroupInfo::is_interior);
+                if interior {
+                    interior_refs += 1;
+                } else {
+                    exterior_refs += 1;
+                }
+                if interior && inside {
+                    cullable += 1;
+                } else {
+                    not_cullable += 1;
+                }
+                if within(box_, p, 0.0) {
+                    exact += 1;
+                    root_exact += 1;
+                } else if inside {
+                    near += 1;
+                } else {
+                    outside += 1;
+                    let gap = (0..3)
+                        .map(|k| (box_.0[k] - p[k]).max(p[k] - box_.1[k]).max(0.0))
+                        .fold(0.0f32, f32::max);
+                    worst_gap = worst_gap.max(gap);
+                }
+                // Control one: the same list off by a single entry, which is
+                // the mistake a stride or a base pointer makes.
+                match root.doodads.get(index + 1) {
+                    Some(d) if within(box_, d.position, 1.0) => shift_in += 1,
+                    _ => shift_out += 1,
+                }
+                // Control two: a doodad half the array away, which is what an
+                // index bearing no relation to the room would score.
+                match root.doodads.get((index + root.doodads.len() / 2) % root.doodads.len()) {
+                    Some(d) if within(box_, d.position, 1.0) => far_in += 1,
+                    _ => far_out += 1,
+                }
+                // Control three: read as an offset into the chosen doodad set
+                // rather than into the whole array.
+                for start in &starts {
+                    match root.doodads.get(index + *start as usize) {
+                        Some(d) if within(box_, d.position, 1.0) => rel_in += 1,
+                        _ => rel_out += 1,
+                    }
+                }
+            }
+        }
+
+        if root_refs > 0 {
+            with_refs += 1;
+            if !starts.is_empty() {
+                separating += 1;
+            }
+        }
+        for n in &times_named {
+            match n {
+                0 => orphan += 1,
+                1 => once += 1,
+                _ => shared += 1,
+            }
+        }
+        if root_refs > 0 && listed < show {
+            listed += 1;
+            println!(
+                "  {name}\n    {} group(s), {} doodad(s) in {} set(s), {root_refs} ref(s), \
+                 {root_exact} inside the room that names them",
+                root.header.group_count,
+                root.doodads.len(),
+                root.doodad_sets.len()
+            );
+        }
+        if i % 500 == 499 {
+            tracing::info!("{}/{} objects", i + 1, roots.len());
+        }
+    }
+
+    let placed = exact + near + outside;
+    let pct = |n: u64, d: u64| if d == 0 { 0.0 } else { n as f64 * 100.0 / d as f64 };
+    println!("\n{refs_total} MODR reference(s) over {with_refs} building(s)");
+    println!(
+        "  as an index into MODD: {exact} inside the room's box, {near} within a unit of it, \
+         {outside} outside ({:.1}% placed, worst {worst_gap:.1} units)",
+        pct(exact + near, placed)
+    );
+    println!(
+        "  shifted by one:        {shift_in} inside / {shift_out} outside ({:.1}% placed)",
+        pct(shift_in, shift_in + shift_out)
+    );
+    println!(
+        "  half the array away:   {far_in} inside / {far_out} outside ({:.1}% placed) -- the floor",
+        pct(far_in, far_in + far_out)
+    );
+    println!(
+        "  read as set-relative:  {rel_in} inside / {rel_out} outside ({:.1}% placed), \
+         over the {separating} building(s) whose sets do not start at zero",
+        pct(rel_in, rel_in + rel_out)
+    );
+    println!("  {dangling} reference(s) name no doodad at all");
+    println!(
+        "
+  claimed by a room flagged interior: {interior_refs}, by an exterior group:          {exterior_refs}"
+    );
+    println!(
+        "  interior AND inside the box that claims it: {cullable} ({:.1}%),          {not_cullable} not -- those inherit no room's visibility",
+        pct(cullable, cullable + not_cullable)
+    );
+    println!(
+        "\ndoodads: {once} named by exactly one room, {shared} by several, \
+         {orphan} by none (a building's exterior scatter)"
+    );
     Ok(())
 }
 
