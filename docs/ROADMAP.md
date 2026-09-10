@@ -8602,3 +8602,79 @@ profile.
 * **`--screenshot` is still not perfectly reproducible.** Tile draw order is
   sorted now, but `World::update_emitters` reads a wall clock, leaving about
   76 pixels differing at delta <= 2 between runs.
+
+## Confirming the portal rung at the window, and the 17-second frame
+
+Two hundred and nineteen seconds in Ironforge, Stormwind and Elwynn, with the
+ordinary double-click launch teeing its per-frame breakdown to a file. **The
+log was read rather than a re-run requested** -- the rule from the indoor
+collision rung, applied to the rung that came after it.
+
+| segment | frames | median worst-frame | p90 | median fps | walked & eye inside |
+|---|---|---|---|---|---|
+| login / Northshire | 32 | 9.6 ms | 26.8 | 160 | 32/32 |
+| Ironforge | 103 | 11.3 ms | 23.2 | 140 | 103/103 |
+| Stormwind | 62 | 10.3 ms | 15.6 | 144 | 51/62 |
+| Elwynn / Goldshire | 16 | 13.6 ms | 50.1 | 102 | 0/16 |
+
+Indoors the walk reported `1 building(s) walked of which 1 had the eye inside`
+on **every** row, and never once `Undecided` while genuinely inside. Outdoors
+it reported `0/0` with `inside buildings nobody is in` at 14 to 90 -- the older
+interiors rule picking up exactly where the walk stops. **That handoff between
+the two rules is the thing no static probe can show**, and it is clean. The
+report from the window was *"nothing was missing"*, which is the only failure
+mode culling has: it decides which draws are issued, never what a draw samples.
+
+### The city is no longer where the cost is
+
+Ironforge was 13 fps before 4.34 and is now the **fastest** of the three at 140
+median. **Outdoor Elwynn is the slowest at 102**, and draws more (1,944-2,335)
+than Ironforge does (~1,000-1,700). Every rung from 4.34 onwards aimed at
+cities because that is where the frame collapsed; it does not collapse there
+any more, and the next frame-time question is a different place entirely.
+
+### A 17.3-second frame, and what named it
+
+The same log carried one frame of **17,362 ms**. The split buckets 4.34
+introduced named it with no guessing at all:
+
+```
+redraw 17361.6: ui 17346.5 = snapshot 17343.0
+  (target 0.0, markers 0.0, bars 0.0, panels 17342.7, map 0.2, windows 0.1)
+```
+
+The line before it is `trainer 0xf13... teaches 86 spell(s)`.
+`Spellbook::resolve_extra` read and parsed four DBCs per call -- `Spell.dbc` at
+49,871 records of 936 bytes plus 12.8 MB of strings, `SpellIcon`,
+`SpellDuration`, `SpellRadius` -- and the trainer snapshot called it once per
+offered row. Bengus Deepforge offers 86.
+
+**The arithmetic settles that this is the whole cost and not part of it**: the
+same four tables are read once at login and that is logged at 231 ms, and
+86 x 231 ms is 19.9 s against a measured 17.3. No hypothesis was spent.
+
+The premise that failed is in the old doc comment -- *"there are only ever a
+handful of them in one session"* -- true of an item's on-use spell, discovered
+one at a time on hover, and false of a trainer list, which asks for every row
+at once. The same comment named the trainer case two lines above it.
+
+`resolve_extra_all` walks the tables once for a whole list. Batching rather
+than caching them on the book is deliberate: `Spell.dbc` is around 60 MB
+parsed, and holding it resident for the session to save a hover trades a hitch
+nobody sees for memory everybody pays.
+
+**The count of spells was never the bug.** Trainer template 201004 has exactly
+86 rows and `CMSG_TRAINER_LIST` carries only a guid, so the server sends all 86
+and the client cannot ask for fewer -- nor should it, since the window draws
+the unlearnable ones greyed out on purpose.
+
+### What this rung added to the instrument box
+
+* **`mpq::Chain::reads()`**, a lifetime count of archive reads. The regression
+  test asserts that count rather than a duration, and was verified by breaking
+  it: the old per-id shape reads **32 against 4** for eight spells. It asserts
+  the resolved names too, because a batch that did nothing would also read
+  nothing.
+* **`fps avg` reported 128 straight through the freeze.** An average cannot
+  see a stall, and the worst-frame line is the only reason this was found at
+  all.
