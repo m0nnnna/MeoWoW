@@ -1534,15 +1534,22 @@ impl World {
                 ));
         }
 
-        for (path, set, parent) in wmo_placements {
-            let Some(model) = self.model(gpu, meshes, chain, &path) else {
-                continue;
-            };
-            let Some(doodads) = model.doodads.get(set) else {
-                continue;
-            };
-            for doodad in doodads {
-                groups.entry(doodad.path.clone()).or_default().push(parent * doodad.transform);
+        // `--max-doodads 0` means *no doodads at all*, which has to include a
+        // building's interior set: in a city that is where nearly every doodad
+        // draw is (Ironforge, 299 of 357), so an instrument that dropped only
+        // the tile scatter would bound the wrong thing. The buildings
+        // themselves are already in `groups` from the loop above.
+        if self.max_doodads > 0 {
+            for (path, set, parent) in wmo_placements {
+                let Some(model) = self.model(gpu, meshes, chain, &path) else {
+                    continue;
+                };
+                let Some(doodads) = model.doodads.get(set) else {
+                    continue;
+                };
+                for doodad in doodads {
+                    groups.entry(doodad.path.clone()).or_default().push(parent * doodad.transform);
+                }
             }
         }
 

@@ -300,12 +300,16 @@ pub fn load(
                     loaded.draws.len(),
                 );
                 let transforms: Vec<Mat4> = placements.iter().map(|(transform, _)| *transform).collect();
-                for (parent, set) in &placements {
-                    let Some(doodads) = loaded.doodads.get(*set) else {
-                        continue;
-                    };
-                    for doodad in doodads {
-                        doodad_groups.entry(doodad.path.clone()).or_default().push(*parent * doodad.transform);
+                // `--max-doodads 0` means no doodads at all -- the building's
+                // interior set included, the same as the streaming path.
+                if max_doodads > 0 {
+                    for (parent, set) in &placements {
+                        let Some(doodads) = loaded.doodads.get(*set) else {
+                            continue;
+                        };
+                        for doodad in doodads {
+                            doodad_groups.entry(doodad.path.clone()).or_default().push(*parent * doodad.transform);
+                        }
                     }
                 }
                 object_instances += transforms.len();

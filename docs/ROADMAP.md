@@ -8435,6 +8435,39 @@ profile.
   the eye is inside the building's box and the frustum, not the distance, is
   what bounds a room. That is exactly why `--interior-cull` cannot help in a
   city and portal culling is the only thing that can.
+
+  **And now that portal culling has taken the buildings, the doodads it left
+  behind are the biggest single piece of a city's draw cost.** `--max-doodads
+  0` drops every doodad -- a building's own interior set included, which it
+  used to spare (299 of Ironforge's 357), so as an instrument it had been
+  bounding the wrong thing. Benched inside Ironforge at noon, drawing to 397,
+  the portal walk on, `--bench 300` (min):
+
+      357 doodads:  record 0.25 | finish 0.60 | submit 0.08 ms   GPU 1.24 ms
+        0 doodads:  record 0.10 | finish 0.17 | submit 0.04 ms   GPU 0.46 ms
+
+  So the 357 cost **~0.6 ms of CPU and ~0.8 ms of GPU** -- roughly 60% of
+  what is left of the model draw once the buildings are down from 731 to 128,
+  and the GPU half matters because in a city the GPU is the slower side. They
+  are close to pure waste: the doodad count does not move with `--portal-depth`
+  at all (357 at depth 0, 357 at depth 99), because doodads are merged per tile
+  by path and carry no room. `group.doodad_refs` (`MODR`) is already parsed and
+  says which room each one belongs to; keying them to rooms the way the
+  building parts already are would recover most of the 0.6 / 0.8. At
+  `--portal-depth 0` the eye's own room holds 35 building parts of 731, so on
+  the same distribution ~85% of the doodads are in rooms the walk has already
+  discarded. **This is the biggest remaining frame win, and it is the portal
+  walk's own data.**
+
+  **Distance-dropping outdoor scatter is a smaller, separate lever, and it
+  was bounded too.** A forested Elwynn camera carries 309 doodads with no room
+  anywhere near, and all of them cost the same ~0.5 ms CPU / ~0.75 ms GPU as
+  the city case. But sweeping the far plane from 397 to 200 floors the count
+  at ~136 -- the near doodads a distance rule would keep regardless -- so only
+  ~170 are far scatter, worth about **0.2 ms CPU / 0.3 ms GPU**, and an
+  `environmentDetail`-style rule that spared the big trees would address less
+  than that. Not a milestone on its own; a cheap addition if a room-based
+  doodad cull is built anyway.
 * **A fixed-cost spike of 43 to 48 ms**, two or three per run, present at every
   crowd size and therefore not a load problem. Almost certainly tile streaming
   or a first-time model load. It is the only thing in the profile that does not
