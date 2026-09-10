@@ -661,6 +661,11 @@ pub fn load_dressed_with(
     let phase = Instant::now();
     let mut indices: Vec<u32> = Vec::new();
     let mut draws: Vec<Draw> = Vec::new();
+    let available_geosets: Vec<u32> = skin
+        .submeshes()
+        .iter()
+        .map(|submesh| u32::from(submesh.id))
+        .collect();
     for batch in skin.batches() {
         let Some(submesh) = skin.submeshes().get(batch.submesh_index as usize) else {
             continue;
@@ -669,7 +674,7 @@ pub fn load_dressed_with(
         // expects the client to pick. Skipped here rather than drawn with a
         // transparent material: an unwanted geoset costs a draw call and
         // overlapping geometry either way.
-        if look.is_some_and(|look| !look.shows(u32::from(submesh.id))) {
+        if look.is_some_and(|look| !look.shows_for_model(u32::from(submesh.id), &available_geosets)) {
             continue;
         }
         let Some(resolved) = skin.submesh_indices(submesh) else {

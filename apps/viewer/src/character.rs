@@ -189,6 +189,20 @@ impl Look {
         // reads equipment.
         variant == 1
     }
+
+    pub(crate) fn shows_for_model(&self, id: u32, available: &[u32]) -> bool {
+        if id == 0 || self.geosets.contains(&id) || id == NECK_PATCH {
+            return true;
+        }
+        let (group, variant) = (id / 100, id % 100);
+        if MANAGED_GROUPS.contains(&group) || self.decided_groups.contains(&group) {
+            return false;
+        }
+        if group == 7 && available.contains(&702) {
+            return variant == 2;
+        }
+        self.shows(id)
+    }
 }
 
 /// The scrap of *body* that closes the back of the neck.
@@ -1787,6 +1801,20 @@ mod tests {
         for id in [1502, 1503, 1504, 1505, 1506] {
             assert!(!look.shows(id), "geoset {id} is a cloak nobody owns");
         }
+    }
+
+    #[test]
+    fn a_model_native_default_replaces_the_generic_variant_when_present() {
+        let look = look_with(vec![0]);
+        assert!(look.shows_for_model(702, &[702]));
+        assert!(!look.shows_for_model(701, &[701, 702]));
+    }
+
+    #[test]
+    fn a_model_without_native_default_keeps_the_existing_variant() {
+        let look = look_with(vec![0]);
+        assert!(look.shows_for_model(701, &[701]));
+        assert!(!look.shows_for_model(702, &[701]));
     }
 
     /// A character wearing a cloak still has a neck.
