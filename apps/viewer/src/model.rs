@@ -715,9 +715,13 @@ pub fn prepare_dressed_with(
                 textures.push(t);
             }
             None => {
-                missing_textures.push(
+                // Kept by slot index for now: whether an unresolved slot is
+                // a *problem* is decided below, once the batches have said
+                // which slots anything drawn actually reads.
+                missing_textures.push((
+                    textures.len(),
                     file.unwrap_or_else(|| format!("<runtime slot type {}>", def.kind)),
-                );
+                ));
                 textures.push(PreparedTexture::Missing);
             }
         }
@@ -813,6 +817,21 @@ pub fn prepare_dressed_with(
         });
         indices.extend_from_slice(&resolved);
     }
+
+    // An unresolved slot nothing draws from is not a missing texture. A
+    // character model carries a cape slot (runtime type 2) whether or not the
+    // wearer owns a cloak, and the cloak geosets are hidden for the ones who
+    // do not -- so the slot is empty *and* unread. Reporting it anyway is how
+    // `foss-wow#122` came to say twenty of twenty-eight Elwynn humanoids drew
+    // white: measured, 0 of the two it named carry a back item, and their
+    // picture had nothing white in it. Only a slot a surviving draw indexes
+    // counts, which is the one case where the placeholder reaches the screen.
+    let read_slots: BTreeSet<usize> = draws.iter().map(|d| d.texture).collect();
+    let missing_textures: Vec<String> = missing_textures
+        .into_iter()
+        .filter(|(slot, _)| read_slots.contains(slot))
+        .map(|(_, name)| name)
+        .collect();
 
     // Opaque first so the depth buffer is populated before anything blends
     // against it. Within each group the authored order is kept: M2 batches are

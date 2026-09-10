@@ -844,8 +844,9 @@ pub struct NpcAppearances {
     sections: Option<CharSections>,
     hair_geosets: Option<CharHairGeosets>,
     facial: Option<CharacterFacialHairStyles>,
-    /// For the geometry an NPC's gear switches on. Its *textures* are already
-    /// in the baked skin, so this is read for geosets alone.
+    /// For the geometry an NPC's gear switches on, and for the one texture
+    /// the bake cannot carry: a cloak is painted from its item, not into the
+    /// skin. Everything else the gear paints is already in the bake.
     items: Option<dbc::schema::ItemDisplayInfo>,
 }
 
@@ -968,11 +969,21 @@ impl NpcAppearances {
             }
         }
 
+        // The one texture an NPC's gear supplies that the bake does not:
+        // a cloak is its own sheet of geometry painted from the item, never
+        // part of the body skin. 1,280 of 15,475 extra rows carry a back
+        // item and every one resolves to a readable cape texture, so this is
+        // the same lookup the player path makes, on the same column.
+        let cape = self
+            .items
+            .as_ref()
+            .and_then(|items| cape_texture(items, &equipment));
+
         Some(Look {
             skin: None,
             body,
             hair,
-            cape: None,
+            cape,
             geosets: geosets.into_iter().chain(worn).collect(),
             decided_groups: decided,
             // Empty, and not for want of data: `NPC_ITEM_SLOTS` carries no
@@ -1865,5 +1876,80 @@ mod tests {
         other.skin = 4;
         assert_ne!(base.key(), other.key());
         assert_eq!(base.key(), base.key());
+    }
+
+    /// An NPC's cloak comes off its back-item column, and an NPC without one
+    /// has no cloak to paint (`foss-wow#122`).
+    ///
+    /// The ticket said twenty of twenty-eight Elwynn humanoids drew runtime
+    /// slot 2 white. Measured: 1,280 of 15,475 extra rows carry a back item,
+    /// every one resolves to a readable cape texture -- and neither display
+    /// the ticket named is among them. Those two were never white; the slot
+    /// was empty and unread, and the warning counted it anyway. The ones that
+    /// *were* white are the 1,280, and display 3016 is one of them.
+    ///
+    /// Both halves asserted: a cloak resolved for the wearer, and none
+    /// invented for the display that has no back item, since `for_kind` used
+    /// to fall a type-2 slot back to variation zero and a wrong fallback here
+    /// paints a guard's cloak with his own skin.
+    #[test]
+    fn npc_cape_comes_from_the_back_item_and_only_then() {
+        use dbc::schema::{CreatureDisplayInfo, CreatureDisplayInfoExtra};
+        let Some(data) = std::env::var_os("WOW_DATA") else {
+            eprintln!("skipping: WOW_DATA not set");
+            return;
+        };
+        let mut chain = Chain::open_wow_data(data, "enUS").expect("opening archives");
+        let displays = CreatureDisplayInfo::parse(&chain.read(CreatureDisplayInfo::PATH).unwrap()).unwrap();
+        let extras = CreatureDisplayInfoExtra::parse(&chain.read(CreatureDisplayInfoExtra::PATH).unwrap()).unwrap();
+        let items = ItemDisplayInfo::parse(&chain.read(ItemDisplayInfo::PATH).unwrap()).unwrap();
+
+        let (mut rows, mut with_back, mut resolved, mut textured, mut readable) = (0, 0, 0, 0, 0);
+        let mut missing_files = std::collections::BTreeMap::<String, usize>::new();
+        for row in extras.iter() {
+            rows += 1;
+            let back = row.item_display_10();
+            if back == 0 { continue; }
+            with_back += 1;
+            let Some(item) = items.iter().find(|r| r.id() == back) else { continue };
+            resolved += 1;
+            let tex = item.model_texture_left();
+            if tex.is_empty() { continue; }
+            textured += 1;
+            let path = format!(r"Item\ObjectComponents\Cape\{tex}.blp");
+            if chain.read(&path).is_ok() { readable += 1; } else { *missing_files.entry(path).or_default() += 1; }
+        }
+        println!("CreatureDisplayInfoExtra rows {rows}: back item set {with_back}, resolving to ItemDisplayInfo {resolved}, naming a texture {textured}, texture readable {readable}");
+        for (p, n) in &missing_files { println!("  unreadable x{n}: {p}"); }
+
+        // A few displays that *do* wear a cloak, for the render to be checked
+        // against by hand.
+        let cloaked: Vec<u32> = displays
+            .iter()
+            .filter(|d| {
+                extras.iter().any(|e| e.id() == d.extended_display_info_id() && e.item_display_10() != 0)
+            })
+            .map(|d| d.id())
+            .take(5)
+            .collect();
+        println!("cloaked displays: {cloaked:?}");
+        assert!(with_back > 1000, "the back column should be populated");
+        assert_eq!(textured, readable, "every named cape texture should read");
+
+        let npcs = NpcAppearances::load(&mut chain).expect("NPC tables");
+        let cloaked_look = npcs.look(3016).expect("display 3016 is a dressed humanoid");
+        let cape = cloaked_look.cape.as_deref().expect("display 3016 wears a cloak");
+        assert!(cape.starts_with(r"Item\ObjectComponents\Cape\"), "{cape}");
+        assert!(chain.read(cape).is_ok(), "{cape} should read");
+        let bare_look = npcs.look(1859).expect("display 1859 is a dressed humanoid");
+        assert!(bare_look.cape.is_none(), "display 1859 has no back item");
+
+        // The Elwynn display ids the ticket named, through the display table.
+        let elwynn = [3251u32, 1859];
+        for d in elwynn {
+            let ext = displays.iter().find(|r| r.id() == d).map(|r| r.extended_display_info_id()).unwrap_or(0);
+            let back = extras.iter().find(|r| r.id() == ext).map(|r| r.item_display_10()).unwrap_or(0);
+            println!("display {d}: extra {ext}, back item display {back}");
+        }
     }
 }
