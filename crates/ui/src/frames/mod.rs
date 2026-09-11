@@ -39,6 +39,7 @@ pub mod taxi;
 pub mod tracker;
 pub mod trade;
 pub mod mail;
+pub mod mail_compose;
 pub mod trainer;
 pub mod unit;
 pub mod vendor;
@@ -67,6 +68,7 @@ pub use trade::{
     TradeClick, TradeOfferAnswer, TradeOfferView, TradeSquare, TradeSquareItem, TradeView,
 };
 pub use mail::{MailAttachment, MailRow, MailRowState, MailView};
+pub use mail_compose::{MailComposeClick, MailComposeField, MailComposeView};
 pub use trainer::{TrainerRow, TrainerRowState, TrainerView};
 pub use unit::UnitView;
 pub use vendor::{VendorRow, VendorView};

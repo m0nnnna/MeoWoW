@@ -348,6 +348,17 @@ impl Minimap {
             outline: Vec::new(),
         });
 
+        // The bezel and the arrow. Uploaded through the same path-keyed cache
+        // the tiles use, so they cost one archive read for the session and a
+        // HashMap hit every frame after. `None` with no installation, and the
+        // frame falls back to its stroked circle and hand-drawn polygon.
+        let border = self
+            .art(gpu, renderer, chain, BORDER_ART)
+            .map(|art| art.texture);
+        let arrow = self
+            .art(gpu, renderer, chain, ARROW_ART)
+            .map(|art| art.texture);
+
         ui::MinimapView {
             title: name,
             // **"No art here" and "nothing here" are different statements.**
@@ -359,9 +370,19 @@ impl Minimap {
                 .then(|| format!("no minimap art for {map_directory}")),
             tiles,
             markers,
+            border,
+            arrow,
         }
     }
 }
+
+/// The bezel that frames the disc. A 256x256 texture whose ring is offset
+/// within it; the frame lines the ring's opening up with the disc and clips
+/// the rest -- see `Style::minimap_border_scale`.
+const BORDER_ART: &str = r"Interface\Minimap\UI-MINIMAP-BORDER.blp";
+/// The player arrow, 32x32, pointing north. Rotated by the same `facing` the
+/// fallback polygon uses.
+const ARROW_ART: &str = r"Interface\Minimap\MinimapArrow.blp";
 
 #[cfg(test)]
 mod tests {

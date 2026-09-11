@@ -57,13 +57,14 @@ pub enum ElementId {
     Trade,
     TradeOffer,
     Mailbox,
+    MailCompose,
     Guild,
     Auction,
     Tracker,
 }
 
 impl ElementId {
-    pub const ALL: [ElementId; 28] = [
+    pub const ALL: [ElementId; 29] = [
         ElementId::PlayerFrame,
         ElementId::TargetFrame,
         ElementId::ChatFrame,
@@ -89,6 +90,7 @@ impl ElementId {
         ElementId::Trade,
         ElementId::TradeOffer,
         ElementId::Mailbox,
+        ElementId::MailCompose,
         ElementId::Guild,
         ElementId::Auction,
         ElementId::Tracker,
@@ -170,6 +172,11 @@ impl ElementId {
             // is, and one sealed under the map is a mailbox nobody can
             // empty.
             | ElementId::Mailbox
+            // With the inbox it is opened beside: the compose form is the
+            // answer to a click on that window's "Send Mail" button, and it
+            // is being read alongside the bags while items are chosen. One
+            // sealed under a panel is a letter the player cannot finish.
+            | ElementId::MailCompose
             // With them, and for the same reason as the trainer: the auction
             // window is the answer to clicking an auctioneer. It is also the
             // largest window in this interface, so one sealed under the map
@@ -276,6 +283,7 @@ impl ElementId {
             ElementId::Trade => "trade",
             ElementId::TradeOffer => "trade-offer",
             ElementId::Mailbox => "mailbox",
+            ElementId::MailCompose => "mail-compose",
             ElementId::Guild => "guild",
             ElementId::Auction => "auction",
             ElementId::Tracker => "tracker",
@@ -314,6 +322,7 @@ impl ElementId {
             ElementId::Trade => "Trade",
             ElementId::TradeOffer => "Trade offer",
             ElementId::Mailbox => "Mailbox",
+            ElementId::MailCompose => "Send mail",
             ElementId::Guild => "Guild",
             ElementId::Auction => "Auction house",
             ElementId::Tracker => "Objective tracker",
@@ -584,6 +593,20 @@ impl ElementId {
             ElementId::Mailbox => Element {
                 anchor: Anchor::Center,
                 offset: [280.0, 210.0],
+                ..Default::default()
+            },
+            // Top-left anchored, in the pocket above the trainer/flight/
+            // vendor column and right of the character panel. **An edge
+            // anchor rather than a centred one, the reasoning the guild and
+            // auction windows give:** a centre offset big enough to reach
+            // this pocket at 1920 puts the form off the screen at 1024,
+            // where a first-time user has no way to drag it back. The inbox
+            // it opens from sits low and right, so the two are visible at
+            // once, and this spot is clear of every default frame -- the
+            // constraint that actually placed it.
+            ElementId::MailCompose => Element {
+                anchor: Anchor::TopLeft,
+                offset: [270.0, 100.0],
                 ..Default::default()
             },
             // Under the minimap and the quest log, against the right edge.

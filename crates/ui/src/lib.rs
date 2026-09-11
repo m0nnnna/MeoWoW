@@ -51,6 +51,7 @@ pub use frames::{
     InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
     QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverOption, QuestgiverRow,
     GuildRow, GuildView, MailAttachment, MailRow, MailRowState, OfficerNotes, MailView,
+    MailComposeClick, MailComposeField, MailComposeView,
     Difficulty, MapMarker, MapPatch, MapView, MarkerKind, MinimapTile, MinimapView,
     QuestgiverView,
     SpellbookEntry, TaxiRow, TaxiView, TrackedQuest, TrackerView, TradeClick, TradeOfferAnswer,
@@ -202,6 +203,13 @@ pub struct HudData<'a> {
     /// mailbox that opened onto nothing at all would read as a request that
     /// failed rather than as a mailbox with nothing in it.
     pub mail: Option<&'a frames::MailView>,
+    /// The compose form, or `None` when it is not open.
+    ///
+    /// A sibling of [`Self::mail`] rather than a field on it: the inbox and
+    /// the compose form are separate frames that open side by side, so
+    /// either can be up without the other -- the form outlives a walk out of
+    /// mailbox range only long enough for the caller to notice and close it.
+    pub mail_compose: Option<&'a frames::MailComposeView>,
     /// The open guild window, or `None`.
     ///
     /// **`None` means the window is closed**, and it is not the same as being
@@ -387,11 +395,26 @@ pub struct HudResponse {
     /// and [`Self::take_loot`]. The inbox is filtered (deleted, undelivered
     /// and expired letters are skipped), so positions do not close up.
     ///
-    /// Only ever set for a letter with something in it. A letter already
-    /// emptied reports nothing, because the only other thing a click could
-    /// mean there is *delete*, and deleting is irreversible with no
-    /// confirmation anywhere in this interface.
+    /// Only ever set for a letter with something in it. The *emptied* rows
+    /// carry a small delete affordance instead -- see [`Self::delete_mail`]
+    /// -- because the only thing a click on one could otherwise mean is
+    /// delete, and that is irreversible.
     pub take_mail: Option<u32>,
+    /// The player confirmed **deleting** an emptied letter, as its mail id.
+    ///
+    /// Reached only through a confirmation prompt: the delete affordance on
+    /// an emptied row opens it, and this is set solely once Destroy has been
+    /// pressed. Never on the affordance click itself -- the mailbox window's
+    /// whole stance is that the destructive half is not on the gesture that
+    /// collects, and a stray click must not lose a letter.
+    pub delete_mail: Option<u32>,
+    /// The inbox's "Send Mail" button was clicked -- the request to open the
+    /// [`frames::mail_compose`] form.
+    pub open_mail_compose: bool,
+    /// What was pressed in the compose form: a field to focus, Send, or
+    /// Close. One field rather than three, so the caller handles them in one
+    /// place and the frame reports them through one call.
+    pub mail_compose: Option<frames::MailComposeClick>,
     /// A guild member was clicked, reported as their **name** rather than as
     /// the row's position -- and here the name is not merely safer, it is the
     /// only handle there is: every guild request in the protocol identifies a
@@ -411,6 +434,11 @@ pub struct HudResponse {
     /// could not tell them apart would either never open the log or reopen it
     /// every time somebody clicked a row inside it.
     pub tracker_quest: Option<u32>,
+    /// A minimap zoom button was pressed: `+1` for one notch closer, `-1` for
+    /// one notch wider. One notch, so the caller drives the one live
+    /// `minimap_range` from this and the wheel through the same step.
+    /// (`i32`, not `f32`, so this struct can keep deriving `Eq`.)
+    pub minimap_zoom: Option<i32>,
     /// An auction row was clicked, reported as the **server's auction id**.
     ///
     /// A position would be wrong here in a way it is not anywhere else in this
@@ -535,6 +563,15 @@ pub struct Hud {
     /// than two options: a cursor cannot simultaneously be carrying an item
     /// and asking whether to destroy one.
     destroy_confirm: Option<usize>,
+    /// An emptied letter's **mail id** waiting on a yes/no answer for whether
+    /// to delete it, or `None`.
+    ///
+    /// The mailbox window's first confirmation. Its whole design says the
+    /// destructive gesture is not the one that collects, so a delete goes
+    /// through the same prompt a discarded bag item does -- reached only from
+    /// the small affordance on an emptied row, and cleared if the letter is
+    /// gone from the inbox by the time the prompt is answered.
+    mail_delete_confirm: Option<u32>,
     /// The first spell shown in the book, as it is scrolled.
     spellbook_scroll: usize,
 }
@@ -550,6 +587,7 @@ impl Default for Hud {
             occupied: Vec::new(),
             held: None,
             destroy_confirm: None,
+            mail_delete_confirm: None,
             spellbook_scroll: 0,
         }
     }
@@ -666,7 +704,10 @@ impl Hud {
     /// a right-click already cancels a hold "anywhere" rather than only over
     /// a window.
     pub fn captures_pointer(&self, ctx: &egui::Context) -> bool {
-        if self.held.is_some() || self.destroy_confirm.is_some() {
+        if self.held.is_some()
+            || self.destroy_confirm.is_some()
+            || self.mail_delete_confirm.is_some()
+        {
             return true;
         }
         if ctx.egui_wants_pointer_input() {
@@ -819,6 +860,7 @@ impl Hud {
             let vendor_placeholder;
             let taxi_placeholder;
             let mail_placeholder;
+            let mail_compose_placeholder;
             let guild_placeholder;
             let auction_placeholder;
             let world_map_placeholder;
@@ -958,6 +1000,14 @@ impl Hud {
                     None if editing => {
                         mail_placeholder = frames::mail::placeholder();
                         Content::Mail(&mail_placeholder)
+                    }
+                    None => continue,
+                },
+                ElementId::MailCompose => match data.mail_compose {
+                    Some(view) => Content::MailCompose(view),
+                    None if editing => {
+                        mail_compose_placeholder = frames::mail_compose::placeholder();
+                        Content::MailCompose(&mail_compose_placeholder)
                     }
                     None => continue,
                 },
@@ -1129,6 +1179,7 @@ impl Hud {
                 Content::Mail(view) => {
                     frames::mail::size(view.rows.len(), &style, element.scale)
                 }
+                Content::MailCompose(_) => frames::mail_compose::size(&style, element.scale),
                 Content::Guild(view) => {
                     frames::guild::size(view.rows.len(), &style, element.scale)
                 }
@@ -1237,6 +1288,7 @@ impl Hud {
                             | Content::Questgiver(_)
                             | Content::Trainer(_)
                             | Content::Mail(_)
+                            | Content::MailCompose(_)
                             | Content::Guild(_)
                             | Content::Auction(_)
                             | Content::Taxi(_)
@@ -1255,6 +1307,9 @@ impl Hud {
                             // left out of it draws correctly, hit-tests
                             // correctly and reports nothing.
                             | Content::Tracker(_)
+                            // The minimap's zoom buttons -- the only thing on
+                            // it a click can hit.
+                            | Content::Minimap(_)
                     ) {
                         // The frames you interact with while playing, so they
                         // sense clicks rather than only hover.
@@ -1371,6 +1426,13 @@ impl Hud {
                             element.scale,
                         ),
                         Content::Mail(view) => frames::mail::draw(
+                            &painter,
+                            response.rect,
+                            view,
+                            &style,
+                            element.scale,
+                        ),
+                        Content::MailCompose(view) => frames::mail_compose::draw(
                             &painter,
                             response.rect,
                             view,
@@ -1746,19 +1808,37 @@ impl Hud {
                 (false, Content::Mail(view)) => {
                     if response.clicked() {
                         if let Some(pointer) = response.interact_pointer_pos() {
-                            // **The row carries the mail id; this does not
-                            // derive it.** The inbox is filtered, so a row
-                            // number is not a mail id and never was.
-                            //
-                            // `row_at` answers only for letters with
-                            // something in them. The other thing a click
-                            // could mean on an emptied letter is *delete*,
-                            // and that is irreversible with nothing
-                            // confirming it -- so it is not on the gesture
-                            // that collects, and an emptied row reports
-                            // nothing at all rather than reporting a click
-                            // the caller has to remember to ignore.
-                            if let Some(row) = frames::mail::row_at(
+                            // The "Send Mail" button in the header opens the
+                            // compose form -- checked first, because it sits
+                            // in the title band above every row.
+                            if frames::mail::compose_button_at(
+                                drawn_rect,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                response_out.open_mail_compose = true;
+                            } else if let Some(row) = frames::mail::delete_at(
+                                drawn_rect,
+                                &view.rows,
+                                &style,
+                                element.scale,
+                                pointer,
+                            ) {
+                                // The delete affordance on an emptied row.
+                                // It does not delete -- it stands up the
+                                // confirmation, the same prompt a discarded
+                                // bag item gets. A stray click here must not
+                                // lose a letter.
+                                if let Some(id) = view.rows.get(row).map(|row| row.id) {
+                                    self.mail_delete_confirm = Some(id);
+                                }
+                            } else if let Some(row) = frames::mail::row_at(
+                                // **The row carries the mail id; this does
+                                // not derive it.** The inbox is filtered, so
+                                // a row number is not a mail id and never
+                                // was. `row_at` answers only for letters
+                                // with something in them.
                                 drawn_rect,
                                 &view.rows,
                                 &style,
@@ -1768,6 +1848,23 @@ impl Hud {
                                 response_out.take_mail =
                                     view.rows.get(row).map(|row| row.id);
                             }
+                        }
+                    }
+                }
+                (false, Content::MailCompose(view)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            // One call answers fields and both buttons, so
+                            // the drawing and the hit test cannot disagree
+                            // about which the click landed on. Send is inert
+                            // while the form says it cannot send.
+                            response_out.mail_compose = frames::mail_compose::click_at(
+                                drawn_rect,
+                                view,
+                                &style,
+                                element.scale,
+                                pointer,
+                            );
                         }
                     }
                 }
@@ -1808,6 +1905,21 @@ impl Hud {
                             response_out.tracker_quest = frames::tracker::quest_at(
                                 drawn_rect,
                                 view,
+                                &style,
+                                element.scale,
+                                pointer,
+                            );
+                        }
+                    }
+                }
+                (false, Content::Minimap(_)) => {
+                    if response.clicked() {
+                        if let Some(pointer) = response.interact_pointer_pos() {
+                            // `+1` closer, `-1` wider -- one wheel notch, so
+                            // the caller feeds it to the same range step the
+                            // scroll wheel does. One value, two controls.
+                            response_out.minimap_zoom = frames::minimap::zoom_button_at(
+                                drawn_rect,
                                 &style,
                                 element.scale,
                                 pointer,
@@ -2237,6 +2349,10 @@ impl Hud {
                             &style,
                             scale,
                         ),
+                        // Its size ignores its contents, like the trade
+                        // window, so there is nothing to fall back to a
+                        // placeholder for.
+                        ElementId::MailCompose => frames::mail_compose::size(&style, scale),
                         ElementId::Guild => frames::guild::size(
                             data.guild
                                 .map(|view| view.rows.len())
@@ -2395,6 +2511,54 @@ impl Hud {
             }
         }
 
+        // **The mailbox window's one confirmation.** Reached only from the
+        // delete affordance on an emptied row, and drawn exactly like the
+        // bag-item prompt above -- directly, `Order::Middle`, claiming the
+        // pointer -- because a letter thrown away does not come back and the
+        // window's whole stance is that the destructive half is not on the
+        // gesture that collects.
+        if self.destroy_confirm.is_none() {
+            if let Some(id) = self.mail_delete_confirm {
+                let view = data
+                    .mail
+                    .and_then(|inbox| inbox.rows.iter().find(|row| row.id == id))
+                    .map(|row| frames::DestroyPromptView {
+                        name: format!("letter from {}", row.sender),
+                        icon: None,
+                    });
+                match view {
+                    Some(view) => {
+                        let rect = egui::Rect::from_center_size(
+                            screen.center(),
+                            frames::destroy_prompt::size(&style, 1.0),
+                        );
+                        self.occupied.push(rect);
+                        let painter = ctx.layer_painter(egui::LayerId::new(
+                            egui::Order::Middle,
+                            egui::Id::new("hud-mail-delete-prompt"),
+                        ));
+                        frames::destroy_prompt::draw(&painter, rect, &view, &style, 1.0);
+                        if let Some(point) = click_at_point {
+                            match frames::destroy_prompt::click_at(rect, &style, 1.0, point) {
+                                Some(frames::DestroyAnswer::Confirm) => {
+                                    response_out.delete_mail = Some(id);
+                                    self.mail_delete_confirm = None;
+                                }
+                                Some(frames::DestroyAnswer::Cancel) => {
+                                    self.mail_delete_confirm = None
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    // The letter is no longer in the inbox -- collected,
+                    // returned, or the mailbox was closed -- so there is
+                    // nothing left to confirm.
+                    None => self.mail_delete_confirm = None,
+                }
+            }
+        }
+
         response_out
     }
 }
@@ -2421,6 +2585,7 @@ enum Content<'a> {
     Trainer(&'a frames::TrainerView),
     Vendor(&'a frames::VendorView),
     Mail(&'a frames::MailView),
+    MailCompose(&'a frames::MailComposeView),
     Guild(&'a frames::GuildView),
     Auction(&'a frames::AuctionView),
     Trade(&'a frames::TradeView),
@@ -3923,6 +4088,146 @@ mod tests {
         );
     }
 
+    fn mail_with_an_emptied_letter() -> frames::MailView {
+        frames::MailView {
+            withheld: 0,
+            rows: vec![frames::MailRow {
+                id: 88,
+                sender: "Auction House".into(),
+                subject: "Auction expired".into(),
+                body: String::new(),
+                money: 0,
+                attachments: Vec::new(),
+                read: true,
+                days_left: 20.0,
+                state: frames::MailRowState::Empty,
+            }],
+        }
+    }
+
+    /// The inbox header's "Send Mail" button asks the caller to open the
+    /// compose form, and reports nothing else -- a click there is not also a
+    /// click on a letter.
+    #[test]
+    fn the_send_mail_button_opens_the_compose_form() {
+        let view = mail_with_an_emptied_letter();
+        let data = HudData {
+            mail: Some(&view),
+            ..Default::default()
+        };
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let element = hud.profile.get(ElementId::Mailbox);
+        let rect = element.rect(
+            screen(),
+            frames::mail::size(view.rows.len(), &hud.profile.style, element.scale),
+        );
+        let button = frames::mail::compose_button_rect(rect, &hud.profile.style, element.scale);
+
+        let out = drive(
+            &mut hud,
+            &data,
+            &click_script(button.center(), egui::PointerButton::Primary),
+        );
+        assert!(out.open_mail_compose, "the Send Mail button did not ask to compose");
+        assert_eq!(out.take_mail, None);
+        assert_eq!(out.delete_mail, None);
+    }
+
+    /// **Deleting an emptied letter takes two deliberate clicks.** The
+    /// affordance on the row only stands the confirmation up; the letter is
+    /// gone only once Destroy is pressed on the prompt.
+    #[test]
+    fn deleting_an_emptied_letter_needs_the_confirmation() {
+        let view = mail_with_an_emptied_letter();
+        let data = HudData {
+            mail: Some(&view),
+            ..Default::default()
+        };
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let style = hud.profile.style.clone();
+        let element = hud.profile.get(ElementId::Mailbox);
+        let scale = element.scale;
+        let rect = element.rect(screen(), frames::mail::size(view.rows.len(), &style, scale));
+        let row = frames::mail::row_rects(rect, view.rows.len(), &style, scale)
+            .next()
+            .unwrap();
+        let target = frames::mail::delete_rect(row, &style, scale).center();
+
+        // First click: the affordance. Nothing is deleted, but the prompt is
+        // now armed.
+        let armed = drive(
+            &mut hud,
+            &data,
+            &click_script(target, egui::PointerButton::Primary),
+        );
+        assert_eq!(armed.delete_mail, None, "the affordance click deleted a letter");
+        assert_eq!(hud.mail_delete_confirm, Some(88));
+
+        // Second click: Destroy on the prompt, which is centred on screen.
+        let prompt = egui::Rect::from_center_size(
+            screen().center(),
+            frames::destroy_prompt::size(&style, 1.0),
+        );
+        let confirm = frames::destroy_prompt::buttons(prompt, &style, 1.0).0.center();
+        let done = drive(
+            &mut hud,
+            &data,
+            &click_script(confirm, egui::PointerButton::Primary),
+        );
+        assert_eq!(done.delete_mail, Some(88), "Destroy on the prompt did not delete mail 88");
+        assert_eq!(hud.mail_delete_confirm, None, "the prompt outlived its answer");
+    }
+
+    /// The compose form's buttons: Send only when it says it can, Close
+    /// always, and a field click asks for that field's focus.
+    #[test]
+    fn the_compose_form_reports_its_buttons_and_fields() {
+        let ready = frames::mail_compose::placeholder();
+        let data = HudData {
+            mail_compose: Some(&ready),
+            ..Default::default()
+        };
+        let mut hud = Hud::default();
+        hide_bars(&mut hud);
+        let style = hud.profile.style.clone();
+        let element = hud.profile.get(ElementId::MailCompose);
+        let scale = element.scale;
+        let rect = element.rect(screen(), frames::mail_compose::size(&style, scale));
+        let (send, close) = frames::mail_compose::buttons(rect, &style, scale);
+
+        let sent = drive(
+            &mut hud,
+            &data,
+            &click_script(send.center(), egui::PointerButton::Primary),
+        );
+        assert_eq!(sent.mail_compose, Some(frames::MailComposeClick::Send));
+
+        let closed = drive(
+            &mut hud,
+            &data,
+            &click_script(close.center(), egui::PointerButton::Primary),
+        );
+        assert_eq!(closed.mail_compose, Some(frames::MailComposeClick::Close));
+
+        // A form that cannot send does not report a Send click -- the
+        // trainer window's inert-row rule.
+        let mut blank = frames::mail_compose::placeholder();
+        blank.recipient.clear();
+        blank.can_send = false;
+        let data = HudData {
+            mail_compose: Some(&blank),
+            ..Default::default()
+        };
+        let ignored = drive(
+            &mut hud,
+            &data,
+            &click_script(send.center(), egui::PointerButton::Primary),
+        );
+        assert_eq!(ignored.mail_compose, None, "a greyed Send still reported a click");
+    }
+
     /// **Clicking an online guild member opens a whisper; clicking an offline
     /// one does nothing.**
     ///
@@ -4258,6 +4563,8 @@ mod tests {
                 },
             ],
             note: None,
+            border: None,
+            arrow: None,
         }
     }
 
@@ -5649,6 +5956,7 @@ mod tests {
                 &profile.style,
                 scale,
             ),
+            ElementId::MailCompose => frames::mail_compose::size(&profile.style, scale),
             ElementId::Guild => frames::guild::size(
                 frames::guild::placeholder().rows.len(),
                 &profile.style,

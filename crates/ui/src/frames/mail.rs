@@ -8,14 +8,27 @@
 //!
 //! ## One gesture, and the destructive half is not on it
 //!
-//! Clicking a letter takes everything in it. Clicking a letter with nothing in
-//! it does **nothing**, deliberately: throwing a letter away is irreversible
-//! and there is no confirmation anywhere in this interface, so it is not put
-//! on the same gesture that collects. The two states are mutually exclusive
-//! and both are drawn, so a click is never ambiguous -- but a stray one on the
-//! wrong row must not destroy anything, which is the same caution that made
-//! the CLI's selection helpers refuse players outright after a substring match
-//! killed somebody's character.
+//! Clicking a letter takes everything in it. Clicking the *body* of a letter
+//! with nothing left in it does **nothing** -- throwing a letter away is
+//! irreversible, so it is not put on the same gesture that collects. The two
+//! states are mutually exclusive and both are drawn, so a click is never
+//! ambiguous, and a stray one on the wrong row must not destroy anything --
+//! the same caution that made the CLI's selection helpers refuse players
+//! outright after a substring match killed somebody's character.
+//!
+//! An emptied row does carry a small delete affordance ([`delete_rect`]),
+//! and it stands up a confirmation prompt rather than deleting -- the same
+//! prompt a discarded bag item gets ([`super::destroy_prompt`]). So the
+//! destructive path exists, but it takes two deliberate clicks and is never
+//! the one a person reaching for "collect" lands on.
+//!
+//! ## The other half: writing a letter
+//!
+//! The header carries a "Send Mail" button ([`compose_button_rect`]) that
+//! opens [`super::mail_compose`], a separate frame. The inbox is a painted
+//! list with a hit test that has to stay honest about which rows act; the
+//! compose form is editable fields and buttons; folding them together would
+//! tangle each one's geometry with the other's.
 //!
 //! **The window says what the gesture is**, in a line under the list, and the
 //! room for it is reserved whether or not there is anything to click. That is
@@ -175,6 +188,62 @@ fn row_height(style: &Style) -> f32 {
     style.spellbook_row * 1.6
 }
 
+/// The "Send Mail" button in the header, right-aligned on the title line.
+///
+/// Its own function so the drawing and the hit test share it -- the rule
+/// every frame here keeps after the trainer window's inert rows made it
+/// load-bearing.
+pub fn compose_button_rect(rect: Rect, style: &Style, scale: f32) -> Rect {
+    let pad = style.padding * scale;
+    let h = (style.font_size + style.gap * 0.5) * scale;
+    let w = style.font_size * 5.5 * scale;
+    let right = rect.max.x - pad;
+    Rect::from_min_size(Pos2::new(right - w, rect.min.y + pad), Vec2::new(w, h))
+}
+
+/// Whether a click at `point` hit the header's "Send Mail" button.
+pub fn compose_button_at(rect: Rect, style: &Style, scale: f32, point: Pos2) -> bool {
+    compose_button_rect(rect, style, scale).contains(point)
+}
+
+/// The delete affordance on one emptied row -- a small square where a full
+/// letter would show its enclosed money, which an emptied one never does.
+///
+/// `bounds` is one row rectangle from [`row_rects`]. Public so a test can
+/// aim at it without re-deriving the offset, the same reason
+/// [`compose_button_rect`] is.
+pub fn delete_rect(bounds: Rect, style: &Style, scale: f32) -> Rect {
+    let side = style.font_size * scale;
+    Rect::from_min_size(
+        Pos2::new(
+            bounds.max.x - side,
+            bounds.min.y + style.gap * scale,
+        ),
+        Vec2::splat(side),
+    )
+}
+
+/// Which emptied row's delete affordance a click at `point` hit, if any.
+///
+/// **Only emptied rows answer.** A letter with something in it is collected
+/// by [`row_at`], not deleted -- throwing away an unopened letter is the one
+/// mistake this window is shaped to make impossible.
+pub fn delete_at(
+    rect: Rect,
+    rows: &[MailRow],
+    style: &Style,
+    scale: f32,
+    point: Pos2,
+) -> Option<usize> {
+    row_rects(rect, rows.len(), style, scale)
+        .enumerate()
+        .find(|(index, bounds)| {
+            rows.get(*index).is_some_and(|row| row.state == MailRowState::Empty)
+                && delete_rect(*bounds, style, scale).contains(point)
+        })
+        .map(|(index, _)| index)
+}
+
 /// How much room a window with this many rows wants.
 pub fn size(rows: usize, style: &Style, scale: f32) -> Vec2 {
     let height = header(style)
@@ -266,6 +335,24 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MailView, style: &Style, scale
         Align2::LEFT_TOP,
         title,
         font.clone(),
+        text,
+    );
+
+    // The way to the other half of the mailbox. Outlined like the trade
+    // window's buttons rather than filled, so it reads as a control without
+    // competing with a letter for attention.
+    let button = compose_button_rect(rect, style, scale);
+    painter.rect_stroke(
+        button,
+        corner_radius(style.corner * scale * 0.5),
+        Stroke::new(style.border_width.max(1.0) * scale, Color32::from(style.text)),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        button.center(),
+        Align2::CENTER_CENTER,
+        "Send Mail",
+        small.clone(),
         text,
     );
 
@@ -364,13 +451,37 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MailView, style: &Style, scale
             small.clone(),
             dim(label, 0.6),
         );
+
+        // The delete affordance, drawn only where a letter is already
+        // emptied -- a full one is collected, not thrown away. It stands the
+        // confirmation up; it does not delete. Placed where an emptied row's
+        // enclosed-money figure would go, which by definition is not drawn.
+        if row.state == MailRowState::Empty {
+            let cross = delete_rect(bounds, style, scale);
+            painter.text(
+                cross.center(),
+                Align2::CENTER_CENTER,
+                "\u{00d7}",
+                font.clone(),
+                dim(text, 0.7),
+            );
+        }
     }
 
-    // The gesture, named on screen. See the module comment.
+    // The gestures, named on screen -- both of them, because the delete
+    // affordance is a small mark a first-time reader would not know to look
+    // for. See the module comment: this line is 4.26's lesson applied before
+    // the first live test.
+    let has_full = view.rows.iter().any(|row| row.state.clickable());
+    let has_empty = view.rows.iter().any(|row| row.state == MailRowState::Empty);
     let hint = if view.rows.is_empty() {
         "Nothing here."
-    } else if view.rows.iter().any(|row| row.state.clickable()) {
+    } else if has_full && has_empty {
+        "Click a letter to take it; \u{00d7} deletes an emptied one"
+    } else if has_full {
         "Click a letter to take what is in it"
+    } else if has_empty {
+        "Nothing left to take -- \u{00d7} deletes an emptied letter"
     } else {
         "Nothing left to take"
     };
@@ -464,5 +575,46 @@ mod tests {
     #[test]
     fn the_header_names_the_letters_that_were_not_sent() {
         assert_eq!(placeholder().withheld, 3);
+    }
+
+    /// The "Send Mail" button sits in the header band, above every row, so a
+    /// click there is never also a click on a letter.
+    #[test]
+    fn the_send_mail_button_is_clear_of_the_rows() {
+        let style = Style::default();
+        for scale in [0.5, 1.0, 2.0] {
+            let view = placeholder();
+            let rect = Rect::from_min_size(Pos2::ZERO, size(view.rows.len(), &style, scale));
+            let button = compose_button_rect(rect, &style, scale);
+            assert!(rect.contains_rect(button), "button outside the window at {scale}");
+            for row in row_rects(rect, view.rows.len(), &style, scale) {
+                assert!(!button.intersects(row), "the button overlaps a row at {scale}");
+            }
+            assert!(compose_button_at(rect, &style, scale, button.center()));
+        }
+    }
+
+    /// Only an emptied row offers a delete target, and only inside its own
+    /// little square -- a click on the row's text still means "collect", or
+    /// on an emptied one, nothing.
+    #[test]
+    fn only_an_emptied_row_has_a_delete_target() {
+        let style = Style::default();
+        let view = placeholder();
+        // placeholder(): row 0 Collectable, row 1 Empty.
+        let rect = Rect::from_min_size(Pos2::ZERO, size(view.rows.len(), &style, 1.0));
+        let rows: Vec<Rect> = row_rects(rect, view.rows.len(), &style, 1.0).collect();
+
+        let empty_target = delete_rect(rows[1], &style, 1.0).center();
+        assert_eq!(delete_at(rect, &view.rows, &style, 1.0, empty_target), Some(1));
+
+        // The same point on the collectable row answers nothing -- a full
+        // letter is collected, never deleted.
+        let full_target = delete_rect(rows[0], &style, 1.0).center();
+        assert_eq!(delete_at(rect, &view.rows, &style, 1.0, full_target), None);
+
+        // And the body of the emptied row is not a delete -- the two-click
+        // rule is the whole point.
+        assert_eq!(delete_at(rect, &view.rows, &style, 1.0, rows[1].left_center()), None);
     }
 }

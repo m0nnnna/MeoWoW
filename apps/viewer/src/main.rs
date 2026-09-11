@@ -5958,6 +5958,12 @@ struct App {
     /// screen explains, so it closes itself -- see [`App::mailbox_in_reach`].
     mailbox: Option<u64>,
 
+    /// The mail compose form, or `None` when it is not open. Opened by the
+    /// inbox's "Send Mail" button, closed by its own Close button, by
+    /// Escape, or when the mailbox goes out of reach -- every `CMSG_SEND_MAIL`
+    /// needs a mailbox guid the same way the inbox requests do.
+    mail_compose: Option<MailComposeState>,
+
     /// Whether the guild window is open.
     ///
     /// A `bool` rather than a guid, unlike the mailbox beside it: a roster is
@@ -7626,6 +7632,33 @@ struct VendorSession {
     list: Option<::world::VendorList>,
 }
 
+/// The mail compose form's edit buffers, kept here because the interface
+/// crate draws a string and reports a click and this end owns the typing --
+/// exactly the split [`App::composing`] has with the chat line.
+///
+/// Its own state rather than a field on the [`App::mailbox`] guid: the inbox
+/// and the compose form are separate frames and either can be up alone. The
+/// pump drops this when the mailbox goes out of reach, the same way it drops
+/// the inbox.
+#[derive(Default)]
+struct MailComposeState {
+    recipient: String,
+    subject: String,
+    body: String,
+    /// Copper as typed, digits only -- parsed when Send is pressed. An empty
+    /// field means "no money", which is not the same edit as a typed zero.
+    money: String,
+    focus: ui::MailComposeField,
+    /// What the last send attempt did, drawn under the form. `None` before
+    /// the first attempt.
+    status: Option<String>,
+    /// Whether [`Self::status`] is a complaint.
+    status_bad: bool,
+    /// Whether a `CMSG_SEND_MAIL` is out with no `SMSG_SEND_MAIL_RESULT`
+    /// back yet. Send is greyed while it is set, so a slow realm cannot be
+    /// made to post the same letter twice.
+    sending: bool,
+}
 
 /// The open auction window, and everything about it the wire does not carry.
 ///
@@ -8253,6 +8286,7 @@ impl App {
             vendor: None,
             auction: None,
             mailbox: None,
+            mail_compose: None,
             guild_open: false,
             guild_invitation_said: None,
             flight: None,
@@ -8983,6 +9017,21 @@ impl App {
         // before egui gets a look at it.
         if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
             if key_event.physical_key == PhysicalKey::Code(KeyCode::Tab) {
+                // With the compose form open, Tab walks its fields rather
+                // than cycling a target -- it is text entry, and returns
+                // here for the same reason the target cycle does: egui would
+                // otherwise claim the press for its own focus ring.
+                if self.mail_compose.is_some() {
+                    if key_event.state == ElementState::Pressed {
+                        self.type_into_mail_compose(
+                            Some(KeyCode::Tab),
+                            None,
+                            self.modifiers.shift_key(),
+                        );
+                        window.request_redraw();
+                    }
+                    return;
+                }
                 if self.composing.is_none()
                     && self.live.is_some()
                     && key_event.state == ElementState::Pressed
@@ -9178,6 +9227,22 @@ impl App {
                 if self.composing.is_some() {
                     if pressed {
                         self.type_into_chat(code, event.text.as_deref());
+                    }
+                    window.request_redraw();
+                    return;
+                }
+
+                // And while the mail compose form is open the keyboard
+                // belongs to whichever of its fields has the caret -- the
+                // same claim the chat line makes, and it returns for the
+                // same reason.
+                if self.mail_compose.is_some() {
+                    if pressed {
+                        self.type_into_mail_compose(
+                            code,
+                            event.text.as_deref(),
+                            self.modifiers.shift_key(),
+                        );
                     }
                     window.request_redraw();
                     return;
@@ -11351,6 +11416,69 @@ impl App {
         }
     }
 
+    /// Handles one keypress while the mail compose form is open.
+    ///
+    /// The same shape as [`Self::type_into_chat`]: `text` is what the key
+    /// actually produced, so a layout, shift and dead keys are the operating
+    /// system's problem and not this function's. Tab walks the fields, Escape
+    /// shuts the form, Enter adds a newline to the message and does nothing
+    /// in the one-line fields, and the money field takes digits only.
+    ///
+    /// **Send is not on a key.** It is a button, checked in [`Self::show`]'s
+    /// response handling, because a letter posted by a stray Enter is exactly
+    /// the mistake the mailbox window is shaped to avoid.
+    fn type_into_mail_compose(&mut self, code: Option<KeyCode>, text: Option<&str>, shift: bool) {
+        use ui::MailComposeField as F;
+        let Some(form) = self.mail_compose.as_mut() else {
+            return;
+        };
+        match code {
+            Some(KeyCode::Escape) => {
+                self.mail_compose = None;
+                return;
+            }
+            Some(KeyCode::Tab) => {
+                form.focus = if shift { form.focus.prev() } else { form.focus.next() };
+                return;
+            }
+            Some(KeyCode::Enter) | Some(KeyCode::NumpadEnter) => {
+                if form.focus == F::Body {
+                    form.body.push('\n');
+                }
+                return;
+            }
+            Some(KeyCode::Backspace) => {
+                match form.focus {
+                    F::Recipient => form.recipient.pop(),
+                    F::Subject => form.subject.pop(),
+                    F::Body => form.body.pop(),
+                    F::Money => form.money.pop(),
+                };
+                return;
+            }
+            _ => {}
+        }
+
+        let Some(text) = text else { return };
+        for character in text.chars().filter(|c| !c.is_control()) {
+            match form.focus {
+                // The wire caps a subject at 63 bytes and a body at 511; a
+                // recipient name cannot be longer than a character name. The
+                // limits are generous and clamped here so an over-long field
+                // is refused at the keyboard rather than by the server.
+                F::Recipient if form.recipient.len() < 24 => form.recipient.push(character),
+                F::Subject if form.subject.len() < 63 => form.subject.push(character),
+                F::Body if form.body.len() < 500 => form.body.push(character),
+                // Digits only, and short of overflowing the copper it parses
+                // to. Ten digits is far past any purse.
+                F::Money if character.is_ascii_digit() && form.money.len() < 10 => {
+                    form.money.push(character)
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Runs a slash command, or reports that it is not one.
     ///
     /// **`/` and not `.`**, and the difference is not cosmetic: a message
@@ -13445,16 +13573,23 @@ impl App {
         if !element.rect(r.egui_ctx.content_rect(), size).contains(pointer) {
             return false;
         }
-        // Multiplicative, like the camera's: a fixed step is coarse at the
-        // near end and useless at the far one. **The same sign as the
-        // camera's, too** -- scrolling up pulls the camera in, so it has to
-        // shrink the range here rather than grow it, or the two zooms fight
-        // each other in the player's hand.
+        self.adjust_minimap_range(notches);
+        true
+    }
+
+    /// Moves the minimap zoom by `notches` and clamps it. The wheel (over the
+    /// disc) and the `+` / `-` buttons both come through here, so there is one
+    /// step and one clamp -- the ticket's "one value, two controls".
+    ///
+    /// Multiplicative, like the camera's: a fixed step is coarse at the near
+    /// end and useless at the far one. **The same sign as the camera's** --
+    /// scrolling up pulls the camera in, so a positive notch shrinks the
+    /// range rather than growing it, or the two zooms fight in the hand.
+    fn adjust_minimap_range(&mut self, notches: f32) {
         self.minimap_range = (self.minimap_range * 0.8f32.powf(notches)).clamp(
             ui::frames::minimap::MIN_RANGE,
             ui::frames::minimap::MAX_RANGE,
         );
-        true
     }
 
     /// Asks the questgiver for one quest's scroll, and the server for its
@@ -13798,6 +13933,113 @@ impl App {
         // effect shows up in the list below and nowhere else.
         if let Err(e) = live.connection.mail_mark_as_read(mailbox, id) {
             tracing::warn!("marking mail {id} read failed: {e:#}");
+        }
+        if let Err(e) = live.connection.get_mail_list(mailbox) {
+            tracing::warn!("re-asking the mailbox failed: {e:#}");
+        }
+    }
+
+    /// Posts the compose form as a letter.
+    ///
+    /// **Answered either way** by `SMSG_SEND_MAIL_RESULT`, whose action field
+    /// echoes `Send` -- so the result handling in [`Self::pump_world`] can tie
+    /// the reply back to this without a flag. The form is left open and its
+    /// Send greyed until that reply lands: a slow realm must not be able to
+    /// post the same letter twice.
+    ///
+    /// Every way out sets [`MailComposeState::status`]. A send that fails
+    /// silently is the one thing this window cannot diagnose, so nothing here
+    /// returns without leaving a line under the form.
+    fn send_composed_mail(&mut self) {
+        let Some(form) = self.mail_compose.as_ref() else {
+            return;
+        };
+        let (recipient, subject, body, money_text) = (
+            form.recipient.trim().to_string(),
+            form.subject.clone(),
+            form.body.clone(),
+            form.money.clone(),
+        );
+
+        let fail = |app: &mut Self, why: &str| {
+            if let Some(form) = app.mail_compose.as_mut() {
+                form.status = Some(why.to_string());
+                form.status_bad = true;
+                form.sending = false;
+            }
+        };
+
+        if recipient.is_empty() {
+            fail(self, "Enter a recipient.");
+            return;
+        }
+        let money: u32 = if money_text.is_empty() {
+            0
+        } else {
+            match money_text.parse() {
+                Ok(copper) => copper,
+                Err(_) => {
+                    fail(self, "That is not a valid amount of copper.");
+                    return;
+                }
+            }
+        };
+        let Some(mailbox) = self.mailbox else {
+            fail(self, "The mailbox is out of reach.");
+            return;
+        };
+        let Some(live) = self.live.as_mut() else {
+            fail(self, "Not connected.");
+            return;
+        };
+        // No attachments: see `ui::frames::mail_compose` on why the form
+        // carries none. Cash on delivery is passed as zero for the same
+        // reason -- there is no control for it and inventing one would be a
+        // number the player did not choose.
+        match live
+            .connection
+            .send_mail(mailbox, &recipient, &subject, &body, money, 0, &[])
+        {
+            Ok(()) => {
+                tracing::info!(
+                    "sent mail to {recipient:?} (subject {subject:?}, {money}c)"
+                );
+                if let Some(form) = self.mail_compose.as_mut() {
+                    form.sending = true;
+                    form.status = Some("Sending...".to_string());
+                    form.status_bad = false;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("sending mail to {recipient:?} failed: {e:#}");
+                fail(self, "The letter could not be sent.");
+            }
+        }
+    }
+
+    /// Throws one emptied letter away, then re-asks the mailbox.
+    ///
+    /// Reached only through the confirmation prompt the inbox stands up -- the
+    /// window's whole stance is that the destructive gesture is not the one
+    /// that collects. Re-asked rather than edited, like [`Self::take_mail`]:
+    /// the server can refuse a delete (cash on delivery on the letter) and a
+    /// window that struck the row itself would then be lying.
+    fn delete_mail(&mut self, id: u32) {
+        let Some(mailbox) = self.mailbox else { return };
+        let template = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.mail.as_ref())
+            .and_then(|inbox| inbox.get(id))
+            .map(|letter| letter.template_id);
+        let Some(template) = template else {
+            tracing::warn!("delete mail {id}: no such letter in the inbox");
+            return;
+        };
+        let Some(live) = self.live.as_mut() else { return };
+        if let Err(e) = live.connection.mail_delete(mailbox, id, template) {
+            tracing::warn!("deleting mail {id} failed: {e:#}");
+            return;
         }
         if let Err(e) = live.connection.get_mail_list(mailbox) {
             tracing::warn!("re-asking the mailbox failed: {e:#}");
@@ -15066,6 +15308,61 @@ impl App {
                     self.chat.push(Line::Chat(local_notice(
                         "You have new mail.".to_string(),
                     )));
+                }
+
+                // **What the server said about a mail request this client
+                // sent.** The result echoes the *action* it was for, which
+                // is the only thing tying a reply to a request in a block
+                // where the take and the mark-as-read are otherwise silent.
+                //
+                // A send updates the compose form, which is where the person
+                // is looking; everything else is a chat line. Only a
+                // successful action is named -- a non-zero result prints its
+                // number, the rule `describe_cast_failure` follows -- because
+                // a wrong word for a status code never errors, it misleads.
+                for result in &report.mail_results {
+                    use ::world::MailAction as A;
+                    match result.action {
+                        A::Send => {
+                            if let Some(form) = self.mail_compose.as_mut() {
+                                form.sending = false;
+                                if result.result == 0 {
+                                    form.status = Some("Letter sent.".to_string());
+                                    form.status_bad = false;
+                                    // Cleared so the form is ready for the
+                                    // next letter rather than re-posting this
+                                    // one on a second Send.
+                                    form.recipient.clear();
+                                    form.subject.clear();
+                                    form.body.clear();
+                                    form.money.clear();
+                                    form.focus = ui::MailComposeField::Recipient;
+                                } else {
+                                    form.status = Some(format!(
+                                        "The letter was refused (code {}).",
+                                        result.result
+                                    ));
+                                    form.status_bad = true;
+                                }
+                            }
+                        }
+                        A::Deleted => self.chat.push(Line::Chat(local_notice(
+                            if result.result == 0 {
+                                "Letter deleted.".to_string()
+                            } else {
+                                format!("The letter could not be deleted (code {}).", result.result)
+                            },
+                        ))),
+                        A::MoneyTaken | A::ItemTaken | A::ReturnedToSender
+                            if result.result != 0 =>
+                        {
+                            self.chat.push(Line::Chat(local_notice(format!(
+                                "The mailbox refused a request (code {}).",
+                                result.result
+                            ))));
+                        }
+                        _ => {}
+                    }
                 }
 
                 // **Something happened to the guild.**
@@ -16408,6 +16705,10 @@ impl App {
         if self.mailbox.is_some() && !Self::mailbox_in_reach(&live.state, self.mailbox, standing) {
             tracing::info!("mailbox closed: out of reach");
             self.mailbox = None;
+            // The compose form needs the same mailbox guid on every
+            // `CMSG_SEND_MAIL`, so it goes when the inbox does -- a form left
+            // open past the walk is one whose Send is refused in silence.
+            self.mail_compose = None;
         }
         // And the auction window, for the identical reason and with the same
         // measurement: every request in the block resolves its auctioneer
@@ -16521,6 +16822,7 @@ impl App {
         self.vendor = None;
         self.auction = None;
         self.mailbox = None;
+        self.mail_compose = None;
         self.looting = None;
         self.area = None;
 
@@ -17586,6 +17888,26 @@ impl App {
             view
         });
 
+        // The compose form, straight off its edit buffers. No renderer and
+        // no world -- four short strings and a focus. Send is live only once
+        // there is a recipient and no earlier send is still in flight.
+        let mail_compose: Option<ui::MailComposeView> = self.mail_compose.as_ref().map(|form| {
+            let can_send = !form.sending && !form.recipient.trim().is_empty();
+            ui::MailComposeView {
+                recipient: form.recipient.clone(),
+                subject: form.subject.clone(),
+                body: form.body.clone(),
+                money: form.money.clone(),
+                focus: form.focus,
+                status: form.status.clone().or_else(|| {
+                    (!can_send && !form.sending)
+                        .then(|| "Enter a recipient to send.".to_string())
+                }),
+                status_bad: form.status_bad,
+                can_send,
+            }
+        });
+
         // The flight master's list. Needs no renderer -- there are no icons
         // -- but it is built here beside the trainer's so that every window
         // fed from an NPC conversation is assembled in one place.
@@ -18240,6 +18562,7 @@ impl App {
                     trainer: trainer.as_ref(),
                     vendor: vendor.as_ref(),
                     mail: mail.as_ref(),
+                    mail_compose: mail_compose.as_ref(),
                     guild: guild.as_ref(),
                     auction: auction_view.as_ref(),
                     trade: trade.as_ref(),
@@ -18599,6 +18922,12 @@ impl App {
             self.selected_quest = Some(quest);
         }
 
+        // A minimap zoom button. Same range step the wheel drives -- see
+        // `App::adjust_minimap_range`.
+        if let Some(notch) = hud_response.minimap_zoom {
+            self.adjust_minimap_range(notch as f32);
+        }
+
         // A destination was chosen. **Both node ids come from the server**:
         // the destination from the row (a `TaxiNodes` id, not a position),
         // and the departure from the menu the server sent. Recomputing the
@@ -18679,6 +19008,40 @@ impl App {
         if let Some(id) = hud_response.take_mail {
             tracing::debug!("taking everything out of mail {id}");
             self.take_mail(id);
+        }
+
+        // The inbox's "Send Mail" button. Opens the compose form; a second
+        // press with it already open is a no-op rather than a reset, so a
+        // half-written letter is not lost to a stray click.
+        if hud_response.open_mail_compose && self.mail_compose.is_none() {
+            tracing::debug!("opening the mail compose form");
+            self.mail_compose = Some(MailComposeState::default());
+        }
+
+        // The compose form's own buttons and field clicks.
+        if let Some(click) = hud_response.mail_compose {
+            match click {
+                ui::MailComposeClick::Focus(field) => {
+                    if let Some(form) = self.mail_compose.as_mut() {
+                        form.focus = field;
+                    }
+                }
+                ui::MailComposeClick::Close => {
+                    tracing::debug!("closing the mail compose form");
+                    self.mail_compose = None;
+                }
+                ui::MailComposeClick::Send => self.send_composed_mail(),
+            }
+        }
+
+        // The delete confirmation on an emptied letter was answered Yes. The
+        // window stood the prompt up; this sends the request and re-asks the
+        // inbox, the same re-ask `take_mail` does -- a delete can be refused
+        // (cash on delivery on the letter) and a window that struck the row
+        // off its own list would then disagree with the server in silence.
+        if let Some(id) = hud_response.delete_mail {
+            tracing::debug!("deleting mail {id}");
+            self.delete_mail(id);
         }
 
         // A guild member was clicked.

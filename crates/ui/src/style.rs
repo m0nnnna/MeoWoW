@@ -280,6 +280,25 @@ pub struct Style {
     /// disc is a fraction of the size and a pin sized for a page covers a
     /// street.
     pub minimap_pin: f32,
+    /// The bezel art's screen size as a multiple of the disc's diameter.
+    ///
+    /// `Interface\Minimap\UI-MINIMAP-BORDER.blp` is a 256x256 texture whose
+    /// ring occupies only its middle and is offset within it, so the art is
+    /// drawn much larger than the disc and clipped back to the window. This
+    /// and [`Self::minimap_border_hole`] are what line the ring's opening up
+    /// with the disc; both are here so a `ui.toml` can nudge a bezel that
+    /// looks off without a rebuild -- the failure mode the milestone was
+    /// scoped around is "an obviously wrong picture", not a silent one.
+    pub minimap_border_scale: f32,
+    /// Where the bezel ring's opening sits inside the border texture, as
+    /// `[u, v]` fractions. Measured from the shipped art; the disc is placed
+    /// under this point.
+    pub minimap_border_hole: [f32; 2],
+    /// Half-extent of the player arrow at scale 1.0 when it is drawn from
+    /// `Interface\Minimap\MinimapArrow.blp` rather than the fallback polygon.
+    pub minimap_arrow: f32,
+    /// Side of a minimap zoom button at scale 1.0.
+    pub minimap_button: f32,
 
     /// Whether the `!` and `?` over questgivers are drawn at all.
     pub show_quest_marks: bool,
@@ -577,6 +596,13 @@ impl Default for Style {
             minimap_backing: Color::rgba(28, 24, 18, 245),
             minimap_rim: Color::rgb(18, 16, 14),
             minimap_pin: 4.0,
+            // 1.9 puts the ring's outer edge just past the disc rim; the
+            // hole fraction is measured off the shipped 256x256 art, whose
+            // ring is centred near (0.66, 0.44) rather than in the middle.
+            minimap_border_scale: 1.9,
+            minimap_border_hole: [0.656, 0.44],
+            minimap_arrow: 10.0,
+            minimap_button: 16.0,
 
             show_quest_marks: true,
             quest_mark_bright: Color::rgb(250, 210, 60),
@@ -721,6 +747,13 @@ impl Style {
             crate::frames::minimap::MAX_RANGE,
         );
         self.minimap_pin = self.minimap_pin.clamp(1.0, 40.0);
+        self.minimap_border_scale = self.minimap_border_scale.clamp(0.5, 6.0);
+        self.minimap_border_hole = [
+            self.minimap_border_hole[0].clamp(0.0, 1.0),
+            self.minimap_border_hole[1].clamp(0.0, 1.0),
+        ];
+        self.minimap_arrow = self.minimap_arrow.clamp(2.0, 60.0);
+        self.minimap_button = self.minimap_button.clamp(6.0, 60.0);
         self.quest_mark_size = self.quest_mark_size.clamp(6.0, 120.0);
         self.tracker_width = self.tracker_width.clamp(80.0, 800.0);
         // Zero would be a frame that draws its header and nothing else, which

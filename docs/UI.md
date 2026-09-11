@@ -497,6 +497,33 @@ deliberately not saved on every notch -- the same arrangement `camera_distance`
 has, for the same reason. What `ui.toml` holds is where the disc *starts*,
 which is what a person editing a config file means.
 
+The `+` / `-` buttons at the disc's bottom-right corner are the second control
+on that one value. They report a notch (`HudResponse::minimap_zoom`, `+1` or
+`-1`) and the viewer feeds it to `App::adjust_minimap_range`, the same step the
+wheel calls -- one clamp, one multiplicative step, so the two cannot drift
+apart. They are drawn from `Style` (`minimap_button`), not from art: 3.3.5a's
+zoom buttons are a nub on the border texture positioned for the retail
+`MinimapCluster`, and reproducing that anchoring here would be a magic-number
+exercise for a `+` and a `-`.
+
+### The bezel is over the rim, never instead of it
+
+`Interface\Minimap\UI-MINIMAP-BORDER.blp` is a 256x256 texture whose ring
+occupies only its middle and is offset within it (measured centre near
+`(0.66, 0.44)`). The frame lines that opening up with the disc -- drawing the
+art much larger than the disc, positioned by `Style::minimap_border_scale` and
+`minimap_border_hole` -- and clips the dead margins and the retail clock nub to
+the window. The **opaque rim mesh stays underneath**: it is what actually hides
+the four corners of off-map terrain, and the art carries an alpha channel and
+must not be trusted to. Both border numbers live in `Style` so a bezel that
+looks off can be nudged in `ui.toml` -- the milestone's failure mode is an
+obviously wrong picture, not a silent one.
+
+The player arrow is `Interface\Minimap\MinimapArrow.blp`, drawn as a textured
+quad rotated by the same `facing` the fallback polygon uses -- `screen_facing`'s
+sign is not re-derived. With no installation both fall back: a stroked circle
+for the bezel, the hand-drawn polygon for the arrow.
+
 ### The quest log gave up the corner
 
 It had the top-right because nothing else claimed it. It moved **sideways**

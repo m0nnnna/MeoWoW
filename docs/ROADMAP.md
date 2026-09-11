@@ -8854,3 +8854,129 @@ enough to look like a stumble, deep enough to start a fall arc.
   the way in that was measured; it does not add a way out.
 * **Not yet confirmed at the window.** The survey is the offline half; the
   hillside above Fargodeep and the reeds at `-9280,-144` are where to walk.
+
+## Writing a letter, and deleting one (`foss-wow#116`)
+
+4.27 read the mailbox and left the other half for later: there was no way to
+send a letter, and an emptied one could not be thrown away. Both were a
+presentation job — `crates/world` already carried `send_mail`, `mail_delete`
+and the `SMSG_SEND_MAIL_RESULT` parse from 4.27, and none of it was touched.
+
+### A separate frame, because the inbox is a list and this is a form
+
+`ui::frames::mail_compose` is its own frame with its own `ElementId`, opened
+from a "Send Mail" button in the inbox header. The inbox is a painted list
+whose hit test has to stay honest about which rows act; the compose form is
+four editable fields — recipient, subject, message, money — and two buttons.
+Folding them together would tangle each one's geometry with the other's, so
+they open side by side. The form's default sits in the one screen-sized
+pocket a 370×290 window fits into on a full 1920 layout without overlapping a
+neighbour — above the trainer column, right of the character panel — and it
+is **edge-anchored** for the guild window's reason: a centre offset large
+enough to reach that pocket puts the form off a 1024-wide screen.
+
+**No item attachments.** Putting an item in a letter means a drag target that
+reads the bag window, and the bag window is a list of row positions this
+crate cannot resolve to a `(bag, slot)`. Money and a note is the honest
+four-field form; a fifth field that half-works is the call `mail` already
+makes about its missing sell window.
+
+### Text editing lives in the viewer, like the chat line
+
+The frame draws a string and a caret and reports *which field a click wants
+focus in*; `apps/viewer` owns the `MailComposeState` buffers and feeds key
+events into whichever field has the caret — the same split `App::composing`
+has with chat. Tab walks the fields (and, like the target-cycle, is caught
+before egui's focus ring can claim it); Escape shuts the form; Enter adds a
+newline to the message and does nothing in the one-line fields; the money
+field takes digits only. **Send is not on a key** — it is a button, because a
+letter posted by a stray Enter is exactly the mistake this window is shaped
+to avoid.
+
+### The result echoes the action, so it needs no flag
+
+`SMSG_SEND_MAIL_RESULT` carries the `MailAction` it was for. A `Send` result
+updates the compose form in place — "Letter sent." and the fields cleared, or
+"The letter was refused (code N)" with the number passed through the way
+`describe_cast_failure` passes a status code it cannot name. `Deleted`, and a
+non-zero result on a take or a return, become chat lines. Those `mail_results`
+were parsed since 4.27 and **read by nobody** until now, so a take that failed
+for want of bag room had been silent.
+
+### Deleting takes two clicks
+
+The mailbox window's whole stance is that the destructive gesture is not the
+one that collects. So an emptied row carries a small delete affordance that
+only *stands up* a confirmation — the same `destroy_prompt` a discarded bag
+item gets, drawn directly in `Order::Middle` and claiming the pointer — and
+the letter is gone only once Destroy is pressed on it. The confirm is `Hud`
+state (`mail_delete_confirm`, a mail id) and clears itself if the letter
+leaves the inbox before the prompt is answered.
+
+### What saw which half
+
+`crates/ui` at 327 tests and `wow-viewer` at 325, zero warnings from
+`cargo build --release` and `cargo test --release --no-run`, full suite green.
+The frame geometry, the `Sense::click()` wiring, the two-click delete flow and
+the greyed-Send rule are covered headless. **`--screenshot` draws no HUD**, so
+the form on screen, the caret following the focused field, and a real
+`CMSG_SEND_MAIL` reaching a realm are unconfirmed until someone is at the
+window. `Testwolf` on the local AzerothCore realm stands on game object
+142075 (a mailbox); `.send`/SOAP refills spent fixture letters.
+
+## The minimap looks like one (`foss-wow#99`)
+
+4.21 built a working minimap and drew it with a flat stroked ring in a style
+colour. The art the game ships for it was always in the archives and always
+resolvable; this rung uses it.
+
+### The bezel, over the rim
+
+`Interface\Minimap\UI-MINIMAP-BORDER.blp` is a 256x256 DXT5 texture, and the
+trap is that its ring is **not centred in it** -- the ring occupies roughly
+the middle 56% and is offset toward `(0.66, 0.44)`, with a horizontal nub at
+the top where retail hangs the tracking and calendar buttons. Measured off the
+exported PNG rather than guessed. The frame places it by lining the ring's
+opening up with the disc (`Style::minimap_border_scale`, default 1.9;
+`Style::minimap_border_hole`, default `[0.656, 0.44]`), draws it much larger
+than the disc, and clips the dead margins and the nub to the window below the
+header line.
+
+**The opaque rim mesh stays underneath.** It is what hides the four corners of
+off-map terrain that egui's rectangle clip leaves showing; the border art
+carries an alpha channel and covering those corners is not its job. Both
+border numbers are in `Style` so a bezel that looks wrong on a given screen is
+a `ui.toml` edit, not a rebuild -- the milestone's failure mode is a visibly
+wrong picture, which is the opposite of the orientation question 4.21 spent
+its measurement budget on.
+
+### The arrow, rotated the one way
+
+`Interface\Minimap\MinimapArrow.blp` (32x32) replaces the hand-drawn polygon
+for the player marker. It is drawn as a textured quad whose four corners are
+rotated by hand -- egui's `image` is axis-aligned only -- by the same `facing`
+the polygon used. `crate::maps::screen_facing`'s sign is reused, not
+re-derived: the polygon and the image share the identical rotation formula, so
+they cannot end up pointing different ways.
+
+### One value, two controls
+
+`+` / `-` buttons at the disc's bottom-right report a notch
+(`HudResponse::minimap_zoom`), and the viewer feeds it to the new
+`App::adjust_minimap_range` -- the exact step the scroll wheel already called,
+now factored out so the wheel and the buttons share one multiplicative step
+and one clamp. The buttons are `Style`-drawn (`minimap_button`), not art: the
+retail zoom buttons live on the border texture's nub, positioned for a layout
+this client does not have.
+
+### Fallbacks and what saw which half
+
+With no installation `border` and `arrow` are `None` and the frame draws its
+old stroked circle and polygon. `crates/ui` at 330 tests, zero warnings from
+`cargo build --release` and `cargo test --release --no-run`, full suite green.
+Headless tests assert the two chrome texture ids reach the painter (loaded and
+uploaded but silently not drawn is the exact failure guarded against), the
+zoom buttons sit inside the window and answer separately, and the frame still
+paints without art. **`--screenshot` draws no HUD**, so the bezel sitting
+right around the disc, the arrow spinning with the character, and the buttons
+under the pointer are unconfirmed until someone is at the window.

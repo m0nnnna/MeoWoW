@@ -110,11 +110,11 @@ Every row is "what works now". The evidence is in `docs/ROADMAP.md`.
 | Interface | Native, fully customisable, **no addons** — see the decision below. Player/target/party frames, click-to-target, chat, spellbook, action bars per character, an XP bar under them, `F1` to rearrange, saved to `ui.toml` |
 | Sign-in | **The viewer opens a login screen with no arguments** — confirmed at the window — so double-clicking it is the ordinary way to start: account, password, server, a folder picker for the `Data` directory, then a realm list and a character list. Remembers a **list of account+server profiles** in `%APPDATA%\open-wow\login.toml`, most-recently-used first — a dropdown on the account field switches between them, and a pre-switcher file is migrated in place. An opt-in **Save password** per profile keeps that account's secret in the **OS credential store** (Windows Credential Manager), keyed by account and server, **never in the file**. **Creates no characters and deletes none** — the original client does that. Four themes (`slate`, `neko`, `void`, `calico`) that *write their colours into `ui.toml`* rather than sitting under it. Its own cat-head icon — `apps/viewer/src/app-icon.png`, resampled in `icon_art.rs` — on the window and on the executable. No queue handling, no return to the screen after a disconnect |
 | Game | Melee, spells with real tooltips and a cast bar, cooldowns, combat log, corpse and loot end to end, inventory with slot moves, character panel, quests taken and handed in, quest log with progress counters |
-| Map | `M` opens the zone page with the character and quest objectives on it; fills in as explored. **Minimap** in the corner with party dots and objective rings. **Questgiver pins** as diamonds — `!` and `?` told apart, and a *remembered* one drawn faded, because it is a fact about the past. No zoom, panning, continent view or rotation |
+| Map | `M` opens the zone page with the character and quest objectives on it; fills in as explored. **Minimap** in the corner with party dots and objective rings, the shipped bezel art over its opaque rim, the real `MinimapArrow.blp` for the player, and `+`/`−` zoom buttons driving the same range the wheel does. **Questgiver pins** as diamonds — `!` and `?` told apart, and a *remembered* one drawn faded, because it is a fact about the past. The page has no zoom, panning, continent view or rotation; the minimap has zoom but no rotation |
 | Tracker | **Always on, no key**, top right under the minimap: five quests of however many, by distance with the finished ones first, each with its objective counters and yards to the nearest marker. States the count in every state. A quest the realm gave no markers for sorts **last, not as zero**, and shows no distance at all |
 | Sound | Zone music and ambience by area and hour, creature voices, weapon impacts, **footsteps that know what they are standing on** — terrain and building floors both. No attenuation, no spell sounds |
 | NPCs | Gossip, vendors (buy only -- no sell window), quests, questgiver `!`/`?` marks, trainers, auctioneers |
-| City services | **All six done and confirmed at the window: trainers, flight paths, trade, mail, guilds and the auction house.** Browsing, paging, bidding and cancelling; no sell window, no search box, no sort control |
+| City services | **All six done and confirmed at the window: trainers, flight paths, trade, mail, guilds and the auction house.** Browsing, paging, bidding and cancelling; **mail can be written, sent and deleted** — a compose form off the inbox's "Send Mail" button, and a two-click delete (affordance then confirmation) on an emptied letter. No sell window, no search box, no sort control; **no item attachments on outgoing mail** (money and a note only — an attachment needs a bag drag-target the interface cannot resolve) |
 | Collision | Walls stop you, floors and stairs hold you up, M2 collision meshes are obstacles. Tiles are selected by the **bounds of what they hold**, not by where the character is — Stormwind is one placement covering nine tiles. **The standing surface is the highest of terrain and mesh at or below a step above the feet** (`support_under`) -- neither source outranks the other, which is what stopped the hillside above a mine dropping the character into its tunnel and a riverbed's sunk reeds swallowing them (`foss-wow#172`; offline, `--floor-survey`). Transitions cut rather than blend; a stair stutter is instrumented, not solved; a character already under the world has no way back up (`#111`) |
 
 ### At the window
@@ -142,9 +142,13 @@ map, **G** guild, **T** trade, **Z** sheathe, **Enter** chat, **F1** to drag
 the layout around and save it. **The auction window has no key** — it opens by
 right-clicking an auctioneer and closes when you walk out of range, because
 every request in that block resolves its NPC through the server's five-unit
-check and fails in silence past it. **The objective tracker has no key
-either**, for the opposite reason: it is never opened and never closed, because
-a log is a thing you open and a tracker is a thing that is simply there.
+check and fails in silence past it. The mailbox is the same — right-click the
+box, walk away to close — and the **mail compose form** has no key either: it
+opens from the "Send Mail" button on the inbox and closes with its own Close
+button, Escape, or the walk out of range that closes the inbox. **The
+objective tracker has no key either**, for the opposite reason: it is never
+opened and never closed, because a log is a thing you open and a tracker is a
+thing that is simply there.
 
 **Chat commands take `/` and never reach the wire; `.` is the *server's*
 prefix**, which is how a GM command travels as ordinary chat.

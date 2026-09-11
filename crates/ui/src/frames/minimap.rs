@@ -67,6 +67,14 @@ pub struct MinimapView {
     /// module comment for why "would not load" and "nothing here" must not
     /// look the same.
     pub note: Option<String>,
+    /// `Interface\Minimap\UI-MINIMAP-BORDER.blp`, drawn over the opaque rim.
+    /// `None` with no installation, and the frame falls back to the plain
+    /// stroked circle the rim already carries.
+    pub border: Option<egui::TextureId>,
+    /// `Interface\Minimap\MinimapArrow.blp` for the player marker. `None`
+    /// falls back to the hand-drawn polygon, which points and rotates the
+    /// same way.
+    pub arrow: Option<egui::TextureId>,
 }
 
 /// A view to draw while the layout is being edited, and before there is a
@@ -84,6 +92,8 @@ pub fn placeholder() -> MinimapView {
             outline: Vec::new(),
         }],
         note: Some("no terrain".into()),
+        border: None,
+        arrow: None,
     }
 }
 
@@ -130,6 +140,41 @@ pub fn art_rect(rect: Rect, style: &Style, scale: f32) -> Rect {
 /// Where a fraction of the viewport lands on screen.
 pub fn marker_pos(art: Rect, u: f32, v: f32) -> Pos2 {
     Pos2::new(art.min.x + art.width() * u, art.min.y + art.height() * v)
+}
+
+/// The zoom-in and zoom-out buttons, stacked at the bottom-right of the
+/// window, inside its rectangle so a click on one is caught by the same
+/// pointer-over-minimap test the wheel uses.
+///
+/// Returns `(zoom in, zoom out)`. Stated once so the drawing and the hit
+/// test cannot disagree -- the rule every frame in this crate keeps.
+pub fn zoom_buttons(rect: Rect, style: &Style, scale: f32) -> (Rect, Rect) {
+    let side = style.minimap_button * scale;
+    let gap = style.gap * scale;
+    let right = rect.max.x - style.border_width.max(1.0) * scale - gap;
+    let out = Rect::from_min_size(
+        Pos2::new(right - side, rect.max.y - style.border_width.max(1.0) * scale - gap - side),
+        Vec2::splat(side),
+    );
+    let inn = Rect::from_min_size(
+        Pos2::new(out.min.x, out.min.y - gap - side),
+        Vec2::splat(side),
+    );
+    (inn, out)
+}
+
+/// Which zoom a click at `point` asked for: `+1` for closer, `-1` for
+/// wider, `None` for a press that missed both. One notch, so the caller
+/// feeds it to the same range step the wheel uses.
+pub fn zoom_button_at(rect: Rect, style: &Style, scale: f32, point: Pos2) -> Option<i32> {
+    let (inn, out) = zoom_buttons(rect, style, scale);
+    if inn.contains(point) {
+        Some(1)
+    } else if out.contains(point) {
+        Some(-1)
+    } else {
+        None
+    }
 }
 
 /// Paints the window.
@@ -226,6 +271,30 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MinimapView, style: &Style, sc
         );
     }
 
+    // The bezel art, **over the opaque rim and never instead of it** -- the
+    // rim is what actually hides the four corners of off-map terrain, and
+    // this sits on top for looks. The texture is much larger than the disc
+    // and its ring is off-centre within it (see `Style::minimap_border_*`),
+    // so it is placed by lining the ring's opening up with the disc and then
+    // clipped to the window; the dead margins and the retail clock nub fall
+    // outside. Clipped below the header line so the sub-zone name stays
+    // legible without a second draw.
+    if let Some(border) = view.border {
+        let d = radius * 2.0 * style.minimap_border_scale;
+        let [hu, hv] = style.minimap_border_hole;
+        let at = Rect::from_min_size(
+            Pos2::new(centre.x - hu * d, centre.y - hv * d),
+            Vec2::splat(d),
+        );
+        let border_clip = Rect::from_min_max(Pos2::new(rect.min.x, art.min.y), rect.max);
+        painter.with_clip_rect(border_clip).image(
+            border,
+            at,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    }
+
     let pin = style.minimap_pin * scale;
     for marker in &view.markers {
         let at = marker_pos(art, marker.u, marker.v);
@@ -288,26 +357,80 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MinimapView, style: &Style, sc
                 }
             }
             MarkerKind::Player => {
-                // The same arrow the world map draws, and for the same reason:
-                // a dot cannot say which way you are facing, and on a map that
-                // is always centred on you that is the *only* thing the marker
-                // has left to say.
-                let (sin, cos) = marker.facing.sin_cos();
-                let rotate =
-                    |x: f32, y: f32| Pos2::new(at.x + x * cos - y * sin, at.y + x * sin + y * cos);
-                clipped.add(egui::Shape::convex_polygon(
-                    vec![
-                        rotate(0.0, -pin),
-                        rotate(pin * 0.7, pin * 0.8),
-                        rotate(0.0, pin * 0.35),
-                        rotate(-pin * 0.7, pin * 0.8),
-                    ],
-                    style.world_map_player,
-                    Stroke::new(scale.max(1.0), style.world_map_outline),
-                ));
+                // A dot cannot say which way you are facing, and on a map
+                // that is always centred on you that is the *only* thing this
+                // marker has left to say. `MinimapArrow.blp` where the
+                // install has it, rotated by the same `facing` the fallback
+                // polygon uses -- the sign is [`crate::maps::screen_facing`]'s
+                // and is not re-derived here.
+                match view.arrow {
+                    Some(arrow) => {
+                        let half = style.minimap_arrow * scale;
+                        clipped.add(rotated_image(arrow, at, half, marker.facing));
+                    }
+                    None => {
+                        let (sin, cos) = marker.facing.sin_cos();
+                        let rotate = |x: f32, y: f32| {
+                            Pos2::new(at.x + x * cos - y * sin, at.y + x * sin + y * cos)
+                        };
+                        clipped.add(egui::Shape::convex_polygon(
+                            vec![
+                                rotate(0.0, -pin),
+                                rotate(pin * 0.7, pin * 0.8),
+                                rotate(0.0, pin * 0.35),
+                                rotate(-pin * 0.7, pin * 0.8),
+                            ],
+                            style.world_map_player,
+                            Stroke::new(scale.max(1.0), style.world_map_outline),
+                        ));
+                    }
+                }
             }
         }
     }
+
+    // The zoom buttons, last and unclipped: chrome on top of everything, at
+    // the window's bottom-right corner. One value, two controls -- the click
+    // drives the same range step the wheel does.
+    let font = FontId::proportional(style.minimap_button * 0.8 * scale);
+    let (zoom_in, zoom_out) = zoom_buttons(rect, style, scale);
+    for (button, glyph) in [(zoom_in, "+"), (zoom_out, "\u{2212}")] {
+        painter.rect_filled(
+            button,
+            egui::CornerRadius::same((style.corner * scale * 0.5).round().clamp(0.0, 255.0) as u8),
+            style.bar_backdrop,
+        );
+        painter.rect_stroke(
+            button,
+            egui::CornerRadius::same((style.corner * scale * 0.5).round().clamp(0.0, 255.0) as u8),
+            Stroke::new(style.border_width.max(1.0) * scale, style.border),
+            StrokeKind::Inside,
+        );
+        painter.text(button.center(), Align2::CENTER_CENTER, glyph, font.clone(), text);
+    }
+}
+
+/// A texture drawn as a square of half-extent `half` centred at `centre` and
+/// spun by `angle` radians. egui's `image` is axis-aligned only, so the four
+/// corners are rotated by hand and handed over as a textured quad.
+fn rotated_image(texture: egui::TextureId, centre: Pos2, half: f32, angle: f32) -> egui::Shape {
+    let (sin, cos) = angle.sin_cos();
+    let corner =
+        |x: f32, y: f32| Pos2::new(centre.x + x * cos - y * sin, centre.y + x * sin + y * cos);
+    let vertex = |pos: Pos2, uv: Pos2| egui::epaint::Vertex {
+        pos,
+        uv,
+        color: Color32::WHITE,
+    };
+    let mut mesh = egui::Mesh::with_texture(texture);
+    mesh.vertices = vec![
+        vertex(corner(-half, -half), Pos2::new(0.0, 0.0)),
+        vertex(corner(half, -half), Pos2::new(1.0, 0.0)),
+        vertex(corner(half, half), Pos2::new(1.0, 1.0)),
+        vertex(corner(-half, half), Pos2::new(0.0, 1.0)),
+    ];
+    mesh.indices = vec![0, 1, 2, 0, 2, 3];
+    egui::Shape::mesh(mesh)
 }
 
 /// A filled annulus, used to paint out everything outside the disc.
@@ -386,5 +509,67 @@ mod tests {
         let two = size(&style, 2.0);
         assert!((two.x - one.x * 2.0).abs() < 0.01, "{one:?} {two:?}");
         assert!((two.y - one.y * 2.0).abs() < 0.01, "{one:?} {two:?}");
+    }
+
+    /// The two zoom buttons sit inside the window and answer opposite ways --
+    /// asserting only `+` would pass a rule that answered `+` for the whole
+    /// corner.
+    #[test]
+    fn the_zoom_buttons_are_inside_and_answer_separately() {
+        let style = style();
+        for scale in [0.5, 1.0, 2.0] {
+            let rect = Rect::from_min_size(Pos2::new(30.0, 40.0), size(&style, scale));
+            let (inn, out) = zoom_buttons(rect, &style, scale);
+            assert!(rect.contains_rect(inn) && rect.contains_rect(out), "at {scale}");
+            assert!(!inn.intersects(out), "the buttons overlap at {scale}");
+            assert_eq!(zoom_button_at(rect, &style, scale, inn.center()), Some(1));
+            assert_eq!(zoom_button_at(rect, &style, scale, out.center()), Some(-1));
+            assert_eq!(zoom_button_at(rect, &style, scale, rect.center()), None);
+        }
+    }
+
+    fn painted(view: &MinimapView) -> String {
+        let ctx = egui::Context::default();
+        let style = style();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0))),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let rect = Rect::from_min_size(Pos2::ZERO, size(&style, 1.0));
+            draw(&painter, rect, view, &style, 1.0);
+        });
+        let rendered = format!("{:?}", output.shapes);
+        output.drop_without_applying_deltas();
+        rendered
+    }
+
+    /// The border and arrow texture ids have to reach the painter, or the
+    /// chrome is loaded and uploaded and then silently not drawn -- the
+    /// failure mode the milestone was scoped around.
+    #[test]
+    fn the_chrome_textures_reach_the_painter() {
+        let bare = painted(&placeholder());
+
+        let mut with_border = placeholder();
+        with_border.border = Some(egui::TextureId::User(77));
+        let border = painted(&with_border);
+        assert_ne!(bare, border, "the border texture never reached the paint");
+        assert!(border.contains("User(77)"), "the border id is not in the shapes");
+
+        let mut with_arrow = placeholder();
+        with_arrow.arrow = Some(egui::TextureId::User(91));
+        let arrow = painted(&with_arrow);
+        assert_ne!(bare, arrow, "the arrow texture never reached the paint");
+        assert!(arrow.contains("User(91)"), "the arrow id is not in the shapes");
+    }
+
+    /// With no art the frame still draws -- the stroked circle and the
+    /// polygon arrow -- rather than refusing or drawing nothing.
+    #[test]
+    fn the_frame_falls_back_without_art() {
+        let out = painted(&placeholder());
+        assert!(out.len() > 200, "the frame painted almost nothing without art");
     }
 }
