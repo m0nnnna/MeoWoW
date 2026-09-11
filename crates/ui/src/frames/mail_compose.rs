@@ -8,15 +8,16 @@
 //! `MailCompose` default, which sits clear of the inbox and clear of the
 //! bags.
 //!
-//! ## What it carries, and what it does not
+//! ## What it carries
 //!
-//! A recipient name, a subject, a body and an amount of copper to enclose.
-//! **No item attachments.** Putting an item in a letter means a drag target
-//! that reads the bag window, and the bag window is a list of row positions
-//! this crate cannot resolve to a `(bag, slot)` -- the same wall
-//! [`super::bags`] describes. An honest four-field form beats a fifth field
-//! that half-works, the call [`super::mail`] already makes about its own
-//! missing sell window and the auction window makes about its missing sort.
+//! A recipient name, a subject, a body, an amount of copper to enclose, and
+//! up to [`MAX_ATTACHMENTS`] items. **Attaching is a modal right-click in the
+//! bag window, not a drag** -- the same gesture [`super::trade`] already
+//! established for putting an item on a table this crate does not own, and
+//! for the same reason: a drag target that reads the bag window needs a
+//! `(bag, slot)` this crate cannot resolve, but a click the caller already
+//! resolves for its own trade squares resolves identically here. The hint
+//! line is drawn only while there are none, exactly as trade's is.
 //!
 //! ## Text editing lives in the caller
 //!
@@ -28,7 +29,15 @@
 
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
 
+use super::mail::MailAttachment;
 use crate::style::Style;
+
+/// The server's own limit (AzerothCore's `MAX_MAIL_ITEMS`), refused with
+/// `MAIL_ERR_TOO_MANY_ATTACHMENTS` past it. Drawn as a fixed row the same way
+/// [`super::trade`]'s seven squares are -- every square shown, empty or not,
+/// so the row reads as remaining capacity rather than as a list that might
+/// still be growing.
+pub const MAX_ATTACHMENTS: usize = 12;
 
 /// Which field of the form the caret is in.
 ///
@@ -97,6 +106,11 @@ pub struct MailComposeView {
     /// Whether the Send button is live. False with no recipient, or while a
     /// send is in flight; the caller decides and the frame only draws it.
     pub can_send: bool,
+    /// Items put on the letter so far, in attach order. Never more than
+    /// [`MAX_ATTACHMENTS`] -- the caller enforces the cap before this is
+    /// built, the same place [`super::trade::TradeView`] enforces its own
+    /// seven-square limit.
+    pub attachments: Vec<MailAttachment>,
 }
 
 impl Default for MailComposeView {
@@ -110,11 +124,16 @@ impl Default for MailComposeView {
             status: None,
             status_bad: false,
             can_send: false,
+            attachments: Vec::new(),
         }
     }
 }
 
 /// A form with plausible contents, for the layout editor.
+///
+/// One attachment with an icon and one without, so the editor shows both the
+/// ordinary square and the name-fallback one -- the same reasoning
+/// [`super::trade::placeholder`] gives for mismatched offers.
 pub fn placeholder() -> MailComposeView {
     MailComposeView {
         recipient: "Testwolf".into(),
@@ -125,6 +144,18 @@ pub fn placeholder() -> MailComposeView {
         status: Some("Ready to send.".into()),
         status_bad: false,
         can_send: true,
+        attachments: vec![
+            MailAttachment {
+                count: 5,
+                icon: None,
+                name: "Darnassian Bleu".into(),
+            },
+            MailAttachment {
+                count: 1,
+                icon: None,
+                name: "Worn Shortsword".into(),
+            },
+        ],
     }
 }
 
@@ -137,6 +168,10 @@ pub enum MailComposeClick {
     Send,
     /// Shut the form without sending.
     Close,
+    /// Take an attachment back off the letter. Reversible with no confirm,
+    /// unlike deleting a received letter -- nothing has left this character's
+    /// bags yet, the server only sees the list at Send.
+    RemoveAttachment(usize),
 }
 
 fn title_height(style: &Style) -> f32 {
@@ -178,6 +213,36 @@ fn row_height(style: &Style, field: MailComposeField) -> f32 {
         + style.gap
 }
 
+/// One attachment square's side, fitted so all [`MAX_ATTACHMENTS`] of them
+/// make exactly one row across a box `width` wide -- smaller than
+/// `style.slot_size` by construction, the same call [`super::mail`]'s own
+/// inbox row already makes for its attachment squares (`row_height(style) *
+/// 0.5` there) rather than use the bag grid's full-size square. A fixed
+/// column count here would either overrun the form's width or, split into
+/// more rows, cost back the vertical room a compose form does not have
+/// beside the trainer/taxi/vendor column it defaults into -- see
+/// `crate::layout`'s `MailCompose` entry.
+///
+/// Takes its cap explicitly rather than reading `style.slot_size` itself so
+/// one function serves both an unscaled caller ([`attachment_band_height`],
+/// which needs a height `size` can add before any scale is known) and a
+/// scaled one ([`attachment_rects`]) without either multiplying the other's
+/// answer by `scale` a second time.
+fn attachment_slot_side(width: f32, pad: f32, gap: f32, cap: f32) -> f32 {
+    let usable = (width - pad * 2.0 - gap * (MAX_ATTACHMENTS as f32 - 1.0)).max(1.0);
+    (usable / MAX_ATTACHMENTS as f32).min(cap)
+}
+
+/// Unscaled height of the attachment band: one label line -- doing double
+/// duty as the "how to attach" hint while the row is empty, so there is no
+/// second line to reserve -- the row of squares, and the gap before whatever
+/// follows.
+fn attachment_band_height(style: &Style) -> f32 {
+    let width = style.login_width.max(style.loot_width * 1.85);
+    let side = attachment_slot_side(width, style.padding, style.slot_gap, style.slot_size);
+    label_height(style) + side + style.gap
+}
+
 /// How much room the form wants.
 pub fn size(style: &Style, scale: f32) -> Vec2 {
     let rows: f32 = MailComposeField::ORDER
@@ -187,6 +252,7 @@ pub fn size(style: &Style, scale: f32) -> Vec2 {
     let height = style.padding * 2.0
         + title_height(style)
         + rows
+        + attachment_band_height(style)
         + status_height(style)
         + button_height(style)
         + style.gap;
@@ -196,6 +262,11 @@ pub fn size(style: &Style, scale: f32) -> Vec2 {
 /// Every field's box, in [`MailComposeField::ORDER`]. The single source of
 /// row geometry, read by the drawing and the hit test both -- the rule every
 /// frame in this crate keeps after the trainer window made it load-bearing.
+///
+/// **The attachment band sits between Money and Body**, so its height is
+/// folded into `y` right after Money's row -- the one place in the loop that
+/// knows where that gap belongs, rather than a second function that would
+/// have to agree with this one about it.
 pub fn field_rects(rect: Rect, style: &Style, scale: f32) -> [Rect; 4] {
     let pad = style.padding * scale;
     let gap = style.gap * scale;
@@ -212,6 +283,30 @@ pub fn field_rects(rect: Rect, style: &Style, scale: f32) -> [Rect; 4] {
         };
         out[slot] = Rect::from_min_size(Pos2::new(left, top), Vec2::new(width, h));
         y = top + h + gap;
+        if *field == MailComposeField::Money {
+            y += attachment_band_height(style) * scale;
+        }
+    }
+    out
+}
+
+/// Where every attachment square sits, [`MAX_ATTACHMENTS`] of them whether or
+/// not they hold anything -- the same reasoning [`super::trade::square_rects`]
+/// gives for always drawing all seven of its own. Positioned off the Money
+/// field's bottom edge, which is the single fact [`field_rects`] already
+/// establishes about where this band starts.
+pub fn attachment_rects(rect: Rect, style: &Style, scale: f32) -> [Rect; MAX_ATTACHMENTS] {
+    let pad = style.padding * scale;
+    let slot_gap = style.slot_gap * scale;
+    let side = attachment_slot_side(rect.width(), pad, slot_gap, style.slot_size * scale);
+    let left = rect.min.x + pad;
+    let top = field_rect(rect, style, scale, MailComposeField::Money).bottom()
+        + style.gap * scale
+        + label_height(style) * scale;
+    let mut out = [Rect::NOTHING; MAX_ATTACHMENTS];
+    for (index, slot) in out.iter_mut().enumerate() {
+        let at = Pos2::new(left + index as f32 * (side + slot_gap), top);
+        *slot = Rect::from_min_size(at, Vec2::splat(side));
     }
     out
 }
@@ -263,7 +358,13 @@ pub fn click_at(
             return Some(MailComposeClick::Focus(*field));
         }
     }
-    None
+    // Only an occupied square answers -- an empty one is capacity, not a
+    // button, the same rule `trade::click_at` applies to its own squares.
+    attachment_rects(rect, style, scale)
+        .iter()
+        .position(|square| square.contains(point))
+        .filter(|&index| index < view.attachments.len())
+        .map(MailComposeClick::RemoveAttachment)
 }
 
 fn corner_radius(radius: f32) -> egui::CornerRadius {
@@ -384,6 +485,85 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MailComposeView, style: &Style
                 [Pos2::new(x, y0), Pos2::new(x, y1)],
                 Stroke::new(1.5 * scale, accent),
             );
+        }
+    }
+
+    // The attachment grid: one label line, then MAX_ATTACHMENTS squares,
+    // filled or not -- the same "always draw the capacity" rule `bags::draw`
+    // and `trade::draw` both follow. **The label line doubles as the "how to
+    // attach" hint while the row is empty** rather than reserving a second
+    // line for it: a modal gesture with nothing on screen naming it is not a
+    // gesture (the call `trade::draw` makes about its own hint), but a line
+    // that appeared only once the grid was empty would move the Message
+    // field the moment an attachment lands or leaves -- the same trap
+    // `trade`'s footer is written up as avoiding.
+    if let Some(first) = attachment_rects(rect, style, scale).first() {
+        let label = if view.attachments.is_empty() {
+            "Right-click a bag item to attach it".to_string()
+        } else {
+            format!("Attachments ({}/{MAX_ATTACHMENTS})", view.attachments.len())
+        };
+        clip.text(
+            Pos2::new(first.left(), first.top() - style.gap * 0.5 * scale),
+            Align2::LEFT_BOTTOM,
+            label,
+            small.clone(),
+            dim,
+        );
+    }
+    let slot_corner = corner_radius(style.corner * scale * 0.5);
+    for (index, bounds) in attachment_rects(rect, style, scale).into_iter().enumerate() {
+        clip.rect_filled(bounds, slot_corner, style.slot_background);
+        match view.attachments.get(index) {
+            Some(attachment) => {
+                match attachment.icon {
+                    Some(icon) => {
+                        clip.image(
+                            icon,
+                            bounds.shrink(style.border_width * scale),
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+                    // No icon: the name's first letters rather than nothing,
+                    // so an unresolved icon and an actually-empty square
+                    // never look alike -- the same call `trade::draw_square`
+                    // makes about its own unnamed squares.
+                    None => {
+                        let squared = clip.with_clip_rect(bounds);
+                        squared.text(
+                            bounds.center(),
+                            Align2::CENTER_CENTER,
+                            attachment.name.chars().take(3).collect::<String>(),
+                            FontId::proportional(style.font_size * 0.8 * scale),
+                            text,
+                        );
+                    }
+                }
+                clip.rect_stroke(
+                    bounds,
+                    slot_corner,
+                    Stroke::new(style.border_width * scale, style.border),
+                    StrokeKind::Inside,
+                );
+                if attachment.count > 1 {
+                    clip.text(
+                        bounds.max - Vec2::splat(style.border_width * scale * 2.0),
+                        Align2::RIGHT_BOTTOM,
+                        attachment.count.to_string(),
+                        FontId::proportional(style.font_size * 0.8 * scale),
+                        text,
+                    );
+                }
+            }
+            None => {
+                clip.rect_stroke(
+                    bounds,
+                    slot_corner,
+                    Stroke::new(style.border_width * scale, style.slot_empty_border),
+                    StrokeKind::Inside,
+                );
+            }
         }
     }
 
@@ -587,5 +767,97 @@ mod tests {
         let mut b = placeholder();
         b.focus = MailComposeField::Subject;
         assert_ne!(painted(&a), painted(&b), "the caret ignored the focused field");
+    }
+
+    /// Every attachment square sits inside the form and none overlaps the
+    /// next -- the drawing and the hit test share `attachment_rects`, same
+    /// contract `field_boxes_are_disjoint_and_inside` holds the four text
+    /// fields to.
+    #[test]
+    fn attachment_squares_are_disjoint_and_inside() {
+        let style = Style::default();
+        for scale in [0.5, 1.0, 2.0] {
+            let r = rect(&style, scale);
+            let rects = attachment_rects(r, &style, scale);
+            for b in &rects {
+                assert!(r.contains_rect(*b), "{b:?} outside {r:?} at {scale}");
+            }
+            for (i, a) in rects.iter().enumerate() {
+                for (j, b) in rects.iter().enumerate() {
+                    if i != j {
+                        assert!(!a.intersects(*b), "squares {i} and {j} overlap at {scale}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A click on a filled attachment square asks to remove that one and no
+    /// other.
+    #[test]
+    fn a_filled_attachment_click_removes_only_that_one() {
+        let style = Style::default();
+        let view = placeholder();
+        let r = rect(&style, 1.0);
+        let rects = attachment_rects(r, &style, 1.0);
+        for index in 0..view.attachments.len() {
+            assert_eq!(
+                click_at(r, &view, &style, 1.0, rects[index].center()),
+                Some(MailComposeClick::RemoveAttachment(index)),
+            );
+        }
+    }
+
+    /// An empty attachment square answers nothing -- it is remaining
+    /// capacity, not a button, the rule `trade`'s own squares follow.
+    #[test]
+    fn an_empty_attachment_square_answers_nothing() {
+        let style = Style::default();
+        let view = placeholder();
+        let r = rect(&style, 1.0);
+        let rects = attachment_rects(r, &style, 1.0);
+        for index in view.attachments.len()..MAX_ATTACHMENTS {
+            assert_eq!(click_at(r, &view, &style, 1.0, rects[index].center()), None);
+        }
+    }
+
+    /// A full grid of twelve draws without panicking and paints something
+    /// different from an empty one -- the smoke test for the loop that walks
+    /// `view.attachments` against a fixed-size grid, where an off-by-one
+    /// against [`MAX_ATTACHMENTS`] would panic on the thirteenth, not draw
+    /// wrongly.
+    #[test]
+    fn a_full_grid_of_attachments_draws_and_differs_from_empty() {
+        fn painted(view: &MailComposeView) -> String {
+            let ctx = egui::Context::default();
+            let style = Style::default();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(900.0))),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                let r = Rect::from_min_size(Pos2::ZERO, size(&style, 1.0));
+                draw(&painter, r, view, &style, 1.0);
+            });
+            let rendered = format!("{:?}", output.shapes);
+            output.drop_without_applying_deltas();
+            rendered
+        }
+        let mut full = placeholder();
+        full.attachments = (0..MAX_ATTACHMENTS)
+            .map(|i| MailAttachment {
+                count: 1,
+                icon: None,
+                name: format!("Item {i}"),
+            })
+            .collect();
+        let mut empty = placeholder();
+        empty.attachments.clear();
+        assert_ne!(
+            painted(&full),
+            painted(&empty),
+            "a full grid painted the same as an empty one"
+        );
     }
 }

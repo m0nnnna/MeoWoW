@@ -7658,6 +7658,11 @@ struct MailComposeState {
     /// back yet. Send is greyed while it is set, so a slow realm cannot be
     /// made to post the same letter twice.
     sending: bool,
+    /// Items put on the letter, by full guid -- see [`Connection::send_mail`]
+    /// on why a guid outlives the item moving bags. Never more than
+    /// [`ui::MAX_ATTACHMENTS`], enforced in [`App::attach_item_to_mail`]
+    /// before a guid is ever pushed here.
+    attachments: Vec<u64>,
 }
 
 /// The open auction window, and everything about it the wire does not carry.
@@ -13954,11 +13959,12 @@ impl App {
         let Some(form) = self.mail_compose.as_ref() else {
             return;
         };
-        let (recipient, subject, body, money_text) = (
+        let (recipient, subject, body, money_text, attachments) = (
             form.recipient.trim().to_string(),
             form.subject.clone(),
             form.body.clone(),
             form.money.clone(),
+            form.attachments.clone(),
         );
 
         let fail = |app: &mut Self, why: &str| {
@@ -13992,17 +13998,21 @@ impl App {
             fail(self, "Not connected.");
             return;
         };
-        // No attachments: see `ui::frames::mail_compose` on why the form
-        // carries none. Cash on delivery is passed as zero for the same
-        // reason -- there is no control for it and inventing one would be a
-        // number the player did not choose.
-        match live
-            .connection
-            .send_mail(mailbox, &recipient, &subject, &body, money, 0, &[])
-        {
+        // Cash on delivery is passed as zero -- there is no control for it
+        // and inventing one would be a number the player did not choose.
+        match live.connection.send_mail(
+            mailbox,
+            &recipient,
+            &subject,
+            &body,
+            money,
+            0,
+            &attachments,
+        ) {
             Ok(()) => {
                 tracing::info!(
-                    "sent mail to {recipient:?} (subject {subject:?}, {money}c)"
+                    "sent mail to {recipient:?} (subject {subject:?}, {money}c, {} item(s))",
+                    attachments.len()
                 );
                 if let Some(form) = self.mail_compose.as_mut() {
                     form.sending = true;
@@ -14751,6 +14761,56 @@ impl App {
         // here, so this is the only thing our half of the window is drawn
         // from. See `world::trade`.
         live.state.note_trade_item(slot, item);
+        true
+    }
+
+    /// Puts one carried item on the open compose form as an attachment.
+    ///
+    /// **The same modal rule `offer_item` established**, on a form this
+    /// crate half-owns instead of a trade window: `ui::frames::mail_compose`
+    /// draws the squares and reports which one a click landed on, but
+    /// attaching happens on the *bag* window's own right-click, resolved here
+    /// exactly the way `offer_item` resolves its own. Unlike a trade offer,
+    /// nothing is sent yet -- the guid is only recorded, and `send_mail`
+    /// carries the whole list at once when the letter actually goes.
+    fn attach_item_to_mail(&mut self, at: Option<::world::inventory::Where>) -> bool {
+        let Some(at) = at else {
+            tracing::debug!("right-click: no bag address for that square");
+            return false;
+        };
+        let Some(form) = self.mail_compose.as_ref() else {
+            tracing::debug!("right-click at {at:?}: no compose form open, so activating instead");
+            return false;
+        };
+        if form.attachments.len() >= ui::MAX_ATTACHMENTS {
+            self.chat.push(Line::Chat(local_notice(
+                "This letter cannot carry any more items.".into(),
+            )));
+            return true;
+        }
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        let Some(carried) = ::world::inventory::carried(&live.state, live.guid)
+            .into_iter()
+            .find(|carried| carried.at == at)
+        else {
+            tracing::debug!("right-click at {at:?}: nothing carried there");
+            return false;
+        };
+        let item = carried.item.guid;
+
+        let Some(form) = self.mail_compose.as_mut() else {
+            return true;
+        };
+        if form.attachments.contains(&item) {
+            self.chat.push(Line::Chat(local_notice(
+                "That is already on the letter.".into(),
+            )));
+            return true;
+        }
+        tracing::info!("attaching item {item:#x} to the letter in progress");
+        form.attachments.push(item);
         true
     }
 
@@ -17776,6 +17836,11 @@ impl App {
                             // for one pass so that the GPU is not needed
                             // while replicated state is borrowed.
                             icon: None,
+                            // Unresolved -- a received letter's item has no
+                            // query wired up yet, so an icon-less square
+                            // stays blank rather than guessing a name off
+                            // the entry alone.
+                            name: String::new(),
                         })
                         .collect(),
                     read: letter.is_read(),
@@ -17888,25 +17953,67 @@ impl App {
             view
         });
 
-        // The compose form, straight off its edit buffers. No renderer and
-        // no world -- four short strings and a focus. Send is live only once
-        // there is a recipient and no earlier send is still in flight.
-        let mail_compose: Option<ui::MailComposeView> = self.mail_compose.as_ref().map(|form| {
+        // The compose form, straight off its edit buffers plus one resolved
+        // pass over its attachments. **Everything is cloned out of `form`
+        // before touching `self.live`/`self.items`/`self.chain`** -- the same
+        // "resolved before `icon`, which takes the renderer and the archive
+        // chain mutably" rule the bag squares above already follow, here
+        // applied to end the borrow of `self.mail_compose` itself rather than
+        // just of a `&live::LiveWorld`.
+        let mail_compose: Option<ui::MailComposeView> = if let Some(form) = self.mail_compose.as_ref() {
             let can_send = !form.sending && !form.recipient.trim().is_empty();
-            ui::MailComposeView {
-                recipient: form.recipient.clone(),
-                subject: form.subject.clone(),
-                body: form.body.clone(),
-                money: form.money.clone(),
-                focus: form.focus,
-                status: form.status.clone().or_else(|| {
-                    (!can_send && !form.sending)
-                        .then(|| "Enter a recipient to send.".to_string())
-                }),
-                status_bad: form.status_bad,
+            let status = form.status.clone().or_else(|| {
+                (!can_send && !form.sending).then(|| "Enter a recipient to send.".to_string())
+            });
+            let (recipient, subject, body, money, focus, status_bad, attachment_guids) = (
+                form.recipient.clone(),
+                form.subject.clone(),
+                form.body.clone(),
+                form.money.clone(),
+                form.focus,
+                form.status_bad,
+                form.attachments.clone(),
+            );
+            // A guid that no longer resolves (the item was consumed or
+            // traded away since it was attached) simply does not draw --
+            // `send_composed_mail` still sends it and lets the server's own
+            // `MAIL_ERR_MAIL_ATTACHMENT_INVALID` say so, the same trust in a
+            // loud refusal this client gives every other silent-until-Send
+            // request.
+            let attachments: Vec<ui::MailAttachment> = attachment_guids
+                .into_iter()
+                .filter_map(|guid| {
+                    let live = self.live.as_ref()?;
+                    let (entry, count) = {
+                        let carried = ::world::inventory::carried(&live.state, live.guid)
+                            .into_iter()
+                            .find(|carried| carried.item.guid == guid)?;
+                        (carried.item.entry.unwrap_or(0), carried.item.count)
+                    };
+                    let name = Self::item_name(self.live.as_ref(), &self.items, entry);
+                    let icon = (entry != 0)
+                        .then(|| {
+                            self.items
+                                .icon(&r.gpu, &mut r.egui_renderer, &mut self.chain, entry)
+                        })
+                        .flatten();
+                    Some(ui::MailAttachment { count, icon, name })
+                })
+                .collect();
+            Some(ui::MailComposeView {
+                recipient,
+                subject,
+                body,
+                money,
+                focus,
+                status,
+                status_bad,
                 can_send,
-            }
-        });
+                attachments,
+            })
+        } else {
+            None
+        };
 
         // The flight master's list. Needs no renderer -- there are no icons
         // -- but it is built here beside the trainer's so that every window
@@ -18721,12 +18828,14 @@ impl App {
             let at = bags_where.get(index).copied().flatten();
             // **Modal, and deliberately so.** While a trade window is open a
             // right-click puts the item on the table instead of equipping or
-            // using it, and while a vendor's stock is open it sells instead.
-            // Both return whether they took the gesture, so the ordinary
+            // using it, while a vendor's stock is open it sells instead, and
+            // while the mail compose form is open it attaches instead. All
+            // three return whether they took the gesture, so the ordinary
             // path is not also run -- a click that both offered an item and
             // equipped it would be two requests from one press, and the
             // second would cancel the trade the first started.
-            if !self.offer_item(at) && !self.sell_item_to_vendor(at) {
+            if !self.offer_item(at) && !self.sell_item_to_vendor(at) && !self.attach_item_to_mail(at)
+            {
                 self.activate_item(at);
             }
         }
@@ -19031,6 +19140,17 @@ impl App {
                     self.mail_compose = None;
                 }
                 ui::MailComposeClick::Send => self.send_composed_mail(),
+                // Reversible with no confirm -- see
+                // `ui::MailComposeClick::RemoveAttachment`'s own doc comment
+                // for why this is not the destroy-item gesture: nothing has
+                // left the bags, the server only sees the list at Send.
+                ui::MailComposeClick::RemoveAttachment(index) => {
+                    if let Some(form) = self.mail_compose.as_mut() {
+                        if index < form.attachments.len() {
+                            form.attachments.remove(index);
+                        }
+                    }
+                }
             }
         }
 

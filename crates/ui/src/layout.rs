@@ -595,18 +595,33 @@ impl ElementId {
                 offset: [280.0, 210.0],
                 ..Default::default()
             },
-            // Top-left anchored, in the pocket above the trainer/flight/
-            // vendor column and right of the character panel. **An edge
-            // anchor rather than a centred one, the reasoning the guild and
-            // auction windows give:** a centre offset big enough to reach
-            // this pocket at 1920 puts the form off the screen at 1024,
-            // where a first-time user has no way to drag it back. The inbox
-            // it opens from sits low and right, so the two are visible at
-            // once, and this spot is clear of every default frame -- the
-            // constraint that actually placed it.
+            // Bottom-anchored, horizontally centred, near the foot of the
+            // screen. **Moved off the trainer/flight/vendor column once
+            // attachments made the form taller** -- a row of squares between
+            // Money and Message added about 43 units to a pocket that had
+            // only about 7 to spare (between the target frame's foot and the
+            // trainer window's head), which is what
+            // `the_default_frames_do_not_overlap` caught. No amount of
+            // trimming the new row was going to fit a strictly taller form
+            // into an unchanged gap.
+            //
+            // **A bottom anchor rather than another top-left offset**,
+            // because a form this tall has almost nowhere left free on a
+            // 1920 canvas that also has to fit inside 1024x768 -- and a
+            // bottom-anchored offset is the one kind of placement that keeps
+            // clearing the small screen's edge for free as the screen
+            // shrinks, the same reason `ElementId::XpBar` and the action
+            // bars anchor to an edge rather than a corner. The pocket this
+            // lands in is below the release-spirit prompt and the loot
+            // window, above the action and cast bars, clear of the mailbox
+            // and trade windows either side -- found by search
+            // (`search_mail_compose_spot`, removed once it had answered)
+            // rather than picked by eye, because eyeballing free space
+            // against twenty other default frames is exactly the exercise
+            // that produced the overlap this replaces.
             ElementId::MailCompose => Element {
-                anchor: Anchor::TopLeft,
-                offset: [270.0, 100.0],
+                anchor: Anchor::Bottom,
+                offset: [-130.0, -120.0],
                 ..Default::default()
             },
             // Under the minimap and the quest log, against the right edge.

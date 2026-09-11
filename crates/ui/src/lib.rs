@@ -51,7 +51,7 @@ pub use frames::{
     InviteAnswer, LootRuleView, PartyInviteView, PartyMemberView, QuestDetail,
     QuestLogEntry, QuestgiverAction, QuestgiverClick, QuestgiverOption, QuestgiverRow,
     GuildRow, GuildView, MailAttachment, MailRow, MailRowState, OfficerNotes, MailView,
-    MailComposeClick, MailComposeField, MailComposeView,
+    MailComposeClick, MailComposeField, MailComposeView, MAX_ATTACHMENTS,
     Difficulty, MapMarker, MapPatch, MapView, MarkerKind, MinimapTile, MinimapView,
     QuestgiverView,
     SpellbookEntry, TaxiRow, TaxiView, TrackedQuest, TrackerView, TradeClick, TradeOfferAnswer,
@@ -4039,6 +4039,7 @@ mod tests {
                     attachments: vec![frames::MailAttachment {
                         count: 3,
                         icon: None,
+                        name: String::new(),
                     }],
                     read: false,
                     days_left: 30.0,

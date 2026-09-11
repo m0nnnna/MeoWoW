@@ -84,11 +84,21 @@ impl MailRowState {
 }
 
 /// One attachment, as far as this window is concerned.
+///
+/// Shared with [`super::mail_compose`], which draws the same square for an
+/// item on its way *out*: a received letter's item has no name without a
+/// separate query nobody has wired up (`name` is empty there, and the square
+/// falls back to a blank fill), while a compose attachment is the player's
+/// own carried item and always resolves one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MailAttachment {
     /// Stack size, straight off the mail record.
     pub count: u32,
     pub icon: Option<egui::TextureId>,
+    /// Empty when unresolved -- see the struct doc. A square with an icon
+    /// never needs it; one without falls back to this, abbreviated, so an
+    /// unresolved icon and an actually-empty square do not look alike.
+    pub name: String,
 }
 
 /// One letter.
@@ -148,6 +158,7 @@ pub fn placeholder() -> MailView {
                 attachments: vec![MailAttachment {
                     count: 5,
                     icon: None,
+                    name: String::new(),
                 }],
                 read: false,
                 days_left: 30.0,
@@ -384,6 +395,16 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MailView, style: &Style, scale
                     square,
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     Color32::WHITE,
+                );
+            } else if !attachment.name.is_empty() {
+                painter.rect_filled(square, corner_radius(2.0 * scale), dim(text, 0.2));
+                let clipped = painter.with_clip_rect(square);
+                clipped.text(
+                    square.center(),
+                    Align2::CENTER_CENTER,
+                    attachment.name.chars().take(3).collect::<String>(),
+                    small.clone(),
+                    text,
                 );
             } else {
                 painter.rect_filled(square, corner_radius(2.0 * scale), dim(text, 0.2));

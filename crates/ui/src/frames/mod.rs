@@ -68,7 +68,7 @@ pub use trade::{
     TradeClick, TradeOfferAnswer, TradeOfferView, TradeSquare, TradeSquareItem, TradeView,
 };
 pub use mail::{MailAttachment, MailRow, MailRowState, MailView};
-pub use mail_compose::{MailComposeClick, MailComposeField, MailComposeView};
+pub use mail_compose::{MailComposeClick, MailComposeField, MailComposeView, MAX_ATTACHMENTS};
 pub use trainer::{TrainerRow, TrainerRowState, TrainerView};
 pub use unit::UnitView;
 pub use vendor::{VendorRow, VendorView};
