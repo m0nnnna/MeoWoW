@@ -929,7 +929,26 @@ fn world_for_live(
         let placements: Vec<world::EntityPlacement> =
             // A headless render has no movement driver to have decided, and
             // the character is standing still: not swimming.
-            drawable_with_own(live, live.position, (0.0, 0.0), 0.0, false, false)
+            drawable_with_own(
+                live,
+                live.position,
+                (0.0, 0.0),
+                0.0,
+                false,
+                false,
+                live.state
+                    .get(live.guid)
+                    .is_some_and(|entity| {
+                        entity.can_fly
+                            || entity.movement.is_some_and(|movement| {
+                                movement.flags
+                                    & (::world::update::movement_flags::CAN_FLY
+                                        | ::world::update::movement_flags::FLYING
+                                        | ::world::update::movement_flags::DISABLE_GRAVITY)
+                                    != 0
+                            })
+                    }),
+            )
                 .iter()
                 .map(|entity| {
                     let (look, look_key) =
@@ -944,6 +963,7 @@ fn world_for_live(
                         turning: entity.turning,
                         airborne: entity.airborne,
                         swimming: entity.swimming,
+                        flying: entity.flying,
                         dead: entity.dead,
                         died_ms_ago: entity.died_ms_ago,
                         swung_ms_ago: entity.swung_ms_ago,
@@ -1117,8 +1137,7 @@ const FOLLOW_PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.05;
 /// cadence -- roughly what a real client sends while moving.
 const LIVE_HEARTBEAT_EVERY: Duration = Duration::from_millis(100);
 
-/// Units per second on foot. Not tunable from the command line: it is a
-/// property of the character, not the viewer.
+/// Fallback units per second on foot before the server's movement state arrives.
 ///
 /// 7.0 is the *run* speed -- 3.3.5a walks at 2.5, and walking is a toggle
 /// nothing here sends -- which is why the character's own body draws with the
@@ -1135,11 +1154,7 @@ const LIVE_RUN_SPEED: f32 = 7.0;
 /// Units per second retreating. 3.3.5a backpedals at 4.5, deliberately slower
 /// than a run so that turning to flee costs something.
 ///
-/// Hardcoded like [`LIVE_RUN_SPEED`] beside it, and for the same reason: the
-/// authoritative figures are in the movement block of the object-create packet,
-/// which carries nine speeds and which this client does not parse yet. Until it
-/// does, a character with a speed buff moves at the default here. Reading them
-/// off the wire is the right fix and is not this one.
+/// The authoritative value is used from the movement block when available.
 ///
 /// **Confirmed against the original client at 4.50 yd/s**, a clearly separate
 /// peak from the run at 7.00 in the same session's histogram. Two peaks and
@@ -1180,21 +1195,42 @@ const LIVE_BACK_SPEED: f32 = 4.5;
 /// `AnimationData`'s `fallback` was read as "the shuffles fall back to Stand":
 /// their fallback is `0`, and so is `Walk`'s and `Run`'s, because `0` there
 /// means *no fallback* rather than row zero.
-fn live_pace(moving: ::world::motion::Motion) -> f32 {
+fn replicated_speed(speeds: Option<&[f32; 9]>, index: usize, fallback: f32) -> f32 {
+    speeds
+        .and_then(|speeds| speeds.get(index).copied())
+        .filter(|speed| speed.is_finite() && *speed > 0.0)
+        .unwrap_or(fallback)
+}
+
+fn live_pace_with_speeds(
+    moving: ::world::motion::Motion,
+    speeds: Option<&[f32; 9]>,
+    flying: bool,
+) -> f32 {
     use ::world::motion::Axis;
+    let forward = if flying {
+        replicated_speed(speeds, ::world::update::SpeedKind::Flight.index(), LIVE_RUN_SPEED)
+    } else {
+        replicated_speed(speeds, ::world::update::SpeedKind::Run.index(), LIVE_RUN_SPEED)
+    };
+    let backward = if flying {
+        replicated_speed(speeds, ::world::update::SpeedKind::FlightBack.index(), LIVE_BACK_SPEED)
+    } else {
+        replicated_speed(speeds, ::world::update::SpeedKind::RunBack.index(), LIVE_BACK_SPEED)
+    };
     match moving.longitudinal() {
         // Backing up is the only direction with its own speed *and* its own
         // cycle.
-        Some(Axis::Negative) => -LIVE_BACK_SPEED,
+        Some(Axis::Negative) => -backward,
         // Forward, and forward with a sideways component: a diagonal is
         // mostly a run.
-        Some(Axis::Positive) => LIVE_RUN_SPEED,
+        Some(Axis::Positive) => forward,
         // A pure sidestep. Travels at the run speed and plays the run, per
         // the travel bit above -- and reporting `0.0` here, which the
         // shuffle-cycle attempt did, stops the character moving at all,
         // because this same number is what the movement integrator scales the
         // direction by.
-        None if moving.is_moving() => LIVE_RUN_SPEED,
+        None if moving.is_moving() => forward,
         _ => 0.0,
     }
 }
@@ -1389,6 +1425,14 @@ const LIVE_TURN_RATE: f32 = std::f32::consts::PI;
 /// role* rather than after a direction in space -- `strafe_left` is what `Q`
 /// does in the world, and `up` is what the free camera does with the keys the
 /// world has no vertical use for.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum VerticalMotion {
+    #[default]
+    Still,
+    Ascending,
+    Descending,
+}
+
 #[derive(Default, Clone, Copy)]
 struct KeyState {
     forward: bool,
@@ -5457,6 +5501,7 @@ struct App {
     /// The movement state currently reported to the server. Compared against
     /// what the keys say each frame; the difference is what has to be sent.
     live_move: ::world::motion::Motion,
+    live_vertical: VerticalMotion,
     /// The jump in progress, if the character is off the ground.
     ///
     /// The server does not simulate the arc -- it is told the take-off and the
@@ -6173,6 +6218,7 @@ fn drawable_with_own(
     lean: f32,
     airborne: bool,
     swimming: bool,
+    flying: bool,
 ) -> Vec<live::Entity> {
     let mut entities = live::drawable_entities(&live.state, live.guid, live.position);
     if let Some(own) = live::own_entity(
@@ -6184,6 +6230,7 @@ fn drawable_with_own(
         pace.1,
         airborne,
         swimming,
+        flying,
     ) {
         entities.push(own);
     }
@@ -8200,6 +8247,7 @@ impl App {
             speed: 1.0,
             live: None,
             live_move: ::world::motion::Motion::default(),
+            live_vertical: VerticalMotion::default(),
             jump: None,
             jump_takeoff_z: 0.0,
             floor_filter: FloorFilter::default(),
@@ -9216,6 +9264,16 @@ impl App {
                     }
                 }
             }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } => {
+                if self.live.is_some() {
+                    self.autorun = !self.autorun;
+                    window.request_redraw();
+                }
+            }
             WindowEvent::ModifiersChanged(state) => {
                 self.modifiers = state.state();
             }
@@ -9299,6 +9357,7 @@ impl App {
                         if code == KeyCode::Space
                             && self.live.is_some()
                             && self.swimming.is_none()
+                            && !self.live_can_fly()
                         {
                             self.begin_jump();
                             window.request_redraw();
@@ -9781,6 +9840,7 @@ impl App {
         // anything wanting `&self` has to have asked already.
         let pace = self.animation_pace();
         let lean = self.strafe_lean();
+        let flying = self.live_can_fly();
 
         // **Before the renderer is borrowed**, because this needs the archive
         // chain and the scene at the same time and the draw below holds the
@@ -9844,9 +9904,8 @@ impl App {
             let phase = Instant::now();
             if self.args.entities {
                 if let Some(live) = self.live.as_mut() {
-                    // The keys, not the wire: the server never relays our own
-                    // movement back to us. Held means running -- there is no
-                    // walk toggle here, and `LIVE_RUN_SPEED` is the run speed.
+                    // The server never relays our own position back to us; the
+                    // replicated movement state still supplies its speeds.
                     // F2. See `App::entity_flip`.
                     let flip = if self.entity_flip { std::f32::consts::PI } else { 0.0 };
                     // **Cosmetic only** -- see `App::drawn_own_z`. `live.position.z`
@@ -9879,6 +9938,7 @@ impl App {
                         lean,
                         self.jump.is_some(),
                         self.swimming.is_some(),
+                        flying,
                     );
                     // See `App::own_body_drawn`: submitted-and-not-drawn and
                     // never-submitted are the same report from the window.
@@ -9921,7 +9981,7 @@ impl App {
                                             world,
                                             entity.guid,
                                             entity.position,
-                                            entity.airborne,
+                                            entity.airborne || entity.flying,
                                             entity.swimming,
                                         )
                                     },
@@ -9931,6 +9991,7 @@ impl App {
                                     turning: entity.turning,
                                     airborne: entity.airborne,
                                     swimming: entity.swimming,
+                                    flying: entity.flying,
                                     dead: entity.dead,
                                     died_ms_ago: entity.died_ms_ago,
                                     swung_ms_ago: entity.swung_ms_ago,
@@ -10410,15 +10471,20 @@ impl App {
     /// What the character's own body should be *animating* at: how fast along
     /// its facing, and how fast it is turning on the spot.
     ///
-    /// **Not how fast it travels** -- that is [`live_pace`] read directly by
+    /// **Not how fast it travels** -- that is [`live_pace_with_speeds`] read by
     /// `drive_live_movement`, and the two parting company for one commit is
     /// what stopped sidestepping from moving anybody. One function so the
     /// frame that is drawn and the list a click is tested against cannot
     /// disagree, which is the same rule that unprojects the picking ray from
     /// the matrix the scene was drawn with.
     fn animation_pace(&self) -> (f32, f32) {
+        let (speeds, flying) = self
+            .live
+            .as_ref()
+            .and_then(|live| live.state.get(live.guid).map(|entity| (entity.speeds.as_ref(), entity.can_fly)))
+            .unwrap_or((None, false));
         (
-            live_pace(self.live_move),
+            live_pace_with_speeds(self.live_move, speeds, flying),
             // Turning on the spot, and only that: the shuffles carry nobody
             // anywhere, and a sidestep is carried by the run with the body
             // turned -- see [`strafe_yaw`].
@@ -10487,6 +10553,145 @@ impl App {
         true
     }
 
+    fn live_can_fly(&self) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        let Some(entity) = live.state.get(live.guid) else {
+            return false;
+        };
+        entity.can_fly
+            || entity.movement.is_some_and(|movement| {
+                movement.flags
+                    & (::world::update::movement_flags::CAN_FLY
+                        | ::world::update::movement_flags::FLYING
+                        | ::world::update::movement_flags::DISABLE_GRAVITY)
+                    != 0
+            })
+    }
+
+    fn drive_live_flying(&mut self) {
+        use ::world::update::movement_flags;
+        use ::world::{ClientOpcode, MovementInfo, Position};
+
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let speeds = live.state.get(live.guid).and_then(|entity| entity.speeds.as_ref());
+        let dt = (self.frame_ms / 1000.0).max(0.0);
+        let turn = if self.steering {
+            0.0
+        } else {
+            match (self.keys.left, self.keys.right) {
+                (true, false) => LIVE_TURN_RATE,
+                (false, true) => -LIVE_TURN_RATE,
+                _ => 0.0,
+            }
+        };
+        if turn != 0.0 {
+            live.orientation = (live.orientation + turn * dt).rem_euclid(std::f32::consts::TAU);
+        }
+        let mut desired = self.keys.motion(self.steering);
+        if self.autorun && !desired.backward {
+            desired.forward = true;
+        }
+        let horizontal_speed = live_pace_with_speeds(desired, speeds, true).abs();
+        let (dx, dy) = desired.direction(live.orientation);
+        live.position.x += dx * horizontal_speed * dt;
+        live.position.y += dy * horizontal_speed * dt;
+        let vertical = match (self.keys.up, self.keys.down) {
+            (true, false) => VerticalMotion::Ascending,
+            (false, true) => VerticalMotion::Descending,
+            _ => VerticalMotion::Still,
+        };
+        let vertical_speed = replicated_speed(
+            speeds,
+            ::world::update::SpeedKind::Flight.index(),
+            LIVE_RUN_SPEED,
+        );
+        match vertical {
+            VerticalMotion::Ascending => live.position.z += vertical_speed * dt,
+            VerticalMotion::Descending => live.position.z -= vertical_speed * dt,
+            VerticalMotion::Still => {}
+        }
+        let position = Position {
+            x: live.position.x,
+            y: live.position.y,
+            z: live.position.z,
+            orientation: live.orientation,
+        };
+        let pitch = self.camera_pitch;
+        let info_now = |live: &live::LiveWorld| MovementInfo {
+            flags: desired.flags()
+                | movement_flags::CAN_FLY
+                | movement_flags::FLYING
+                | match vertical {
+                    VerticalMotion::Ascending => movement_flags::ASCENDING,
+                    VerticalMotion::Descending => movement_flags::DESCENDING,
+                    VerticalMotion::Still => 0,
+                },
+            time: live.connection.tick(),
+            position,
+            pitch: Some(pitch),
+            ..MovementInfo::default()
+        };
+        let mut send = |opcode| {
+            if let Err(error) = live
+                .connection
+                .send_movement(opcode, live.guid, &info_now(live))
+            {
+                tracing::warn!("sending flying movement failed: {error:#}");
+            }
+        };
+        let transitions = ::world::motion::Motion::transitions(self.live_move, desired);
+        for opcode in transitions.iter().copied() {
+            send(opcode);
+        }
+        if !transitions.is_empty() {
+            self.live_move = desired;
+        }
+        let previous_vertical = self.live_vertical;
+        if previous_vertical != vertical {
+            if previous_vertical == VerticalMotion::Ascending
+                && vertical != VerticalMotion::Ascending
+            {
+                send(ClientOpcode::MoveStopAscend);
+            }
+            if previous_vertical == VerticalMotion::Descending
+                && vertical != VerticalMotion::Descending
+            {
+                send(ClientOpcode::MoveHeartbeat);
+            }
+            if previous_vertical != VerticalMotion::Ascending
+                && vertical == VerticalMotion::Ascending
+            {
+                send(ClientOpcode::MoveStartAscend);
+            }
+            if previous_vertical != VerticalMotion::Descending
+                && vertical == VerticalMotion::Descending
+            {
+                send(ClientOpcode::MoveStartDescend);
+            }
+            self.live_vertical = vertical;
+            self.last_heartbeat = Instant::now();
+        }
+        if transitions.is_empty()
+            && previous_vertical == vertical
+            && (desired.is_moving() || vertical != VerticalMotion::Still)
+            && self.last_heartbeat.elapsed() >= LIVE_HEARTBEAT_EVERY
+        {
+            send(ClientOpcode::MoveHeartbeat);
+            self.last_heartbeat = Instant::now();
+        } else if transitions.is_empty()
+            && previous_vertical == vertical
+            && turn != 0.0
+            && self.last_heartbeat.elapsed() >= LIVE_HEARTBEAT_EVERY
+        {
+            send(ClientOpcode::MoveSetFacing);
+            self.last_heartbeat = Instant::now();
+        }
+    }
+
     fn drive_live_movement(&mut self) {
         use ::world::update::movement_flags;
         use ::world::{ClientOpcode, MovementInfo, Position};
@@ -10511,6 +10716,11 @@ impl App {
         if self.advance_flight() {
             return;
         }
+        if self.live_can_fly() {
+            self.drive_live_flying();
+            return;
+        }
+        self.live_vertical = VerticalMotion::Still;
 
         let Some(live) = self.live.as_mut() else {
             return;
@@ -10547,6 +10757,7 @@ impl App {
         if self.autorun && !desired.backward {
             desired.forward = true;
         }
+        let speeds = live.state.get(live.guid).and_then(|entity| entity.speeds.as_ref());
 
         let (dx, dy) = desired.direction(live.orientation);
         if (dx, dy) != (0.0, 0.0) {
@@ -10555,7 +10766,7 @@ impl App {
             // the caller that made a pace of zero mean "do not move", which
             // is why `live_pace` cannot answer an animation question with a
             // number the movement integrator also reads.
-            let speed = live_pace(desired).abs();
+            let speed = live_pace_with_speeds(desired, speeds, false).abs();
             let wanted = glam::Vec3::new(
                 live.position.x + dx * speed * dt,
                 live.position.y + dy * speed * dt,
@@ -10970,7 +11181,7 @@ impl App {
                     self.jump_takeoff_z = base;
                     self.jump = Some(::world::motion::Jump::stepping_off(
                         desired.direction(live.orientation),
-                        live_pace(desired).abs(),
+                        live_pace_with_speeds(desired, speeds, false).abs(),
                     ));
                     // `ground_base` is deliberately left where it was: the
                     // ledge is what the arc falls *from*, and the airborne
@@ -11024,7 +11235,7 @@ impl App {
                 // already in the player's hands that carries a vertical
                 // direction -- adding a second one would give two ways to sink
                 // that could disagree.
-                z += self.camera_pitch.sin() * live_pace(desired).abs() * dt;
+                z += self.camera_pitch.sin() * live_pace_with_speeds(desired, speeds, false).abs() * dt;
             } else {
                 // Buoyancy: a fraction of the remaining distance per second
                 // rather than a fixed rise, for the reason the camera's height
@@ -12031,10 +12242,14 @@ impl App {
         let Some(live) = self.live.as_mut() else {
             return;
         };
+        let speeds = live.state.get(live.guid).and_then(|entity| entity.speeds.as_ref());
         // The heading at take-off, kept for the whole arc: a jump carries the
         // direction it began with, which is why turning in mid-air does not
         // steer it.
-        let jump = ::world::motion::Jump::begin(moving.direction(live.orientation), LIVE_RUN_SPEED);
+        let jump = ::world::motion::Jump::begin(
+            moving.direction(live.orientation),
+            live_pace_with_speeds(moving, speeds, false).abs(),
+        );
         let info = MovementInfo {
             flags: moving.flags() | ::world::update::movement_flags::FALLING,
             time: live.connection.tick(),
@@ -15045,6 +15260,7 @@ impl App {
             self.strafe_lean(),
             self.jump.is_some(),
             self.swimming.is_some(),
+            self.live_can_fly(),
         );
         if skip_players {
             entities.retain(|entity| entity.kind != ::world::ObjectType::Player);
@@ -15280,6 +15496,7 @@ impl App {
             Ok(packets) => {
                 let report = live::replicate(&mut live.state, &packets);
                 live.note_failures(&report);
+                live.answer_movement_controls(&report);
                 // **Our own body is dressed from a login snapshot**, so a
                 // piece of gear equipped or removed in play -- a cape most
                 // visibly -- changes nothing on screen until the snapshot is
@@ -18770,7 +18987,7 @@ impl App {
                         "left-click to target, right-click to target and attack, \
                          Tab targets the nearest mob, Ctrl+Tab the nearest \
                          party member, right-drag to steer, wheel to zoom, \
-                         Q/E strafe, space jumps, Num Lock or R autoruns, \
+                         Q/E strafe, space jumps, middle-click/Num Lock/R autoruns, \
                          Z draws or stows the weapon. \
                          P for the spellbook (click a spell then a slot; \
                          right-click a slot to clear it), B for the bags, \
@@ -19339,7 +19556,7 @@ mod gesture_tests {
     /// where `Q` and `E` moved nobody.
     ///
     /// The cycle itself is settled in `AnimationData` rather than here; see
-    /// [`live_pace`] and the test below it.
+    /// [`live_pace_with_speeds`] and the test below it.
     #[test]
     fn a_sidestep_travels_at_the_run_speed_like_every_other_direction() {
         use ::world::motion::Motion;
@@ -19368,7 +19585,7 @@ mod gesture_tests {
             ("retreat", back, -LIVE_BACK_SPEED),
             ("still", Motion::default(), 0.0),
         ] {
-            assert_eq!(live_pace(motion), expected, "{name}");
+            assert_eq!(live_pace_with_speeds(motion, None, false), expected, "{name}");
         }
         // The other half: a *travelling* character must not also be reported
         // as turning on the spot, or the shuffle would be laid over the run.
@@ -19379,6 +19596,29 @@ mod gesture_tests {
                 "{name} must not report a turn as well"
             );
         }
+    }
+
+    #[test]
+    fn replicated_speeds_drive_ground_and_flight_pace() {
+        use ::world::motion::Motion;
+
+        let speeds = [2.0, 9.5, 5.25, 3.0, 2.0, 14.0, 6.5, 1.0, 1.0];
+        assert_eq!(
+            live_pace_with_speeds(Motion { forward: true, ..Default::default() }, Some(&speeds), false),
+            9.5
+        );
+        assert_eq!(
+            live_pace_with_speeds(Motion { backward: true, ..Default::default() }, Some(&speeds), false),
+            -5.25
+        );
+        assert_eq!(
+            live_pace_with_speeds(Motion { forward: true, ..Default::default() }, Some(&speeds), true),
+            14.0
+        );
+        assert_eq!(
+            live_pace_with_speeds(Motion { backward: true, ..Default::default() }, Some(&speeds), true),
+            -6.5
+        );
     }
 
     /// **A wall stops the eye short; open air leaves it exactly where it

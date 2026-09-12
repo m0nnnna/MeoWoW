@@ -1200,6 +1200,7 @@ pub struct EntityPlacement {
     /// having to sample the water under them. False for creatures: a
     /// `SMSG_MONSTER_MOVE` carries a path and no flags.
     pub swimming: bool,
+    pub flying: bool,
     /// Whether this unit has no health left, so it should be drawn down rather
     /// than standing. Outranks `speed`: a creature killed mid-charge still has
     /// the charge's speed attached to it.
@@ -2879,26 +2880,30 @@ impl World {
                 (Some(age), Some(rest)) => Some((age, rest)),
                 _ => None,
             };
-            let motion = Motion::resolve(
-                placement.speed,
-                placement.turning,
-                placement.airborne,
-                placement.swimming,
-                placement.dead,
-                placement.died_ms_ago,
-                placement.swung_ms_ago,
-                placement.fighting,
-                now_ms,
-                // Stowed weapons leave the hands free, so the stance only
-                // applies while something is drawn.
-                if placement.sheathed {
-                    Stance::Unarmed
-                } else {
-                    placement.stance
-                },
-                sheathing,
-                placement.spell,
-            );
+            let motion = if placement.flying && !placement.dead {
+                Motion::Flying
+            } else {
+                Motion::resolve(
+                    placement.speed,
+                    placement.turning,
+                    placement.airborne,
+                    placement.swimming,
+                    placement.dead,
+                    placement.died_ms_ago,
+                    placement.swung_ms_ago,
+                    placement.fighting,
+                    now_ms,
+                    // Stowed weapons leave the hands free, so the stance only
+                    // applies while something is drawn.
+                    if placement.sheathed {
+                        Stance::Unarmed
+                    } else {
+                        placement.stance
+                    },
+                    sheathing,
+                    placement.spell,
+                )
+            };
             let bucket = (
                 placement.display_id,
                 // Applied after rather than inside: see `Motion::crouched`.
@@ -4144,6 +4149,7 @@ const FALL_ANIMATION_ID: u16 = 40;
 const SWIM_IDLE_ANIMATION_ID: u16 = 41;
 const SWIM_ANIMATION_ID: u16 = 42;
 const SWIM_BACK_ANIMATION_ID: u16 = 45;
+const FLYING_ANIMATION_ID: u16 = 135;
 /// Falling over, and lying still afterwards. Two rows, not one, and the table
 /// says so itself: `Dead` (6) lists `Death` (1) as its *fallback*, which is
 /// exactly the relationship between them -- a model with no settled-corpse
@@ -4408,6 +4414,7 @@ pub enum Motion {
     /// correctly for the whole flight; the other three are the refinement, not
     /// the feature.
     Airborne,
+    Flying,
     /// Turning on the spot, and which way.
     ///
     /// **Not sidestepping.** That was the first reading and it was reported
@@ -4758,7 +4765,7 @@ impl Motion {
     /// this total rather than leaving a hole for the frame in between.
     fn crouched(self) -> Motion {
         match self {
-            Motion::Dying(_) | Motion::Dead | Motion::Airborne | Motion::Swim(_) => self,
+            Motion::Dying(_) | Motion::Dead | Motion::Airborne | Motion::Flying | Motion::Swim(_) => self,
             Motion::Run => Motion::Stealth(Creep::Run),
             // Backing up creeps too. `AnimationData` has no reverse stealth
             // cycle at all, so the choice is the forward creep or standing
@@ -4782,6 +4789,7 @@ impl Motion {
                 | Motion::WalkBack
                 | Motion::Shuffle(_)
                 | Motion::Airborne
+                | Motion::Flying
                 | Motion::Swim(_)
                 // Continuous, like walking, and this line runs on every
                 // rebuild -- which is every frame. A rogue that crouched once
@@ -4842,6 +4850,7 @@ impl Motion {
             // sailing through the air in its idle pose is the same failure as
             // one sliding along the ground in it.
             Motion::Airborne => &[JUMP_ANIMATION_ID, FALL_ANIMATION_ID, RUN_ANIMATION_ID],
+            Motion::Flying => &[FLYING_ANIMATION_ID, RUN_ANIMATION_ID],
             // Falling back to the *other* swim cycle rather than to standing
             // or running, for the reason `Airborne` falls back to the run: a
             // body held upright and walking through a lake is a worse picture
@@ -5618,6 +5627,11 @@ mod tests {
         // Not to standing: a model sliding backwards on the spot is the bug
         // the travelling cycles exist to avoid.
         assert!(!ids.contains(&STAND_ANIMATION_ID));
+    }
+
+    #[test]
+    fn flying_uses_the_reference_motion_id() {
+        assert_eq!(Motion::Flying.animation_ids().first(), Some(&FLYING_ANIMATION_ID));
     }
 
     /// A drawn weapon holds the guard up on its own, without a fight.

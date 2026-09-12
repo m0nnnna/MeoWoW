@@ -34,6 +34,8 @@ pub struct Entity {
     /// Every field seen so far, with later updates folded over earlier ones.
     pub fields: Fields,
     pub movement: Option<MovementInfo>,
+    pub speeds: Option<[f32; 9]>,
+    pub can_fly: bool,
     /// Where a `SMSG_MONSTER_MOVE` says this creature is heading, if anywhere.
     pub destination: Option<Position>,
     /// How long the move to `destination` takes, in milliseconds. `None`
@@ -164,6 +166,17 @@ impl Entity {
 
     pub fn health(&self) -> Option<u32> {
         self.fields.get(crate::update::fields::UNIT_HEALTH)
+    }
+
+    pub fn movement_speed(&self, index: usize) -> Option<f32> {
+        self.speeds
+            .and_then(|speeds| speeds.get(index).copied())
+            .filter(|speed| speed.is_finite() && *speed > 0.0)
+    }
+
+    pub fn flying(&self) -> bool {
+        self.movement
+            .is_some_and(|movement| movement.flags & crate::update::movement_flags::FLYING != 0)
     }
 
     /// Which *kind* of thing this is, as a template id.
@@ -1057,6 +1070,10 @@ pub struct Replication {
     pub weather_changes: usize,
     pub monster_moves: usize,
     pub relayed_moves: usize,
+    pub speed_changes: Vec<crate::update::ForceSpeedChange>,
+    pub relayed_speed_changes: Vec<crate::update::RelayedSpeedChange>,
+    pub spline_speed_changes: Vec<crate::update::SplineSpeedChange>,
+    pub can_fly_changes: Vec<crate::update::CanFlyChange>,
     /// `SMSG_DEATH_RELEASE_LOC`s folded this batch, whether placing a marker or
     /// clearing one.
     pub release_locations: usize,
@@ -2173,9 +2190,12 @@ impl WorldState {
                     ..
                 } => self.create(*guid, *object_type, movement, fields),
                 Block::Values { guid, fields } => self.update_values(*guid, fields),
-                Block::Movement { guid, movement } => {
-                    self.update_movement(*guid, movement.position, movement.info)
-                }
+                Block::Movement { guid, movement } => self.update_movement(
+                    *guid,
+                    movement.position,
+                    movement.info,
+                    movement.speeds,
+                ),
                 Block::OutOfRange { guids } => {
                     for guid in guids {
                         self.remove(*guid);
@@ -2213,6 +2233,9 @@ impl WorldState {
             if movement.info.is_some() {
                 existing.movement = movement.info;
             }
+            if movement.speeds.is_some() {
+                existing.speeds = movement.speeds;
+            }
             return;
         }
 
@@ -2225,6 +2248,8 @@ impl WorldState {
                 position: movement.position,
                 fields: fields.clone(),
                 movement: movement.info,
+                speeds: movement.speeds,
+                can_fly: false,
                 destination: None,
                 move_duration: None,
                 move_started: None,
@@ -2275,6 +2300,7 @@ impl WorldState {
         guid: u64,
         position: Option<Position>,
         info: Option<MovementInfo>,
+        speeds: Option<[f32; 9]>,
     ) {
         let Some(entity) = self.entities.get_mut(&guid) else {
             self.stats.orphaned += 1;
@@ -2288,6 +2314,48 @@ impl WorldState {
         }
         if info.is_some() {
             entity.movement = info;
+        }
+        if speeds.is_some() {
+            entity.speeds = speeds;
+        }
+    }
+
+    fn apply_speed_change(&mut self, change: &crate::update::ForceSpeedChange) {
+        if let Some(entity) = self.entities.get_mut(&change.guid) {
+            let speeds = entity.speeds.get_or_insert([0.0; 9]);
+            speeds[change.kind.index()] = change.speed;
+        }
+    }
+
+    fn apply_relayed_speed_change(&mut self, change: &crate::update::RelayedSpeedChange) {
+        self.apply_relayed_movement(change.guid, &change.info);
+        if let Some(entity) = self.entities.get_mut(&change.guid) {
+            let speeds = entity.speeds.get_or_insert([0.0; 9]);
+            speeds[change.kind.index()] = change.speed;
+        }
+    }
+
+    fn apply_spline_speed_change(&mut self, change: &crate::update::SplineSpeedChange) {
+        if let Some(entity) = self.entities.get_mut(&change.guid) {
+            let speeds = entity.speeds.get_or_insert([0.0; 9]);
+            speeds[change.kind.index()] = change.speed;
+        }
+    }
+
+    fn apply_can_fly_change(&mut self, change: &crate::update::CanFlyChange) {
+        if let Some(entity) = self.entities.get_mut(&change.guid) {
+            entity.can_fly = change.enabled;
+            if let Some(movement) = entity.movement.as_mut() {
+                if change.enabled {
+                    movement.flags |= crate::update::movement_flags::CAN_FLY;
+                    movement.flags &= !crate::update::movement_flags::FALLING;
+                } else {
+                    movement.flags &= !(crate::update::movement_flags::CAN_FLY
+                        | crate::update::movement_flags::FLYING
+                        | crate::update::movement_flags::ASCENDING
+                        | crate::update::movement_flags::DESCENDING);
+                }
+            }
         }
     }
 
@@ -2801,6 +2869,120 @@ impl WorldState {
                         Ok(moved) => {
                             report.monster_moves += 1;
                             self.apply_monster_move(&moved);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                opcode @ (crate::opcode::server::FORCE_RUN_SPEED_CHANGE
+                | crate::opcode::server::FORCE_RUN_BACK_SPEED_CHANGE
+                | crate::opcode::server::FORCE_SWIM_SPEED_CHANGE
+                | crate::opcode::server::FORCE_WALK_SPEED_CHANGE
+                | crate::opcode::server::FORCE_SWIM_BACK_SPEED_CHANGE
+                | crate::opcode::server::FORCE_TURN_RATE_CHANGE
+                | crate::opcode::server::FORCE_FLIGHT_SPEED_CHANGE
+                | crate::opcode::server::FORCE_FLIGHT_BACK_SPEED_CHANGE
+                | crate::opcode::server::FORCE_PITCH_RATE_CHANGE) => {
+                    let kind = match opcode {
+                        crate::opcode::server::FORCE_RUN_SPEED_CHANGE => crate::update::SpeedKind::Run,
+                        crate::opcode::server::FORCE_RUN_BACK_SPEED_CHANGE => crate::update::SpeedKind::RunBack,
+                        crate::opcode::server::FORCE_SWIM_SPEED_CHANGE => crate::update::SpeedKind::Swim,
+                        crate::opcode::server::FORCE_WALK_SPEED_CHANGE => crate::update::SpeedKind::Walk,
+                        crate::opcode::server::FORCE_SWIM_BACK_SPEED_CHANGE => crate::update::SpeedKind::SwimBack,
+                        crate::opcode::server::FORCE_TURN_RATE_CHANGE => crate::update::SpeedKind::Turn,
+                        crate::opcode::server::FORCE_FLIGHT_SPEED_CHANGE => crate::update::SpeedKind::Flight,
+                        crate::opcode::server::FORCE_FLIGHT_BACK_SPEED_CHANGE => crate::update::SpeedKind::FlightBack,
+                        crate::opcode::server::FORCE_PITCH_RATE_CHANGE => crate::update::SpeedKind::Pitch,
+                        _ => unreachable!(),
+                    };
+                    match update::parse_force_speed_change(&packet.body, kind) {
+                        Ok(change) => {
+                            self.apply_speed_change(&change);
+                            report.speed_changes.push(change);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                opcode @ (crate::opcode::server::MOVE_SET_CAN_FLY
+                | crate::opcode::server::MOVE_UNSET_CAN_FLY) => {
+                    let enabled = opcode == crate::opcode::server::MOVE_SET_CAN_FLY;
+                    match update::parse_can_fly_change(&packet.body, enabled) {
+                        Ok(change) => {
+                            self.apply_can_fly_change(&change);
+                            report.can_fly_changes.push(change);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                opcode @ (crate::opcode::server::MOVE_SET_RUN_SPEED
+                | crate::opcode::server::MOVE_SET_RUN_BACK_SPEED
+                | crate::opcode::server::MOVE_SET_WALK_SPEED
+                | crate::opcode::server::MOVE_SET_SWIM_SPEED
+                | crate::opcode::server::MOVE_SET_SWIM_BACK_SPEED
+                | crate::opcode::server::MOVE_SET_TURN_RATE
+                | crate::opcode::server::MOVE_SET_FLIGHT_SPEED
+                | crate::opcode::server::MOVE_SET_FLIGHT_BACK_SPEED
+                | crate::opcode::server::MOVE_SET_PITCH_RATE) => {
+                    let kind = match opcode {
+                        crate::opcode::server::MOVE_SET_RUN_SPEED => crate::update::SpeedKind::Run,
+                        crate::opcode::server::MOVE_SET_RUN_BACK_SPEED => crate::update::SpeedKind::RunBack,
+                        crate::opcode::server::MOVE_SET_WALK_SPEED => crate::update::SpeedKind::Walk,
+                        crate::opcode::server::MOVE_SET_SWIM_SPEED => crate::update::SpeedKind::Swim,
+                        crate::opcode::server::MOVE_SET_SWIM_BACK_SPEED => crate::update::SpeedKind::SwimBack,
+                        crate::opcode::server::MOVE_SET_TURN_RATE => crate::update::SpeedKind::Turn,
+                        crate::opcode::server::MOVE_SET_FLIGHT_SPEED => crate::update::SpeedKind::Flight,
+                        crate::opcode::server::MOVE_SET_FLIGHT_BACK_SPEED => crate::update::SpeedKind::FlightBack,
+                        crate::opcode::server::MOVE_SET_PITCH_RATE => crate::update::SpeedKind::Pitch,
+                        _ => unreachable!(),
+                    };
+                    match update::parse_relayed_speed_change(&packet.body, kind) {
+                        Ok(change) => {
+                            self.apply_relayed_speed_change(&change);
+                            report.relayed_speed_changes.push(change);
+                        }
+                        Err(error) => report.failures.push((
+                            packet.opcode,
+                            error,
+                            Ok(packet.body.clone()),
+                        )),
+                    }
+                }
+                opcode @ (crate::opcode::server::SPLINE_SET_RUN_SPEED
+                | crate::opcode::server::SPLINE_SET_RUN_BACK_SPEED
+                | crate::opcode::server::SPLINE_SET_SWIM_SPEED
+                | crate::opcode::server::SPLINE_SET_WALK_SPEED
+                | crate::opcode::server::SPLINE_SET_SWIM_BACK_SPEED
+                | crate::opcode::server::SPLINE_SET_TURN_RATE
+                | crate::opcode::server::SPLINE_SET_FLIGHT_SPEED
+                | crate::opcode::server::SPLINE_SET_FLIGHT_BACK_SPEED
+                | crate::opcode::server::SPLINE_SET_PITCH_RATE) => {
+                    let kind = match opcode {
+                        crate::opcode::server::SPLINE_SET_RUN_SPEED => crate::update::SpeedKind::Run,
+                        crate::opcode::server::SPLINE_SET_RUN_BACK_SPEED => crate::update::SpeedKind::RunBack,
+                        crate::opcode::server::SPLINE_SET_SWIM_SPEED => crate::update::SpeedKind::Swim,
+                        crate::opcode::server::SPLINE_SET_WALK_SPEED => crate::update::SpeedKind::Walk,
+                        crate::opcode::server::SPLINE_SET_SWIM_BACK_SPEED => crate::update::SpeedKind::SwimBack,
+                        crate::opcode::server::SPLINE_SET_TURN_RATE => crate::update::SpeedKind::Turn,
+                        crate::opcode::server::SPLINE_SET_FLIGHT_SPEED => crate::update::SpeedKind::Flight,
+                        crate::opcode::server::SPLINE_SET_FLIGHT_BACK_SPEED => crate::update::SpeedKind::FlightBack,
+                        crate::opcode::server::SPLINE_SET_PITCH_RATE => crate::update::SpeedKind::Pitch,
+                        _ => unreachable!(),
+                    };
+                    match update::parse_spline_speed_change(&packet.body, kind) {
+                        Ok(change) => {
+                            self.apply_spline_speed_change(&change);
+                            report.spline_speed_changes.push(change);
                         }
                         Err(error) => report.failures.push((
                             packet.opcode,

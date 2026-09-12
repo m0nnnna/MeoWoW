@@ -299,6 +299,17 @@ impl Connection {
         self.send(opcode, &protocol::movement(mover, info))
     }
 
+    pub fn send_movement_ack(
+        &mut self,
+        opcode: ClientOpcode,
+        mover: u64,
+        counter: u32,
+        info: &crate::movement::MovementInfo,
+        value: f32,
+    ) -> Result<(), Error> {
+        self.send(opcode, &protocol::movement_ack(mover, counter, info, value))
+    }
+
     /// Walks a character in a straight line and reports where it ended up.
     ///
     /// Movement is a *stream*, not a request: start, a heartbeat every so

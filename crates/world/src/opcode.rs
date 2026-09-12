@@ -347,6 +347,19 @@ pub enum ClientOpcode {
     MoveStopSwim = 0x00CB,
     MoveSetFacing = 0x00DA,
     MoveHeartbeat = 0x00EE,
+    MoveSetCanFlyAck = 0x0345,
+    MoveStartAscend = 0x0359,
+    MoveStopAscend = 0x035A,
+    MoveStartDescend = 0x03A7,
+    ForceWalkSpeedChangeAck = 0x02DB,
+    ForceRunSpeedChangeAck = 0x00E3,
+    ForceRunBackSpeedChangeAck = 0x00E5,
+    ForceSwimSpeedChangeAck = 0x00E7,
+    ForceSwimBackSpeedChangeAck = 0x02DD,
+    ForceTurnRateChangeAck = 0x02DF,
+    ForceFlightSpeedChangeAck = 0x0382,
+    ForceFlightBackSpeedChangeAck = 0x0384,
+    ForcePitchRateChangeAck = 0x045D,
     /// Confirming a teleport within the same map. The server sends this
     /// opcode, and the client must send it back before the move takes effect.
     ///
@@ -1318,6 +1331,35 @@ pub mod server {
     /// A creature following a server-computed path. The most common packet in
     /// a populated zone by a wide margin.
     pub const MONSTER_MOVE: u16 = 0x00DD;
+    pub const MOVE_SET_RUN_SPEED: u16 = 0x00CD;
+    pub const MOVE_SET_RUN_BACK_SPEED: u16 = 0x00CF;
+    pub const MOVE_SET_WALK_SPEED: u16 = 0x00D1;
+    pub const MOVE_SET_SWIM_SPEED: u16 = 0x00D3;
+    pub const MOVE_SET_SWIM_BACK_SPEED: u16 = 0x00D5;
+    pub const MOVE_SET_TURN_RATE: u16 = 0x00D8;
+    pub const FORCE_RUN_SPEED_CHANGE: u16 = 0x00E2;
+    pub const FORCE_RUN_BACK_SPEED_CHANGE: u16 = 0x00E4;
+    pub const FORCE_SWIM_SPEED_CHANGE: u16 = 0x00E6;
+    pub const FORCE_WALK_SPEED_CHANGE: u16 = 0x02DA;
+    pub const FORCE_SWIM_BACK_SPEED_CHANGE: u16 = 0x02DC;
+    pub const FORCE_TURN_RATE_CHANGE: u16 = 0x02DE;
+    pub const MOVE_SET_CAN_FLY: u16 = 0x0343;
+    pub const MOVE_UNSET_CAN_FLY: u16 = 0x0344;
+    pub const FORCE_FLIGHT_SPEED_CHANGE: u16 = 0x0381;
+    pub const FORCE_FLIGHT_BACK_SPEED_CHANGE: u16 = 0x0383;
+    pub const FORCE_PITCH_RATE_CHANGE: u16 = 0x045C;
+    pub const MOVE_SET_FLIGHT_SPEED: u16 = 0x037E;
+    pub const MOVE_SET_FLIGHT_BACK_SPEED: u16 = 0x0380;
+    pub const MOVE_SET_PITCH_RATE: u16 = 0x045B;
+    pub const SPLINE_SET_RUN_SPEED: u16 = 0x02FE;
+    pub const SPLINE_SET_RUN_BACK_SPEED: u16 = 0x02FF;
+    pub const SPLINE_SET_SWIM_SPEED: u16 = 0x0300;
+    pub const SPLINE_SET_WALK_SPEED: u16 = 0x0301;
+    pub const SPLINE_SET_SWIM_BACK_SPEED: u16 = 0x0302;
+    pub const SPLINE_SET_TURN_RATE: u16 = 0x0303;
+    pub const SPLINE_SET_FLIGHT_SPEED: u16 = 0x0385;
+    pub const SPLINE_SET_FLIGHT_BACK_SPEED: u16 = 0x0386;
+    pub const SPLINE_SET_PITCH_RATE: u16 = 0x045E;
     /// Relayed movement from another mover, sharing the client opcodes.
     pub const MOVE_START_FORWARD: u16 = 0x00B5;
     pub const MOVE_STOP: u16 = 0x00B7;

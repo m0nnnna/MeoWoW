@@ -133,8 +133,12 @@ pub mod movement_flags {
     pub const STRAFE_RIGHT: u32 = 0x0000_0008;
     pub const WALKING: u32 = 0x0000_0100;
     pub const ON_TRANSPORT: u32 = 0x0000_0200;
+    pub const DISABLE_GRAVITY: u32 = 0x0000_0400;
     pub const FALLING: u32 = 0x0000_1000;
     pub const SWIMMING: u32 = 0x0020_0000;
+    pub const ASCENDING: u32 = 0x0040_0000;
+    pub const DESCENDING: u32 = 0x0080_0000;
+    pub const CAN_FLY: u32 = 0x0100_0000;
     pub const FLYING: u32 = 0x0200_0000;
     pub const SPLINE_ELEVATION: u32 = 0x0400_0000;
     pub const SPLINE_ENABLED: u32 = 0x0800_0000;
@@ -183,6 +187,122 @@ impl Movement {
     pub fn is_living(&self) -> bool {
         self.flags & update_flags::LIVING != 0
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedKind {
+    Walk,
+    Run,
+    RunBack,
+    Swim,
+    SwimBack,
+    Turn,
+    Flight,
+    FlightBack,
+    Pitch,
+}
+
+impl SpeedKind {
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Walk => 0,
+            Self::Run => 1,
+            Self::RunBack => 2,
+            Self::Swim => 3,
+            Self::SwimBack => 4,
+            Self::Flight => 5,
+            Self::FlightBack => 6,
+            Self::Turn => 7,
+            Self::Pitch => 8,
+        }
+    }
+
+    pub const fn ack_opcode(self) -> crate::opcode::ClientOpcode {
+        match self {
+            Self::Walk => crate::opcode::ClientOpcode::ForceWalkSpeedChangeAck,
+            Self::Run => crate::opcode::ClientOpcode::ForceRunSpeedChangeAck,
+            Self::RunBack => crate::opcode::ClientOpcode::ForceRunBackSpeedChangeAck,
+            Self::Swim => crate::opcode::ClientOpcode::ForceSwimSpeedChangeAck,
+            Self::SwimBack => crate::opcode::ClientOpcode::ForceSwimBackSpeedChangeAck,
+            Self::Turn => crate::opcode::ClientOpcode::ForceTurnRateChangeAck,
+            Self::Flight => crate::opcode::ClientOpcode::ForceFlightSpeedChangeAck,
+            Self::FlightBack => crate::opcode::ClientOpcode::ForceFlightBackSpeedChangeAck,
+            Self::Pitch => crate::opcode::ClientOpcode::ForcePitchRateChangeAck,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ForceSpeedChange {
+    pub guid: u64,
+    pub counter: u32,
+    pub speed: f32,
+    pub kind: SpeedKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RelayedSpeedChange {
+    pub guid: u64,
+    pub info: crate::movement::MovementInfo,
+    pub speed: f32,
+    pub kind: SpeedKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SplineSpeedChange {
+    pub guid: u64,
+    pub speed: f32,
+    pub kind: SpeedKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanFlyChange {
+    pub guid: u64,
+    pub counter: u32,
+    pub enabled: bool,
+}
+
+pub fn parse_force_speed_change(body: &[u8], kind: SpeedKind) -> Result<ForceSpeedChange, Error> {
+    let mut reader = Reader::new(body, "SMSG_FORCE_*_SPEED_CHANGE");
+    let guid = read_packed_guid(&mut reader)?;
+    let counter = reader.u32()?;
+    if kind == SpeedKind::Run {
+        reader.skip(1)?;
+    }
+    let speed = reader.f32()?;
+    reader.finish()?;
+    Ok(ForceSpeedChange { guid, counter, speed, kind })
+}
+
+pub fn parse_can_fly_change(body: &[u8], enabled: bool) -> Result<CanFlyChange, Error> {
+    let mut reader = Reader::new(body, "SMSG_MOVE_*SET_CAN_FLY");
+    let guid = read_packed_guid(&mut reader)?;
+    let counter = reader.u32()?;
+    reader.finish()?;
+    Ok(CanFlyChange { guid, counter, enabled })
+}
+
+pub fn parse_relayed_speed_change(
+    body: &[u8],
+    kind: SpeedKind,
+) -> Result<RelayedSpeedChange, Error> {
+    let mut reader = Reader::new(body, "MSG_MOVE_SET_*_SPEED");
+    let guid = read_packed_guid(&mut reader)?;
+    let info = crate::movement::MovementInfo::read(&mut reader)?;
+    let speed = reader.f32()?;
+    reader.finish()?;
+    Ok(RelayedSpeedChange { guid, info, speed, kind })
+}
+
+pub fn parse_spline_speed_change(
+    body: &[u8],
+    kind: SpeedKind,
+) -> Result<SplineSpeedChange, Error> {
+    let mut reader = Reader::new(body, "SMSG_SPLINE_SET_*_SPEED");
+    let guid = read_packed_guid(&mut reader)?;
+    let speed = reader.f32()?;
+    reader.finish()?;
+    Ok(SplineSpeedChange { guid, speed, kind })
 }
 
 /// The field values a block carries, as a sparse index-to-word map.
@@ -1724,6 +1844,52 @@ mod tests {
 
         let mut reader = Reader::new(&packed, "guid");
         assert_eq!(read_packed_guid(&mut reader).unwrap(), guid);
+    }
+
+    #[test]
+    fn forced_speed_and_can_fly_packets_keep_their_counters() {
+        let mut body = Vec::new();
+        write_packed_guid(0x1234, &mut body);
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(1);
+        body.extend_from_slice(&12.5f32.to_le_bytes());
+        let change = parse_force_speed_change(&body, SpeedKind::Run).unwrap();
+        assert_eq!(change.guid, 0x1234);
+        assert_eq!(change.counter, 7);
+        assert_eq!(change.kind, SpeedKind::Run);
+        assert_eq!(change.speed, 12.5);
+
+        let mut body = Vec::new();
+        write_packed_guid(0x5678, &mut body);
+        body.extend_from_slice(&9u32.to_le_bytes());
+        assert_eq!(
+            parse_can_fly_change(&body, true).unwrap(),
+            CanFlyChange { guid: 0x5678, counter: 9, enabled: true }
+        );
+        assert_eq!(SpeedKind::Flight.index(), 5);
+        assert_eq!(SpeedKind::FlightBack.index(), 6);
+        assert_eq!(SpeedKind::Turn.index(), 7);
+    }
+
+    #[test]
+    fn relayed_and_spline_speed_packets_keep_their_trailing_values() {
+        let info = crate::movement::MovementInfo::standing(Position::default(), 4);
+        let mut body = Vec::new();
+        write_packed_guid(0x1234, &mut body);
+        info.write(&mut body);
+        body.extend_from_slice(&30.0f32.to_le_bytes());
+        let relayed = parse_relayed_speed_change(&body, SpeedKind::Run).unwrap();
+        assert_eq!(relayed.guid, 0x1234);
+        assert_eq!(relayed.info.time, 4);
+        assert_eq!(relayed.speed, 30.0);
+
+        let mut body = Vec::new();
+        write_packed_guid(0x5678, &mut body);
+        body.extend_from_slice(&12.0f32.to_le_bytes());
+        assert_eq!(
+            parse_spline_speed_change(&body, SpeedKind::Flight).unwrap(),
+            SplineSpeedChange { guid: 0x5678, speed: 12.0, kind: SpeedKind::Flight }
+        );
     }
 
     fn fields_bytes(entries: &[(u16, u32)]) -> Vec<u8> {

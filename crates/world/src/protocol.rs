@@ -881,6 +881,20 @@ pub fn movement(mover: u64, info: &crate::movement::MovementInfo) -> Vec<u8> {
     body
 }
 
+pub fn movement_ack(
+    mover: u64,
+    counter: u32,
+    info: &crate::movement::MovementInfo,
+    value: f32,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(48);
+    crate::update::write_packed_guid(mover, &mut body);
+    body.extend_from_slice(&counter.to_le_bytes());
+    info.write(&mut body);
+    body.extend_from_slice(&value.to_le_bytes());
+    body
+}
+
 /// Reads a movement packet relayed from another mover.
 pub fn parse_movement(
     body: &[u8],

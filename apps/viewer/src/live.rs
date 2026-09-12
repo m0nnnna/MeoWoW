@@ -58,6 +58,7 @@ pub struct Entity {
     /// drawn swimming without this client sampling the water beneath them --
     /// see `world::state::Entity::swimming`.
     pub swimming: bool,
+    pub flying: bool,
     /// Whether this unit is lying dead, and so should be drawn face down.
     /// Outranks `speed` when choosing a cycle: a creature killed mid-charge
     /// keeps the charge's speed for a moment after it stops being able to use
@@ -691,6 +692,7 @@ pub fn drawable_entities(
             turning: 0.0,
             airborne: false,
             swimming: entity.swimming(),
+            flying: entity.flying(),
             dead: entity.is_corpse(),
             died_ms_ago: entity.dying_for(now).map(|d| d.as_millis() as u32),
             swung_ms_ago: entity
@@ -765,6 +767,89 @@ fn turn_fraction(dt: f32) -> f32 {
 }
 
 impl LiveWorld {
+    fn own_movement_info(&self) -> ::world::movement::MovementInfo {
+        let position = ::world::update::Position {
+            x: self.position.x,
+            y: self.position.y,
+            z: self.position.z,
+            orientation: self.orientation,
+        };
+        let mut info = self
+            .state
+            .get(self.guid)
+            .and_then(|entity| entity.movement)
+            .unwrap_or_else(|| ::world::movement::MovementInfo::standing(position, self.connection.tick()));
+        info.position = position;
+        info.time = self.connection.tick();
+        if self
+            .state
+            .get(self.guid)
+            .is_some_and(|entity| {
+                entity.can_fly
+                    || entity.movement.is_some_and(|movement| {
+                        movement.flags
+                            & (::world::update::movement_flags::CAN_FLY
+                                | ::world::update::movement_flags::FLYING
+                                | ::world::update::movement_flags::DISABLE_GRAVITY)
+                            != 0
+                    })
+            })
+        {
+            info.flags |= ::world::update::movement_flags::CAN_FLY
+                | ::world::update::movement_flags::FLYING;
+            info.flags &= !::world::update::movement_flags::FALLING;
+            info.pitch = Some(0.0);
+        }
+        info
+    }
+
+    pub fn answer_movement_controls(&mut self, report: &world::state::Replication) {
+        for change in &report.can_fly_changes {
+            if change.guid != self.guid {
+                continue;
+            }
+            let mut info = self.own_movement_info();
+            if change.enabled {
+                info.flags |= ::world::update::movement_flags::CAN_FLY
+                    | ::world::update::movement_flags::FLYING;
+                info.flags &= !::world::update::movement_flags::FALLING;
+                info.pitch = Some(0.0);
+            } else {
+                info.flags &= !(::world::update::movement_flags::CAN_FLY
+                    | ::world::update::movement_flags::FLYING
+                    | ::world::update::movement_flags::ASCENDING
+                    | ::world::update::movement_flags::DESCENDING);
+                if info.flags & ::world::update::movement_flags::SWIMMING == 0 {
+                    info.pitch = None;
+                }
+            }
+            if let Err(error) = self.connection.send_movement_ack(
+                ::world::ClientOpcode::MoveSetCanFlyAck,
+                self.guid,
+                change.counter,
+                &info,
+                0.0,
+            ) {
+                tracing::warn!("sending can-fly acknowledgement failed: {error:#}");
+            }
+        }
+        for change in &report.speed_changes {
+            if change.guid != self.guid {
+                continue;
+            }
+            let info = self.own_movement_info();
+            if let Err(error) = self.connection.send_movement_ack(
+                change.kind.ack_opcode(),
+                self.guid,
+                change.counter,
+                &info,
+                change.speed,
+            ) {
+                tracing::warn!("sending speed acknowledgement failed: {error:#}");
+            }
+        }
+    }
+
     /// Eases each entity's drawn heading toward the one the world reports.
     ///
     /// **The world's answer is a step change and a model must not be.** A
@@ -834,6 +919,7 @@ pub fn own_entity(
     turning: f32,
     airborne: bool,
     swimming: bool,
+    flying: bool,
 ) -> Option<Entity> {
     use world::update;
 
@@ -875,6 +961,7 @@ pub fn own_entity(
         // whatever we were doing at login -- the trap documented at length on
         // the data itself. The movement driver knows, so it is passed in.
         swimming,
+        flying,
         // The player's own death is read from replicated state like anyone
         // else's -- it is the one part of our own condition the server *does*
         // tell us about, unlike our position.

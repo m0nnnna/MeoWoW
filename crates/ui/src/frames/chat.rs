@@ -12,6 +12,7 @@
 //! to lose.
 
 use egui::{Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
+use egui::text::{LayoutJob, TextFormat};
 
 use crate::style::{Color, Style};
 
@@ -60,6 +61,134 @@ pub struct ChatEntry {
     pub prefix: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ChatSpan {
+    text: String,
+    colour: egui::Color32,
+}
+
+fn push_span(spans: &mut Vec<ChatSpan>, text: &mut String, colour: egui::Color32) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = spans.last_mut() {
+        if last.colour == colour {
+            last.text.push_str(text);
+            text.clear();
+            return;
+        }
+    }
+    spans.push(ChatSpan { text: std::mem::take(text), colour });
+}
+
+fn markup_spans(text: &str, default: egui::Color32) -> Vec<ChatSpan> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut visible = String::new();
+    let mut colour = default;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if bytes[offset] != b'|' || offset + 1 >= bytes.len() {
+            let character = text[offset..].chars().next().unwrap();
+            visible.push(character);
+            offset += character.len_utf8();
+            continue;
+        }
+        match bytes[offset + 1] {
+            b'c' if offset + 10 <= bytes.len()
+                && bytes[offset + 2..offset + 10]
+                    .iter()
+                    .all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                push_span(&mut spans, &mut visible, colour);
+                let value = u32::from_str_radix(std::str::from_utf8(&bytes[offset + 2..offset + 10]).unwrap(), 16).unwrap();
+                colour = egui::Color32::from_rgba_unmultiplied(
+                    (value >> 16) as u8,
+                    (value >> 8) as u8,
+                    value as u8,
+                    (value >> 24) as u8,
+                );
+                offset += 10;
+            }
+            b'r' => {
+                push_span(&mut spans, &mut visible, colour);
+                colour = default;
+                offset += 2;
+            }
+            b'n' => {
+                visible.push('\n');
+                offset += 2;
+            }
+            b'|' => {
+                visible.push('|');
+                offset += 2;
+            }
+            b'H' => {
+                let Some(metadata_end) = text[offset + 2..].find("|h").map(|end| offset + 2 + end) else {
+                    visible.push('|');
+                    offset += 1;
+                    continue;
+                };
+                let display_start = metadata_end + 2;
+                let Some(display_end) = text[display_start..].find("|h").map(|end| display_start + end) else {
+                    visible.push('|');
+                    offset += 1;
+                    continue;
+                };
+                visible.push_str(&text[display_start..display_end]);
+                offset = display_end + 2;
+            }
+            b'T' => {
+                let Some(texture_end) = text[offset + 2..].find("|t").map(|end| offset + 2 + end) else {
+                    visible.push('|');
+                    offset += 1;
+                    continue;
+                };
+                push_span(&mut spans, &mut visible, colour);
+                offset = texture_end + 2;
+            }
+            b'h' | b't' => offset += 2,
+            _ => {
+                visible.push('|');
+                offset += 1;
+            }
+        }
+    }
+    push_span(&mut spans, &mut visible, colour);
+    spans
+}
+
+fn append_text(job: &mut LayoutJob, text: &str, font: &egui::FontId, colour: egui::Color32) {
+    if !text.is_empty() {
+        job.append(text, 0.0, TextFormat { font_id: font.clone(), color: colour, ..Default::default() });
+    }
+}
+
+fn entry_layout(entry: &ChatEntry, font: &egui::FontId, default: egui::Color32, width: f32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = width;
+    if let Some(prefix) = &entry.prefix {
+        append_text(&mut job, "[", font, default);
+        append_text(&mut job, prefix, font, default);
+        append_text(&mut job, "] ", font, default);
+    }
+    match (&entry.who, entry.kind) {
+        (Some(who), ChatKind::Emote) => {
+            append_text(&mut job, who, font, default);
+            append_text(&mut job, " ", font, default);
+        }
+        (Some(who), _) => {
+            append_text(&mut job, who, font, default);
+            append_text(&mut job, ": ", font, default);
+        }
+        (None, _) => {}
+    }
+    for span in markup_spans(&entry.text, default) {
+        append_text(&mut job, &span.text, font, span.colour);
+    }
+    job
+}
+
 impl ChatEntry {
     /// The line as it reads on screen.
     pub fn rendered(&self) -> String {
@@ -82,7 +211,9 @@ impl ChatEntry {
             }
             (None, _) => {}
         }
-        line.push_str(&self.text);
+        for span in markup_spans(&self.text, egui::Color32::WHITE) {
+            line.push_str(&span.text);
+        }
         line
     }
 }
@@ -160,17 +291,13 @@ pub fn draw(
         if bottom <= inner.top() {
             break;
         }
-        let galley = painter.layout(
-            entry.rendered(),
-            font.clone(),
-            colour(entry.kind, style).into(),
-            inner.width(),
-        );
+        let default = colour(entry.kind, style).into();
+        let galley = painter.layout_job(entry_layout(entry, &font, default, inner.width()));
         bottom -= galley.size().y;
         painter.galley(
             Pos2::new(inner.left(), bottom),
             galley,
-            colour(entry.kind, style).into(),
+            default,
         );
     }
 }
@@ -259,6 +386,26 @@ mod tests {
             prefix: None,
         };
         assert_eq!(entry.rendered(), "Server restarting.");
+    }
+
+    #[test]
+    fn wow_markup_preserves_link_text_and_colour_runs() {
+        let entry = ChatEntry {
+            kind: ChatKind::System,
+            who: None,
+            text: "|cffff0000|Hplayer:Denveous:1:0:0:0:0:0:0|h[Denveous]|h|r's Fly Mode on".into(),
+            prefix: None,
+        };
+        assert_eq!(entry.rendered(), "[Denveous]'s Fly Mode on");
+        let spans = markup_spans(&entry.text, egui::Color32::WHITE);
+        assert_eq!(spans[0], ChatSpan { text: "[Denveous]".into(), colour: egui::Color32::from_rgb(255, 0, 0) });
+        assert_eq!(spans[1], ChatSpan { text: "'s Fly Mode on".into(), colour: egui::Color32::WHITE });
+    }
+
+    #[test]
+    fn wow_markup_consumes_texture_newline_and_pipe_codes() {
+        let spans = markup_spans(r"before|TInterface\Icon\foo:16:16|tafter|nline||tail", egui::Color32::WHITE);
+        assert_eq!(spans, vec![ChatSpan { text: "beforeafter\nline|tail".into(), colour: egui::Color32::WHITE }]);
     }
 
     /// Every kind must have a colour of its own, or two kinds are
